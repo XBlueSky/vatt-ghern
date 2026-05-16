@@ -3,9 +3,9 @@ import rssPlugin from "@11ty/eleventy-plugin-rss";
 export default function (eleventyConfig) {
   eleventyConfig.addPlugin(rssPlugin);
 
-  // Asset passthrough inside posts (images, JSON sidecars, etc.).
+  // Asset passthrough inside posts (images, videos, CSVs, PDFs — no JSON sidecars).
   eleventyConfig.addPassthroughCopy(
-    "src/posts/**/*.{png,jpg,jpeg,gif,svg,webp,avif,mp4,webm,json,csv,pdf}"
+    "src/posts/**/*.{png,jpg,jpeg,gif,svg,webp,avif,mp4,webm,csv,pdf}"
   );
   eleventyConfig.addPassthroughCopy({ "src/static": "static" });
 
