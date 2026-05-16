@@ -1,0 +1,241 @@
+---
+name: daily-news
+description: This skill should be used when the user asks to "run daily news", "publish today's news", "draft today's vatt-ghern roundup", "do the daily-news routine", invokes `/vatt-ghern:daily-news`, or asks Claude to author tech-news posts for the vatt-ghern blog. The skill produces one daily-roundup HTML (10 items) plus up to three daily-deep-story HTML posts under `src/posts/YYYY/MM/DD/`, runs anti-duplication checks against the past 7 days, and opens a PR to `main`. Always use this skill (instead of authoring news posts ad-hoc) so output stays consistent with the archetype rules, design system, and dedup conventions.
+version: 0.1.0
+---
+
+# daily-news
+
+Curate today's tech news for the vatt-ghern blog and publish it as bespoke
+HTML posts. Adopt a senior-tech-lead persona, fetch from a priority source
+list, score and de-duplicate against the past 7 days, write one roundup and
+up to three deep-stories, and open a pull request for human review.
+
+## When this skill runs
+
+Two invocation paths converge here:
+
+- **Slash command**: `/vatt-ghern:daily-news` (defined in
+  `${CLAUDE_PLUGIN_ROOT}/commands/daily-news.md`)
+- **Routine fallback**: Claude Routines invoking the repo may load this
+  SKILL.md directly when the slash command is unavailable. Both paths execute
+  the same 9-step workflow below.
+
+Do not author daily news posts without this skill. Ad-hoc posts drift from
+the archetype rules and break the dedup invariants that future days depend
+on.
+
+## Required reading before authoring
+
+Read these references before producing output. They are the single source of
+truth — do not re-derive their contents:
+
+- **`references/persona.md`** — Voice (measured, curious, materially-rooted),
+  five priority domains, what earns inclusion vs. what doesn't, punctuation
+  rules (`：` not `:`; `——` not `—`).
+- **`references/sources.md`** — Tier-1 through Tier-5 source list with
+  priority order. HackerNoon is the primary signal.
+- **`references/archetypes.md`** — Required HTML structure for roundup and
+  deep-story, sidecar JSON schema, content rules, scoring rubric.
+- **`references/anti-duplication.md`** — Rules for the 7-day window check
+  and how to handle near-duplicates.
+- **`references/design-system.md`** — Color tokens, font stacks, component
+  classes, read-tracking attribute conventions, SVG patterns.
+- **`references/widget-isolation.md`** — CSS / ID / JS scoping contract for
+  inline SVG widgets.
+
+## Workflow — nine steps
+
+Execute in order. Do not skip steps. If a step fails, report the failure
+mode rather than silently producing partial output.
+
+### Step 1: Load context
+
+Run the load-context script and parse its JSON output:
+
+```bash
+node ${CLAUDE_PLUGIN_ROOT}/skills/daily-news/scripts/load-context.mjs
+```
+
+Returns: `today` (YYYY-MM-DD, UTC+8), `past_news_ids`, `past_urls`,
+`past_roundup_titles`, `past_deep_titles`. Keep this blob — it is the
+anti-duplication ground truth for steps 3, 4, and 5.
+
+### Step 2: Fetch sources
+
+Walk `references/sources.md` in tier order (Tier 1 first). For each source,
+fetch the home/index page and collect top 5–10 items from the last ~24
+hours. Use WebFetch with prompts like:
+
+> "List the top 8 items from this page that look like original engineering
+> blog posts (not job listings, marketing pages, or product launches without
+> technical content). For each, give me title, canonical link, and a 1-2
+> sentence summary of the substance."
+
+De-duplicate by canonical URL across sources. Aim for ~50–100 candidates
+total. If fewer than 5 sources succeed, fail-fast: report which sources
+failed and abort without writing files.
+
+### Step 3: Score and filter
+
+For each candidate, assign a domain (ai / systems / infra / storage /
+industry) and a 0–10 score per the rubric in `references/archetypes.md`.
+
+Drop candidates that:
+
+- Have a canonical URL already in `past_urls`
+- Have a title whose Jaccard char-bigram similarity > 0.85 against any
+  `past_roundup_titles` (compute this manually — the formal check runs in
+  step 8 via `check-dup.mjs`)
+- Violate the "what does NOT earn a place" rules in `persona.md`
+
+### Step 4: Pick today's 10
+
+Select top 10 by score with constraint: **≥3 distinct domains represented**.
+If a single-domain day is genuinely the truth (e.g., model-release Friday),
+accept fewer than 10 rather than padding with low-quality items.
+
+Assign final `news_id` values as `YYYY-MM-DD-NN` (zero-padded) in
+ranked order.
+
+### Step 5: Pick deep-story candidates
+
+From today's 10, select up to 3 deep-story candidates satisfying ALL:
+
+- Score ≥ 8
+- Source has drillable depth (long-form, paper, RFC, design doc — not press
+  release)
+- Different domains where possible
+
+Cross-check against `past_deep_titles` (Jaccard > 0.70 = drop). If fewer
+than 3 qualify, write fewer. Never recycle a past deep-story topic to hit 3.
+
+### Step 6: Write roundup HTML + sidecar
+
+Read the archetype skeleton at
+`${CLAUDE_PLUGIN_ROOT}/src/archetypes/daily-roundup.html` for structure.
+Author the full HTML following `references/archetypes.md` § "Archetype 1".
+Write to `src/posts/YYYY/MM/DD/roundup.html` plus matching `.11tydata.json`
+sidecar (schema in `references/archetypes.md`).
+
+Required structural attributes (the test suite checks them):
+
+- Each item card has `id="item-NN"` (zero-padded)
+- Each item card has `data-vg-readkey-item="{{page.url}}#item-NN"`
+- Progress span has `data-vg-progress-of` and `data-vg-progress-total`
+
+### Step 7: Write each deep-story HTML + sidecar (×N where N ≤ 3)
+
+For each deep-story candidate, do additional WebFetch on the canonical
+source to gather technical detail (RFC excerpts, code samples, real
+numbers). Read the skeleton at
+`${CLAUDE_PLUGIN_ROOT}/src/archetypes/daily-deep-story.html`. Author
+following `references/archetypes.md` § "Archetype 2".
+
+Each deep-story file:
+
+- Path: `src/posts/YYYY/MM/DD/deep-<kebab-slug>.html`
+- Sidecar: `news_ids` references exactly one item from today's roundup;
+  `related_roundup` is set to `/YYYY/MM/DD/roundup/`
+- Body contains opener → drop-cap intro → three H2 acts → take-away closer
+- ≥2 inline SVG widgets (timeline, architecture, comparison, data viz)
+
+### Step 8: Self-check
+
+Run the validation scripts:
+
+```bash
+# Dedup check (catches anything missed in step 3)
+node ${CLAUDE_PLUGIN_ROOT}/skills/daily-news/scripts/check-dup.mjs src/posts/YYYY/MM/DD/
+
+# Schema/structure check
+node ${CLAUDE_PLUGIN_ROOT}/skills/daily-news/scripts/publish.mjs src/posts/YYYY/MM/DD/
+
+# HTML validity
+npx @11ty/eleventy && npx html-validate "_site/**/*.html"
+```
+
+If any step fails: fix the underlying content, re-run. Do not commit while
+checks fail.
+
+### Step 9: Open PR
+
+```bash
+git checkout -b daily/YYYY-MM-DD
+git add src/posts/YYYY/MM/DD/
+git commit -m "daily: YYYY-MM-DD news (1 roundup + N deep stories)"
+git push -u origin daily/YYYY-MM-DD
+gh pr create --base main --title "daily: YYYY-MM-DD news (1 roundup + N deep stories)" --body "<see body template below>"
+```
+
+**PR body template** — include all sections:
+
+```markdown
+## 今日 10 則 (roundup)
+
+01. {{title}} — {{source_url}}
+02. ...
+...
+
+## 深入文章 (deep-stories)
+
+### {{deep_title_1}}
+
+Lede: {{deep_lede_1}}
+
+### {{deep_title_2}}
+
+Lede: {{deep_lede_2}}
+
+## 跳過 (dup with last 7 days)
+
+- {{skipped_url}} — title similarity 0.91 vs "{{past_title}}"
+- (none) if no skips
+
+## 來源使用
+
+- HackerNoon: 18 candidates → 4 selected
+- Hacker News: 12 candidates → 2 selected
+- Cloudflare blog: 5 candidates → 1 selected
+- ...
+- Failed: (none) or list of failed-fetch sources
+
+## Preview
+
+Cloudflare Pages will post a preview URL once build completes. Please review
+visual rendering (light + dark mode) before merging.
+```
+
+Do not merge. Wait for human review.
+
+## Failure modes — explicit handling
+
+| Scenario | Handling |
+|---|---|
+| Some sources fetch-fail | Skip them; log in PR body; require ≥5 successes overall |
+| Fewer than 10 candidates pass scoring | Write actual N ("今日 7 則"); don't pad |
+| Fewer than 3 deep-story candidates pass | Write 2 or 1; don't force |
+| All sources fail | Fail-fast: no PR, no commit; report status |
+| Dup filter excludes everything in a domain | Note in PR body; pick from other domains |
+| html-validate fails | Self-fix one round; if still failing, open PR but flag `⚠ HTML validation failed` in title |
+
+## Output expectations summary
+
+A successful run produces:
+
+- 1 × `roundup.html` + `roundup.11tydata.json` in `src/posts/YYYY/MM/DD/`
+- 1-3 × `deep-<slug>.html` + matching `.11tydata.json`
+- One git branch `daily/YYYY-MM-DD` pushed to origin
+- One PR open against `main` with the body template above filled in
+
+## Why this is split across multiple references
+
+`SKILL.md` stays lean (workflow only) so it loads fast when the skill
+triggers. Detailed rules (persona, sources, archetype HTML structures, dedup
+math, design tokens, widget contract) live in `references/` files that load
+on-demand when authoring decisions actually need them. This is the
+"progressive disclosure" pattern: ~150 words always visible, ~1500 words
+visible when skill activates, ~5000 words loadable as needed.
+
+If a reference contradicts this SKILL.md, the reference wins for content
+decisions (it is the detailed spec); SKILL.md wins for workflow ordering.
