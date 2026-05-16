@@ -83,7 +83,7 @@ export default function (eleventyConfig) {
     for (const post of api.getFilteredByGlob("src/posts/**/*.html")) {
       if (post.data.status === "draft") continue;
       const d = new Date(post.data.date);
-      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+      const key = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
       if (!byDay.has(key)) byDay.set(key, []);
       byDay.get(key).push(post);
     }
@@ -108,12 +108,12 @@ export default function (eleventyConfig) {
   eleventyConfig.addFilter("dateMD", (d) => {
     const dt = d ? new Date(d) : new Date();
     if (isNaN(dt)) return "";
-    return `${String(dt.getMonth() + 1).padStart(2, "0")}.${String(dt.getDate()).padStart(2, "0")}`;
+    return `${String(dt.getUTCMonth() + 1).padStart(2, "0")}.${String(dt.getUTCDate()).padStart(2, "0")}`;
   });
   eleventyConfig.addFilter("dateHuman", (d) => {
     const dt = d ? new Date(d) : new Date();
     if (isNaN(dt)) return "";
-    return `${dt.getFullYear()} · ${String(dt.getMonth() + 1).padStart(2, "0")} · ${String(dt.getDate()).padStart(2, "0")}`;
+    return `${dt.getUTCFullYear()} · ${String(dt.getUTCMonth() + 1).padStart(2, "0")} · ${String(dt.getUTCDate()).padStart(2, "0")}`;
   });
   eleventyConfig.addFilter("displayTags", (tags) => {
     if (!Array.isArray(tags)) return [];
@@ -121,8 +121,9 @@ export default function (eleventyConfig) {
   });
   eleventyConfig.addFilter("take", (arr, n) => (Array.isArray(arr) ? arr.slice(0, n) : []));
 
-  // Group posts by ISO week for homepage timeline. Returns
-  // [{ weekLabel, days: [{ date, posts }] }, ...].
+  // Group posts into civic weeks (Sunday-anchored) for homepage timeline.
+  // Not ISO-8601 — labels are for visual grouping only, not stable identifiers.
+  // Returns [{ weekLabel, days: [{ date, posts }] }, ...].
   eleventyConfig.addFilter("groupByWeek", (days) => {
     if (!Array.isArray(days)) return [];
     const out = new Map();
