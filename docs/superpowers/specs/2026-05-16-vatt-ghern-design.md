@@ -310,8 +310,36 @@ class prefix, JS in IIFE, no global pollution.
 **Dark mode**: all inline SVG uses `currentColor` or `light-dark()` token,
 never hardcoded hex/rgb.
 
-**No tracking, no analytics, no newsletter signup, no social-share
-buttons.**
+**No newsletter signup, no follower-count widgets, no third-party
+tracking scripts.** Two privacy-bounded exceptions are enabled:
+
+- **Cloudflare Web Analytics** (cookie-less, no GDPR consent banner
+  needed, opt-in via Cloudflare dashboard). Records aggregate pageviews,
+  referrers, country, device type — nothing user-identifying.
+- **Share buttons** (per post footer): plain anchor links to
+  `twitter.com/intent/tweet`, `threads.net/intent/post`, and a
+  `Copy link` button. No embedded SDK, no tracking pixel. Styled as IM
+  Fell italic text links, not brand-colored icons. Mastodon / Bluesky
+  may be added later.
+
+### 6.4 Read-tracking ("已閱" mechanism)
+
+Pure client-side, zero-backend reading progress tracking. Privacy-
+preserving by construction (state lives only in the reader's browser).
+
+| Aspect | Spec |
+|---|---|
+| Storage | `localStorage` key `vg-read`, value is a JSON map `{ "/2026/05/16/roundup/": "read", "/2026/05/16/roundup/#item-03": "read", "/2026/05/16/deep-io-uring-cve/": "read", ... }` |
+| Granularity | Per-post (any post page) AND per-item within a roundup (each of the 10 cards has stable anchor `#item-NN` and trackable independently) |
+| Auto-mark trigger | Scroll to bottom (≥95% viewport depth reached) AND dwell ≥5s on the post — flips state to `read` automatically |
+| Manual toggle | Each post + each roundup item has a small `✓ 已閱` / `↶ 標未閱` toggle (IM Fell italic, accent-text color) |
+| Visual: unread | Default — full opacity, normal weight |
+| Visual: read | `opacity: 0.55`, title prefixed with `✓ ` marker (IM Fell italic, accent-text) |
+| Visual: roundup card progress | Roundup index/timeline cards show small `N / 10 已閱` line in IM Fell italic below the date |
+| Visual: deep-story preview cards | Same opacity rule; no progress count |
+| Reset | "重置已閱狀態" link in site footer; clears `vg-read` key entirely |
+| Implementation | `src/static/read-tracker.js` (~80 lines IIFE) + corresponding CSS rules in `site.css` under `.vg-read` / `.vg-read-progress` class scope |
+| Failure mode | If `localStorage` is unavailable (private mode, quota), feature silently no-ops; page still renders normally |
 
 ## 7. Daily-news skill workflow
 
@@ -555,7 +583,11 @@ Lean, by design. Personal blog, not SaaS.
 - Each deep-story has ≥2 inline SVG widgets
 - No hardcoded colors (hex/rgb); only tokens
 - Sidecar JSON schema satisfied
-- No forbidden patterns: Latin em-dash, subscribe CTA, social-share buttons
+- No forbidden patterns: Latin em-dash in site prose, subscribe CTA,
+  newsletter signup, third-party tracking SDK, follower-count widget
+- Roundup posts: each of the N news items has stable `id="item-NN"`
+  anchor on its outer container (required by read-tracker.js for
+  per-item read state)
 
 ### 10.3 Visual review (Tony, per PR)
 
@@ -583,6 +615,8 @@ Lean, by design. Personal blog, not SaaS.
 | `references/*.md` | **Skill at runtime** | Behavior tuning |
 | `skills/daily-news/SKILL.md` | Skill itself + routine fallback | Workflow change |
 | `commands/daily-news.md` | Claude Code plugin loader | Rare |
+| `src/static/read-tracker.js` | Browser-side reader UX | Read-state UX tweaks |
+| `src/_includes/share-buttons.njk` | Per-post share affordances | New platform added |
 | `docs/superpowers/specs/*` | Future Tony tracing design rationale | Never (frozen) |
 
 **Single source of truth for skill behavior**: `references/` (skill-facing
@@ -604,8 +638,16 @@ hand-written sample posts visible.
    toggle script, sigil PNG (reused km wolf)
 3. Wordmark = `vatt'ghern` / `jaskier's ballads`
 4. Layouts: `base.njk`, `index.njk`, `archive.njk`, `tags.njk`,
-   `topics.njk`, `feed.xml.njk`, `404.njk`
-5. 2 hand-written sample posts in `src/posts/2026/05/16/`:
+   `topics.njk`, `feed.xml.njk`, `404.njk` — base layout includes share
+   buttons partial, read-tracker script tag, and footer "重置已閱" link
+5. `src/static/read-tracker.js` (IIFE, ~80 lines): localStorage-backed
+   read state for posts and roundup items, auto-mark on scroll+dwell,
+   manual toggle binding, footer reset hook
+6. `src/_includes/share-buttons.njk` partial: Copy link + Twitter +
+   Threads anchor links, IM Fell italic styling
+7. Cloudflare Web Analytics enabled in Cloudflare dashboard (no
+   per-page setup needed)
+8. 2 hand-written sample posts in `src/posts/2026/05/16/`:
    - sample roundup (10 fictional items)
    - sample deep-story (any topic)
 6. Archetypes distilled into `src/archetypes/daily-roundup.html` +
