@@ -125,17 +125,54 @@ ranked order.
 - Any domain that hit the cap and had candidates dropped (e.g.,
   "8 qualifying items in AI today, top 6 selected")
 
-### Step 5: Pick deep-story candidates
+### Step 5: Pick deep-story candidates + choose archetype
 
-From today's 10, select up to 3 deep-story candidates satisfying ALL:
+For each candidate scoring ≥8 from Step 4, decide:
 
-- Score ≥ 8
-- Source has drillable depth (long-form, paper, RFC, design doc — not press
-  release)
-- Different domains where possible
+**a. Worth a deep-story?**
 
-Cross-check against `past_deep_titles` (Jaccard > 0.70 = drop). If fewer
-than 3 qualify, write fewer. Never recycle a past deep-story topic to hit 3.
+YES if all of:
+- Source has drillable depth (long-form blog, paper, RFC, design doc,
+  postmortem, repo with substantial README/docs)
+- Topic genuinely benefits from 600-1200 lines of treatment
+- Not duplicate-similar to a past `past_deep_titles` entry (Jaccard
+  bigram similarity ≤ 0.70)
+
+**b. If yes, which archetype fits?**
+
+Decision tree:
+
+| Signal | Pick |
+|---|---|
+| Time-ordered story of an event | `narrative` |
+| Structural exposition of a new design / algorithm / protocol | `technical-deep-dive` |
+| "Why is this happening?" puzzle with hypotheses | `investigation` |
+| Two or more options to choose between | `comparison` |
+| Reader may not know what X even is, concept needs explained | `explainer` |
+| None fit cleanly, or fits multiple awkwardly, or hybrid | `freeform` |
+
+**IMPORTANT**: Archetypes are SUGGESTIONS. When in doubt — or when
+forcing a structured archetype would worsen the prose — pick
+`freeform`. A forced fit produces worse content than free shape.
+
+**c. Selection constraints when writing up to 3**:
+
+- All 3 must score ≥8
+- ≥2 distinct domains required if writing 3 (≥1 if writing 2)
+- ≥2 distinct archetypes required if writing 3 (avoid "3 narratives in
+  a row"); `freeform` counts as its own archetype for diversity
+- If candidates cannot satisfy domain + archetype diversity, write
+  fewer (2 or 1). Do not force.
+
+After picking each archetype, read the corresponding detail file for the
+structure rules to follow when writing:
+
+- `${CLAUDE_PLUGIN_ROOT}/skills/daily-news/references/archetypes/deep-narrative.md`
+- `${CLAUDE_PLUGIN_ROOT}/skills/daily-news/references/archetypes/deep-technical-deep-dive.md`
+- `${CLAUDE_PLUGIN_ROOT}/skills/daily-news/references/archetypes/deep-investigation.md`
+- `${CLAUDE_PLUGIN_ROOT}/skills/daily-news/references/archetypes/deep-comparison.md`
+- `${CLAUDE_PLUGIN_ROOT}/skills/daily-news/references/archetypes/deep-explainer.md`
+- `${CLAUDE_PLUGIN_ROOT}/skills/daily-news/references/archetypes/deep-freeform.md`
 
 ### Step 6: Write roundup HTML + sidecar
 
