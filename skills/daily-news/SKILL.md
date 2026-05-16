@@ -336,6 +336,18 @@ Lede: {{deep_lede_2}}
 - {{skipped_url}} — title similarity 0.91 vs "{{past_title}}"
 - (none) if no skips
 
+## Domain distribution
+
+AI · 3 · SYSTEMS · 3 · INFRA · 2 · STORAGE · 1 · INDUSTRY · 1
+
+## Domains skipped today
+
+- (none) — or list each: e.g., "STORAGE: no qualifying candidates"
+
+## Domains capped (≤6 rule)
+
+- (none) — or list e.g., "AI: 8 qualifying, top 6 selected"
+
 ## 來源使用
 
 - HackerNoon: 18 candidates → 4 selected
@@ -353,6 +365,12 @@ Lede: {{deep_lede_2}}
   fix attempts in Step 8.5 (tried wider viewBox, label nudge, font shrink)
   did not fully resolve.
 - `/2026/05/16/roundup/`: drop cap baseline 2px below following line. Minor.
+
+## Deep-story archetypes used today
+
+- {{deep_title_1}} — `narrative`
+- {{deep_title_2}} — `technical-deep-dive`
+- {{deep_title_3}} — `freeform` (hybrid topic, no structured archetype fit cleanly)
 
 ## Preview
 
