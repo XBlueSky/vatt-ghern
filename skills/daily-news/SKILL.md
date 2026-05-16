@@ -180,10 +180,24 @@ sleep 2 && curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/
 **For each published post** (roundup + each deep-story):
 
 1. Navigate Playwright to `http://localhost:8080/YYYY/MM/DD/<slug>/`
-2. Set `localStorage["vg-theme"] = "light"` and screenshot
-3. Set `localStorage["vg-theme"] = "dark"` and screenshot
-4. For deep-stories with widgets: scroll to each `<figure>` / `<svg>` and
-   screenshot specifically (don't trust above-fold screenshot to cover them)
+2. Initial viewport screenshot in light mode (default)
+3. Switch to dark via **both** `localStorage` AND `data-theme` attribute —
+   the site reads `localStorage` only on page load and then applies
+   `data-theme` to `<html>`, so post-load `localStorage` change alone does
+   nothing. Use:
+   ```js
+   localStorage.setItem("vg-theme", "dark");
+   document.documentElement.setAttribute("data-theme", "dark");
+   ```
+   Then take initial viewport screenshot.
+4. For widgets below the fold (deep-stories often have widgets 800–1500px
+   down): use `document.querySelector('.vg-w-...').scrollIntoView()` then
+   screenshot the **viewport**, not the element. Element-level screenshots
+   (`target=` in playwright) are unreliable when multiple `<figure>` or
+   `<svg>` elements exist on the page (strict-mode selector violation).
+5. Mobile viewport check: resize to 375px, navigate to roundup once,
+   screenshot. Verify no layout collapse, no horizontal scroll, SVG widgets
+   scale.
 
 **Look at each screenshot. Classify any issues by severity**:
 
