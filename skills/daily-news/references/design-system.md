@@ -113,7 +113,12 @@ on the `<svg>` element so it responds to layout.
 
 ## Anti-patterns (don't ship)
 
-- `<style>` blocks in posts (use existing classes; only `style="width: ...; height: ..."` allowed on SVG)
+- `<style>` blocks at post body level (use existing classes; only
+  `style="width: ...; height: ..."` allowed as attribute on SVG element).
+  Exception: an inline `<style>` block *inside* an `<svg>` element is
+  allowed when every rule is prefixed with the widget's `vg-w-*` class
+  (see `widget-isolation.md` Rule 1). The ban is on rules that leak into
+  the document scope.
 - Newsletter signup forms, subscribe CTAs, social follower widgets
 - Third-party tracking scripts (Cloudflare Web Analytics is injected
   automatically via the host platform; no per-post code needed)

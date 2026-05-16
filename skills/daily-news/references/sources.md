@@ -9,12 +9,13 @@ All URLs are public. No API keys required.
 
 ## Tier 1 — Most important
 
-- https://hackernoon.com/ **(primary signal)**
+- https://news.ycombinator.com/news **(primary signal — most reliable, broadest)**
+- https://lobste.rs/ **(systems-focused, high signal-to-noise)**
+- https://hackernoon.com/ — may return HTTP 403 to bot fetchers; treat as
+  best-effort. If blocked, skip and continue.
 
 ## Tier 2 — Aggregators
 
-- https://news.ycombinator.com/news
-- https://lobste.rs/
 - https://app.daily.dev/
 - https://blog.gslin.org/
 
@@ -47,7 +48,7 @@ All URLs are public. No API keys required.
 - https://meetingcpp.com/blog/blogroll/
 - https://cpp.libhunt.com/
 - https://blog.algomaster.io/
-- https://blog.bytebytego.com/
+- https://blog.bytebytego.com/archive (use /archive — the root is a landing page)
 - https://newsletter.systemdesigncodex.com/
 - https://blog.codingconfessions.com/
 - https://www.f5.com/company/blog/pillar/nginx
