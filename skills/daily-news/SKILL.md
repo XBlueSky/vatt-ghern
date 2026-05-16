@@ -89,14 +89,41 @@ Drop candidates that:
   step 8 via `check-dup.mjs`)
 - Violate the "what does NOT earn a place" rules in `persona.md`
 
-### Step 4: Pick today's 10
+### Step 4: Pick today's items (domain coverage)
 
-Select top 10 by score with constraint: **≥3 distinct domains represented**.
-If a single-domain day is genuinely the truth (e.g., model-release Friday),
-accept fewer than 10 rather than padding with low-quality items.
+Aim: all 5 priority domains represented (ai / systems / infra / storage /
+industry). Hard floor: ≥4 distinct domains. Per-domain cap: ≤6 items.
+
+**Selection algorithm**:
+
+1. Sort all candidates by score, descending.
+2. Take top items in score order until 10 selected.
+3. If fewer than 4 domains represented in the selected 10:
+   - For each uncovered domain, find the highest-score candidate in
+     that domain
+   - SWAP it in for the lowest-score selected item from an
+     over-represented domain
+   - Repeat until ≥4 domains met
+4. If any domain has >6 items in the selected list (over the cap):
+   - Drop the lowest-score items in that domain until count is 6
+   - If those drops bring total below 10, swap in the highest-score
+     candidates from under-represented domains until 10 or until no
+     candidates remain
+5. If exhaustive search shows no qualifying candidate for ≥2 domains
+   (genuine sparse day), accept fewer items rather than padding with
+   garbage. Log skipped domains in the PR body under "Domains skipped
+   today".
 
 Assign final `news_id` values as `YYYY-MM-DD-NN` (zero-padded) in
 ranked order.
+
+**PR body must list**:
+- Domain distribution (e.g., "AI · 3 · SYSTEMS · 3 · INFRA · 2 ·
+  STORAGE · 1 · INDUSTRY · 1")
+- Any domain skipped (with reason: no qualifying candidates / all
+  candidates failed dedup / etc.)
+- Any domain that hit the cap and had candidates dropped (e.g.,
+  "8 qualifying items in AI today, top 6 selected")
 
 ### Step 5: Pick deep-story candidates
 
