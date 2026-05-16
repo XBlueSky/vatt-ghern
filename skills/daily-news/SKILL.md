@@ -140,7 +140,7 @@ Each deep-story file:
 - Body contains opener → drop-cap intro → three H2 acts → take-away closer
 - ≥2 inline SVG widgets (timeline, architecture, comparison, data viz)
 
-### Step 8: Self-check
+### Step 8: Self-check (mechanical)
 
 Run the validation scripts:
 
@@ -151,12 +151,70 @@ node ${CLAUDE_PLUGIN_ROOT}/skills/daily-news/scripts/check-dup.mjs src/posts/YYY
 # Schema/structure check
 node ${CLAUDE_PLUGIN_ROOT}/skills/daily-news/scripts/publish.mjs src/posts/YYYY/MM/DD/
 
-# HTML validity
-npx @11ty/eleventy && npx html-validate "_site/**/*.html"
+# HTML validity + archetype + link check
+npx @11ty/eleventy
+npx html-validate "_site/**/*.html"
+node ${CLAUDE_PLUGIN_ROOT}/tests/archetype-check.mjs _site/
+node ${CLAUDE_PLUGIN_ROOT}/tests/link-check.mjs
 ```
 
 If any step fails: fix the underlying content, re-run. Do not commit while
 checks fail.
+
+### Step 8.5: Visual self-review (Playwright + multimodal)
+
+Mechanical checks (Step 8) catch broken HTML and missing structure; they
+do NOT catch visual regressions like SVG widgets invisible in dark mode,
+text overflow, layout collapse, or unreadable contrast. Step 8.5 closes
+that gap by having Claude open each rendered page in Playwright, take a
+screenshot, and look at it.
+
+**Setup**:
+
+```bash
+npm run dev > /tmp/vg-dev-selfreview.log 2>&1 &
+sleep 2 && curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/
+# ^ expect 200; otherwise tear down and BLOCK
+```
+
+**For each published post** (roundup + each deep-story):
+
+1. Navigate Playwright to `http://localhost:8080/YYYY/MM/DD/<slug>/`
+2. Set `localStorage["vg-theme"] = "light"` and screenshot
+3. Set `localStorage["vg-theme"] = "dark"` and screenshot
+4. For deep-stories with widgets: scroll to each `<figure>` / `<svg>` and
+   screenshot specifically (don't trust above-fold screenshot to cover them)
+
+**Look at each screenshot. Classify any issues by severity**:
+
+| Tier | Examples | Loop behavior |
+|---|---|---|
+| **Blocking** | Element overlap obscuring text; text cut off mid-character; SVG widget completely invisible (white-on-white in light mode, dark-on-dark in dark mode); page renders blank or with browser console errors; layout collapse where one column eats another | Fix the underlying CSS/HTML; rebuild; re-screenshot; re-classify. Up to **5 iterations**. If still blocking after 5 → stop and report BLOCKED status (do NOT open PR). |
+| **Important** | Awkward but readable spacing; SVG renders but legend overflows; sticky header overlaps card title on scroll; CJK wrap breaking a code identifier ugly | Fix in current iteration. Up to **3 iterations**. If still present after 3 → note in PR body under `## Visual Concerns` and continue to PR. |
+| **Minor** | Drop cap baseline 2-3px off; tag chip vertical alignment imperfect; line-height slightly tight | Record only. Note in PR body, do NOT iterate. |
+
+**Iteration budget rationale**: 5 blocking-tier iterations covers real-world
+fix cycles (a wrong CSS selector → rebuild → re-screenshot → still wrong →
+another CSS attempt → success usually fits in 2-3 rounds; 5 is the hard
+ceiling so the routine doesn't infinite-loop on an unfixable case). 3
+important-tier iterations keeps quality bar without spending all run-time
+on polish. Minor issues never iterate — they belong in human review.
+
+**Inter-iteration discipline**: each fix must be a deliberate, named change
+("changed `.vg-card-roundup` grid columns from 3rem 1fr to 4rem 1fr to fix
+overlap of #NN numeral with title at narrow viewports"). Do NOT change
+multiple unrelated things in one iteration — if fix doesn't work, you won't
+know which change was wrong.
+
+**Tear down**:
+
+```bash
+kill $(lsof -ti:8080) 2>/dev/null
+```
+
+**Record findings**: keep a list of any Important + Minor issues to write
+into the PR body. Blocking issues should be all-fixed before reaching
+Step 9 (or the run should have BLOCKED out).
 
 ### Step 9: Open PR
 
@@ -200,6 +258,16 @@ Lede: {{deep_lede_2}}
 - ...
 - Failed: (none) or list of failed-fetch sources
 
+## Visual Concerns (from Step 8.5 self-review)
+
+- (none) — or list each issue found at Important/Minor tier with affected
+  page URL + brief description. Example:
+- `/2026/05/16/deep-quic-cubic/` (dark mode): timeline SVG legend label
+  "T2 incident" overlaps with arrowhead at 480px viewport. Important; 3
+  fix attempts in Step 8.5 (tried wider viewBox, label nudge, font shrink)
+  did not fully resolve.
+- `/2026/05/16/roundup/`: drop cap baseline 2px below following line. Minor.
+
 ## Preview
 
 Cloudflare Pages will post a preview URL once build completes. Please review
@@ -218,6 +286,9 @@ Do not merge. Wait for human review.
 | All sources fail | Fail-fast: no PR, no commit; report status |
 | Dup filter excludes everything in a domain | Note in PR body; pick from other domains |
 | html-validate fails | Self-fix one round; if still failing, open PR but flag `⚠ HTML validation failed` in title |
+| Step 8.5 visual: blocking issue still present after 5 iterations | Stop. Do NOT open PR. Report BLOCKED status with the offending screenshot path so a human can inspect. |
+| Step 8.5 visual: important issue still present after 3 iterations | Continue to Step 9. Write the issue into `## Visual Concerns` so reviewer knows. |
+| Step 8.5 visual: dev server fails to start | BLOCKED — likely a build break; cannot self-review without a live server. |
 
 ## Output expectations summary
 
