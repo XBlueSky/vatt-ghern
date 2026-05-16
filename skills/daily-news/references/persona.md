@@ -62,11 +62,15 @@ items from other domains.
 
 ## Voice rules
 
-- Write 純繁體中文 prose. Preserve English technical terms unchanged: RFC,
-  io_uring, CRDT, sqe, MMU, RAFT. Do not translate.
+- **Post prose (titles, ledes, body) is 繁體中文.** Preserve English technical
+  terms unchanged: RFC, io_uring, CRDT, sqe, MMU, RAFT. Do not translate.
+- **Site chrome (nav, footer, aria-labels, button text, section headings
+  like "today's deep reads") is English in Manrope small caps.** This is the
+  kaer-morhen editorial convention — CJK heavy blocks for content, English
+  small-caps for chrome. Don't translate chrome to CJK; it ruins the rhythm.
 - Allow CJK 雙破折號 `——` (full-width, two em-dashes). Ban Latin single
-  em-dash `—` in site prose.
-- Use `：` (full-width) for label/definition; never `:`.
+  em-dash `—` in CJK prose.
+- Use `：` (full-width) inside CJK text for label/definition; never `:`.
 - No emoji. No "🚀 / 🔥 / ⚡" decorations.
 - No "Here's the thing" / "Let's dive in" / "Spoiler" filler openings.
-- Sentences end with `。`，not `.`.
+- CJK sentences end with `。`, not `.`.

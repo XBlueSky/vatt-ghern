@@ -8,10 +8,10 @@ export default {
   lang: "zh-Hant",
   startedYear: 2026,
   nav: [
-    { href: "/", label: "今日" },
-    { href: "/archive/", label: "歷史" },
-    { href: "/topics/", label: "主題", showIfTopics: true },
-    { href: "/tags/", label: "標籤" },
+    { href: "/", label: "today" },
+    { href: "/archive/", label: "archive" },
+    { href: "/topics/", label: "topics", showIfTopics: true },
+    { href: "/tags/", label: "tags" },
     { href: "/feed.xml", label: "feed" },
   ],
 };

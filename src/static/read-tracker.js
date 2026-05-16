@@ -47,7 +47,7 @@
       const prefix = el.getAttribute("data-vg-progress-of");
       const items = Object.keys(state).filter((k) => k.startsWith(prefix) && k.includes("#item-"));
       const total = parseInt(el.getAttribute("data-vg-progress-total") || "10", 10);
-      el.textContent = `${items.length} / ${total} 已閱`;
+      el.textContent = `${items.length} / ${total} read`;
     });
   }
 
@@ -56,10 +56,10 @@
       btn.addEventListener("click", () => {
         const k = btn.getAttribute("data-vg-toggle");
         mark(state, k, !isRead(state, k));
-        btn.textContent = isRead(state, k) ? "↶ 標未閱" : "✓ 已閱";
+        btn.textContent = isRead(state, k) ? "↶ unread" : "✓ read";
       });
       const k = btn.getAttribute("data-vg-toggle");
-      btn.textContent = isRead(state, k) ? "↶ 標未閱" : "✓ 已閱";
+      btn.textContent = isRead(state, k) ? "↶ unread" : "✓ read";
     });
   }
 
@@ -67,7 +67,7 @@
     const reset = document.getElementById("vg-reset-read");
     if (!reset) return;
     reset.addEventListener("click", () => {
-      if (!confirm("重置所有「已閱」狀態？")) return;
+      if (!confirm("Reset all read state?")) return;
       try { localStorage.removeItem(KEY); } catch (e) {}
       Object.keys(state).forEach((k) => delete state[k]);
       applyVisuals(state);
@@ -99,7 +99,7 @@
         try {
           await navigator.clipboard.writeText(location.href);
           const orig = btn.textContent;
-          btn.textContent = "已複製 ✓";
+          btn.textContent = "copied ✓";
           setTimeout(() => { btn.textContent = orig; }, 1500);
         } catch (e) { /* clipboard denied — no-op */ }
       });

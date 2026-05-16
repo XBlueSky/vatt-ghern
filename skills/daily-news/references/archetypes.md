@@ -54,14 +54,14 @@ Index of today's 10 news items for 3-minute scan.
   <p class="vg-roundup-lede">{{ONE-SENTENCE_TODAY_THREAD}}</p>
 </header>
 
-<section class="vg-roundup-stats" aria-label="今日統計">
+<section class="vg-roundup-stats" aria-label="today's stats">
   <!-- SVG donut: domain distribution -->
 </section>
 
-<section class="vg-roundup-list" aria-label="今日新聞">
+<section class="vg-roundup-list" aria-label="today's stories">
   <span data-vg-progress-of="{{page.url}}#item-"
         data-vg-progress-total="{{N}}"
-        class="vg-card-progress">0 / {{N}} 已閱</span>
+        class="vg-card-progress">0 / {{N}} read</span>
 
   <!-- Repeat for each item, NN=01..10 -->
   <article class="vg-card vg-card-roundup" id="item-NN"
@@ -71,16 +71,16 @@ Index of today's 10 news items for 3-minute scan.
       <h2 class="vg-card-title">{{ITEM_TITLE}}</h2>
       <p class="vg-card-lede">{{2-3_SENTENCES_WHAT_AND_WHY}}</p>
       <p>
-        <a href="{{source_url}}">原文 →</a>
-        {{IF deep-story exists}} · <a href="{{deep_url}}">深入閱讀 ↗</a>{{END}}
+        <a href="{{source_url}}">read source →</a>
+        {{IF deep-story exists}} · <a href="{{deep_url}}">deep read ↗</a>{{END}}
         {{IF domain_chip}} · <a class="vg-tag" href="/tags/{{tag}}/">{{tag}}</a>{{END}}
       </p>
     </div>
   </article>
 </section>
 
-<section class="vg-roundup-deep" aria-label="今日深入文章">
-  <h2>今日深入文章</h2>
+<section class="vg-roundup-deep" aria-label="today's deep reads">
+  <h2>today's deep reads</h2>
   <!-- One vg-card-deep <a> per deep-story; href to the deep-story's url -->
 </section>
 ```
@@ -95,7 +95,7 @@ Index of today's 10 news items for 3-minute scan.
 - Item lede is 2-3 sentences. First sentence = what happened. Second = why
   an engineer cares. Optional third = a concrete number or quote.
 - Stats SVG must render correctly in dark mode (use tokens, not hex).
-- The progress span `0 / {{N}} 已閱` text is updated by the read-tracker JS
+- The progress span `0 / {{N}} read` text is updated by the read-tracker JS
   at runtime; never hardcode another number.
 
 ### Minimum widget budget
