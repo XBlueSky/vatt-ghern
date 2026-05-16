@@ -85,6 +85,32 @@ Index of today's 10 news items for 3-minute scan.
 </section>
 ```
 
+### Visual differentiation rules
+
+**Deep-story-bearing items**: items that have a corresponding `daily-deep-story`
+post must get the `vg-card-roundup-has-deep` modifier class on the `<article>`:
+
+```html
+<article class="vg-card vg-card-roundup vg-card-roundup-has-deep" id="item-NN" ...>
+```
+
+This adds a sage-colored corner mark "↗ deep" so readers can scan for which
+items have drill-down content.
+
+**Domain grouping**: when a day has 10 items spanning 3+ domains, group items
+visually by domain. Insert a `<header>` between the previous item and the next
+item of a new domain:
+
+```html
+  <header class="vg-roundup-section-label" aria-hidden="true">
+    <span class="vg-roundup-section-name">SYSTEMS</span>
+  </header>
+```
+
+The section-name is the domain in uppercase (one of: AI, SYSTEMS, INFRA,
+STORAGE, INDUSTRY). The first domain's section header is omitted (header
+appears only when domain CHANGES).
+
 ### Content rules
 
 - `TITLE` format: `YYYY.MM.DD —— 今日 N 則` (no parenthetical when not a
