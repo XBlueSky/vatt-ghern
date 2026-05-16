@@ -1,8 +1,28 @@
 # Archetypes — Output Format Rules
 
-Two HTML archetypes ship per day: one `daily-roundup` and (up to) three
-`daily-deep-story`. Each follows a strict structure so the design system
-keeps cohesion and the test suite can validate output mechanically.
+Each day the daily-news skill emits one `daily-roundup` and up to three
+`daily-deep-story` posts. The roundup follows a single fixed structure
+(specified here). Each deep-story picks ONE of six archetypes:
+
+| deep_archetype | When to pick | Detail file |
+|---|---|---|
+| `narrative` | Time-ordered event story (incident, CVE chain, release week) | `archetypes/deep-narrative.md` |
+| `technical-deep-dive` | Structural exposition of a new design / algorithm / protocol | `archetypes/deep-technical-deep-dive.md` |
+| `investigation` | "Why is this happening?" puzzle with hypotheses | `archetypes/deep-investigation.md` |
+| `comparison` | Two or more options to choose between | `archetypes/deep-comparison.md` |
+| `explainer` | Concept explained from zero (reader needs the prereqs) | `archetypes/deep-explainer.md` |
+| `freeform` | Hybrid topic, or none of the structured five fits | `archetypes/deep-freeform.md` |
+
+The five structured archetypes have specific H2 requirements; freeform
+requires only the universal contract (opener, dropcap, closer, ≥2 SVG).
+
+**Archetypes are SUGGESTIONS, not commandments.** When in doubt or when
+forcing a structured archetype would worsen the prose, pick `freeform`.
+A forced fit produces worse content than free shape.
+
+The skill picks the archetype in Step 5 of the workflow (see SKILL.md),
+then reads the appropriate `archetypes/<name>.md` file for the structure
+rules to follow when writing.
 
 ## Common conventions
 
@@ -21,30 +41,37 @@ Each post lives in `src/posts/YYYY/MM/DD/<slug>.{html,11tydata.json}`.
   "title": "string (CJK ok)",
   "date": "YYYY-MM-DD",
   "archetype": "daily-roundup" | "daily-deep-story",
+  "deep_archetype": "narrative" | "technical-deep-dive" | "investigation"
+                    | "comparison" | "explainer" | "freeform",
   "topics": ["systems" | "ai" | "infra" | "storage" | "industry" | "roundup"],
   "tags": ["string", ...],
   "sources": ["https://...", ...],
   "news_ids": ["YYYY-MM-DD-NN", ...],
   "summary": "one-sentence CJK summary, <= 80 chars",
   "estimated_read_min": integer,
-  "related_roundup": "/YYYY/MM/DD/roundup/"  // deep-story only
+  "related_roundup": "/YYYY/MM/DD/roundup/"
 }
 ```
 
-### Design system hygiene (apply to BOTH archetypes)
+`deep_archetype` is REQUIRED for `archetype: "daily-deep-story"` posts
+and OMITTED for `daily-roundup`. publish.mjs enforces presence.
+
+### Design system hygiene (apply to ALL archetypes)
 
 - All inline SVG uses `var(--accent)` / `var(--ink)` / `var(--muted)` / etc.
   Never hardcoded hex/rgb. Token list lives in `references/design-system.md`.
 - Use `currentColor` for SVG strokes that should follow theme.
-- Use CJK 全形 punctuation: `：` `，` `、` `。`. Never half-width `:` in
-  prose or H2 text.
-- Use CJK 雙破折號 `——` (two em-dashes, full-width). Never Latin `—`.
+- Use CJK 全形 punctuation: `：` `，` `、` `。` inside CJK prose. Half-width
+  `:` allowed in English H2s (e.g., investigation's `hypothesis: foo` or
+  comparison's `dimension: bar`).
+- Use CJK 雙破折號 `——` (two em-dashes, full-width) inside CJK prose.
+  Never Latin `—` in CJK prose.
 - No emoji. No tracking scripts. No `<style>` blocks (use design system
   classes; inline `style=""` allowed only for SVG sizing).
 
-## Archetype 1: `daily-roundup`
+## Roundup spec
 
-Index of today's 10 news items for 3-minute scan.
+Index of today's items for 3-minute scan.
 
 ### Required structure
 
@@ -97,14 +124,13 @@ post must get the `vg-card-roundup-has-deep` modifier class on the `<article>`:
 This adds a sage-colored corner mark "↗ deep" so readers can scan for which
 items have drill-down content.
 
-**Domain grouping**: when a day has 10 items spanning 3+ domains, group items
-visually by domain. Insert a `<header>` between the previous item and the next
-item of a new domain:
+**Domain grouping**: when a day has items spanning 3+ domains, group items
+visually by domain. Insert a `<header>` between items of different domains:
 
 ```html
-  <header class="vg-roundup-section-label" aria-hidden="true">
-    <span class="vg-roundup-section-name">SYSTEMS</span>
-  </header>
+<header class="vg-roundup-section-label" aria-hidden="true">
+  <span class="vg-roundup-section-name">SYSTEMS</span>
+</header>
 ```
 
 The section-name is the domain in uppercase (one of: AI, SYSTEMS, INFRA,
@@ -113,82 +139,19 @@ appears only when domain CHANGES).
 
 ### Content rules
 
-- `TITLE` format: `YYYY.MM.DD —— 今日 N 則` (no parenthetical when not a
-  sample).
-- Lede names today's thread in one sentence — the *one* signal across the
-  10. Examples: "今日主旋律：io_uring CVE 連環爆 + Cloudflare DNS 服務改版"
-  or "今日多事之秋：Rust async traits 進入 stable、Postgres 17 釋出"。
+- `TITLE` format: `YYYY.MM.DD —— 今日 N 則`. Use the actual N, not 10
+  if fewer items qualified.
+- Lede names today's thread in one sentence — the *one* signal across all
+  items. Example: "今日主旋律：io_uring CVE 連環爆 + Cloudflare DNS 服務改版"
 - Item lede is 2-3 sentences. First sentence = what happened. Second = why
   an engineer cares. Optional third = a concrete number or quote.
 - Stats SVG must render correctly in dark mode (use tokens, not hex).
-- The progress span `0 / {{N}} read` text is updated by the read-tracker JS
-  at runtime; never hardcode another number.
+- The progress span text is updated by the read-tracker JS at runtime;
+  never hardcode another number.
 
 ### Minimum widget budget
 
 1 SVG (the donut). Optional: source-distribution bar, top-tags cloud.
-
-## Archetype 2: `daily-deep-story`
-
-Long-form drill into one of today's 10 items, ~600-1200 lines of HTML.
-
-### Required structure
-
-```html
-<header class="vg-deep-hero">
-  <p class="vg-deep-opener">{{HOOK}}</p>
-  <h1 class="vg-post-title">{{TITLE}}</h1>
-</header>
-
-<div class="vg-post-prose">
-  <p>
-    <span class="vg-dropcap">{{FIRST_CHAR}}</span>{{REST_OF_OPENING_PARAGRAPH}}
-  </p>
-
-  <h2>幕一：發生了什麼</h2>
-  <!-- prose -->
-  <!-- WIDGET 1: timeline OR sequence diagram (inline SVG, viewBox-based) -->
-  <!-- optional: blockquote -->
-
-  <h2>幕二：為什麼重要</h2>
-  <!-- prose -->
-  <!-- WIDGET 2: architecture diagram OR data viz (inline SVG) -->
-  <!-- optional: <pre><code>...</code></pre> -->
-
-  <h2>幕三：延伸與思考</h2>
-  <!-- prose -->
-  <ul>
-    <li>對應今日 roundup：<a href="/YYYY/MM/DD/roundup/#item-NN">#NN {{title}}</a></li>
-    <!-- optional: prior-vatt-ghern cross-links -->
-  </ul>
-
-  <p class="vg-deep-closer"><strong>Take-away</strong>：{{ONE_SENTENCE_TAKEAWAY}}</p>
-</div>
-```
-
-### Content rules
-
-- **Opener**: a scene, a question, or a snatch of dialogue. Pull the reader
-  in. Examples: "凌晨三點。值班工程師接到通知⋯⋯" or "如果我說 Postgres
-  17 不再 vacuum 整張表，你會怎麼想？"
-- **Drop cap** on the first paragraph: wrap the first CJK character in
-  `<span class="vg-dropcap">字</span>`. Use one character only.
-- **All three H2** must be present. Use exactly `幕一：發生了什麼`,
-  `幕二：為什麼重要`, `幕三：延伸與思考`. (Full-width `：`.)
-- **Cross-link** in 幕三 must reference today's roundup item by `news_id`.
-- **Take-away** is ONE sentence ending with `。`. No bullet expansion.
-
-### Minimum widget budget
-
-**Two inline SVG widgets** (one per first two acts), each non-trivial — a
-timeline, sequence diagram, architecture diagram, comparison plot, or
-sparkline tied to a real number. A solitary donut does not count.
-
-### Code blocks
-
-`<pre><code>` rendering — no syntax-highlight library; CSS in
-`src/static/site.css` handles type. Languages can be tagged
-(`<pre data-lang="nginx">`) but no JS highlighting at build time in Phase 2.
 
 ## Scoring rubric (for source-selection step)
 
@@ -200,15 +163,7 @@ For each candidate, score 0–10:
 - 2 pts: domain coverage bonus (item belongs to under-represented domain
   today)
 
-Pick top 10 with the constraint that ≥3 domains are represented.
+## Deep-story selection (from today's items)
 
-## Deep-story selection (from today's 10)
-
-Pick up to 3 items that satisfy ALL:
-
-- Score ≥ 8
-- Original source has drillable depth (long-form, RFC, paper, design doc —
-  not just a press release)
-- Different domains where possible (3 different > 2 different > 1)
-
-If fewer than 3 qualify, write fewer. Do not force.
+See SKILL.md Step 5 for the full selection algorithm including domain
+and archetype diversity constraints.
