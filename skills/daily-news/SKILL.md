@@ -192,17 +192,25 @@ Required structural attributes (the test suite checks them):
 
 For each deep-story candidate, do additional WebFetch on the canonical
 source to gather technical detail (RFC excerpts, code samples, real
-numbers). Read the skeleton at
-`${CLAUDE_PLUGIN_ROOT}/src/archetypes/daily-deep-story.html`. Author
-following `references/archetypes.md` § "Archetype 2".
+numbers).
+
+Read the archetype reference file picked in Step 5:
+`${CLAUDE_PLUGIN_ROOT}/skills/daily-news/references/archetypes/deep-<archetype>.md`.
+
+It contains the required structure (H2 sequence, widget budget, closer
+label) for that specific archetype. Follow it.
 
 Each deep-story file:
 
 - Path: `src/posts/YYYY/MM/DD/deep-<kebab-slug>.html`
 - Sidecar: `news_ids` references exactly one item from today's roundup;
-  `related_roundup` is set to `/YYYY/MM/DD/roundup/`
-- Body contains opener → drop-cap intro → three H2 acts → take-away closer
-- ≥2 inline SVG widgets (timeline, architecture, comparison, data viz)
+  `related_roundup` is set to `/YYYY/MM/DD/roundup/`; `archetype` is
+  `"daily-deep-story"`; **`deep_archetype` is the value picked in Step 5**
+- Body matches the picked archetype's required structure exactly
+- ≥2 inline SVG widgets (per archetype-specific widget recommendations)
+- Universal contract from `deep-freeform.md` applies to all archetypes:
+  opener (`<p class="vg-deep-opener">`), drop-cap in first paragraph,
+  closer (`<p class="vg-deep-closer">` with `<strong>` inside)
 
 ### Step 8: Self-check (mechanical)
 
