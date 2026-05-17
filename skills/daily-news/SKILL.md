@@ -177,16 +177,37 @@ structure rules to follow when writing:
 ### Step 6: Write roundup HTML + sidecar
 
 Read the archetype skeleton at
-`${CLAUDE_PLUGIN_ROOT}/src/archetypes/daily-roundup.html` for structure.
-Author the full HTML following `references/archetypes.md` § "Archetype 1".
-Write to `src/posts/YYYY/MM/DD/roundup.html` plus matching `.11tydata.json`
-sidecar (schema in `references/archetypes.md`).
+`${CLAUDE_PLUGIN_ROOT}/src/archetypes/daily-roundup.html` for structure
+reference. Author the full HTML following
+`references/archetypes.md` § "Roundup spec".
 
-Required structural attributes (the test suite checks them):
+Write to `src/posts/YYYY/MM/DD/roundup.html` plus matching
+`.11tydata.json` sidecar.
 
-- Each item card has `id="item-NN"` (zero-padded)
+**Required structural attributes** (the test suite checks them):
+
+- Each item card has `id="item-NN"` (zero-padded), corresponding to
+  the score-order `news_id`
 - Each item card has `data-vg-readkey-item="{{page.url}}#item-NN"`
+- Each item card wraps its `<h2>` + `<p class="vg-card-lede">` +
+  `<p class="vg-card-meta">` content in a `<div class="vg-card-roundup-body">`
 - Progress span has `data-vg-progress-of` and `data-vg-progress-total`
+
+**Required emit order** (NOT score order):
+
+Items render grouped by domain in this fixed order:
+`ai → systems → infra → storage → industry`. Within each domain, sort
+by score descending. Each non-empty domain emits exactly ONE section
+label header at the top of its group (with `<span class="vg-roundup-section-count">N 篇</span>`).
+Empty domains emit no section.
+
+**Lede length**: each item lede is ONE Chinese sentence ending with
+`。`. Optionally two clauses separated by `——`. Multi-sentence ledes
+fail archetype-check.
+
+**Lede typography**: render as `<p class="vg-card-lede">` — CSS handles
+the rest (Spectral 400 normal at `--fs-sm`). Do not add inline
+`style=""` or italic markup.
 
 ### Step 7: Write each deep-story HTML + sidecar (×N where N ≤ 3)
 
