@@ -124,18 +124,33 @@ post must get the `vg-card-roundup-has-deep` modifier class on the `<article>`:
 This adds a sage-colored corner mark "↗ deep" so readers can scan for which
 items have drill-down content.
 
-**Domain grouping**: when a day has items spanning 3+ domains, group items
-visually by domain. Insert a `<header>` between items of different domains:
+**Domain grouping (mandatory)**: items render in this fixed display order:
+
+```
+ai → systems → infra → storage → industry
+```
+
+Within each domain, sort by score descending. Each non-empty domain emits
+exactly ONE section header at the top of its group:
 
 ```html
 <header class="vg-roundup-section-label" aria-hidden="true">
   <span class="vg-roundup-section-name">SYSTEMS</span>
+  <span class="vg-roundup-section-count">3 篇</span>
 </header>
 ```
 
-The section-name is the domain in uppercase (one of: AI, SYSTEMS, INFRA,
-STORAGE, INDUSTRY). The first domain's section header is omitted (header
-appears only when domain CHANGES).
+The domain name is uppercase English; the count uses CJK 「篇」 with the
+integer. Empty domains are skipped (no empty section emitted).
+
+**Important**: `news_id` (`YYYY-MM-DD-NN`) is assigned in **score order**,
+NOT display order. The on-page `#NN` numeral therefore appears in
+non-monotonic sequence when grouped by domain — this is a feature: it
+shows the reader both score-rank and domain at once.
+
+**Item body wrapper**: each card MUST wrap title + lede + meta in a
+`<div class="vg-card-roundup-body">` for the read-tracker JS to find a
+stable insertion point for the `↶ unread` button.
 
 ### Content rules
 
@@ -143,8 +158,14 @@ appears only when domain CHANGES).
   if fewer items qualified.
 - Lede names today's thread in one sentence — the *one* signal across all
   items. Example: "今日主旋律：io_uring CVE 連環爆 + Cloudflare DNS 服務改版"
-- Item lede is 2-3 sentences. First sentence = what happened. Second = why
-  an engineer cares. Optional third = a concrete number or quote.
+- **Item lede is ONE sentence**. Answers "what happened + why an engineer
+  cares" in one breath, optionally two clauses separated by `——`. If the
+  news needs three sentences to land, it belongs in a deep-story, not the
+  roundup. The lede renders as Spectral 400 normal (not italic) — keep
+  it readable, not decorative.
+- Item meta row uses `<p class="vg-card-meta">` containing source link,
+  optional deep link, optional tag chip — in that order, separated by
+  `·` dots.
 - Stats SVG must render correctly in dark mode (use tokens, not hex).
 - The progress span text is updated by the read-tracker JS at runtime;
   never hardcode another number.
