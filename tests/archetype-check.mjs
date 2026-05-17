@@ -66,12 +66,42 @@ function checkRoundup(path, html) {
       `${path}: ${itemMatches.length} item cards but only ${readkeyCount} data-vg-readkey-item attrs`
     );
   }
+  // Each item must wrap content in .vg-card-roundup-body for read-tracker injection point
+  const bodyWrapperCount = (html.match(/class="[^"]*vg-card-roundup-body/g) || []).length;
+  if (bodyWrapperCount < itemMatches.length) {
+    violations.push(
+      `${path}: ${itemMatches.length} item cards but only ${bodyWrapperCount} .vg-card-roundup-body wrappers`
+    );
+  }
   // Progress span
   if (!/data-vg-progress-of="/.test(html)) {
     violations.push(`${path}: missing data-vg-progress-of span`);
   }
   if (!/data-vg-progress-total="/.test(html)) {
     violations.push(`${path}: missing data-vg-progress-total span`);
+  }
+  // Section labels: at least one .vg-roundup-section-label per item (loose
+  // proxy for "items are grouped"). Be lenient: roundup with all items in
+  // ONE domain only needs ≥1 section label.
+  const sectionLabelCount = (html.match(/class="[^"]*vg-roundup-section-label/g) || []).length;
+  if (sectionLabelCount < 1) {
+    violations.push(
+      `${path}: roundup has ${itemMatches.length} items but no domain section labels`
+    );
+  }
+  // One-sentence lede check (heuristic): each lede should contain ≤2 「。」
+  // periods (one ending the sentence, one allowed for inline reference like
+  // "Cloudflare 25.11." or similar). >2 implies multi-sentence.
+  const ledeMatches = [...html.matchAll(/<p[^>]*class="[^"]*vg-card-lede[^"]*"[^>]*>([\s\S]*?)<\/p>/g)];
+  for (const m of ledeMatches) {
+    const text = m[1].replace(/<[^>]+>/g, "");
+    const periodCount = (text.match(/。/g) || []).length;
+    if (periodCount > 2) {
+      const snippet = text.slice(0, 50).trim();
+      violations.push(
+        `${path}: roundup item lede has ${periodCount} 「。」 periods (max 2 for one-sentence rule): "${snippet}…"`
+      );
+    }
   }
 }
 
