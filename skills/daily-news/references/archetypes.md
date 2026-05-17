@@ -158,11 +158,11 @@ stable insertion point for the `↶ unread` button.
   if fewer items qualified.
 - Lede names today's thread in one sentence — the *one* signal across all
   items. Example: "今日主旋律：io_uring CVE 連環爆 + Cloudflare DNS 服務改版"
-- **Item lede is ONE sentence**. Answers "what happened + why an engineer
-  cares" in one breath, optionally two clauses separated by `——`. If the
-  news needs three sentences to land, it belongs in a deep-story, not the
-  roundup. The lede renders as Spectral 400 normal (not italic) — keep
-  it readable, not decorative.
+- **Item lede is 2-3 sentences**. First sentence = what happened. Second =
+  why an engineer cares. Optional third = a concrete number, quote, or
+  consequence. Lint enforces ≤ 4 「。」 periods (allows the 2-3 sentences
+  plus inline references like `ClickHouse 25.11.`). The lede renders as
+  Spectral 400 normal (not italic) — keep it readable, not decorative.
 - Item meta row uses `<p class="vg-card-meta">` containing source link,
   optional deep link, optional tag chip — in that order, separated by
   `·` dots.

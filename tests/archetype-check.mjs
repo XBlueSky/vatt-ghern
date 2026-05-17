@@ -89,17 +89,17 @@ function checkRoundup(path, html) {
       `${path}: roundup has ${itemMatches.length} items but no domain section labels`
     );
   }
-  // One-sentence lede check (heuristic): each lede should contain ≤2 「。」
-  // periods (one ending the sentence, one allowed for inline reference like
-  // "Cloudflare 25.11." or similar). >2 implies multi-sentence.
+  // Lede length sanity (heuristic): 2-3 sentences allowed (≤4 「。」 periods
+  // to also allow inline references like "ClickHouse 25.11." or "CVE-2026-31431."
+  // counting as periods). >4 implies the lede is bloating to deep-story territory.
   const ledeMatches = [...html.matchAll(/<p[^>]*class="[^"]*vg-card-lede[^"]*"[^>]*>([\s\S]*?)<\/p>/g)];
   for (const m of ledeMatches) {
     const text = m[1].replace(/<[^>]+>/g, "");
     const periodCount = (text.match(/。/g) || []).length;
-    if (periodCount > 2) {
+    if (periodCount > 4) {
       const snippet = text.slice(0, 50).trim();
       violations.push(
-        `${path}: roundup item lede has ${periodCount} 「。」 periods (max 2 for one-sentence rule): "${snippet}…"`
+        `${path}: roundup item lede has ${periodCount} 「。」 periods (max 4 — 2-3 sentences plus inline-reference allowance): "${snippet}…"`
       );
     }
   }

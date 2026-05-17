@@ -201,9 +201,10 @@ by score descending. Each non-empty domain emits exactly ONE section
 label header at the top of its group (with `<span class="vg-roundup-section-count">N 篇</span>`).
 Empty domains emit no section.
 
-**Lede length**: each item lede is ONE Chinese sentence ending with
-`。`. Optionally two clauses separated by `——`. Multi-sentence ledes
-fail archetype-check.
+**Lede length**: 2-3 Chinese sentences. First = what happened, second =
+why an engineer cares, optional third = a concrete number / quote /
+consequence. Lint allows up to 4 `。` periods (covers 2-3 sentences
+plus inline references like `ClickHouse 25.11.`).
 
 **Lede typography**: render as `<p class="vg-card-lede">` — CSS handles
 the rest (Spectral 400 normal at `--fs-sm`). Do not add inline
