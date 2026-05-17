@@ -210,6 +210,23 @@ plus inline references like `ClickHouse 25.11.`).
 the rest (Spectral 400 normal at `--fs-sm`). Do not add inline
 `style=""` or italic markup.
 
+**Hero lede chrome label**: the hero `<p class="vg-roundup-lede">` MUST
+begin with an inline `<span class="vg-roundup-lede-label">TODAY'S THREAD</span>`
+prefix (uppercase English, no trailing colon) followed by a space and
+the CJK summary sentence. Do NOT prefix the CJK summary with
+"今日主旋律：" — the English label has replaced that role.
+
+**Do NOT hardcode read-state buttons in HTML**. The read-tracker
+(`src/static/read-tracker.js`) injects all of these at page load:
+
+- `↶ unread` button inside each `.vg-card-roundup-body`
+- `✓ mark read` button (with separator) appended into each `.vg-card-meta`
+- `mark all read` link appended next to the progress span
+
+Emit only source link, optional deep link, optional tag chip in the meta
+row. The button surface is owned by JS so it can evolve without
+re-emitting historical roundup HTML.
+
 ### Step 7: Write each deep-story HTML + sidecar (×N where N ≤ 3)
 
 For each deep-story candidate, do additional WebFetch on the canonical

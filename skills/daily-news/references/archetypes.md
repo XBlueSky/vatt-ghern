@@ -152,12 +152,30 @@ shows the reader both score-rank and domain at once.
 `<div class="vg-card-roundup-body">` for the read-tracker JS to find a
 stable insertion point for the `↶ unread` button.
 
+**Read-state buttons are JS-injected — do NOT hardcode them in HTML**:
+
+- `↶ unread` button (inside `.vg-card-roundup-body`, shown when collapsed)
+- `✓ mark read` button (appended into `.vg-card-meta`, with a `·` separator)
+- `mark all read` link (appended next to the progress span)
+
+All three are injected at page-load by `src/static/read-tracker.js`. Future
+roundup HTML should emit just the source link, optional deep link, and
+optional tag chip in the meta row — the mark-read button arrives via JS.
+This keeps the emitted HTML focused on content and lets the read-tracker
+evolve independently.
+
 ### Content rules
 
 - `TITLE` format: `YYYY.MM.DD —— 今日 N 則`. Use the actual N, not 10
   if fewer items qualified.
-- Lede names today's thread in one sentence — the *one* signal across all
-  items. Example: "今日主旋律：io_uring CVE 連環爆 + Cloudflare DNS 服務改版"
+- Hero lede begins with the inline chrome label
+  `<span class="vg-roundup-lede-label">TODAY'S THREAD</span>` (uppercase,
+  no trailing colon; CSS applies Manrope small caps + terracotta). The
+  CJK summary sentence follows after a space — do NOT prefix with
+  "今日主旋律：" since the English chrome label has replaced that role.
+- Hero lede summary is one sentence — the *one* signal across all items.
+  Example body: "QUIC 擁塞控制死亡螺旋、ClickHouse mutex 瓶頸——兩條
+  獨立的事件，根源都是邊緣條件下靜默出錯。"
 - **Item lede is 2-3 sentences**. First sentence = what happened. Second =
   why an engineer cares. Optional third = a concrete number, quote, or
   consequence. Lint enforces ≤ 4 「。」 periods (allows the 2-3 sentences
@@ -165,7 +183,7 @@ stable insertion point for the `↶ unread` button.
   Spectral 400 normal (not italic) — keep it readable, not decorative.
 - Item meta row uses `<p class="vg-card-meta">` containing source link,
   optional deep link, optional tag chip — in that order, separated by
-  `·` dots.
+  `·` dots. Do NOT add a mark-read button here; JS injects it.
 - Stats SVG must render correctly in dark mode (use tokens, not hex).
 - The progress span text is updated by the read-tracker JS at runtime;
   never hardcode another number.
