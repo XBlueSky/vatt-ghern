@@ -1,0 +1,115 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">分區鍵改了，查詢仍然有精確的 namespace 過濾，理論上應該更快才對。實際上，帳單管線開始在幾分鐘內停滯——I/O 正常，記憶體正常，CPU 正常。問題藏在一個從沒人量測過的 mutex 裡。</p>
+  <h1 class="vg-post-title">{{ title }}</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p><span class="vg-dropcap">C</span>loudflare 的 Ready-Analytics ClickHouse 叢集規模達數 PB，帳單管線是它的關鍵用戶之一。為了支援 per-namespace 的資料保留政策，工程師把分區鍵從 <code>(day)</code> 改為 <code>(namespace, day)</code>。這個變更看似無害：查詢本來就按 namespace 過濾，新分區鍵讓過濾更精確。但 part 數量從 3 萬攀升至 16 萬，一個深藏在 query planner 裡的 mutex 開始讓數百條平行查詢排隊等候。</p>
+
+  <h2>MergeTreeData mutex 的鎖定語意</h2>
+
+  <p>ClickHouse 的 MergeTree 引擎把資料儲存在多個「part」（不可變的排序資料片段）中，定期合併以減少 part 數量。Query planner 在執行每條查詢時需要一份當下的 part 清單，再從中過濾出符合目標分區的 parts，最後交給 reader threads 處理。</p>
+
+  <p>問題在於取得這份清單的方式：planner 需要拿到 <code>MergeTreeData</code> 的一個獨佔鎖定（exclusive mutex），複製整個 parts 向量，然後釋放鎖定。在 3 萬個 parts 時，這個操作很快，鎖定競爭幾乎不可見。在 16 萬個 parts 時，複製操作本身變慢，加上數百條並行查詢競相等待同一個獨佔鎖，查詢規劃階段變成一個串行化瓶頸。</p>
+
+  <figure>
+    <svg class="vg-w-arch-ch-mutex" viewBox="0 0 480 200" role="img"
+         aria-label="ClickHouse query planner mutex 競爭示意" style="width: 100%; height: auto; max-width: 480px;">
+      <style>
+        .vg-w-arch-ch-mutex text { font-family: EB Garamond, serif; font-size: 11px; }
+        .vg-w-arch-ch-mutex .label { font-family: IM Fell English, serif; font-style: italic; }
+      </style>
+      <defs>
+        <marker id="vg-w-acm-arr" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
+          <path d="M0,0 L6,3 L0,6 Z" fill="var(--muted)"/>
+        </marker>
+      </defs>
+      <!-- Queries waiting -->
+      <rect x="20" y="20" width="80" height="22" rx="3" fill="none" stroke="var(--muted-2)" stroke-width="1"/>
+      <text x="60" y="35" text-anchor="middle" fill="var(--muted)" class="label">Query 1</text>
+      <rect x="20" y="50" width="80" height="22" rx="3" fill="none" stroke="var(--muted-2)" stroke-width="1"/>
+      <text x="60" y="65" text-anchor="middle" fill="var(--muted)" class="label">Query 2</text>
+      <rect x="20" y="80" width="80" height="22" rx="3" fill="none" stroke="var(--muted-2)" stroke-width="1"/>
+      <text x="60" y="95" text-anchor="middle" fill="var(--muted)" class="label">Query 3</text>
+      <rect x="20" y="110" width="80" height="22" rx="3" fill="none" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="3,2"/>
+      <text x="60" y="125" text-anchor="middle" fill="var(--muted)" class="label">... ×N</text>
+      <!-- Mutex box -->
+      <rect x="160" y="55" width="130" height="50" rx="4" fill="none" stroke="var(--accent)" stroke-width="1.8"/>
+      <text x="225" y="75" text-anchor="middle" fill="var(--accent)" class="label">MergeTreeData</text>
+      <text x="225" y="89" text-anchor="middle" fill="var(--accent)" class="label">exclusive mutex</text>
+      <text x="225" y="103" text-anchor="middle" fill="var(--muted)" class="label">（16 萬個 parts）</text>
+      <!-- Parts vector -->
+      <rect x="340" y="55" width="120" height="50" rx="4" fill="none" stroke="var(--muted-2)" stroke-width="1.2"/>
+      <text x="400" y="75" text-anchor="middle" fill="var(--ink)" class="label">parts 向量</text>
+      <text x="400" y="89" text-anchor="middle" fill="var(--muted)" class="label">完整複製</text>
+      <text x="400" y="103" text-anchor="middle" fill="var(--muted)" class="label">→ 過濾</text>
+      <!-- Arrows -->
+      <line x1="100" y1="31" x2="158" y2="68" stroke="var(--muted-2)" stroke-width="1" marker-end="url(#vg-w-acm-arr)"/>
+      <line x1="100" y1="61" x2="158" y2="75" stroke="var(--muted-2)" stroke-width="1" marker-end="url(#vg-w-acm-arr)"/>
+      <line x1="100" y1="91" x2="158" y2="82" stroke="var(--muted-2)" stroke-width="1" marker-end="url(#vg-w-acm-arr)"/>
+      <line x1="290" y1="80" x2="338" y2="80" stroke="var(--muted)" stroke-width="1.2" marker-end="url(#vg-w-acm-arr)"/>
+      <!-- Wait annotation -->
+      <text x="60" y="155" text-anchor="middle" fill="var(--accent)" class="label">等待鎖定</text>
+      <text x="60" y="168" text-anchor="middle" fill="var(--muted)" class="label">查詢延遲 = 鎖競爭時間</text>
+      <text x="225" y="140" text-anchor="middle" fill="var(--muted)" class="label">串行化瓶頸</text>
+      <text x="225" y="153" text-anchor="middle" fill="var(--muted)" class="label">（parts 多 → 複製慢 → 鎖持有更久）</text>
+    </svg>
+    <figcaption>修補前：每條查詢需獨佔 MergeTreeData mutex 以複製完整 parts 向量；parts 越多，鎖持有時間越長，競爭越激烈。</figcaption>
+  </figure>
+
+  <p>診斷的突破點來自 ClickHouse 內建的 <code>trace_log</code>：工程師切換到「Real」模式（採樣所有 thread，包括等待中的 thread），而非預設的 CPU 模式（只採樣活躍 thread）。火焰圖顯示超過一半的 leaf 查詢時間花在等待 mutex，而非實際計算。這是一個教科書級的陷阱：CPU 模式的火焰圖看起來一切正常，因為等待 mutex 的 thread 沒有消耗 CPU。</p>
+
+  <h2>三階段修補的結構</h2>
+
+  <p>修補不是一次到位，而是三個遞進的優化，每個針對瓶頸的不同層次：</p>
+
+  <p><strong>第一階段——shared lock：</strong>query planner 讀取 parts 向量時不需要修改它，所以獨佔鎖是多餘的。改為 shared lock（read lock）後，多條查詢可以同時持有鎖。效果立竿見影：鎖競爭幾乎消失，查詢延遲即時下降。這個修補改動最小，影響最直接。</p>
+
+  <p><strong>第二階段——延遲向量複製：</strong>即使有了 shared lock，每條查詢仍然需要複製一份完整的 16 萬個 parts 向量，再過濾出目標 namespace 的 parts。大多數時候，這份「完整複製」的大部分都直接被過濾掉。新方案維護一份共享的完整 parts 副本（cached copy），planner 只複製過濾後的結果——從複製 16 萬個 part 元素降到複製幾千個。</p>
+
+  <p><strong>第三階段——namespace 二分搜尋：</strong>由於 <code>(namespace, day)</code> 是分區鍵，parts 向量按 namespace 排序。過濾 namespace 不需要線性掃描，改用二分搜尋可以直接定位目標 namespace 的區段，跳過其他所有 namespace 的 parts。這一步把查詢延遲與 part 數量的相關性從 O(N) 降到 O(log N)，讓「parts 越多、查詢越慢」的假設不再成立。</p>
+
+  <figure>
+    <svg class="vg-w-bench-ch-parts" viewBox="0 0 480 160" role="img"
+         aria-label="ClickHouse 三階段修補效果對比" style="width: 100%; height: auto; max-width: 480px;">
+      <style>
+        .vg-w-bench-ch-parts text { font-family: EB Garamond, serif; font-size: 11px; }
+        .vg-w-bench-ch-parts .label { font-family: IM Fell English, serif; font-style: italic; }
+      </style>
+      <!-- Y-axis label -->
+      <text x="14" y="90" text-anchor="middle" fill="var(--muted)" class="label" transform="rotate(-90 14 90)">查詢延遲</text>
+      <!-- X-axis -->
+      <line x1="40" y1="130" x2="460" y2="130" stroke="var(--muted-2)" stroke-width="1"/>
+      <!-- X labels -->
+      <text x="100" y="145" text-anchor="middle" fill="var(--muted)" class="label">30k parts</text>
+      <text x="220" y="145" text-anchor="middle" fill="var(--muted)" class="label">80k parts</text>
+      <text x="340" y="145" text-anchor="middle" fill="var(--muted)" class="label">120k parts</text>
+      <text x="430" y="145" text-anchor="middle" fill="var(--muted)" class="label">160k parts</text>
+      <!-- Before line (accent, rising steeply) -->
+      <polyline points="100,110 220,95 340,60 430,20"
+                fill="none" stroke="var(--accent)" stroke-width="2"/>
+      <!-- After phase 1 (ink-deep, flatter) -->
+      <polyline points="100,112 220,110 340,108 430,105"
+                fill="none" stroke="var(--ink-deep)" stroke-width="2"/>
+      <!-- After phase 3 (sage, nearly flat) -->
+      <polyline points="100,114 220,113 340,113 430,113"
+                fill="none" stroke="var(--sage-deep)" stroke-width="2"/>
+      <!-- Legend -->
+      <line x1="45" y1="20" x2="75" y2="20" stroke="var(--accent)" stroke-width="2"/>
+      <text x="80" y="24" fill="var(--muted)" class="label">修補前（exclusive lock）</text>
+      <line x1="45" y1="38" x2="75" y2="38" stroke="var(--ink-deep)" stroke-width="2"/>
+      <text x="80" y="42" fill="var(--muted)" class="label">Phase 1：shared lock</text>
+      <line x1="45" y1="56" x2="75" y2="56" stroke="var(--sage-deep)" stroke-width="2"/>
+      <text x="80" y="60" fill="var(--muted)" class="label">Phase 3：binary search（延遲與 parts 數解耦）</text>
+    </svg>
+    <figcaption>修補前查詢延遲與 parts 數量呈線性相關；Phase 1 shared lock 大幅降低基線，Phase 3 binary search 讓延遲與 parts 數量基本解耦。</figcaption>
+  </figure>
+
+  <h2>上游貢獻與更廣泛的意義</h2>
+
+  <p>第一和第二階段的修補已作為 PR #85535 合入 ClickHouse 25.11。第三階段的二分搜尋優化則依賴更廣的分區鍵排序保證，目前作為 Cloudflare 內部補丁運行。這個貢獻路徑本身也值得注意：Cloudflare 在自己的 petabyte 規模叢集上發現問題、診斷、修復，然後把通用性高的部分回饋上游——這是「以規模換換洞察力，以洞察力換社群影響力」的標準路徑。</p>
+
+  <p>對於使用 ClickHouse 的工程師，這個事件揭示了幾個操作上的教訓：首先，分區鍵的選擇不只影響查詢過濾效率，也影響 part 數量，進而影響 planner 的內部機制；其次，<code>trace_log</code> 的 Real 模式在診斷 mutex 競爭時是必要工具——CPU 模式會遺漏等待中的 thread；第三，MergeTree 的 part 數量有一個軟上限建議（通常是幾千個，生產環境應積極合併），超過這個範圍需要特別關注 planner 行為。</p>
+
+  <p class="vg-deep-closer"><strong>What this enables</strong>：三階段修補把 ClickHouse MergeTree query planner 的 mutex 瓶頸從 O(N) 壓縮到 O(log N)，讓帳單管線在 16 萬個 parts 的叢集上仍能保持穩定延遲——這個能力讓 per-namespace 細粒度保留政策可以放心部署，不需要再為「分區更細 → parts 更多 → 查詢更慢」的權衡折衷。</p>
+</div>

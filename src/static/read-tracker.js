@@ -106,6 +106,120 @@
     });
   }
 
+  // Auto-mark a roundup item as read when the user clicks any source / deep
+  // link inside its meta row. Click reflects intent — opening the article
+  // means "I'm reading it". Navigation proceeds normally; the mark+save
+  // completes synchronously before the browser leaves the page.
+  function bindRoundupSourceAutoMark(state) {
+    document.querySelectorAll(".vg-card-roundup").forEach((card) => {
+      const key = card.getAttribute("data-vg-readkey-item");
+      if (!key) return;
+      const links = card.querySelectorAll(".vg-card-meta a");
+      links.forEach((a) => {
+        a.addEventListener("click", () => {
+          if (!isRead(state, key)) mark(state, key, true);
+          // Do not preventDefault — let navigation proceed.
+        });
+      });
+    });
+  }
+
+  // Collapsed-read roundup cards can be temporarily expanded to re-read
+  // the lede without leaving the read state. Toggling .vg-expanded shows
+  // lede/meta without removing .vg-read (so the next render still treats
+  // the card as collapsed).
+  function bindRoundupExpandToggle(state) {
+    document.querySelectorAll(".vg-card-roundup").forEach((card) => {
+      card.addEventListener("click", (e) => {
+        if (!card.classList.contains("vg-read")) return;
+        // Click on the unread button restores unread state — handled below.
+        if (e.target.closest(".vg-card-roundup-unread-btn")) return;
+        // Click on a link (lede or expanded meta) — let it navigate; do not toggle.
+        if (e.target.closest("a")) return;
+        card.classList.toggle("vg-expanded");
+      });
+    });
+  }
+
+  // When a card is collapsed-read, surface a small "↶ unread" button so the
+  // user can reverse. Wire it to mark(false) on the readkey.
+  function bindRoundupUnreadButton(state) {
+    document.querySelectorAll(".vg-card-roundup").forEach((card) => {
+      const key = card.getAttribute("data-vg-readkey-item");
+      if (!key) return;
+      // Only inject the button once per card.
+      if (card.querySelector(".vg-card-roundup-unread-btn")) return;
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "vg-card-roundup-unread-btn";
+      btn.textContent = "↶ unread";
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        mark(state, key, false);
+        card.classList.remove("vg-expanded");
+      });
+      // Append inside the body wrapper so it sits visually below the title
+      // when expanded; CSS hides it when not .vg-read.
+      const body = card.querySelector(".vg-card-roundup-body") || card.querySelector(":scope > div");
+      if (body) body.appendChild(btn);
+    });
+  }
+
+  // Inject a "✓ mark read" button into each unread card's meta row so a user
+  // who scanned the lede and decided to skip can mark it without clicking
+  // through to the source. Button hides itself once the card becomes read
+  // (CSS .vg-read .vg-card-roundup-mark-btn { display: none }).
+  function bindRoundupMarkReadButton(state) {
+    document.querySelectorAll(".vg-card-roundup").forEach((card) => {
+      const key = card.getAttribute("data-vg-readkey-item");
+      if (!key) return;
+      if (card.querySelector(".vg-card-roundup-mark-btn")) return;
+      const meta = card.querySelector(".vg-card-meta");
+      if (!meta) return;
+      const sep = document.createElement("span");
+      sep.setAttribute("aria-hidden", "true");
+      sep.textContent = "·";
+      sep.className = "vg-card-meta-sep";
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "vg-card-roundup-mark-btn";
+      btn.textContent = "✓ mark read";
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        if (!isRead(state, key)) mark(state, key, true);
+      });
+      meta.appendChild(sep);
+      meta.appendChild(btn);
+    });
+  }
+
+  // Inject a "mark all read" link next to the N / N read progress span, so
+  // the user can collapse the whole roundup in one click after a full scan.
+  function bindRoundupMarkAllRead(state) {
+    document.querySelectorAll("[data-vg-progress-of]").forEach((progress) => {
+      if (progress.parentNode.querySelector(".vg-card-progress-mark-all")) return;
+      const prefix = progress.getAttribute("data-vg-progress-of");
+      const cards = [...document.querySelectorAll(`[data-vg-readkey-item^="${prefix}"]`)];
+      if (cards.length === 0) return;
+      const sep = document.createElement("span");
+      sep.setAttribute("aria-hidden", "true");
+      sep.className = "vg-card-progress-sep";
+      sep.textContent = "·";
+      const link = document.createElement("button");
+      link.type = "button";
+      link.className = "vg-card-progress-mark-all";
+      link.textContent = "mark all read";
+      link.addEventListener("click", () => {
+        cards.forEach((card) => {
+          const k = card.getAttribute("data-vg-readkey-item");
+          if (k && !isRead(state, k)) mark(state, k, true);
+        });
+      });
+      progress.parentNode.insertBefore(sep, progress.nextSibling);
+      progress.parentNode.insertBefore(link, sep.nextSibling);
+    });
+  }
+
   const state = load();
   document.addEventListener("DOMContentLoaded", () => {
     applyVisuals(state);
@@ -113,5 +227,10 @@
     bindReset(state);
     bindAutoMark(state);
     bindCopyLink();
+    bindRoundupSourceAutoMark(state);
+    bindRoundupExpandToggle(state);
+    bindRoundupUnreadButton(state);
+    bindRoundupMarkReadButton(state);
+    bindRoundupMarkAllRead(state);
   });
 })();
