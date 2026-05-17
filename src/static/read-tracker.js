@@ -165,6 +165,61 @@
     });
   }
 
+  // Inject a "✓ mark read" button into each unread card's meta row so a user
+  // who scanned the lede and decided to skip can mark it without clicking
+  // through to the source. Button hides itself once the card becomes read
+  // (CSS .vg-read .vg-card-roundup-mark-btn { display: none }).
+  function bindRoundupMarkReadButton(state) {
+    document.querySelectorAll(".vg-card-roundup").forEach((card) => {
+      const key = card.getAttribute("data-vg-readkey-item");
+      if (!key) return;
+      if (card.querySelector(".vg-card-roundup-mark-btn")) return;
+      const meta = card.querySelector(".vg-card-meta");
+      if (!meta) return;
+      const sep = document.createElement("span");
+      sep.setAttribute("aria-hidden", "true");
+      sep.textContent = "·";
+      sep.className = "vg-card-meta-sep";
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "vg-card-roundup-mark-btn";
+      btn.textContent = "✓ mark read";
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        if (!isRead(state, key)) mark(state, key, true);
+      });
+      meta.appendChild(sep);
+      meta.appendChild(btn);
+    });
+  }
+
+  // Inject a "mark all read" link next to the N / N read progress span, so
+  // the user can collapse the whole roundup in one click after a full scan.
+  function bindRoundupMarkAllRead(state) {
+    document.querySelectorAll("[data-vg-progress-of]").forEach((progress) => {
+      if (progress.parentNode.querySelector(".vg-card-progress-mark-all")) return;
+      const prefix = progress.getAttribute("data-vg-progress-of");
+      const cards = [...document.querySelectorAll(`[data-vg-readkey-item^="${prefix}"]`)];
+      if (cards.length === 0) return;
+      const sep = document.createElement("span");
+      sep.setAttribute("aria-hidden", "true");
+      sep.className = "vg-card-progress-sep";
+      sep.textContent = "·";
+      const link = document.createElement("button");
+      link.type = "button";
+      link.className = "vg-card-progress-mark-all";
+      link.textContent = "mark all read";
+      link.addEventListener("click", () => {
+        cards.forEach((card) => {
+          const k = card.getAttribute("data-vg-readkey-item");
+          if (k && !isRead(state, k)) mark(state, k, true);
+        });
+      });
+      progress.parentNode.insertBefore(sep, progress.nextSibling);
+      progress.parentNode.insertBefore(link, sep.nextSibling);
+    });
+  }
+
   const state = load();
   document.addEventListener("DOMContentLoaded", () => {
     applyVisuals(state);
@@ -175,5 +230,7 @@
     bindRoundupSourceAutoMark(state);
     bindRoundupExpandToggle(state);
     bindRoundupUnreadButton(state);
+    bindRoundupMarkReadButton(state);
+    bindRoundupMarkAllRead(state);
   });
 })();
