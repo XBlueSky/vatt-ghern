@@ -299,30 +299,85 @@ Emit only source link, optional deep link, optional tag chip in the meta
 row. The button surface is owned by JS so it can evolve without
 re-emitting historical roundup HTML.
 
-### Step 7: Write each deep-story HTML + sidecar (×N where N ≤ 3)
+### Step 7a: Prepare deep-story briefs
 
-For each deep-story candidate, do additional WebFetch on the canonical
-source to gather technical detail (RFC excerpts, code samples, real
-numbers).
+For each cluster picked in Step 5 (≤3 briefs total), construct a
+deep-story brief following the contract in
+`references/deep-story-brief.md`. Each brief is fully self-contained
+— it knows its cluster, its archetype, its output path, and all the
+reference files it needs.
 
-Read the archetype reference file picked in Step 5:
-`${CLAUDE_PLUGIN_ROOT}/skills/daily-news/references/archetypes/deep-<archetype>.md`.
+Each brief carries these fields:
 
-It contains the required structure (H2 sequence, widget budget, closer
-label) for that specific archetype. Follow it.
+- `news_id` — the YYYY-MM-DD-NN from the roundup
+- `primary_url` and `variant_urls[]` — every variant from the cluster
+- `title`, `domain`, `archetype` — set in Step 5
+- `summary` — 2-3 sentences telling the sub-agent what to cover
+- `output_path` — `src/posts/YYYY/MM/DD/deep-<kebab-slug>.html`
+- `sidecar_path` — same path with `.11tydata.json`
+- `related_roundup` — `/YYYY/MM/DD/roundup/`
 
-Each deep-story file:
+Briefs must be finalised before any dispatch in Step 7b — the parent
+agent is the only place that knows the cluster→archetype mapping and
+the dedup state. Each sub-agent sees only its own brief.
 
-- Path: `src/posts/YYYY/MM/DD/deep-<kebab-slug>.html`
-- Sidecar: `news_ids` references exactly one item from today's roundup;
-  `related_roundup` is set to `/YYYY/MM/DD/roundup/`; `archetype` is
-  `"daily-deep-story"`; **`deep_archetype` is the value picked in Step 5**
-- Body matches the picked archetype's H2 *count range* (phrasing free)
-- ≥1 inline SVG widget (≥2 recommended; single must carry high density)
-- Universal contract from `deep-freeform.md` applies to all archetypes:
-  opener (`<p class="vg-deep-opener">`), closer (`<p class="vg-deep-closer">`
-  with `<strong>` inside). Drop cap is **recommended** but optional —
-  skip on solemn topics where an illuminated capital reads as decorative.
+The sidecar contract is unchanged:
+
+- `archetype` is `"daily-deep-story"`
+- `deep_archetype` is the value picked in Step 5
+- `sources[]` MUST include every variant_url, not just the primary
+  (cross-source synthesis contract from Step 5.0)
+
+### Step 7b: Dispatch parallel deep-story sub-agents
+
+Issue all ≤3 dispatches in ONE response (single message containing
+multiple `Agent` tool blocks). Each dispatch uses
+`subagent_type: general-purpose` and passes the brief from Step 7a as
+the prompt — see `references/deep-story-brief.md` for the exact
+markdown template each sub-agent receives.
+
+Sub-agents run concurrently; the parent waits for all to return before
+proceeding to Step 7c.
+
+Each sub-agent is constrained per the brief:
+
+- Tools allowed: WebFetch, Read, Write only.
+- No nested `Agent` dispatch, no Bash, no Edit on other days' posts,
+  no git operations.
+- Writes ONE HTML to `output_path` + ONE sidecar to `sidecar_path`,
+  reports back with `{status, char_count, archetype, archetype_deviations}`.
+
+If a sub-agent reports `BLOCKED` or `DONE_WITH_CONCERNS`:
+
+- `DONE_WITH_CONCERNS` with a documented deviation → accept and
+  proceed; note the deviation in the PR body.
+- `BLOCKED` → re-dispatch that one brief with additional context, or
+  drop the deep-story (reducing N to N-1). Do NOT skip QA — the
+  routine remains correct with fewer deep-stories.
+
+### Step 7c: Verify deep-story outputs
+
+After all sub-agents return:
+
+1. Read each output HTML + sidecar back to confirm the files exist and
+   the sidecar parses as JSON.
+2. Verify per-file invariants the sub-agent was told to honour:
+   - 600-1200 lines.
+   - `<p class="vg-deep-opener">` and `<p class="vg-deep-closer"><strong>`.
+   - ≥1 inline SVG widget (≥2 recommended; single must carry high density).
+   - Universal contract from `deep-freeform.md` applies to all archetypes.
+   - Body matches the picked archetype's H2 *count range* (phrasing free).
+3. The mechanical QA gate in Step 8 (`archetype-check`, `check-dup`,
+   `html-validate`, `link-check`) is the formal validation. Step 7c is
+   the first-pass sanity check before that.
+
+PR body must list:
+
+- One line per deep-story: news_id, archetype, slug, char count,
+  archetype-deviations (if any).
+- "Parallel dispatch summary": which N briefs were dispatched, how
+  many returned DONE / DONE_WITH_CONCERNS / BLOCKED, and any
+  re-dispatches needed.
 
 ### Step 8: Self-check (mechanical)
 
