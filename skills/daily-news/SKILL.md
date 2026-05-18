@@ -155,6 +155,14 @@ Decision tree:
 forcing a structured archetype would worsen the prose — pick
 `freeform`. A forced fit produces worse content than free shape.
 
+**Phrasing freedom**: archetype reference files describe the *arc*
+(e.g., setup → mechanism → consequence for narrative), not the exact
+H2 text. Name each H2 after the actual topic — generic phrasing
+(`what happened` / `why it matters` / `so what`) makes every post in
+an archetype feel like the same post. The test suite checks H2
+*counts*, not strings. Closer labels are also free; pick one that
+fits the post's voice.
+
 **c. Selection constraints when writing up to 3**:
 
 - All 3 must score ≥8
@@ -245,11 +253,12 @@ Each deep-story file:
 - Sidecar: `news_ids` references exactly one item from today's roundup;
   `related_roundup` is set to `/YYYY/MM/DD/roundup/`; `archetype` is
   `"daily-deep-story"`; **`deep_archetype` is the value picked in Step 5**
-- Body matches the picked archetype's required structure exactly
-- ≥2 inline SVG widgets (per archetype-specific widget recommendations)
+- Body matches the picked archetype's H2 *count range* (phrasing free)
+- ≥1 inline SVG widget (≥2 recommended; single must carry high density)
 - Universal contract from `deep-freeform.md` applies to all archetypes:
-  opener (`<p class="vg-deep-opener">`), drop-cap in first paragraph,
-  closer (`<p class="vg-deep-closer">` with `<strong>` inside)
+  opener (`<p class="vg-deep-opener">`), closer (`<p class="vg-deep-closer">`
+  with `<strong>` inside). Drop cap is **recommended** but optional —
+  skip on solemn topics where an illuminated capital reads as decorative.
 
 ### Step 8: Self-check (mechanical)
 
@@ -410,6 +419,12 @@ AI · 3 · SYSTEMS · 3 · INFRA · 2 · STORAGE · 1 · INDUSTRY · 1
 - {{deep_title_1}} — `narrative`
 - {{deep_title_2}} — `technical-deep-dive`
 - {{deep_title_3}} — `freeform` (hybrid topic, no structured archetype fit cleanly)
+
+## Archetype overrides
+
+- (none) — or list each: e.g. `deep-foo`:選了 `freeform` 而非 `narrative`,
+  因為該題目沒有清晰時間線,強套 setup→mechanism→consequence 會讓 prose
+  變成「凡是事件都套同一個 H2 序列」的模板感。
 
 ## Preview
 

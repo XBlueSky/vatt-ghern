@@ -20,7 +20,25 @@ technical-deep-dive says "this system has components A, B, C, and they
 relate this way." The post does not move through time — it moves
 through structure.
 
-## Required structure
+## Shape (the arc, not the wording)
+
+Walk through the components, then close with what the assembled whole
+unlocks. Name each H2 *after the actual component or concept*.
+
+1. **Component 1** — free-named after the real thing.
+2. **Component 2**
+3. **Component 3** — (3-5 component sections total.)
+
+### Example H2 sets
+
+- Postgres 17 planner: `the new merge-append path` / `parallel-safe
+  function whitelist` / `cost-model recalibration`
+- QUIC v2 congestion: `the receive window state machine` / `BBR2
+  bandwidth probe` / `loss-recovery interplay`
+- CPU SIMD ext: `the new register file` / `predicate masks` /
+  `permitted operand widths` / `interaction with existing AVX-512`
+
+## Required structure (universal contract)
 
 ```html
 <header class="vg-deep-hero">
@@ -34,30 +52,32 @@ through structure.
   what this thing is and what problem it solves}}</p>
 
   <h2>{{COMPONENT_1_NAME}}</h2>
-  <!-- First component / concept. Free-named after the actual thing. -->
-
   <h2>{{COMPONENT_2_NAME}}</h2>
-  <!-- Second component. -->
-
   <h2>{{COMPONENT_3_NAME}}</h2>
-  <!-- Third. (3-5 component sections total.) -->
+  <!-- 3-6 component sections total. -->
 
-  <p class="vg-deep-closer"><strong>What this enables</strong>：{{one
+  <p class="vg-deep-closer"><strong>{{CLOSER_LABEL}}</strong>：{{one
   sentence on the new capability the components together unlock}}</p>
 </div>
 ```
 
 ## Hard requirements (archetype-check.mjs enforces)
 
-- 3 to 5 H2 elements in the body
-- H2 text is free-named (use the actual component / concept name in
-  English). **Banned H2 names**: `what happened`, `why it matters`,
-  `so what`, `observation`, `the truth`, `how to choose`, `the core
-  idea` — these belong to other archetypes.
-- Closer label is `What this enables` (not `Take-away` — the
-  emphasis is on capability, not conclusion)
-- ≥2 inline `<svg>` widgets
-- Universal contract from `deep-freeform.md`
+- 3-6 H2 elements
+- Universal contract (opener, closer with `<strong>`)
+- ≥1 inline `<svg>` (≥2 recommended)
+- Drop cap recommended
+
+### Closer label
+
+Free. For deep-dives, common shapes (emphasis is on capability, not
+methodology):
+
+- `What this enables` — the canonical choice
+- `What you can build` — when the closer points at applications
+- `Why it matters` — used sparingly (this phrase belongs more to
+  narrative; only pick when the closer truly steps back to context)
+- `The unlock`
 
 ## Recommended widgets
 

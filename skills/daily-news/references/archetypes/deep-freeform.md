@@ -10,7 +10,7 @@ Pick when one of these is true:
 
 - Topic is hybrid: part-narrative + part-explainer
 - The natural reading order doesn't match any structured archetype's
-  H2 sequence
+  shape
 - The story's pivot is structural in a way no archetype captures
   (e.g., "two parallel events turn out to share the same root cause")
 - Forcing one of the five would make the prose worse
@@ -18,30 +18,37 @@ Pick when one of these is true:
 When in doubt between freeform and a structured archetype, prefer
 freeform. A forced fit produces worse content than free shape.
 
-## Required structure (universal contract only)
+If you pick freeform after considering a structured archetype, note
+the reason in the PR body under `## Archetype overrides` so reviewers
+can see the call.
+
+## Required structure (universal contract)
 
 The skill MUST emit:
 
 - `<h1 class="vg-post-title">` with the post title
 - `<p class="vg-deep-opener">` with the hook (a scene, question, or
   reframing — pulls the reader in before technical content begins)
-- `<span class="vg-dropcap">` wrapping the first character of the
-  first paragraph of the body
 - `<p class="vg-deep-closer">` near the end, containing a `<strong>`
-  with a closing label (Take-away / Closing thought / Reflection /
-  any label that signals "this is the wrap")
-- ≥2 inline `<svg>` widgets
+  with a closing label (free phrasing — any label that signals "this
+  is the wrap")
+- ≥1 inline `<svg>` widget (≥2 recommended; warning if only 1, and
+  the single widget must carry high informational density — no
+  decorative spacers)
 
-Chrome (post-trail, share buttons, bards-note) comes from
-`layouts/post.njk` automatically.
+## Recommended but not required
+
+- `<span class="vg-dropcap">` wrapping the first character of the
+  first paragraph. Recommended for visual rhythm; skip on solemn
+  topics where an illuminated capital would feel decorative
+  (CVE postmortem, accident report, obituary-shaped pieces).
 
 ## What freeform does NOT allow (banned even here)
 
 - No opener (article starts cold)
-- No drop cap (visual rhythm broken)
 - No closer (article ends mid-thought)
 - Wall-of-text without paragraph breaks
-- One SVG or zero (visual budget still applies)
+- Zero widgets
 
 ## Example shape (one of many possible)
 
@@ -61,6 +68,14 @@ A 2026-style freeform post on a hybrid topic might look like:
   <p class="vg-deep-closer"><strong>{{CLOSING_LABEL}}</strong>：{{closing}}</p>
 </div>
 ```
+
+### Closer label
+
+Free. Pick something that fits the post's voice. Examples:
+
+`Take-away` · `Closing thought` · `Reflection` · `So what` · `What
+changes` · `The lesson` · `What this enables` · `Next time` · `The
+call` · `The model` · `In a sentence` · `Looking ahead`
 
 Sidecar JSON:
 

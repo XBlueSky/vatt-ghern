@@ -62,8 +62,9 @@ and OMITTED for `daily-roundup`. publish.mjs enforces presence.
   Never hardcoded hex/rgb. Token list lives in `references/design-system.md`.
 - Use `currentColor` for SVG strokes that should follow theme.
 - Use CJK 全形 punctuation: `：` `，` `、` `。` inside CJK prose. Half-width
-  `:` allowed in English H2s (e.g., investigation's `hypothesis: foo` or
-  comparison's `dimension: bar`).
+  `:` allowed in English H2s (e.g., one valid investigation H2 phrasing is
+  `hypothesis: cache-eviction lock contention`, but the H2 wording is free
+  per the archetype reference — name it after the actual hypothesis).
 - Use CJK 雙破折號 `——` (two em-dashes, full-width) inside CJK prose.
   Never Latin `—` in CJK prose.
 - No emoji. No tracking scripts. No `<style>` blocks (use design system

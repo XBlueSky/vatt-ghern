@@ -19,7 +19,37 @@ knows the surrounding concepts and explores ONE specific implementation
 of an established idea. Explainer assumes the reader knows little and
 walks them up the abstraction ladder.
 
-## Required structure
+## Shape (the arc, not the wording)
+
+A four-to-five beat ladder. Each beat moves the reader one rung up.
+Name each H2 *after the actual concept being taught* — generic names
+make every explainer feel like the same post.
+
+1. **Concrete case** — a scenario the reader already understands; the
+   need behind the concept.
+2. **The gap** — why existing tools / approaches don't solve the case
+   well. (Optional: collapse into 1 if the gap is obvious.)
+3. **The idea** — the new concept stated plainly; the smallest possible
+   formulation.
+4. **The worked example** — concrete code, real numbers, or a step-by-
+   step. The reader sees the idea *actually do something*. Must
+   materialise as `<pre><code>` or `<svg>` somewhere in the body —
+   prose alone fails the test.
+5. **Applicability** — where the idea earns its place; what it costs.
+
+### Example H2 sets — pick names that name the topic
+
+- io_uring explainer: `the workload that breaks epoll` / `why thread
+  pools and async don't fix it` / `submission and completion rings` /
+  `a 30-line example` / `where it pays off`
+- CRDT explainer: `two laptops, no internet` / `last-write-wins eats
+  edits` / `merge as commutative union` / `a counter you can split` /
+  `what CRDTs can't fix`
+- Zig std.Io explainer: `the 10K-request problem` / `threads vs async,
+  the false choice` / `std.Io as a vtable` / `a worked echo server` /
+  `where this lands`
+
+## Required structure (universal contract)
 
 ```html
 <header class="vg-deep-hero">
@@ -33,52 +63,44 @@ walks them up the abstraction ladder.
   <p><span class="vg-dropcap">{{CHAR}}</span>{{intro — one sentence on
   what the reader will know after reading}}</p>
 
-  <h2>start with a concrete case</h2>
-  <!-- A scenario the reader already understands. No new concepts yet. -->
+  <h2>{{CONCRETE_CASE_NAMED_FOR_TOPIC}}</h2>
+  <h2>{{GAP_NAMED_FOR_TOPIC}}</h2>
+  <h2>{{IDEA_NAMED_FOR_TOPIC}}</h2>
+  <h2>{{WORKED_EXAMPLE_NAMED_FOR_TOPIC}}</h2>
+  <!-- This section MUST contain <pre><code> or <svg>. -->
+  <h2>{{APPLICABILITY_NAMED_FOR_TOPIC}}</h2>
 
-  <h2>where today's tools fall short</h2>
-  <!-- Show why existing approaches fail to solve the scenario well. -->
-
-  <h2>the core idea</h2>
-  <!-- The new concept stated plainly. Widget #1: conceptual diagram. -->
-
-  <h2>what it actually looks like</h2>
-  <!-- Concrete example: simplified code or a worked example.
-       Widget #2: before/after or worked-example diagram. -->
-
-  <h2>when you'd reach for it</h2>
-  <!-- Real situations where the concept earns its place. Limits and
-       trade-offs. -->
-
-  <p class="vg-deep-closer"><strong>Take-away</strong>：{{one-line
+  <p class="vg-deep-closer"><strong>{{CLOSER_LABEL}}</strong>：{{one-line
   mental model — the sentence the reader keeps}}</p>
 </div>
 ```
 
 ## Hard requirements (archetype-check.mjs enforces)
 
-- Exactly 5 H2 elements in the body
-- H2 text matches exactly, in this exact order:
-  1. `start with a concrete case`
-  2. `where today's tools fall short`
-  3. `the core idea`
-  4. `what it actually looks like`
-  5. `when you'd reach for it`
-- The `what it actually looks like` section must contain a
-  `<pre><code>...</code></pre>` OR an inline `<svg>` (a worked
-  example must be concrete, not just prose)
-- Closer label is `Take-away`
-- ≥2 inline `<svg>` widgets
-- Universal contract from `deep-freeform.md`
+- 4-6 H2 elements (phrasing free)
+- Body must contain `<pre><code>` or `<svg>` (the worked example must
+  be concrete, not just prose)
+- Universal contract (opener, closer with `<strong>`)
+- ≥1 inline `<svg>` widget (≥2 recommended)
+- Drop cap recommended
+
+### Closer label
+
+Free. For explainers, common shapes:
+
+- `Take-away` — the mental model in one line
+- `The model` — when the closer crystallises a way of seeing
+- `Mental model`
+- `Plain words` — when the post's value is the simplest possible
+  rephrasing
 
 ## Recommended widgets
 
-1. **Conceptual diagram**: in `the core idea`. Visualizes the new
-   abstraction at its most distilled form. Boxes, arrows, labels in
-   plain words.
-2. **Before/after or worked example**: in `what it actually looks like`.
-   Shows the old approach next to the new approach, OR walks through
-   one concrete instance step by step.
+1. **Conceptual diagram**: visualises the new abstraction at its most
+   distilled form. Boxes, arrows, labels in plain words.
+2. **Before/after or worked example diagram**: shows the old approach
+   next to the new approach, OR walks through one concrete instance
+   step by step.
 
 ## Sidecar
 

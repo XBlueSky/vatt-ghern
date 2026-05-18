@@ -10,8 +10,15 @@
 //       * Each item card has data-vg-readkey-item attr
 //       * Progress span has data-vg-progress-of and data-vg-progress-total
 //   - Deep-story HTML (path matches **/deep-*/index.html):
-//       * Universal contract: opener, dropcap, closer (with <strong>), ≥2 <svg>
-//       * Per-archetype rules based on sidecar deep_archetype field
+//       * Universal contract: opener (required), closer with <strong> (required),
+//         ≥1 <svg> (required), dropcap (recommended → warning), ≥2 <svg> (recommended → warning)
+//       * Per-archetype rules: H2 *count range* enforced, H2 *phrasing* free
+//         (the agent picks words that fit each story instead of repeating
+//         "what happened / why it matters / so what" eight times across three
+//         days). Closer label is free.
+//       * Special structural requirements still enforced: comparison needs
+//         a <table> or vg-w-comparison-* SVG; explainer body needs <pre><code>
+//         or <svg> somewhere (the worked example must materialise concretely).
 //   - Universal:
 //       * No `:` (half-width) inside .vg-card-title or H1/H2 text content
 //       * No Latin em-dash `—` inside .vg-post-body or .vg-post-title
@@ -43,6 +50,7 @@ function walk(dir) {
 }
 
 const violations = [];
+const warnings = [];
 
 function checkRoundup(path, html) {
   const itemMatches = [...html.matchAll(/<article[^>]+class="[^"]*vg-card-roundup[^"]*"[^>]*id="item-(\d+)"/g)];
@@ -127,7 +135,7 @@ function checkUniversalContract(path, html) {
     violations.push(`${path}: missing .vg-deep-opener`);
   }
   if (!/class="[^"]*vg-dropcap/.test(html)) {
-    violations.push(`${path}: missing .vg-dropcap`);
+    warnings.push(`${path}: missing .vg-dropcap (recommended for visual rhythm; OK to omit on solemn topics)`);
   }
   if (!/class="[^"]*vg-deep-closer/.test(html)) {
     violations.push(`${path}: missing .vg-deep-closer`);
@@ -136,8 +144,10 @@ function checkUniversalContract(path, html) {
     violations.push(`${path}: .vg-deep-closer must contain a <strong> for the closing label`);
   }
   const svgCount = (html.match(/<svg\b/g) || []).length;
-  if (svgCount < 2) {
-    violations.push(`${path}: deep-story requires ≥2 <svg> widgets, found ${svgCount}`);
+  if (svgCount < 1) {
+    violations.push(`${path}: deep-story requires ≥1 <svg> widget, found ${svgCount}`);
+  } else if (svgCount < 2) {
+    warnings.push(`${path}: deep-story has only ${svgCount} <svg> widget (≥2 recommended; single must carry high informational density)`);
   }
 }
 
@@ -147,116 +157,59 @@ function extractH2Texts(html) {
 }
 
 function checkNarrative(path, html) {
-  const expected = ["what happened", "why it matters", "so what"];
+  // Narrative shape: setup → mechanism → consequence. Three-beat arc.
+  // Phrasing is free — agent chooses words that fit the story.
   const actual = extractH2Texts(html);
-  if (actual.length !== 3) {
-    violations.push(`${path}: narrative requires exactly 3 H2 elements, found ${actual.length}`);
+  if (actual.length < 2 || actual.length > 5) {
+    violations.push(`${path}: narrative requires 2-5 H2 elements (setup → mechanism → consequence arc), found ${actual.length}`);
   }
-  for (let i = 0; i < expected.length; i++) {
-    if (actual[i] !== expected[i]) {
-      violations.push(`${path}: narrative H2[${i}] expected "${expected[i]}", got "${actual[i] || "(missing)"}"`);
-    }
-  }
-  if (!/<strong>Take-away<\/strong>/.test(html)) {
-    violations.push(`${path}: narrative closer must use <strong>Take-away</strong> label`);
-  }
+  // Closer label is free; just needs a <strong> tag (checked by universal contract).
 }
 
 function checkTechnicalDeepDive(path, html) {
   const actual = extractH2Texts(html);
-  if (actual.length < 3 || actual.length > 5) {
-    violations.push(`${path}: technical-deep-dive requires 3-5 H2 elements, found ${actual.length}`);
+  if (actual.length < 3 || actual.length > 6) {
+    violations.push(`${path}: technical-deep-dive requires 3-6 H2 elements (one per component), found ${actual.length}`);
   }
-  const banned = ["what happened", "why it matters", "so what", "observation", "the truth", "how to choose", "the core idea"];
-  for (const h2 of actual) {
-    if (banned.includes(h2.toLowerCase())) {
-      violations.push(`${path}: technical-deep-dive H2 "${h2}" is banned (belongs to another archetype)`);
-    }
-  }
-  if (!/<strong>What this enables<\/strong>/.test(html)) {
-    violations.push(`${path}: technical-deep-dive closer must use <strong>What this enables</strong> label`);
-  }
+  // Closer label is free; phrasing should signal "capability unlocked".
 }
 
 function checkInvestigation(path, html) {
+  // Investigation shape: puzzle → 1-3 falsified candidates → resolution.
+  // H2 count enforced; phrasing free.
   const actual = extractH2Texts(html);
-  if (actual.length < 3) {
-    violations.push(`${path}: investigation requires at least 3 H2 elements (observation + ≥1 hypothesis + the truth), found ${actual.length}`);
+  if (actual.length < 3 || actual.length > 6) {
+    violations.push(`${path}: investigation requires 3-6 H2 elements (puzzle + 1-3 hypotheses + resolution), found ${actual.length}`);
   }
-  if (actual[0] !== "observation") {
-    violations.push(`${path}: investigation H2[0] must be "observation", got "${actual[0] || "(missing)"}"`);
-  }
-  if (actual[actual.length - 1] !== "the truth") {
-    violations.push(`${path}: investigation last H2 must be "the truth", got "${actual[actual.length - 1] || "(missing)"}"`);
-  }
-  const middle = actual.slice(1, -1);
-  const hypothesisCount = middle.filter((h) => h.startsWith("hypothesis: ")).length;
-  if (hypothesisCount < 1 || hypothesisCount > 3) {
-    violations.push(`${path}: investigation requires 1-3 "hypothesis: ..." H2s, found ${hypothesisCount}`);
-  }
-  if (hypothesisCount !== middle.length) {
-    violations.push(`${path}: investigation middle H2s must all start with "hypothesis: ", got: ${middle.join(", ")}`);
-  }
-  if (!/<strong>Take-away<\/strong>/.test(html)) {
-    violations.push(`${path}: investigation closer must use <strong>Take-away</strong> label`);
-  }
+  // Closer label is free.
 }
 
 function checkComparison(path, html) {
+  // Comparison shape: 3-5 axes (per-option breakdown) + a decision section.
+  // H2 phrasing free — "dimension: X" is an example, not a rule.
   const actual = extractH2Texts(html);
   if (actual.length < 4 || actual.length > 6) {
-    violations.push(`${path}: comparison requires 4-6 H2 elements (3-5 dimensions + how to choose), found ${actual.length}`);
-  }
-  const lastH2 = actual[actual.length - 1];
-  if (lastH2 !== "how to choose") {
-    violations.push(`${path}: comparison last H2 must be "how to choose", got "${lastH2 || "(missing)"}"`);
-  }
-  const dimensions = actual.slice(0, -1);
-  if (dimensions.length < 3 || dimensions.length > 5) {
-    violations.push(`${path}: comparison requires 3-5 "dimension: ..." H2s before "how to choose", found ${dimensions.length}`);
-  }
-  for (const h2 of dimensions) {
-    if (!h2.startsWith("dimension: ")) {
-      violations.push(`${path}: comparison H2 "${h2}" must start with "dimension: "`);
-    }
+    violations.push(`${path}: comparison requires 4-6 H2 elements (3-5 axes + decision), found ${actual.length}`);
   }
   const hasTable = /<table\b/.test(html);
   const hasComparisonSvg = /class="[^"]*vg-w-comparison-/.test(html);
   if (!hasTable && !hasComparisonSvg) {
     violations.push(`${path}: comparison requires either <table> or <svg class="vg-w-comparison-...">`);
   }
-  if (!/<strong>Take-away<\/strong>/.test(html)) {
-    violations.push(`${path}: comparison closer must use <strong>Take-away</strong> label`);
-  }
 }
 
 function checkExplainer(path, html) {
-  const expected = [
-    "start with a concrete case",
-    "where today's tools fall short",
-    "the core idea",
-    "what it actually looks like",
-    "when you'd reach for it",
-  ];
+  // Explainer shape: concrete case → gap → idea → worked example → applicability.
+  // H2 count range enforced (4-6); phrasing free.
+  // Worked example must materialise as code or SVG somewhere in body.
   const actual = extractH2Texts(html);
-  if (actual.length !== 5) {
-    violations.push(`${path}: explainer requires exactly 5 H2 elements, found ${actual.length}`);
+  if (actual.length < 4 || actual.length > 6) {
+    violations.push(`${path}: explainer requires 4-6 H2 elements (case → gap → idea → example → applicability), found ${actual.length}`);
   }
-  for (let i = 0; i < expected.length; i++) {
-    if (actual[i] !== expected[i]) {
-      violations.push(`${path}: explainer H2[${i}] expected "${expected[i]}", got "${actual[i] || "(missing)"}"`);
-    }
-  }
-  // The "what it actually looks like" section must contain code or svg
-  const wialMatch = html.match(/<h2[^>]*>\s*what it actually looks like\s*<\/h2>([\s\S]*?)(?:<h2|<p[^>]*vg-deep-closer)/);
-  if (wialMatch) {
-    const section = wialMatch[1];
-    if (!/<pre/.test(section) && !/<svg\b/.test(section)) {
-      violations.push(`${path}: explainer "what it actually looks like" section must contain <pre><code> or <svg>`);
-    }
-  }
-  if (!/<strong>Take-away<\/strong>/.test(html)) {
-    violations.push(`${path}: explainer closer must use <strong>Take-away</strong> label`);
+  const bodyMatch = html.match(/<div[^>]+class="[^"]*vg-post-prose[^"]*"[^>]*>([\s\S]*?)<\/div>/);
+  const body = bodyMatch ? bodyMatch[1] : html;
+  if (!/<pre\b/.test(body) && !/<svg\b/.test(body)) {
+    violations.push(`${path}: explainer body must contain <pre><code> or <svg> for the worked example`);
   }
 }
 
@@ -327,8 +280,12 @@ for (const path of walk(root)) {
   checkUniversal(path, html);
 }
 
+// Warnings: visible but non-fatal. Encourage variety without enforcing it.
+for (const w of warnings) process.stdout.write(`warning: ${w}\n`);
+
 if (violations.length > 0) {
   for (const v of violations) process.stderr.write(v + "\n");
   process.exit(1);
 }
-process.stdout.write(`OK: archetype-check passed for ${root}\n`);
+const warnNote = warnings.length > 0 ? ` (${warnings.length} warning${warnings.length === 1 ? "" : "s"})` : "";
+process.stdout.write(`OK: archetype-check passed for ${root}${warnNote}\n`);
