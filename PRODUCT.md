@@ -42,3 +42,12 @@ for the topic, not for the brand.
 - Not a generic SSG demo.
 - Not maximalist editorial magazine.
 - Not terminal-aesthetic developer blog.
+
+## Pipeline performance
+
+The daily routine wallclock is dominated by deep-story authoring.
+Step 7 dispatches deep-stories in parallel — one sub-agent per story,
+up to 3 concurrent — see
+`skills/daily-news/references/deep-story-brief.md` for the contract.
+Sequential authoring previously took ~2-3 minutes; parallel is bounded
+by the slowest single brief (~60s).
