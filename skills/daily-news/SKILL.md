@@ -63,18 +63,33 @@ anti-duplication ground truth for steps 3, 4, and 5.
 
 ### Step 2: Fetch sources
 
-Walk `references/sources.md` in tier order (Tier 1 first). For each source,
-fetch the home/index page and collect top 5–10 items from the last ~24
-hours. Use WebFetch with prompts like:
+Run the dispatcher to pull every registered source:
 
-> "List the top 8 items from this page that look like original engineering
-> blog posts (not job listings, marketing pages, or product launches without
-> technical content). For each, give me title, canonical link, and a 1-2
-> sentence summary of the substance."
+```bash
+node ${CLAUDE_PLUGIN_ROOT}/skills/daily-news/scripts/fetch-all.mjs
+```
 
-De-duplicate by canonical URL across sources. Aim for ~50–100 candidates
-total. If fewer than 5 sources succeed, fail-fast: report which sources
-failed and abort without writing files.
+It reads `src/_data/sources.yml`, calls the right fetcher per `type`
+(arxiv, hf, sitemap, lobsters_json, html_index), updates
+`src/_data/web-state.json` for sitemap sources, and prints a summary.
+
+For `html_index` records the script returns them in `deferred[]` —
+those still need Claude's `WebFetch` tool for LLM summarisation. Walk
+each deferred record in tier order and ask:
+
+> "List the top 8 items from this page that look like original
+> engineering blog posts (not job listings, marketing pages, or product
+> launches without technical content). For each, give me title, canonical
+> link, and a 1-2 sentence summary of the substance."
+
+Merge the WebFetch results with the dispatcher's `candidates[]` array,
+de-duplicate by canonical URL across sources, aim for ~50–100 candidates
+total. If fewer than 5 sources succeed (concrete + deferred combined),
+fail-fast: report which sources failed and abort without writing files.
+
+The full source catalogue and per-source rationale lives in
+`src/_data/sources.yml`. The narrative in `references/sources.md`
+documents tier philosophy.
 
 ### Step 3: Score and filter
 
