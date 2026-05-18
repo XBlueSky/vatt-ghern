@@ -5,6 +5,7 @@ import { readFileSync } from "node:fs";
 import { loadSources } from "../skills/daily-news/scripts/registry.mjs";
 import { fetch as arxivFetch } from "../skills/daily-news/scripts/fetchers/arxiv.mjs";
 import { fetch as hfFetch } from "../skills/daily-news/scripts/fetchers/hf.mjs";
+import { fetch as lobstersFetch } from "../skills/daily-news/scripts/fetchers/lobsters-json.mjs";
 
 test("registry loads all sources with required fields", () => {
   const all = loadSources();
@@ -69,4 +70,15 @@ test("hf fetcher parses model list", async () => {
   assert.equal(candidates[0].title, "openai/whisper-large-v4");
   assert.equal(candidates[0].signal.downloads, 1000000);
   assert.equal(candidates[0].signal.likes, 4321);
+});
+
+test("lobsters-json picks external url, falls back to comments_url", async () => {
+  const json = readFileSync(new URL("./fixtures/lobsters-sample.json", import.meta.url), "utf8");
+  const record = { id: "lobsters-json", tier: 1, url: "https://example/api" };
+  const ctx = { fetchImpl: async () => ({ ok: true, json: async () => JSON.parse(json) }) };
+  const { candidates } = await lobstersFetch(record, ctx);
+  assert.equal(candidates.length, 2);
+  assert.equal(candidates[0].url, "https://example.com/memory");
+  assert.equal(candidates[1].url, "https://lobste.rs/s/def456");
+  assert.deepEqual(candidates[0].signal.tags, ["rust", "memory"]);
 });
