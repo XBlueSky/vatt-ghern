@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { loadSources } from "../skills/daily-news/scripts/registry.mjs";
 import { fetch as arxivFetch } from "../skills/daily-news/scripts/fetchers/arxiv.mjs";
+import { fetch as hfFetch } from "../skills/daily-news/scripts/fetchers/hf.mjs";
 
 test("registry loads all sources with required fields", () => {
   const all = loadSources();
@@ -55,4 +56,17 @@ test("arxiv fetcher parses Atom feed into candidates", async () => {
   assert.equal(candidates[0].title, "A Test Paper About Transformers");
   assert.match(candidates[0].summary, /transformers/i);
   assert.equal(candidates[0].published_at, "2026-05-18T08:00:00Z");
+});
+
+test("hf fetcher parses model list", async () => {
+  const json = readFileSync(new URL("./fixtures/hf-models-sample.json", import.meta.url), "utf8");
+  const record = { id: "hf-trending-models", tier: 4, url: "https://example/api" };
+  const ctx = { fetchImpl: async () => ({ ok: true, json: async () => JSON.parse(json) }) };
+  const { candidates } = await hfFetch(record, ctx);
+  assert.equal(candidates.length, 2);
+  assert.equal(candidates[0].source_id, "hf-trending-models");
+  assert.equal(candidates[0].url, "https://huggingface.co/openai/whisper-large-v4");
+  assert.equal(candidates[0].title, "openai/whisper-large-v4");
+  assert.equal(candidates[0].signal.downloads, 1000000);
+  assert.equal(candidates[0].signal.likes, 4321);
 });
