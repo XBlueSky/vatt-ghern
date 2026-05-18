@@ -1,73 +1,59 @@
-# Sources — Priority Crawl List
+# Sources — Rationale
 
-The skill fetches today's tech news from this priority-ordered list of public
-sites. Higher entries are tried first; lower entries fill in. The skill needs
-**≥5 successful fetches** to continue (otherwise fail-fast and let the next
-day's run retry).
+The authoritative source list lives in `src/_data/sources.yml`. To list
+it: `npm run sources:list` (or `--json` for machine output).
 
-All URLs are public. No API keys required.
+This document explains *why* the tiers exist and how to think about
+adding a new source.
 
-## Tier 1 — Most important
+## Why tier?
 
-- https://news.ycombinator.com/news **(primary signal — most reliable, broadest)**
-- https://lobste.rs/ **(systems-focused, high signal-to-noise)**
-- https://hackernoon.com/ — may return HTTP 403 to bot fetchers; treat as
-  best-effort. If blocked, skip and continue.
+The skill needs **≥5 successful fetches** to continue. Tiering lets the
+dispatcher fail noisily on Tier 1 outages while shrugging off
+lower-tier hiccups. Roughly:
 
-## Tier 2 — Aggregators
+- **Tier 1** — Primary signal. Broadest aggregators, highest reliability.
+  HN, Lobsters (HTML + JSON), HackerNoon. Outage here is a real problem.
+- **Tier 2** — Secondary aggregators (daily.dev, gslin.org). Bias check.
+- **Tier 3** — Big-tech engineering blogs. Slow but high-quality. The
+  Anthropic + OpenAI sitemap-diff sources also sit here — they surface
+  official quiet updates we'd otherwise miss.
+- **Tier 4** — Systems / language community + ArXiv (cs.AI, cs.CL,
+  cs.LG, cs.PL, cs.DC) + Hugging Face trending. Depth, not breadth.
+- **Tier 5** — Adjacent (Quanta etc.). Occasional cross-pollination.
 
-- https://app.daily.dev/
-- https://blog.gslin.org/
+## Source types
 
-## Tier 3 — Big-tech engineering blogs
+The `type` field on each record dispatches to a fetcher:
 
-- https://blog.cloudflare.com/
-- https://netflixtechblog.com/
-- https://engineering.fb.com/
-- https://github.blog/category/engineering/
-- https://devblogs.microsoft.com/
-- https://stripe.com/blog/engineering
-- https://dropbox.tech/
-- https://discord.com/category/engineering
-- https://slack.engineering/
-- https://www.linkedin.com/blog/engineering
-- https://engineering.atspotify.com/
-- https://medium.com/@Pinterest_Engineering
-- https://dropbox.tech/
-- https://www.uber.com/en-TW/blog/taipei/engineering/
-- https://www.notion.com/zh-tw/blog
-- https://techblog.lycorp.co.jp/en
-- https://developer.squareup.com/blog/
-- https://www.docker.com/blog/
-- https://blogs.nvidia.com/
-- https://developers.googleblog.com/en/
+- `html_index` — front page / archive page. Handed to Claude's `WebFetch`
+  tool for LLM summarisation. Most sources are this.
+- `arxiv` — arXiv Atom export. Parsed locally; no LLM needed.
+- `hf` — Hugging Face Hub JSON API for models/datasets.
+- `sitemap` — `sitemap.xml`. Diffed against `src/_data/web-state.json`
+  per-URL `lastmod`. Only changed URLs become candidates.
+- `lobsters_json` — Lobsters `hottest.json`. Cleaner than scraping the
+  HTML.
 
-## Tier 4 — Systems / language community
+## Adding a source
 
-- https://wanghenshui.github.io/cppweeklynews/
-- https://meetingcpp.com/blog/blogroll/
-- https://cpp.libhunt.com/
-- https://blog.algomaster.io/
-- https://blog.bytebytego.com/archive (use /archive — the root is a landing page)
-- https://newsletter.systemdesigncodex.com/
-- https://blog.codingconfessions.com/
-- https://www.f5.com/company/blog/pillar/nginx
-- https://blog.nginx.org/
+1. Append a record to `src/_data/sources.yml` with a unique `id`.
+2. Pick the tier honestly (would you want this to be the reason the
+   skill fails-fast today? No → not tier 1).
+3. Pick a type. If none fits, you need a new fetcher in
+   `skills/daily-news/scripts/fetchers/` — write it with a test first.
+4. Run `npm run sources:list` to confirm it loads.
+5. Run `npm run sources:dry-run -- --id=<your-id>` to confirm it fetches.
 
-## Tier 5 — Adjacent
+## Fetch rules (unchanged)
 
-- https://www.quantamagazine.org/
-- https://medium.com/better-practices
-
-## Fetch rules
-
-- **Per source**: collect top 5–10 items from the last ~24h (since-yesterday
-  cutoff). If a site doesn't expose freshness, take the top-of-page items.
+- **Per source**: collect top 5–10 items from the last ~24h. If a site
+  doesn't expose freshness, take the top-of-page items.
 - **Total candidate pool**: aim for ~50–100 items before scoring.
-- **De-duplicate URLs** across sources before scoring — the same Cloudflare
-  blog post appearing on HN should be one candidate, not two.
-- **Failures are not fatal**: skip a failing source, log it in the PR body,
-  continue. Only fail-fast if fewer than 5 sources succeed.
+- **De-duplicate URLs** across sources before scoring — the same
+  Cloudflare blog post appearing on HN should be one candidate.
+- **Failures are not fatal**: skip a failing source, log it in the PR
+  body, continue. Only fail-fast if fewer than 5 sources succeed.
 
 ## What the skill records per item
 
