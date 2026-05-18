@@ -50,10 +50,15 @@ Useful one-offs:
 ```shell
 npm run og                                    # rebuild OG images
 npm run card                                  # rebuild today.svg
+npm run social                                # rebuild repo social preview
 npm run sigil                                 # rebuild sigil webp variants
 npm run sources:list                          # list daily-news sources
 npm run sources:dry-run -- --type=arxiv       # dry-fetch one source type
 ```
+
+The repo's GitHub social preview image is `src/static/social-preview.png`
+(1280×640). After regenerating, upload via the GitHub web UI at
+*Settings → Social preview*.
 
 ## Deploy
 
