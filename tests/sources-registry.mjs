@@ -115,3 +115,63 @@ test("html-index fetcher returns deferred sentinel", async () => {
   assert.equal(deferred.kind, "webfetch");
   assert.equal(deferred.source_id, "hn");
 });
+
+test("hf fetcher throws on non-OK HTTP", async () => {
+  const record = { id: "hf-trending-models", tier: 4, url: "https://example/api" };
+  const ctx = { fetchImpl: async () => ({ ok: false, status: 503 }) };
+  await assert.rejects(() => hfFetch(record, ctx), /hf-trending-models.*503/);
+});
+
+test("hf fetcher throws when payload is not an array", async () => {
+  const record = { id: "hf-trending-models", tier: 4, url: "https://example/api" };
+  const ctx = { fetchImpl: async () => ({ ok: true, json: async () => ({ wrong: "shape" }) }) };
+  await assert.rejects(() => hfFetch(record, ctx), /not an array/);
+});
+
+test("lobsters-json fetcher throws on non-OK HTTP", async () => {
+  const record = { id: "lobsters-json", tier: 1, url: "https://example/api" };
+  const ctx = { fetchImpl: async () => ({ ok: false, status: 429 }) };
+  await assert.rejects(() => lobstersFetch(record, ctx), /lobsters-json.*429/);
+});
+
+test("sitemap-diff with no <url> entries yields no candidates", async () => {
+  const record = { id: "anthropic-sitemap", tier: 3, url: "https://example/sitemap.xml" };
+  const ctx = {
+    fetchImpl: async () => ({
+      ok: true,
+      text: async () => `<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"></urlset>`,
+    }),
+    priorState: {},
+  };
+  const { candidates, state_diff } = await sitemapFetch(record, ctx);
+  assert.deepEqual(candidates, []);
+  assert.deepEqual(state_diff, {});
+});
+
+test("sitemap-diff skips unchanged urls even when present in feed", async () => {
+  // Same fixture as the existing sitemap test, but priorState includes ALL three
+  // entries — so nothing should appear as a candidate.
+  const xml = readFileSync(
+    new URL("./fixtures/anthropic-sitemap-sample.xml", import.meta.url),
+    "utf8"
+  );
+  const record = { id: "anthropic-sitemap", tier: 3, url: "https://example/sitemap.xml" };
+  const ctx = {
+    fetchImpl: async () => ({ ok: true, text: async () => xml }),
+    priorState: {
+      "https://www.anthropic.com/news/post-a": "2026-05-18",
+      "https://www.anthropic.com/news/post-b": "2026-05-17",
+      "https://www.anthropic.com/about": "2025-01-01",
+    },
+  };
+  const { candidates, state_diff } = await sitemapFetch(record, ctx);
+  assert.equal(candidates.length, 0);
+  assert.equal(Object.keys(state_diff).length, 3);
+});
+
+test("html-index sentinel propagates tier and url", async () => {
+  const record = { id: "cloudflare-blog", tier: 3, url: "https://blog.cloudflare.com/" };
+  const { deferred } = await htmlIndexFetch(record);
+  assert.equal(deferred.source_tier, 3);
+  assert.equal(deferred.url, "https://blog.cloudflare.com/");
+});
