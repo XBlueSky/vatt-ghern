@@ -72,7 +72,38 @@ Already covered in `design-system.md`. Reiterated here because widgets are
 the most likely place for someone to drop in a `stroke="#ff6b35"` and break
 dark mode.
 
-### 5. No external assets
+### 5. ViewBox sizing — design for the desktop breakout width
+
+Deep-story figures render inside `<figure>`, which breaks out of the
+prose column on desktop. Current caps:
+
+| Viewport | `<figure>` width |
+|---|---|
+| ≥1280 px | up to 960 px |
+| 900-1279 px | up to 880 px |
+| <900 px (mobile) | viewport-1× gutter (essentially full screen) |
+
+Pick viewBox aspect + size for these widths. Common shapes:
+
+- **Timeline / sequence (wide-flat)**: `viewBox="0 0 720 200"` or
+  `0 0 880 240`. Lets time labels and event circles space out.
+- **Architecture (wider, taller)**: `0 0 720 320` or `0 0 880 360`.
+  Boxes + arrows for 3-6 components.
+- **Bar chart / metric viz**: `0 0 720 240` or `0 0 880 280`. Y-axis
+  labels need room.
+- **Comparison row-of-cells**: `0 0 880 200` so each cell stays >100 px
+  wide at desktop.
+
+Avoid `0 0 480 200` and similar narrow viewBoxes inherited from older
+posts — they leave half the available width empty on desktop.
+
+Inline `<text>` element font-size should account for the rendered
+width: at 960 px wide with `viewBox="0 0 880 …"`, a `font-size="14"`
+text node renders ~15.3 px on screen — fine for labels but small for
+chart titles. Use `font-size="16"` or `18` for titles, `12-14` for
+labels.
+
+### 6. No external assets
 
 No `<image href="https://external.cdn/...">`, no `@font-face` from external
 URLs in widget CSS, no `<script src="https://cdn...">`. Widgets stay

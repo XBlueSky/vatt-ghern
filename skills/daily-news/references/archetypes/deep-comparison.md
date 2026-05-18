@@ -40,10 +40,14 @@ decision rule. Name each axis H2 *after what the axis actually measures*
 
 ## Required structure (universal contract)
 
+Hero block (see `archetypes.md § Hero contract` for full rules — opener
+DOM-first but visually after h1; opener writes as a pull-quote, 1-2
+sentences, self-contained):
+
 ```html
 <header class="vg-deep-hero">
-  <p class="vg-deep-opener">{{HOOK — why this comparison matters
-  *now* (a deadline, a deprecation, a release that changes the
+  <p class="vg-deep-opener">{{HOOK — 1-2 sentences: why this comparison
+  matters *now* (a deadline, a deprecation, a release that changes the
   calculation)}}</p>
   <h1 class="vg-post-title">{{TITLE — typically contains "vs" or
   "之間如何選"}}</h1>

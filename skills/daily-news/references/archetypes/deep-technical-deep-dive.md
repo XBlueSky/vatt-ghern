@@ -40,10 +40,14 @@ unlocks. Name each H2 *after the actual component or concept*.
 
 ## Required structure (universal contract)
 
+Hero block (see `archetypes.md § Hero contract` for full rules — opener
+DOM-first but visually after h1; opener writes as a pull-quote, 1-2
+sentences, self-contained):
+
 ```html
 <header class="vg-deep-hero">
-  <p class="vg-deep-opener">{{HOOK — a counter-intuitive design choice,
-  a clever trick, a constraint that drove the design}}</p>
+  <p class="vg-deep-opener">{{HOOK — 1-2 sentences: a counter-intuitive
+  design choice, a clever trick, a constraint that drove the design}}</p>
   <h1 class="vg-post-title">{{TITLE}}</h1>
 </header>
 
@@ -82,7 +86,7 @@ methodology):
 ## Recommended widgets
 
 1. **Architecture diagram**: show the components and their connections.
-   ViewBox `0 0 480 200` or `0 0 720 240`. Boxes for components, lines
+   ViewBox `0 0 720 280` or `0 0 880 360`. Boxes for components, lines
    for data flow.
 2. **Data viz**: a measurement that proves the design works — throughput,
    memory profile, latency distribution. Real numbers from the source.

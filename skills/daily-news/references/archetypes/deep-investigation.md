@@ -46,10 +46,14 @@ proposed.
 
 ## Required structure (universal contract)
 
+Hero block (see `archetypes.md § Hero contract` for full rules — opener
+DOM-first but visually after h1; opener writes as a pull-quote, 1-2
+sentences, self-contained):
+
 ```html
 <header class="vg-deep-hero">
-  <p class="vg-deep-opener">{{HOOK — the counter-intuitive observation
-  itself, stated as the puzzle}}</p>
+  <p class="vg-deep-opener">{{HOOK — 1-2 sentences: the counter-intuitive
+  observation itself, stated as the puzzle}}</p>
   <h1 class="vg-post-title">{{TITLE}}</h1>
 </header>
 
@@ -92,8 +96,9 @@ Free. For investigations, common shapes:
 ## Recommended widgets
 
 1. **Metrics chart**: show the anomaly visually. ViewBox commonly
-   `0 0 480 160` or `0 0 600 200`. Y-axis for the metric, X-axis for
-   time / config / parameter. Mark the surprising point.
+   `0 0 720 240` or `0 0 880 280`. Y-axis for the metric, X-axis for
+   time / config / parameter. Mark the surprising point. See
+   `widget-isolation.md § 5` for breakout sizing.
 2. **Flame graph or call sequence**: reveal the truth. Boxes for
    functions, dashed arrows for the unexpected path.
 

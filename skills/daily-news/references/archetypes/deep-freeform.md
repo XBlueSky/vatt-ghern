@@ -24,11 +24,14 @@ can see the call.
 
 ## Required structure (universal contract)
 
-The skill MUST emit:
+The skill MUST emit (see `archetypes.md § Hero contract` for full
+rules including the opener-DOM-first / h1-renders-first convention
+and the opener-as-pull-quote writing guidance):
 
 - `<h1 class="vg-post-title">` with the post title
-- `<p class="vg-deep-opener">` with the hook (a scene, question, or
-  reframing — pulls the reader in before technical content begins)
+- `<p class="vg-deep-opener">` with the hook (1-2 sentences,
+  self-contained — a scene, question, number, or counter-intuitive
+  observation that stands alone as a pull-quote)
 - `<p class="vg-deep-closer">` near the end, containing a `<strong>`
   with a closing label (free phrasing — any label that signals "this
   is the wrap")

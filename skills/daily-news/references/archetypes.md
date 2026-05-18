@@ -56,6 +56,59 @@ Each post lives in `src/posts/YYYY/MM/DD/<slug>.{html,11tydata.json}`.
 `deep_archetype` is REQUIRED for `archetype: "daily-deep-story"` posts
 and OMITTED for `daily-roundup`. publish.mjs enforces presence.
 
+### Hero contract (deep-story only)
+
+Every deep-story emits this `<header>` block at the top of the body:
+
+```html
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">{{HOOK}}</p>
+  <h1 class="vg-post-title">{{TITLE}}</h1>
+</header>
+```
+
+**Why opener is in the DOM before h1**: the universal-contract check
+greps for `.vg-deep-opener` and `<h1 class="vg-post-title">` as siblings
+of `.vg-deep-hero`. Keeping opener as the first child is the historical
+convention and is what `tests/archetype-check.mjs` validates.
+
+**Why the rendered order is h1-then-opener**: site.css applies
+`.vg-deep-hero { display: flex; flex-direction: column }` plus
+`order: 0` on the title and `order: 1` on the opener, so sighted
+readers see article identity first and the hook second. Screen-reader
+order matches the DOM and is unaffected.
+
+**Opener writing rules** — because it renders as a *pull-quote* (italic
+Spectral, ink-deep color, left accent rule, fs-md), write it to stand
+alone:
+
+- One or two sentences max. A pull-quote that runs four sentences feels
+  like a stuck intro, not a hook.
+- Self-contained — does not start with "之後" / "因此" / "所以" or any
+  back-reference that needs the body to make sense.
+- Concrete: a scene, a quote, a number, a question, a counter-intuitive
+  observation. Not a topic summary ("this post is about CDC").
+- Independent of the title — the opener and h1 should *each* be the
+  best version of itself, not redundant. If the opener restates the
+  title, rewrite the opener.
+
+Bad opener (echoes title, hedges):
+
+```
+BuildBuddy 在 Bazel 中啟用了 content-defined chunking，這項技術讓檔案
+dedup 變得更有效，本文將深入解析其運作原理與實際成效。
+```
+
+Good opener (concrete, self-standing):
+
+```
+Bazel 的 remote cache 早就會 dedup——只要兩個 action 產出 byte-for-byte
+相同的輸出，第二份不會佔新的儲存。問題出在「99% 相同的輸出」這種情況。
+```
+
+The h1 then names the post: `BuildBuddy 把 FastCDC 帶進 Bazel——300 TiB
+重複資料消失`. Together: hook → identity.
+
 ### Design system hygiene (apply to ALL archetypes)
 
 - All inline SVG uses `var(--accent)` / `var(--ink)` / `var(--muted)` / etc.

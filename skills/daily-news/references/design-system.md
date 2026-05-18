@@ -66,14 +66,15 @@ Bespoke posts (`.vg-main:has(.vg-post)`) get up to `min(1080px, full-gutter)`.
 | `.vg-card-roundup` | A roundup item card |
 | `.vg-card-roundup-num` | `#NN` numeral |
 | `.vg-card-title` | Card title (Spectral 600) |
-| `.vg-card-lede` | Card lede (IM Fell italic) |
-| `.vg-card-progress` | "N / 10 已閱" line |
+| `.vg-card-lede` | Card lede (Spectral roman, fs-sm) |
+| `.vg-card-progress` | "N / 10 read" line (Manrope, tabular nums) |
 | `.vg-card-deep` | Deep-story preview card |
-| `.vg-deep-hero` | Deep-story top region |
-| `.vg-deep-opener` | Hook paragraph above title |
-| `.vg-dropcap` | Drop cap span |
-| `.vg-deep-closer` | Take-away wrapper |
-| `.vg-tag` | Tag chip (italic terracotta with `#` prefix) |
+| `.vg-deep-hero` | Deep-story top region — flex column; CSS reverses visual order so h1 renders before opener |
+| `.vg-deep-opener` | Hook paragraph (renders as a pull-quote: italic Spectral, ink-deep, left accent rule, fs-md). DOM-first per universal contract; visually after h1. Write 1-2 self-contained sentences. |
+| `.vg-dropcap` | Drop cap on first paragraph; recommended-not-required. EB Garamond 4.5rem with calibrated baseline offset. |
+| `.vg-deep-closer` | Closer wrapper (IM Fell italic + accent left rule; `<strong>` inside is Manrope small-caps). Closer label is free phrasing. |
+| `.vg-tag` | Tag chip (Manrope 500 uppercase tracking, terracotta with `#` prefix). Lucide-only for icon affordances elsewhere. |
+| `.vg-read-time` | Reading-time pill in `.vg-post-trail` (lucide `book-open` + `N MIN`). Auto-injected by `post.njk` via `readingMinutes` filter — daily-news skill does NOT emit this directly. |
 
 ## Read-tracking attribute conventions
 

@@ -40,9 +40,14 @@ within five seconds. Generic phrasing fails that test.
 
 ## Required structure (universal contract)
 
+Hero block (see `archetypes.md § Hero contract` for full rules — opener
+DOM-first but visually after h1; opener writes as a pull-quote, 1-2
+sentences, self-contained):
+
 ```html
 <header class="vg-deep-hero">
-  <p class="vg-deep-opener">{{HOOK — a scene, a quote, a question}}</p>
+  <p class="vg-deep-opener">{{HOOK — one or two sentences, concrete:
+  a scene, a number, a counter-intuitive observation}}</p>
   <h1 class="vg-post-title">{{TITLE}}</h1>
 </header>
 
@@ -90,11 +95,11 @@ post's voice.
 ## Recommended widgets
 
 1. **Timeline / sequence**: orient the reader in time. ViewBox
-   `0 0 480 80` or `0 0 480 120`. Use `<circle>` for events,
+   `0 0 720 160` or `0 0 880 200`. Use `<circle>` for events,
    `<line>` for the spine, `<text font-family="EB Garamond, serif">`
-   for time labels.
-2. **Architecture / before-after**: show what changed in
-   the system. ViewBox `0 0 480 200` or wider.
+   for time labels. See `widget-isolation.md § 5` for breakout sizing.
+2. **Architecture / before-after**: show what changed in the system.
+   ViewBox `0 0 720 280` or `0 0 880 320`.
 
 ## Sidecar
 

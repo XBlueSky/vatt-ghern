@@ -51,10 +51,14 @@ make every explainer feel like the same post.
 
 ## Required structure (universal contract)
 
+Hero block (see `archetypes.md § Hero contract` for full rules — opener
+DOM-first but visually after h1; opener writes as a pull-quote, 1-2
+sentences, self-contained):
+
 ```html
 <header class="vg-deep-hero">
-  <p class="vg-deep-opener">{{HOOK — "if you don't know X, you probably
-  think it's Y" or "imagine the situation where..."}}</p>
+  <p class="vg-deep-opener">{{HOOK — 1-2 sentences: "if you don't know
+  X, you probably think it's Y", or a scenario the reader recognises}}</p>
   <h1 class="vg-post-title">{{TITLE — typically "what is X" or
   "X, in plain words"}}</h1>
 </header>
