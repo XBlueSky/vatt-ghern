@@ -100,7 +100,7 @@ Index of today's items for 3-minute scan.
       <p class="vg-card-lede">{{2-3_SENTENCES_WHAT_AND_WHY}}</p>
       <p>
         <a href="{{source_url}}">read source →</a>
-        {{IF deep-story exists}} · <a href="{{deep_url}}">deep read ↗</a>{{END}}
+        {{IF deep-story exists}} · <a href="{{deep_url}}">deep read <svg class="vg-icon vg-icon-arrow-up-right" aria-hidden="true" focusable="false" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 7h10v10"/><path d="M7 17 17 7"/></svg></a>{{END}}
         {{IF domain_chip}} · <a class="vg-tag" href="/tags/{{tag}}/">{{tag}}</a>{{END}}
       </p>
     </div>
@@ -122,8 +122,16 @@ post must get the `vg-card-roundup-has-deep` modifier class on the `<article>`:
 <article class="vg-card vg-card-roundup vg-card-roundup-has-deep" id="item-NN" ...>
 ```
 
-This adds a sage-colored corner mark "↗ deep" so readers can scan for which
-items have drill-down content.
+This is reserved as a marker class for future styling hooks. Currently no
+visual treatment is attached; the inline `deep read <arrow-up-right>` link
+inside the meta row is the only deep-story affordance.
+
+All icons in vatt-ghern come from **lucide** (`lucide-static`). Inline
+them as SVG with `class="vg-icon vg-icon-<name>"` and `stroke="currentColor"`
+so they inherit the surrounding text color. Common icons: `arrow-up-right`
+(external link to deep story or source), `check` (read state), `undo-2`
+(unread), `list-checks` (mark all read), `link` (copy link). Do NOT use
+unicode glyphs (↗, ✓, ↶) for chrome icons.
 
 **Domain grouping (mandatory)**: items render in this fixed display order:
 
