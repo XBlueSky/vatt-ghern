@@ -44,6 +44,44 @@ function readWebState() {
   }
 }
 
+function stableStringify(obj) {
+  // Two-level sort: top-level source_ids, then each slot's url keys.
+  // Keeps git diff quiet when content hasn't actually changed.
+  const out = {};
+  for (const id of Object.keys(obj).sort()) {
+    const slot = obj[id];
+    if (slot && typeof slot === "object" && !Array.isArray(slot)) {
+      const sortedSlot = {};
+      for (const k of Object.keys(slot).sort()) sortedSlot[k] = slot[k];
+      out[id] = sortedSlot;
+    } else {
+      out[id] = slot;
+    }
+  }
+  return JSON.stringify(out, null, 2);
+}
+
+/**
+ * Dispatch every (filtered) source in the registry to its fetcher and merge results.
+ *
+ * Per-fetcher ctx contract:
+ *   ctx.fetchImpl   — optional. Defaults to globalThis.fetch. Tests inject mocks here.
+ *   ctx.priorState  — slot for this source from web-state.json (or {}). Shape is
+ *                     fetcher-defined: sitemap-diff uses {[url]: lastmod}; arxiv,
+ *                     hf, lobsters_json, and html_index ignore it.
+ *
+ * Per-fetcher return shape (all optional):
+ *   { candidates, deferred, state_diff }
+ *   - state_diff is the FULL replacement for this source's web-state slot
+ *     (not a delta). The dispatcher merges with a shallow object spread.
+ *
+ * @param {object} opts
+ * @param {{tier?: number, type?: string, id?: string}} [opts.filter]
+ * @param {Function} [opts.fetchImpl]   Injected fetch (for tests).
+ * @param {object} [opts.priorWebState] Pre-loaded web-state object. Skips disk read.
+ * @param {boolean} [opts.writeState]   Persist merged state to web-state.json on success.
+ * @returns {Promise<{candidates: Array, deferred: Array, state_diffs: object, failures: Array}>}
+ */
 export async function fetchAll({ filter = {}, fetchImpl, priorWebState, writeState = false } = {}) {
   const sources = loadSources(filter);
   const priorState = priorWebState ?? readWebState();
@@ -73,8 +111,10 @@ export async function fetchAll({ filter = {}, fetchImpl, priorWebState, writeSta
   }
 
   if (writeState && Object.keys(stateDiffs).length > 0) {
+    // Spread priorState first so source ids NOT in this run keep their slots.
+    // stateDiffs values are full replacements per the fetcher contract above.
     const next = { ...priorState, ...stateDiffs };
-    writeFileSync(WEB_STATE_PATH, JSON.stringify(next, null, 2) + "\n");
+    writeFileSync(WEB_STATE_PATH, stableStringify(next) + "\n");
   }
 
   return { candidates: allCandidates, deferred, state_diffs: stateDiffs, failures };
