@@ -7,6 +7,23 @@
   const DWELL_MS = 5000;
   const SCROLL_RATIO = 0.95;
 
+  // Inline lucide icons for JS-injected buttons (no fetch, no network).
+  // Sourced from node_modules/lucide-static/icons/*.svg at build time.
+  // Stroke uses currentColor so icons follow the surrounding text color
+  // in both light and dark themes.
+  const ICON_BASE = 'xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"';
+  const ICONS = {
+    check: `<svg ${ICON_BASE} class="vg-icon vg-icon-check" aria-hidden="true" focusable="false"><path d="M20 6 9 17l-5-5"/></svg>`,
+    "undo-2": `<svg ${ICON_BASE} class="vg-icon vg-icon-undo-2" aria-hidden="true" focusable="false"><path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 5.5 5.5a5.5 5.5 0 0 1-5.5 5.5H11"/></svg>`,
+    "list-checks": `<svg ${ICON_BASE} class="vg-icon vg-icon-list-checks" aria-hidden="true" focusable="false"><path d="M13 5h8"/><path d="M13 12h8"/><path d="M13 19h8"/><path d="m3 17 2 2 4-4"/><path d="m3 7 2 2 4-4"/></svg>`,
+    "arrow-up-right": `<svg ${ICON_BASE} class="vg-icon vg-icon-arrow-up-right" aria-hidden="true" focusable="false"><path d="M7 7h10v10"/><path d="M7 17 17 7"/></svg>`,
+    "chevrons-up-down": `<svg ${ICON_BASE} class="vg-icon vg-icon-chevrons-up-down" aria-hidden="true" focusable="false"><path d="m7 15 5 5 5-5"/><path d="m7 9 5-5 5 5"/></svg>`,
+    link: `<svg ${ICON_BASE} class="vg-icon vg-icon-link" aria-hidden="true" focusable="false"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>`,
+  };
+  function icon(name) {
+    return ICONS[name] || "";
+  }
+
   function load() {
     try { return JSON.parse(localStorage.getItem(KEY) || "{}"); }
     catch (e) { return {}; }
@@ -52,14 +69,19 @@
   }
 
   function bindManualToggles(state) {
+    function renderToggle(btn, read) {
+      btn.innerHTML = read
+        ? `${icon("undo-2")}<span class="vg-btn-label">unread</span>`
+        : `${icon("check")}<span class="vg-btn-label">read</span>`;
+    }
     document.querySelectorAll("[data-vg-toggle]").forEach((btn) => {
       btn.addEventListener("click", () => {
         const k = btn.getAttribute("data-vg-toggle");
         mark(state, k, !isRead(state, k));
-        btn.textContent = isRead(state, k) ? "↶ unread" : "✓ read";
+        renderToggle(btn, isRead(state, k));
       });
       const k = btn.getAttribute("data-vg-toggle");
-      btn.textContent = isRead(state, k) ? "↶ unread" : "✓ read";
+      renderToggle(btn, isRead(state, k));
     });
   }
 
@@ -98,9 +120,9 @@
       btn.addEventListener("click", async () => {
         try {
           await navigator.clipboard.writeText(location.href);
-          const orig = btn.textContent;
-          btn.textContent = "copied ✓";
-          setTimeout(() => { btn.textContent = orig; }, 1500);
+          const orig = btn.innerHTML;
+          btn.innerHTML = `${icon("check")}<span class="vg-btn-label">copied</span>`;
+          setTimeout(() => { btn.innerHTML = orig; }, 1500);
         } catch (e) { /* clipboard denied — no-op */ }
       });
     });
@@ -152,7 +174,7 @@
       const btn = document.createElement("button");
       btn.type = "button";
       btn.className = "vg-card-roundup-unread-btn";
-      btn.textContent = "↶ unread";
+      btn.innerHTML = `${icon("undo-2")}<span class="vg-btn-label">unread</span>`;
       btn.addEventListener("click", (e) => {
         e.stopPropagation();
         mark(state, key, false);
@@ -183,7 +205,7 @@
       const btn = document.createElement("button");
       btn.type = "button";
       btn.className = "vg-card-roundup-mark-btn";
-      btn.textContent = "✓ mark read";
+      btn.innerHTML = `${icon("check")}<span class="vg-btn-label">mark read</span>`;
       btn.addEventListener("click", (e) => {
         e.stopPropagation();
         if (!isRead(state, key)) mark(state, key, true);
@@ -208,7 +230,7 @@
       const link = document.createElement("button");
       link.type = "button";
       link.className = "vg-card-progress-mark-all";
-      link.textContent = "mark all read";
+      link.innerHTML = `${icon("list-checks")}<span class="vg-btn-label">mark all read</span>`;
       link.addEventListener("click", () => {
         cards.forEach((card) => {
           const k = card.getAttribute("data-vg-readkey-item");
@@ -217,6 +239,53 @@
       });
       progress.parentNode.insertBefore(sep, progress.nextSibling);
       progress.parentNode.insertBefore(link, sep.nextSibling);
+    });
+  }
+
+  // Mobile-only tag-cloud expander.
+  // Two surfaces use chips:
+  //   - /tags page: <ul class="vg-tag-cloud"><li><a class="vg-tag-cloud-item">
+  //   - Post chrome: <nav class="vg-post-trail"><a class="vg-tag">…
+  // For both, collapse to ~first 5 chips on mobile and add a "+N more" toggle.
+  function bindTagCloudExpander() {
+    if (!window.matchMedia("(max-width: 640px)").matches) return;
+
+    document.querySelectorAll(".vg-tag-cloud").forEach((cloud) => {
+      const items = cloud.querySelectorAll("li");
+      if (items.length <= 6) return;
+      cloud.classList.add("vg-tag-cloud-collapsed");
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "vg-tag-cloud-toggle";
+      btn.textContent = "+" + (items.length - 6) + " more";
+      btn.addEventListener("click", () => {
+        const open = cloud.classList.toggle("vg-tag-cloud-collapsed");
+        btn.textContent = open ? "+" + (items.length - 6) + " more" : "− less";
+      });
+      cloud.insertAdjacentElement("afterend", btn);
+      // Start collapsed.
+      cloud.classList.add("vg-tag-cloud-collapsed");
+    });
+
+    document.querySelectorAll(".vg-post-trail").forEach((trail) => {
+      const chips = trail.querySelectorAll(":scope > .vg-tag");
+      if (chips.length <= 5) return;
+      const extras = Array.from(chips).slice(5);
+      extras.forEach((c) => c.classList.add("vg-tag-collapsed-extra"));
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "vg-tag-trail-toggle";
+      btn.textContent = "+" + extras.length + " more";
+      btn.addEventListener("click", () => {
+        const open = extras[0].classList.toggle("vg-tag-collapsed-extra-show");
+        extras.forEach((c, i) => {
+          if (i === 0) return;
+          c.classList.toggle("vg-tag-collapsed-extra-show", open);
+        });
+        btn.textContent = open ? "− less" : "+" + extras.length + " more";
+      });
+      // Inject the button right after the last visible chip (5th).
+      chips[4].insertAdjacentElement("afterend", btn);
     });
   }
 
@@ -232,5 +301,6 @@
     bindRoundupUnreadButton(state);
     bindRoundupMarkReadButton(state);
     bindRoundupMarkAllRead(state);
+    bindTagCloudExpander();
   });
 })();

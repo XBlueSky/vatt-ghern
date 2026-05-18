@@ -56,14 +56,68 @@ Each post lives in `src/posts/YYYY/MM/DD/<slug>.{html,11tydata.json}`.
 `deep_archetype` is REQUIRED for `archetype: "daily-deep-story"` posts
 and OMITTED for `daily-roundup`. publish.mjs enforces presence.
 
+### Hero contract (deep-story only)
+
+Every deep-story emits this `<header>` block at the top of the body:
+
+```html
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">{{HOOK}}</p>
+  <h1 class="vg-post-title">{{TITLE}}</h1>
+</header>
+```
+
+**Why opener is in the DOM before h1**: the universal-contract check
+greps for `.vg-deep-opener` and `<h1 class="vg-post-title">` as siblings
+of `.vg-deep-hero`. Keeping opener as the first child is the historical
+convention and is what `tests/archetype-check.mjs` validates.
+
+**Why the rendered order is h1-then-opener**: site.css applies
+`.vg-deep-hero { display: flex; flex-direction: column }` plus
+`order: 0` on the title and `order: 1` on the opener, so sighted
+readers see article identity first and the hook second. Screen-reader
+order matches the DOM and is unaffected.
+
+**Opener writing rules** — because it renders as a *pull-quote* (italic
+Spectral, ink-deep color, left accent rule, fs-md), write it to stand
+alone:
+
+- One or two sentences max. A pull-quote that runs four sentences feels
+  like a stuck intro, not a hook.
+- Self-contained — does not start with "之後" / "因此" / "所以" or any
+  back-reference that needs the body to make sense.
+- Concrete: a scene, a quote, a number, a question, a counter-intuitive
+  observation. Not a topic summary ("this post is about CDC").
+- Independent of the title — the opener and h1 should *each* be the
+  best version of itself, not redundant. If the opener restates the
+  title, rewrite the opener.
+
+Bad opener (echoes title, hedges):
+
+```
+BuildBuddy 在 Bazel 中啟用了 content-defined chunking，這項技術讓檔案
+dedup 變得更有效，本文將深入解析其運作原理與實際成效。
+```
+
+Good opener (concrete, self-standing):
+
+```
+Bazel 的 remote cache 早就會 dedup——只要兩個 action 產出 byte-for-byte
+相同的輸出，第二份不會佔新的儲存。問題出在「99% 相同的輸出」這種情況。
+```
+
+The h1 then names the post: `BuildBuddy 把 FastCDC 帶進 Bazel——300 TiB
+重複資料消失`. Together: hook → identity.
+
 ### Design system hygiene (apply to ALL archetypes)
 
 - All inline SVG uses `var(--accent)` / `var(--ink)` / `var(--muted)` / etc.
   Never hardcoded hex/rgb. Token list lives in `references/design-system.md`.
 - Use `currentColor` for SVG strokes that should follow theme.
 - Use CJK 全形 punctuation: `：` `，` `、` `。` inside CJK prose. Half-width
-  `:` allowed in English H2s (e.g., investigation's `hypothesis: foo` or
-  comparison's `dimension: bar`).
+  `:` allowed in English H2s (e.g., one valid investigation H2 phrasing is
+  `hypothesis: cache-eviction lock contention`, but the H2 wording is free
+  per the archetype reference — name it after the actual hypothesis).
 - Use CJK 雙破折號 `——` (two em-dashes, full-width) inside CJK prose.
   Never Latin `—` in CJK prose.
 - No emoji. No tracking scripts. No `<style>` blocks (use design system
@@ -99,7 +153,7 @@ Index of today's items for 3-minute scan.
       <p class="vg-card-lede">{{2-3_SENTENCES_WHAT_AND_WHY}}</p>
       <p>
         <a href="{{source_url}}">read source →</a>
-        {{IF deep-story exists}} · <a href="{{deep_url}}">deep read ↗</a>{{END}}
+        {{IF deep-story exists}} · <a href="{{deep_url}}">deep read <svg class="vg-icon vg-icon-arrow-up-right" aria-hidden="true" focusable="false" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 7h10v10"/><path d="M7 17 17 7"/></svg></a>{{END}}
         {{IF domain_chip}} · <a class="vg-tag" href="/tags/{{tag}}/">{{tag}}</a>{{END}}
       </p>
     </div>
@@ -121,8 +175,16 @@ post must get the `vg-card-roundup-has-deep` modifier class on the `<article>`:
 <article class="vg-card vg-card-roundup vg-card-roundup-has-deep" id="item-NN" ...>
 ```
 
-This adds a sage-colored corner mark "↗ deep" so readers can scan for which
-items have drill-down content.
+This is reserved as a marker class for future styling hooks. Currently no
+visual treatment is attached; the inline `deep read <arrow-up-right>` link
+inside the meta row is the only deep-story affordance.
+
+All icons in vatt-ghern come from **lucide** (`lucide-static`). Inline
+them as SVG with `class="vg-icon vg-icon-<name>"` and `stroke="currentColor"`
+so they inherit the surrounding text color. Common icons: `arrow-up-right`
+(external link to deep story or source), `check` (read state), `undo-2`
+(unread), `list-checks` (mark all read), `link` (copy link). Do NOT use
+unicode glyphs (↗, ✓, ↶) for chrome icons.
 
 **Domain grouping (mandatory)**: items render in this fixed display order:
 

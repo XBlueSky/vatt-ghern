@@ -14,12 +14,40 @@ Pick when the topic is a selection / migration / shootout:
 Distinguish from technical-deep-dive: deep-dive explains ONE thing.
 Comparison weighs MULTIPLE things and reaches a recommendation.
 
-## Required structure
+## Shape (the arc, not the wording)
+
+A comparison post does two things: walks 3-5 axes, then offers a
+decision rule. Name each axis H2 *after what the axis actually measures*
+— a `dimension: ` prefix is one valid phrasing among many.
+
+1. (Optional opener context paragraph + an at-a-glance table or SVG.)
+2. **Axis 1** — name it for what it measures in this comparison.
+3. **Axis 2**
+4. **Axis 3** — (3-5 axes total.)
+5. **Decision** — the choice rule. "If your situation is X, pick A;
+   otherwise B." Concrete enough that a reader can self-classify.
+
+### Example H2 sets
+
+- Postgres vs ClickHouse for analytics: `query latency at 1B rows` /
+  `write-path overhead` / `operational maturity` / `ecosystem you
+  inherit` / `pick by workload`
+- gRPC implementations shootout: `wire performance` / `language
+  ergonomics` / `interop and tooling` / `community velocity` / `the
+  call`
+- Postgres 16 → 17 migration: `query-planner gains` / `replication
+  changes` / `extension breakage risk` / `should you upgrade?`
+
+## Required structure (universal contract)
+
+Hero block (see `archetypes.md § Hero contract` for full rules — opener
+DOM-first but visually after h1; opener writes as a pull-quote, 1-2
+sentences, self-contained):
 
 ```html
 <header class="vg-deep-hero">
-  <p class="vg-deep-opener">{{HOOK — why this comparison matters
-  *now* (a deadline, a deprecation, a release that changes the
+  <p class="vg-deep-opener">{{HOOK — 1-2 sentences: why this comparison
+  matters *now* (a deadline, a deprecation, a release that changes the
   calculation)}}</p>
   <h1 class="vg-post-title">{{TITLE — typically contains "vs" or
   "之間如何選"}}</h1>
@@ -29,47 +57,46 @@ Comparison weighs MULTIPLE things and reaches a recommendation.
   <p><span class="vg-dropcap">{{CHAR}}</span>{{intro — name the options
   by full name, state the selection stakes}}</p>
 
-  <!-- An at-a-glance comparison widget: HTML <table> or
-       SVG with class "vg-w-comparison-*" — required (see below). -->
+  <!-- An at-a-glance comparison: HTML <table> or
+       SVG with class "vg-w-comparison-*" — required. -->
 
-  <h2>dimension: {{DIMENSION_1_NAME}}</h2>
-  <!-- e.g., "dimension: write throughput" or "dimension: developer
-       ergonomics". How each option fares on this axis. -->
+  <h2>{{AXIS_1_NAMED_FOR_WHAT_IT_MEASURES}}</h2>
+  <h2>{{AXIS_2_NAMED_FOR_WHAT_IT_MEASURES}}</h2>
+  <h2>{{AXIS_3_NAMED_FOR_WHAT_IT_MEASURES}}</h2>
+  <!-- 3-5 axis sections. -->
 
-  <h2>dimension: {{DIMENSION_2_NAME}}</h2>
+  <h2>{{DECISION_H2 — e.g. "how to choose" or "pick by workload" or
+  "the call"}}</h2>
 
-  <h2>dimension: {{DIMENSION_3_NAME}}</h2>
-  <!-- 3 to 5 dimension sections required. -->
-
-  <h2>how to choose</h2>
-  <!-- The decision. "If your situation is X, pick A; if Y, pick B."
-       Concrete enough that a reader can self-classify and walk away
-       with the answer. -->
-
-  <p class="vg-deep-closer"><strong>Take-away</strong>：{{one sentence —
-  typically "for 80% of cases pick X; only in scenario Z does Y win"}}</p>
+  <p class="vg-deep-closer"><strong>{{CLOSER_LABEL}}</strong>：{{one
+  sentence — typically "for 80% of cases pick X; only in scenario Z
+  does Y win"}}</p>
 </div>
 ```
 
 ## Hard requirements (archetype-check.mjs enforces)
 
-- ≥3 H2 elements matching `dimension: ...` (lowercase prefix, colon,
-  space, then the dimension name)
-- Exactly 1 H2 with text `how to choose`
-- `how to choose` must be the last H2 before the closer
-- Total H2 count: 4 to 6 (3-5 dimensions + 1 how-to-choose)
-- ≥1 HTML `<table>` element OR ≥1 `<svg>` with a class matching
-  `vg-w-comparison-*`
-- Closer label is `Take-away`
-- ≥2 inline `<svg>` widgets total (the comparison-shaped one counts)
-- Universal contract from `deep-freeform.md`
+- 4-6 H2 elements (3-5 axes + decision)
+- `<table>` OR `<svg class="vg-w-comparison-...">` somewhere in body
+- Universal contract (opener, closer with `<strong>`)
+- ≥1 inline `<svg>` (≥2 recommended; the comparison-shaped one counts)
+- Drop cap recommended
+
+### Closer label
+
+Free. For comparisons, common shapes:
+
+- `Take-away` — the rule in one line
+- `The call` — when the post is structured as a verdict
+- `How to choose` — when the answer is conditional
+- `Recommendation`
 
 ## Recommended widgets
 
 1. **At-a-glance comparison**: HTML `<table>` with rows for criteria
    and columns for options, OR SVG row-of-cells with checks/X marks.
-2. **Per-dimension visualization**: in one of the dimension H2 sections,
-   a chart that visualizes the gap (throughput bars, latency CDFs).
+2. **Per-axis visualization**: in one of the axis H2 sections, a chart
+   that visualizes the gap (throughput bars, latency CDFs).
 
 ## Sidecar
 

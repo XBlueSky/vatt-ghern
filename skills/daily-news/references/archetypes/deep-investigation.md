@@ -18,12 +18,42 @@ happened externally. Investigation tells the *inquiry's* internal
 structure — what we thought, what we tried, what was wrong, what was
 right.
 
-## Required structure
+## Shape (the arc, not the wording)
+
+1. **The puzzle** — the counter-intuitive observation itself, stated
+   precisely enough for the reader to feel the wrongness.
+2. **Candidate 1** — what we suspected and why. How we tested it. Why
+   it turned out wrong (or partially right).
+3. **Candidate 2** — (1-3 candidates total.)
+4. **Resolution** — the real root cause. Why it's plausible. Why the
+   wrong candidates pointed elsewhere.
+
+Name H2s for the *actual hypotheses and observations*, not the generic
+labels `observation` / `hypothesis: ...` / `the truth`. A reader
+should know from H2 alone what the puzzle is and what each candidate
+proposed.
+
+### Example H2 sets
+
+- Cache-then-slower regression: `the 30% slowdown after we added the
+  cache` / `theory: cache miss path is expensive` / `theory: lock
+  contention on cache eviction` / `the cause: per-request allocations
+  on the hit path`
+- 10x traffic spike no one launched: `traffic doubled overnight, no
+  campaign ran` / `theory: bot scrape` / `theory: leaked share-link` /
+  `theory: client retry storm` / `the cause: a Slack share preview
+  unfurled for 200k users`
+
+## Required structure (universal contract)
+
+Hero block (see `archetypes.md § Hero contract` for full rules — opener
+DOM-first but visually after h1; opener writes as a pull-quote, 1-2
+sentences, self-contained):
 
 ```html
 <header class="vg-deep-hero">
-  <p class="vg-deep-opener">{{HOOK — the counter-intuitive observation
-  itself, stated as the puzzle}}</p>
+  <p class="vg-deep-opener">{{HOOK — 1-2 sentences: the counter-intuitive
+  observation itself, stated as the puzzle}}</p>
   <h1 class="vg-post-title">{{TITLE}}</h1>
 </header>
 
@@ -31,44 +61,44 @@ right.
   <p><span class="vg-dropcap">{{CHAR}}</span>{{intro — set up the
   puzzle, hint that "we thought X, it turned out not to be X"}}</p>
 
-  <h2>observation</h2>
-  <!-- Describe the puzzle precisely. Widget #1: metrics chart showing
-       the surprising thing. -->
+  <h2>{{PUZZLE_NAMED_FOR_TOPIC}}</h2>
+  <!-- Widget #1 often goes here: metrics chart showing the surprise. -->
 
-  <h2>hypothesis: {{HYPOTHESIS_1_SHORT_NAME}}</h2>
-  <!-- What we suspected and why. How we tested it. Why it turned out
-       wrong (or partially right). -->
+  <h2>{{CANDIDATE_1_NAMED_FOR_TOPIC}}</h2>
+  <h2>{{CANDIDATE_2_NAMED_FOR_TOPIC}}</h2>
+  <!-- 1-3 candidate sections. -->
 
-  <h2>hypothesis: {{HYPOTHESIS_2_SHORT_NAME}}</h2>
-  <!-- (1 to 3 hypothesis sections total. At least 1 required.) -->
+  <h2>{{RESOLUTION_NAMED_FOR_TOPIC}}</h2>
+  <!-- Widget #2 often goes here: flame graph, call stack, or sequence
+       revealing the cause. -->
 
-  <h2>the truth</h2>
-  <!-- The real root cause. Why it's plausible. Why the wrong
-       hypotheses pointed elsewhere. Widget #2: flame graph,
-       call stack, or sequence diagram revealing the cause. -->
-
-  <p class="vg-deep-closer"><strong>Take-away</strong>：{{one sentence
-  methodology lesson — "next time you see X, look at Y first"}}</p>
+  <p class="vg-deep-closer"><strong>{{CLOSER_LABEL}}</strong>：{{one
+  sentence methodology lesson — "next time you see X, look at Y first"}}</p>
 </div>
 ```
 
 ## Hard requirements (archetype-check.mjs enforces)
 
-- H2 sequence: `observation` first, `the truth` last, with one or more
-  H2 elements starting with `hypothesis: ` between them
-- All H2 text in lowercase English; `hypothesis: ` H2s use the literal
-  prefix `hypothesis: ` (lowercase, colon, space) followed by a short
-  name
-- 1 to 3 `hypothesis: ...` sections
-- Closer label is `Take-away`
-- ≥2 inline `<svg>` widgets
-- Universal contract from `deep-freeform.md`
+- 3-6 H2 elements (puzzle + 1-3 candidates + resolution)
+- Universal contract (opener, closer with `<strong>`)
+- ≥1 inline `<svg>` (≥2 recommended)
+- Drop cap recommended
+
+### Closer label
+
+Free. For investigations, common shapes:
+
+- `Take-away` — the methodology lesson
+- `The lesson` — emphasises craft
+- `Next time` — when the post is about what to check first
+- `What we missed`
 
 ## Recommended widgets
 
 1. **Metrics chart**: show the anomaly visually. ViewBox commonly
-   `0 0 480 160` or `0 0 600 200`. Y-axis for the metric, X-axis for
-   time / config / parameter. Mark the surprising point.
+   `0 0 720 240` or `0 0 880 280`. Y-axis for the metric, X-axis for
+   time / config / parameter. Mark the surprising point. See
+   `widget-isolation.md § 5` for breakout sizing.
 2. **Flame graph or call sequence**: reveal the truth. Boxes for
    functions, dashed arrows for the unexpected path.
 

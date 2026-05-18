@@ -1,7 +1,48 @@
 import rssPlugin from "@11ty/eleventy-plugin-rss";
+import { readFileSync, existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const LUCIDE_DIR = join(__dirname, "node_modules", "lucide-static", "icons");
+const LUCIDE_CACHE = new Map();
+
+function lucideIcon(name, extraClass = "", ariaLabel = "") {
+  const cacheKey = `${name}|${extraClass}|${ariaLabel}`;
+  if (LUCIDE_CACHE.has(cacheKey)) return LUCIDE_CACHE.get(cacheKey);
+  const path = join(LUCIDE_DIR, `${name}.svg`);
+  if (!existsSync(path)) {
+    throw new Error(`lucide icon not found: ${name} (looked at ${path})`);
+  }
+  let svg = readFileSync(path, "utf8").trim();
+  // Inject vg-icon class + optional extra class; aria-label if given,
+  // otherwise mark decorative. Stroke uses currentColor (lucide default).
+  const cls = ["vg-icon", `vg-icon-${name}`, extraClass].filter(Boolean).join(" ");
+  const a11y = ariaLabel
+    ? `role="img" aria-label="${ariaLabel.replace(/"/g, "&quot;")}"`
+    : `aria-hidden="true" focusable="false"`;
+  // Replace lucide's built-in class with our class set; if no class
+  // attr present, inject one. Then add a11y attrs (overwriting any
+  // existing aria-hidden/role on the SVG).
+  if (/\sclass="[^"]*"/.test(svg)) {
+    svg = svg.replace(/\sclass="[^"]*"/, ` class="${cls}"`);
+  } else {
+    svg = svg.replace(/<svg/, `<svg class="${cls}"`);
+  }
+  svg = svg.replace(/\s(aria-hidden|aria-label|role|focusable)="[^"]*"/g, "");
+  svg = svg.replace(/<svg/, `<svg ${a11y}`);
+  LUCIDE_CACHE.set(cacheKey, svg);
+  return svg;
+}
 
 export default function (eleventyConfig) {
   eleventyConfig.addPlugin(rssPlugin);
+
+  // Inline lucide SVG icon. Usage:
+  //   {% lucide "check" %}                      decorative
+  //   {% lucide "chevron-left", "vg-mn-arrow", "previous month" %}
+  // currentColor stroke so SVG follows surrounding text color in both themes.
+  eleventyConfig.addShortcode("lucide", lucideIcon);
 
   // Asset passthrough inside posts (images, videos, CSVs, PDFs — no JSON sidecars).
   eleventyConfig.addPassthroughCopy(
@@ -110,6 +151,28 @@ export default function (eleventyConfig) {
     if (isNaN(dt)) return "";
     return `${String(dt.getUTCMonth() + 1).padStart(2, "0")}.${String(dt.getUTCDate()).padStart(2, "0")}`;
   });
+  eleventyConfig.addFilter("dayNum", (d) => {
+    const dt = d ? new Date(d) : new Date();
+    if (isNaN(dt)) return "";
+    return String(dt.getUTCDate()).padStart(2, "0");
+  });
+
+  // Reading-time estimator for bilingual zh-Hant + English prose.
+  // CJK chars at 350/min, Latin words at 250/min, then sum; ceil to int.
+  // Strips HTML tags + <style>/<script> blocks + comments before counting.
+  eleventyConfig.addFilter("readingMinutes", (html) => {
+    if (!html || typeof html !== "string") return 1;
+    let text = html
+      .replace(/<style[\s\S]*?<\/style>/gi, "")
+      .replace(/<script[\s\S]*?<\/script>/gi, "")
+      .replace(/<!--[\s\S]*?-->/g, "")
+      .replace(/<[^>]+>/g, " ");
+    const cjkMatches = text.match(/[㐀-鿿　-〿＀-￯]/g) || [];
+    const latinText = text.replace(/[㐀-鿿　-〿＀-￯]/g, " ");
+    const latinWords = (latinText.match(/[A-Za-z0-9][A-Za-z0-9'\-]*/g) || []).length;
+    const minutes = cjkMatches.length / 350 + latinWords / 250;
+    return Math.max(1, Math.ceil(minutes));
+  });
   eleventyConfig.addFilter("dateHuman", (d) => {
     const dt = d ? new Date(d) : new Date();
     if (isNaN(dt)) return "";
@@ -136,6 +199,103 @@ export default function (eleventyConfig) {
       out.get(key).push(d);
     }
     return [...out.entries()].map(([weekLabel, days]) => ({ weekLabel, days }));
+  });
+
+  // Group days by calendar month for the archive page.
+  // Returns [{ monthKey: "2026-05", monthLabel: "2026.05", year, month (1-12),
+  //            weeks: [{ weekLabel, days: [...] }], calendar: [{ row: [cells…] }],
+  //            firstDay, lastDay, postCount }, ...] newest month first.
+  //
+  // `calendar` is a 6×7 grid of cells for a month-view render. Each cell:
+  //   { day: 1..31 | null, iso: "YYYY-MM-DD" | null,
+  //     hasPosts: boolean, postsCount: number,
+  //     roundupUrl?: string, anchor?: "d-DD" }
+  eleventyConfig.addFilter("groupByMonth", (days) => {
+    if (!Array.isArray(days)) return [];
+    const byMonth = new Map();
+    for (const d of days) {
+      const dt = new Date(d.date);
+      const key = `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, "0")}`;
+      if (!byMonth.has(key)) byMonth.set(key, []);
+      byMonth.get(key).push(d);
+    }
+    const monthsAsc = [...byMonth.entries()].sort(([a], [b]) => a.localeCompare(b));
+    const out = monthsAsc.map(([monthKey, monthDays]) => {
+      const [yStr, mStr] = monthKey.split("-");
+      const year = Number(yStr);
+      const month = Number(mStr); // 1-12
+
+      // Build 6×7 calendar grid (Sunday-anchored). UTC throughout so day
+      // numbers match post dates regardless of server timezone.
+      const firstOfMonth = new Date(Date.UTC(year, month - 1, 1));
+      const lastOfMonth = new Date(Date.UTC(year, month, 0)); // day 0 of next = last day
+      const startWeekday = firstOfMonth.getUTCDay(); // 0=Sun
+      const daysInMonth = lastOfMonth.getUTCDate();
+      const daysByNum = new Map();
+      for (const d of monthDays) {
+        const dt = new Date(d.date);
+        daysByNum.set(dt.getUTCDate(), d);
+      }
+      const cells = [];
+      // Leading blanks
+      for (let i = 0; i < startWeekday; i++) cells.push({ day: null });
+      // Real days
+      for (let d = 1; d <= daysInMonth; d++) {
+        const dayData = daysByNum.get(d);
+        const iso = `${year}-${String(month).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+        if (dayData) {
+          const roundup = dayData.posts.find((p) => p.data.archetype === "daily-roundup");
+          cells.push({
+            day: d,
+            iso,
+            hasPosts: true,
+            postsCount: dayData.posts.length,
+            roundupUrl: roundup ? roundup.url : null,
+            anchor: `d-${String(d).padStart(2, "0")}`,
+          });
+        } else {
+          cells.push({ day: d, iso, hasPosts: false, postsCount: 0 });
+        }
+      }
+      // Trailing blanks to complete the final week (multiple of 7)
+      while (cells.length % 7) cells.push({ day: null });
+      // Slice into rows for easier njk iteration
+      const rows = [];
+      for (let i = 0; i < cells.length; i += 7) rows.push(cells.slice(i, i + 7));
+
+      // Also reuse the week grouping for the per-month week list
+      const weekOut = new Map();
+      for (const d of monthDays) {
+        const dt = new Date(d.date);
+        const onejan = new Date(dt.getFullYear(), 0, 1);
+        const week = Math.ceil((((dt - onejan) / 86400000) + onejan.getDay() + 1) / 7);
+        const wkey = `${dt.getFullYear()}-W${String(week).padStart(2, "0")}`;
+        if (!weekOut.has(wkey)) weekOut.set(wkey, []);
+        weekOut.get(wkey).push(d);
+      }
+      const weeks = [...weekOut.entries()]
+        .sort(([a], [b]) => b.localeCompare(a))
+        .map(([weekLabel, days]) => ({
+          weekLabel,
+          days: days.sort((a, b) => b.date.localeCompare(a.date)),
+        }));
+
+      const postCount = monthDays.reduce((acc, d) => acc + d.posts.length, 0);
+      return {
+        monthKey,
+        monthLabel: `${year}.${String(month).padStart(2, "0")}`,
+        year,
+        month,
+        rows,
+        weeks,
+        firstDay: monthDays[monthDays.length - 1]?.date,
+        lastDay: monthDays[0]?.date,
+        dayCount: monthDays.length,
+        postCount,
+      };
+    });
+    // Newest month first for top-of-page rendering, but keep navigation linear.
+    return out.reverse();
   });
 
   return {
