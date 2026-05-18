@@ -156,6 +156,23 @@ export default function (eleventyConfig) {
     if (isNaN(dt)) return "";
     return String(dt.getUTCDate()).padStart(2, "0");
   });
+
+  // Reading-time estimator for bilingual zh-Hant + English prose.
+  // CJK chars at 350/min, Latin words at 250/min, then sum; ceil to int.
+  // Strips HTML tags + <style>/<script> blocks + comments before counting.
+  eleventyConfig.addFilter("readingMinutes", (html) => {
+    if (!html || typeof html !== "string") return 1;
+    let text = html
+      .replace(/<style[\s\S]*?<\/style>/gi, "")
+      .replace(/<script[\s\S]*?<\/script>/gi, "")
+      .replace(/<!--[\s\S]*?-->/g, "")
+      .replace(/<[^>]+>/g, " ");
+    const cjkMatches = text.match(/[㐀-鿿　-〿＀-￯]/g) || [];
+    const latinText = text.replace(/[㐀-鿿　-〿＀-￯]/g, " ");
+    const latinWords = (latinText.match(/[A-Za-z0-9][A-Za-z0-9'\-]*/g) || []).length;
+    const minutes = cjkMatches.length / 350 + latinWords / 250;
+    return Math.max(1, Math.ceil(minutes));
+  });
   eleventyConfig.addFilter("dateHuman", (d) => {
     const dt = d ? new Date(d) : new Date();
     if (isNaN(dt)) return "";
