@@ -220,23 +220,50 @@
     });
   }
 
-  // Mobile-only tag-cloud expander. CSS clips .vg-tag-cloud to two rows
-  // under 640px; this adds a single "+N more" link that toggles the
-  // .vg-tag-cloud-expanded class so the rest can be revealed.
+  // Mobile-only tag-cloud expander.
+  // Two surfaces use chips:
+  //   - /tags page: <ul class="vg-tag-cloud"><li><a class="vg-tag-cloud-item">
+  //   - Post chrome: <nav class="vg-post-trail"><a class="vg-tag">…
+  // For both, collapse to ~first 5 chips on mobile and add a "+N more" toggle.
   function bindTagCloudExpander() {
     if (!window.matchMedia("(max-width: 640px)").matches) return;
+
     document.querySelectorAll(".vg-tag-cloud").forEach((cloud) => {
       const items = cloud.querySelectorAll("li");
       if (items.length <= 6) return;
+      cloud.classList.add("vg-tag-cloud-collapsed");
       const btn = document.createElement("button");
       btn.type = "button";
       btn.className = "vg-tag-cloud-toggle";
       btn.textContent = "+" + (items.length - 6) + " more";
       btn.addEventListener("click", () => {
-        const open = cloud.classList.toggle("vg-tag-cloud-expanded");
-        btn.textContent = open ? "− less" : "+" + (items.length - 6) + " more";
+        const open = cloud.classList.toggle("vg-tag-cloud-collapsed");
+        btn.textContent = open ? "+" + (items.length - 6) + " more" : "− less";
       });
       cloud.insertAdjacentElement("afterend", btn);
+      // Start collapsed.
+      cloud.classList.add("vg-tag-cloud-collapsed");
+    });
+
+    document.querySelectorAll(".vg-post-trail").forEach((trail) => {
+      const chips = trail.querySelectorAll(":scope > .vg-tag");
+      if (chips.length <= 5) return;
+      const extras = Array.from(chips).slice(5);
+      extras.forEach((c) => c.classList.add("vg-tag-collapsed-extra"));
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "vg-tag-trail-toggle";
+      btn.textContent = "+" + extras.length + " more";
+      btn.addEventListener("click", () => {
+        const open = extras[0].classList.toggle("vg-tag-collapsed-extra-show");
+        extras.forEach((c, i) => {
+          if (i === 0) return;
+          c.classList.toggle("vg-tag-collapsed-extra-show", open);
+        });
+        btn.textContent = open ? "− less" : "+" + extras.length + " more";
+      });
+      // Inject the button right after the last visible chip (5th).
+      chips[4].insertAdjacentElement("afterend", btn);
     });
   }
 
