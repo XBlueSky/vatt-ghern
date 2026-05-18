@@ -49,6 +49,7 @@ export default function (eleventyConfig) {
     "src/posts/**/*.{png,jpg,jpeg,gif,svg,webp,avif,mp4,webm,csv,pdf}"
   );
   eleventyConfig.addPassthroughCopy({ "src/static": "static" });
+  eleventyConfig.addPassthroughCopy({ "src/robots.txt": "robots.txt" });
 
   // Self-host fonts via fontsource. Mirror files/ (woff2 + woff) for each
   // family, plus the specific weight-CSS files we actually use.
