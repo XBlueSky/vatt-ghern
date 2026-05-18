@@ -8,6 +8,7 @@ import { fetch as hfFetch } from "../skills/daily-news/scripts/fetchers/hf.mjs";
 import { fetch as lobstersFetch } from "../skills/daily-news/scripts/fetchers/lobsters-json.mjs";
 import { fetch as sitemapFetch } from "../skills/daily-news/scripts/fetchers/sitemap-diff.mjs";
 import { fetch as htmlIndexFetch } from "../skills/daily-news/scripts/fetchers/html-index.mjs";
+import { fetchAll } from "../skills/daily-news/scripts/fetch-all.mjs";
 
 test("registry loads all sources with required fields", () => {
   const all = loadSources();
@@ -174,4 +175,31 @@ test("html-index sentinel propagates tier and url", async () => {
   const { deferred } = await htmlIndexFetch(record);
   assert.equal(deferred.source_tier, 3);
   assert.equal(deferred.url, "https://blog.cloudflare.com/");
+});
+
+test("fetch-all groups deferred webfetch + concrete candidates", async () => {
+  // Hand-roll a small registry: 1 arxiv source + 1 html_index source.
+  // We can't easily inject loadSources, so the test runs against the
+  // real sources.yml and asserts shape only.
+  const result = await fetchAll({
+    filter: { type: "arxiv" },
+    fetchImpl: async () => ({
+      ok: true,
+      text: async () => `<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom">
+        <entry>
+          <id>http://arxiv.org/abs/x</id>
+          <title>X</title>
+          <summary>x</summary>
+          <published>2026-05-18T00:00:00Z</published>
+          <link href="http://arxiv.org/abs/x" rel="alternate" type="text/html"/>
+        </entry>
+      </feed>`,
+    }),
+    priorWebState: {},
+  });
+  assert.ok(Array.isArray(result.candidates));
+  assert.ok(result.candidates.length >= 1);
+  assert.deepEqual(result.deferred, []); // none are html_index
+  assert.deepEqual(result.state_diffs, {}); // none are sitemap
+  assert.ok(Array.isArray(result.failures));
 });
