@@ -1,0 +1,143 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">2023 年 Figma 的每日資料管道從凌晨開始跑：對每張資料表做一次完整 dump、複製到 Snowflake、覆寫舊版。一張資料表 1 億 row、改了 100 row，pipeline 還是搬了完整 1 億 row。某天工程師發現整個 daily sync 花了超過 6 小時，分析師早上 9 點打開 dashboard 仍是「前天」的數字——而 Figma 為這條每日複製鏈付了多個專屬 RDS replica、年費以百萬美元計。</p>
+  <h1 class="vg-post-title">{{ title }}</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p><span class="vg-dropcap">這</span>篇是一條資料管道從每日全表 dump 走到分鐘級 CDC 的三年路。技術選型是常見的（PostgreSQL WAL、Kafka、S3 snapshot、Snowflake），但 Figma 把每一步銜接的失敗模式都用一個額外設計補上——關鍵不在組件清單，在 snapshot 與 stream 之間怎麼對齊、以及離線怎麼證明資料是對的。</p>
+
+  <h2>what happened</h2>
+
+  <p>2023 年的 pipeline 是一個簡單的 cron job：每天午夜 fork 出一條 worker，對每張需要同步的 PostgreSQL 資料表執行 <code>SELECT *</code>、寫入 staging、再 swap 到 Snowflake 的 production table。架構簡單，缺點是「無視變動量」：100 row 改動觸發 1 億 row 的搬運。Figma 的業務量在 2023 年成長到每天的同步需要 6 小時以上，且因為 dump 對來源 PostgreSQL 造成壓力，必須跑在多個專屬 read replica 上——RDS 帳單以百萬美元為單位累積。</p>
+
+  <figure>
+    <svg class="vg-w-timeline-figma-pipeline" viewBox="0 0 480 130" role="img"
+         aria-label="Figma 資料管道的三階段演進時序" style="width: 100%; height: auto; max-width: 480px;">
+      <style>
+        .vg-w-timeline-figma-pipeline text { font-family: EB Garamond, serif; font-size: 11px; }
+        .vg-w-timeline-figma-pipeline .label { font-family: IM Fell English, serif; font-style: italic; }
+      </style>
+      <defs>
+        <marker id="vg-w-tfp-arr" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
+          <path d="M0,0 L6,3 L0,6 Z" fill="var(--accent)"/>
+        </marker>
+      </defs>
+      <line x1="40" y1="65" x2="440" y2="65" stroke="var(--muted-2)" stroke-width="1.5"/>
+
+      <!-- 2023: cron dump -->
+      <circle cx="80" cy="65" r="6" fill="var(--accent)"/>
+      <line x1="80" y1="59" x2="80" y2="28" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="3,2"/>
+      <text x="80" y="22" text-anchor="middle" fill="var(--ink)" class="label">2023</text>
+      <text x="80" y="86" text-anchor="middle" fill="var(--muted)" class="label">每日 cron dump</text>
+      <text x="80" y="98" text-anchor="middle" fill="var(--muted)" class="label">6+ 小時 sync</text>
+      <text x="80" y="110" text-anchor="middle" fill="var(--muted)" class="label">$M 級 RDS replica</text>
+
+      <!-- 2024: CDC build -->
+      <circle cx="220" cy="65" r="6" fill="var(--ink-deep)"/>
+      <line x1="220" y1="59" x2="220" y2="28" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="3,2"/>
+      <text x="220" y="22" text-anchor="middle" fill="var(--ink)" class="label">2024</text>
+      <text x="220" y="86" text-anchor="middle" fill="var(--muted)" class="label">CDC + Kafka + Snowflake</text>
+      <text x="220" y="98" text-anchor="middle" fill="var(--muted)" class="label">snapshot 與 stream</text>
+      <text x="220" y="110" text-anchor="middle" fill="var(--muted)" class="label">offset 重疊銜接</text>
+
+      <!-- 2026: audit pipeline -->
+      <circle cx="380" cy="65" r="6" fill="var(--sage-deep)"/>
+      <line x1="380" y1="59" x2="380" y2="28" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="3,2"/>
+      <text x="380" y="22" text-anchor="middle" fill="var(--ink)" class="label">2026</text>
+      <text x="380" y="86" text-anchor="middle" fill="var(--muted)" class="label">每週 cell-by-cell</text>
+      <text x="380" y="98" text-anchor="middle" fill="var(--muted)" class="label">re-bootstrap 驗證</text>
+      <text x="380" y="110" text-anchor="middle" fill="var(--muted)" class="label">3 小時延遲 → 可調分鐘級</text>
+    </svg>
+    <figcaption>從每日全表 dump、到 2024 年的 CDC 切換、到 2026 年補上獨立 re-bootstrap 審計——資料管線的三階段演進。</figcaption>
+  </figure>
+
+  <p>2024 年的改造是分階段的，不是一次切換。第一階段：對所有需要同步的表啟用 PostgreSQL logical replication，把 WAL 變更事件寫到 Kafka——每張表一個 topic，下游可以獨立消費。第二階段：在 Snowflake 端寫 stored procedure，每隔 N 小時把 Kafka 上的 delta 與既有 production table 做 incremental merge；N 預設 3，但 per-table 可以調到分鐘級。第三階段也是最棘手的：bootstrap。新資料表第一次接入時，必須先把目前完整內容搬到 Snowflake、然後從某個 CDC offset 開始 apply stream——這兩者必須在時間上「重疊」否則會漏資料。</p>
+
+  <p>Figma 的解法是 Amazon RDS 的 snapshot-to-S3 export 功能。流程是這樣：先在 Kafka 上記下「現在的最新 offset O_start」，立即觸發 RDS export snapshot 到 S3；snapshot 完成後（可能要幾十分鐘），把 S3 上的 snapshot 批次匯入 Snowflake，然後從 O_start 開始 apply Kafka 上累積的 delta。因為 O_start 是 snapshot 開始前的 offset，snapshot 內容必然涵蓋這個 offset 之前的所有變更——「重疊」確保了即使 snapshot 過程中有寫入，也會被 stream 重新 apply、不會漏。重複 apply 是冪等的（每筆 CDC 事件有 primary key），所以重疊不會造成髒資料。</p>
+
+  <p>2026 年的最後一塊是審計。CDC 管道有個經典失敗模式：某個 stored procedure bug 或 schema 不一致導致 delta 漏掉特定 row，整體 row count 仍然看起來對，但個別 cell 的值靜默偏離。Figma 不靠 row count 抽樣——他們每週對所有表做一次完整 re-bootstrap（獨立的一條 snapshot → 匯入到 audit schema），然後跑 cell-by-cell 比對。發現偏差時，系統會自動 alert 並列出具體偏離的 row。</p>
+
+  <h2>why it matters</h2>
+
+  <p>三個結果值得單獨記下：第一，延遲從 30+ 小時降到 3 小時，per-table 可調到分鐘級——對 dashboard、alerting、A/B 測試 readout 是完全不同的可用性等級。第二，能搬的 table 規模從原本上限放大 10 倍——之前因為 dump 時間太長而被列為「不適合同步」的大表，現在可以接進來。第三，因為不再需要專屬 RDS replica 跑 dump，每年節省以百萬美元計。</p>
+
+  <figure>
+    <svg class="vg-w-arch-figma-pipeline-shift" viewBox="0 0 720 240" role="img"
+         aria-label="舊管道與 CDC 管道的架構對照" style="width: 100%; height: auto; max-width: 720px;">
+      <style>
+        .vg-w-arch-figma-pipeline-shift text { font-family: EB Garamond, serif; font-size: 12px; }
+        .vg-w-arch-figma-pipeline-shift .label { font-family: IM Fell English, serif; font-style: italic; }
+      </style>
+      <defs>
+        <marker id="vg-w-afps-arr" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
+          <path d="M0,0 L6,3 L0,6 Z" fill="var(--muted)"/>
+        </marker>
+      </defs>
+
+      <!-- OLD pipeline (top) -->
+      <text x="20" y="32" fill="var(--muted)" class="label">舊（2023）</text>
+      <rect x="100" y="20" width="120" height="36" rx="4" fill="none" stroke="var(--muted-2)" stroke-width="1.2"/>
+      <text x="160" y="36" text-anchor="middle" fill="var(--ink)" class="label">PostgreSQL</text>
+      <text x="160" y="50" text-anchor="middle" fill="var(--muted)" class="label">primary</text>
+
+      <rect x="270" y="20" width="120" height="36" rx="4" fill="none" stroke="var(--muted-2)" stroke-width="1.2"/>
+      <text x="330" y="36" text-anchor="middle" fill="var(--ink)" class="label">專屬 RDS replica</text>
+      <text x="330" y="50" text-anchor="middle" fill="var(--muted)" class="label">cron 全表 SELECT *</text>
+
+      <rect x="440" y="20" width="120" height="36" rx="4" fill="none" stroke="var(--muted-2)" stroke-width="1.2"/>
+      <text x="500" y="36" text-anchor="middle" fill="var(--ink)" class="label">Snowflake</text>
+      <text x="500" y="50" text-anchor="middle" fill="var(--muted)" class="label">每日 swap</text>
+
+      <line x1="220" y1="38" x2="268" y2="38" stroke="var(--muted)" stroke-width="1" marker-end="url(#vg-w-afps-arr)"/>
+      <line x1="390" y1="38" x2="438" y2="38" stroke="var(--muted)" stroke-width="1" marker-end="url(#vg-w-afps-arr)"/>
+      <text x="600" y="42" fill="var(--accent)" class="label">6+ 小時延遲</text>
+
+      <!-- Divider -->
+      <line x1="100" y1="78" x2="700" y2="78" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="3,3"/>
+
+      <!-- NEW pipeline (bottom) -->
+      <text x="20" y="106" fill="var(--muted)" class="label">新（2024）</text>
+      <rect x="100" y="96" width="120" height="36" rx="4" fill="none" stroke="var(--accent)" stroke-width="1.5"/>
+      <text x="160" y="112" text-anchor="middle" fill="var(--ink)" class="label">PostgreSQL</text>
+      <text x="160" y="126" text-anchor="middle" fill="var(--muted)" class="label">+ logical replication</text>
+
+      <rect x="270" y="96" width="120" height="36" rx="4" fill="none" stroke="var(--ink-deep)" stroke-width="1.5"/>
+      <text x="330" y="112" text-anchor="middle" fill="var(--ink-deep)" class="label">Kafka</text>
+      <text x="330" y="126" text-anchor="middle" fill="var(--muted)" class="label">per-table topic</text>
+
+      <rect x="440" y="96" width="120" height="36" rx="4" fill="none" stroke="var(--sage)" stroke-width="1.5"/>
+      <text x="500" y="112" text-anchor="middle" fill="var(--sage-deep)" class="label">Snowflake</text>
+      <text x="500" y="126" text-anchor="middle" fill="var(--muted)" class="label">incremental merge</text>
+
+      <line x1="220" y1="114" x2="268" y2="114" stroke="var(--accent)" stroke-width="1.2" marker-end="url(#vg-w-afps-arr)"/>
+      <line x1="390" y1="114" x2="438" y2="114" stroke="var(--accent)" stroke-width="1.2" marker-end="url(#vg-w-afps-arr)"/>
+
+      <!-- bootstrap path -->
+      <rect x="160" y="160" width="160" height="36" rx="4" fill="none" stroke="var(--sage)" stroke-width="1.2" stroke-dasharray="3,3"/>
+      <text x="240" y="176" text-anchor="middle" fill="var(--sage-deep)" class="label">RDS snapshot → S3</text>
+      <text x="240" y="190" text-anchor="middle" fill="var(--muted)" class="label">bootstrap（一次性）</text>
+
+      <line x1="160" y1="132" x2="200" y2="158" stroke="var(--sage)" stroke-width="1" stroke-dasharray="3,2" marker-end="url(#vg-w-afps-arr)"/>
+      <line x1="320" y1="178" x2="440" y2="132" stroke="var(--sage)" stroke-width="1" stroke-dasharray="3,2" marker-end="url(#vg-w-afps-arr)"/>
+
+      <!-- audit -->
+      <rect x="400" y="160" width="160" height="36" rx="4" fill="none" stroke="var(--accent)" stroke-width="1.2" stroke-dasharray="3,3"/>
+      <text x="480" y="176" text-anchor="middle" fill="var(--accent-text)" class="label">每週 re-bootstrap</text>
+      <text x="480" y="190" text-anchor="middle" fill="var(--muted)" class="label">cell-by-cell 比對</text>
+      <line x1="480" y1="158" x2="500" y2="134" stroke="var(--accent)" stroke-width="1" stroke-dasharray="3,2" marker-end="url(#vg-w-afps-arr)"/>
+
+      <text x="600" y="118" fill="var(--accent-text)" class="label">3 小時 → 分鐘級</text>
+    </svg>
+    <figcaption>舊管道靠專屬 RDS replica + 每日 cron dump；新管道靠 logical replication + Kafka + Snowflake 增量合併，並用 RDS snapshot 解 bootstrap、每週 re-bootstrap 做 cell-by-cell 審計。</figcaption>
+  </figure>
+
+  <p>有兩個容易被忽略的設計值得記住。第一是 bootstrap 與 stream 的 offset 重疊：很多人寫 CDC 都會在「snapshot 起點」與「stream 起點」之間留個 race window，靠人類盯著時間戳對齊；Figma 用「先記 offset、再 snapshot」確保 snapshot 必然涵蓋 offset 之前的 state，把對齊問題在設計階段就消掉。第二是審計：每週 re-bootstrap 在工程量上不便宜（要再一次完整 snapshot 並 cell-by-cell diff），但這是「資料正確性」的唯一硬保證——靠 row count 比對只能抓掉粗暴的失敗。</p>
+
+  <h2>so what</h2>
+
+  <p>對任何維護資料管道的團隊，這條三年路有幾個直接可拿走的設計選擇：（1）只要管道夠大，CDC 比定期 dump 划算的點來得很快——RDS replica 帳單是個很硬的訊號。（2）bootstrap 設計常被當成 one-off 工程，但它是 CDC 管道每次新表上線時都要重做的——把它做成 self-serve 的工具流程，不要每張表都人工對 offset。（3）資料正確性的審計不能靠 row count，要靠獨立路徑重做的 byte-level diff。傳統 ETL 圈在這一塊長期失守，現代資料平台正在補課。</p>
+
+  <p>更廣的脈絡：CDC + Kafka + Snowflake 增量合併，現在已經是大規模資料管線的事實上預設架構。Figma 的故事與 Stripe 的 Data Movement Platform、Notion 的 schema 遷移管道、Airbnb 的 Spinaltap 是同一條曲線上的不同站點——共同前提是「不要每天搬全部資料」，方法各家略有不同。值得追蹤的是審計這一段：因為「靜默偏離」是 CDC 的特有失敗模式，誰把這部分做得最便宜、最自動，誰的長期可信度最高。</p>
+
+  <p class="vg-deep-closer"><strong>Take-away</strong>：CDC 管道的設計不在組件清單（Kafka、Snowflake、S3 大家都有），而在三件事——bootstrap 與 stream 的 offset 怎麼重疊銜接、incremental merge 怎麼冪等、以及靜默偏離怎麼用獨立的 re-bootstrap diff 抓出來。</p>
+</div>
