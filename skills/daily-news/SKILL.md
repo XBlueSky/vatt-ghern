@@ -13,13 +13,25 @@ up to three deep-stories, and open a pull request for human review.
 
 ## When this skill runs
 
-Two invocation paths converge here:
+Three invocation paths converge here:
 
-- **Slash command**: `/vatt-ghern:daily-news` (defined in
-  `${CLAUDE_PLUGIN_ROOT}/commands/daily-news.md`)
+- **Daily** — `/vatt-ghern:daily-news` (defined in
+  `${CLAUDE_PLUGIN_ROOT}/commands/daily-news.md`). Executes the full
+  9-step workflow below.
+- **Weekly rollup** — `/vatt-ghern:weekly` (Monday morning). Skips
+  Steps 2–6; reads past 7 days via
+  `scripts/load-past-roundups.mjs --days=7`; authors one
+  `weekly.html` using the `weekly-rollup` archetype.
+- **Monthly rollup** — `/vatt-ghern:monthly` (first of month). Same
+  pattern as weekly but `--days=<28..31>` and `monthly-rollup` archetype.
 - **Routine fallback**: Claude Routines invoking the repo may load this
-  SKILL.md directly when the slash command is unavailable. Both paths execute
-  the same 9-step workflow below.
+  SKILL.md directly when the slash command is unavailable. The routine
+  inspects its own schedule to decide daily vs weekly vs monthly.
+
+For weekly/monthly invocations, read the rollup archetype reference
+(`references/archetypes/weekly-rollup.md` or
+`references/archetypes/monthly-rollup.md`) — it spells out which
+workflow steps to skip and what the output looks like.
 
 Do not author daily news posts without this skill. Ad-hoc posts drift from
 the archetype rules and break the dedup invariants that future days depend
