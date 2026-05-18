@@ -7,6 +7,7 @@ import { fetch as arxivFetch } from "../skills/daily-news/scripts/fetchers/arxiv
 import { fetch as hfFetch } from "../skills/daily-news/scripts/fetchers/hf.mjs";
 import { fetch as lobstersFetch } from "../skills/daily-news/scripts/fetchers/lobsters-json.mjs";
 import { fetch as sitemapFetch } from "../skills/daily-news/scripts/fetchers/sitemap-diff.mjs";
+import { fetch as htmlIndexFetch } from "../skills/daily-news/scripts/fetchers/html-index.mjs";
 
 test("registry loads all sources with required fields", () => {
   const all = loadSources();
@@ -105,4 +106,12 @@ test("sitemap-diff surfaces only changed urls", async () => {
   // state_diff contains all current urls (full replacement, not delta).
   assert.equal(Object.keys(state_diff).length, 3);
   assert.equal(state_diff["https://www.anthropic.com/news/post-a"], "2026-05-18");
+});
+
+test("html-index fetcher returns deferred sentinel", async () => {
+  const record = { id: "hn", tier: 1, url: "https://news.ycombinator.com/news" };
+  const { candidates, deferred } = await htmlIndexFetch(record);
+  assert.deepEqual(candidates, []);
+  assert.equal(deferred.kind, "webfetch");
+  assert.equal(deferred.source_id, "hn");
 });
