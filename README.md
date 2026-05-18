@@ -38,6 +38,23 @@ Source PNG: `src/static/vg-sigil.png`. To regenerate webp variants:
 npm run sigil
 ```
 
+## Embeddable today card
+
+`src/static/today.svg` is a 600×320 self-contained SVG with today's
+roundup title + top 3 headlines + sigil. Rebuilt automatically before
+each deploy. Pure SVG (no JS, no external assets), safe to embed in
+GitHub READMEs and markdown surfaces.
+
+```markdown
+[![today on vatt-ghern](https://vatt-ghern.pages.dev/static/today.svg)](https://vatt-ghern.pages.dev/)
+```
+
+Regenerate manually:
+
+```shell
+npm run card
+```
+
 ## Phase
 
 This is Phase 1 (site shell). Phase 2 adds the daily-news skill. Phase 3

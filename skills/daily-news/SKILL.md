@@ -13,13 +13,25 @@ up to three deep-stories, and open a pull request for human review.
 
 ## When this skill runs
 
-Two invocation paths converge here:
+Three invocation paths converge here:
 
-- **Slash command**: `/vatt-ghern:daily-news` (defined in
-  `${CLAUDE_PLUGIN_ROOT}/commands/daily-news.md`)
+- **Daily** — `/vatt-ghern:daily-news` (defined in
+  `${CLAUDE_PLUGIN_ROOT}/commands/daily-news.md`). Executes the full
+  9-step workflow below.
+- **Weekly rollup** — `/vatt-ghern:weekly` (Monday morning). Skips
+  Steps 2–6; reads past 7 days via
+  `scripts/load-past-roundups.mjs --days=7`; authors one
+  `weekly.html` using the `weekly-rollup` archetype.
+- **Monthly rollup** — `/vatt-ghern:monthly` (first of month). Same
+  pattern as weekly but `--days=<28..31>` and `monthly-rollup` archetype.
 - **Routine fallback**: Claude Routines invoking the repo may load this
-  SKILL.md directly when the slash command is unavailable. Both paths execute
-  the same 9-step workflow below.
+  SKILL.md directly when the slash command is unavailable. The routine
+  inspects its own schedule to decide daily vs weekly vs monthly.
+
+For weekly/monthly invocations, read the rollup archetype reference
+(`references/archetypes/weekly-rollup.md` or
+`references/archetypes/monthly-rollup.md`) — it spells out which
+workflow steps to skip and what the output looks like.
 
 Do not author daily news posts without this skill. Ad-hoc posts drift from
 the archetype rules and break the dedup invariants that future days depend
@@ -63,18 +75,40 @@ anti-duplication ground truth for steps 3, 4, and 5.
 
 ### Step 2: Fetch sources
 
-Walk `references/sources.md` in tier order (Tier 1 first). For each source,
-fetch the home/index page and collect top 5–10 items from the last ~24
-hours. Use WebFetch with prompts like:
+Run the dispatcher to pull every registered source:
 
-> "List the top 8 items from this page that look like original engineering
-> blog posts (not job listings, marketing pages, or product launches without
-> technical content). For each, give me title, canonical link, and a 1-2
-> sentence summary of the substance."
+```bash
+node ${CLAUDE_PLUGIN_ROOT}/skills/daily-news/scripts/fetch-all.mjs
+```
 
-De-duplicate by canonical URL across sources. Aim for ~50–100 candidates
-total. If fewer than 5 sources succeed, fail-fast: report which sources
-failed and abort without writing files.
+It reads `src/_data/sources.yml`, calls the right fetcher per `type`
+(arxiv, hf, sitemap, lobsters_json, html_index), updates
+`src/_data/web-state.json` for sitemap sources, and prints a summary.
+
+For `html_index` records the script returns them in `deferred[]` —
+those still need Claude's `WebFetch` tool for LLM summarisation. Walk
+each deferred record in tier order and ask:
+
+> "List the top 8 items from this page that look like original
+> engineering blog posts (not job listings, marketing pages, or product
+> launches without technical content). For each, give me title, canonical
+> link, and a 1-2 sentence summary of the substance."
+
+Merge the WebFetch results with the dispatcher's `candidates[]` array,
+de-duplicate by canonical URL across sources, aim for ~50–100 candidates
+total. If fewer than 5 sources succeed (concrete + deferred combined),
+fail-fast: report which sources failed and abort without writing files.
+
+**Sitemap candidates need a title-resolution pass.** Records from
+`sitemap` sources carry `title: <url>` because a `sitemap.xml` has no
+human title. Before scoring, batch-WebFetch each sitemap candidate
+URL (skip if it scores < 5 on the rubric without fetching). Replace
+`title` with the page's `<title>` or `<h1>`; if WebFetch returns a
+listing/index page rather than an article, drop the candidate.
+
+The full source catalogue and per-source rationale lives in
+`src/_data/sources.yml`. The narrative in `references/sources.md`
+documents tier philosophy.
 
 ### Step 3: Score and filter
 
@@ -125,9 +159,51 @@ ranked order.
 - Any domain that hit the cap and had candidates dropped (e.g.,
   "8 qualifying items in AI today, top 6 selected")
 
+### Step 5.0: Cluster candidates across sources
+
+Before deciding which candidates earn a deep-story, cluster them so the
+same story spotted on multiple sources gets one combined brief rather
+than competing briefs. Pipe the merged `candidates[]` (Step 2's
+dispatcher + WebFetch results) through the clustering helper:
+
+```bash
+echo '<candidates json array>' | npm run sources:cluster --silent
+```
+
+Or in-process:
+
+```js
+import { clusterCandidates } from "./skills/daily-news/scripts/cluster-candidates.mjs";
+const clusters = clusterCandidates(candidates);
+```
+
+Each cluster has shape:
+
+```js
+{ primary: { ... }, variants: [ { ... }, ... ] }
+```
+
+Two candidates cluster when their canonical URLs match (modulo
+`utm_*`, hash, trailing slash) OR their title token-Jaccard ≥ 0.6.
+Clustering is transitive (union-find). `primary` is the highest-tier
+variant in the cluster (lowest `source_tier` number; ties broken by
+longest summary then lowest `source_id`). Singletons (candidates that
+didn't cluster with anything) still appear, with
+`primary === variants[0]`.
+
+Use these clusters as the unit of decision in the rest of Step 5: one
+deep-story per cluster, not per candidate. A cluster's score = its
+`primary`'s score; do not aggregate scores across variants.
+
+When a deep-story is written from a multi-variant cluster, the
+sidecar's `sources[]` array must list every variant's canonical URL,
+not just the primary. That is the data-layer signature of
+cross-source synthesis — the post visibly draws from multiple upstream
+signals.
+
 ### Step 5: Pick deep-story candidates + choose archetype
 
-For each candidate scoring ≥8 from Step 4, decide:
+For each **cluster** whose `primary` scored ≥8 from Step 4, decide:
 
 **a. Worth a deep-story?**
 
@@ -235,30 +311,85 @@ Emit only source link, optional deep link, optional tag chip in the meta
 row. The button surface is owned by JS so it can evolve without
 re-emitting historical roundup HTML.
 
-### Step 7: Write each deep-story HTML + sidecar (×N where N ≤ 3)
+### Step 7a: Prepare deep-story briefs
 
-For each deep-story candidate, do additional WebFetch on the canonical
-source to gather technical detail (RFC excerpts, code samples, real
-numbers).
+For each cluster picked in Step 5 (≤3 briefs total), construct a
+deep-story brief following the contract in
+`references/deep-story-brief.md`. Each brief is fully self-contained
+— it knows its cluster, its archetype, its output path, and all the
+reference files it needs.
 
-Read the archetype reference file picked in Step 5:
-`${CLAUDE_PLUGIN_ROOT}/skills/daily-news/references/archetypes/deep-<archetype>.md`.
+Each brief carries these fields:
 
-It contains the required structure (H2 sequence, widget budget, closer
-label) for that specific archetype. Follow it.
+- `news_id` — the YYYY-MM-DD-NN from the roundup
+- `primary_url` and `variant_urls[]` — every variant from the cluster
+- `title`, `domain`, `archetype` — set in Step 5
+- `summary` — 2-3 sentences telling the sub-agent what to cover
+- `output_path` — `src/posts/YYYY/MM/DD/deep-<kebab-slug>.html`
+- `sidecar_path` — same path with `.11tydata.json`
+- `related_roundup` — `/YYYY/MM/DD/roundup/`
 
-Each deep-story file:
+Briefs must be finalised before any dispatch in Step 7b — the parent
+agent is the only place that knows the cluster→archetype mapping and
+the dedup state. Each sub-agent sees only its own brief.
 
-- Path: `src/posts/YYYY/MM/DD/deep-<kebab-slug>.html`
-- Sidecar: `news_ids` references exactly one item from today's roundup;
-  `related_roundup` is set to `/YYYY/MM/DD/roundup/`; `archetype` is
-  `"daily-deep-story"`; **`deep_archetype` is the value picked in Step 5**
-- Body matches the picked archetype's H2 *count range* (phrasing free)
-- ≥1 inline SVG widget (≥2 recommended; single must carry high density)
-- Universal contract from `deep-freeform.md` applies to all archetypes:
-  opener (`<p class="vg-deep-opener">`), closer (`<p class="vg-deep-closer">`
-  with `<strong>` inside). Drop cap is **recommended** but optional —
-  skip on solemn topics where an illuminated capital reads as decorative.
+The sidecar contract is unchanged:
+
+- `archetype` is `"daily-deep-story"`
+- `deep_archetype` is the value picked in Step 5
+- `sources[]` MUST include every variant_url, not just the primary
+  (cross-source synthesis contract from Step 5.0)
+
+### Step 7b: Dispatch parallel deep-story sub-agents
+
+Issue all ≤3 dispatches in ONE response (single message containing
+multiple `Agent` tool blocks). Each dispatch uses
+`subagent_type: general-purpose` and passes the brief from Step 7a as
+the prompt — see `references/deep-story-brief.md` for the exact
+markdown template each sub-agent receives.
+
+Sub-agents run concurrently; the parent waits for all to return before
+proceeding to Step 7c.
+
+Each sub-agent is constrained per the brief:
+
+- Tools allowed: WebFetch, Read, Write only.
+- No nested `Agent` dispatch, no Bash, no Edit on other days' posts,
+  no git operations.
+- Writes ONE HTML to `output_path` + ONE sidecar to `sidecar_path`,
+  reports back with `{status, char_count, archetype, archetype_deviations}`.
+
+If a sub-agent reports `BLOCKED` or `DONE_WITH_CONCERNS`:
+
+- `DONE_WITH_CONCERNS` with a documented deviation → accept and
+  proceed; note the deviation in the PR body.
+- `BLOCKED` → re-dispatch that one brief with additional context, or
+  drop the deep-story (reducing N to N-1). Do NOT skip QA — the
+  routine remains correct with fewer deep-stories.
+
+### Step 7c: Verify deep-story outputs
+
+After all sub-agents return:
+
+1. Read each output HTML + sidecar back to confirm the files exist and
+   the sidecar parses as JSON.
+2. Verify per-file invariants the sub-agent was told to honour:
+   - 600-1200 lines.
+   - `<p class="vg-deep-opener">` and `<p class="vg-deep-closer"><strong>`.
+   - ≥1 inline SVG widget (≥2 recommended; single must carry high density).
+   - Universal contract from `deep-freeform.md` applies to all archetypes.
+   - Body matches the picked archetype's H2 *count range* (phrasing free).
+3. The mechanical QA gate in Step 8 (`archetype-check`, `check-dup`,
+   `html-validate`, `link-check`) is the formal validation. Step 7c is
+   the first-pass sanity check before that.
+
+PR body must list:
+
+- One line per deep-story: news_id, archetype, slug, char count,
+  archetype-deviations (if any).
+- "Parallel dispatch summary": which N briefs were dispatched, how
+  many returned DONE / DONE_WITH_CONCERNS / BLOCKED, and any
+  re-dispatches needed.
 
 ### Step 8: Self-check (mechanical)
 
