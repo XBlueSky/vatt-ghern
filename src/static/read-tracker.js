@@ -220,6 +220,26 @@
     });
   }
 
+  // Mobile-only tag-cloud expander. CSS clips .vg-tag-cloud to two rows
+  // under 640px; this adds a single "+N more" link that toggles the
+  // .vg-tag-cloud-expanded class so the rest can be revealed.
+  function bindTagCloudExpander() {
+    if (!window.matchMedia("(max-width: 640px)").matches) return;
+    document.querySelectorAll(".vg-tag-cloud").forEach((cloud) => {
+      const items = cloud.querySelectorAll("li");
+      if (items.length <= 6) return;
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "vg-tag-cloud-toggle";
+      btn.textContent = "+" + (items.length - 6) + " more";
+      btn.addEventListener("click", () => {
+        const open = cloud.classList.toggle("vg-tag-cloud-expanded");
+        btn.textContent = open ? "− less" : "+" + (items.length - 6) + " more";
+      });
+      cloud.insertAdjacentElement("afterend", btn);
+    });
+  }
+
   const state = load();
   document.addEventListener("DOMContentLoaded", () => {
     applyVisuals(state);
@@ -232,5 +252,6 @@
     bindRoundupUnreadButton(state);
     bindRoundupMarkReadButton(state);
     bindRoundupMarkAllRead(state);
+    bindTagCloudExpander();
   });
 })();
