@@ -6,6 +6,7 @@ import { loadSources } from "../skills/daily-news/scripts/registry.mjs";
 import { fetch as arxivFetch } from "../skills/daily-news/scripts/fetchers/arxiv.mjs";
 import { fetch as hfFetch } from "../skills/daily-news/scripts/fetchers/hf.mjs";
 import { fetch as lobstersFetch } from "../skills/daily-news/scripts/fetchers/lobsters-json.mjs";
+import { fetch as sitemapFetch } from "../skills/daily-news/scripts/fetchers/sitemap-diff.mjs";
 
 test("registry loads all sources with required fields", () => {
   const all = loadSources();
@@ -81,4 +82,27 @@ test("lobsters-json picks external url, falls back to comments_url", async () =>
   assert.equal(candidates[0].url, "https://example.com/memory");
   assert.equal(candidates[1].url, "https://lobste.rs/s/def456");
   assert.deepEqual(candidates[0].signal.tags, ["rust", "memory"]);
+});
+
+test("sitemap-diff surfaces only changed urls", async () => {
+  const xml = readFileSync(
+    new URL("./fixtures/anthropic-sitemap-sample.xml", import.meta.url),
+    "utf8"
+  );
+  const record = { id: "anthropic-sitemap", tier: 3, url: "https://example/sitemap.xml" };
+  const ctx = {
+    fetchImpl: async () => ({ ok: true, text: async () => xml }),
+    // Prior known state: post-b at 2026-05-17, about at 2025-01-01.
+    // post-a is new; post-b unchanged; about unchanged.
+    priorState: {
+      "https://www.anthropic.com/news/post-b": "2026-05-17",
+      "https://www.anthropic.com/about": "2025-01-01",
+    },
+  };
+  const { candidates, state_diff } = await sitemapFetch(record, ctx);
+  assert.equal(candidates.length, 1);
+  assert.equal(candidates[0].url, "https://www.anthropic.com/news/post-a");
+  // state_diff contains all current urls (full replacement, not delta).
+  assert.equal(Object.keys(state_diff).length, 3);
+  assert.equal(state_diff["https://www.anthropic.com/news/post-a"], "2026-05-18");
 });
