@@ -1,7 +1,9 @@
 // tests/sources-registry.mjs
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { loadSources } from "../skills/daily-news/scripts/registry.mjs";
+import { fetch as arxivFetch } from "../skills/daily-news/scripts/fetchers/arxiv.mjs";
 
 test("registry loads all sources with required fields", () => {
   const all = loadSources();
@@ -39,4 +41,18 @@ test("all ids are unique", () => {
   const all = loadSources();
   const ids = all.map((s) => s.id);
   assert.equal(new Set(ids).size, ids.length, "duplicate id in sources.yml");
+});
+
+test("arxiv fetcher parses Atom feed into candidates", async () => {
+  const xml = readFileSync(new URL("./fixtures/arxiv-sample.xml", import.meta.url), "utf8");
+  const record = { id: "arxiv-cs-ai", tier: 4, url: "https://example/feed" };
+  const ctx = { fetchImpl: async () => ({ ok: true, text: async () => xml }) };
+  const { candidates } = await arxivFetch(record, ctx);
+  assert.equal(candidates.length, 2);
+  assert.equal(candidates[0].source_id, "arxiv-cs-ai");
+  assert.equal(candidates[0].source_tier, 4);
+  assert.equal(candidates[0].url, "http://arxiv.org/abs/2601.12345v1");
+  assert.equal(candidates[0].title, "A Test Paper About Transformers");
+  assert.match(candidates[0].summary, /transformers/i);
+  assert.equal(candidates[0].published_at, "2026-05-18T08:00:00Z");
 });
