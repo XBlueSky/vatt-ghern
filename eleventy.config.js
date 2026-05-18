@@ -1,4 +1,7 @@
 import rssPlugin from "@11ty/eleventy-plugin-rss";
+import syntaxHighlight from "@11ty/eleventy-plugin-syntaxhighlight";
+import Prism from "prismjs";
+import loadLanguages from "prismjs/components/index.js";
 import { readFileSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -37,6 +40,47 @@ function lucideIcon(name, extraClass = "", ariaLabel = "") {
 
 export default function (eleventyConfig) {
   eleventyConfig.addPlugin(rssPlugin);
+  // PrismJS-based syntax highlight. Blocks tagged with class="language-*"
+  // (e.g. <pre><code class="language-js">) get tokenised at build time;
+  // untagged <pre> blocks pass through unchanged and only pick up the
+  // typographic styling in site.css.
+  eleventyConfig.addPlugin(syntaxHighlight, {
+    preAttributes: { tabindex: 0 },
+  });
+
+  // Post-process bespoke HTML posts: any <pre><code class="language-X">
+  // gets tokenised by Prism at build time. The plugin alone only adds a
+  // {% highlight %} shortcode; vatt-ghern posts are direct HTML, so we
+  // walk the output and apply Prism in place.
+  //
+  // Decoding rule: the authored HTML has & < > already entity-encoded
+  // for safety, so we must decode them before handing the source to
+  // Prism, then let Prism re-encode whatever needs encoding in tokens.
+  function htmlDecode(s) {
+    return s
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/&amp;/g, "&");
+  }
+  eleventyConfig.addTransform("prism-highlight", function (content) {
+    if (!this.page.outputPath || !this.page.outputPath.endsWith(".html")) {
+      return content;
+    }
+    return content.replace(
+      /<pre([^>]*)><code class="language-([\w-]+)">([\s\S]*?)<\/code><\/pre>/g,
+      (match, preAttrs, lang, body) => {
+        if (!Prism.languages[lang]) {
+          try { loadLanguages([lang]); } catch { /* unknown — fall through */ }
+        }
+        if (!Prism.languages[lang]) return match; // unknown language, leave alone
+        const decoded = htmlDecode(body);
+        const highlighted = Prism.highlight(decoded, Prism.languages[lang], lang);
+        return `<pre${preAttrs} tabindex="0" class="language-${lang}"><code class="language-${lang}">${highlighted}</code></pre>`;
+      }
+    );
+  });
 
   // Inline lucide SVG icon. Usage:
   //   {% lucide "check" %}                      decorative

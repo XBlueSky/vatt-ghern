@@ -76,6 +76,41 @@ Bespoke posts (`.vg-main:has(.vg-post)`) get up to `min(1080px, full-gutter)`.
 | `.vg-tag` | Tag chip (Manrope 500 uppercase tracking, terracotta with `#` prefix). Lucide-only for icon affordances elsewhere. |
 | `.vg-read-time` | Reading-time pill in `.vg-post-trail` (lucide `book-open` + `N MIN`). Auto-injected by `post.njk` via `readingMinutes` filter — daily-news skill does NOT emit this directly. |
 
+## Code blocks + inline code
+
+Three tiers — pick by what the block is actually doing, not by reflex:
+
+- **Inline code**: wrap with bare `<code>`. CSS adds JetBrains Mono,
+  a slight slab background, and a thin border. Use sparingly in flowing
+  prose for identifiers (`fsync()`), SQL (`SELECT *`), or short literals.
+
+- **Pseudocode / config / shell / output**: wrap with
+  `<pre data-kind="KIND"><code>…</code></pre>` where KIND ∈
+  {`pseudocode`, `config`, `shell`, `output`}. CSS gives the block a
+  left accent rule, a small KIND chip in the top-right corner (Manrope
+  small-caps, e.g. `PSEUDOCODE`), and a relaxed 1.8 line-height. The
+  chip explicitly tells the reader "the lack of colour is intentional
+  — this is structured text, not code that failed to highlight."
+  Comments inside the block can be wrapped in `<em>// like this</em>`
+  to get Spectral italic in `--muted`, reading as author marginalia
+  rather than disabled code. Use this tier for algorithms sketched out,
+  config-file fragments, shell snippets without a specific shell, and
+  imagined program output.
+
+- **Highlighted real code**: wrap with `<pre><code class="language-XXX">`
+  where `XXX` ∈ {`js`, `ts`, `rust`, `go`, `c`, `cpp`, `python`, `sql`,
+  `bash`, `yaml`, `json`, `html`, `css`, `zig`, ...}. Eleventy's
+  build-time Prism transform tokenises the body and assigns
+  OKLCH-token-mapped colours: keywords use `--accent`, comments italic
+  in `--muted`, strings in `--sage-deep`, numbers/literals in
+  `--ink-deep`. Don't combine with `data-kind` — pick one.
+
+**HTML entities** inside any code block must be encoded by the author
+(`&lt;` `&gt;` `&amp;`). The Prism transform decodes them before
+tokenising and re-encodes correctly in the output. The pseudocode tier
+does no decoding pass, so authored entities render literally as
+intended.
+
 ## Read-tracking attribute conventions
 
 | Attribute | Meaning |
