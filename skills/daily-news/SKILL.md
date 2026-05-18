@@ -87,6 +87,13 @@ de-duplicate by canonical URL across sources, aim for ~50–100 candidates
 total. If fewer than 5 sources succeed (concrete + deferred combined),
 fail-fast: report which sources failed and abort without writing files.
 
+**Sitemap candidates need a title-resolution pass.** Records from
+`sitemap` sources carry `title: <url>` because a `sitemap.xml` has no
+human title. Before scoring, batch-WebFetch each sitemap candidate
+URL (skip if it scores < 5 on the rubric without fetching). Replace
+`title` with the page's `<title>` or `<h1>`; if WebFetch returns a
+listing/index page rather than an article, drop the candidate.
+
 The full source catalogue and per-source rationale lives in
 `src/_data/sources.yml`. The narrative in `references/sources.md`
 documents tier philosophy.
