@@ -146,6 +146,11 @@ export default function (eleventyConfig) {
     const dt = d ? new Date(d) : new Date();
     return isNaN(dt) ? new Date().toISOString() : dt.toISOString();
   });
+  eleventyConfig.addFilter("dateYMD", (d) => {
+    const dt = d ? new Date(d) : new Date();
+    if (isNaN(dt)) return new Date().toISOString().slice(0, 10);
+    return dt.toISOString().slice(0, 10);
+  });
   eleventyConfig.addFilter("dateMD", (d) => {
     const dt = d ? new Date(d) : new Date();
     if (isNaN(dt)) return "";
