@@ -76,6 +76,25 @@ Bespoke posts (`.vg-main:has(.vg-post)`) get up to `min(1080px, full-gutter)`.
 | `.vg-tag` | Tag chip (Manrope 500 uppercase tracking, terracotta with `#` prefix). Lucide-only for icon affordances elsewhere. |
 | `.vg-read-time` | Reading-time pill in `.vg-post-trail` (lucide `book-open` + `N MIN`). Auto-injected by `post.njk` via `readingMinutes` filter — daily-news skill does NOT emit this directly. |
 
+## Code blocks + inline code
+
+- **Inline code**: wrap with bare `<code>`. CSS adds JetBrains Mono,
+  a slight slab background, and a thin border. Use sparingly in flowing
+  prose for identifiers (`fsync()`), SQL (`SELECT *`), or short literals.
+- **Code blocks**: wrap with `<pre><code>` (no class) for prose-style
+  pseudo-code, config snippets, or any block where syntax highlighting
+  would mis-fire. CSS adds slab background, padding, rounded corners,
+  horizontal overflow with a slim themed scrollbar.
+- **Highlighted code blocks**: wrap with `<pre><code class="language-XXX">`
+  where `XXX` ∈ {`js`, `ts`, `rust`, `go`, `c`, `cpp`, `python`, `sql`,
+  `bash`, `yaml`, `json`, `html`, `css`, ...}. Eleventy's build-time
+  Prism transform tokenises the body and assigns OKLCH-token-mapped
+  colours: keywords use `--accent`, comments italic in `--muted`,
+  strings in `--sage-deep`, numbers/literals in `--ink-deep`.
+- **Entities** inside code blocks must be HTML-encoded by the author
+  (`&lt;` `&gt;` `&amp;`). The Prism transform decodes them before
+  tokenising and re-encodes correctly in the output.
+
 ## Read-tracking attribute conventions
 
 | Attribute | Meaning |
