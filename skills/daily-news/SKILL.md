@@ -147,9 +147,51 @@ ranked order.
 - Any domain that hit the cap and had candidates dropped (e.g.,
   "8 qualifying items in AI today, top 6 selected")
 
+### Step 5.0: Cluster candidates across sources
+
+Before deciding which candidates earn a deep-story, cluster them so the
+same story spotted on multiple sources gets one combined brief rather
+than competing briefs. Pipe the merged `candidates[]` (Step 2's
+dispatcher + WebFetch results) through the clustering helper:
+
+```bash
+echo '<candidates json array>' | npm run sources:cluster --silent
+```
+
+Or in-process:
+
+```js
+import { clusterCandidates } from "./skills/daily-news/scripts/cluster-candidates.mjs";
+const clusters = clusterCandidates(candidates);
+```
+
+Each cluster has shape:
+
+```js
+{ primary: { ... }, variants: [ { ... }, ... ] }
+```
+
+Two candidates cluster when their canonical URLs match (modulo
+`utm_*`, hash, trailing slash) OR their title token-Jaccard ≥ 0.6.
+Clustering is transitive (union-find). `primary` is the highest-tier
+variant in the cluster (lowest `source_tier` number; ties broken by
+longest summary then lowest `source_id`). Singletons (candidates that
+didn't cluster with anything) still appear, with
+`primary === variants[0]`.
+
+Use these clusters as the unit of decision in the rest of Step 5: one
+deep-story per cluster, not per candidate. A cluster's score = its
+`primary`'s score; do not aggregate scores across variants.
+
+When a deep-story is written from a multi-variant cluster, the
+sidecar's `sources[]` array must list every variant's canonical URL,
+not just the primary. That is the data-layer signature of
+cross-source synthesis — the post visibly draws from multiple upstream
+signals.
+
 ### Step 5: Pick deep-story candidates + choose archetype
 
-For each candidate scoring ≥8 from Step 4, decide:
+For each **cluster** whose `primary` scored ≥8 from Step 4, decide:
 
 **a. Worth a deep-story?**
 
