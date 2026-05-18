@@ -1,5 +1,6 @@
 // skills/daily-news/scripts/registry.mjs
 // Sole reader of src/_data/sources.yml. Exposes loadSources(filter?).
+// Throws at load time on duplicate id, invalid tier/type, or missing required fields.
 
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -13,6 +14,8 @@ const YML_PATH = join(REPO_ROOT, "src", "_data", "sources.yml");
 const VALID_TIERS = new Set([1, 2, 3, 4, 5]);
 const VALID_TYPES = new Set(["html_index", "arxiv", "hf", "sitemap", "lobsters_json"]);
 
+// Cache lives for the lifetime of the Node process. CLI/short-lived scripts
+// see one parse; long-running consumers should spawn a new process to reload.
 let cache = null;
 
 function readAll() {
@@ -22,6 +25,7 @@ function readAll() {
   if (!doc || !Array.isArray(doc.sources)) {
     throw new Error(`sources.yml malformed — missing top-level "sources:" list`);
   }
+  const seenIds = new Set();
   for (const s of doc.sources) {
     if (!s.id || !s.name || !s.url) {
       throw new Error(`sources.yml: record missing id/name/url: ${JSON.stringify(s)}`);
@@ -32,6 +36,10 @@ function readAll() {
     if (!VALID_TYPES.has(s.type)) {
       throw new Error(`sources.yml: ${s.id} has invalid type ${s.type}`);
     }
+    if (seenIds.has(s.id)) {
+      throw new Error(`sources.yml: duplicate id "${s.id}"`);
+    }
+    seenIds.add(s.id);
   }
   cache = doc.sources;
   return cache;
