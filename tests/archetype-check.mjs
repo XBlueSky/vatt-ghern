@@ -218,6 +218,131 @@ function checkFreeform(path, html) {
   // No H2 constraints, no closer label constraints (label is free)
 }
 
+function readSidecarRaw(htmlPath) {
+  const m = htmlPath.match(/[/\\](\d{4})[/\\](\d{2})[/\\](\d{2})[/\\]([^/\\]+)[/\\]index\.html$/);
+  if (!m) return null;
+  const [, y, mo, d, slug] = m;
+  const sidecarPath = join(REPO_ROOT, "src", "posts", y, mo, d, `${slug}.11tydata.json`);
+  if (!existsSync(sidecarPath)) return null;
+  try { return JSON.parse(readFileSync(sidecarPath, "utf8")); } catch { return null; }
+}
+
+function extractPostBody(html) {
+  const openTag = /<div\s+class="vg-post-body"\s*>/;
+  const openMatch = html.match(openTag);
+  if (!openMatch) return html; // fallback: scan whole html (shouldn't happen for deep-stories)
+  const start = openMatch.index + openMatch[0].length;
+  // Find the closing aside (deterministic landmark in post.njk)
+  const asideIdx = html.indexOf('<aside class="vg-bards-note"', start);
+  if (asideIdx < 0) return html.slice(start); // fallback: rest of file
+  // Walk backwards from aside to find the </div> that closes vg-post-body
+  const closeIdx = html.lastIndexOf("</div>", asideIdx);
+  if (closeIdx < start) return html.slice(start, asideIdx);
+  return html.slice(start, closeIdx);
+}
+
+function checkWidgetContract(path, html) {
+  // Scope widget-contract checks to the post-body region only. Layout chrome
+  // (JSON-LD, theme pre-paint, vg-progress, read-tracker) sits outside
+  // .vg-post-body and would otherwise trip the IIFE / external-src bans.
+  const body = extractPostBody(html);
+
+  // 1. Widget count: ≥ 3 elements with class="vg-w-*"
+  const widgetMatches = [...body.matchAll(/class="[^"]*\bvg-w-[a-z0-9-]+/g)];
+  // Deduplicate by capturing the actual class names per element root.
+  const widgetClasses = new Set();
+  for (const m of widgetMatches) {
+    const cls = m[0].match(/vg-w-[a-z0-9-]+/);
+    if (cls) widgetClasses.add(cls[0]);
+  }
+  if (widgetClasses.size < 3) {
+    violations.push(`${path}: widget contract requires ≥ 3 widgets (vg-w-* classes), found ${widgetClasses.size}`);
+  }
+
+  // 2. At least 1 widget must be interactive
+  const hasScript = /<script\b/.test(body);
+  const hasInput = /<input\b/.test(body);
+  const hasCanvas = /<canvas\b/.test(body);
+  const hasScrollTimeline = /animation-timeline:\s*scroll\(/.test(body);
+  if (!(hasScript || hasInput || hasCanvas || hasScrollTimeline)) {
+    violations.push(`${path}: widget contract requires ≥ 1 interactive widget (<script>, <input>, <canvas>, or animation-timeline: scroll())`);
+  }
+
+  // 3. Sidecar must have widget_count, widget_questions, widget_templates
+  const sidecar = readSidecarRaw(path);
+  if (!sidecar) {
+    violations.push(`${path}: widget contract requires sidecar JSON`);
+    return;
+  }
+  if (typeof sidecar.widget_count !== "number") {
+    violations.push(`${path}: sidecar missing widget_count`);
+  }
+  if (!Array.isArray(sidecar.widget_questions) || sidecar.widget_questions.length === 0) {
+    violations.push(`${path}: sidecar missing widget_questions[] (non-empty array required)`);
+  } else if (sidecar.widget_count != null && sidecar.widget_questions.length !== sidecar.widget_count) {
+    violations.push(`${path}: sidecar widget_count (${sidecar.widget_count}) != widget_questions.length (${sidecar.widget_questions.length})`);
+  }
+  if (!Array.isArray(sidecar.widget_templates) || sidecar.widget_templates.length === 0) {
+    violations.push(`${path}: sidecar missing widget_templates[] (non-empty array required)`);
+  } else if (sidecar.widget_count != null && sidecar.widget_templates.length !== sidecar.widget_count) {
+    violations.push(`${path}: sidecar widget_count (${sidecar.widget_count}) != widget_templates.length (${sidecar.widget_templates.length})`);
+  }
+
+  // 4. Prose substance — CJK char count inside .vg-post-body, with widget code stripped.
+  // Floor 6000 CJK chars ≈ 2000 中文字 ≈ 8-10 分鐘讀完, the target depth for a vatt'ghern deep-story.
+  // We use char count not line count because Eleventy's render collapses paragraph
+  // whitespace; lines are an unreliable proxy. Scope is .vg-post-body, not the whole
+  // rendered page, so layout chrome (head meta, nav, footer) doesn't inflate the count.
+  const proseBody = body
+    .replace(/<script[\s\S]*?<\/script>/g, "")
+    .replace(/<style[\s\S]*?<\/style>/g, "")
+    .replace(/<svg[\s\S]*?<\/svg>/g, "")
+    .replace(/<canvas[\s\S]*?<\/canvas>/g, "")
+    .replace(/<[^>]+>/g, "");
+  const cjkCharCount = (proseBody.match(/[一-鿿]/g) || []).length;
+  if (cjkCharCount < 6000) {
+    violations.push(`${path}: prose has ${cjkCharCount} CJK chars (widget contract requires ≥ 6000 CJK chars in .vg-post-body, widget code excluded)`);
+  }
+
+  // 5. Inline <script src=...> is banned
+  if (/<script[^>]+\bsrc=/.test(body)) {
+    violations.push(`${path}: external <script src=...> is banned in widget contract`);
+  }
+
+  // 6. Inline <script> blocks must be IIFE
+  for (const m of body.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/g)) {
+    const scriptBody = m[1].trim();
+    if (scriptBody.length === 0) continue;
+    // Allow forms: (function () {...})(); (() => {...})(); (async () => {...})(); (async function () {...})();
+    const iifeOpeners = /^\(\s*(async\s+)?(function\s*\(|\(\s*\)\s*=>|[^)]*=>)/;
+    if (!iifeOpeners.test(scriptBody)) {
+      const snippet = scriptBody.slice(0, 60).replace(/\n/g, " ");
+      violations.push(`${path}: inline <script> must be IIFE-wrapped (starts with: "${snippet}")`);
+    }
+  }
+
+  // 7. Post-level <style> blocks must have every rule scoped to .vg-w-*
+  // Detect <style> blocks that exist OUTSIDE any <svg> by stripping <svg>...</svg> first.
+  const noSvg = body.replace(/<svg[\s\S]*?<\/svg>/g, "");
+  for (const m of noSvg.matchAll(/<style\b[^>]*>([\s\S]*?)<\/style>/g)) {
+    const block = m[1];
+    // Split on '}' to get rule list (rough). Each rule has a selector portion before '{'.
+    const rules = block.split("}").map((r) => r.trim()).filter((r) => r.length > 0 && r.includes("{"));
+    for (const rule of rules) {
+      const selectorPart = rule.split("{")[0].trim();
+      // Allow @-rules (@container, @media, @supports, @keyframes); their body's selectors are checked separately if needed.
+      if (selectorPart.startsWith("@")) continue;
+      // Each comma-separated selector must contain .vg-w-
+      const selectors = selectorPart.split(",").map((s) => s.trim()).filter((s) => s.length > 0);
+      for (const sel of selectors) {
+        if (!sel.includes(".vg-w-")) {
+          violations.push(`${path}: post-level <style> rule selector lacks .vg-w- scoping: "${sel}"`);
+        }
+      }
+    }
+  }
+}
+
 const ARCHETYPE_CHECKERS = {
   narrative: checkNarrative,
   "technical-deep-dive": checkTechnicalDeepDive,
@@ -229,6 +354,7 @@ const ARCHETYPE_CHECKERS = {
 
 function checkDeepStory(path, html) {
   checkUniversalContract(path, html);
+  checkWidgetContract(path, html);
   const archetype = readSidecarArchetype(path);
   if (!archetype) {
     violations.push(`${path}: deep-story sidecar missing or has no deep_archetype field`);

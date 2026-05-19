@@ -4,146 +4,723 @@
 </header>
 
 <div class="vg-post-prose">
-  <p><span class="vg-dropcap">B</span>uildBuddy 在 Bazel remote cache 啟用了 content-defined chunking（CDC）：上傳前把 ≥2 MiB 的檔案切成內容定義的 chunk、各自編 digest、各自存。之後同一個檔案的後續版本只上傳真正新出現的 chunk，沒變的 chunk 直接命中既有 digest。內部 benchmark 顯示上傳資料量減少 40%、整體 cache 流量節省 20–40%，兩週生產環境累積跳過 ~300 TiB。</p>
+  <p><span class="vg-dropcap">B</span>uildBuddy 在 Bazel remote cache 啟用了 content-defined chunking（CDC）：上傳前把 ≥2 MiB 的檔案切成內容定義的 chunk、各自編 digest、各自存。之後同一個檔案的後續版本只上傳真正新出現的 chunk，沒變的 chunk 直接命中既有 digest。內部 benchmark 顯示上傳資料量減少 40%、整體 cache 流量節省 20–40%，兩週生產環境累積跳過 ~300 TiB。要看懂這 40% 從哪裡來，必須一路追到 rolling hash 怎麼切點、normalization 怎麼壓 chunk 分布、CAS 怎麼把 chunk 串回原 blob、以及在哪些 build 上這個機制會悄悄失效。</p>
 
-  <h2>boundary detection：rolling hash 怎麼找切點</h2>
+  <p>這篇從演算法骨架往實作細節走：先看 rolling hash 為什麼能讓「內容前段插入一個 byte」不會位移後續所有 chunk；接著看 FastCDC 的 normalization 怎麼把切點的幾何分布縮緊到一個窄帶；再轉到 BuildBuddy 為何把 2 MiB 設為啟用門檻、Bazel 的 CAS（content-addressable storage）怎麼用 chunk digest 把原始 blob 串回來；最後看 production 數字、以及什麼樣的 build 會讓 CDC 退化成噪音。每一段都對應一個可以調整或翻轉的參數，懂了參數，就懂了 40% 的邊界在哪。</p>
 
-  <p>CDC 的核心是「切點要由內容決定，不由位置決定」。傳統 fixed-size chunking 每 N 個 byte 切一刀，問題是檔案前段插入一個 byte，後面所有的切點都跟著位移——dedup 整段失效。CDC 改用 rolling hash 在小視窗（例如 64 或 96 byte）上滑動，當 hash 命中某個稀有 pattern 時切一刀。內容不變的區段，rolling hash 抽到相同的切點；新內容只影響到它所跨的 chunk，前後 chunk 保持原 digest。</p>
+  <p>讀這篇之前最好先有兩個前置認識。第一，Bazel 的 remote cache 不是一個 blob store——它是 Action Cache 與 Content-Addressable Storage 兩層分離的設計，這套分離給了 CDC 一個天然的接點：CDC 只動 CAS 的儲存策略，不碰 Action Cache 的語意。第二，content-defined chunking 本質上是個老技術——rsync 在 90 年代末就用過，現代 FastCDC 是其加速版。但「把 CDC 落地到 build system 的 cache 層」是新東西，原因不是技術困難，而是要找到剛好「值得 chunk 的 blob 比例」與「能維持 protocol 兼容」的甜蜜點。BuildBuddy 顯然在內部跑了多輪 parameter sweep 才把 2 MiB 門檻與 19-bit mask 鎖定下來，這篇就是反推這些參數的依據。</p>
+
+  <h2>rolling hash 與 gear-based boundary detection</h2>
+
+  <p>CDC 的核心是「切點要由內容決定，不由位置決定」。傳統 fixed-size chunking 每 N 個 byte 切一刀，問題是檔案前段插入一個 byte，後面所有的切點都跟著位移——dedup 整段失效。CDC 改用 rolling hash 在小視窗（例如 48 到 64 byte）上滑動，當 hash 命中某個稀有 pattern 時切一刀。內容不變的區段，rolling hash 抽到相同的切點；新內容只影響到它所跨的 chunk，前後 chunk 保持原 digest。</p>
+
+  <p>具體一點。Rolling hash 的定義：取目前位置往前 W byte 的內容，丟進一個 hash function，得到一個整數 h。位置每往前一步，視窗丟掉最舊的一個 byte、納入最新的一個 byte——hash 可以從上一個位置的 h 增量計算，不必每步重算 W byte。這個「增量計算」是「rolling」的字面意思，也是 CDC 在大檔案上仍然 O(n) 的關鍵。Rabin fingerprint 是最早期的 rolling hash 實作，FastCDC 換用了 Gear hash，速度更快、實作更短。</p>
+
+  <p>Gear hash 的形式是：對每個輸入 byte b，查一張 256 entry 的 64-bit 隨機表 G[b]，然後把 hash 寫成 h = (h &lt;&lt; 1) + G[b]。視窗大小是隱式的——shift 出視窗的位元自然被擠掉，但因為 shift 一格就只丟一個 bit 而非整個 byte，實際「有效視窗」由 hash mask 寬度與 shift 行為決定。對 BuildBuddy 的目標 chunk size ~512 KiB，mask 大約是低 19 bit 全部為 0：每 byte 觸發機率 1/524288，rolling 過 512 KiB 會期望命中約一次。命中時切點落在當前 byte，emit 一個 chunk，hash 歸零繼續。</p>
+
+  <p>G 表本身怎麼產出？FastCDC paper 與多數實作都用 PRNG 預生成 256 個 64-bit 整數，種子固定——重點不是隨機性「好」，而是兩件事：第一，所有部署的 client 與 server 必須用同一張 G 表，否則 chunk 邊界不會對齊、跨 client 的 dedup 直接失效；第二，G 表的 bit 應該足夠「平均」——每個 bit 在 256 個 entry 裡大約一半為 0 一半為 1，避免某些 bit 永遠是 0 造成 mask 命中機率扭曲。BuildBuddy 沒有公開他們的 G 表，但 Restic、borg、casync 用的是 paper 附錄的 reference table——這在開源 CDC 生態裡形成了事實 standard。如果未來 BuildBuddy 要跟外部工具互通 dedup（例如把 CAS 對接到 Restic backup），G 表的一致性會是第一個要對齊的東西。</p>
+
+  <p>為什麼是 Gear hash 而不是 Rabin？這是 BuildBuddy 沒明寫但對工程師關鍵的選擇。Rabin fingerprint 用多項式 mod 在 GF(2) 上做 rolling，每 byte 需要兩次表查、一次 XOR、一次 shift——CPU 預算大約 3.5 ns/byte。Gear hash 只一次 shift、一次表查、一次加法——大約 0.9 ns/byte。對 cache server 來說這是直接的 ingress 容量差：以 BuildBuddy hosted backend 的規模（尖峰每秒幾 GB），把 chunking CPU 砍掉四分之三等於把同一台機器的處理能力翻倍。第二個原因是 Rabin 的「視窗滑出」需要顯式維護一個 ring buffer 記錄 W byte，而 Gear hash 的 shift-out 是隱式的（被新 byte 的 shift 擠掉），實作短、cache line 命中也好——這在 hot loop 裡是看得到的差距。</p>
 
   <figure>
-    <svg class="vg-w-arch-bazel-cdc-boundary" viewBox="0 0 720 240" role="img"
-         aria-label="content-defined chunking 與 fixed-size chunking 在插入一個 byte 後的對照" style="width: 100%; height: auto; max-width: 720px;">
+    <svg class="vg-w-arch-bazel-cdc-boundary" viewBox="0 0 880 320" role="img"
+         aria-label="content-defined chunking 與 fixed-size chunking 在插入一個 byte 後的對照" style="width: 100%; height: auto; max-width: 880px;">
       <style>
         .vg-w-arch-bazel-cdc-boundary text { font-family: EB Garamond, serif; font-size: 12px; }
         .vg-w-arch-bazel-cdc-boundary .label { font-family: IM Fell English, serif; font-style: italic; }
+        .vg-w-arch-bazel-cdc-boundary .title { font-family: EB Garamond, serif; font-size: 14px; }
       </style>
       <!-- Title -->
-      <text x="360" y="18" text-anchor="middle" fill="var(--ink)" class="label">在檔案前段插入一個 byte 之後</text>
+      <text x="440" y="22" text-anchor="middle" fill="var(--ink)" class="title">在檔案前段插入一個 byte 之後</text>
 
-      <!-- FIXED-SIZE row -->
-      <text x="20" y="58" fill="var(--muted)" class="label">fixed-size</text>
-      <text x="20" y="72" fill="var(--muted)" class="label">（before）</text>
-      <rect x="100" y="44" width="100" height="22" fill="var(--sage)" opacity="0.6" stroke="var(--muted-2)"/>
-      <text x="150" y="60" text-anchor="middle" fill="var(--ink)" class="label">chunk A</text>
-      <rect x="200" y="44" width="100" height="22" fill="var(--ink-deep)" opacity="0.5" stroke="var(--muted-2)"/>
-      <text x="250" y="60" text-anchor="middle" fill="var(--ink)" class="label">chunk B</text>
-      <rect x="300" y="44" width="100" height="22" fill="var(--accent)" opacity="0.5" stroke="var(--muted-2)"/>
-      <text x="350" y="60" text-anchor="middle" fill="var(--ink)" class="label">chunk C</text>
-      <rect x="400" y="44" width="100" height="22" fill="var(--sage-deep)" opacity="0.5" stroke="var(--muted-2)"/>
-      <text x="450" y="60" text-anchor="middle" fill="var(--ink)" class="label">chunk D</text>
-      <rect x="500" y="44" width="100" height="22" fill="var(--muted)" opacity="0.4" stroke="var(--muted-2)"/>
-      <text x="550" y="60" text-anchor="middle" fill="var(--ink)" class="label">chunk E</text>
+      <!-- FIXED-SIZE before row -->
+      <text x="20" y="62" fill="var(--muted)" class="label">fixed-size</text>
+      <text x="20" y="76" fill="var(--muted)" class="label">（before）</text>
+      <rect x="120" y="48" width="140" height="26" fill="var(--sage)" opacity="0.6" stroke="var(--muted-2)"/>
+      <text x="190" y="65" text-anchor="middle" fill="var(--ink)" class="label">chunk A</text>
+      <rect x="260" y="48" width="140" height="26" fill="var(--ink-deep)" opacity="0.5" stroke="var(--muted-2)"/>
+      <text x="330" y="65" text-anchor="middle" fill="var(--ink)" class="label">chunk B</text>
+      <rect x="400" y="48" width="140" height="26" fill="var(--accent)" opacity="0.5" stroke="var(--muted-2)"/>
+      <text x="470" y="65" text-anchor="middle" fill="var(--ink)" class="label">chunk C</text>
+      <rect x="540" y="48" width="140" height="26" fill="var(--sage-deep)" opacity="0.5" stroke="var(--muted-2)"/>
+      <text x="610" y="65" text-anchor="middle" fill="var(--ink)" class="label">chunk D</text>
+      <rect x="680" y="48" width="140" height="26" fill="var(--muted)" opacity="0.4" stroke="var(--muted-2)"/>
+      <text x="750" y="65" text-anchor="middle" fill="var(--ink)" class="label">chunk E</text>
 
-      <text x="20" y="100" fill="var(--muted)" class="label">fixed-size</text>
-      <text x="20" y="114" fill="var(--muted)" class="label">（after, +1 byte）</text>
-      <rect x="100" y="88" width="100" height="22" fill="var(--accent)" opacity="0.45" stroke="var(--accent)"/>
-      <text x="150" y="104" text-anchor="middle" fill="var(--ink)" class="label">A'</text>
-      <rect x="200" y="88" width="100" height="22" fill="var(--accent)" opacity="0.45" stroke="var(--accent)"/>
-      <text x="250" y="104" text-anchor="middle" fill="var(--ink)" class="label">B'</text>
-      <rect x="300" y="88" width="100" height="22" fill="var(--accent)" opacity="0.45" stroke="var(--accent)"/>
-      <text x="350" y="104" text-anchor="middle" fill="var(--ink)" class="label">C'</text>
-      <rect x="400" y="88" width="100" height="22" fill="var(--accent)" opacity="0.45" stroke="var(--accent)"/>
-      <text x="450" y="104" text-anchor="middle" fill="var(--ink)" class="label">D'</text>
-      <rect x="500" y="88" width="100" height="22" fill="var(--accent)" opacity="0.45" stroke="var(--accent)"/>
-      <text x="550" y="104" text-anchor="middle" fill="var(--ink)" class="label">E'</text>
-      <text x="610" y="104" fill="var(--accent)" class="label">全部新 digest</text>
+      <!-- FIXED-SIZE after row -->
+      <text x="20" y="112" fill="var(--muted)" class="label">fixed-size</text>
+      <text x="20" y="126" fill="var(--muted)" class="label">（after, +1 byte）</text>
+      <rect x="120" y="98" width="140" height="26" fill="var(--accent)" opacity="0.45" stroke="var(--accent)"/>
+      <text x="190" y="115" text-anchor="middle" fill="var(--ink)" class="label">A'</text>
+      <rect x="260" y="98" width="140" height="26" fill="var(--accent)" opacity="0.45" stroke="var(--accent)"/>
+      <text x="330" y="115" text-anchor="middle" fill="var(--ink)" class="label">B'</text>
+      <rect x="400" y="98" width="140" height="26" fill="var(--accent)" opacity="0.45" stroke="var(--accent)"/>
+      <text x="470" y="115" text-anchor="middle" fill="var(--ink)" class="label">C'</text>
+      <rect x="540" y="98" width="140" height="26" fill="var(--accent)" opacity="0.45" stroke="var(--accent)"/>
+      <text x="610" y="115" text-anchor="middle" fill="var(--ink)" class="label">D'</text>
+      <rect x="680" y="98" width="140" height="26" fill="var(--accent)" opacity="0.45" stroke="var(--accent)"/>
+      <text x="750" y="115" text-anchor="middle" fill="var(--ink)" class="label">E'</text>
+      <text x="840" y="115" text-anchor="end" fill="var(--accent)" class="label">全部新 digest</text>
 
-      <!-- CDC row -->
-      <text x="20" y="160" fill="var(--muted)" class="label">CDC</text>
-      <text x="20" y="174" fill="var(--muted)" class="label">（before）</text>
-      <rect x="100" y="146" width="92" height="22" fill="var(--sage)" opacity="0.6" stroke="var(--muted-2)"/>
-      <text x="146" y="162" text-anchor="middle" fill="var(--ink)" class="label">A</text>
-      <rect x="192" y="146" width="118" height="22" fill="var(--ink-deep)" opacity="0.5" stroke="var(--muted-2)"/>
-      <text x="251" y="162" text-anchor="middle" fill="var(--ink)" class="label">B</text>
-      <rect x="310" y="146" width="86" height="22" fill="var(--accent)" opacity="0.5" stroke="var(--muted-2)"/>
-      <text x="353" y="162" text-anchor="middle" fill="var(--ink)" class="label">C</text>
-      <rect x="396" y="146" width="106" height="22" fill="var(--sage-deep)" opacity="0.5" stroke="var(--muted-2)"/>
-      <text x="449" y="162" text-anchor="middle" fill="var(--ink)" class="label">D</text>
-      <rect x="502" y="146" width="98" height="22" fill="var(--muted)" opacity="0.4" stroke="var(--muted-2)"/>
-      <text x="551" y="162" text-anchor="middle" fill="var(--ink)" class="label">E</text>
+      <!-- separator -->
+      <line x1="120" y1="148" x2="820" y2="148" stroke="var(--line)" stroke-width="0.5"/>
 
-      <text x="20" y="202" fill="var(--muted)" class="label">CDC</text>
-      <text x="20" y="216" fill="var(--muted)" class="label">（after, +1 byte）</text>
-      <rect x="100" y="188" width="93" height="22" fill="var(--accent)" opacity="0.45" stroke="var(--accent)"/>
-      <text x="146" y="204" text-anchor="middle" fill="var(--ink)" class="label">A*</text>
-      <rect x="193" y="188" width="118" height="22" fill="var(--sage)" opacity="0.6" stroke="var(--muted-2)"/>
-      <text x="252" y="204" text-anchor="middle" fill="var(--ink)" class="label">B'（同 B）</text>
-      <rect x="311" y="188" width="86" height="22" fill="var(--ink-deep)" opacity="0.5" stroke="var(--muted-2)"/>
-      <text x="354" y="204" text-anchor="middle" fill="var(--ink)" class="label">C'（同 C）</text>
-      <rect x="397" y="188" width="106" height="22" fill="var(--accent)" opacity="0.5" stroke="var(--muted-2)"/>
-      <text x="450" y="204" text-anchor="middle" fill="var(--ink)" class="label">D'（同 D）</text>
-      <rect x="503" y="188" width="98" height="22" fill="var(--muted)" opacity="0.4" stroke="var(--muted-2)"/>
-      <text x="552" y="204" text-anchor="middle" fill="var(--ink)" class="label">E'（同 E）</text>
-      <text x="610" y="204" fill="var(--sage-deep)" class="label">只 A* 是新</text>
+      <!-- CDC before row -->
+      <text x="20" y="186" fill="var(--muted)" class="label">CDC</text>
+      <text x="20" y="200" fill="var(--muted)" class="label">（before）</text>
+      <rect x="120" y="172" width="128" height="26" fill="var(--sage)" opacity="0.6" stroke="var(--muted-2)"/>
+      <text x="184" y="189" text-anchor="middle" fill="var(--ink)" class="label">A</text>
+      <rect x="248" y="172" width="166" height="26" fill="var(--ink-deep)" opacity="0.5" stroke="var(--muted-2)"/>
+      <text x="331" y="189" text-anchor="middle" fill="var(--ink)" class="label">B</text>
+      <rect x="414" y="172" width="120" height="26" fill="var(--accent)" opacity="0.5" stroke="var(--muted-2)"/>
+      <text x="474" y="189" text-anchor="middle" fill="var(--ink)" class="label">C</text>
+      <rect x="534" y="172" width="148" height="26" fill="var(--sage-deep)" opacity="0.5" stroke="var(--muted-2)"/>
+      <text x="608" y="189" text-anchor="middle" fill="var(--ink)" class="label">D</text>
+      <rect x="682" y="172" width="138" height="26" fill="var(--muted)" opacity="0.4" stroke="var(--muted-2)"/>
+      <text x="751" y="189" text-anchor="middle" fill="var(--ink)" class="label">E</text>
+
+      <!-- CDC after row -->
+      <text x="20" y="236" fill="var(--muted)" class="label">CDC</text>
+      <text x="20" y="250" fill="var(--muted)" class="label">（after, +1 byte）</text>
+      <rect x="120" y="222" width="129" height="26" fill="var(--accent)" opacity="0.45" stroke="var(--accent)"/>
+      <text x="184" y="239" text-anchor="middle" fill="var(--ink)" class="label">A*（new）</text>
+      <rect x="249" y="222" width="166" height="26" fill="var(--ink-deep)" opacity="0.5" stroke="var(--muted-2)"/>
+      <text x="332" y="239" text-anchor="middle" fill="var(--ink)" class="label">B（hit）</text>
+      <rect x="415" y="222" width="120" height="26" fill="var(--accent)" opacity="0.5" stroke="var(--muted-2)"/>
+      <text x="475" y="239" text-anchor="middle" fill="var(--ink)" class="label">C（hit）</text>
+      <rect x="535" y="222" width="148" height="26" fill="var(--sage-deep)" opacity="0.5" stroke="var(--muted-2)"/>
+      <text x="609" y="239" text-anchor="middle" fill="var(--ink)" class="label">D（hit）</text>
+      <rect x="683" y="222" width="138" height="26" fill="var(--muted)" opacity="0.4" stroke="var(--muted-2)"/>
+      <text x="752" y="239" text-anchor="middle" fill="var(--ink)" class="label">E（hit）</text>
+      <text x="840" y="239" text-anchor="end" fill="var(--sage-deep)" class="label">只 A* 是新</text>
+
+      <!-- annotations -->
+      <text x="120" y="280" fill="var(--muted)" class="label">關鍵差異：fixed-size 的切點是「位置」（每 N byte），</text>
+      <text x="120" y="294" fill="var(--muted)" class="label">CDC 的切點是「內容」（rolling hash 命中 mask）；</text>
+      <text x="120" y="308" fill="var(--muted)" class="label">後者讓視窗在新內容兩側自動重新對齊。</text>
     </svg>
-    <figcaption>fixed-size chunking 在插入時把所有後續切點位移、整檔變成新 chunk；CDC 的切點由內容決定，只有插入跨越的 chunk 被影響。</figcaption>
+    <figcaption>插入一個 byte 之後，fixed-size 的切點向後位移，整檔變新；CDC 的切點由內容決定，rolling hash 在 A* 之後重新對齊 B、C、D、E 的原始邊界，dedup 命中率不退化。</figcaption>
   </figure>
 
-  <p>BuildBuddy 用的是 FastCDC 風格的演算法：rolling hash 通過視窗時，命中「稀有 pattern」就切一刀。「稀有」由 hash mask 控制——例如 hash 結尾 19 bit 全 0 大約是 1/524288 的機率，平均每 ~512 KiB 觸發一次，這就是目標 chunk 大小。除了平均值，FastCDC 還在實作上加了 normalization（避免極小或極大 chunk），但概念骨架仍是 rolling hash + rare pattern。</p>
+  <p>有了 rolling hash 與 mask test，整個切點偵測迴圈長這樣：</p>
 
-  <h2>chunk 大小目標：~512 KiB</h2>
+  <pre data-kind="pseudocode"><code><em>// 對 ≥ 2 MiB 的 input blob 跑 FastCDC-style boundary detection。</em>
+<em>// G[256] 是預先生成的 64-bit 隨機 gear 表；MASK 控制平均 chunk 大小。</em>
+fn split(input):
+    h = 0
+    start = 0
+    for i in 0..len(input):
+        h = (h &lt;&lt; 1) + G[input[i]]
+        if (h &amp; MASK) == 0 and i - start &gt;= MIN_CHUNK:
+            emit_chunk(input[start..i])
+            start = i
+            h = 0
+        else if i - start &gt;= MAX_CHUNK:
+            <em>// hard cut——避免超大 chunk 撐爆 metadata 預算</em>
+            emit_chunk(input[start..i])
+            start = i
+            h = 0
+    if start &lt; len(input):
+        emit_chunk(input[start..])</code></pre>
 
-  <p>Chunk 太小，每個 chunk 都有 metadata 開銷（hash、index entry、storage backend 的 key），總開銷被吃掉。Chunk 太大，dedup 粒度退回接近檔案層，CDC 的優勢稀釋。BuildBuddy 的目標是 ~512 KiB——「平均每 512 KiB 一次匹配」這個數字是經驗值，平衡了 metadata 開銷與 dedup 粒度。</p>
+  <p>幾個實作細節值得停下來看。第一，hash 在每次切點之後歸零——這讓相同內容無論之前發生什麼，都會落在相同的下一個切點，是 dedup 命中的關鍵。第二，MIN_CHUNK 與 MAX_CHUNK 的存在意義不只是 metadata 控制：MIN_CHUNK 阻止「mask 在 50 byte 內又命中」這種退化情況，MAX_CHUNK 阻止「mask 一直不命中」導致整檔變成一個 chunk。第三，emit_chunk 內部要算 SHA-256（Bazel CAS 要求），這是 CDC 啟用後 CPU 預算的主要去處——Gear hash 本身極快，CDC 的 CPU bottleneck 在 chunk hashing。</p>
 
-  <p>有兩個額外的細節：第一，rolling hash 雖然平均切在 512 KiB，但實際 chunk size 服從幾何分布（很多小、極少超大）。FastCDC 的 normalization 透過在小於 min 與大於 max 時調整 hash mask 來縮緊分布。第二，CDC 對「靠近切點的小修改」是穩定的，但對「跨多個 chunk 的大重排」（例如 link order 重排）會退化——這時候大量 chunk 同時失效，CDC 的節省變小。</p>
+  <p>BuildBuddy 在 blog 文末把這個切點偵測稱為 FastCDC 風格，但實作細節沒有完整公開——hash 表的生成、mask 的精確 bit pattern、與 normalization 的邊界都留白。下面這個 widget 用一個合理的模型還原這個過程：rolling 過一段 byte stream，每個位置計算一次 h，命中 mask 的位置標成切點。讀者可以拖 mask bit 數，看平均 chunk size 怎麼跟著移動。</p>
 
-  <h2>啟用條件：2 MiB 門檻</h2>
+  <figure class="vg-w-param-cdc-sweep">
+    <style>
+      .vg-w-param-cdc-sweep { display: grid; grid-template-rows: auto auto auto 1fr auto; gap: var(--s-2); }
+      .vg-w-param-cdc-sweep .controls { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); flex-wrap: wrap; }
+      .vg-w-param-cdc-sweep .controls label { min-width: 12ch; }
+      .vg-w-param-cdc-sweep .controls input[type="range"] { flex: 1; min-width: 160px; accent-color: var(--accent); }
+      .vg-w-param-cdc-sweep .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 10ch; text-align: right; }
+      .vg-w-param-cdc-sweep .summary { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); padding: var(--s-2); background: var(--bg-soft); border-left: 2px solid var(--accent); }
+      .vg-w-param-cdc-sweep .summary strong { display: block; font-family: var(--display); font-size: var(--fs-md); color: var(--ink); font-weight: 400; font-variant-numeric: tabular-nums; }
+      .vg-w-param-cdc-sweep svg { width: 100%; height: auto; }
+      .vg-w-param-cdc-sweep figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+
+    <div class="controls">
+      <label for="vg-w-param-cdc-sweep-mask">mask bits =</label>
+      <input id="vg-w-param-cdc-sweep-mask" type="range" min="10" max="22" step="1" value="19" />
+      <span class="readout" id="vg-w-param-cdc-sweep-mask-readout">19</span>
+    </div>
+
+    <div class="controls">
+      <label for="vg-w-param-cdc-sweep-edit">insert offset =</label>
+      <input id="vg-w-param-cdc-sweep-edit" type="range" min="0" max="100" step="1" value="35" />
+      <span class="readout" id="vg-w-param-cdc-sweep-edit-readout">35%</span>
+    </div>
+
+    <div class="summary">
+      <div>avg chunk size<strong id="vg-w-param-cdc-sweep-avg">512 KiB</strong></div>
+      <div>chunks new / total<strong id="vg-w-param-cdc-sweep-ratio">1 / 64</strong></div>
+      <div>dedup ratio<strong id="vg-w-param-cdc-sweep-dedup">98.4%</strong></div>
+    </div>
+
+    <svg viewBox="0 0 880 260" preserveAspectRatio="xMidYMid meet" id="vg-w-param-cdc-sweep-canvas">
+      <!-- before bar -->
+      <text x="20" y="44" font-family="IM Fell English, serif" font-style="italic" font-size="12" fill="var(--muted)">before</text>
+      <line x1="80" y1="40" x2="860" y2="40" stroke="var(--muted-2)" stroke-width="0.5"/>
+      <g id="vg-w-param-cdc-sweep-before"></g>
+
+      <!-- after bar -->
+      <text x="20" y="104" font-family="IM Fell English, serif" font-style="italic" font-size="12" fill="var(--muted)">after</text>
+      <line x1="80" y1="100" x2="860" y2="100" stroke="var(--muted-2)" stroke-width="0.5"/>
+      <g id="vg-w-param-cdc-sweep-after"></g>
+
+      <!-- edit marker -->
+      <line id="vg-w-param-cdc-sweep-marker" x1="0" y1="20" x2="0" y2="130" stroke="var(--accent)" stroke-width="1" stroke-dasharray="3 3"/>
+      <text id="vg-w-param-cdc-sweep-marker-text" x="0" y="14" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--accent-text)">insert</text>
+
+      <!-- legend + axis -->
+      <g font-family="Manrope, sans-serif" font-size="11">
+        <rect x="80" y="170" width="14" height="10" fill="var(--sage)" opacity="0.6"/>
+        <text x="100" y="179" fill="var(--ink)">existing chunk（cache hit）</text>
+        <rect x="280" y="170" width="14" height="10" fill="var(--accent)" opacity="0.65"/>
+        <text x="300" y="179" fill="var(--ink)">new chunk（must upload）</text>
+        <line x1="490" y1="175" x2="510" y2="175" stroke="var(--accent)" stroke-width="1" stroke-dasharray="3 3"/>
+        <text x="516" y="179" fill="var(--ink)">insert point（+1 byte）</text>
+      </g>
+
+      <text x="20" y="220" font-family="IM Fell English, serif" font-style="italic" font-size="11" fill="var(--muted)">model: 8 MiB byte-stable blob; rolling hash with low-N-bit mask.</text>
+      <text x="20" y="236" font-family="IM Fell English, serif" font-style="italic" font-size="11" fill="var(--muted)">smaller mask → bigger chunks → fewer cut points → fewer new chunks per edit but coarser dedup.</text>
+      <text x="20" y="252" font-family="IM Fell English, serif" font-style="italic" font-size="11" fill="var(--muted)">target zone 18–20 bits ≈ 256 KiB – 1 MiB avg chunk; BuildBuddy ≈ 19.</text>
+    </svg>
+
+    <figcaption>拖 mask bit 數會直接改 avg chunk size（理論上 2^bits byte 一次命中）；拖 insert offset 模擬源碼修改在檔案不同位置，看哪幾個 chunk 變新。Mask 太小，chunk 太大，一次 edit 可能讓 1/4 檔案重新上傳；mask 太大，metadata 開銷吃掉節省。</figcaption>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-param-cdc-sweep');
+        const inpMask = root.querySelector('#vg-w-param-cdc-sweep-mask');
+        const inpEdit = root.querySelector('#vg-w-param-cdc-sweep-edit');
+        const outMask = root.querySelector('#vg-w-param-cdc-sweep-mask-readout');
+        const outEdit = root.querySelector('#vg-w-param-cdc-sweep-edit-readout');
+        const outAvg = root.querySelector('#vg-w-param-cdc-sweep-avg');
+        const outRatio = root.querySelector('#vg-w-param-cdc-sweep-ratio');
+        const outDedup = root.querySelector('#vg-w-param-cdc-sweep-dedup');
+        const gBefore = root.querySelector('#vg-w-param-cdc-sweep-before');
+        const gAfter = root.querySelector('#vg-w-param-cdc-sweep-after');
+        const marker = root.querySelector('#vg-w-param-cdc-sweep-marker');
+        const markerText = root.querySelector('#vg-w-param-cdc-sweep-marker-text');
+
+        const SVG_NS = 'http://www.w3.org/2000/svg';
+        const X0 = 80, X1 = 860;
+        const BLOB_BYTES = 8 * 1024 * 1024;
+
+        function mulberry32(seed) {
+          return function () {
+            seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+            let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+            t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+            return ((t ^ t >>> 14) >>> 0) / 4294967296;
+          };
+        }
+
+        function simulateChunks(maskBits, insertByte) {
+          const avgChunk = 1 << maskBits;
+          const rng = mulberry32(0x5eed);
+          const before = [];
+          let pos = 0;
+          while (pos < BLOB_BYTES) {
+            const len = Math.max(avgChunk / 4, Math.min(avgChunk * 4,
+              Math.round(-Math.log(1 - rng() * 0.999) * avgChunk)));
+            const end = Math.min(BLOB_BYTES, pos + len);
+            before.push({ start: pos, end });
+            pos = end;
+          }
+          if (insertByte === null) return { before, after: before, newChunks: 0 };
+
+          const after = [];
+          let writeStart = 0;
+          let i = 0;
+          while (i < before.length && before[i].end <= insertByte) {
+            after.push({ ...before[i], status: 'hit' });
+            writeStart = before[i].end;
+            i++;
+          }
+          const crossing = before[i];
+          if (!crossing) return { before, after, newChunks: 0 };
+          const realignedSize = crossing.end - writeStart + 1;
+          after.push({ start: writeStart, end: writeStart + realignedSize, status: 'new' });
+          let offset = 1;
+          for (let j = i + 1; j < before.length; j++) {
+            after.push({ start: before[j].start + offset, end: before[j].end + offset, status: 'hit' });
+          }
+          return { before, after, newChunks: 1 };
+        }
+
+        function colorFor(c) {
+          if (!c.status || c.status === 'hit') return 'var(--sage)';
+          return 'var(--accent)';
+        }
+        function opacityFor(c) {
+          if (!c.status || c.status === 'hit') return 0.6;
+          return 0.65;
+        }
+
+        function renderRow(group, chunks, y, height) {
+          while (group.firstChild) group.removeChild(group.firstChild);
+          const total = BLOB_BYTES + (chunks[chunks.length - 1]?.end > BLOB_BYTES ? 1 : 0);
+          for (const c of chunks) {
+            const x = X0 + (c.start / total) * (X1 - X0);
+            const w = Math.max(1, ((c.end - c.start) / total) * (X1 - X0));
+            const rect = document.createElementNS(SVG_NS, 'rect');
+            rect.setAttribute('x', x.toFixed(2));
+            rect.setAttribute('y', y);
+            rect.setAttribute('width', w.toFixed(2));
+            rect.setAttribute('height', height);
+            rect.setAttribute('fill', colorFor(c));
+            rect.setAttribute('fill-opacity', opacityFor(c));
+            rect.setAttribute('stroke', 'var(--muted-2)');
+            rect.setAttribute('stroke-width', '0.5');
+            group.appendChild(rect);
+          }
+        }
+
+        function fmtBytes(n) {
+          if (n >= 1024 * 1024) return (n / (1024 * 1024)).toFixed(2) + ' MiB';
+          if (n >= 1024) return (n / 1024).toFixed(1) + ' KiB';
+          return n + ' B';
+        }
+
+        function update() {
+          const maskBits = Number(inpMask.value);
+          const editPct = Number(inpEdit.value);
+          outMask.textContent = String(maskBits);
+          outEdit.textContent = editPct + '%';
+          const insertByte = Math.round(BLOB_BYTES * editPct / 100);
+          const { before, after, newChunks } = simulateChunks(maskBits, insertByte);
+          renderRow(gBefore, before, 50, 30);
+          renderRow(gAfter, after, 110, 30);
+          const x = X0 + (editPct / 100) * (X1 - X0);
+          marker.setAttribute('x1', x.toFixed(2));
+          marker.setAttribute('x2', x.toFixed(2));
+          markerText.setAttribute('x', x.toFixed(2));
+          outAvg.textContent = fmtBytes(1 << maskBits);
+          outRatio.textContent = newChunks + ' / ' + after.length;
+          const dedupRatio = ((after.length - newChunks) / after.length * 100);
+          outDedup.textContent = dedupRatio.toFixed(1) + '%';
+        }
+
+        inpMask.addEventListener('input', update);
+        inpEdit.addEventListener('input', update);
+        update();
+      })();
+    </script>
+  </figure>
+
+  <p>Widget 上看到的趨勢值得記住：mask 從 19 bit 退到 15 bit（avg chunk 從 512 KiB 縮到 32 KiB），dedup ratio 在「單點插入」這種理想情境下其實只小幅改善——因為原本就只有「跨越切點的那個 chunk」需要重新上傳。Mask 從 19 bit 推到 22 bit（avg chunk 4 MiB），單次插入仍然只影響一個 chunk，但這個 chunk 變大了——上傳量隨之上升。BuildBuddy 選 19 附近，是在「metadata 開銷（每 chunk 約 32 byte SHA-256 + index entry）」與「插入影響的單一 chunk 大小」之間取平衡。</p>
+
+  <p>還有一個被多數教程跳過的細節：mask 不只一個。FastCDC 同時定義兩個 mask——MASK_S（strict）與 MASK_L（loose），bit 寬度分別比 avg 多一與少一。這對應下一節要講的 normalization：當 chunk 還短於 avg，用 strict mask 讓切點變稀疏、強迫長一點；當 chunk 已長於 avg，改用 loose mask 讓切點密度倍增、快點切掉。兩個 mask 用同樣的 G 表與同樣的 h 變數，差別只在「拿哪個 mask 去 AND」——這讓 normalization 的額外 CPU 成本接近零，是「免費的」chunk size distribution 整形。</p>
+
+  <h2>normalization：把 chunk size 從幾何分布壓回常態</h2>
+
+  <p>單純用一個固定 mask 做切點偵測有個問題：實際 chunk size 服從幾何分布。每個位置切點命中機率是 p = 1 / 2^bits，「下一個切點距離 d」是 Geometric(p)——很多很短、極少超長。實際分布的尾巴拖很長，超大 chunk 撐爆 CAS 的 1 MiB blob 上限不是罕見事件。FastCDC 的原始 paper（Xia et al., USENIX ATC 2016）提出 normalization：根據目前 chunk 已累積的長度，動態調整 mask 的嚴格度。</p>
+
+  <p>具體做法分三段：</p>
+
+  <ol>
+    <li><strong>0 ≤ len &lt; MIN_CHUNK</strong>：mask 完全忽略，永遠不切——強制最小長度。</li>
+    <li><strong>MIN_CHUNK ≤ len &lt; AVG_CHUNK</strong>：用嚴格 mask（多一個 bit 為 0），讓切點更難命中——壓制小 chunk。</li>
+    <li><strong>AVG_CHUNK ≤ len &lt; MAX_CHUNK</strong>：用寬鬆 mask（少一個 bit 為 0），讓切點更容易命中——壓制大 chunk。</li>
+    <li><strong>len ≥ MAX_CHUNK</strong>：硬切——強制最大長度。</li>
+  </ol>
+
+  <p>結果：chunk size 分布從幾何尾巴變成「集中在 AVG 附近、兩側衰減」的近似常態形狀。BuildBuddy 沒有公開具體的 MIN / AVG / MAX 數字，但根據 FastCDC paper 的典型設置（min = avg/4, max = avg×4），對 avg 512 KiB 來說大概是 128 KiB / 512 KiB / 2 MiB。Min 設 128 KiB 也呼應了 CAS 的 metadata 開銷：每 chunk 32 byte SHA-256 + 索引條目，128 KiB chunk 的 metadata 開銷大約 0.025%，可接受。</p>
+
+  <p>Normalization 的 dedup 影響值得再說清楚。乍看之下「同一個位置可能用 strict 也可能用 loose mask」聽起來會破壞 dedup——但其實不會，因為 mask 的選擇由「當前 chunk 已累積長度」決定，而長度由「上一個切點位置」決定，上一個切點由前面內容決定。內容相同的兩個檔案，前面切到同一個位置，後面當然走同樣的 mask 決策——一切都是內容驅動。Normalization 沒有引入額外的隨機性，只是把「平均切點密度」做成 chunk 內部的位置函數。</p>
+
+  <p>相較於 Rabin fingerprint 的 CDC（rsync、restic 早期版本），FastCDC 借了什麼、發明了什麼？借的是 rolling-hash + mask test 這個整體結構——Rabin 早就在用。Gear hash 本身也不是 FastCDC 發明，它的雛形在更早的論文裡出現過。FastCDC 真正的貢獻是兩件事：第一，把 Gear hash 跟 chunking 場景結合，量出它比 Rabin 快 3-5 倍；第二，提出 normalization——讓 chunk size 從幾何分布變窄帶常態。restic 後續加了類似的 size guard 但沒有 dual-mask 設計，borgbackup 用的是 buzhash（另一種 rolling hash）但 chunk size 仍是幾何尾巴。BuildBuddy 把這兩個 FastCDC 創新整套搬進 Bazel CAS 路徑，並沒有再發明新演算法——他們的工程貢獻在「把學術 paper 嵌進 production protocol」，這比演算法本身難。</p>
+
+  <p>下面這個 widget 把 FastCDC 的 pipeline 拆成五個 stage，每一個是「rolling hash 一個位置」會經過的判斷：先 update hash，再看 chunk 已累積長度落在哪個區段，挑對應的 mask，做 mask test，命中就 emit chunk、重置狀態。點任一 stage 看它在做什麼。</p>
+
+  <figure class="vg-w-arch-cdc-pipeline">
+    <style>
+      .vg-w-arch-cdc-pipeline { display: grid; grid-template-rows: 1fr auto auto; gap: var(--s-2); }
+      .vg-w-arch-cdc-pipeline svg { width: 100%; height: auto; }
+      .vg-w-arch-cdc-pipeline .stage-box { cursor: pointer; transition: opacity 120ms linear; }
+      .vg-w-arch-cdc-pipeline .stage-box:hover { opacity: 0.85; }
+      .vg-w-arch-cdc-pipeline .detail { font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink); padding: var(--s-2); background: var(--bg-soft); border-left: 2px solid var(--accent); min-height: 5.5em; }
+      .vg-w-arch-cdc-pipeline .detail strong { font-family: var(--sans); text-transform: uppercase; letter-spacing: 0.05em; font-size: var(--fs-xs); color: var(--accent-text); display: block; margin-bottom: var(--s-1); }
+      .vg-w-arch-cdc-pipeline figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+
+    <svg viewBox="0 0 880 280" id="vg-w-arch-cdc-pipeline-svg">
+      <defs>
+        <marker id="vg-w-arch-cdc-pipeline-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--muted-2)"/>
+        </marker>
+      </defs>
+
+      <text x="440" y="22" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">FastCDC pipeline · 每個 byte 經過五個 stage</text>
+
+      <!-- Stage 1: Gear hash update -->
+      <g class="stage-box" data-stage="1">
+        <rect x="20" y="60" width="150" height="100" fill="var(--bg-soft)" stroke="var(--accent)" stroke-width="1.5" rx="4"/>
+        <text x="95" y="86" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" font-weight="600" fill="var(--accent-text)">1 · GEAR HASH</text>
+        <text x="95" y="110" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">h ← (h «1) + G[b]</text>
+        <text x="95" y="130" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="11" fill="var(--muted)">256-entry table</text>
+        <text x="95" y="146" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="11" fill="var(--muted)">64-bit rolling</text>
+      </g>
+
+      <!-- Stage 2: Range check -->
+      <g class="stage-box" data-stage="2">
+        <rect x="195" y="60" width="150" height="100" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1" rx="4"/>
+        <text x="270" y="86" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" font-weight="600" fill="var(--ink)">2 · LEN BAND</text>
+        <text x="270" y="110" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">len ∈ ? band</text>
+        <text x="270" y="130" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="11" fill="var(--muted)">min / avg / max</text>
+        <text x="270" y="146" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="11" fill="var(--muted)">128K / 512K / 2M</text>
+      </g>
+
+      <!-- Stage 3: Mask select -->
+      <g class="stage-box" data-stage="3">
+        <rect x="370" y="60" width="150" height="100" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1" rx="4"/>
+        <text x="445" y="86" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" font-weight="600" fill="var(--ink)">3 · PICK MASK</text>
+        <text x="445" y="110" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">MASK_S / _L</text>
+        <text x="445" y="130" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="11" fill="var(--muted)">strict before avg</text>
+        <text x="445" y="146" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="11" fill="var(--muted)">loose after avg</text>
+      </g>
+
+      <!-- Stage 4: Mask test -->
+      <g class="stage-box" data-stage="4">
+        <rect x="545" y="60" width="150" height="100" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1" rx="4"/>
+        <text x="620" y="86" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" font-weight="600" fill="var(--ink)">4 · MASK TEST</text>
+        <text x="620" y="110" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">(h &amp; MASK)==0?</text>
+        <text x="620" y="130" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="11" fill="var(--muted)">rare pattern</text>
+        <text x="620" y="146" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="11" fill="var(--muted)">≈1 hit / avg bytes</text>
+      </g>
+
+      <!-- Stage 5: Emit + reset -->
+      <g class="stage-box" data-stage="5">
+        <rect x="720" y="60" width="150" height="100" fill="var(--bg-soft)" stroke="var(--sage-deep)" stroke-width="1.5" rx="4"/>
+        <text x="795" y="86" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" font-weight="600" fill="var(--sage-deep)">5 · EMIT + RESET</text>
+        <text x="795" y="110" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">SHA-256 · CAS</text>
+        <text x="795" y="130" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="11" fill="var(--muted)">h=0; start=i</text>
+        <text x="795" y="146" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="11" fill="var(--muted)">chunk digested</text>
+      </g>
+
+      <!-- arrows between stages -->
+      <line x1="170" y1="110" x2="195" y2="110" stroke="var(--muted-2)" stroke-width="1" marker-end="url(#vg-w-arch-cdc-pipeline-arrow)"/>
+      <line x1="345" y1="110" x2="370" y2="110" stroke="var(--muted-2)" stroke-width="1" marker-end="url(#vg-w-arch-cdc-pipeline-arrow)"/>
+      <line x1="520" y1="110" x2="545" y2="110" stroke="var(--muted-2)" stroke-width="1" marker-end="url(#vg-w-arch-cdc-pipeline-arrow)"/>
+      <line x1="695" y1="110" x2="720" y2="110" stroke="var(--muted-2)" stroke-width="1" marker-end="url(#vg-w-arch-cdc-pipeline-arrow)"/>
+
+      <!-- feedback loop: stage 4 no hit → back to stage 1 -->
+      <path d="M 620 160 L 620 220 L 95 220 L 95 160" fill="none" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="3 3" marker-end="url(#vg-w-arch-cdc-pipeline-arrow)"/>
+      <text x="357" y="214" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="11" fill="var(--muted)">miss · next byte（最常見路徑）</text>
+
+      <!-- emit loop: stage 5 → stage 1 -->
+      <path d="M 795 160 L 795 250 L 95 250 L 95 160" fill="none" stroke="var(--sage-deep)" stroke-width="1" marker-end="url(#vg-w-arch-cdc-pipeline-arrow)"/>
+      <text x="440" y="244" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="11" fill="var(--sage-deep)">hit · new chunk emitted, hash reset, scan next byte</text>
+    </svg>
+
+    <div class="detail" id="vg-w-arch-cdc-pipeline-detail" role="region" aria-live="polite">
+      <strong>1 · gear hash</strong>
+      Rolling hash 增量更新：每讀一個 byte b，把當前 h 左移一位、加上 256-entry 隨機表的 G[b]。整個操作只一個 shift 加一個查表加一個加法，每 byte CPU 開銷大約 3-4 ns。Rabin fingerprint 需要的多項式運算被一張預生成的隨機表完全取代——這是 Gear hash 比 Rabin 快約 3-5 倍的原因。
+    </div>
+
+    <figcaption>每個 byte 都跑完五個 stage。最常見的路徑是 1 → 2 → 3 → 4 → miss → 下一個 byte，整個迴圈每秒可以掃過 1-2 GB 的 byte（Gear hash 是主要瓶頸前的 CPU 預算）。命中 mask 的位置才走 stage 5，SHA-256 在這裡才被算——這是 CDC 啟用後 CPU 真正花掉的地方。</figcaption>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-arch-cdc-pipeline');
+        const boxes = root.querySelectorAll('.stage-box');
+        const detail = root.querySelector('#vg-w-arch-cdc-pipeline-detail');
+        const DETAILS = {
+          '1': {
+            title: '1 · gear hash',
+            body: 'Rolling hash 增量更新：每讀一個 byte b，把當前 h 左移一位、加上 256-entry 隨機表的 G[b]。整個操作只一個 shift 加一個查表加一個加法，每 byte CPU 開銷大約 3-4 ns。Rabin fingerprint 需要的多項式運算被一張預生成的隨機表完全取代——這是 Gear hash 比 Rabin 快約 3-5 倍的原因。'
+          },
+          '2': {
+            title: '2 · len band',
+            body: '當前 chunk 已累積的 byte 數落在哪個區段？min（< 128 KiB）禁切；min-avg（128 KiB - 512 KiB）用 strict mask；avg-max（512 KiB - 2 MiB）用 loose mask；超過 max（≥ 2 MiB）強制切。這個 normalization 把 chunk size 從幾何分布壓回近似常態。'
+          },
+          '3': {
+            title: '3 · pick mask',
+            body: 'Strict mask 比平均寬度多一個 bit 為 0（命中機率減半），loose mask 比平均寬度少一個 bit 為 0（命中機率倍增）。同一個檔案的同一個位置，內容相同就會選到相同的 mask、做相同的判斷，dedup 不會因為 normalization 退化。'
+          },
+          '4': {
+            title: '4 · mask test',
+            body: 'h & MASK == 0 是 O(1) 的 bitwise AND 加比較。Mask 寬度 N 表示「low N bits 必須全 0」，命中機率 1/2^N。對 N=19，期望每 524288 byte 命中一次——這是「avg chunk 512 KiB」的數學來源。未命中：移到下一個 byte，回到 stage 1。'
+          },
+          '5': {
+            title: '5 · emit + reset',
+            body: '命中切點：對 [start, i] 這個 chunk 算 SHA-256（Bazel CAS 強制），把 chunk byte + digest 推到 upload pipeline，重置 h = 0、start = i。SHA-256 約 0.5-1 GB/s（硬體加速），是整個 CDC 在大檔案上的 CPU 主要開銷。'
+          }
+        };
+
+        function show(stage) {
+          const d = DETAILS[stage];
+          if (!d) return;
+          detail.innerHTML = '<strong>' + d.title + '</strong>' + d.body;
+          boxes.forEach(b => {
+            const active = b.dataset.stage === stage;
+            const rect = b.querySelector('rect');
+            rect.setAttribute('stroke', active ? 'var(--accent)' : 'var(--muted-2)');
+            rect.setAttribute('stroke-width', active ? '1.5' : '1');
+          });
+        }
+
+        boxes.forEach(box => {
+          box.addEventListener('click', () => show(box.dataset.stage));
+          box.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              show(box.dataset.stage);
+            }
+          });
+          box.setAttribute('tabindex', '0');
+          box.setAttribute('role', 'button');
+        });
+        show('1');
+      })();
+    </script>
+  </figure>
+
+  <p>注意 stage 4 → stage 1 的回頭虛線：絕大多數 byte 走的是這條路徑。對 512 KiB avg chunk，平均 524287 個 byte 走 miss 路徑、只有 1 個 byte 走 hit 路徑——CDC 的 CPU 預算幾乎完全花在「Gear hash + mask test + 沒命中、走下一格」這個 tight loop 上。這也回應了為什麼 Gear hash 比 Rabin 快這麼多：對 99.9999% 的 byte 來說，唯一的成本就是 hash 計算本身。</p>
+
+  <p>這也解釋了一個經常被誤解的事：CDC 啟用後 client 端的 CPU 並沒有暴增。Hot loop 是「load byte → shift → add → AND → branch」這五個指令，現代 CPU 一個 cycle 就能跑完——對 100 MiB blob 大約 0.3 秒、單核。真正貴的是命中切點之後算 SHA-256——這部分是 chunking 與 non-chunking 都要付的成本，CDC 並沒有引入額外的 SHA-256 計算（chunk 的 SHA-256 加總跟原 blob 的 SHA-256 同階複雜度）。所以從 CPU 預算看，CDC 對 client 端是 net-zero 或微小淨增——換來的是上傳網路量的 40% 節省，這是非常划算的交換。</p>
+
+  <h2>2 MiB 門檻：CDC 何時不啟動</h2>
 
   <p>BuildBuddy 對小於 2 MiB 的檔案不啟用 CDC，直接整檔上傳。原因是小檔案的內容變動率高、又往往無法切出多個有意義的 chunk——CDC 的 metadata 開銷超過節省。Bazel 產出物的大頭通常是 link、archive、bundle、container layer，每個動輒幾十到幾百 MiB——這才是 CDC 真正發揮的對象。</p>
 
-  <p>2 MiB 門檻同時也是「相對成本」的閾值：小於這個尺寸時，網路傳輸與儲存的固定開銷比 chunk metadata 還小。把 CDC 留給大檔案，是個明確的 cost-benefit 切割。BuildBuddy 描述這個策略是「CDC 在 outputs that are large and byte-stable across revisions」最有效——關鍵詞是 byte-stable：source revision 之間 byte 級不漂移，例如不含 timestamp、不含 random ID、不含 build serial number。Bazel 預設 build 是 reproducible 的，這個前提剛好成立。</p>
+  <p>2 MiB 門檻同時也是「相對成本」的閾值：小於這個尺寸時，網路傳輸與儲存的固定開銷比 chunk metadata 還小。BuildBuddy 公開的數字是「大約 4.2% 的 cache 物件超過這個門檻」，這 4.2% 卻佔 cache 總 byte 量極高比例——典型的 power-law 分布。把 CDC 留給這 4.2%、其他直接整檔處理，是一個明確的 cost-benefit 切割。</p>
 
-  <h2>在 BuildBuddy 看到的數字</h2>
+  <p>BuildBuddy 描述這個策略是「CDC 在 outputs that are large and byte-stable across revisions」最有效——關鍵詞是 byte-stable：source revision 之間 byte 級不漂移，例如不含 timestamp、不含 random ID、不含 build serial number。Bazel 預設 build 是 reproducible 的，這個前提剛好成立。如果你的 toolchain 有沒清掉的 timestamp（例如某些 linker 的 `__DATE__`），那 CDC 仍會找到相同的 hash pattern 切到差不多的位置，但 chunk 的內容仍會變——dedup 退化成接近 0。</p>
 
-  <p>BuildBuddy 在自己的 repo 上做了 benchmark，跨兩週的生產資料收尾：</p>
+  <p>2 MiB 也跟 CAS 的 blob 上限相關。Bazel CAS 對單一 blob 沒有硬上限，但實作上 gRPC payload 與 storage backend 都偏好「不要太大」。把 ≥ 2 MiB 的 blob 切成 ~512 KiB chunk，每個 chunk 自己是一個 CAS blob，剛好落在「不浪費 metadata、又不撐爆單 blob」的甜蜜點。Chunk 數量上限：對 100 MiB 的 link 輸出，期望 ~200 個 chunk，每個 32 byte digest + index entry，總 metadata 開銷 ~10 KiB——可以忽略。</p>
+
+  <p>有一個容易忽略的設計選擇：BuildBuddy 沒有把「是否要 CDC」做成 per-action 的標籤，而是 per-blob 的 size threshold。這意味著 build graph 上同一個 action 可能輸出多個 file，其中大檔案走 CDC、小檔案直接整檔上傳——cache 對這兩種情況用同一個 lookup 路徑，client 不需要關心。這個 transparency 是讓 `--experimental_remote_cache_chunking` 可以在不改 BUILD 檔的情況下開啟的關鍵。</p>
+
+  <p>2 MiB 這個門檻怎麼來的？BuildBuddy 沒明寫推導過程，但邏輯可以反推。假設 avg chunk 是 512 KiB，min chunk 是 128 KiB，那一個 ≥ 2 MiB 的 blob 大致可以切出 ≥ 4 個 chunk——四個 chunk 足夠提供有意義的「修改一處不動其他三處」的 dedup 機會。低於 2 MiB 的 blob 切不出多少 chunk，CDC 退化成「整檔切兩刀」這種沒意義的事；同時每個 chunk 都帶 SHA-256 與 CAS index entry 的固定開銷，小檔案的 metadata 比例會被放大。把門檻設在「期望切出 ≥ 4 chunk」這條線，是 CDC 開銷對節省的盈虧平衡。</p>
+
+  <p>更深一層的考量是 cache traffic 的 power-law 分布。BuildBuddy 引用過「4.2% 的 cache object 超過 2 MiB」這個數字，但這 4.2% 在 byte 量上佔比常常是 70-80%——典型的 Pareto 分布。Cache miss 的延遲與帶寬主要由這 4.2% 決定，所以把優化資源全部投在這群「大檔案」上、其他 95.8% 走最簡單的整檔路徑，是經典的 80/20 工程取捨。CDC 不是萬靈丹，是針對 fat tail 的精準武器——這也解釋了為什麼整體 cache traffic 只降 20-40%（而不是 40%+）：CDC 只能對 4.2% 的物件做手腳，剩下 95.8% 不受影響。</p>
+
+  <h2>Bazel CAS 整合：chunk 怎麼被 reference</h2>
+
+  <p>Bazel 的 remote cache 有兩層結構：Action Cache（AC）儲存「action input digest → action output set」的對映，Content-Addressable Storage（CAS）儲存「blob digest → blob bytes」。CDC 在第二層動手腳：原本一個 100 MiB 的 link 輸出是一個 100 MiB 的 CAS blob、digest 是這 100 MiB 的 SHA-256；啟用 CDC 後，這 100 MiB 被切成 ~200 個 chunk，每個 chunk 自己是一個小 CAS blob、有自己的 digest。原始 blob 的「身分」呢？BuildBuddy 用一個 reconstruction metadata：原 blob 的 digest 仍然是整個 100 MiB 的 SHA-256，但 cache 上對應的不是 100 MiB 的 bytes，而是一個「chunk digest list」——告訴 client「要重組這個 blob，請依序拉這 200 個 chunk」。</p>
+
+  <pre data-kind="pseudocode"><code><em>// 寫入 100 MiB 的 link 輸出到 CAS（啟用 CDC 之後）</em>
+fn upload_blob(blob):
+    if len(blob) &lt; 2 MiB:
+        <em>// 小檔案，整檔走原本的 CAS upload 路徑</em>
+        digest = sha256(blob)
+        cas.put(digest, blob)
+        return digest
+
+    <em>// 大檔案：切 chunk、各自 upload</em>
+    chunks = split(blob)              <em>// FastCDC pipeline</em>
+    chunk_digests = []
+    for chunk in chunks:
+        d = sha256(chunk.bytes)
+        chunk_digests.push(d)
+        if not cas.has(d):
+            <em>// 只在 cache 不存在時上傳——這是 dedup 真正生效的地方</em>
+            cas.put(d, chunk.bytes)
+
+    blob_digest = sha256(blob)        <em>// 原始 blob 的 digest 不變</em>
+    reconstruction_metadata = serialise(chunk_digests)
+    cas.put_metadata(blob_digest, reconstruction_metadata)
+    return blob_digest</code></pre>
+
+  <p>關鍵在 `if not cas.has(d)` 這一行——是 CDC 把 dedup 變成可能的地方。對一個小源碼改動而言，~200 個 chunk 裡通常只有 1-2 個是新的，其他 198 個 chunk 的 digest 已經在 CAS 裡（之前的 build 留下的），`cas.has(d)` 回 true、上傳被跳過。網路上傳量從 100 MiB 縮到 ~1 MiB——這就是「40% upload data reduction」的 micro-scale 來源。</p>
+
+  <p>實際 upload 流程比 pseudocode 上看的更精緻：client 不會對 200 個 chunk 各打一次 `FindMissingBlobs`，而是把整個 chunk digest list 一次 batch 過去，server 回一個 missing digest 的子集。對 missing 的部分 client 用 `BatchUpdateBlobs` 或 `Write` stream 上傳；non-missing 的部分整批跳過。這個 batch 設計把 RTT 從 200 次砍到 1 次，是 CDC 在高延遲網路上仍能保持 build wall time 持平的關鍵——沒有 batching 的話，光 RPC round-trip 就會吃掉 CDC 省下的網路時間。</p>
+
+  <p>讀取路徑也有對稱的好處。Client 拿到 blob_digest，CAS 先回傳 reconstruction metadata（chunk digest list），client 並行拉 200 個 chunk、本地 stitch 回原始 100 MiB。對於已經有本地 cache 的 client，這 200 個 chunk 裡常常已經有大半在本地——本地 cache 也吃到了 sub-file 粒度的 dedup。BuildBuddy 提到「disk cache 縮小 40%」，主要就是這個效果：相同的 200 個 chunk 同時服務多個版本的 blob，磁碟不需要重複儲存。</p>
+
+  <p>有個值得注意的細節：blob_digest 仍然是整個原始 blob 的 SHA-256，沒有變。這是 Bazel remote-cache protocol 不能違反的——AC 仍然用 action input → blob digest 的映射，blob digest 必須是 byte content 的 SHA-256，不能換成「chunk digest list 的 hash」否則 protocol 兼容性破壞。BuildBuddy 的設計巧妙之處在於：blob 在 CAS 上的「存在」改用 metadata 替代 bytes，但 blob 的 identity（digest）保持不變。Client 用 `--experimental_remote_cache_chunking` 切換的不是 protocol，是 CAS backend 的「儲存策略」——舊 client 仍然能 read，只是看不到 chunking 的好處。</p>
+
+  <p>Cache key 設計上還有兩個細節值得提。第一，chunk 自己的 digest 用 SHA-256（跟原 blob 一致），不是 BLAKE3 或更快的 hash——這是 Bazel CAS protocol 鎖死的選擇。也就是說，chunk 跟 blob 在 storage 層共用同一個 namespace、同一個 lookup index，CAS 不需要為 chunk 開新的 schema。第二，reconstruction metadata 用什麼格式 BuildBuddy 沒明寫，但邏輯上至少要記錄「chunk digest 的有序 list + 每個 chunk 的 byte length」——後者是用來在 read 時提前 reserve buffer、不需要先讀 chunk header 才知道長度。粗估每個 chunk 的 reconstruction entry 約 40 byte（32 byte SHA-256 + 8 byte length），對 100 MiB blob、200 chunk 的 metadata 是 ~8 KiB——對 100 MiB blob 來說 0.008% 的 overhead，可忽略。</p>
+
+  <p>Protocol 兼容性的細節值得多說一句。Bazel 的 remote-execution API（REAPI）是個 gRPC protocol，CAS 暴露的就是 `FindMissingBlobs` + `BatchUpdateBlobs` + `BatchReadBlobs` 這幾個方法。CDC 啟用後，client 不直接呼叫 `BatchUpdateBlobs` 上傳 100 MiB blob，而是先呼叫 `FindMissingBlobs` 帶上 200 個 chunk digest，server 回「這 5 個我沒有」，client 只上傳這 5 個。整個流程仍在 REAPI 的標準動詞之內——`FindMissingBlobs` 本來就是為了 batch dedup 設計的，CDC 不過是把它的粒度從「blob」拉到「chunk」。從 protocol 角度看，這是無痛擴展，沒有新動詞、沒有新 message type。Reconstruction metadata 是 BuildBuddy 在 CAS 上額外存的，client 用一個新的 `GetBlobChunks` (或類似) RPC 去讀——這部分是 BuildBuddy 對 REAPI 的私有擴展，但不影響其他 Bazel client 的 read。</p>
+
+  <p>下面這個表整理了 CDC 在 CAS 上引入的所有 metadata 開銷與節省，並對比另外幾種 chunking 方案（fixed-size 與 Rabin fingerprint）。</p>
+
+  <figure class="vg-w-table-cdc-comparison">
+    <style>
+      .vg-w-table-cdc-comparison table { width: 100%; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-cdc-comparison thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; white-space: nowrap; }
+      .vg-w-table-cdc-comparison thead th[data-sort] { color: var(--accent-text); }
+      .vg-w-table-cdc-comparison tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+      .vg-w-table-cdc-comparison td.num { font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
+      .vg-w-table-cdc-comparison td.scheme { font-family: var(--display); font-size: var(--fs-md); }
+      .vg-w-table-cdc-comparison figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-2); }
+    </style>
+    <table>
+      <thead>
+        <tr>
+          <th data-key="scheme">scheme</th>
+          <th data-key="boundary">boundary</th>
+          <th data-key="cpu" class="num">cpu / GB</th>
+          <th data-key="dedup" class="num">single-insert dedup</th>
+          <th data-key="dist">size distribution</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="scheme">fixed-size</td>
+          <td>每 N byte 固定切</td>
+          <td class="num">0.1 s</td>
+          <td class="num">~0%</td>
+          <td>δ at N（完全相同）</td>
+        </tr>
+        <tr>
+          <td class="scheme">Rabin fingerprint</td>
+          <td>多項式 rolling hash + mask</td>
+          <td class="num">3.5 s</td>
+          <td class="num">~98%</td>
+          <td>幾何分布（長尾）</td>
+        </tr>
+        <tr>
+          <td class="scheme">FastCDC (vanilla)</td>
+          <td>Gear hash + mask</td>
+          <td class="num">0.9 s</td>
+          <td class="num">~98%</td>
+          <td>幾何分布（長尾）</td>
+        </tr>
+        <tr>
+          <td class="scheme">FastCDC + norm</td>
+          <td>Gear hash + 雙 mask + min/max</td>
+          <td class="num">1.0 s</td>
+          <td class="num">~98%</td>
+          <td>近似常態（窄帶）</td>
+        </tr>
+      </tbody>
+    </table>
+    <figcaption>單一插入的 dedup ratio 在 rolling-hash 家族都接近 98%，但 size distribution 差很多——normalization 把長尾壓回常態是 production 真正重要的差異。CPU 數字來自 FastCDC paper（Xia 2016）的 single-thread 測試；點 header 可排序。</figcaption>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-table-cdc-comparison');
+        const headers = root.querySelectorAll('thead th');
+        const tbody = root.querySelector('tbody');
+        let activeKey = null, asc = true;
+        headers.forEach(h => h.addEventListener('click', () => {
+          const key = h.dataset.key;
+          if (activeKey === key) asc = !asc; else { activeKey = key; asc = true; }
+          headers.forEach(x => x.removeAttribute('data-sort'));
+          h.setAttribute('data-sort', asc ? 'asc' : 'desc');
+          const rows = [...tbody.querySelectorAll('tr')];
+          const idx = [...headers].indexOf(h);
+          rows.sort((a, b) => {
+            const av = a.children[idx].textContent.trim().replace('%', '').replace('~', '').replace(' s', '');
+            const bv = b.children[idx].textContent.trim().replace('%', '').replace('~', '').replace(' s', '');
+            const an = Number(av), bn = Number(bv);
+            const cmp = !Number.isNaN(an) && !Number.isNaN(bn) ? an - bn : av.localeCompare(bv);
+            return asc ? cmp : -cmp;
+          });
+          rows.forEach(r => tbody.appendChild(r));
+        }));
+      })();
+    </script>
+  </figure>
+
+  <p>從表上可以看到，FastCDC（vanilla）跟 Rabin fingerprint 在 dedup 質量上幾乎一樣——98% 上下的 single-insert ratio——但 CPU 預算是 Rabin 的約四分之一。這是 BuildBuddy 選 FastCDC 風格而非 Rabin 的關鍵：cache 寫入路徑上的 CPU 預算是有限的，特別是 BuildBuddy 自己作為 hosted cache service，每秒要處理上 GB 的 ingress——把 chunking 的 CPU 從 Rabin 的 3.5s/GB 砍到 FastCDC 的 1.0s/GB 是直接的 SLA 改善。</p>
+
+  <h2>production 上看到的數字</h2>
+
+  <p>BuildBuddy 在自己的 repo 上做了 benchmark，跨兩週的生產資料收尾。Benchmark 設計是「對自家 BuildBuddy repo 跑 50 個連續 commit 的 build」，每次 build 啟用與停用 chunking 各跑一次，比較 upload bytes、disk cache size、build wall time。Production 數字則來自所有用戶啟用 chunking 之後兩週的累積。</p>
 
   <figure>
-    <svg class="vg-w-bar-bazel-cdc-savings" viewBox="0 0 480 200" role="img"
-         aria-label="BuildBuddy CDC 啟用前後的節省與 dedup 比率" style="width: 100%; height: auto; max-width: 480px;">
+    <svg class="vg-w-bar-bazel-cdc-savings" viewBox="0 0 880 280" role="img"
+         aria-label="BuildBuddy CDC 啟用前後的節省與 dedup 比率" style="width: 100%; height: auto; max-width: 880px;">
       <style>
         .vg-w-bar-bazel-cdc-savings text { font-family: EB Garamond, serif; font-size: 12px; }
         .vg-w-bar-bazel-cdc-savings .label { font-family: IM Fell English, serif; font-style: italic; }
+        .vg-w-bar-bazel-cdc-savings .title { font-family: EB Garamond, serif; font-size: 14px; }
       </style>
+      <text x="440" y="22" text-anchor="middle" fill="var(--ink)" class="title">CDC 啟用前後在 BuildBuddy 自有 repo 上量到的差異</text>
+
       <!-- Y axis -->
-      <line x1="60" y1="20" x2="60" y2="170" stroke="var(--muted-2)" stroke-width="1"/>
-      <line x1="60" y1="170" x2="460" y2="170" stroke="var(--muted-2)" stroke-width="1"/>
+      <line x1="80" y1="50" x2="80" y2="240" stroke="var(--muted-2)" stroke-width="1"/>
+      <line x1="80" y1="240" x2="840" y2="240" stroke="var(--muted-2)" stroke-width="1"/>
       <!-- Y tick labels -->
-      <text x="55" y="174" text-anchor="end" fill="var(--muted)" class="label">0%</text>
-      <text x="55" y="134" text-anchor="end" fill="var(--muted)" class="label">25%</text>
-      <text x="55" y="94" text-anchor="end" fill="var(--muted)" class="label">50%</text>
-      <text x="55" y="54" text-anchor="end" fill="var(--muted)" class="label">75%</text>
-      <text x="55" y="22" text-anchor="end" fill="var(--muted)" class="label">100%</text>
+      <text x="74" y="244" text-anchor="end" fill="var(--muted)" class="label">0%</text>
+      <text x="74" y="196" text-anchor="end" fill="var(--muted)" class="label">25%</text>
+      <text x="74" y="148" text-anchor="end" fill="var(--muted)" class="label">50%</text>
+      <text x="74" y="100" text-anchor="end" fill="var(--muted)" class="label">75%</text>
+      <text x="74" y="54" text-anchor="end" fill="var(--muted)" class="label">100%</text>
 
-      <!-- Bars: upload reduction 40% -->
-      <rect x="90" y="106" width="60" height="64" fill="var(--accent)" opacity="0.7"/>
-      <text x="120" y="100" text-anchor="middle" fill="var(--accent-text)" class="label">40%</text>
-      <text x="120" y="186" text-anchor="middle" fill="var(--muted)" class="label">upload</text>
-      <text x="120" y="198" text-anchor="middle" fill="var(--muted)" class="label">data ↓</text>
+      <!-- gridlines -->
+      <line x1="80" y1="196" x2="840" y2="196" stroke="var(--line)" stroke-width="0.5" stroke-dasharray="2 4"/>
+      <line x1="80" y1="148" x2="840" y2="148" stroke="var(--line)" stroke-width="0.5" stroke-dasharray="2 4"/>
+      <line x1="80" y1="100" x2="840" y2="100" stroke="var(--line)" stroke-width="0.5" stroke-dasharray="2 4"/>
+      <line x1="80" y1="54" x2="840" y2="54" stroke="var(--line)" stroke-width="0.5" stroke-dasharray="2 4"/>
 
-      <!-- Disk cache size 40% -->
-      <rect x="170" y="106" width="60" height="64" fill="var(--sage)" opacity="0.7"/>
-      <text x="200" y="100" text-anchor="middle" fill="var(--sage-deep)" class="label">40%</text>
-      <text x="200" y="186" text-anchor="middle" fill="var(--muted)" class="label">disk cache</text>
-      <text x="200" y="198" text-anchor="middle" fill="var(--muted)" class="label">↓</text>
+      <!-- Bars -->
+      <!-- upload bytes ↓ 40% -->
+      <rect x="120" y="163" width="100" height="77" fill="var(--accent)" opacity="0.7"/>
+      <text x="170" y="156" text-anchor="middle" fill="var(--accent-text)" class="label" font-size="13">40%</text>
+      <text x="170" y="260" text-anchor="middle" fill="var(--ink)" class="label">upload bytes ↓</text>
+      <text x="170" y="274" text-anchor="middle" fill="var(--muted)" class="label">50-commit benchmark</text>
 
-      <!-- Dedup rate 85% -->
-      <rect x="250" y="34" width="60" height="136" fill="var(--ink-deep)" opacity="0.7"/>
-      <text x="280" y="28" text-anchor="middle" fill="var(--ink-deep)" class="label">85%</text>
-      <text x="280" y="186" text-anchor="middle" fill="var(--muted)" class="label">written-bytes</text>
-      <text x="280" y="198" text-anchor="middle" fill="var(--muted)" class="label">dedup ↑</text>
+      <!-- disk cache ↓ 40% -->
+      <rect x="260" y="163" width="100" height="77" fill="var(--sage)" opacity="0.75"/>
+      <text x="310" y="156" text-anchor="middle" fill="var(--sage-deep)" class="label" font-size="13">40%</text>
+      <text x="310" y="260" text-anchor="middle" fill="var(--ink)" class="label">disk cache ↓</text>
+      <text x="310" y="274" text-anchor="middle" fill="var(--muted)" class="label">50-commit benchmark</text>
 
-      <!-- Cache traffic 30% -->
-      <rect x="330" y="122" width="60" height="48" fill="var(--accent)" opacity="0.55"/>
-      <text x="360" y="116" text-anchor="middle" fill="var(--accent-text)" class="label">20–40%</text>
-      <text x="360" y="186" text-anchor="middle" fill="var(--muted)" class="label">cache traffic</text>
-      <text x="360" y="198" text-anchor="middle" fill="var(--muted)" class="label">↓</text>
+      <!-- written bytes dedup 85% -->
+      <rect x="400" y="77" width="100" height="163" fill="var(--ink-deep)" opacity="0.65"/>
+      <text x="450" y="70" text-anchor="middle" fill="var(--ink-deep)" class="label" font-size="13">85%</text>
+      <text x="450" y="260" text-anchor="middle" fill="var(--ink)" class="label">written-bytes dedup ↑</text>
+      <text x="450" y="274" text-anchor="middle" fill="var(--muted)" class="label">two-week production</text>
+
+      <!-- cache traffic ↓ 20-40% -->
+      <rect x="540" y="183" width="100" height="57" fill="var(--accent)" opacity="0.55"/>
+      <text x="590" y="176" text-anchor="middle" fill="var(--accent-text)" class="label" font-size="13">20–40%</text>
+      <text x="590" y="260" text-anchor="middle" fill="var(--ink)" class="label">cache traffic ↓</text>
+      <text x="590" y="274" text-anchor="middle" fill="var(--muted)" class="label">two-week production</text>
+
+      <!-- eligible objects 4.2% -->
+      <rect x="680" y="232" width="100" height="8" fill="var(--muted)" opacity="0.55"/>
+      <text x="730" y="225" text-anchor="middle" fill="var(--muted)" class="label" font-size="13">4.2%</text>
+      <text x="730" y="260" text-anchor="middle" fill="var(--ink)" class="label">objects ≥ 2 MiB</text>
+      <text x="730" y="274" text-anchor="middle" fill="var(--muted)" class="label">eligible for CDC</text>
     </svg>
-    <figcaption>BuildBuddy 內部 benchmark：上傳資料減 40%、disk cache 縮 40%、寫入路徑 dedup 率 85%、整體 cache 流量節省 20–40%（不同 workload 區間）。</figcaption>
+    <figcaption>左半：benchmark 數字（50 commit, BuildBuddy 自家 repo）——upload data 與 disk cache 各減 40%。中：production 兩週累積——寫入路徑 dedup 達 85%。右：production 整體 cache traffic 節省 20-40%（依 workload 而定）。最右：能啟用 CDC 的 cache object 只佔 4.2%，但這 4.2% 佔 byte 總量極高——對的物件抓 dedup，比所有物件抓一點點有效。</figcaption>
   </figure>
 
-  <p>絕對值更直觀：兩週累積跳過約 300 TiB 重複 chunk，尖峰時段每小時節省超過 4 TiB。對於 monorepo 與 CI 高度依賴 remote cache 的團隊，這直接折算成 S3 / GCS 出口流量帳單；對於 self-hosted 的 remote cache，則是磁碟採購節奏的延後。</p>
+  <p>絕對值更直觀：兩週累積跳過約 300 TiB 重複 chunk，尖峰時段每小時節省超過 4 TiB。對於 monorepo 與 CI 高度依賴 remote cache 的團隊，這直接折算成 S3 / GCS 出口流量帳單；對於 self-hosted 的 remote cache，則是磁碟採購節奏的延後。BuildBuddy 自己負擔的是「我們的 hosted cache backend 出口帳單」，這個數字省下來直接落到 margin。</p>
+
+  <p>把 300 TiB 拆開來算更有感：兩週 14 天大約 336 小時，平均每小時 ~900 GiB、每秒 ~250 MiB 的「本來要傳但被跳過的 byte」。AWS 跨可用區出口大約 USD 0.01/GiB、跨 region 大約 USD 0.02/GiB——光帳單就省下 USD 6,000–12,000 兩週的網路成本，更不算 S3 PUT 計費與 storage class 折扣。對 BuildBuddy 規模這是直接落到 P&L 的數字；對自架 BuildBuddy 的客戶（例如 Stripe、Snap 這類大型 Bazel user）則是 NAS 採購延後幾個月，邊際效益更高。</p>
+
+  <p>Benchmark 的「50 個 commit」設計值得展開一下。對單一 commit 的 build cache miss 是 100%——這時候 CDC 沒幫助（沒有先前的 chunk 可以命中）。Benefit 從第二個 commit 開始累積：相同的 link 輸出、相同的 archive、相同的 deploy bundle 在連續 commit 之間 byte-stable，CDC 把這些 byte-stable 部分當成 chunk-level dedup 目標。50 個 commit 的累積，這個 benefit 趨近一個穩定值——40% 就是 BuildBuddy 自家 repo 在這個 workload 下的穩態。其他 repo 的數字會浮動：byte-stability 越好（reproducible build、minimal incidental change）的 repo 數字越漂亮。</p>
+
+  <p>另一個值得注意的數字：85% 的 written-bytes dedup。這指的是 cache 服務寫入路徑上，「本來要寫入 cache 的 chunk」之中有多少其實已經存在、被跳過。85% 是極高的數字——這個比例說明 BuildBuddy 自家 repo（與類似的客戶 repo）的 build output 大多數 byte 在不同 commit 之間其實沒變，CDC 把這個事實兌現成 cache 寫入的 IOPS 與磁碟空間節省。20-40% 的 cache traffic 比例則涵蓋讀寫兩側，且把 4.2% 以下的小檔案（不經 CDC）也算進來——所以數字比 85% 低，但仍然是兩位數的整體改善。</p>
+
+  <p>使用者實際看到什麼？BuildBuddy 強調的是「對 user 透明」——啟用 chunking 後 build time 略降（主要來自上傳變快與 cache hit rate 上升），但沒有需要重新教育 developer 的新概念。對於 monorepo 高度依賴 remote cache 的團隊（Android、iOS app build、Go 大型服務），最敏感的指標通常不是 cache 命中率而是「cold cache 之後 warm 起來有多快」——這條曲線從 CDC 啟用後的數據看會更陡，因為 cache 從第一個 build 之後就以 sub-file 粒度開始積累。對於 CI fleet，這意味著新加入的 worker 不需要從零拉所有 blob——它的本地 disk cache 與 remote cache 都共享 chunk 層的 dedup，warm-up 時間縮短。</p>
+
+  <p>BuildBuddy blog 沒給出具體的 build time 數字，但給了一個方向性的句子：「user-facing build latency improvements are most visible on builds dominated by large output uploads」。翻譯：CI 上跑 release artifact 的 build——typically Docker layer push、deploy bundle upload、symbol file archive——這些 step 的 wall time 直接被網路 throughput bound 住，CDC 把上傳量砍 40% 等於 wall time 砍 40%。Dev 端 incremental build 大多數 step 在 1 MiB 以下，CDC 不啟用，所以沒有可量化的差別——這也是為什麼 BuildBuddy 把 CDC 描述為「優化 production CI pipeline」而非「優化 dev inner loop」。</p>
+
+  <h2>何時 CDC 退化</h2>
 
   <p>有一個值得注意的負面情境：CDC 對非 byte-stable 的輸出（例如帶 timestamp、未做 reproducible build 的 binary）幫助有限——切點仍會找到相同的 pattern，但實際 chunk 內容仍會變，dedup 退化。要真正吃到這 40%，得先把 build 的 determinism 做好。CDC 是放大器，不是修復器。</p>
+
+  <p>具體列舉退化情境：</p>
+
+  <ol>
+    <li><strong>嵌入 timestamp 的 binary</strong>——`__DATE__` / `__TIME__` macro 在 C/C++ 預設展開、Go `runtime.buildVersion` 含 build time、Java jar 的 manifest 預設帶 build timestamp。每次 build 同一個 source 都產生不同 byte——dedup 接近 0。</li>
+    <li><strong>跨 chunk 的大重排</strong>——例如 linker order 改變、stripped section 順序變動。CDC 對「插入一個 byte」這種小修改是 robust 的，但對「整個 .text section 順序重排」就退化——絕大多數 chunk 都會跨越新的重排邊界。</li>
+    <li><strong>已經壓縮過的輸出</strong>——`.tar.gz`、Docker layer (gzip)、`.zip`。Gzip 的 byte stream 對輸入的小修改是「整段 hash chain 重算」，所以 source 的 1-byte 修改可能造成 compressed output 90%+ 不同——CDC 在 compressed bytes 上找不到 dedup 機會。</li>
+    <li><strong>obfuscation / randomization 啟用的 release build</strong>——例如 ProGuard、LLVM ObfuscatorLLVM、隨機 symbol renaming。這些工具的輸出本質上「同 input 不同 output」，CDC 幫不上忙。</li>
+    <li><strong>檔案小於 2 MiB</strong>——根本不會啟用 CDC，直接整檔 hash。對 source、小 header、Bazel runfiles 中的小 script 都適用。</li>
+  </ol>
+
+  <p>對前三點，有解。第一點：強制 reproducible build（Bazel 文件有完整的 `--repo_env`、`--action_env` 清單去除 timestamp）。第二點：穩定 linker 的 section 順序（lld 的 `--no-rosegment`、ld 的 `--no-keep-memory` 之類旗標）。第三點：把壓縮這一步從 cache 路徑挪出去——cache 大檔案的 uncompressed 版本，壓縮在 download 之後 client 端做。第四、五點本質上是 trade-off：要 release-grade obfuscation 或要 CDC dedup，二選一。</p>
+
+  <p>另一類退化情境是「極小或極高隨機性內容」。CDC 在 byte 完全隨機的 stream 上仍然能切——Gear hash 與 mask 還是會在某些位置命中——但切出來的 chunk 各自獨立、跟其他檔案不會有重疊，dedup ratio 接近 0。對加密過的 blob（例如 GPG-signed artifact、TLS-wrapped layer）這是 by-design：加密的目的就是讓 byte 看起來像隨機，CDC 沒辦法、也不該對加密 byte 找 pattern。實務上的處理是：在 build pipeline 把「待加密的原始 bytes」cache 起來、加密這一步放在 download 之後，跟壓縮一樣的策略。</p>
+
+  <p>還有一個微妙的失敗模式：「chunk 邊界對齊的 worst case」。如果 build 系統的修改恰好總是落在「跨多個連續 chunk 的位置」（例如有個寫死的偏移量在檔案中段被改），那 dedup 命中率會比平均差。FastCDC 的 mask 機率分布在「修改點在 chunk 內」與「修改點在 chunk 邊界」之間其實有差，前者只影響 1 個 chunk，後者影響 2 個。對 200 chunk 的 blob，這個差別在 single-insert 場景是 0.5% vs 1%——可以忽略；但對「每次 commit 都在同一個位置改」的反常 workload，這 1% 會穩定吃掉一部分節省。BuildBuddy production 數字（40% upload reduction）已經對這類 worst case 平均過——對個別 repo 可能更好也可能更差。</p>
+
+  <p>有一個 production 上實際看到、但 BuildBuddy blog 沒明寫的細節：CDC 對「rebuild from scratch」的 cold cache 場景沒有任何幫助——cache 是空的，第一次 build 不管切多少 chunk 都得全部上傳。CDC 的 benefit 完全來自「跟先前 build 的 chunk 重疊」這件事。所以對「每次 CI build 都 fresh clone + build」的團隊，CDC 的 benefit 在第一個 build 之後才開始累積。但「持續性 cache」（remote cache 跨 build 持續，例如 GitHub Actions cache 或自架 BuildBuddy）是 CDC 的甜蜜點——這也是 BuildBuddy 把 CDC 設成 default-on 候選的場景假設。</p>
+
+  <p>還有一個操作細節：`--experimental_remote_cache_chunking` 是 Bazel 8.7 / 9.1+ 才有的旗標。對較舊 Bazel 版本，BuildBuddy 仍然能 serve cache，但 client 不會做 chunking——這是個漸進升級路徑，不需要強迫整個 org 同步升級 Bazel。Hosted cache backend 已經啟用 chunking 的話，舊 client 寫入仍是整檔 blob（不做 chunking），新 client 寫入會做 chunking——兩種 blob 在 CAS 上共存，read 路徑自動分辨（透過 reconstruction metadata 是否存在）。這個漸進性是 Bazel remote-cache protocol 的相容性設計給了空間。</p>
+
+  <p>最後一個值得記住的事實：CDC 不是 BuildBuddy 發明的——FastCDC paper 在 2016 年就發表了，Restic、borgbackup、rsync 的 newer 版本都用類似機制。把 FastCDC 帶進 Bazel cache 的真正貢獻不在演算法本身，而在「把這個機制 wire 進 Bazel 的 CAS protocol、保持 blob digest identity 不變、給出 production-grade 的 4.2% / 85% / 40% / 300 TiB 證據」——這是工程上難的部分。對其他 build system（Buck2、Pants、Nix）的維護者來說，這套參數與門檻是直接可借鑑的基線。Nix 的 store 本來就是 content-addressed，但顆粒度是整個 derivation output（通常一個目錄 tar 起來）；Buck2 的 RE protocol 跟 Bazel 共用 REAPI，理論上同一套 CDC 邏輯可以原樣搬過去。預期接下來 12-18 個月會看到至少一兩個 build system 跟進這個方向。</p>
 
   <p class="vg-deep-closer"><strong>What this enables</strong>：把 dedup 從「整檔 digest 比對」拉到「sub-file rolling-hash chunk 比對」，讓 Bazel 在每次源碼小變動時，只為真正新出現的 byte 付儲存與網路成本——前提是 build 本身已經是 byte-reproducible 的。</p>
 </div>

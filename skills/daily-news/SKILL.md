@@ -422,11 +422,16 @@ After all sub-agents return:
 1. Read each output HTML + sidecar back to confirm the files exist and
    the sidecar parses as JSON.
 2. Verify per-file invariants the sub-agent was told to honour:
-   - 600-1200 lines.
+   - Prose ≥ 500 lines (HTML lines excluding inside `<script>`,
+     `<style>`, `<svg>`, `<canvas>` blocks).
    - `<p class="vg-deep-opener">` and `<p class="vg-deep-closer"><strong>`.
-   - ≥1 inline SVG widget (≥2 recommended; single must carry high density).
+   - ≥ 3 widgets total (count of elements with `class="vg-w-*"`).
+   - ≥ 1 widget is interactive (contains `<script>` OR `<input>`
+     OR `<canvas>` OR `animation-timeline: scroll()` in inline CSS).
    - Universal contract from `deep-freeform.md` applies to all archetypes.
    - Body matches the picked archetype's H2 *count range* (phrasing free).
+   - Sidecar contains `widget_count`, `widget_questions`,
+     `widget_templates` arrays; lengths agree.
 3. The mechanical QA gate in Step 8 (`archetype-check`, `check-dup`,
    `html-validate`, `link-check`) is the formal validation. Step 7c is
    the first-pass sanity check before that.

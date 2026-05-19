@@ -49,12 +49,33 @@ Each post lives in `src/posts/YYYY/MM/DD/<slug>.{html,11tydata.json}`.
   "news_ids": ["YYYY-MM-DD-NN", ...],
   "summary": "one-sentence CJK summary, <= 80 chars",
   "estimated_read_min": integer,
-  "related_roundup": "/YYYY/MM/DD/roundup/"
+  "related_roundup": "/YYYY/MM/DD/roundup/",
+  "widget_count": integer,
+  "widget_questions": ["conceptual question per widget", ...],
+  "widget_templates": ["interactive-param-demo" | "scroll-driven-explanation"
+                       | "mini-canvas-simulation" | "annotated-diagram-walkthrough"
+                       | "data-driven-chart" | "<tier-2 snippet id>", ...]
 }
 ```
 
 `deep_archetype` is REQUIRED for `archetype: "daily-deep-story"` posts
-and OMITTED for `daily-roundup`. publish.mjs enforces presence.
+and OMITTED for `daily-roundup`.
+
+`widget_count`, `widget_questions`, and `widget_templates` are
+REQUIRED for `archetype: "daily-deep-story"` posts (where the new
+widget contract applies). They are OPTIONAL for `daily-roundup` (the
+roundup's widget budget is unchanged — see "Roundup spec" below).
+
+Invariants:
+
+- `widget_count == widget_questions.length`
+- `widget_templates.length == widget_count`
+- Every entry in `widget_templates` exists as a file under
+  `skills/daily-news/references/widget-cookbook/tier-1-golden/<id>.md`
+  OR `skills/daily-news/references/widget-cookbook/tier-2-snippets/<id>.md`
+
+`publish.mjs` enforces presence + length invariants. The cookbook-id
+existence check runs in `tests/widget-cookbook-check.mjs`.
 
 ### Hero contract (deep-story only)
 
