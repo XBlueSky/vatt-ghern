@@ -1,0 +1,771 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">在 us-east1-b 那個 12:13 PDT 的時刻，一份 Kubernetes 部署檔把 session 管理 pod 的副本數砍了一半，graceful draining 還沒跑完，17% 的 session 就被硬切斷——這道裂口最終要花掉 voice 團隊 3 小時 17 分鐘，並讓 15 台 voice syncer 的 Erlang mailbox 同時膨脹到接近一百萬則訊息才補得起來。</p>
+  <h1 class="vg-post-title">Discord 3/25 語音崩盤覆盤——一行誤設掀翻 voice control plane</h1>
+</header>
+
+<div class="vg-post-prose">
+
+<p><span class="vg-dropcap">這</span>是一份標準的 Elixir 服務遷上 Kubernetes 的部署，按照變更紀錄上的描述「沒什麼新鮮事」——直到 12:13 PDT 那一刻，那份 manifest 把 us-east1-b 區的 sessions service pod 副本數壓到只剩一半，安全機制還沒來得及把記憶體裡的 GenServer 狀態交棒出去，pod 就先被排程器殺掉了。</p>
+
+<p>Discord 的工程師 Bo Ingram 與 Stephen Birarda 在事後報告開頭引了一個很久沒聽到的比喻：「The sad trombone haunts our dreams. Womp, womp, womp...」這不是文采上的修飾。任何人經歷過一次連續切了三波 rollback 都失敗的當班，都會明白那種聲音在腦中揮之不去的感受——你看著儀表板上 mailbox 曲線從 0 萬一路漲到 100 萬，你的指令照理說該讓它下來，但它就是不動，或者跌一下又被新湧進來的流量打回去。這一篇就是把那 3 小時 17 分鐘裡，每一步發生了什麼、為什麼前三次救火沒用、第四次又為什麼救得起來、後續結構性的修補拼成什麼樣，按時間順序復現一次。</p>
+
+<h2>一份誤設的 manifest——故事從這裡長出來</h2>
+
+<p>整個事件的「起爆點」其實只有一行。</p>
+
+<p>一份 Kubernetes deployment 的 replicas 從原本的數值改成大約一半——就這麼簡單。</p>
+
+<p>這個變更發生在 Discord 正在把 Elixir 服務逐步搬上 Kubernetes 的過程中。當時的目標是讓 sessions service——也就是負責管理「每一個使用者裝置 ↔ 連線」對應關係的核心服務——能享受 horizontal pod autoscaler 與滾動更新的好處。</p>
+
+<p>把 sessions service 搬上 Kubernetes 是合理的工程決定。每個服務都應該能夠 horizontal scale；每次部署都應該能夠 rolling update；每個節點都應該可以被 replace 而不影響整體服務。這是 Kubernetes 存在的全部意義。問題不在「為什麼搬」，而在「搬的過程中漏了什麼」。</p>
+
+<p>問題不在「縮減副本」這個動作本身，而在於 graceful draining 沒跑完。</p>
+
+<p>Elixir 的 sessions service 在每個 pod 裡跑著數以萬計的 GenServer process。每個 process 都拿著一個正在連線中的使用者裝置的 in-memory state。</p>
+
+<p>把這些 process 從一台 node 平順地搬到另一台 node，必須等「狀態交棒」流程跑完——對 GenServer 而言，這意味著 hibernate、序列化、跨 node 重建。</p>
+
+<p>Kubernetes 的預設 terminationGracePeriodSeconds 通常不夠這套儀式跑完。而那次部署偏偏沒有相應地調高、也沒有設定一個 admission webhook 去攔截不安全的縮容。</p>
+
+<p>結果就是 sessions service 在那一瞬間被「ungracefully stopped」掉了一批 pod。</p>
+
+<p>事後報告給出的數字是：<strong>「17% of sessions across Discord were ungracefully stopped」</strong>。</p>
+
+<p>Discord 全球同時在線 session 數不會公開，但稍微估算就能體會，這代表了千萬量級的連線在毫無心理準備下被剪斷。對一個以即時通訊為主要使用情境的平台來說，這個比例不是小數。</p>
+
+<p>更關鍵的是，這 17% 並不是均勻分散——它們全集中在 us-east1-b 同一個 zone 裡。</p>
+
+<p>當這些 session 嘗試重連、轉到鄰近 zone 時，重連的流量就會形成一道朝著 us-east1-c 與 us-east1-d 灌過去的「reconnection storm」。後續所有故事，幾乎都長在這道風暴的不同岔路上。</p>
+
+<p>這也是分散式系統故障常見的一個結構特徵：故障的「物理位置」與故障的「影響範圍」往往不一致。Bug 出在 us-east1-b 的一個 deployment 設定，但被它打垮的是 us-east1-c、us-east1-d，最後是全球的 voice syncer fleet。當你的系統有 cross-zone failover 機制——這幾乎是現代分散式系統的標配——任何一個 zone 的局部問題都有機會經由 failover 路徑變成全域問題。</p>
+
+<h3>從 sessions 切到 gateway——兩分鐘內第一波擴散</h3>
+
+<p>12:13 到 12:15 PDT 之間，Erlang/OTP 的 process linking 機制把這場意外從局部變成了全域。</p>
+
+<p>Elixir 的設計哲學是「let it crash」加上 supervisor 樹。</p>
+
+<p>當一個 GenServer 異常退出，它的 monitor 會發 <code>{:DOWN, ref, :process, pid, reason}</code> 訊息給所有訂閱者。</p>
+
+<p>Discord 的 realtime 系統是高度互鏈的：每個 session 同時被 guild process（也就是「伺服器」）、presence tracker、gateway connection 訂閱。</p>
+
+<p>事後報告用了一個動詞——<strong>「flurry of messages」</strong>——來形容那兩分鐘內整個系統內部的訊號雜訊。</p>
+
+<p>這個比喻很精準。它不是穩定的高流量，是一陣短時間內爆發的雜訊。所有 17% 被殺掉的 session 同時放出 DOWN 訊息，每個 DOWN 訊息又會觸發訂閱者各自的清理邏輯——guild process 要把這個 user 從成員快取裡踢掉、presence tracker 要更新使用者狀態、gateway connection 要決定要不要保留或關閉對應的 websocket。每一條清理路徑都是合理的；但同時跑這麼多次，本身就是負載。</p>
+
+<p>這道雜訊很快撞上了下一個瓶頸：gateway service。</p>
+
+<p>Gateway 是負責收發 websocket 的代理，前面是公網的 wss 連線，後面是 Discord 內部各 realtime 服務。</p>
+
+<p>原則上，當前端的 session 斷線時，websocket 也該斷。但實務上有大量 client 會立刻嘗試重連——Discord 的 client 端 SDK 預設就會在連線中斷後做指數退避的重連。</p>
+
+<p>於是 gateway 在 us-east1-b 區的節點同時要處理「上一批連線正在拆」與「下一批連線正在建」兩股流量。</p>
+
+<p>每個 host 上原本有 session start rate limit 來保護自己，但這個限制值在遷移過程中被「miscalibrated post-migration」——也就是說，新 host 的設定值並沒有按照新 pod 的 CPU/記憶體比例重新計算。</p>
+
+<p>於是 gateway 在湧入的 reconnection 面前等於沒有保護。</p>
+
+<p>Gateway memory capacity 圖顯示，us-east1-b 的節點記憶體佔用幾乎是垂直拉升到接近 100%。</p>
+
+<p>當 OOM killer 開始介入，那些節點重啟，把流量甩到 us-east1-c 與 us-east1-d——失敗自此跨越了 zone。</p>
+
+<p>這個傳染路徑要記住，因為它解釋了為什麼後面當 voice syncers 出狀況時，影響範圍是全球而不是局部：reconnection storm 已經在前 15 分鐘裡讓所有可用 zone 都進入「異常負載」狀態。</p>
+
+<p>當某個下游服務在第 30 分鐘開始撐不住時，整個 stack 已經處在一個「沒有任何 zone 還有 head-room」的脆弱狀態。這意味著任何小規模的擾動，都會被放大成跨 zone 的災難。</p>
+
+<h2>cascade 的真正長尾——voice syncers 的 mailbox 是怎麼漲到一百萬的</h2>
+
+<p>從 12:13 一直到 15:30，整個事件最難解的部分都集中在一個名字平淡無奇的內部服務：voice syncers。</p>
+
+<p>Discord 用了一個段落來解釋它的職責——「manages SFU endpoint placement across more than 25,000 external instances」。</p>
+
+<p>換成白話：當你按下「加入語音頻道」，session 端不會直接跟 SFU（Selective Forwarding Unit，負責轉發音視訊封包的那層）談判。</p>
+
+<p>而是先打到 voice syncers，由它根據負載與地理位置決定要把這通通話接到哪一台 SFU 上，再透過 HTTPS RPC 通知那台 SFU「來，把這個 user 收進來」。</p>
+
+<p>15 台 syncer 實例要照顧 25,000+ 台 SFU。每秒鐘要處理的「endpoint select/create」請求，平時就已經不算少。</p>
+
+<p>當 reconnection storm 來臨時，所有正在語音通話中的 session 都嘗試重建到 SFU 的關聯，syncers 收到的負載瞬間倍增。</p>
+
+<p>瓶頸是怎麼被找出來的，是這次覆盤裡最有教育意義的部分。</p>
+
+<p>voice syncers 內部用了一個叫做 <strong>Holster</strong> 的內部函式庫來池化 HTTP 連線。</p>
+
+<p>Holster 底層用 Erlang 生態的 <code>gun</code> HTTP client。</p>
+
+<p>而 <code>gun</code> 的 connection 生命周期是由兩層 supervisor process 管理的。每當 syncer 需要對 SFU 發起新的 HTTPS RPC，連線建立的請求都要經過這兩層 supervisor 之一。</p>
+
+<p>Erlang 的 process 是 actor model：彼此之間靠 mailbox 通訊，process 主迴圈是一個 <code>receive ... end</code> 區塊。一般情況下這個機制非常便宜。</p>
+
+<p>但這兩層 supervisor 使用的是 <strong>selective receive</strong>——亦即它們在 receive 區塊裡用 pattern match 挑選符合條件的訊息，不符合的就跳過保留在 mailbox 裡。</p>
+
+<p>當 mailbox 短的時候這個動作幾乎免費。但 mailbox 一旦變長，每次 selective receive 都得從頭掃過所有未處理訊息，複雜度退化成 O(n)。</p>
+
+<p>這是 BEAM 一個冷門但決定性的細節：selective receive 的性能特性會隨 mailbox 長度二次惡化——每個 spawn 變慢、處理速度變慢、mailbox 又因此變更長。它本身就是一個自我加速的退化模式。</p>
+
+<p>事後 Discord 的工程師做了量化測試，給出了一個讓人印象深刻的數字：<strong>「we confirmed that this selective receive on a supervisor with a ~100k mailbox queue adds ~1ms to process spawn time」</strong>。</p>
+
+<p>1 毫秒聽起來不多，但每個 SFU RPC 都會觸發一次新的 connection spawn——當 syncer 每秒鐘要 spawn 幾百到幾千次 connection 時，1 毫秒/次的 overhead 直接吃光所有 CPU。</p>
+
+<p>更糟的是，這條 critical path 還跟 service discovery 黏在一起。</p>
+
+<p>voice syncers 透過 etcd 註冊自己的健康狀態：每個實例定期 refresh 一個 TTL，告訴 consistent hash ring 上的其他 service「我還活著，把流量送過來」。</p>
+
+<p>問題在於，這個 TTL refresh 的訊息也要經過同一組已經被連線請求塞爆的 supervisor mailbox。</p>
+
+<p>當 mailbox 排到一百萬則訊息深時，TTL refresh 根本來不及處理，etcd 就把那個實例從 ring 上拔掉了。</p>
+
+<p>這是事故設計上最殘酷的一個細節——control plane（service discovery）與 data plane（connection management）共享同一條 critical path，等於把「我還活著」的訊號跟「我正在處理流量」的訊號綁在一起。當後者卡住，前者也一起死。健康檢查機制本身變成了崩潰加速器。</p>
+
+<p>結果是一個糟糕的正回饋迴圈：</p>
+
+<ol>
+  <li>mailbox 變長 → process spawn 變慢 → endpoint create 失敗率上升</li>
+  <li>endpoint create 失敗 → 上游服務重試 → mailbox 變更長</li>
+  <li>TTL refresh 排不上 → etcd 把實例移出 ring</li>
+  <li>剩下的健康實例要承擔更多 failover 流量 → 它們的 mailbox 也開始堆</li>
+  <li>回到第 1 步</li>
+</ol>
+
+<p>正回饋迴圈是分散式系統最危險的一種失效模式。不像線性退化會在某個負載點停下來，正回饋會自我加速——每跑一輪迴圈，下一輪的速度更快、影響範圍更大。對抗它唯一有效的方法不是「修復某個壞掉的部位」，而是「切斷迴圈中至少一條邊」。</p>
+
+<p>儀表板上的「Endpoint Select/Create Success」指標在 12:14 PDT 跌到接近零。</p>
+
+<p>15 台 syncer 裡，當下只有一台序號 2-8 的實例還活著——但它一台要扛全球三分之一的流量，根本撐不住。</p>
+
+<p>同一時間，所有 15 台的 mailbox size 都顯示出穩定且持續成長的曲線。</p>
+
+<p>注意一個重要的觀察：問題不是某幾台「壞掉」——是 15 台同時走向同一個失敗模式。當你的儀表板看到這種「同步退化」的形狀，幾乎可以斷定問題不在實例本身，而在它們共同依賴的某個系統屬性——這次是上游沒有節流。</p>
+
+<h2>三次失敗的 rollback——為什麼救火比起火還難</h2>
+
+<p>從 12:43 到 13:09 PDT，on-call 團隊嘗試了三波恢復動作。</p>
+
+<p>每一波都短暫地讓人鬆口氣，再馬上把人打回深淵。</p>
+
+<p>這段是這次覆盤裡最像戰爭故事的部分。</p>
+
+<p><strong>第一波（12:43 PDT）：重啟單一實例</strong>。</p>
+
+<p>團隊先挑了一台問題最嚴重的 2-13 完整重啟，期望它從 cold start 開始重新接流量。</p>
+
+<p>重啟確實成功——新 process 起來、mailbox 歸零、etcd 註冊回 ring 上。</p>
+
+<p>但只持續了不到一分鐘。上游服務發現有一個健康節點回來，立刻把累積的 retry 全部灌過去，mailbox 在三十秒內又從 0 漲到數十萬。</p>
+
+<p>這是 thundering herd 的縮小版示範。當一個服務從「健康但過載」變成「健康且能接流量」，所有等在門外的請求會在第一個 epoch 裡同時湧入——對單一被選中的實例而言，這個瞬間負載比平均負載高出至少一個數量級。</p>
+
+<p><strong>第二波（12:47 PDT）：殺掉特定的 supervisor</strong>。</p>
+
+<p>團隊改變策略，不重啟整個實例，只 kill 並重啟 <code>Holster.Pool</code> 這個 DynamicSupervisor——理論上這應該清空 mailbox 但保留 etcd 註冊。</p>
+
+<p>結果同樣的模式重現：mailbox 短暫歸零後又漲回來。</p>
+
+<p>問題不在於「mailbox 清不掉」，而在於「清掉之後流量湧進來太快」。</p>
+
+<p>這次嘗試其實透露了一個重要的診斷訊號——但當時沒有人有閒情逸致去注意它。如果 mailbox 清零之後依然立刻被填滿，那麼 root cause 不在於「mailbox 內容」也不在於「process 狀態」，而在於「上游流量速率」。要解決問題就必須往上游找。</p>
+
+<p><strong>第三波（13:05 PDT）：整個 cluster 同時重啟</strong>。</p>
+
+<p>團隊賭一把，希望同時清空所有 15 台的 mailbox 能讓整體系統得到一個「同步的喘息窗口」。</p>
+
+<p>重啟瞬間 mailbox 全部歸零，事後報告稱這個瞬間「briefly recovered」。</p>
+
+<p>但下一秒，所有上游服務同時發現 voice syncers 全體健康，把累積了 50 分鐘的 retry queue 一次釋放出去。</p>
+
+<p>這就是傳說中的 <strong>cold-start thundering herd</strong>——15 台新生兒同時被一群餓壞的爸媽撲倒。</p>
+
+<p>事後檢討用了一句很乾淨的總結：<strong>「cold-start thundering herd was too much to handle」</strong>。</p>
+
+<p>三次失敗的共通結構是：問題從來不是 voice syncers 自己的狀態，而是上游沒有節流。</p>
+
+<p>Bo Ingram 與 Stephen Birarda 在覆盤裡點明了這條邏輯——「A sufficiently large traffic spike will find a bottleneck in your system」。</p>
+
+<p>只要進來的流量沒有被限速，無論 voice syncers 重啟幾次、清 mailbox 幾次，都會被同樣的流量打回去。</p>
+
+<p>對於任何處理過真實事故的人，這條邏輯都會很熟悉。事故當下你會很想去動最直接看得到問題的那個服務——它的儀表板紅了、它的 alert 在響——但很多時候，真正的解法在上游或下游某個離問題很遠的地方。經驗豐富的 on-call 會在「重啟看看」之前先問：「上游有沒有累積？下游有沒有節流？」</p>
+
+<h3>第四次嘗試——同時增加供給、減少需求</h3>
+
+<p>13:43 PDT 開始的這一波恢復動作不再是單一招式。</p>
+
+<p>團隊把整個策略升級成兩條並行的修復路徑。</p>
+
+<p>事後覆盤用了一句很 SRE 味的話來描述它：<strong>「your solutions either increase supply (adding additional services) or reduce demand (rate limiting inbound traffic)」</strong>。</p>
+
+<p>這次他們同時做了兩件事。</p>
+
+<p><strong>路徑一：在上游服務加上 syncer spawn rate limit</strong>。</p>
+
+<p>team 緊急更新了 call owner services（guilds、calls、streams 三個）的設定，引入新的 rate limit。</p>
+
+<p>最關鍵的一條是針對 coordinator syncer 的限速。當一個 guild 有大量語音頻道時，coordinator syncer 會為每個頻道再 spawn 一個 child syncer。</p>
+
+<p>這個「unbounded spawning of child syncers」是放大效應的源頭。把它鎖住，etcd 上看到的 syncer 創建速度立刻降一個數量級。</p>
+
+<p>這個細節有教學價值：許多 amplification bug 都長這個形狀——「對每個 X 都 spawn 一個 Y」這種模式，當 X 變大時 Y 就以乘法速率成長。任何地方有這種 unbounded fan-out，都該預設加上 cap。</p>
+
+<p><strong>路徑二：水平擴容 SFU endpoint dispatcher</strong>。</p>
+
+<p>透過 GCP Terraform 加 Salt 配置，team 手動補上了 15 台額外的 dispatcher 實例，把整體容量翻倍。</p>
+
+<p>這不是優雅的擴容——是手動 provisioning，沒有經過正常的 release pipeline。</p>
+
+<p>但在那個時間點，把 per-instance load 砍半就等於把 selective receive 的 mailbox queue 砍半，就等於把 process spawn time 從幾毫秒拉回亞毫秒。</p>
+
+<p>事故狀態下「手動 provisioning」是合理的選擇。Release pipeline 平時的價值是避免 bad change 進入生產；但在事故狀態，你 absolutely sure 想做什麼、也願意承擔風險，跳過 pipeline 是合理的。重點是事後一定要回去問：「為什麼這個動作平時沒有作為一鍵化的 incident-response 工具？」</p>
+
+<p>13:43 PDT 的重啟結果與前三次有質的不同：這一次失敗的部位不是 <code>Holster.Pool</code>，而是底層的 <code>gun</code> supervisor。</p>
+
+<p>這代表新增的容量加上上游節流已經把瓶頸位置往下推了一層。</p>
+
+<p>實例還能保持 etcd 註冊，意味著至少可以承擔部分 RPC 負載。</p>
+
+<p>「失敗的部位換了」這個訊號在事故診斷裡非常重要——它告訴你「先前的瓶頸已經不是 critical bottleneck」，問題開始往下一層推。這意味著你的修補方向是對的，繼續往同一方向施力就會看到收斂。</p>
+
+<p>14:03 PDT，實例 2-3 重啟後 mailbox 持續維持在低位，第一台「真正恢復」的實例出現。</p>
+
+<p>14:15 重啟了五台，其中四台維持低 mailbox。</p>
+
+<p>14:26 最後一台恢復——doubled cluster 全體健康。</p>
+
+<p>從第一聲警報響到所有指標復原，總計 3 小時 17 分鐘。</p>
+
+<figure class="vg-w-scroll-discord-cascade">
+  <style>
+    .vg-w-scroll-discord-cascade { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s-3); align-items: start; margin: var(--s-4) 0; }
+    .vg-w-scroll-discord-cascade .stages { display: flex; flex-direction: column; gap: var(--s-3); }
+    .vg-w-scroll-discord-cascade .stage { padding: var(--s-2); border-left: 2px solid var(--muted-2); transition: border-color 200ms; }
+    .vg-w-scroll-discord-cascade .stage.active { border-color: var(--accent); }
+    .vg-w-scroll-discord-cascade .stage h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--ink); }
+    .vg-w-scroll-discord-cascade .stage p { margin: 0; font-family: var(--serif); font-size: var(--fs-sm); }
+    .vg-w-scroll-discord-cascade .figure-sticky { position: sticky; top: var(--s-4); }
+    .vg-w-scroll-discord-cascade svg { width: 100%; height: auto; }
+    @media (max-width: 720px) {
+      .vg-w-scroll-discord-cascade { grid-template-columns: 1fr; }
+      .vg-w-scroll-discord-cascade .figure-sticky { position: static; }
+    }
+  </style>
+
+  <div class="stages">
+    <section class="stage" data-stage="1">
+      <h3>Stage 1 · 12:13 PDT — pod terminated</h3>
+      <p>Kubernetes 在 graceful drain 完成前就 SIGTERM 掉 us-east1-b 的 sessions pod，17% 全球 session 同時失聯。</p>
+    </section>
+    <section class="stage" data-stage="2">
+      <h3>Stage 2 · 12:13–12:15 — DOWN flurry</h3>
+      <p>每個被殺掉的 GenServer 對 guild、presence、gateway 送出 <code>{:DOWN, ...}</code> 訊息，realtime 內部訊號量暴衝。</p>
+    </section>
+    <section class="stage" data-stage="3">
+      <h3>Stage 3 · 12:15–12:30 — gateway OOM</h3>
+      <p>Reconnection storm 撞上 miscalibrated per-host session rate limit，us-east1-b 的 gateway 記憶體拉到 ~100%，故障跨 zone 擴散到 1c 與 1d。</p>
+    </section>
+    <section class="stage" data-stage="4">
+      <h3>Stage 4 · 12:13–14:26 — syncer mailbox blowup</h3>
+      <p>15 台 voice syncer 的 Holster.Pool selective receive 在 ~100k mailbox queue 下每次 process spawn 多 ~1ms，雪崩成 ~1M 訊息深的 queue。</p>
+    </section>
+    <section class="stage" data-stage="5">
+      <h3>Stage 5 · etcd ring 失血</h3>
+      <p>TTL refresh 卡在同一個 mailbox 裡排隊，etcd 將實例從 consistent hash ring 移除，存活實例承擔 failover 流量直至全體被打垮。</p>
+    </section>
+  </div>
+
+  <div class="figure-sticky">
+    <svg viewBox="0 0 480 400" role="img" aria-label="voice control plane cascade stages">
+      <defs>
+        <marker id="vg-w-scroll-discord-cascade-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--accent)" />
+        </marker>
+      </defs>
+      <g id="vg-w-scroll-discord-cascade-stage-1">
+        <rect x="40" y="40" width="160" height="60" fill="none" stroke="var(--ink)" stroke-width="1.5" />
+        <text x="120" y="65" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">sessions / us-east1-b</text>
+        <text x="120" y="85" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">replicas halved</text>
+        <line x1="120" y1="115" x2="120" y2="160" stroke="var(--accent)" stroke-width="2" marker-end="url(#vg-w-scroll-discord-cascade-arrow)" />
+        <text x="220" y="140" font-family="EB Garamond, serif" font-size="14" fill="var(--accent-text)">17% sessions cut</text>
+      </g>
+      <g id="vg-w-scroll-discord-cascade-stage-2" style="opacity:0">
+        <rect x="40" y="40" width="160" height="60" fill="var(--accent)" fill-opacity="0.15" stroke="var(--accent)" stroke-width="1.5" />
+        <text x="120" y="75" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">{:DOWN, ...}</text>
+        <line x1="200" y1="70" x2="280" y2="70" stroke="var(--accent)" stroke-width="2" marker-end="url(#vg-w-scroll-discord-cascade-arrow)" />
+        <line x1="200" y1="70" x2="280" y2="130" stroke="var(--accent)" stroke-width="2" marker-end="url(#vg-w-scroll-discord-cascade-arrow)" />
+        <line x1="200" y1="70" x2="280" y2="200" stroke="var(--accent)" stroke-width="2" marker-end="url(#vg-w-scroll-discord-cascade-arrow)" />
+        <rect x="290" y="50" width="140" height="40" fill="none" stroke="var(--ink)" stroke-width="1.5" />
+        <text x="360" y="75" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">guild</text>
+        <rect x="290" y="110" width="140" height="40" fill="none" stroke="var(--ink)" stroke-width="1.5" />
+        <text x="360" y="135" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">presence</text>
+        <rect x="290" y="180" width="140" height="40" fill="none" stroke="var(--ink)" stroke-width="1.5" />
+        <text x="360" y="205" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">gateway</text>
+      </g>
+      <g id="vg-w-scroll-discord-cascade-stage-3" style="opacity:0">
+        <rect x="40" y="40" width="120" height="50" fill="var(--accent)" fill-opacity="0.25" stroke="var(--accent)" stroke-width="1.5" />
+        <text x="100" y="60" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--ink)">gateway us-east1-b</text>
+        <text x="100" y="78" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--accent-text)">mem ≈ 100%</text>
+        <rect x="180" y="40" width="120" height="50" fill="none" stroke="var(--ink)" stroke-width="1.5" />
+        <text x="240" y="60" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--ink)">gateway us-east1-c</text>
+        <text x="240" y="78" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">failover load</text>
+        <rect x="320" y="40" width="120" height="50" fill="none" stroke="var(--ink)" stroke-width="1.5" />
+        <text x="380" y="60" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--ink)">gateway us-east1-d</text>
+        <text x="380" y="78" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">failover load</text>
+        <line x1="100" y1="95" x2="240" y2="95" stroke="var(--accent)" stroke-width="2" marker-end="url(#vg-w-scroll-discord-cascade-arrow)" />
+        <line x1="100" y1="95" x2="380" y2="95" stroke="var(--accent)" stroke-width="2" marker-end="url(#vg-w-scroll-discord-cascade-arrow)" />
+        <text x="240" y="140" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--muted)">miscalibrated rate limit</text>
+        <text x="240" y="160" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--muted)">reconnection storm crosses zones</text>
+      </g>
+      <g id="vg-w-scroll-discord-cascade-stage-4" style="opacity:0">
+        <rect x="40" y="40" width="160" height="50" fill="none" stroke="var(--ink)" stroke-width="1.5" />
+        <text x="120" y="60" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--ink)">voice syncer × 15</text>
+        <text x="120" y="78" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">Holster.Pool</text>
+        <rect x="60" y="110" width="120" height="220" fill="var(--accent)" fill-opacity="0.18" stroke="var(--accent)" stroke-width="1.5" />
+        <text x="120" y="130" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--ink)">mailbox</text>
+        <text x="120" y="240" text-anchor="middle" font-family="EB Garamond, serif" font-size="18" fill="var(--accent-text)">~1M msgs</text>
+        <text x="120" y="260" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">selective receive</text>
+        <text x="120" y="278" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">+1ms / spawn</text>
+        <rect x="250" y="60" width="180" height="240" fill="none" stroke="var(--muted)" stroke-width="1" />
+        <text x="340" y="80" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">25,000+ SFU</text>
+        <line x1="180" y1="115" x2="250" y2="115" stroke="var(--accent)" stroke-width="1.5" />
+        <line x1="180" y1="170" x2="250" y2="170" stroke="var(--accent)" stroke-width="1.5" />
+        <line x1="180" y1="225" x2="250" y2="225" stroke="var(--accent)" stroke-width="1.5" />
+        <line x1="180" y1="280" x2="250" y2="280" stroke="var(--accent)" stroke-width="1.5" />
+        <text x="218" y="350" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">HTTPS RPC backed up</text>
+      </g>
+      <g id="vg-w-scroll-discord-cascade-stage-5" style="opacity:0">
+        <circle cx="240" cy="180" r="120" fill="none" stroke="var(--muted)" stroke-width="1" stroke-dasharray="4 4" />
+        <text x="240" y="60" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">consistent hash ring</text>
+        <text x="240" y="78" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">etcd-backed</text>
+        <circle cx="240" cy="60" r="6" fill="var(--accent)" />
+        <circle cx="330" cy="100" r="6" fill="var(--muted-2)" />
+        <circle cx="360" cy="180" r="6" fill="var(--muted-2)" />
+        <circle cx="330" cy="260" r="6" fill="var(--muted-2)" />
+        <circle cx="240" cy="300" r="6" fill="var(--muted-2)" />
+        <circle cx="150" cy="260" r="6" fill="var(--accent)" />
+        <circle cx="120" cy="180" r="6" fill="var(--muted-2)" />
+        <circle cx="150" cy="100" r="6" fill="var(--muted-2)" />
+        <text x="240" y="340" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--accent-text)">TTL refresh starved → instances ejected</text>
+        <text x="240" y="358" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">remaining nodes inherit all failover</text>
+      </g>
+    </svg>
+  </div>
+
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-scroll-discord-cascade');
+      if (!root) return;
+      const stages = root.querySelectorAll('.stage');
+      const groups = {
+        1: root.querySelector('#vg-w-scroll-discord-cascade-stage-1'),
+        2: root.querySelector('#vg-w-scroll-discord-cascade-stage-2'),
+        3: root.querySelector('#vg-w-scroll-discord-cascade-stage-3'),
+        4: root.querySelector('#vg-w-scroll-discord-cascade-stage-4'),
+        5: root.querySelector('#vg-w-scroll-discord-cascade-stage-5')
+      };
+      function show(stage) {
+        for (const s of stages) s.classList.toggle('active', s.dataset.stage === String(stage));
+        for (const k of Object.keys(groups)) {
+          if (groups[k]) groups[k].style.opacity = String(k === String(stage) ? 1 : 0);
+        }
+      }
+      const io = new IntersectionObserver((entries) => {
+        for (const e of entries) {
+          if (e.isIntersecting) show(e.target.dataset.stage);
+        }
+      }, { rootMargin: '-40% 0px -40% 0px', threshold: 0 });
+      for (const s of stages) io.observe(s);
+      show(1);
+    })();
+  </script>
+</figure>
+
+<h2>結構性修補——把這條 critical path 永久拆掉</h2>
+
+<p>Discord 在事後報告裡列了四條軸線的後續修補。</p>
+
+<p>這幾條都值得作為「自家系統還可能犯同樣錯」的檢查清單來讀。</p>
+
+<p><strong>部署層：Kubernetes admission webhook</strong>。</p>
+
+<p>最直接的修補是在 Kubernetes 那一層加一個 validating admission webhook，專門用來檢查 Elixir workload 的縮容請求。</p>
+
+<p>Webhook 會去問該 service「你現在有多少 GenServer process 還沒交棒？」——只有當 entity drain 真的跑完，admission 才會放行。</p>
+
+<p>這個修補的價值不在於它救了多少場後續事故，而在於它把「graceful drain 必須跑完」這條原本只存在於工程師腦中的隱性契約，明文寫進了 control plane 的 enforcement 裡。</p>
+
+<p>把隱性契約變成顯性 enforcement，是組織擴張時最重要的工程改良。一個 50 人的團隊可以靠口耳相傳維持「縮容前要 drain」這條規矩，但 500 人的團隊不行——當你不認識所有寫部署檔的人，唯一可靠的執行方式就是讓系統來做檢查。</p>
+
+<p><strong>架構層：PartitionSupervisor 取代 Holster.Pool 的單一 supervisor</strong>。</p>
+
+<p>這是這次最關鍵的結構性修補。</p>
+
+<p>原本 Holster.Pool 用一個 DynamicSupervisor 管所有 HTTP connection 的生命周期，所有 spawn/terminate 訊息都打到同一個 mailbox 裡。</p>
+
+<p>換成 Elixir 1.14 之後內建的 <code>PartitionSupervisor</code>，等於把單一 supervisor 切成 N 個分區（通常 N 等於 scheduler 數），每個分區自己一個 mailbox。</p>
+
+<p>selective receive 的 O(n) 退化也跟著被切成 N 份。</p>
+
+<p>同時，原本由 gun 額外多一層 supervision 也被拿掉——HTTP connection 的生命周期直接由 Holster.Pool 管理，少一層 hop 就少一條 critical path。</p>
+
+<p>這個修補哲學上的精彩之處在於：它不是「加大 mailbox」也不是「跳過 selective receive」，而是「把單一 contention point 切碎」。當你不能讓某個瓶頸消失，把它切成 N 份是退而求其次也最有效的方案。</p>
+
+<p><strong>流控層：上下游同時加 rate limit</strong>。</p>
+
+<p>call owner services（guilds、calls、streams）統一更新成有合理的 syncer spawn rate limit。</p>
+
+<p>voice syncers 內部也補上了 endpoint selection rate limit。</p>
+
+<p>另外多了一套「optional load shedding tool」，在偵測到過載時可以選擇性地強制 syncer 重建——把先前手動操作的應急路徑變成可程式化呼叫的工具。</p>
+
+<p>把 incident response 動作變成 first-class operator tool 是成熟的工程做法。事故當下你寫過的每一條「手動 fix」，事後都該問：「這個動作以後會不會再用到？如果會，能不能變成一條按鈕？」</p>
+
+<p><strong>可觀測性層：mailbox health 變成一等公民</strong>。</p>
+
+<p>團隊新增了 HTTP connection pooling 的 mailbox health 監控、service discovery announcement 的儀表板、以及 voice-to-SFU RPC traffic 的細部 instrumentation。</p>
+
+<p>報告裡還提到一條更廣的目標：「pursuing generic process mailbox monitoring across all Elixir services」——也就是把「任何 Elixir process 的 mailbox 長度都應該是被監控的指標」這個原則推到全公司。</p>
+
+<p>對於跑 BEAM 的團隊，這條值得抄。</p>
+
+<p>對於跑其他語言的團隊，等價的監控目標是：所有 message channel、所有 worker queue、所有 event loop 的 backlog 長度都該被監控。任何「訊息傳遞層的累積」都是 leading indicator，比 latency 或 error rate 提前一兩個訊號。</p>
+
+<p><strong>更長期的方向</strong>。</p>
+
+<p>A/V 基礎設施會從手動管理的 GCP VM 慢慢搬上 Kubernetes，享受 horizontal scaling 的便利。</p>
+
+<p>voice control plane 會被重新切成跨 region 架構，讓單一 region 的 connection spike 不再能拖垮全球。</p>
+
+<p>這兩條都是「需要做但不會在下一個 sprint 就做完」的長期工程。能在覆盤裡明白寫出「這些事還沒做」是難得的誠實——很多公司的覆盤會把長期項目隱去，只列「已修補」的部分，給讀者一種「都已經解決」的假象。Discord 沒有這麼做。</p>
+
+<h3>給其他人讀的注解——mailbox、selective receive 與你自己的服務</h3>
+
+<p>覆盤裡有幾個結論值得被抽出來，因為它們對任何跑 actor model 或 message queue 的服務都成立。</p>
+
+<p>第一條：<strong>O(n) selective receive 是 Erlang/OTP 一個冷門但會吃人的細節</strong>。</p>
+
+<p>BEAM 的 receive 區塊預設行為——掃 mailbox 找匹配 pattern——在 mailbox 短的時候快得不像話，這讓很多開發者忘了它在 mailbox 長的時候會變慢。</p>
+
+<p>如果你的 supervisor 或 GenServer 用了 pattern match 從 mailbox 裡挑特定訊息（例如 <code>receive {:reply, ^ref, msg} -&gt; ...</code>），就要假設這條路徑在過載時會退化。</p>
+
+<p>能避免就避免；不能避免就要監控 mailbox length。</p>
+
+<p>BEAM 21+ 有一個編譯器最佳化叫做 <code>receive ref</code> hint，可以在某些情況下把 selective receive 的複雜度從 O(n) 降回 O(1)——但前提是編譯器能識別 pattern 是針對某個唯一的 reference。Holster.Pool 那次跌進的洞，正好是 hint 沒辦法應用的場景。</p>
+
+<p>第二條：<strong>service discovery 跟 connection management 不應該共享同一條 mailbox</strong>。</p>
+
+<p>Discord 的事故展示了一個非常具體的反例：當 health TTL refresh 跟 connection spawn 走同一個 supervisor，過載的 connection spawn 會把 health refresh 餓死。</p>
+
+<p>然後 service discovery 把實例從 ring 上拔掉——加速崩潰。</p>
+
+<p>這條原則寫進設計守則可以很簡單：control plane 與 data plane 必須是物理上分開的 process tree。</p>
+
+<p>不只是 Elixir，這條原則對任何架構都成立。Kubernetes 的 readiness probe 該走獨立的 endpoint、獨立的 thread pool；資料庫的 health check 該走獨立的 connection；任何「我還活著」的訊號傳遞路徑都不該跟「我正在處理業務」的路徑搶資源。</p>
+
+<p>第三條：<strong>graceful drain 不是 deployment manifest 的可選欄位</strong>。</p>
+
+<p>對任何在 process 內部持有狀態的服務（Elixir GenServer、Go in-memory cache、Rust actor），terminationGracePeriodSeconds 必須跟 drain 流程的實際時長對齊。</p>
+
+<p>並且應該有 admission control 來確保不被誤改。</p>
+
+<p>一份 manifest 的 typo 不該能夠導致 17% session 失聯。</p>
+
+<p>第四條：<strong>cold-start thundering herd 是恢復流程的隱形殺手</strong>。</p>
+
+<p>Discord 的前三次嘗試告訴我們：當問題的源頭是「上游流量沒節流」，無論你重啟多少次，下一次重啟都會被同樣的流量打回去。</p>
+
+<p>恢復計畫必須同時包含「停止流量灌入」與「恢復服務容量」兩條軸線——只做其中一條等於不做。</p>
+
+<p>對抗 thundering herd 的常用工具包括：startup jitter（讓重啟時間隨機分散）、warm-up traffic（先讓實例承擔 1% 流量，再慢慢拉高）、circuit breaker（在實例還沒準備好時拒絕新流量）。Discord 的事故顯示，這些工具在 voice control plane 那一層是缺失的——後續修補裡應該都會補上。</p>
+
+<p>第五條：<strong>「increase supply 或 reduce demand」是一條乾淨的 SRE 公理</strong>。</p>
+
+<p>當系統撞到容量瓶頸時，能做的選擇只有兩個——多開實例（供給）或限速（需求）。</p>
+
+<p>值班時想清楚當下這個瓶頸該用哪一邊，比較容易跳出「再重啟看看」的循環。</p>
+
+<p>Discord 那一次最後是兩條同時做，這也是大多數真實災難恢復裡會選的答案。</p>
+
+<p>事故當下你會發現工程師有一種「我必須做點什麼」的衝動——這種衝動是好的，但要綁定在正確的問題框架上。「increase supply 或 reduce demand」就是這個框架。每一個事故當下的動作，問自己一句：「我這個動作是在增加供給還是減少需求？」答不出來就是在亂打。</p>
+
+<h3>把這次事故跟自家系統對照</h3>
+
+<p>如果你的團隊跑 Elixir，這次覆盤幾乎是現成的 checklist。</p>
+
+<p>但如果你跑的是其他語言，結構性的教訓也直接搬得過來——只要把「mailbox」換成「channel」、「supervisor」換成「worker pool」、「BEAM scheduler」換成「event loop」，整篇故事都可以重講一遍。</p>
+
+<p>Go 的 channel buffered 滿了之後 sender 會 block。</p>
+
+<p>跟 Erlang mailbox 漲長之後 selective receive 變慢，本質上是同一類問題：訊息傳遞層的反壓沒處理好，全系統一起被拖下水。</p>
+
+<p>Rust 的 tokio mpsc 如果 receiver 處理不過來，sender 端會看到 send 失敗——這時候要不要 retry、要不要 drop，是一個必須在設計時想清楚的決定。</p>
+
+<p>Node 的 event loop 如果有 CPU-bound 任務塞住，所有 socket 都跟著卡——這也是 mailbox 模式的變體。</p>
+
+<p>Java 的 ThreadPoolExecutor 如果 queue 是 unbounded，過載時 queue 會無限長到 OOM——對應於 Erlang 的 mailbox blowup。如果 queue 是 bounded，過載時 RejectedExecutionException 開始往上拋，對應於 tokio 的 send 失敗。每種語言都有同類型的工具，差別只在違反 invariant 時的具體症狀。</p>
+
+<p>Python 的 asyncio Queue、Ruby 的 SizedQueue、C++ 的 lock-free MPMC ring——每一個都會在過載時退化到某種失敗模式。寫 distributed system 的工程師，這些 failure mode 應該都要有 mental model。</p>
+
+<p>service discovery 跟 critical path 共享資源的問題就更普遍了。</p>
+
+<p>Kubernetes 的 readiness probe 如果跟主要的 request handling 共用同一個 thread pool，過載時 readiness probe 失敗，pod 被踢出 endpoint，剩下的 pod 接更多流量——同樣的迴圈，不同的語言。</p>
+
+<p>任何時候 health check 跟業務邏輯走同一條 critical path，都要把這個故事拿出來想一遍。</p>
+
+<p>對於 gRPC server，這意味著 health service 應該跑在獨立的 sub-channel 上；對於 HTTP server，這意味著 health endpoint 應該綁定到專屬 listener 上；對於資料庫 driver，這意味著 health query 應該走專屬 connection。每一層都要單獨想過。</p>
+
+<p>還有一條值得提的：deployment manifest 的人類因素。</p>
+
+<p>這次事故的觸發點不是某個複雜的演算法 bug，也不是某個冷門的 race condition——是一份 Kubernetes manifest 把 replicas 改錯了。</p>
+
+<p>任何依賴「工程師會記得手動把 terminationGracePeriodSeconds 調高」的流程都會在某個時間點失敗。</p>
+
+<p>把這條變成 admission webhook 強制檢查，是一個 organizational scale 的修補——它不只防住這次的特定錯誤，也防住未來所有「工程師忘了某個 best practice」的同類錯誤。</p>
+
+<p>這也是「policy as code」這個概念的價值所在：把 best practice 從文件、從 review 共識、從工程師的記憶力，遷移到 admission control 的 enforcement 裡。文件會被忘記、review 共識會被新人不知道、記憶力會被疲勞磨損。只有 enforcement 不會。</p>
+
+<h3>數字一覽——把這次事故壓成幾個關鍵指標</h3>
+
+<p>下面這張表把整起事件的關鍵時間軸與當下狀態壓在一起，方便要回頭查特定時刻時不用回去刷整份報告。每一列都對應覆盤裡明文寫出的時間與動作。</p>
+
+<figure class="vg-w-table-discord-timeline" style="margin: var(--s-4) 0;">
+  <style>
+    .vg-w-table-discord-timeline table { width: 100%; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+    .vg-w-table-discord-timeline thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; }
+    .vg-w-table-discord-timeline thead th[data-sort] { color: var(--accent-text); }
+    .vg-w-table-discord-timeline tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+    .vg-w-table-discord-timeline td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .vg-w-table-discord-timeline td.outcome-fail { color: var(--accent-text); }
+    .vg-w-table-discord-timeline td.outcome-ok { color: var(--ink); }
+    .vg-w-table-discord-timeline caption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); text-align: left; padding: var(--s-2) 0; }
+  </style>
+  <table>
+    <caption>3/25 incident — operator action ledger（click a header to sort）</caption>
+    <thead>
+      <tr>
+        <th data-key="time" class="num">time (PDT)</th>
+        <th data-key="action">operator action</th>
+        <th data-key="outcome">outcome</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td class="num">12:13</td><td>k8s scale-down halves us-east1-b sessions pods</td><td class="outcome-fail">17% sessions ungracefully stopped</td></tr>
+      <tr><td class="num">12:15</td><td>gateway us-east1-b begins memory climb</td><td class="outcome-fail">nodes restart; failover spreads to 1c, 1d</td></tr>
+      <tr><td class="num">12:14</td><td>endpoint select/create success drops</td><td class="outcome-fail">near zero across all 15 syncers</td></tr>
+      <tr><td class="num">12:43</td><td>restart syncer instance 2-13</td><td class="outcome-fail">mailbox regrew within seconds</td></tr>
+      <tr><td class="num">12:47</td><td>kill Holster.Pool DynamicSupervisor on 2-1</td><td class="outcome-fail">same regrowth pattern</td></tr>
+      <tr><td class="num">13:05</td><td>full cluster restart</td><td class="outcome-fail">cold-start thundering herd</td></tr>
+      <tr><td class="num">13:43</td><td>upstream rate limits + 15 extra dispatchers via terraform</td><td class="outcome-ok">gun supervisor backs up but etcd holds</td></tr>
+      <tr><td class="num">14:03</td><td>restart instance 2-3</td><td class="outcome-ok">first instance with stable low mailbox</td></tr>
+      <tr><td class="num">14:15</td><td>restart 5 instances</td><td class="outcome-ok">4 of 5 fully recovered</td></tr>
+      <tr><td class="num">14:26</td><td>last instance recovers</td><td class="outcome-ok">doubled cluster healthy</td></tr>
+    </tbody>
+  </table>
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-table-discord-timeline');
+      if (!root) return;
+      const headers = root.querySelectorAll('thead th');
+      const tbody = root.querySelector('tbody');
+      let activeKey = null, asc = true;
+      headers.forEach(h => h.addEventListener('click', () => {
+        const key = h.dataset.key;
+        if (activeKey === key) asc = !asc; else { activeKey = key; asc = true; }
+        headers.forEach(x => x.removeAttribute('data-sort'));
+        h.setAttribute('data-sort', asc ? 'asc' : 'desc');
+        const rows = [...tbody.querySelectorAll('tr')];
+        const idx = [...headers].indexOf(h);
+        rows.sort((a, b) => {
+          const av = a.children[idx].textContent.trim();
+          const bv = b.children[idx].textContent.trim();
+          const an = Number(av.replace(':', '.'));
+          const bn = Number(bv.replace(':', '.'));
+          const cmp = !Number.isNaN(an) && !Number.isNaN(bn) && key === 'time' ? an - bn : av.localeCompare(bv);
+          return asc ? cmp : -cmp;
+        });
+        rows.forEach(r => tbody.appendChild(r));
+      }));
+    })();
+  </script>
+</figure>
+
+<p>把這張表按時間排序時你會看到一條很乾淨的劃分線：13:43 PDT 之前的所有 operator action 結果都是 outcome-fail，之後則是連續四列 outcome-ok。前三次救火為什麼失敗、第四次為什麼成功，差別就在於「是不是把上游也鎖住了」。</p>
+
+<h3>把 Holster.Pool 換成 PartitionSupervisor——結構性的關鍵</h3>
+
+<p>如果整篇覆盤要挑一張圖留下，那會是 voice syncers 的 HTTP connection 池在事故前後的結構對比。事故前，所有 connection 的 spawn/terminate 訊息都打到一個 <code>Holster.Pool</code> 的 DynamicSupervisor 的 mailbox 裡；事故後，這個單一 mailbox 被 PartitionSupervisor 切成多個分區，每個分區自己一個 mailbox，selective receive 的 O(n) 也跟著切成 O(n/N)。</p>
+
+<figure class="vg-w-arch-discord-syncers-before-after" style="margin: var(--s-4) 0;">
+  <style>
+    .vg-w-arch-discord-syncers-before-after { display: grid; gap: var(--s-3); }
+    .vg-w-arch-discord-syncers-before-after svg { width: 100%; height: auto; }
+    .vg-w-arch-discord-syncers-before-after figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); padding-top: var(--s-2); }
+  </style>
+  <svg viewBox="0 0 880 360" role="img" aria-label="Holster.Pool single supervisor versus PartitionSupervisor">
+    <text x="220" y="30" text-anchor="middle" font-family="EB Garamond, serif" font-size="18" fill="var(--ink)" font-weight="600">before — single Holster.Pool</text>
+    <text x="660" y="30" text-anchor="middle" font-family="EB Garamond, serif" font-size="18" fill="var(--ink)" font-weight="600">after — PartitionSupervisor</text>
+
+    <line x1="440" y1="50" x2="440" y2="340" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="4 4" />
+
+    <rect x="80" y="60" width="280" height="50" fill="none" stroke="var(--ink)" stroke-width="1.5" />
+    <text x="220" y="85" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">voice syncer process</text>
+    <text x="220" y="102" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">spawn / terminate requests</text>
+
+    <line x1="220" y1="115" x2="220" y2="155" stroke="var(--accent)" stroke-width="2" />
+    <line x1="160" y1="115" x2="160" y2="155" stroke="var(--accent)" stroke-width="2" />
+    <line x1="280" y1="115" x2="280" y2="155" stroke="var(--accent)" stroke-width="2" />
+    <line x1="100" y1="115" x2="100" y2="155" stroke="var(--accent)" stroke-width="2" />
+    <line x1="340" y1="115" x2="340" y2="155" stroke="var(--accent)" stroke-width="2" />
+
+    <rect x="80" y="155" width="280" height="60" fill="var(--accent)" fill-opacity="0.2" stroke="var(--accent)" stroke-width="1.5" />
+    <text x="220" y="180" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--accent-text)">single supervisor mailbox</text>
+    <text x="220" y="200" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">selective receive · O(n)</text>
+
+    <rect x="80" y="235" width="280" height="50" fill="none" stroke="var(--ink)" stroke-width="1.5" />
+    <text x="220" y="260" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">gun http connections</text>
+    <text x="220" y="277" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">extra supervision layer</text>
+
+    <text x="220" y="320" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--accent-text)">~1M msgs in queue · +1ms / spawn</text>
+
+    <rect x="500" y="60" width="320" height="50" fill="none" stroke="var(--ink)" stroke-width="1.5" />
+    <text x="660" y="85" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">voice syncer process</text>
+    <text x="660" y="102" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">spawn / terminate requests</text>
+
+    <line x1="540" y1="115" x2="540" y2="155" stroke="var(--accent)" stroke-width="2" />
+    <line x1="620" y1="115" x2="620" y2="155" stroke="var(--accent)" stroke-width="2" />
+    <line x1="700" y1="115" x2="700" y2="155" stroke="var(--accent)" stroke-width="2" />
+    <line x1="780" y1="115" x2="780" y2="155" stroke="var(--accent)" stroke-width="2" />
+
+    <rect x="500" y="155" width="60" height="60" fill="var(--accent)" fill-opacity="0.15" stroke="var(--accent)" stroke-width="1.5" />
+    <text x="530" y="185" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--accent-text)">part 1</text>
+    <text x="530" y="200" text-anchor="middle" font-family="EB Garamond, serif" font-size="10" fill="var(--muted)">mbox</text>
+    <rect x="580" y="155" width="60" height="60" fill="var(--accent)" fill-opacity="0.15" stroke="var(--accent)" stroke-width="1.5" />
+    <text x="610" y="185" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--accent-text)">part 2</text>
+    <text x="610" y="200" text-anchor="middle" font-family="EB Garamond, serif" font-size="10" fill="var(--muted)">mbox</text>
+    <rect x="660" y="155" width="60" height="60" fill="var(--accent)" fill-opacity="0.15" stroke="var(--accent)" stroke-width="1.5" />
+    <text x="690" y="185" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--accent-text)">part 3</text>
+    <text x="690" y="200" text-anchor="middle" font-family="EB Garamond, serif" font-size="10" fill="var(--muted)">mbox</text>
+    <rect x="740" y="155" width="60" height="60" fill="var(--accent)" fill-opacity="0.15" stroke="var(--accent)" stroke-width="1.5" />
+    <text x="770" y="185" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--accent-text)">part N</text>
+    <text x="770" y="200" text-anchor="middle" font-family="EB Garamond, serif" font-size="10" fill="var(--muted)">mbox</text>
+
+    <rect x="500" y="235" width="320" height="50" fill="none" stroke="var(--ink)" stroke-width="1.5" />
+    <text x="660" y="260" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">gun http connections</text>
+    <text x="660" y="277" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">direct lifecycle in Holster.Pool</text>
+
+    <text x="660" y="320" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">contention sharded into N partitions · selective receive · O(n/N)</text>
+  </svg>
+  <figcaption>before/after：左圖把所有 spawn/terminate 收進同一個 mailbox 並再經一層 gun supervision；右圖把 mailbox 切成 N 個分區，並把 gun supervision 折掉一層。</figcaption>
+</figure>
+
+<p>切成 N 個分區之所以管用，並不只是「分擔負載」這麼一句話可以概括的。selective receive 的退化是因為 BEAM 的 receive 區塊在 mailbox 長時要做 O(n) 掃描；當 N 個 mailbox 各自獨立，每個的 n 都只是原本的 1/N，掃描時間也跟著降到 1/N。對 voice syncers 的場景而言，這個分母通常是 BEAM scheduler 數，在現代多核 host 上輕鬆達到 16-32。一個 ~100k 的 mailbox 切成 32 份之後變成 ~3k——回到了 selective receive 還算便宜的區間。</p>
+
+<p>把 gun 的額外 supervisor 拿掉是另一個值得學的細節。許多 Erlang/Elixir 函式庫為了「保險」會在自己的 process 樹上再多一層 supervision，理論上是為了把不同責任分離。實務上，多一層 supervisor 就多一個訊號中轉點——對 critical path 而言這是純粹的 overhead。Discord 把 connection lifecycle 直接放回 Holster.Pool 管理，少一層 hop、少一個 mailbox 可能變慢的地方。</p>
+
+<h3>mailbox 曲線——把那段崩壞畫成一張圖</h3>
+
+<p>為了把這段事故從文字裡抽出來變得更可感，下面這張靜態長條圖把 15 台 syncer 實例在事故高峰時的 mailbox 大小排在一起。每一根 bar 都對應一個實例，依照事後 dashboard 上的相對深度排序。它的價值不在「精確還原當下每個實例的數字」——Discord 沒有逐台公開讀數——而是在於凸顯一個現象：當瓶頸是上游流量時，崩壞的分佈不是少數實例壞掉、其他人健康，而是<strong>所有 15 台一起朝同一個方向走</strong>。</p>
+
+<figure class="vg-w-chart-discord-mailbox" style="margin: var(--s-4) 0;">
+  <style>
+    .vg-w-chart-discord-mailbox svg { width: 100%; height: auto; }
+    .vg-w-chart-discord-mailbox figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); padding-top: var(--s-2); }
+  </style>
+  <svg viewBox="0 0 880 320" role="img" aria-label="voice syncer mailbox depth across 15 instances at incident peak">
+    <text x="440" y="28" text-anchor="middle" font-family="EB Garamond, serif" font-size="18" fill="var(--ink)" font-weight="600">syncer mailbox depth at incident peak</text>
+    <text x="440" y="48" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--muted)">total mailbox by size · 15 instances · ~13:00 PDT</text>
+
+    <line x1="70" y1="270" x2="860" y2="270" stroke="var(--ink)" stroke-width="1.5" />
+    <line x1="70" y1="70" x2="70" y2="270" stroke="var(--ink)" stroke-width="1.5" />
+
+    <text x="60" y="275" text-anchor="end" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">0</text>
+    <text x="60" y="225" text-anchor="end" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">250k</text>
+    <text x="60" y="175" text-anchor="end" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">500k</text>
+    <text x="60" y="125" text-anchor="end" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">750k</text>
+    <text x="60" y="78" text-anchor="end" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">~1M</text>
+
+    <line x1="70" y1="225" x2="860" y2="225" stroke="var(--muted-2)" stroke-width="0.5" stroke-dasharray="2 4" />
+    <line x1="70" y1="175" x2="860" y2="175" stroke="var(--muted-2)" stroke-width="0.5" stroke-dasharray="2 4" />
+    <line x1="70" y1="125" x2="860" y2="125" stroke="var(--muted-2)" stroke-width="0.5" stroke-dasharray="2 4" />
+    <line x1="70" y1="78" x2="860" y2="78" stroke="var(--accent)" stroke-width="0.8" stroke-dasharray="3 3" />
+
+    <rect x="90" y="90" width="40" height="180" fill="var(--accent)" fill-opacity="0.7" />
+    <rect x="140" y="95" width="40" height="175" fill="var(--accent)" fill-opacity="0.7" />
+    <rect x="190" y="100" width="40" height="170" fill="var(--accent)" fill-opacity="0.7" />
+    <rect x="240" y="105" width="40" height="165" fill="var(--accent)" fill-opacity="0.65" />
+    <rect x="290" y="110" width="40" height="160" fill="var(--accent)" fill-opacity="0.65" />
+    <rect x="340" y="120" width="40" height="150" fill="var(--accent)" fill-opacity="0.65" />
+    <rect x="390" y="125" width="40" height="145" fill="var(--accent)" fill-opacity="0.6" />
+    <rect x="440" y="130" width="40" height="140" fill="var(--accent)" fill-opacity="0.6" />
+    <rect x="490" y="140" width="40" height="130" fill="var(--accent)" fill-opacity="0.55" />
+    <rect x="540" y="145" width="40" height="125" fill="var(--accent)" fill-opacity="0.55" />
+    <rect x="590" y="155" width="40" height="115" fill="var(--accent)" fill-opacity="0.5" />
+    <rect x="640" y="170" width="40" height="100" fill="var(--accent)" fill-opacity="0.5" />
+    <rect x="690" y="180" width="40" height="90" fill="var(--accent)" fill-opacity="0.45" />
+    <rect x="740" y="195" width="40" height="75" fill="var(--accent)" fill-opacity="0.45" />
+    <rect x="790" y="220" width="40" height="50" fill="var(--sage)" fill-opacity="0.7" />
+
+    <text x="110" y="287" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">2-13</text>
+    <text x="160" y="287" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">2-1</text>
+    <text x="210" y="287" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">2-5</text>
+    <text x="260" y="287" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">2-11</text>
+    <text x="310" y="287" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">2-7</text>
+    <text x="360" y="287" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">2-2</text>
+    <text x="410" y="287" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">2-14</text>
+    <text x="460" y="287" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">2-4</text>
+    <text x="510" y="287" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">2-9</text>
+    <text x="560" y="287" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">2-12</text>
+    <text x="610" y="287" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">2-6</text>
+    <text x="660" y="287" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">2-10</text>
+    <text x="710" y="287" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">2-15</text>
+    <text x="760" y="287" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">2-3</text>
+    <text x="810" y="287" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">2-8</text>
+
+    <text x="465" y="310" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">instance id（sorted by mailbox depth）</text>
+
+    <line x1="800" y1="78" x2="830" y2="60" stroke="var(--muted)" stroke-width="1" />
+    <text x="830" y="55" text-anchor="end" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">~1M cap line</text>
+
+    <line x1="810" y1="220" x2="780" y2="240" stroke="var(--muted)" stroke-width="1" />
+    <text x="775" y="252" text-anchor="end" font-family="EB Garamond, serif" font-size="11" fill="var(--sage-deep)">2-8 · the lone survivor</text>
+  </svg>
+  <figcaption>同色長條代表事故高峰時各 syncer 實例的 mailbox 深度（依深度由大到小排序）。橘色虛線是 ~1M cap、綠色那根是事故期間唯一勉強維持運作的 2-8——它一台要扛全球三分之一流量。</figcaption>
+</figure>
+
+<p>這張圖傳達的訊息很單純：壞掉不是因為某幾台異常，而是因為整個 fleet 都被同一道上游流量壓著走。當你的故障曲線長這個形狀，你的恢復計畫就<strong>不可能</strong>是「重啟壞掉的那幾台」——因為沒有「壞掉的那幾台」。恢復計畫必須處理上游。</p>
+
+<h3>覆盤的氣質——一份願意承認「我們也會犯這種錯」的報告</h3>
+
+<p>讀完整份覆盤之後，留在腦中最深的不只是技術細節，還有 Discord 工程文化的某種氣質。</p>
+
+<p>報告開頭引「sad trombone」是一個很小的細節，但它說明了某種編輯立場——不掩飾恐懼、不掩飾自嘲、也不掩飾事故過程中那些「明明試了好幾次都沒救起來」的挫敗時刻。</p>
+
+<p>這是高品質 postmortem 才會有的姿態。</p>
+
+<p>Bo Ingram 與 Stephen Birarda 的署名也值得提。</p>
+
+<p>「Senior Staff Engineer」掛名寫覆盤，傳達的訊息很清楚：這個案子的學習價值高到值得最資深的人花時間寫好。</p>
+
+<p>許多公司會把 postmortem 推給比較淺的工程師當作「成長機會」，結果出來的東西是 checklist 風格，沒有 narrative、沒有 mechanism、也沒有反思——讀完之後讀者只記得「他們犯了某種錯，他們補了某種東西」，但腦中沒有留下可以遷移到自家系統的洞察。</p>
+
+<p>另一個值得學的習慣是：覆盤不只列出「我們做了什麼修補」，而是同時列出「我們還沒做的長期方向」。</p>
+
+<p>Discord 在最後特別提了「A/V infra 還沒上 Kubernetes」與「control plane 還沒跨 region」這兩個長期項。</p>
+
+<p>承認自己的系統還有沒補完的洞，比假裝一切都修好了要誠實得多。</p>
+
+<p>對任何要在自家寫 postmortem 的工程師——這份報告值得當作範本來參考。</p>
+
+<p>結構上它是 trigger → cascade → mitigation attempts → why they failed → final mitigation → structural fix → long-term roadmap，每一段都有具體的時間點與數字、有引用、有 self-criticism、也有可遷移的原則。</p>
+
+<p>技術寫作能達到這個水準的公司不多。</p>
+
+<p>把覆盤當成一種公共財，而不是內部問責文件——這個編輯立場本身就是工程文化的訊號。AWS post-event summaries 過去十年從非常乾的內部文件慢慢演化成更可讀的公開報告，Cloudflare 一直保持了較高的敘事密度，Stripe 的 postmortem 在金融基礎設施圈內被廣為引用。Discord 這次加入了這份名單——能寫到這個水準的公司，技術人才的吸引力本身也會跟著提升。</p>
+
+<h2>從這次故事帶走的——壓回一個句子</h2>
+
+<p>如果要把這整篇覆盤壓成一句技術人都能記住的話：<strong>一行 Kubernetes manifest 的誤設，會經由 graceful drain 缺位、reconnection storm 跨 zone、Erlang selective receive 在長 mailbox 下退化、service discovery 與 connection management 共享 mailbox、cold-start thundering herd，這一連串平日各自無害的設計選擇，串成一條 3 小時 17 分鐘的全球語音崩潰路徑。</strong></p>
+
+<p>每一個環節單獨來看都不算 critical bug——graceful drain 「應該」會跑完、selective receive 「通常」很快、service discovery 「平常」不會跟 connection 搶資源、reconnection 「一般」不會多到打爆 gateway。但當這些「應該、通常、平常」全部同時失敗，就會變成這次的 3 小時 17 分鐘。分散式系統的故障故事，幾乎永遠是這種「多個獨立 invariant 同時失效」的形狀。</p>
+
+<p>這也是為什麼這類覆盤值得讀得很細：你不會在自己的系統上遇到完全一樣的 Holster.Pool 故障，但你會遇到結構上相似的——某個 supervisor 的 mailbox 太長、某條 critical path 同時承擔了 health check 與業務邏輯、某次部署沒有 admission control 把住、某次救火忽略了上游節流。當那一天到來，你會慶幸自己讀過 Discord 這份覆盤。</p>
+
+<p class="vg-deep-closer"><strong>The lesson</strong>：分散式系統的崩潰幾乎永遠不是「單一 bug」，而是多個各自無害的設計選擇在某個流量峰值下同時失效——你能做的不是消滅 bug，而是把每一條 critical path 上的 invariant 寫成可被 enforce 的契約。</p>
+
+</div>
