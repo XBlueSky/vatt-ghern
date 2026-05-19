@@ -32,6 +32,22 @@ import { fileURLToPath } from "node:url";
 const here = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(here, "..");
 
+// Date gate: posts dated before WIDGET_CONTRACT_EFFECTIVE_DATE are
+// grandfathered to the pre-widget-cookbook contract. Update this
+// constant at PR merge time to the actual merge date.
+const WIDGET_CONTRACT_EFFECTIVE_DATE = "2026-06-01"; // YYYY-MM-DD
+
+function postDateFromPath(htmlPath) {
+  const m = htmlPath.match(/[/\\](\d{4})[/\\](\d{2})[/\\](\d{2})[/\\]/);
+  return m ? `${m[1]}-${m[2]}-${m[3]}` : null;
+}
+
+function isWidgetContractActive(htmlPath) {
+  const d = postDateFromPath(htmlPath);
+  if (!d) return false;
+  return d >= WIDGET_CONTRACT_EFFECTIVE_DATE;
+}
+
 const root = process.argv[2];
 if (!root) {
   process.stderr.write("Usage: archetype-check.mjs <dir>\n");
@@ -218,6 +234,110 @@ function checkFreeform(path, html) {
   // No H2 constraints, no closer label constraints (label is free)
 }
 
+function readSidecarRaw(htmlPath) {
+  const m = htmlPath.match(/[/\\](\d{4})[/\\](\d{2})[/\\](\d{2})[/\\]([^/\\]+)[/\\]index\.html$/);
+  if (!m) return null;
+  const [, y, mo, d, slug] = m;
+  const sidecarPath = join(REPO_ROOT, "src", "posts", y, mo, d, `${slug}.11tydata.json`);
+  if (!existsSync(sidecarPath)) return null;
+  try { return JSON.parse(readFileSync(sidecarPath, "utf8")); } catch { return null; }
+}
+
+function checkWidgetContract(path, html) {
+  if (!isWidgetContractActive(path)) return; // legacy mode
+
+  // 1. Widget count: ≥ 3 elements with class="vg-w-*"
+  const widgetMatches = [...html.matchAll(/class="[^"]*\bvg-w-[a-z0-9-]+/g)];
+  // Deduplicate by capturing the actual class names per element root.
+  const widgetClasses = new Set();
+  for (const m of widgetMatches) {
+    const cls = m[0].match(/vg-w-[a-z0-9-]+/);
+    if (cls) widgetClasses.add(cls[0]);
+  }
+  if (widgetClasses.size < 3) {
+    violations.push(`${path}: widget contract requires ≥ 3 widgets (vg-w-* classes), found ${widgetClasses.size}`);
+  }
+
+  // 2. At least 1 widget must be interactive
+  const hasScript = /<script\b/.test(html);
+  const hasInput = /<input\b/.test(html);
+  const hasCanvas = /<canvas\b/.test(html);
+  const hasScrollTimeline = /animation-timeline:\s*scroll\(/.test(html);
+  if (!(hasScript || hasInput || hasCanvas || hasScrollTimeline)) {
+    violations.push(`${path}: widget contract requires ≥ 1 interactive widget (<script>, <input>, <canvas>, or animation-timeline: scroll())`);
+  }
+
+  // 3. Sidecar must have widget_count, widget_questions, widget_templates
+  const sidecar = readSidecarRaw(path);
+  if (!sidecar) {
+    violations.push(`${path}: widget contract requires sidecar JSON`);
+    return;
+  }
+  if (typeof sidecar.widget_count !== "number") {
+    violations.push(`${path}: sidecar missing widget_count`);
+  }
+  if (!Array.isArray(sidecar.widget_questions) || sidecar.widget_questions.length === 0) {
+    violations.push(`${path}: sidecar missing widget_questions[] (non-empty array required)`);
+  } else if (sidecar.widget_count != null && sidecar.widget_questions.length !== sidecar.widget_count) {
+    violations.push(`${path}: sidecar widget_count (${sidecar.widget_count}) != widget_questions.length (${sidecar.widget_questions.length})`);
+  }
+  if (!Array.isArray(sidecar.widget_templates) || sidecar.widget_templates.length === 0) {
+    violations.push(`${path}: sidecar missing widget_templates[] (non-empty array required)`);
+  } else if (sidecar.widget_count != null && sidecar.widget_templates.length !== sidecar.widget_count) {
+    violations.push(`${path}: sidecar widget_count (${sidecar.widget_count}) != widget_templates.length (${sidecar.widget_templates.length})`);
+  }
+
+  // 4. Prose line count ≥ 500
+  // Strip <script>, <style>, <svg>, <canvas> blocks and count remaining lines.
+  const stripped = html
+    .replace(/<script[\s\S]*?<\/script>/g, "")
+    .replace(/<style[\s\S]*?<\/style>/g, "")
+    .replace(/<svg[\s\S]*?<\/svg>/g, "")
+    .replace(/<canvas[\s\S]*?<\/canvas>/g, "");
+  const proseLineCount = stripped.split("\n").filter((l) => l.trim().length > 0).length;
+  if (proseLineCount < 500) {
+    violations.push(`${path}: prose line count is ${proseLineCount} (widget contract requires ≥ 500 lines of prose, widget code excluded)`);
+  }
+
+  // 5. Inline <script src=...> is banned
+  if (/<script[^>]+\bsrc=/.test(html)) {
+    violations.push(`${path}: external <script src=...> is banned in widget contract`);
+  }
+
+  // 6. Inline <script> blocks must be IIFE
+  for (const m of html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/g)) {
+    const body = m[1].trim();
+    if (body.length === 0) continue;
+    // Allow forms: (function () {...})(); (() => {...})(); (async () => {...})(); (async function () {...})();
+    const iifeOpeners = /^\(\s*(async\s+)?(function\s*\(|\(\s*\)\s*=>|[^)]*=>)/;
+    if (!iifeOpeners.test(body)) {
+      const snippet = body.slice(0, 60).replace(/\n/g, " ");
+      violations.push(`${path}: inline <script> must be IIFE-wrapped (starts with: "${snippet}")`);
+    }
+  }
+
+  // 7. Post-level <style> blocks must have every rule scoped to .vg-w-*
+  // Detect <style> blocks that exist OUTSIDE any <svg> by stripping <svg>...</svg> first.
+  const noSvg = html.replace(/<svg[\s\S]*?<\/svg>/g, "");
+  for (const m of noSvg.matchAll(/<style\b[^>]*>([\s\S]*?)<\/style>/g)) {
+    const block = m[1];
+    // Split on '}' to get rule list (rough). Each rule has a selector portion before '{'.
+    const rules = block.split("}").map((r) => r.trim()).filter((r) => r.length > 0 && r.includes("{"));
+    for (const rule of rules) {
+      const selectorPart = rule.split("{")[0].trim();
+      // Allow @-rules (@container, @media, @supports, @keyframes); their body's selectors are checked separately if needed.
+      if (selectorPart.startsWith("@")) continue;
+      // Each comma-separated selector must contain .vg-w-
+      const selectors = selectorPart.split(",").map((s) => s.trim()).filter((s) => s.length > 0);
+      for (const sel of selectors) {
+        if (!sel.includes(".vg-w-")) {
+          violations.push(`${path}: post-level <style> rule selector lacks .vg-w- scoping: "${sel}"`);
+        }
+      }
+    }
+  }
+}
+
 const ARCHETYPE_CHECKERS = {
   narrative: checkNarrative,
   "technical-deep-dive": checkTechnicalDeepDive,
@@ -229,6 +349,7 @@ const ARCHETYPE_CHECKERS = {
 
 function checkDeepStory(path, html) {
   checkUniversalContract(path, html);
+  checkWidgetContract(path, html);
   const archetype = readSidecarArchetype(path);
   if (!archetype) {
     violations.push(`${path}: deep-story sidecar missing or has no deep_archetype field`);
