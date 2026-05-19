@@ -47,6 +47,28 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+const PRUNE_TTL_DAYS = 90;
+
+export function pruneStaleEntries(state, now = Date.now()) {
+  const cutoffMs = now - PRUNE_TTL_DAYS * 86400 * 1000;
+  const out = {};
+  for (const [sourceId, slot] of Object.entries(state)) {
+    if (!slot || typeof slot !== "object" || Array.isArray(slot)) {
+      out[sourceId] = slot;
+      continue;
+    }
+    const kept = {};
+    for (const [url, lastmod] of Object.entries(slot)) {
+      const t = Date.parse(lastmod);
+      if (Number.isFinite(t) && t >= cutoffMs) {
+        kept[url] = lastmod;
+      }
+    }
+    out[sourceId] = kept;
+  }
+  return out;
+}
+
 function readWebState() {
   if (!existsSync(WEB_STATE_PATH)) return {};
   try {
@@ -140,8 +162,11 @@ export async function fetchAll({ filter = {}, fetchImpl, priorWebState, writeSta
   if (writeState && Object.keys(stateDiffs).length > 0) {
     // Spread priorState first so source ids NOT in this run keep their slots.
     // stateDiffs values are full replacements per the fetcher contract above.
+    // Prune sitemap-shape slots (TTL 90 days) before write to keep
+    // web-state.json from growing without bound.
     const next = { ...priorState, ...stateDiffs };
-    writeFileSync(WEB_STATE_PATH, stableStringify(next) + "\n");
+    const pruned = pruneStaleEntries(next);
+    writeFileSync(WEB_STATE_PATH, stableStringify(pruned) + "\n");
   }
 
   return { candidates: allCandidates, deferred, state_diffs: stateDiffs, failures };
