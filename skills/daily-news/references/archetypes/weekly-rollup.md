@@ -50,21 +50,84 @@ The rollup is a deep-story-style essay, so the universal contract from
 
 ## H2 sequence
 
-The H2 count is flexible (3-6 sections), but the *arc* is fixed:
+The H2 count is flexible (4-6 sections), but the *arc* is fixed:
 
 1. **這週的主軸** (1 H2) — one paragraph naming the theme + listing
    the 2-3 daily stories that supported it.
 2. **沒被合稱的個別亮點** (1 H2) — 3-5 items, one short paragraph each,
    surfacing posts that didn't fit the main theme but earn mention.
    Link each to its original deep-story or roundup item.
-3. **一週的形狀** (1 H2) — the visualization H2. Contains the inline
+3. **本週劢頭** (1 H2, optional — skipped if last week was empty) — the
+   week-over-week comparison H2. See "Delta computation" below.
+4. **一週的形狀** (1 H2) — the visualization H2. Contains the inline
    SVG (tag distribution, deep-archetype mix, or domain breakdown).
    The SVG MUST be ID-scoped per `widget-isolation.md`.
-4. **下一週可能會展開的線索** (1 H2, optional) — 1-2 paragraphs of
+5. **下一週可能會展開的線索** (1 H2, optional) — 1-2 paragraphs of
    "what to watch for next week" — RFCs in flight, conferences,
    versions about to drop. Only include if there's something material.
 
 Closer (free phrasing — any label that signals "this is the wrap").
+
+## Delta computation (for 本週劢頭)
+
+Before writing the H2, call the weekly-delta module:
+
+```bash
+node skills/daily-news/scripts/decisions/weekly-delta.mjs --end=YYYY-MM-DD > delta.json
+```
+
+`end` is the Monday of the rollup week. The module reads 14 days of
+sidecars via `load-past-roundups.mjs --days=14` internally, splits into
+this-week (days 1-7) and last-week (days 8-14), and emits:
+
+- `range_this`, `range_last` — inclusive date ranges
+- `domain_shift[]` — 5 priority domains in fixed order
+  (`ai → systems → infra → web → backend`), each with
+  `{this_week_count, last_week_count, this_week_pct, last_week_pct,
+  delta_pp}`. Legacy `storage`/`industry` topics roll into a `legacy`
+  pseudo-domain appended after the 5; prose ignores it unless it's
+  > 20% of either week.
+- `tag_movement.new_this_week[]` — tags new this week with ≥2 mentions
+- `tag_movement.surge[]` — tags up ≥2 vs last week and ≥3 this week
+- `tag_movement.faded[]` — tags down ≥2 vs last week and ≥3 last week
+- `totals`, optional `note` (`"this_week_empty"` or `"last_week_empty"`)
+
+If `note` is non-null, **skip the 本週劢頭 H2 entirely** for that week.
+
+## 本週劢頭 H2 shape
+
+When the delta JSON is non-empty:
+
+- Heading: `<h2>本週劢頭</h2>`. CJK heading, no English chrome label.
+- 1-2 short paragraphs of prose:
+  - First sentence: anchor on the most significant domain shift
+    (`|delta_pp| ≥ 10`). Cite at least one specific number:
+    "ai 從 71% 退到 0%、systems 從 0% 漲到 45%——這週的重心整個搬到
+    systems 和 web 上。"
+  - Second sentence: pick the most meaningful tag movement (1 new
+    arrival OR 1 surge OR 1 faded). Concrete tag name + counts:
+    "Vite 連續三日上榜、上週的 vLLM 風潮這週靜了下來。"
+- 1 inline `<svg>` widget — the **delta widget**. Pick one visual
+  idiom; both work:
+  - Two stacked horizontal bars (上週 vs 本週), each showing 5-domain
+    breakdown with CJK label below.
+  - Arrow chart: 5 dots representing this-week percentages with
+    arrows showing direction + magnitude from last-week percentages.
+
+The SVG must be ID-scoped per `widget-isolation.md` (every `id`, every
+`url()` reference, every `<defs>` child must carry a unique suffix).
+
+Prose MUST cite at least 1 specific number from the module's output.
+No vague "more AI" or "less systems".
+
+## Advisory overrides
+
+The delta module is advisory. If the prose's interpretation diverges
+from the raw numbers (e.g., module says ai-share dropped 25pp but
+Claude judges the drop irrelevant because last week was a one-off ai
+spike), Claude writes the narrative its way and records the override
+in the weekly PR body under `## Advisory overrides`. Matches the
+routine-wide pattern from PR #17.
 
 ## Voice
 
