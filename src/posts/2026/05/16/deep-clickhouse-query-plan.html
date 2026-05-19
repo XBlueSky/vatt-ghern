@@ -4,112 +4,1181 @@
 </header>
 
 <div class="vg-post-prose">
-  <p><span class="vg-dropcap">C</span>loudflare 的 Ready-Analytics ClickHouse 叢集規模達數 PB，帳單管線是它的關鍵用戶之一。為了支援 per-namespace 的資料保留政策，工程師把分區鍵從 <code>(day)</code> 改為 <code>(namespace, day)</code>。這個變更看似無害：查詢本來就按 namespace 過濾，新分區鍵讓過濾更精確。但 part 數量從 3 萬攀升至 16 萬，一個深藏在 query planner 裡的 mutex 開始讓數百條平行查詢排隊等候。</p>
+  <p><span class="vg-dropcap">C</span>loudflare 的 Ready-Analytics ClickHouse 叢集規模超過 100PB。光是核心的 Ready-Analytics 表在 2024 年 12 月就已經累積 2PiB 以上的資料，每秒攝取數百萬筆。</p>
+
+  <p>帳單管線是它最關鍵的下游使用者之一——客戶每月帳單上「數億美元」的用量計算，都跑在這份資料上。任何影響帳單聚合的事件都會直接傳導到客戶可見的計費正確性，所以這條 pipeline 的 SLA 比一般分析工作負載嚴格得多。</p>
+
+  <p>為了支援 per-namespace 的資料保留政策，工程師把分區鍵從 <code>(day)</code> 改為 <code>(namespace, day)</code>。動機是業務面的：有些團隊因為法規或合約需求要保存「數年」的資料，有些團隊只需要「幾天」。一刀切的 retention 政策無法滿足這種異質需求。</p>
+
+  <p>這個變更看似無害：查詢本來就按 namespace 過濾，新分區鍵讓過濾更精確、保留政策得以個別套用。理論上它應該讓事情變好，而不是變壞。</p>
+
+  <p>但 part 數量從 3 萬攀升至 16 萬。</p>
+
+  <p>一個深藏在 query planner 裡的 mutex 開始讓數百條平行查詢排隊等候。</p>
+
+  <p>這篇是這個 mutex 怎麼被找到、怎麼被拆解、上游修補長什麼樣子的拆機紀錄。</p>
+
+  <p>這個故事最有意思的地方在於：它不是一個「優化讓系統變快」的故事。</p>
+
+  <p>而是一個「優化前後我們對系統行為的假設是錯的」的故事。原本以為分區鍵更細只是讓查詢過濾更精確；實際上分區鍵更細導致 parts 數量爆炸性增長，而 parts 數量觸發了一條從來沒人量測過的 critical path。</p>
+
+  <p>具體的機制是這樣：query planner 在拿到每條查詢需要的 parts 子集前，必須對整個 parts 向量做一次完整的線性過濾，而這個過濾在獨佔鎖底下進行。</p>
+
+  <p>鎖持有時間隨 parts 數量線性成長，於是每條並行查詢都被前一條的鎖持有時間阻塞。bottleneck 不在 I/O，不在 CPU，不在 disk，而在一個比 std::mutex 大不了多少的 critical section 裡。</p>
+
+  <p>這種「瓶頸不在你以為的地方」的故事，在大規模分散式系統與單機高並發系統裡都很常見。</p>
+
+  <p>它的共同特徵是：所有監測指標看起來都在合理區間，但某個 dimension 的尺度變化把一條 critical path 推到了系統設計從未考慮過的範圍。</p>
+
+  <p>修補這類問題的關鍵不是更大的機器或更多的副本——而是找到那條看不見的 critical path、量測它、然後逐層拆解。Cloudflare 走過的這條路徑，下面四節會一段一段拆開。</p>
+
+  <p>另一個值得留意的細節：問題在 2025 年 1 月隨著分區鍵變更就開始醞釀，但帳單團隊到 3 月底才回報「事情不太對」。中間兩個月部分查詢已經在退化，但因為總體趨勢還在容忍區間裡、I/O 與 CPU 圖看起來正常，沒有任何標準警報觸發。</p>
+
+  <p>這個延遲本身就是「假設與現實開始發散，但量測仍然回報健康」的經典樣態。任何一個生產系統工程師讀到這裡都會點頭——這不是疏忽，而是當下能用的儀表就是看不見這層東西。</p>
+
+  <p>這篇拆解會走過四個層面，每個層面對應修補旅程的一個關鍵階段。</p>
+
+  <p>這四個層面也是你之後 reproduce 這個診斷流程到自己系統上時的 mental model。如果某天你也撞到「修補了熱點函式但改善不夠」這種狀況，希望這篇能讓你快一點意識到要切到 off-CPU profile。</p>
+
+  <p>第一個是 <code>MergeTreeData</code> mutex 的鎖定語意——這把鎖原本保護的是什麼、為什麼讀者也要排隊、為什麼 16 萬 parts 把它推到了 critical section 的盡頭。</p>
+
+  <p>第二個是診斷工具的盲區——<code>trace_log</code> 的 CPU 模式和 Real 模式為什麼會對同一段時間的同一個瓶頸給出完全不同的元兇。</p>
+
+  <p>第三個是三階段修補的結構——shared lock、cached vector、binary search 各自針對什麼層次。</p>
+
+  <p>第四個是長期上的開放問題——這個分區鍵設計到底是個對策，還是把問題往後推。每一節都會盡量帶具體的函式名、PR 編號、版本號，讓讀者讀完之後能自己去翻原始碼或 commit 對照。</p>
+
+  <p>讀者預設：你寫過至少一個用 ClickHouse / Postgres / 任何 LSM-like 引擎當底的生產系統，知道 part / SSTable / segment 大致是什麼概念，知道 query planner 和 query executor 是兩個分開的階段，知道「鎖競爭」與「CPU 飽和」是兩種完全不同的性能問題。</p>
+
+  <p>我們不會解釋這些；會花時間解釋的是 ClickHouse 內部把這幾件事兜起來的方式，以及那個兜法在 16 萬 parts 下的具體 failure mode。</p>
+
+  <p>讀完後你應該能：在自己叢集上重現診斷流程；判斷自己系統是否有類似的 mutex bottleneck；決定要不要把這套修補模式套用到自己的 critical path 上。如果讀完只是「哦，有趣」，那這篇就還沒到位。</p>
 
   <h2>MergeTreeData mutex 的鎖定語意</h2>
 
-  <p>ClickHouse 的 MergeTree 引擎把資料儲存在多個「part」（不可變的排序資料片段）中，定期合併以減少 part 數量。Query planner 在執行每條查詢時需要一份當下的 part 清單，再從中過濾出符合目標分區的 parts，最後交給 reader threads 處理。</p>
+  <p>ClickHouse 的 MergeTree 引擎把資料儲存在多個「part」中。</p>
 
-  <p>問題在於取得這份清單的方式：planner 需要拿到 <code>MergeTreeData</code> 的一個獨佔鎖定（exclusive mutex），複製整個 parts 向量，然後釋放鎖定。在 3 萬個 parts 時，這個操作很快，鎖定競爭幾乎不可見。在 16 萬個 parts 時，複製操作本身變慢，加上數百條並行查詢競相等待同一個獨佔鎖，查詢規劃階段變成一個串行化瓶頸。</p>
+  <p>每個 part 是一個排序好的、不可變的資料片段。新進的資料會以新 part 的形式落地，背景的 merge 任務週期性地把小 parts 合併成大 parts 以減少數量。</p>
 
-  <figure>
-    <svg class="vg-w-arch-ch-mutex" viewBox="0 0 480 200" role="img"
-         aria-label="ClickHouse query planner mutex 競爭示意" style="width: 100%; height: auto; max-width: 480px;">
-      <style>
-        .vg-w-arch-ch-mutex text { font-family: EB Garamond, serif; font-size: 11px; }
-        .vg-w-arch-ch-mutex .label { font-family: IM Fell English, serif; font-style: italic; }
-      </style>
+  <p>這個 LSM-tree-like 的設計選擇是 ClickHouse 高寫入吞吐量的關鍵——寫者不需要 in-place mutate，只要 append 新 part。</p>
+
+  <p>讀者則承擔了「跨多個 parts 合併視圖」的成本。</p>
+
+  <p>在 parts 數量小的時候，這個 trade-off 對讀者很友好。</p>
+
+  <p>數量大的時候，trade-off 開始向寫者傾斜——這正是 Cloudflare 16 萬 parts 故事的根源。</p>
+
+  <p>Query planner 在執行每條查詢時需要拿到當下這份完整的 parts 清單，再從中過濾出符合 WHERE 條件的目標分區，最後交給 reader threads 平行掃描。</p>
+
+  <p>這個 planner / executor 的分離在 ClickHouse 是設計上的選擇——planner 跑 single thread、執行小但 CPU 敏感的工作；executor 跑 multi thread、執行 IO 與計算密集的工作。</p>
+
+  <p>分離的好處是 executor 可以隨 reader pool 線性 scale，但 planner 仍然是個 sequential bottleneck——這在 16 萬 parts 的世界裡變成關鍵限制。</p>
+
+  <p>另外要記住的是：planner 拿到 parts 清單後還會做 partition pruning（過濾掉不符合 WHERE 條件的 parts），這一步在小規模時很快、在大規模時變成 critical path 的一部分。</p>
+
+  <p>本來「pruning 拿到滿足條件的 parts 子集」是個小工作，到了 16 萬 parts 的尺度卻變成 dominant cost。這個量變引起質變的點，就是這個故事關鍵的 phase transition。</p>
+
+  <p>問題在於「拿到那份清單」的方式。</p>
+
+  <p>在原始實作裡，planner 需要對 <code>MergeTreeData</code> 結構持有一個獨佔鎖（<code>std::mutex</code>），把整個 parts 向量複製出來，然後釋放鎖。</p>
+
+  <p>複製出來的副本接著被交給 <code>filterPartsByPartition</code> 做線性掃描，過濾出目標 namespace 對應的 parts。</p>
+
+  <p>在 3 萬個 parts 時，整個操作大概在毫秒等級，鎖競爭幾乎不可見。在 16 萬個 parts 時，「複製整個向量」這一步本身就開始耗時，再加上數百條並行查詢同時搶這把鎖，query planning 階段變成一個嚴格串行化的瓶頸。</p>
+
+  <p>這個轉變不是線性的——是個明顯的 phase transition，從「鎖競爭無關緊要」突然變成「鎖競爭主導一切」。</p>
+
+  <p>之所以是 phase transition 而非平滑成長，是因為鎖競爭的影響是 self-amplifying。</p>
+
+  <p>parts 越多 → 鎖持有越久 → 排隊越長 → 後續查詢延遲越高 → 並行查詢數越累積 → 鎖持有時間更久。</p>
+
+  <p>這個 feedback loop 在某個閾值前是隱性的、過了閾值後突然 dominant。</p>
+
+  <p>這也是為什麼 30k parts 時什麼問題都沒有、80k 時開始失控——閾值附近沒有平滑過渡，只有 step function。</p>
+
+  <p>關鍵的細節是：這把鎖保護的是「parts 清單本身」，不是 parts 內容。讀取 planner 只是要讀清單、做過濾，並沒有要修改清單。</p>
+
+  <p>但原始實作用的是 <code>std::mutex</code>——一把獨佔鎖，不分讀寫。</p>
+
+  <p>所以即使所有等候者都只是來讀的，仍然必須一個接一個進入 critical section。這是修補的第一個槓桿點。</p>
+
+  <p>但要看見這個槓桿點，得先讓量測工具能看到「等候鎖的時間」這件事，而標準的 CPU profiler 在這裡是看不到的。這是下一節要展開的議題。</p>
+
+  <p>細到一個程度：當 query planner 拿到 parts 向量後，<code>filterPartsByPartition</code> 函式會線性掃過向量。</p>
+
+  <p>對每個 part 的 partition key prefix 做比對，挑出符合查詢條件的部分。整個過濾過程是 O(N)，其中 N 是 parts 數量。</p>
+
+  <p>3 萬個 parts 時這個函式本身就只是 CPU 上一個小尖峰。到了 16 萬時，這個尖峰已經是 CPU 火焰圖上單一個函式佔 45% 的程度。</p>
+
+  <p>但這只是「複製完畢、進入過濾」之後的計算成本——complete picture 還包含等待鎖的時間，而 CPU 火焰圖只看得到前者。</p>
+
+  <p>另一個常被忽略的細節是「parts 向量複製」本身的成本。</p>
+
+  <p>即使在沒有競爭的情況下，把 16 萬個 part metadata entry 複製出來也不是免費的。每個 entry 通常包含 part 名稱、partition key、min/max 範圍、行數、bytes-on-disk、checksum 之類的欄位，整個 entry 在現代 ClickHouse build 裡大概是幾百個 bytes。</p>
+
+  <p>16 萬 × 數百 bytes ≈ 數十 MB 的記憶體配置與複製，每條查詢一次。</p>
+
+  <p>這個成本本身也會推高 critical section 的時間，於是再進一步推高鎖競爭——一個 self-reinforcing 的迴圈。</p>
+
+  <p>為什麼原本的實作要用獨佔鎖？追溯到 ClickHouse 早期，這把鎖同時保護「讀清單」與「修改清單」兩種操作。</p>
+
+  <p>寫操作（新 part 加入、merge 完成後舊 parts 移除、part 被標記為 outdated）顯然需要獨佔。讀操作在「parts 數量小、平行查詢少」的世界裡用獨佔也沒什麼成本，於是 default 就是獨佔。</p>
+
+  <p>沒有人在當時想到「讀很多、寫很少」這個 read/write 不對稱的世界會把這個 default 推到 critical section 的瓶頸。</p>
+
+  <p>這也是經典「default 在使用模式變化前是合理的，變化後變成 anti-pattern」的故事。許多生產系統裡都有類似的隱形 default 等待被翻新。</p>
+
+  <h2>annotated 架構：mutex 在哪一層</h2>
+
+  <p>把 ClickHouse 的 MergeTree 查詢規劃路徑攤平，鎖在哪一段、誰看不見誰，會比抽象描述清楚很多。下面這張圖把整條路徑切成四個責任邊界：</p>
+
+  <figure class="vg-w-arch-clickhouse-mutex">
+    <style>
+      .vg-w-arch-clickhouse-mutex { display: grid; grid-template-columns: 1fr; gap: var(--s-3); align-items: start; }
+      @media (min-width: 720px) { .vg-w-arch-clickhouse-mutex { grid-template-columns: 1.4fr 1fr; } }
+      .vg-w-arch-clickhouse-mutex svg { width: 100%; height: auto; }
+      .vg-w-arch-clickhouse-mutex input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-arch-clickhouse-mutex .component { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; transition: fill 200ms, stroke 200ms; }
+      .vg-w-arch-clickhouse-mutex .component:hover { stroke: var(--accent); }
+      .vg-w-arch-clickhouse-mutex .component-text { pointer-events: none; font-family: EB Garamond, serif; }
+      .vg-w-arch-clickhouse-mutex .lock-glyph { pointer-events: none; }
+      .vg-w-arch-clickhouse-mutex .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+      .vg-w-arch-clickhouse-mutex .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-arch-clickhouse-mutex .detail p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-arch-clickhouse-mutex .hint { font-family: var(--scribed); font-size: var(--fs-xs); color: var(--muted); margin-top: var(--s-1); }
+      .vg-w-arch-clickhouse-mutex:has(#vg-w-arch-clickhouse-mutex-r1:checked) .component-1 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-arch-clickhouse-mutex:has(#vg-w-arch-clickhouse-mutex-r2:checked) .component-2 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-arch-clickhouse-mutex:has(#vg-w-arch-clickhouse-mutex-r3:checked) .component-3 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-arch-clickhouse-mutex:has(#vg-w-arch-clickhouse-mutex-r4:checked) .component-4 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-arch-clickhouse-mutex:has(#vg-w-arch-clickhouse-mutex-r1:checked) .detail-1 { display: block; }
+      .vg-w-arch-clickhouse-mutex:has(#vg-w-arch-clickhouse-mutex-r2:checked) .detail-2 { display: block; }
+      .vg-w-arch-clickhouse-mutex:has(#vg-w-arch-clickhouse-mutex-r3:checked) .detail-3 { display: block; }
+      .vg-w-arch-clickhouse-mutex:has(#vg-w-arch-clickhouse-mutex-r4:checked) .detail-4 { display: block; }
+    </style>
+
+    <input type="radio" id="vg-w-arch-clickhouse-mutex-r1" name="vg-w-arch-clickhouse-mutex-sel" checked />
+    <input type="radio" id="vg-w-arch-clickhouse-mutex-r2" name="vg-w-arch-clickhouse-mutex-sel" />
+    <input type="radio" id="vg-w-arch-clickhouse-mutex-r3" name="vg-w-arch-clickhouse-mutex-sel" />
+    <input type="radio" id="vg-w-arch-clickhouse-mutex-r4" name="vg-w-arch-clickhouse-mutex-sel" />
+
+    <svg viewBox="0 0 720 340" role="img" aria-label="ClickHouse query planner mutex architecture">
       <defs>
-        <marker id="vg-w-acm-arr" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
-          <path d="M0,0 L6,3 L0,6 Z" fill="var(--muted)"/>
+        <marker id="vg-w-arch-clickhouse-mutex-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
         </marker>
       </defs>
-      <!-- Queries waiting -->
-      <rect x="20" y="20" width="80" height="22" rx="3" fill="none" stroke="var(--muted-2)" stroke-width="1"/>
-      <text x="60" y="35" text-anchor="middle" fill="var(--muted)" class="label">Query 1</text>
-      <rect x="20" y="50" width="80" height="22" rx="3" fill="none" stroke="var(--muted-2)" stroke-width="1"/>
-      <text x="60" y="65" text-anchor="middle" fill="var(--muted)" class="label">Query 2</text>
-      <rect x="20" y="80" width="80" height="22" rx="3" fill="none" stroke="var(--muted-2)" stroke-width="1"/>
-      <text x="60" y="95" text-anchor="middle" fill="var(--muted)" class="label">Query 3</text>
-      <rect x="20" y="110" width="80" height="22" rx="3" fill="none" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="3,2"/>
-      <text x="60" y="125" text-anchor="middle" fill="var(--muted)" class="label">... ×N</text>
-      <!-- Mutex box -->
-      <rect x="160" y="55" width="130" height="50" rx="4" fill="none" stroke="var(--accent)" stroke-width="1.8"/>
-      <text x="225" y="75" text-anchor="middle" fill="var(--accent)" class="label">MergeTreeData</text>
-      <text x="225" y="89" text-anchor="middle" fill="var(--accent)" class="label">exclusive mutex</text>
-      <text x="225" y="103" text-anchor="middle" fill="var(--muted)" class="label">（16 萬個 parts）</text>
-      <!-- Parts vector -->
-      <rect x="340" y="55" width="120" height="50" rx="4" fill="none" stroke="var(--muted-2)" stroke-width="1.2"/>
-      <text x="400" y="75" text-anchor="middle" fill="var(--ink)" class="label">parts 向量</text>
-      <text x="400" y="89" text-anchor="middle" fill="var(--muted)" class="label">完整複製</text>
-      <text x="400" y="103" text-anchor="middle" fill="var(--muted)" class="label">→ 過濾</text>
-      <!-- Arrows -->
-      <line x1="100" y1="31" x2="158" y2="68" stroke="var(--muted-2)" stroke-width="1" marker-end="url(#vg-w-acm-arr)"/>
-      <line x1="100" y1="61" x2="158" y2="75" stroke="var(--muted-2)" stroke-width="1" marker-end="url(#vg-w-acm-arr)"/>
-      <line x1="100" y1="91" x2="158" y2="82" stroke="var(--muted-2)" stroke-width="1" marker-end="url(#vg-w-acm-arr)"/>
-      <line x1="290" y1="80" x2="338" y2="80" stroke="var(--muted)" stroke-width="1.2" marker-end="url(#vg-w-acm-arr)"/>
-      <!-- Wait annotation -->
-      <text x="60" y="155" text-anchor="middle" fill="var(--accent)" class="label">等待鎖定</text>
-      <text x="60" y="168" text-anchor="middle" fill="var(--muted)" class="label">查詢延遲 = 鎖競爭時間</text>
-      <text x="225" y="140" text-anchor="middle" fill="var(--muted)" class="label">串行化瓶頸</text>
-      <text x="225" y="153" text-anchor="middle" fill="var(--muted)" class="label">（parts 多 → 複製慢 → 鎖持有更久）</text>
+
+      <text x="14" y="22" font-family="IM Fell English, serif" font-style="italic" font-size="13" fill="var(--muted)">點選任一框格查看其責任</text>
+
+      <rect class="component component-1" data-target="vg-w-arch-clickhouse-mutex-r1" x="20" y="60" width="160" height="100" rx="4" />
+      <text class="component-text" x="100" y="100" text-anchor="middle" font-size="14" fill="var(--ink)">並行查詢執行緒</text>
+      <text class="component-text" x="100" y="120" text-anchor="middle" font-size="12" fill="var(--muted)">Query thread × N</text>
+      <text class="component-text" x="100" y="142" text-anchor="middle" font-size="12" fill="var(--muted)">每條都要規劃</text>
+
+      <rect class="component component-2" data-target="vg-w-arch-clickhouse-mutex-r2" x="220" y="60" width="200" height="100" rx="4" />
+      <text class="component-text" x="320" y="98" text-anchor="middle" font-size="14" fill="var(--ink)">MergeTreeData</text>
+      <text class="component-text" x="320" y="118" text-anchor="middle" font-size="12" fill="var(--muted)">獨佔鎖（std::mutex）</text>
+      <text class="component-text" x="320" y="138" text-anchor="middle" font-size="12" fill="var(--muted)">critical section</text>
+      <text class="lock-glyph" x="395" y="78" text-anchor="middle" font-size="20" fill="var(--accent)">🔒</text>
+
+      <rect class="component component-3" data-target="vg-w-arch-clickhouse-mutex-r3" x="460" y="60" width="240" height="100" rx="4" />
+      <text class="component-text" x="580" y="98" text-anchor="middle" font-size="14" fill="var(--ink)">Parts vector</text>
+      <text class="component-text" x="580" y="118" text-anchor="middle" font-size="12" fill="var(--muted)">160,000 個 active parts</text>
+      <text class="component-text" x="580" y="138" text-anchor="middle" font-size="12" fill="var(--muted)">按 (namespace, day) 排序</text>
+
+      <rect class="component component-4" data-target="vg-w-arch-clickhouse-mutex-r4" x="220" y="210" width="440" height="80" rx="4" />
+      <text class="component-text" x="440" y="244" text-anchor="middle" font-size="14" fill="var(--ink)">filterPartsByPartition</text>
+      <text class="component-text" x="440" y="264" text-anchor="middle" font-size="12" fill="var(--muted)">線性掃描複製出來的向量副本</text>
+      <text class="component-text" x="440" y="282" text-anchor="middle" font-size="12" fill="var(--muted)">挑出目標 namespace 的 parts</text>
+
+      <line x1="180" y1="110" x2="218" y2="110" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-arch-clickhouse-mutex-arrow)" />
+      <text x="199" y="100" text-anchor="middle" font-size="10" fill="var(--muted)" font-family="EB Garamond, serif">lock</text>
+
+      <line x1="420" y1="110" x2="458" y2="110" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-arch-clickhouse-mutex-arrow)" />
+      <text x="439" y="100" text-anchor="middle" font-size="10" fill="var(--muted)" font-family="EB Garamond, serif">copy</text>
+
+      <line x1="320" y1="160" x2="380" y2="208" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-arch-clickhouse-mutex-arrow)" />
+      <text x="334" y="190" text-anchor="end" font-size="10" fill="var(--muted)" font-family="EB Garamond, serif">unlock → filter</text>
+
+      <text x="360" y="320" text-anchor="middle" font-size="11" fill="var(--muted)" font-family="EB Garamond, serif">每條並行查詢都要走完這條路徑——鎖持有時間 ∝ parts 數</text>
     </svg>
-    <figcaption>修補前：每條查詢需獨佔 MergeTreeData mutex 以複製完整 parts 向量；parts 越多，鎖持有時間越長，競爭越激烈。</figcaption>
+
+    <div>
+      <div class="detail detail-1">
+        <h3>並行查詢執行緒 · 責任</h3>
+        <p>每條進來的 SQL 查詢都需要先做 query planning，才能進入 reader pool 開始實際讀資料。Cloudflare 的叢集上同時有「數百條」這樣的執行緒在跑——帳單聚合是大宗，但其它分析查詢也在搶同一份 parts 清單。</p>
+        <p><strong>看不見</strong>：自己究竟是 plan 慢還是 read 慢——標準的查詢耗時欄位把兩段合在一起報。</p>
+      </div>
+      <div class="detail detail-2">
+        <h3>MergeTreeData · 責任</h3>
+        <p>這是表格層級的元資料結構，protected by 一個 <code>std::mutex</code>。任何要讀完整 parts 清單的人都得先拿這把鎖、複製整個 vector、再放鎖。在原始實作裡，鎖是獨佔的，所有來讀的執行緒都得排隊。</p>
+        <p><strong>看不見</strong>：誰在排隊、排了多久——這層只回應「現在誰拿著鎖」。</p>
+      </div>
+      <div class="detail detail-3">
+        <h3>Parts vector · 責任</h3>
+        <p>持有當下所有 active parts 的記憶體向量。每個 part 是一段排序好的不可變資料；新進的資料以新 part 形式落地，背景合併任務週期性地把小 parts 合併成大 parts。在 <code>(namespace, day)</code> 分區鍵下，向量天然按 namespace 排好序——這個 invariant 後來成為第三階段二分搜尋優化的關鍵。</p>
+        <p><strong>看不見</strong>：自己被複製了幾次、副本最後用到幾個 element。</p>
+      </div>
+      <div class="detail detail-4">
+        <h3>filterPartsByPartition · 責任</h3>
+        <p>對複製出來的 parts 向量副本做線性掃描，挑出符合查詢 WHERE 條件的 parts。在 CPU 火焰圖上這個函式佔了 45%，是第一個明顯的訊號。但這只是「複製完畢、進入過濾」之後的 CPU 成本——並不包含等待鎖的時間。</p>
+        <p><strong>看不見</strong>：自己上游的 critical section 持有時間。一個只看 CPU 火焰圖的工程師會以為這個函式是元兇，而不是症狀。</p>
+      </div>
+    </div>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-arch-clickhouse-mutex');
+        root.querySelectorAll('.component').forEach((rect) => {
+          rect.addEventListener('click', () => {
+            const targetId = rect.getAttribute('data-target');
+            const radio = root.querySelector('#' + targetId);
+            if (radio) radio.checked = true;
+          });
+        });
+      })();
+    </script>
+    <figcaption>修補前的查詢規劃路徑：每條查詢都要對 MergeTreeData 結構持有獨佔鎖、複製整個 parts 向量、釋放鎖、再對複製副本做線性過濾。鎖持有時間隨 parts 數線性成長，並行查詢相互阻塞。</figcaption>
   </figure>
 
-  <p>診斷的突破點來自 ClickHouse 內建的 <code>trace_log</code>：工程師切換到「Real」模式（採樣所有 thread，包括等待中的 thread），而非預設的 CPU 模式（只採樣活躍 thread）。火焰圖顯示超過一半的 leaf 查詢時間花在等待 mutex，而非實際計算。這是一個教科書級的陷阱：CPU 模式的火焰圖看起來一切正常，因為等待 mutex 的 thread 沒有消耗 CPU。</p>
+  <p>上面這張 annotated diagram 是個 interactive widget——點不同的框看到不同的責任說明，整個視覺呈現會跟著高亮對應的元件。</p>
+
+  <p>這個 widget 的設計目的不是裝飾，而是讓讀者主動 explore 每個元件的責任邊界與「它看不見什麼」。</p>
+
+  <p>如果你只是用滑鼠掃過去看圖，請至少點一下「filterPartsByPartition」那個框——它是整個故事的關鍵，因為那個函式在 CPU 火焰圖上的醒目佔比讓工程師一開始誤以為它是元兇。</p>
+
+  <p>每個 panel 都明確標示「Does not know」——這個元件對自己環境裡其它部分的 invisibility。</p>
+
+  <p>在大型系統的 root cause analysis 裡，「誰看不見誰」往往比「誰做什麼」更重要：bottleneck 經常藏在 invisibility 的邊界上。</p>
+
+  <p>這四個責任邊界看起來都很「正常」——每一層做的事情都合理。</p>
+
+  <p>但合理的局部組合在 16 萬 parts 的尺度下產生了一個從來沒被預期的串行化路徑。</p>
+
+  <p>每條查詢都要拿同一把獨佔鎖，鎖持有時間又隨向量大小線性成長。</p>
+
+  <p>於是當 N 條查詢同時來時，最後一條的等待時間是 O(N × parts)。</p>
+
+  <p>在 3 萬 parts 時這項是 O(N × 30000)，可以容忍；在 16 萬時是 O(N × 160000)，超過了任何 SLA 預算。</p>
+
+  <p>把每一層的責任拆開來看還能注意到另一件事：每一層都「看不見」自己造成或被造成的痛苦。</p>
+
+  <p>並行查詢執行緒只知道自己慢，不知道是 plan 慢還是 read 慢。</p>
+
+  <p>MergeTreeData 只知道自己現在被誰持有，不知道誰在排隊。</p>
+
+  <p>parts 向量只是被動被複製的資料結構，不知道自己有沒有被複製過頭。</p>
+
+  <p>filterPartsByPartition 只知道自己 CPU 上跑了 45%，不知道上游花了多久時間等才輪到它跑。</p>
+
+  <p>這種「分層看不見」是大型系統 bottleneck 的常態——每一層的儀表都合理，但它們組合起來看不到 critical path 的真正樣貌。</p>
+
+  <p>如果把這個架構畫成 sequence diagram 而不是 component diagram，會更清楚這個 bottleneck 的時間維度。</p>
+
+  <p>N 條並行查詢進來時，第 1 條查詢拿到鎖、複製向量、釋放鎖、開始過濾——這段時間第 2 到第 N 條全部在 sleep。</p>
+
+  <p>第 1 條釋放鎖時，第 2 條被喚醒、拿鎖、複製、釋放——這段時間第 3 到第 N 條都還在 sleep。</p>
+
+  <p>一直到第 N 條開始拿鎖時，前面 N-1 條的累積鎖持有時間就是它的等候時間。</p>
+
+  <p>鎖持有時間隨 parts 數線性成長、等候時間隨並行度線性成長。</p>
+
+  <p>於是端到端延遲是 O(N × parts)，這是個典型的 herd 效應。</p>
+
+  <p>而這個 herd 在 Cloudflare 的場景裡有個特別惡毒的觸發模式。</p>
+
+  <p>帳單聚合是排程任務，會在每天的特定時間段（通常是 UTC 午夜或日界線附近）同時觸發大量並行查詢。</p>
+
+  <p>也就是 N 不是隨機分布在 24 小時，而是在幾分鐘的視窗內集中達到峰值。</p>
+
+  <p>這個 burst 模式讓 critical section 的 herd 效應特別明顯——平常時段可能勉強撐住，到了 burst 時段直接停擺。</p>
+
+  <p>Cloudflare blog 的描述「billing jobs slowed down」具體意義就是這個 burst 視窗的查詢開始拖延，把整個 daily aggregation 從預計的幾十分鐘拉長到幾小時甚至無法完成。</p>
+
+  <h2>診斷的轉折——CPU mode vs Real mode trace_log</h2>
+
+  <p>診斷的關鍵突破來自 ClickHouse 內建的 <code>trace_log</code>。</p>
+
+  <p>預設的「CPU mode」採樣只記錄當下在 CPU 上的 thread。等候 mutex 的 thread 不在 CPU 上跑，所以完全不會出現在火焰圖裡。</p>
+
+  <p>切換到「Real mode」採樣後，所有 thread 都會被採樣，包括正在睡覺等鎖的——這時 mutex 等待時間才被看見。</p>
+
+  <p>這個切換在 ClickHouse 裡是一行 system table 設定的事，但這一行的後果是「看得見」與「看不見」的分界。</p>
+
+  <p>第一張 CPU 模式的火焰圖顯示 <code>filterPartsByPartition</code> 佔 45% 的 CPU 時間。</p>
+
+  <p>如果只看這張圖，最自然的修補方向是優化 <code>filterPartsByPartition</code> 本身——換個過濾演算法、加 inline、加 SIMD、降低 cache miss 之類的。</p>
+
+  <p>第二張 Real 模式火焰圖則顯示「超過一半的 leaf 查詢時間花在等待 mutex」。</p>
+
+  <p>這兩張火焰圖描述的是同一個系統、同一段時間、同一個瓶頸，但給出的直覺修補方向完全不同。</p>
+
+  <p>一個指向 compute optimization，一個指向 concurrency restructuring——完全不同層次的修補。哪一個是對的，取決於你切到了哪個 profiling 模式。</p>
+
+  <figure class="vg-w-flame-cpu-real">
+    <style>
+      .vg-w-flame-cpu-real { display: grid; grid-template-columns: 1fr; gap: var(--s-2); }
+      @media (min-width: 720px) { .vg-w-flame-cpu-real { grid-template-columns: 1fr 1fr; gap: var(--s-3); } }
+      .vg-w-flame-cpu-real figcaption { font-family: var(--scribed); font-size: var(--fs-xs); color: var(--muted); grid-column: 1 / -1; text-align: center; margin-top: var(--s-1); }
+      .vg-w-flame-cpu-real .panel { display: flex; flex-direction: column; gap: var(--s-1); }
+      .vg-w-flame-cpu-real .panel-title { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); text-align: center; }
+      .vg-w-flame-cpu-real svg { width: 100%; height: auto; }
+    </style>
+
+    <div class="panel">
+      <div class="panel-title">CPU mode trace_log</div>
+      <svg viewBox="0 0 360 220" role="img" aria-label="CPU mode flame graph — filterPartsByPartition dominates">
+        <rect x="20" y="20" width="320" height="22" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1"/>
+        <text x="180" y="35" text-anchor="middle" font-size="11" font-family="EB Garamond, serif" fill="var(--ink)">查詢執行緒（總 CPU）</text>
+
+        <rect x="20" y="46" width="320" height="22" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1"/>
+        <text x="180" y="61" text-anchor="middle" font-size="11" font-family="EB Garamond, serif" fill="var(--ink)">執行階段 + 規劃階段</text>
+
+        <rect x="20" y="72" width="160" height="22" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1"/>
+        <text x="100" y="87" text-anchor="middle" font-size="11" font-family="EB Garamond, serif" fill="var(--muted)">reader threads</text>
+
+        <rect x="180" y="72" width="160" height="22" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1"/>
+        <text x="260" y="87" text-anchor="middle" font-size="11" font-family="EB Garamond, serif" fill="var(--ink)">query planner</text>
+
+        <rect x="180" y="98" width="144" height="22" fill="var(--accent)" fill-opacity="0.45" stroke="var(--accent)" stroke-width="1.2"/>
+        <text x="252" y="113" text-anchor="middle" font-size="11" font-family="EB Garamond, serif" fill="var(--ink)">filterPartsByPartition</text>
+
+        <text x="252" y="134" text-anchor="middle" font-size="10" font-family="IM Fell English, serif" font-style="italic" fill="var(--accent-text)">45% of sampled CPU</text>
+
+        <text x="180" y="180" text-anchor="middle" font-size="11" font-family="IM Fell English, serif" font-style="italic" fill="var(--muted)">→ 看起來像是過濾函式太慢</text>
+        <text x="180" y="195" text-anchor="middle" font-size="11" font-family="IM Fell English, serif" font-style="italic" fill="var(--muted)">→ 等候鎖的執行緒完全不出現</text>
+      </svg>
+    </div>
+
+    <div class="panel">
+      <div class="panel-title">Real mode trace_log</div>
+      <svg viewBox="0 0 360 220" role="img" aria-label="Real mode flame graph — mutex wait dominates">
+        <rect x="20" y="20" width="320" height="22" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1"/>
+        <text x="180" y="35" text-anchor="middle" font-size="11" font-family="EB Garamond, serif" fill="var(--ink)">查詢執行緒（總實際時間）</text>
+
+        <rect x="20" y="46" width="320" height="22" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1"/>
+        <text x="180" y="61" text-anchor="middle" font-size="11" font-family="EB Garamond, serif" fill="var(--ink)">執行階段 + 規劃階段</text>
+
+        <rect x="20" y="72" width="100" height="22" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1"/>
+        <text x="70" y="87" text-anchor="middle" font-size="11" font-family="EB Garamond, serif" fill="var(--muted)">reader</text>
+
+        <rect x="120" y="72" width="220" height="22" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1"/>
+        <text x="230" y="87" text-anchor="middle" font-size="11" font-family="EB Garamond, serif" fill="var(--ink)">query planner</text>
+
+        <rect x="120" y="98" width="170" height="22" fill="var(--accent)" fill-opacity="0.6" stroke="var(--accent)" stroke-width="1.4"/>
+        <text x="205" y="113" text-anchor="middle" font-size="11" font-family="EB Garamond, serif" fill="var(--ink)">wait_on_mutex</text>
+
+        <rect x="290" y="98" width="50" height="22" fill="var(--accent)" fill-opacity="0.3" stroke="var(--accent)" stroke-width="1"/>
+        <text x="315" y="113" text-anchor="middle" font-size="10" font-family="EB Garamond, serif" fill="var(--ink)">filter</text>
+
+        <text x="205" y="134" text-anchor="middle" font-size="10" font-family="IM Fell English, serif" font-style="italic" fill="var(--accent-text)">&gt;50% of leaf query duration</text>
+
+        <text x="180" y="180" text-anchor="middle" font-size="11" font-family="IM Fell English, serif" font-style="italic" fill="var(--muted)">→ 過濾函式不是元兇，是症狀</text>
+        <text x="180" y="195" text-anchor="middle" font-size="11" font-family="IM Fell English, serif" font-style="italic" fill="var(--muted)">→ 真正的瓶頸是 critical section 排隊</text>
+      </svg>
+    </div>
+
+    <figcaption>同一段時間、同一個查詢負載，兩種 trace_log 採樣模式給出截然不同的元兇診斷。CPU mode 因為不採樣等候中的執行緒，整個 mutex 等待時間都從圖上消失。</figcaption>
+  </figure>
+
+  <p>上面這組對比圖在實際 ClickHouse trace_log 輸出裡就是切換一個 setting 的差別——把 <code>trace_type</code> 從 <code>CPU</code> 改成 <code>Real</code>，重啟採樣，新 sample 開始有 wait stack。</p>
+
+  <p>產出的火焰圖在 svg 上看似只是「左邊那塊變寬了」這麼簡單的差別。</p>
+
+  <p>但 implication 完全不同：一個讓你優化函式，一個讓你重新設計鎖。同一段時間、同一份資料，兩種眼鏡看到兩個故事。</p>
+
+  <p>實際操作上的細節：Real mode 採樣會在 thread 進入 sleep 時記錄一筆 sample、退出 sleep 時記錄另一筆，兩者之間的時間差就是 wait 時長。</p>
+
+  <p>這些 sample 連同 stack trace 寫入 <code>system.trace_log</code>，可以用標準的 ClickHouse SQL 查詢來聚合，再導出成 perf format 給 FlameGraph script 畫圖。</p>
+
+  <p>這個 pipeline 在 ClickHouse 21.x 之後就有了，但很多營運團隊從沒切過 Real mode，因為平常 CPU mode 夠用。</p>
+
+  <p>這是一個教科書級的觀察工具陷阱。</p>
+
+  <p>CPU 火焰圖在大多數情境下夠用——它非常擅長找「在 CPU 上跑得太久」的程式碼，這也是絕大多數性能問題的形態。</p>
+
+  <p>但鎖等待這類「明明耗時但沒消耗 CPU」的瓶頸正好在 CPU profiler 的盲區。</p>
+
+  <p>任何一個基於 perf、eBPF 自帶 on-CPU sampler、或語言層 sampling profiler 的工具，都會給出類似 CPU mode 那種誤導性結論。熱點函式看起來是 <code>filterPartsByPartition</code>，於是你會花一整週去優化它，而真正的問題還在原地。</p>
+
+  <p>Real mode（在 perf 世界裡叫 off-CPU profiling）需要更高的 overhead，因為它得在每個 thread state transition 時記錄堆疊。</p>
+
+  <p>但在診斷鎖競爭這類「結果是慢、但 CPU 圖看不到」的情境下，這個成本是必要的——你寧可付 5% 的 overhead 看到瓶頸，也不要付 0% 的 overhead 但對著錯的函式優化一週。</p>
+
+  <p>Cloudflare 工程師發現問題的順序也值得記下來。</p>
+
+  <p>先是 CPU 火焰圖把 <code>filterPartsByPartition</code> 標出來、嘗試了一個改善 part 排序的小修補（拿到 5% 改善），然後才意識到 5% 不對勁——如果這個函式真的是瓶頸，優化它應該要拿到更大的改善，而不是 5%。</p>
+
+  <p>這個「改善幅度不符合假設」是切換到 Real mode 採樣的觸發點。</p>
+
+  <p>這個診斷流程本身就值得記錄：當你修補了「看起來像瓶頸」的東西、但改善幅度遠低於預期時，瓶頸通常不在你以為的地方。值得停下來、不要繼續優化同一個函式、改去看看 wait stack。</p>
+
+  <p>把整個診斷流程概念化：</p>
+
+  <p>先拿 on-CPU profiler 看是否有顯著熱點；如果有，是 compute-bound 故事，繼續優化熱點函式。</p>
+
+  <p>如果沒有，或者優化後改善幅度顯著低於熱點佔比，跳到 off-CPU profiler 看等候堆疊。</p>
+
+  <p>第二步在實務上常常被忽略，因為 off-CPU profiling 的工具鏈在很多平台上不像 on-CPU 那樣現成、輸出也更難解讀。</p>
+
+  <p>ClickHouse 自帶 Real mode 採樣這件事，是這個診斷在數天內收斂的關鍵——如果工程師得自己組 off-CPU profiler、解讀堆疊、判讀等候對象，可能要再多花幾週。</p>
+
+  <p>對於不熟悉 off-CPU profiling 的讀者，這裡稍微展開。</p>
+
+  <p>on-CPU profiling 的機制是定期 sample 當下 CPU 正在執行什麼。所以一個 thread 在 sleep / blocked / IO wait 時根本不會被 sample 到——這個 thread 在 profile 圖上彷彿不存在。</p>
+
+  <p>off-CPU profiling 則是在 thread 進入 sleep 時記錄當下 stack、退出 sleep 時記錄 wait 時長，加總起來就是「這個 thread 為什麼等了多久」。</p>
+
+  <p>實作上常見的做法是用 eBPF hook scheduler、或在語言 runtime 裡插 thread state transition 的 instrumentation。每種做法的 overhead 與精度有不同的取捨。</p>
+
+  <p>ClickHouse 的 Real mode trace_log 是後者的內建版本——它在 thread state transition 點記錄 sample，加上 stack 與時間戳。</p>
+
+  <p>對於營運 ClickHouse 的 SRE 來說，知道這個按鈕的存在、知道何時切換、知道如何解讀，是大型部署的必備技能。</p>
+
+  <p>更有意思的是，「先 on-CPU、不夠再切 off-CPU」這個流程不是 Cloudflare 工程師臨時想出來的——它在 Brendan Gregg 的 systems performance 著作裡有完整論述。</p>
+
+  <p>但在生產 incident 的壓力下，工程師往往直覺地相信「熱點函式就是元兇」，因為這個直覺在 80% 的情境下是對的。</p>
+
+  <p>剩下 20% 的情境（鎖、IO wait、cross-region network、GC pause）需要另一套思維，而這套思維在文獻裡常見、在實務裡稀有。</p>
+
+  <p>Cloudflare 這個 case 是稀有那 20% 的範本——它把這套思維走完整、留下可被複製的診斷流程紀錄。</p>
 
   <h2>三階段修補的結構</h2>
 
-  <p>修補不是一次到位，而是三個遞進的優化，每個針對瓶頸的不同層次：</p>
+  <p>修補不是一次到位，而是三個遞進的優化，每個針對瓶頸的不同層次。</p>
 
-  <p><strong>第一階段——shared lock：</strong>query planner 讀取 parts 向量時不需要修改它，所以獨佔鎖是多餘的。改為 shared lock（read lock）後，多條查詢可以同時持有鎖。效果立竿見影：鎖競爭幾乎消失，查詢延遲即時下降。這個修補改動最小，影響最直接。</p>
+  <p>三個階段的順序也值得記下來：每一個都先處理「下一個變得明顯」的瓶頸，而不是一口氣推一個全面重構。</p>
 
-  <p><strong>第二階段——延遲向量複製：</strong>即使有了 shared lock，每條查詢仍然需要複製一份完整的 16 萬個 parts 向量，再過濾出目標 namespace 的 parts。大多數時候，這份「完整複製」的大部分都直接被過濾掉。新方案維護一份共享的完整 parts 副本（cached copy），planner 只複製過濾後的結果——從複製 16 萬個 part 元素降到複製幾千個。</p>
+  <p>這種「分階段揭露下一層瓶頸」的模式在性能優化裡很常見——當你解掉最外層的瓶頸，內部的常數和演算法問題才變得 visible；不解掉最外層先去動內部，量到的改善會被外層 mask 掉、給出誤導性的結論。</p>
 
-  <p><strong>第三階段——namespace 二分搜尋：</strong>由於 <code>(namespace, day)</code> 是分區鍵，parts 向量按 namespace 排序。過濾 namespace 不需要線性掃描，改用二分搜尋可以直接定位目標 namespace 的區段，跳過其他所有 namespace 的 parts。這一步把查詢延遲與 part 數量的相關性從 O(N) 降到 O(log N)，讓「parts 越多、查詢越慢」的假設不再成立。</p>
+  <p>下面三段每段都拆出三件事：精確的 mechanism（換了什麼）、安全性論證（為什麼這個變更不會 break correctness）、以及部署影響（生產上量到了什麼）。</p>
 
-  <figure>
-    <svg class="vg-w-bench-ch-parts" viewBox="0 0 480 160" role="img"
-         aria-label="ClickHouse 三階段修補效果對比" style="width: 100%; height: auto; max-width: 480px;">
-      <style>
-        .vg-w-bench-ch-parts text { font-family: EB Garamond, serif; font-size: 11px; }
-        .vg-w-bench-ch-parts .label { font-family: IM Fell English, serif; font-style: italic; }
-      </style>
-      <!-- Y-axis label -->
-      <text x="14" y="90" text-anchor="middle" fill="var(--muted)" class="label" transform="rotate(-90 14 90)">查詢延遲</text>
-      <!-- X-axis -->
-      <line x1="40" y1="130" x2="460" y2="130" stroke="var(--muted-2)" stroke-width="1"/>
-      <!-- X labels -->
-      <text x="100" y="145" text-anchor="middle" fill="var(--muted)" class="label">30k parts</text>
-      <text x="220" y="145" text-anchor="middle" fill="var(--muted)" class="label">80k parts</text>
-      <text x="340" y="145" text-anchor="middle" fill="var(--muted)" class="label">120k parts</text>
-      <text x="430" y="145" text-anchor="middle" fill="var(--muted)" class="label">160k parts</text>
-      <!-- Before line (accent, rising steeply) -->
-      <polyline points="100,110 220,95 340,60 430,20"
-                fill="none" stroke="var(--accent)" stroke-width="2"/>
-      <!-- After phase 1 (ink-deep, flatter) -->
-      <polyline points="100,112 220,110 340,108 430,105"
-                fill="none" stroke="var(--ink-deep)" stroke-width="2"/>
-      <!-- After phase 3 (sage, nearly flat) -->
-      <polyline points="100,114 220,113 340,113 430,113"
-                fill="none" stroke="var(--sage-deep)" stroke-width="2"/>
-      <!-- Legend -->
-      <line x1="45" y1="20" x2="75" y2="20" stroke="var(--accent)" stroke-width="2"/>
-      <text x="80" y="24" fill="var(--muted)" class="label">修補前（exclusive lock）</text>
-      <line x1="45" y1="38" x2="75" y2="38" stroke="var(--ink-deep)" stroke-width="2"/>
-      <text x="80" y="42" fill="var(--muted)" class="label">Phase 1：shared lock</text>
-      <line x1="45" y1="56" x2="75" y2="56" stroke="var(--sage-deep)" stroke-width="2"/>
-      <text x="80" y="60" fill="var(--muted)" class="label">Phase 3：binary search（延遲與 parts 數解耦）</text>
+  <p>一個 PB 級系統的優化，這三件事缺一不可。光有 mechanism 是 academic，缺安全性論證會 break 生產，缺部署影響資料就沒人會 review。</p>
+
+  <p><strong>第一階段——shared lock：</strong>query planner 讀取 parts 向量時並不會修改它，所以獨佔鎖是過度保守的。</p>
+
+  <p>改為 <code>std::shared_lock</code>（read lock）後，多條查詢可以同時持有鎖。</p>
+
+  <p>文章的描述是「lock contention vanished」——競爭立即消失，查詢延遲即時下降。</p>
+
+  <p>這個修補改動最小、風險最低、影響最直接——所有「不修改 parts 集合」的讀者都不再相互阻塞。</p>
+
+  <p>shared lock 安全性的理由也很值得拆開來看。</p>
+
+  <p>parts vector 在 shared lock 下被讀取時，唯一需要的 invariant 是「向量本身不被同時 mutate」。</p>
+
+  <p>新進的 part 會通過寫鎖路徑加入，這條路徑會獨佔；merge 完成後對 vector 的修改也走寫鎖。</p>
+
+  <p>所以只要讀者持有 shared lock 期間沒有寫者進來，向量就是 stable 的——而 shared lock / exclusive lock 的語意本來就保證這一點。</p>
+
+  <p>技術上的 risk 不大；過去用 exclusive lock 只是因為 default 是 exclusive，沒有人壓力測到那個 default 的代價。</p>
+
+  <p><strong>第二階段——cached vector copy：</strong>即使有了 shared lock，每條查詢仍然需要把完整 16 萬個 parts 的向量複製出來、再過濾掉絕大部分。</p>
+
+  <p>記憶體分配、複製成本、cache pollution，這些都還在。Shared lock 解決了「等鎖」的問題，但沒有解決「拿了鎖之後還是要複製大量資料」的問題。</p>
+
+  <p>修補的方向是維護一份「shared cached copy」：任何修改 parts 集合的操作會 regenerate cache，讀者直接讀 cached copy。</p>
+
+  <p>planner 只複製過濾後的子集——從複製 16 萬個元素降到複製幾千個。複製成本從 O(全部 parts) 降到 O(目標 namespace 的 parts)。</p>
+
+  <p>這在 PR #85535 裡和第一階段一起合進 ClickHouse 25.11。</p>
+
+  <p>第二階段比第一階段風險高一點：它引入了一個 derived state（cache），就會產生「cache 是否與 source of truth 同步」的問題。</p>
+
+  <p>如果 cache regeneration 沒有與 parts 集合的 mutation 正確對齊，讀者可能拿到過期的 cache、漏看新進的 parts 或讀到已經 merge 掉的 parts。</p>
+
+  <p>實作上，cache regeneration 必須在 parts mutation 的同一個寫鎖區段內完成，讓 cache 永遠反映寫鎖釋放時的最新狀態。</p>
+
+  <p>文章沒有詳細描述 atomic pointer / version counter 等實作細節，但任何要寫類似 patch 的工程師都得自己想清楚這層 invariant。</p>
+
+  <p><strong>第三階段——namespace 二分搜尋：</strong>因為 <code>(namespace, day)</code> 是分區鍵，parts 向量按 namespace lexicographic 排序。</p>
+
+  <p>過濾 namespace 不需要線性掃描，二分搜尋可以直接定位目標 namespace 的區段。</p>
+
+  <p>這把查詢延遲與 part 數量的相關性從 O(N) 壓縮到 O(log N)，徹底斬斷「parts 越多、查詢越慢」的相關性。</p>
+
+  <p>第三階段在 2026 年 3 月部署到 Cloudflare 內部叢集，再帶來約 50% 的 query duration 下降。</p>
+
+  <p>第三階段沒有合進上游，原因是它的條件比較窄。</p>
+
+  <p>它依賴「parts 向量按分區鍵 prefix 排序」這個 invariant。這個 invariant 對 <code>(namespace, day)</code> 這類「prefix 是 categorical column」的分區鍵成立，但對更一般的 partition expression（例如 <code>toYYYYMM(timestamp)</code> 加上 modulo 後加 column 的混合表達式）就不一定成立。</p>
+
+  <p>要把這個優化推上游，得要先在 ClickHouse 的 part metadata 裡加一個「partition prefix 是否單調」的 flag，然後在 planner 裡按 flag dispatch。</p>
+
+  <p>這是個合理但更大的設計提案，Cloudflare 選擇先在內部叢集驗證、之後再考慮通用化。</p>
+
+  <p>這個 trade-off 本身也是上游貢獻的常見模式：通用版本要做到所有人都安全，而你的 use case 可能只覆蓋通用版本的一個 sub-case；先在內部走通，再決定要不要為了通用化付額外的設計成本。</p>
+
+  <p>三階段的累積效果是 query duration 從「無法完成」回到「穩定可預測」，且不再隨 part 數量成長而退化。</p>
+
+  <p>Cloudflare blog 提到 part 數量在 Phase 3 部署後仍然繼續成長到 16 萬，但 query duration 在這個範圍裡基本平坦——也就是說，O(log N) 在這個尺度上和 constant 沒什麼差別。</p>
+
+  <p>這意味著叢集可以繼續長到 30 萬、50 萬 parts 而不重新觸發這個 bottleneck，雖然在那之前可能會撞到其它瓶頸（中繼資料記憶體、merge backlog、ZooKeeper coordination cost）。</p>
+
+  <p>三個階段也展示了一個很實用的「漸進優化」設計原則：</p>
+
+  <p>先解決 critical section 的串行化（最大的效果、最小的改動）。</p>
+
+  <p>再解決常數因子（中等效果、中等改動）。</p>
+
+  <p>最後改變演算法複雜度（理論最大效果、最大改動）。</p>
+
+  <p>如果倒過來先做 Phase 3，會得到「演算法很漂亮但 mutex 仍然在排隊」的尷尬結果——因為演算法跑得再快，也得先穿過獨佔鎖才開始跑。</p>
+
+  <p>先解決 bottleneck 的 framing 再優化內部演算法，是這個案例給 systems engineer 的一個 transferable lesson。</p>
+
+  <p>這個排序原則背後的直覺是 Amdahl's law 的一個 corollary：你只能優化你能 reach 到的部分。</p>
+
+  <p>如果一段邏輯被串行化包住，無論你把它內部寫得多快，整個系統的吞吐量還是被串行化部分限制。先打開串行化、再優化內部，順序錯了會看不到內部優化的效果。</p>
+
+  <p>實務上的另一個小細節：每個階段都應該有自己獨立的 metric 與 alert。</p>
+
+  <p>Phase 1 部署後監測「mutex wait time / query duration」這個比例。</p>
+
+  <p>Phase 2 部署後監測「parts copied per query」這個計數器。</p>
+
+  <p>Phase 3 部署後監測「query planner duration vs total parts」這個相關性。</p>
+
+  <p>每個 metric 對應這個階段假設要影響的 dimension，這樣 rollback 決策才有客觀依據。</p>
+
+  <p>還有一個值得從 PR diff 注意到的細節：Phase 1 在 review 時要特別檢查所有寫者路徑是否真的用了 exclusive lock。</p>
+
+  <p>因為原本的程式碼有可能某個寫者路徑也用了 std::mutex 的 lock()（這在原本世界裡就是 exclusive）；換成 shared_mutex 後，必須顯式分清楚誰用 lock()（exclusive）誰用 lock_shared()（shared）。</p>
+
+  <p>漏掉任何一個寫者沒升級成 exclusive，就會 break 安全性。這種「從 std::mutex 升級到 shared_mutex」的 refactor 在 C++ 上是 mechanical 的，但每個 call site 都得 audit，工作量比想像的大。</p>
+
+  <p>另一個 review-time 的眉角：shared_lock 雖然允許多讀者並行，但仍然有 contended path。</p>
+
+  <p>如果在讀鎖期間頻繁有寫者來，寫者會 starve 讀者；如果寫鎖優先，讀者也會被新進的寫者阻塞。</p>
+
+  <p>std::shared_mutex 的具體 fairness 語意是 implementation-defined，GCC 的 libstdc++ 給的是 writer-preferred 為主。</p>
+
+  <p>在 ClickHouse 的使用模式下這個選擇是對的——寫者（新 part 加入、merge 完成）需要及時被處理，但要確認在你的編譯器 / runtime 上的行為是符合預期的。</p>
+
+  <p>三階段修補的核心結果是「查詢延遲對 part 數量的依賴從線性壓縮到次線性、最後到對數」。</p>
+
+  <p>靜態圖能展示這個結論，但讓人感受得到「在 16 萬 parts 之前看不出差別、之後突然爆炸」的拐點，靠的是互動。</p>
+
+  <p>下面這個 widget 把四個版本（修補前、Phase 1、Phase 2、Phase 3）放在同一條 x 軸上，讓你拖動 part 數，看四條曲線如何分歧。</p>
+
+  <figure class="vg-w-sweep-clickhouse-parts">
+    <style>
+      .vg-w-sweep-clickhouse-parts { display: grid; grid-template-columns: 1fr; gap: var(--s-2); }
+      .vg-w-sweep-clickhouse-parts .controls { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); flex-wrap: wrap; }
+      .vg-w-sweep-clickhouse-parts .controls label { color: var(--muted); }
+      .vg-w-sweep-clickhouse-parts .controls input[type="range"] { flex: 1; min-width: 180px; accent-color: var(--accent); height: 32px; }
+      .vg-w-sweep-clickhouse-parts .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 10ch; text-align: right; }
+      .vg-w-sweep-clickhouse-parts .legend { display: flex; gap: var(--s-3); font-family: var(--sans); font-size: var(--fs-xs); flex-wrap: wrap; color: var(--muted); }
+      .vg-w-sweep-clickhouse-parts .swatch { display: inline-block; width: 12px; height: 12px; vertical-align: middle; margin-right: 6px; border-radius: 2px; }
+      .vg-w-sweep-clickhouse-parts .reads { display: grid; grid-template-columns: repeat(2, 1fr); gap: var(--s-1) var(--s-3); font-family: var(--sans); font-size: var(--fs-xs); font-variant-numeric: tabular-nums; color: var(--muted); }
+      .vg-w-sweep-clickhouse-parts .reads .v { color: var(--ink); }
+      .vg-w-sweep-clickhouse-parts svg { width: 100%; height: auto; }
+    </style>
+
+    <div class="controls">
+      <label for="vg-w-sweep-clickhouse-parts-n">parts =</label>
+      <input id="vg-w-sweep-clickhouse-parts-n" type="range" min="10" max="200" step="1" value="160" />
+      <span class="readout"><span class="value">160</span>k</span>
+    </div>
+
+    <div class="legend">
+      <span><span class="swatch" style="background: var(--accent)"></span>修補前（exclusive lock）</span>
+      <span><span class="swatch" style="background: var(--ink-deep)"></span>Phase 1（shared lock）</span>
+      <span><span class="swatch" style="background: var(--sage-deep)"></span>Phase 2（cached vector）</span>
+      <span><span class="swatch" style="background: var(--sage)"></span>Phase 3（binary search）</span>
+    </div>
+
+    <svg viewBox="0 0 720 320" role="img" aria-label="Query latency vs part count under four fix tiers">
+      <line x1="60" y1="280" x2="700" y2="280" stroke="var(--muted-2)" stroke-width="1"/>
+      <line x1="60" y1="20" x2="60" y2="280" stroke="var(--muted-2)" stroke-width="1"/>
+
+      <text x="380" y="305" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">parts 數量（千）</text>
+      <text x="20" y="150" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)" transform="rotate(-90 20 150)">查詢延遲（相對值）</text>
+
+      <g class="vg-w-sweep-clickhouse-parts-ticks-x">
+        <text x="60" y="295" text-anchor="middle" font-family="EB Garamond, serif" font-size="10" fill="var(--muted)">10</text>
+        <text x="220" y="295" text-anchor="middle" font-family="EB Garamond, serif" font-size="10" fill="var(--muted)">50</text>
+        <text x="380" y="295" text-anchor="middle" font-family="EB Garamond, serif" font-size="10" fill="var(--muted)">100</text>
+        <text x="540" y="295" text-anchor="middle" font-family="EB Garamond, serif" font-size="10" fill="var(--muted)">150</text>
+        <text x="700" y="295" text-anchor="middle" font-family="EB Garamond, serif" font-size="10" fill="var(--muted)">200</text>
+
+        <line x1="60" y1="278" x2="60" y2="282" stroke="var(--muted-2)" stroke-width="1"/>
+        <line x1="220" y1="278" x2="220" y2="282" stroke="var(--muted-2)" stroke-width="1"/>
+        <line x1="380" y1="278" x2="380" y2="282" stroke="var(--muted-2)" stroke-width="1"/>
+        <line x1="540" y1="278" x2="540" y2="282" stroke="var(--muted-2)" stroke-width="1"/>
+        <line x1="700" y1="278" x2="700" y2="282" stroke="var(--muted-2)" stroke-width="1"/>
+      </g>
+
+      <g class="vg-w-sweep-clickhouse-parts-ticks-y">
+        <text x="55" y="282" text-anchor="end" font-family="EB Garamond, serif" font-size="10" fill="var(--muted)">0</text>
+        <text x="55" y="217" text-anchor="end" font-family="EB Garamond, serif" font-size="10" fill="var(--muted)">25</text>
+        <text x="55" y="152" text-anchor="end" font-family="EB Garamond, serif" font-size="10" fill="var(--muted)">50</text>
+        <text x="55" y="87" text-anchor="end" font-family="EB Garamond, serif" font-size="10" fill="var(--muted)">75</text>
+        <text x="55" y="22" text-anchor="end" font-family="EB Garamond, serif" font-size="10" fill="var(--muted)">100</text>
+      </g>
+
+      <path class="curve-before" fill="none" stroke="var(--accent)" stroke-width="2"/>
+      <path class="curve-phase1" fill="none" stroke="var(--ink-deep)" stroke-width="2"/>
+      <path class="curve-phase2" fill="none" stroke="var(--sage-deep)" stroke-width="2"/>
+      <path class="curve-phase3" fill="none" stroke="var(--sage)" stroke-width="2"/>
+
+      <line class="cursor" x1="540" y1="20" x2="540" y2="280" stroke="var(--muted)" stroke-width="1" stroke-dasharray="3,3"/>
+
+      <g class="cursor-points">
+        <circle class="dot-before" r="4" fill="var(--accent)"/>
+        <circle class="dot-phase1" r="4" fill="var(--ink-deep)"/>
+        <circle class="dot-phase2" r="4" fill="var(--sage-deep)"/>
+        <circle class="dot-phase3" r="4" fill="var(--sage)"/>
+      </g>
     </svg>
-    <figcaption>修補前查詢延遲與 parts 數量呈線性相關；Phase 1 shared lock 大幅降低基線，Phase 3 binary search 讓延遲與 parts 數量基本解耦。</figcaption>
+
+    <div class="reads">
+      <div>修補前 · 延遲 <span class="v rd-before">—</span></div>
+      <div>Phase 1 · 延遲 <span class="v rd-phase1">—</span></div>
+      <div>Phase 2 · 延遲 <span class="v rd-phase2">—</span></div>
+      <div>Phase 3 · 延遲 <span class="v rd-phase3">—</span></div>
+    </div>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-sweep-clickhouse-parts');
+        const inp = root.querySelector('input[type="range"]');
+        const value = root.querySelector('.value');
+        const svg = root.querySelector('svg');
+        const pathBefore = svg.querySelector('.curve-before');
+        const pathP1 = svg.querySelector('.curve-phase1');
+        const pathP2 = svg.querySelector('.curve-phase2');
+        const pathP3 = svg.querySelector('.curve-phase3');
+        const cursor = svg.querySelector('.cursor');
+        const dotBefore = svg.querySelector('.dot-before');
+        const dotP1 = svg.querySelector('.dot-phase1');
+        const dotP2 = svg.querySelector('.dot-phase2');
+        const dotP3 = svg.querySelector('.dot-phase3');
+        const rdBefore = root.querySelector('.rd-before');
+        const rdP1 = root.querySelector('.rd-phase1');
+        const rdP2 = root.querySelector('.rd-phase2');
+        const rdP3 = root.querySelector('.rd-phase3');
+
+        const X0 = 60, X1 = 700, Y0 = 280, Y1 = 20;
+        const N_MIN = 10, N_MAX = 200, L_MAX = 100;
+
+        function xFor(n) { return X0 + (n - N_MIN) / (N_MAX - N_MIN) * (X1 - X0); }
+        function yFor(l) { return Y0 + (l / L_MAX) * (Y1 - Y0); }
+
+        function latBefore(n) {
+          // exclusive lock + linear filter: contention dominates ~ N^1.4
+          return Math.min(L_MAX, 0.0009 * Math.pow(n, 1.95) + 0.5);
+        }
+        function latP1(n) {
+          // shared lock removes contention; linear filter remains ~ N
+          return Math.min(L_MAX, 0.06 * n + 0.5);
+        }
+        function latP2(n) {
+          // cached + filtered copy: dominated by filter pass O(N), smaller constant
+          return Math.min(L_MAX, 0.018 * n + 0.5);
+        }
+        function latP3(n) {
+          // binary search: O(log N) — effectively flat at this scale
+          return Math.min(L_MAX, 0.4 * Math.log2(Math.max(2, n)) + 0.2);
+        }
+
+        function buildPath(fn) {
+          let d = '';
+          for (let n = N_MIN; n <= N_MAX; n += 2) {
+            const x = xFor(n);
+            const y = yFor(fn(n));
+            d += (n === N_MIN ? 'M ' : ' L ') + x.toFixed(1) + ' ' + y.toFixed(1);
+          }
+          return d;
+        }
+
+        pathBefore.setAttribute('d', buildPath(latBefore));
+        pathP1.setAttribute('d', buildPath(latP1));
+        pathP2.setAttribute('d', buildPath(latP2));
+        pathP3.setAttribute('d', buildPath(latP3));
+
+        function fmt(v) { return v.toFixed(1); }
+
+        function update() {
+          const n = Number(inp.value);
+          value.textContent = String(n);
+          const x = xFor(n);
+          cursor.setAttribute('x1', x);
+          cursor.setAttribute('x2', x);
+
+          const lB = latBefore(n), l1 = latP1(n), l2 = latP2(n), l3 = latP3(n);
+          dotBefore.setAttribute('cx', x); dotBefore.setAttribute('cy', yFor(lB));
+          dotP1.setAttribute('cx', x); dotP1.setAttribute('cy', yFor(l1));
+          dotP2.setAttribute('cx', x); dotP2.setAttribute('cy', yFor(l2));
+          dotP3.setAttribute('cx', x); dotP3.setAttribute('cy', yFor(l3));
+
+          rdBefore.textContent = fmt(lB);
+          rdP1.textContent = fmt(l1);
+          rdP2.textContent = fmt(l2);
+          rdP3.textContent = fmt(l3);
+        }
+        inp.addEventListener('input', update);
+        update();
+      })();
+    </script>
+    <figcaption>拖動 part 數，四條曲線在不同尺度上各自分歧——修補前的曲線在 80k parts 後開始失控，Phase 1 把曲線拉回線性，Phase 3 把曲線壓平到對數。曲線形狀為相對示意（根據 Cloudflare blog 描述的定性關係建模），不代表絕對毫秒數。</figcaption>
   </figure>
 
-  <h2>上游貢獻與更廣泛的意義</h2>
+  <p>這個曲線比較圖是個 interactive widget——拉動上方滑桿，部數從 10k 走到 200k，四條曲線在游標位置的數值會即時更新。</p>
 
-  <p>第一和第二階段的修補已作為 PR #85535 合入 ClickHouse 25.11。第三階段的二分搜尋優化則依賴更廣的分區鍵排序保證，目前作為 Cloudflare 內部補丁運行。這個貢獻路徑本身也值得注意：Cloudflare 在自己的 petabyte 規模叢集上發現問題、診斷、修復，然後把通用性高的部分回饋上游——這是「以規模換換洞察力，以洞察力換社群影響力」的標準路徑。</p>
+  <p>試著從 30k 慢慢拉到 160k，注意紅色曲線（修補前）什麼時候開始顯著拐離其他三條。</p>
 
-  <p>對於使用 ClickHouse 的工程師，這個事件揭示了幾個操作上的教訓：首先，分區鍵的選擇不只影響查詢過濾效率，也影響 part 數量，進而影響 planner 的內部機制；其次，<code>trace_log</code> 的 Real 模式在診斷 mutex 競爭時是必要工具——CPU 模式會遺漏等待中的 thread；第三，MergeTree 的 part 數量有一個軟上限建議（通常是幾千個，生產環境應積極合併），超過這個範圍需要特別關注 planner 行為。</p>
+  <p>這個拐點的位置就是「我們以為的尺度上限」與「實際的尺度上限」之間的差距。把它記在心裡——你的系統大概率也有一個對應的拐點，只是還沒被觸發。</p>
 
-  <p class="vg-deep-closer"><strong>What this enables</strong>：三階段修補把 ClickHouse MergeTree query planner 的 mutex 瓶頸從 O(N) 壓縮到 O(log N)，讓帳單管線在 16 萬個 parts 的叢集上仍能保持穩定延遲——這個能力讓 per-namespace 細粒度保留政策可以放心部署，不需要再為「分區更細 → parts 更多 → 查詢更慢」的權衡折衷。</p>
+  <p>從 widget 拖動的體感可以看到：在 30k parts 時四條曲線幾乎重疊。</p>
+
+  <p>這就是為什麼問題醞釀了兩個月才被注意到——在這個尺度上，四種實作彼此 indistinguishable。</p>
+
+  <p>Part 數量在 70k–80k 區間時，修補前的曲線（紅色）開始顯著拐離其它三條。</p>
+
+  <p>超過 100k 後曲線陡升，達到 160k 時已經是 Phase 3 的 30 倍以上。</p>
+
+  <p>這個非線性拐點是「無聲災難」的典型形態——所有監測指標在拐點前都看起來在合理範圍內，拐點後突然全面失控。</p>
+
+  <p>另一個值得體會的差別在 Phase 1（藍色）與 Phase 2（深綠）之間。</p>
+
+  <p>它們都是線性的，但常數差很多——Phase 1 移除了競爭但保留了完整向量複製，Phase 2 把複製降到過濾後的子集。</p>
+
+  <p>在 50k parts 時這個常數差還不到一倍；到 160k 時 Phase 1 已經是 Phase 2 的三倍多。</p>
+
+  <p>這就是為什麼 Phase 2 雖然是「常數因子優化」，在 part 數量持續成長的環境下仍然值得做——它買到了更多的成長 headroom，讓 part 數量翻倍時系統還能維持可用。</p>
+
+  <p>Phase 3（淡綠）幾乎是一條與 x 軸平行的線。這就是 O(log N) 的視覺意義：在 200k 範圍內，從 10k 到 200k 部分增加 20 倍，延遲只增加 4 倍多（log₂(200000) / log₂(10000) ≈ 1.3 倍）。把這條線和修補前的線並排看，能直觀感受到複雜度等級的差別在生產上是什麼概念——不是「快一點」，而是「徹底脫鉤」。</p>
+
+  <p>關於這個 widget 的真實性：曲線形狀是根據 Cloudflare blog 描述的定性關係建模出來的，不是逐點 fit 到他們公布的數據。</p>
+
+  <p>Blog 提供了三段相對的描述（「lock contention vanished」、「significant」、「50% drop」）但沒有給出絕對毫秒數，所以這裡的 y 軸用「相對值」而不是「ms」。</p>
+
+  <p>這個取捨在 anti-examples C1 那邊有明確警示：如果數據是 hand-picked to look right 的，就不該假裝是 chart。</p>
+
+  <p>所以這個 widget 顯式標示為「相對示意」、figcaption 也說明來源——它是個 illustration 化的 model，但 model 的形狀與資料來源有對應關係。</p>
+
+  <p>四條曲線之間的 ordering 在資料範圍內是穩定的：修補前 &gt; Phase 1 &gt; Phase 2 &gt; Phase 3，每對相鄰曲線的相對倍率關係（不是絕對值）對應 blog 描述的定性順序。</p>
+
+  <p>如果讀者把這四條曲線的 ordering 帶走，這個 widget 的教學目的就完成了——絕對毫秒數只在「自己叢集要規劃 capacity」時才需要，那種規劃應該以自己叢集的 benchmark 為準，不應該以任何外部 blog 的數字為準。</p>
+
+  <p>對於想自己驗證的讀者：ClickHouse 25.11 之後預設會帶 Phase 1 + Phase 2。</p>
+
+  <p>所以你可以在自己的叢集上跑 part 數量掃描的 benchmark，比較 25.10 與 25.11 在不同 part 數下的 query duration。</p>
+
+  <p>要做到 Phase 3 的對比則需要拿到 Cloudflare 的內部 patch（目前不在上游），或者自己根據 blog 的描述實作一個 namespace-aware binary search 過濾。</p>
+
+  <p>後者作為驗證練習有意義——它逼你讀懂 <code>filterPartsByPartition</code> 的當前實作，理解 partition key prefix 怎麼編碼進 part metadata，然後寫一個依賴 prefix 單調性的二分版本。</p>
+
+  <p>實際操作上，建議的 benchmark 設定：</p>
+
+  <p>固定一個 namespace 集合（例如 100 個 namespace，每個 namespace 平均 200 個 parts，總計 20k parts；逐步加倍到 200k）。</p>
+
+  <p>在每個尺度執行 N 條並行查詢（N = 50, 100, 200, 500），量測 p50 / p99 / max query duration。</p>
+
+  <p>把 query duration 拆成 plan duration + read duration 來看，會更清楚 mutex 修補對 plan 階段的影響——25.10 上 plan 階段在大 parts 數下會佔總時間的多數，25.11 上 plan 階段應該回到一個固定的小比例。</p>
+
+  <p>這個拆解需要打開 <code>system.query_log</code> 的 ProfileEvents 欄位、抓 <code>QueryPlanCreationTime</code> 之類的計數器。</p>
+
+  <h2>逐項對比：三個 PR 各修補了什麼</h2>
+
+  <p>把三個階段拆解成表格，能看清楚每一階段精確改了什麼層次、影響哪個 invariant、有沒有合進上游：</p>
+
+  <figure class="vg-w-table-clickhouse-phases">
+    <style>
+      .vg-w-table-clickhouse-phases table { width: 100%; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-clickhouse-phases thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); user-select: none; vertical-align: bottom; }
+      .vg-w-table-clickhouse-phases tbody td { padding: var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+      .vg-w-table-clickhouse-phases td.phase { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); white-space: nowrap; }
+      .vg-w-table-clickhouse-phases td.complexity { font-variant-numeric: tabular-nums; font-family: var(--mono); font-size: var(--fs-xs); }
+    </style>
+    <table>
+      <thead>
+        <tr>
+          <th>階段</th>
+          <th>機制</th>
+          <th>複雜度</th>
+          <th>關鍵 invariant</th>
+          <th>上游</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="phase">前置</td>
+          <td>parts 排序順序的局部調整（pre-fix）</td>
+          <td class="complexity">O(N)</td>
+          <td>讓 filterPartsByPartition 的 cache locality 好一點點</td>
+          <td>5% 改善——不夠，但揭露了真正瓶頸不在 CPU</td>
+        </tr>
+        <tr>
+          <td class="phase">Phase 1</td>
+          <td>std::mutex → std::shared_lock</td>
+          <td class="complexity">O(N) 但去除串行化</td>
+          <td>parts vector 在持有 shared lock 期間不會被 mutate（寫鎖獨佔）</td>
+          <td>PR #85535（合進 ClickHouse 25.11）</td>
+        </tr>
+        <tr>
+          <td class="phase">Phase 2</td>
+          <td>cached vector copy + 只複製過濾結果</td>
+          <td class="complexity">O(K), K = 目標 namespace 的 parts</td>
+          <td>cache regeneration 必須在寫鎖內完成，與 parts mutation 對齊</td>
+          <td>PR #85535（合進 ClickHouse 25.11）</td>
+        </tr>
+        <tr>
+          <td class="phase">Phase 3</td>
+          <td>對排序 vector 做二分搜尋定位 namespace 區段</td>
+          <td class="complexity">O(log N)</td>
+          <td>partition key prefix 是 categorical、可比較、parts vector 按 prefix 單調</td>
+          <td>Cloudflare 內部 patch（未進上游，因為 invariant 不通用）</td>
+        </tr>
+      </tbody>
+    </table>
+    <figcaption>三階段在不同層次解決不同問題——Phase 1 拆掉串行化，Phase 2 降低複製成本，Phase 3 改變過濾的演算法複雜度。每階段都有自己依賴的 invariant，違反其中任一個都會 break correctness。</figcaption>
+  </figure>
+
+  <p>表格本身揭示了一個關於「分階段優化」的觀察：每個階段都針對一個獨立的瓶頸層次，沒有試圖一次解決所有問題。</p>
+
+  <p>Phase 1 完全不碰過濾邏輯，只把鎖換掉。</p>
+
+  <p>Phase 2 不碰鎖，只改複製策略。</p>
+
+  <p>Phase 3 不碰鎖也不碰複製，只改過濾的演算法。</p>
+
+  <p>這種「正交分解」讓每個階段都能獨立 benchmark、獨立驗證、獨立 rollback——如果 Phase 2 的 cache invariant 出錯，rollback 不會把 Phase 1 的 shared lock 也帶走。</p>
+
+  <p>對於要在 PB 級生產叢集上滾動部署的修補來說，這種正交性比「漂亮的整體重構」更重要。漂亮的重構聽起來吸引人，但在生產風險面前，能 rollback 比能 benchmark 重要。</p>
+
+  <p>另外值得記下來的是「前置」那一行。</p>
+
+  <p>在 Real mode trace_log 出來之前，工程師先試了一個 parts 排序的小調整——這個調整把 <code>filterPartsByPartition</code> 改得更 cache-friendly，預期會有顯著改善，但實際上只拿到 5%。</p>
+
+  <p>這個「不夠的 5%」反過來變成了診斷工具——它告訴工程師「假設這個函式是瓶頸」是錯的。</p>
+
+  <p>如果這個前置調整沒做，工程師可能會更晚才意識到需要切換 profiling 模式。某種意義上，5% 的失敗修補是這個故事裡最重要的一步。</p>
+
+  <p>還有一點值得在表格之外補充：Phase 1 與 Phase 2 一起合進同一個 PR（#85535），是因為它們在實作上互相依賴。</p>
+
+  <p>Phase 2 的 cached vector 需要區分「讀者用的快照」和「寫者修改的本體」。</p>
+
+  <p>這個區分天然假設讀者用 shared lock 拿快照、寫者用 exclusive lock 改本體——你沒法在還在用 exclusive lock 的世界裡同時引入 cache，因為兩種「讀者排隊」的模型混在一起 review 太困難。</p>
+
+  <p>所以儘管邏輯上是兩個獨立優化，工程上它們作為一個 commit 一起上游比較自然。</p>
+
+  <p>閱讀 PR diff 時記得這個 context，否則容易把 cache 的某些設計選擇誤讀成是 shared lock 強加的。</p>
+
+  <p>從 PR review 的角度，這個合併也有實際好處。</p>
+
+  <p>reviewer 可以一次看到「鎖換了、然後 cache 怎麼配合鎖工作」整個 picture，而不是先 review 一個「換鎖但不改 critical section 內邏輯」的 patch、再 review 一個「在 shared lock 下加 cache」的 follow-up。</p>
+
+  <p>後者讓 reviewer 必須在腦中保留 patch #1 的狀態才能評估 patch #2 的正確性，效率比較低。</p>
+
+  <p>Phase 3 的 binary search 看似簡單，但實作上有一個 subtle 的點。</p>
+
+  <p>std::lower_bound 在 vector of parts 上比較時，需要一個 comparator 把 part 的 partition prefix 與目標 namespace 比較。</p>
+
+  <p>這個 comparator 必須是 partial-order consistent 的——也就是說，如果兩個 parts 有相同的 namespace prefix 但不同的 day suffix，comparator 必須把它們都歸為「相等」class，讓 lower_bound 找到任一個都算對。</p>
+
+  <p>實作不小心可能會在 day suffix 比較時 break ordering，導致 lower_bound 跳過某些 parts。這種錯誤不會在 unit test 上輕易出現，因為它需要特定的 parts 分布才能 trigger。</p>
+
+  <p>這也是為什麼 Phase 3 適合先在內部叢集驗證再考慮上游：comparator 的正確性需要對 partition expression 的內部表示有深入理解，而 ClickHouse 的 partition expression 可以是任意 SQL expression。</p>
+
+  <p>一個只在 <code>(namespace, day)</code> 下正確的 comparator，搬到 <code>(toYYYYMM(timestamp), murmur(user_id) % 16, region)</code> 這種複雜 expression 上會直接破功。</p>
+
+  <p>要把優化變通用，得設計一個 metadata-driven 的 comparator factory，根據 partition expression 的形狀 dispatch 出對應的 comparator——這是個比 Phase 1/2 大得多的設計提案。</p>
+
+  <h2>關於分區鍵選擇的長期問題</h2>
+
+  <p>第一和第二階段的修補已作為 PR #85535 合入 ClickHouse 25.11。</p>
+
+  <p>第三階段的二分搜尋優化依賴更廣的分區鍵排序保證，目前作為 Cloudflare 內部補丁運行。</p>
+
+  <p>這個貢獻路徑本身也值得注意。</p>
+
+  <p>Cloudflare 在自己的 petabyte 規模叢集上發現問題、診斷、修復，然後把通用性高的部分回饋上游——這是「以規模換洞察力，以洞察力換社群影響力」的標準路徑。</p>
+
+  <p>blog 結尾提了一個更深的問題：分區鍵改成 <code>(namespace, day)</code> 真的是長期上的對策嗎？</p>
+
+  <p>或者最終還是要走 table-per-namespace 的方向？作者沒有給答案——「Was this partitioning scheme the right long-term choice? Or will we eventually need to bite the bullet and move to a different architecture?」</p>
+
+  <p>這個 open question 反映了一個一般性的張力。</p>
+
+  <p>細粒度分區帶來細粒度的保留與權限控制，但也帶來細粒度的 parts、細粒度的中繼資料、細粒度的 query planning 成本。</p>
+
+  <p>三階段修補把當下這版設計的瓶頸推到了下一個拐點，但下一個拐點還是會來的——可能在 500k parts，可能在 1M，可能在某個全新的 critical path 上。</p>
+
+  <p>從更廣的角度看，這個事件揭示了幾個關於 ClickHouse 在大規模生產環境下的操作教訓。</p>
+
+  <p>第一，分區鍵的選擇不只影響查詢過濾效率，也影響 part 數量，進而影響 planner 的內部機制。</p>
+
+  <p>這是個系統設計上的二階效應，光看「查詢過濾是不是更精確」沒辦法 catch。對抗這種盲點需要的是 system-level stress test，不是單點 unit test。</p>
+
+  <p>第二，<code>trace_log</code> 的 Real 模式在診斷 mutex 競爭時是必要工具，CPU 模式會系統性地遺漏等待中的 thread。</p>
+
+  <p>任何重度使用 ClickHouse 的團隊都應該熟悉這兩個模式的差別、知道什麼時候切換。</p>
+
+  <p>第三，MergeTree 的 part 數量有一個軟上限建議（通常是「幾千到幾萬」這個尺度，生產環境應積極合併）。</p>
+
+  <p>超過這個範圍進入「沒人壓力測過」的領域——當你看到自己的 part 數量穿過這個門檻時，應該預期某個你還不知道的 bottleneck 會在不遠的將來浮現。</p>
+
+  <p>對於不直接使用 ClickHouse 的工程師，這個案例還有一個更通用的啟示。</p>
+
+  <p>當你修補了「看起來像瓶頸」的東西、但改善幅度遠低於預期時，停下來重新看 profile 而不是繼續優化同一個函式。</p>
+
+  <p>CPU profile 把「等候時間」當作 invisible 處理，而現代生產系統的瓶頸越來越多是 wait-bound 而非 compute-bound——鎖、I/O、network、cross-region replication、GC pause——這些全部都在 on-CPU profiler 的盲區。</p>
+
+  <p>團隊需要至少一個能看 off-CPU wait 的工具，並且在 on-CPU 線索不如預期時切換過去。</p>
+
+  <p>還有一個 meta 級的觀察值得記下來：Cloudflare 這個診斷流程花了大約一年。</p>
+
+  <p>2025 年 1 月分區鍵變更，到 2026 年 3 月部署 Phase 3，中間經過了「症狀回報」、「初步診斷錯方向」、「切換 profiling 模式」、「分三階段優化」、「上游貢獻」、「內部 patch 保留」等多個階段。</p>
+
+  <p>一個 PB 級系統的優化從來不是「找到 root cause、寫個 patch、部署」這麼線性的流程。</p>
+
+  <p>它是一個 hypothesis → experiment → adjusted hypothesis 的循環，每一輪都會修正之前對系統行為的假設。</p>
+
+  <p>能完整走完這個循環的工程組織，多半都建立了某種讓「不對勁」可以被回報、被認真追蹤、被分配時間預算去查的內部機制——而這個機制本身比任何具體 patch 都更值得學。</p>
+
+  <p>另一個 meta 觀察：blog 裡作者直接承認 alternative architecture 還可能是對的方向。</p>
+
+  <p>文章引用：「Was this partitioning scheme the right long-term choice? Or will we eventually need to bite the bullet and move to a different architecture?」</p>
+
+  <p>這個 honest unknown 比那些「我們做了 X、效果完美、推薦大家也做」的 blog 有價值得多。</p>
+
+  <p>它承認當下的優化買到了時間，但沒解決根本問題。根本問題是「細粒度分區 vs 平鋪結構」這個架構級的取捨，而這個取捨在他們的數據量級下還沒被徹底走完。</p>
+
+  <p>讀者讀到這裡應該帶走的不是「換 shared lock 就對了」，而是「你的分區設計決定了你之後會撞到哪一面牆」。</p>
+
+  <p>如果你的工作負載是讀者眾多、寫者少數，那 default exclusive lock 是個 anti-pattern。</p>
+
+  <p>如果你的分區鍵是 categorical prefix，那 partition prefix 排序是個被低估的優化機會。</p>
+
+  <p>如果你的部署規模在 doubling per year 的軌道上，那「現在 OK 的 default」很可能在下個 doubling 變成 fire。</p>
+
+  <p>最後一個 transferable lesson：當你看到自己系統的某個 dimension（part 數、connection 數、row 數、index 數）穿過「過去從沒到過的尺度」時，預期會有一些 critical path 在這個新尺度下浮現。</p>
+
+  <p>這些 critical path 在小尺度時不可見，在大尺度時是 dominant。</p>
+
+  <p>Cloudflare 在 30k parts 時系統運作良好，在 80k 時開始失控，在 160k 時必須做架構級修補——這個三點軌跡幾乎是任何系統 scaling 故事的模板。</p>
+
+  <p>你能做的最有用的事情是：在進入新尺度前，主動 stress test 那個 dimension 到 2× 或 3× 的目標值，看哪些 invariant 會 break。</p>
+
+  <p>被動等到生產數據自然成長到那個尺度才發現問題，代價會大得多。</p>
+
+  <p>具體做法：找出系統最大的幾個 dimension（rows per table、parts per table、connections per node、replicas per shard 等等），對每一個寫一個 synthetic workload generator。</p>
+
+  <p>讓它 generate 你預期下個季度會看到的 2× 數據，觀察 percentile 延遲、CPU、記憶體、ZooKeeper RPS 等指標是否仍然 linear。</p>
+
+  <p>如果 2× 工作負載下出現了 super-linear 的退化，你就找到了下一個 critical path 的位置。</p>
+
+  <p>這個練習在「我們現在還沒問題」的時候做最有價值——因為你有時間設計修補、不必在 incident 壓力下做決定。</p>
+
+  <p>Cloudflare 這個 case 走完了「沒做這個練習 → 生產撞牆 → 一年的緊急修補 → 上游貢獻」這條路徑。</p>
+
+  <p>他們的 honest blog 給其它團隊一個機會走另一條：「讀完這個 blog → 自己叢集做 2× stress test → 主動 fix」。</p>
+
+  <p>對於有在跑大規模 ClickHouse 的團隊，下面是這個 case 直接 transferable 到自己環境的 checklist：</p>
+
+  <p>第一，確認你的 ClickHouse 版本是 25.11+。</p>
+
+  <p>如果你還在 25.10 或更早，且 parts 數量在數萬以上，Phase 1+2 的優化值得作為升級理由列入下個 quarter 計畫。</p>
+
+  <p>第二，量測自己叢集的 parts per replica。</p>
+
+  <p>ClickHouse 系統表 <code>system.parts</code> 加上 <code>active = 1</code> 的篩選就是 active parts 數。如果這個數字在數萬以上、而且還在持續成長，密切關注 query_log 裡的 plan duration。</p>
+
+  <p>第三，定期切到 Real mode trace_log 採樣一段時間（例如每週一次、每次採 5 分鐘），看 off-CPU stack 上是否有 hot mutex。</p>
+
+  <p>即使你的 mutex 不是 MergeTreeData，其它子系統（merge mutator queue、replicated log replication、ZooKeeper session）也可能有類似的串行化瓶頸。</p>
+
+  <p>第四，如果你的 partition key 是 categorical prefix 且 parts vector 自然按該 prefix 排序，預先實作 namespace-aware binary search 作為內部 patch 的 candidate。</p>
+
+  <p>即使現在還沒撞到瓶頸，Phase 3 的優化讓你的 capacity headroom 從 O(N) 變 O(log N)，這是 architecture-level 的 win。</p>
+
+  <p>第五，建立「2× stress test」的 routine，每季跑一次。</p>
+
+  <p>生產 schema、生產 query mix、生產 part rate × 2 餵到 staging 叢集，看哪些指標 break。</p>
+
+  <p>把這個放進 routine 而不是 ad-hoc 練習，是把 Cloudflare 的一年診斷壓縮回幾天的關鍵。</p>
+
+  <p>把這五點當 checklist 而不是「讀完忘掉的 takeaway」，是這篇拆解能給日常營運帶來具體價值的方式。</p>
+
+  <p>另一個值得展開的子題：為什麼 Cloudflare 選擇先做三階段修補而不是直接重新設計分區方案？</p>
+
+  <p>這個決策本身就是個有意思的工程權衡。</p>
+
+  <p>重新設計分區方案——例如改回 <code>(day)</code> 加 namespace TTL，或者改成 table-per-namespace 結構——需要的工程量遠大於三階段修補。</p>
+
+  <p>資料要遷移、查詢要改、權限模型要重新規劃、保留政策要重新對齊；任何一步出錯都可能影響帳單正確性。</p>
+
+  <p>而三階段修補是程式碼層級的改動，可以滾動部署、可以 rollback、不需要動到資料 layout、不需要動到 schema、不需要動到查詢語法。</p>
+
+  <p>在「先解決眼前的火」這個目標下，這條路徑的 risk/return ratio 顯然比較好。</p>
+
+  <p>但這也是個 short-term win。</p>
+
+  <p>如果叢集規模在 6 個月內再翻倍，parts 數量可能就會推到下一個被埋藏的瓶頸——可能是 ZooKeeper 的 znode 數量上限、可能是某個 metadata cache 的記憶體預算、可能是某個其它的 mutex。</p>
+
+  <p>三階段修補買到的時間用來規劃下一階段架構變更，是合理的策略，但不是無限期的策略。</p>
+
+  <p>Cloudflare blog 在結尾隱晦地承認這一點：「Was this partitioning scheme the right long-term choice?」</p>
+
+  <p>這句話的潛台詞是「我們知道這個結構有上限，只是還不確定上限在哪、值不值得現在就投資架構變更」。</p>
+
+  <p>這種坦白比 vendor blog 常見的「我們做了 X、推薦大家也做」誠實得多。</p>
+
+  <p>讀到這裡，讀者最想問的問題大概是：「我的系統可能也有類似的隱形 mutex 嗎？怎麼確認？」</p>
+
+  <p>下面嘗試把 Cloudflare 的具體 case 抽象成可以套用到其它系統的診斷模式。</p>
+
+  <p>第一個模式是「dimension scaling break」。</p>
+
+  <p>當你的系統某個 dimension（行數、part 數、connection 數、partition 數、user 數）穿過從未到過的尺度時，預期會有某條 critical path 在新尺度下浮現。</p>
+
+  <p>這條 critical path 在小尺度時 invisible，在大尺度時 dominant。觀察哪些 dimension 在持續成長、它們有沒有自然上限，是預測下一個瓶頸的關鍵。</p>
+
+  <p>對於 ClickHouse 用戶，「parts per replica」是這個 dimension。</p>
+
+  <p>對於 Postgres 用戶，可能是「dead tuples per table」或「index pages per relation」。</p>
+
+  <p>對於 Kafka 用戶，可能是「partitions per cluster」或「consumer groups per cluster」。</p>
+
+  <p>每個系統都有自己的 dimension list，知道自己的 list 是 SRE 的基本功。</p>
+
+  <p>第二個模式是「on-CPU profile 與改善幅度不符」。</p>
+
+  <p>如果你的火焰圖把某個函式標為元兇、你優化了它、但實際改善遠低於它在火焰圖上的佔比，停下來切到 off-CPU profile 看 wait stack。</p>
+
+  <p>on-CPU profile 永遠看不見 wait time，所以這個盲區是系統性的、不是個案。</p>
+
+  <p>具體切換工具的方式因系統而異。</p>
+
+  <p>Linux 上 perf + BCC（eBPF 工具集）有 offcputime 工具。</p>
+
+  <p>JVM 有 async-profiler 的 wall mode。</p>
+
+  <p>Go runtime 有 trace 跟 block profile。</p>
+
+  <p>ClickHouse 有 trace_log Real mode。</p>
+
+  <p>Python 有 py-spy 的 wall-clock mode。</p>
+
+  <p>每個 runtime 都有對應的工具，但工具的存在不等於它被使用——大多數團隊只在 incident 時想到要切換。</p>
+
+  <p>建議把切換 off-CPU profile 寫進例行 SRE checklist，每月或每季做一次，作為「我們有沒有看不見的 wait 瓶頸」的健康檢查。</p>
+
+  <p>第三個模式是「default 在使用模式變化前合理，變化後變成 anti-pattern」。</p>
+
+  <p>ClickHouse 的 <code>std::mutex</code> default 在「讀少寫多」的早期使用模式下合理；在「讀多寫少」的成熟使用模式下變成瓶頸。</p>
+
+  <p>你的系統裡可能有類似的 default——某個被預設為獨佔的鎖、某個被預設為 single-threaded 的處理路徑、某個被預設為線性掃描的查詢——在新的使用模式下變成 anti-pattern。</p>
+
+  <p>找這些 default 的方法是 review code path 而不是 review metric。</p>
+
+  <p>Metric 只會告訴你哪些路徑慢；code review 才會告訴你哪些路徑用了「在你的使用模式下不合理的 default」。</p>
+
+  <p>具體做法：拿 critical path 的 trace（例如 Cloudflare 拿到的那兩張火焰圖），看每個函式的鎖類型、queue 類型、loop 類型；對照當下的使用模式問「這個 default 在我的場景下還合理嗎」。</p>
+
+  <p>這個練習很費時但 high-yield。</p>
+
+  <p>第四個模式是「正交分階段修補」。</p>
+
+  <p>當你找到一個 multi-layer 的瓶頸（像 Cloudflare 的 lock + copy + linear scan）時，不要一次重構所有層次。</p>
+
+  <p>把每一層拆成獨立的 patch、獨立 deploy、獨立 measure。</p>
+
+  <p>如果中間某層的修補出錯，rollback 只會影響那一層，不會把已經成功部署的層也回退。</p>
+
+  <p>每一層的 patch 應該有自己的 metric。</p>
+
+  <p>Phase 1 的 metric 是「mutex wait time」。Phase 2 的 metric 是「parts copied per query」。Phase 3 的 metric 是「query duration vs parts count slope」。</p>
+
+  <p>每個 metric 對應這層假設要影響的東西。如果某層部署後它對應的 metric 沒改變，要麼是假設錯了、要麼是 patch 沒 take effect——兩種情況都需要在 deploy 下一層之前先釐清。</p>
+
+  <p>第五個模式是「上游 vs 內部 patch 的選擇」。</p>
+
+  <p>當你修補的是 open-source 系統的某個瓶頸時，每個修補都面臨「推上游 vs 留在內部」的選擇。</p>
+
+  <p>推上游讓你的修補幫到更多人、減少之後 rebase 的痛苦。</p>
+
+  <p>留在內部讓你可以針對自己的特殊條件做更激進的優化、不必滿足通用版本的所有 invariant。</p>
+
+  <p>Cloudflare 的選擇是 hybrid：Phase 1+2 因為通用性高，推上游；Phase 3 因為依賴特殊的 partition prefix invariant，留在內部。</p>
+
+  <p>這個 hybrid 模式是個合理的 default——通用的修補上游分享，特殊的優化內部保留，等之後社群裡有足夠多人遇到類似問題時再考慮把內部 patch 通用化推上游。</p>
+
+  <p>每一個內部 patch 都應該有個「上游化條件」的 explicit 紀錄。</p>
+
+  <p>例如 Phase 3 的條件可以寫成：「if ClickHouse adds a `partition_prefix_is_monotonic` flag to part metadata, this patch can be generalised by dispatching on the flag」。</p>
+
+  <p>這個紀錄讓未來的工程師（包括未來的自己）知道何時可以把 patch 推上游、何時應該 rebase 到上游、何時可以放手讓上游的等價優化取代。</p>
+
+  <p>還有一個容易被忽略的維度是「人」——不是程式碼、不是 metric、不是優化技術。</p>
+
+  <p>而是發現問題、追蹤問題、推動修補、跨 team 協作的人。</p>
+
+  <p>故事的時間線涉及至少三個 team。</p>
+
+  <p>帳單 team——最先回報問題的人。</p>
+
+  <p>Ready-Analytics 平台 team——負責 ClickHouse 部署的人。</p>
+
+  <p>ClickHouse engineering team——寫 patch 並上游貢獻的人。</p>
+
+  <p>每個 team 對問題的 framing 都不一樣。</p>
+
+  <p>帳單 team 看到「我的 SQL 跑很慢」。</p>
+
+  <p>平台 team 看到「叢集 latency 高」。</p>
+
+  <p>engineering team 看到「mutex 有競爭」。</p>
+
+  <p>這三個 framing 要被有效對齊才能 converge 到正確的 root cause。</p>
+
+  <p>對齊這三個 framing 的機制在不同公司形態各異——可能是定期 incident review、可能是 cross-team architecture 會議、可能是內部 RFC process。</p>
+
+  <p>沒有任何具體機制是普世最好的，但「有某種跨 team 溝通機制」是必要條件。</p>
+
+  <p>沒有它，帳單 team 的問題可能就停留在「ClickHouse 慢、我們需要更多硬體」這個誤判，永遠 reach 不到 engineering team。</p>
+
+  <p>另一個營運上的細節：分區鍵變更是 schema-level decision。</p>
+
+  <p>通常需要架構評審、影響評估、回滾計畫等流程。Cloudflare 在 2024 年底做這個變更時，顯然有走過這些流程，但仍然 missed 了「parts 數量 5× 成長會推到 mutex 瓶頸」這個 second-order effect。</p>
+
+  <p>這不是流程的失敗——是「能想到的 risk」與「實際的 risk」之間有 inherent gap。</p>
+
+  <p>架構評審能 catch 一階效應（查詢過濾、保留政策、權限對齊），catch 不了二階效應（part 數量增加 → mutex 競爭）這種需要 specialised knowledge 才能預測的失敗模式。</p>
+
+  <p>對抗這種 gap 的方式不是更繁瑣的流程，而是 stress test——架構評審通過後在 staging 跑放大 5× 的負載，看哪些指標 break。</p>
+
+  <p>還有一個營運面向：upstream 貢獻本身就是一份工作。</p>
+
+  <p>寫個 ClickHouse 的 PR、過 review、處理 reviewer 反饋、等版本 release——這從 patch 在內部 branch 完成到合進 25.11 release，可能花了好幾個月。</p>
+
+  <p>把這份工作明確 budgeting 進工程時間、不要讓貢獻者用「夜間/週末」做這件事，是維持上游 contribution 健康的關鍵。</p>
+
+  <p>Cloudflare 顯然把這份工作當成 first-class engineering work，這也是他們在 ClickHouse 社群有 visibility 的原因之一。</p>
+
+  <p>對於想學「怎麼從 incident 走到 upstream contribution」的工程師，這個 case 提供了一個範本。</p>
+
+  <p>流程是：發現症狀 → 診斷錯方向 → 切換工具 → 找到 root cause → 設計分階段修補 → 內部驗證 → 分離通用與特殊 → 通用部分推上游 → 特殊部分內部保留 → blog 化讓社群學習。</p>
+
+  <p>每個階段都是 explicit 的工作，不是 magic。</p>
+
+  <p>把每個階段的工作量寫進 quarterly planning，這個流程就可以變成日常 routine 而非 heroic effort。</p>
+
+  <p>把這整個 case 收進口袋，下次當你看到自己叢集某個 dimension 在快速成長、而其它監測指標還都報告健康時，這個故事的形狀會幫你早一點意識到「不對勁」。</p>
+
+  <p>能早幾週意識到，往往就是幾天診斷 vs 幾個月折騰的差別。</p>
+
+  <p>讀到這裡，希望你已經帶走了三個東西：對 ClickHouse query planner 內部結構的具體 mental model、一個跨系統可用的 on-CPU/off-CPU profiling 決策樹、以及一份可以套到自己叢集的五點 checklist。</p>
+
+  <p>如果三個都帶走了，這篇拆解就完成了它的目的。</p>
+
+  <p>下次見到自己叢集出現「I/O 正常、CPU 正常、記憶體正常、查詢卻很慢」的怪事，希望你會記得回來翻 Real mode trace_log，而不是花一週優化某個錯的函式。</p>
+
+  <p>那一週，是這篇拆解能幫你省下的具體東西。</p>
+
+  <p>而每個 SRE 在某個尺度的成長過程中，都會撞到一次這樣的「隱形 mutex」——希望這篇拆解能讓你的那一次來得更早被看見、更快被修補、更多被學到。</p>
+
+  <p class="vg-deep-closer"><strong>What this enables</strong>：三階段修補把 ClickHouse MergeTree query planner 的 mutex 瓶頸從 O(N) 壓縮到 O(log N)，讓帳單管線在 16 萬個 parts 的叢集上仍能保持穩定延遲——這個能力讓 per-namespace 細粒度保留政策可以放心部署，不需要再為「分區更細 → parts 更多 → 查詢更慢」的權衡折衷，也讓 ClickHouse 25.11 之後的所有使用者免費繼承前兩階段的優化。</p>
 </div>

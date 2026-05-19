@@ -1,113 +1,917 @@
 <header class="vg-deep-hero">
-  <p class="vg-deep-opener">連線已經穩定傳輸了幾秒鐘，然後發生一次丟包。CUBIC 開始復原。兩個封包送出去、確認回來，<code>bytes_in_flight</code> 歸零——但下一輪傳送後，擁塞窗口依舊卡在兩個封包。再下一輪，還是卡著。六秒七秒後，測試逾時。</p>
+  <p class="vg-deep-opener">連線已經穩定傳輸了幾秒鐘，然後發生一次丟包。CUBIC 開始復原，兩個封包送出去、確認回來，<code>bytes_in_flight</code> 歸零——但下一輪傳送之後，擁塞窗口依舊卡在兩個封包。再下一輪，還是卡著。每 14 毫秒切換一次 recovery 與 congestion avoidance，999 次狀態轉換只用 6.7 秒；測試在 10 秒逾時前根本無法完成下載。</p>
   <h1 class="vg-post-title">{{ title }}</h1>
 </header>
 
 <div class="vg-post-prose">
-  <p><span class="vg-dropcap">C</span>UBIC 的 RFC 9438 §4.2-12 定義了 app-limited exclusion：應用程式閒置期間，CUBIC 不應讓擁塞窗口因為沒有流量而產生不公平的暴衝。2017 年 Linux 核心引入的修補正是要解決這個問題——但當 Cloudflare 在 2020 年把這個修補移植進使用者空間的 QUIC 實作 quiche 時，少了核心的一個回呼，一個靜默的邊緣條件就此埋入。</p>
+  <p>
+    <span class="vg-dropcap">C</span>UBIC 的 RFC 9438 §4.2-12 定義了 app-limited exclusion：
+    應用程式閒置期間，CUBIC 不應讓擁塞窗口因為沒有流量而產生不公平的暴衝。
+    2017 年 Linux 核心引入的修補正是要解決這個問題——
+    但當 Cloudflare 在 2020 年把這個修補移植進使用者空間的 QUIC 實作 quiche 時，
+    少了核心的一個回呼，一個靜默的邊緣條件就此埋入。
+    六年後它在壓力測試裡以 61% 的失敗率現形，
+    修復只動了三行——
+    但在它現形之前，這個 bug 在所有 happy path 測試裡完全不會浮現。
+  </p>
 
-  <h2>what happened</h2>
+  <p>
+    這篇文章不是 quiche 的咎責文。
+    它是一個關於「語意等價」的故事：
+    把核心層的演算法直譯到使用者空間，
+    看似行為相同，
+    實際上時間點已經偏移一個 RTT；
+    而那個 RTT 在最壞情況下，
+    足以讓擁塞窗口永遠卡死。
+    本文先把 2017 年的核心修補放回它的歷史脈絡，
+    再追蹤這個修補在 2020 年被移植到 quiche 時遺漏了什麼，
+    接著拆解死亡螺旋的自我強化機制、
+    量化它的觀測訊號、
+    講完修復方案，
+    最後抽出三個對「核心 → 使用者空間」演算法移植普遍適用的工程結論。
+  </p>
 
-  <p>故事的起點是 2017 年的一個 Linux CUBIC 缺陷：若應用程式長時間閒置，epoch（參考時間戳記）不更新，導致下次傳送時 <code>delta_t = now − epoch_start</code> 暴增，CUBIC 計算出不切實際的大目標窗口。Eric Dumazet、Yuchung Cheng 和 Neal Cardwell 的修補方案是「將 epoch 向前平移閒置時長」，而非重設，保留了 CUBIC 的增長曲線形狀。這個修補在 TCP 的核心層運作良好，因為核心的 TCP 機制有精確的回呼點可以判斷「真正的閒置」起始。</p>
+  <h2>2017 年的核心修補：為什麼 epoch 需要被推平</h2>
+
+  <p>
+    CUBIC 的擁塞窗口成長曲線是一條以三次多項式定義的時間函數：<code>W(t) = C × (t − K)³ + W_max</code>。
+    <code>K</code> 是「上次 congestion event 之後，要花多少時間才能回到 <code>W_max</code>」的常數；
+    <code>t</code> 是從 <em>epoch start</em>（最近一次 congestion event 或 idle exit）到現在的時間。
+    換句話說，CUBIC 在內部維護一個時間原點，所有的窗口大小決策都從這個原點往前看。
+  </p>
+
+  <p>
+    2017 年之前，Linux CUBIC 的實作有一個尷尬的 corner case：如果應用程式長時間閒置——例如一個 HTTP keep-alive 連線在兩個請求之間靜默 30 秒——epoch 不會被更新。
+    當下一個請求送出時，<code>delta_t = now − epoch_start</code> 已經暴增到 30 秒級，代入三次多項式後 CUBIC 算出來的目標窗口會是不切實際的大值。
+    下一個 ACK 抵達時，CUBIC 試著把擁塞窗口拉高到那個目標，瞬間就把網路打爆。
+  </p>
+
+  <p>
+    這個問題的官方名稱是 <em>idle application bursts</em>。
+    它違反 RFC 5681 的 §4.1（restart-after-idle）：閒置之後不應該假設網路狀況跟閒置前一樣，新一輪傳送應該回到 slow start 而不是憑舊狀態暴衝。
+    Linux 的修補設計者——Eric Dumazet、Yuchung Cheng、Neal Cardwell——在 2017 年提出了一個比「重設 cwnd」更精緻的方案：保留 cwnd，但「把 epoch 向前平移閒置時長」。
+  </p>
+
+  <p>
+    具體做法很簡單：當偵測到應用程式從 idle 回來時，把 <code>epoch_start</code> 加上閒置時長。
+    這樣 <code>delta_t</code> 就會被歸回到「彷彿閒置從未發生」的值，CUBIC 的成長曲線形狀完整保留，但 burst 不會發生。
+    這個技巧在演算法上很巧妙——它沒有改動 CUBIC 的數學模型，只是調整時間軸的零點。
+  </p>
+
+  <p>
+    第一個修補的 commit 是 <code>30927520dbae297182990bb21d08762bcc35ce1d</code>，落在 net-next 樹上。
+    後續一個小修正 <code>c2e7204d180f8efc80f27959ca9cf16fa17f67db</code> 處理了 epoch 平移在「閒置之後立刻又進入 recovery」這種雙重邊界條件下的細節。
+    兩個 commit 在 Linux 4.13 mainline 釋出。
+  </p>
+
+  <p>
+    關鍵問題：核心怎麼知道「現在是 idle exit」？答案藏在 TCP stack 的呼叫順序裡。
+    Linux 的 <code>tcp_cubic</code> 模組（<code>net/ipv4/tcp_cubic.c</code>）導出一組回呼，由核心 TCP layer 在精確的時間點觸發：<code>cubictcp_init</code> 初始化、<code>cubictcp_cong_avoid</code> 在 congestion avoidance 時呼叫、<code>cubictcp_cwnd_event</code> 在事件發生時呼叫，<code>cubictcp_state</code> 在狀態切換時呼叫。
+    idle 偵測是透過 <code>cwnd_event</code> 接受 <code>CA_EVENT_TX_START</code> 這個事件——TCP layer 在「準備送出一段 burst」之前呼叫它。
+  </p>
+
+  <p>
+    這個觸發時機關鍵在於它發生在 ACK 處理路徑之外。
+    核心知道「真正的閒置開始於最後一個有效 ACK 之後（或者，連線剛建立時的 <code>tp->lsndtime</code>），閒置結束於應用程式呼叫 <code>send()</code> 而觸發新一輪傳送」。
+    <code>delta_t</code> 是用 <code>tcp_jiffies32 − tp->lsndtime</code> 計算的，<code>lsndtime</code> 在每次 <code>tcp_event_data_sent</code> 被呼叫時更新——但對 idle exit 而言，我們關心的是 <em>上一次傳送對應的 ACK 路徑</em> 是否已經 quiesce。
+    核心透過 <code>icsk_ca_state</code> 與 <code>tp->packets_out</code> 雙重檢查，確保 idle 判定不會被「已送出但還沒被 ACK」的封包誤觸發。
+  </p>
+
+  <p>
+    換句話說：核心擁有 ACK 處理路徑與傳送處理路徑兩端的精確控制。
+    idle 判定發生在「下次傳送之前」，但它衡量的時長是「上次成功 ACK 到現在」——這兩個時間錨點的差，正是真正的閒置。
+    在這個邊界條件下，<code>delta_t</code> 確實對應到網路上沒有任何 in-flight 資料的時長。
+  </p>
+
+  <p>
+    從 2017 到 2020，這個修補在 Linux mainline 跑了三年，穩定無事。
+    Google 的 BBR 後續演化也參考了同一個 epoch-shift 技巧。
+    Linux TCP 子系統的 maintainer 名單上有 Eric Dumazet 與 Neal Cardwell——他們對 CUBIC 與 BBR 的維護是同一條 codebase 的兩個分支，回呼語意在這條 codebase 內部完全一致。
+  </p>
+
+  <p>
+    本節的核心觀察：核心的 idle exit 偵測不是「在某段程式碼裡檢查條件」，而是「依賴 TCP layer 在恰當時機呼叫 <code>cwnd_event</code> 回呼」。
+    這條因果鏈裡，TCP layer 是 trusted base——它握有 ACK 與 send 兩端的時間錨點，並且在 idle 真正結束的那一個瞬間呼叫 CUBIC。
+    CUBIC 自己不需要決定「idle 是什麼」，它只負責執行「拿到 idle exit 訊號之後，把 epoch 平移」這一段邏輯。
+  </p>
+
+  <p>
+    這個 trusted base 在使用者空間 QUIC 裡並不存在。
+    下一節我們會看到，當 quiche 試著移植同一段邏輯時，它必須自己重建 idle exit 偵測——而它選擇的觸發點，剛好把核心抹掉的那個 RTT 偷渡回來。
+  </p>
+
+  <h2>2020 年的移植：少了一個回呼的後果</h2>
+
+  <p>
+    2020 年，Cloudflare 把 CUBIC 的 idle epoch 修補移植進 quiche——他們的 Rust QUIC 實作，使用者空間 library，用來取代 Linux 核心 TCP 在邊緣節點的角色。
+    quiche 從一開始就把 CUBIC 設計成一個 trait 介面，跟 Reno、BBR 並列；
+    移植 idle 修補只是「在 CUBIC 實作裡加幾行邏輯」這個層級的工作。
+    從 PR 的視角看，它確實只動了 CUBIC 那一個模組。
+  </p>
+
+  <p>
+    使用者空間的 QUIC 沒有 TCP 核心層那組 <code>cwnd_event</code> 回呼。
+    quiche 必須自己回答「現在算不算 idle exit」這個問題，而它的選擇是：在每次封包送出時——<code>on_packet_sent()</code> 進入點——檢查 <code>bytes_in_flight == 0</code>。
+    如果是，就認為這是 idle exit；
+    如果不是，就略過 idle 平移邏輯。
+  </p>
+
+  <p>
+    這個判定看似合理：<code>bytes_in_flight == 0</code> 確實意味著「沒有任何未確認的封包」，從應用層看就是「網路是空的」。
+    但這個判定發生在「送出封包<em>之後</em>」，而不是「最後一個 ACK 確認<em>之後</em>」。
+    閒置時長被計算為 <code>now − last_sent_time</code>。
+    在絕大多數真實場景下，這個值跟核心的 <code>now − last_ack_time</code> 幾乎一樣——因為 last_sent_time 與 last_ack_time 在穩定狀態下只差幾百微秒。
+    但在一個特定的邊界條件下，這兩個時間戳記會差一個完整的 RTT。
+  </p>
+
+  <p>
+    那個邊界條件就是 cwnd 已經被壓縮到最低點（QUIC 的 minimum congestion window 是兩個 MTU，約 2,700 位元組）的時刻。
+    當 cwnd = 2 時，每一個 RTT 內：傳送方送出兩個封包，等 ACK 回來，然後再送下兩個。
+    <code>bytes_in_flight</code> 在「ACK 抵達」與「下次傳送」之間短暫歸零——這是 cwnd 受限的正常運作，不是 idle。
+    但 quiche 的 <code>on_packet_sent()</code> 把這個 transient zero 解讀為閒置開始；
+    計算出的閒置時長就是上一個 RTT 的長度，約 14 毫秒。
+  </p>
+
+  <p>
+    從程式碼層面看，quiche 的 CUBIC 模組裡 <code>on_packet_sent</code> 大致長這樣：拿 <code>bytes_in_flight</code>，如果為零、且距離 <code>last_sent_packet_time</code> 超過閾值，就視為 idle exit，把 <code>recovery_epoch_start</code> 與 <code>congestion_recovery_start_time</code> 都加上 <code>(now − last_sent_packet_time)</code>。
+    核心邏輯來自 Linux <code>cubictcp_cwnd_event</code>，但呼叫時機差了一個 ACK round-trip。
+  </p>
+
+  <pre data-kind="pseudocode"><code><em>// quiche 的 on_packet_sent（移植自 Linux 2017 修補，缺少 ACK-side 錨點）</em>
+fn on_packet_sent(&amp;mut self, now: Instant, sent_bytes: usize) {
+  if self.bytes_in_flight == 0 {
+    let delta = now - self.last_sent_packet_time;   <em>// ← 衡量的是「上次 send 到現在」</em>
+    self.recovery_epoch_start += delta;
+    self.congestion_recovery_start_time += delta;   <em>// ← 把 recovery 起點推到未來</em>
+  }
+  self.bytes_in_flight += sent_bytes;
+  self.last_sent_packet_time = now;
+}
+
+<em>// 核心 Linux 版本對應的邏輯（簡化）：</em>
+<em>// idle 偵測由 TCP layer 在 CA_EVENT_TX_START 呼叫；</em>
+<em>// delta = now − tp-&gt;lsndtime，但 idle 真正的判斷依靠 tp-&gt;packets_out == 0</em>
+<em>// 而 packets_out 是被 ACK 處理路徑減回零的——也就是說，核心隱含地用了「last_ack_time」</em>
+<em>// 而非「last_sent_time」作為閒置起點，差別在最壞情況下是一個 RTT。</em></code></pre>
+
+  <p>
+    這個錯位在 happy path 上完全看不出來。
+    HTTP keep-alive 在兩個請求之間靜默幾秒到幾分鐘——這種情境下，<code>now − last_sent_time</code> 與真正的閒置時長幾乎相等（差幾百微秒），平移後的 <code>recovery_epoch_start</code> 不會比 <code>now</code> 多多少，CUBIC 的成長曲線正常運作。
+    所有的單元測試、所有的負載測試、所有的 happy path benchmark 都通過了。
+    修補上線。
+  </p>
+
+  <p>
+    「happy path 通過」這個事實，是這類 bug 最危險的特徵。
+    它不是直接的程式碼錯誤——程式碼讀起來完全合理，每一行都對應到核心邏輯的某個元素，註解可能還引用了 Linux 的 commit。
+    但隱藏的假設——「<code>last_sent_time</code> 跟 <code>last_ack_time</code> 在所有時刻幾乎相等」——是錯的。
+    它在 99% 的時刻正確；
+    剩下 1% 的時刻不正確，並且那 1% 剛好是「網路已經出問題、需要 CUBIC 表現得好」的時刻。
+  </p>
+
+  <p>
+    從 2020 到 bug 浮現之間，這段邏輯在 Cloudflare 的生產環境跑了將近六年。
+    Cloudflare 每秒處理數百萬個 QUIC 連線——絕大多數連線都不會撞到這個 bug，因為絕大多數連線都不會同時滿足「真實丟包、處於 congestion avoidance、cwnd 已被壓到 2」這三個條件。
+    但只要有少數連線撞到，那些連線就會表現為「下載永遠完成不了，最後 timeout」。
+    在公開的 SLI 上，這顯示為「P99.9 完成時間異常」——一個經常被歸因為「網路波動」的訊號。
+  </p>
+
+  <p>
+    真正讓這個 bug 浮現的，是 Cloudflare 內部對 QUIC 表現的壓力測試套件。
+    這個套件刻意製造惡劣網路條件（人工注入丟包、抖動、頻寬限制），追蹤 quiche 在邊緣條件下的行為。
+    在這個套件下，61% 的測試 run 失敗——cwnd 被壓在最低點、連線在 10 秒逾時前無法完成下載。
+    同樣的測試在 Reno 下 100% 通過。
+    對比之強烈，使得 quiche 團隊立刻把懷疑焦點放在 CUBIC。
+  </p>
+
+  <p>
+    定位這個 bug 花了好幾週的 qlog 分析。
+    qlog 是 QUIC 的 structured logging 標準，記錄每個封包送出、ACK 抵達、cwnd 變化、recovery state 切換的時間戳記。
+    從 qlog 看，工程師發現了一個極為反常的訊號：cwnd 在 6.7 秒裡發生了 999 次 recovery / congestion avoidance 之間的切換。
+    每 ~14 毫秒一次——這個週期正好是測試環境的 RTT。
+    也就是說，每一個 RTT 都觸發了一次完整的「進入 recovery、退出 recovery」循環，但 cwnd 從來沒有真正成長過。
+  </p>
+
+  <p>
+    有了這個訊號之後，下一步是回答「為什麼每個 RTT 都進入 recovery 一次」。
+    答案藏在 <code>in_congestion_recovery()</code> 的判定裡——它檢查 <code>now &lt; congestion_recovery_start_time</code>。
+    如果 <code>congestion_recovery_start_time</code> 被推到了未來，那麼從這個時刻往後直到那個未來時刻為止，<code>in_congestion_recovery()</code> 都會回傳 true。
+    而當這個函數回傳 true 時，CUBIC 跳過 cwnd 成長計算——cwnd 永遠停在進入 recovery 時的值，也就是最低點。
+  </p>
+
+  <h2>死亡螺旋：自我強化的時間錯位</h2>
+
+  <p>
+    死亡螺旋的特徵是它的自我強化。
+    一個一次性的時間錯位不可怕——它造成一個 RTT 的延誤就會被自然修正。
+    但這個 bug 把錯位放在一個會反覆被觸發的呼叫點上，每一次觸發都重新把 recovery 起點往未來推；
+    推得越遠，下一次觸發前 cwnd 越沒機會成長，越沒機會成長就越快回到 cwnd = 2 的狀態，越快觸發下一次錯位。
+  </p>
+
+  <p>具體的循環是這樣：</p>
+
+  <p>
+    第一步——連線進入 congestion avoidance，cwnd 已經被壓到 minimum（2 個封包）。
+    傳送方送出兩個封包。
+  </p>
+
+  <p>
+    第二步——一個 RTT 之後，兩個封包都被 ACK。
+    <code>bytes_in_flight</code> 從 2 個封包減到 0。
+    此時應用層還有更多資料要送（或 QUIC stack 自己有 stream data 排隊），所以 <code>on_packet_sent()</code> 立刻被呼叫，準備送下一輪。
+  </p>
+
+  <p>
+    第三步——<code>on_packet_sent()</code> 進入時，<code>bytes_in_flight == 0</code>。
+    判定為 idle exit。
+    計算 <code>delta = now − last_sent_packet_time</code>——這個值是剛剛那個 RTT 的長度，約 14 毫秒。
+  </p>
+
+  <p>
+    第四步——把 <code>congestion_recovery_start_time</code> 加上 <code>delta</code>。
+    原本 recovery 起點是 14 毫秒前（上一輪剛進入 recovery 的時刻），加上 14 毫秒之後變成「現在」——但因為 CPU 排程、計時器精度等因素，實際上會被推到「未來幾微秒」。
+    從這一刻起，<code>in_congestion_recovery()</code> 在接下來幾微秒到幾毫秒之間都會回傳 true。
+  </p>
+
+  <p>
+    第五步——下一輪 ACK 抵達。
+    CUBIC 走 <code>on_packet_acked()</code> 路徑，第一件事就是呼叫 <code>in_congestion_recovery()</code> 判斷是否處於 recovery。
+    回傳 true，於是 CUBIC 跳過 cwnd 成長計算——cwnd 維持 2，恰好是 minimum。
+  </p>
+
+  <p>
+    第六步——再下一輪 <code>on_packet_sent()</code> 被呼叫。
+    <code>bytes_in_flight</code> 又一次回到 0，循環從第二步開始。
+    每 RTT 一次，永遠卡死。
+  </p>
+
+  <p>
+    這個循環的關鍵性質是「<code>congestion_recovery_start_time</code> 永遠領先 <code>now</code> 一個 RTT」。
+    傳送方每送一輪、收一輪，把 recovery 起點再推一個 RTT；
+    recovery 永遠在未來，永遠不會結束。
+    CUBIC 的成長曲線從此凍結。
+  </p>
+
+  <p>從外部觀察者看，這個現象有幾個特徵：</p>
+
+  <p>
+    第一，cwnd 完美卡在 minimum（QUIC 1200 位元組 MTU 下大約 2,700 位元組）。
+    不是「卡在最低附近」，而是「精確等於最低值」——CUBIC 的成長被完全跳過，沒有任何 +1 的機會。
+  </p>
+
+  <p>
+    第二，吞吐量計算很簡單：每 RTT 兩個封包，每封包 1200 位元組，14 毫秒 RTT，得出 ~171 KB/s。
+    即便目標檔案只有 1-2 MB，要十幾秒到幾十秒才能下完。
+  </p>
+
+  <p>
+    第三，recovery state 切換頻率異常高。
+    正常情況下，一條穩定連線進出 recovery 是事件性的——丟包觸發進入，幾個 RTT 後退出。
+    在死亡螺旋下，每 RTT 一次切換，6.7 秒裡 999 次。
+    這是 qlog 裡最顯眼的訊號。
+  </p>
+
+  <p>
+    第四，這個現象不會自動恢復。
+    沒有 timer、沒有 timeout、沒有 reset 路徑會主動打破循環——除非應用層的 timeout 把整個連線砍掉重建。
+    對使用者來說，就是「下載卡住、最後失敗」。
+  </p>
+
+  <p>
+    把這個機制畫成圖，比較容易看清「為什麼是自我強化」：每一次傳送都把 recovery 起點往未來推；
+    每一次 ACK 都因為 recovery 起點在未來而跳過成長；
+    跳過成長保證 cwnd 維持 minimum；
+    維持 minimum 保證下一個 RTT 又回到 <code>bytes_in_flight == 0</code>；
+    於是循環從頭開始。
+    沒有任何路徑能讓 cwnd 成長，因為成長路徑被 <code>in_congestion_recovery()</code> 守住，而那個守衛永遠拒絕通行。
+  </p>
+
+  <figure class="vg-w-canvas-quic-spiral">
+    <style>
+      .vg-w-canvas-quic-spiral { display: grid; grid-template-rows: auto auto 1fr auto; gap: var(--s-2); }
+      .vg-w-canvas-quic-spiral .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+      .vg-w-canvas-quic-spiral button { font-family: var(--sans); font-size: var(--fs-sm); padding: 4px 12px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); cursor: pointer; }
+      .vg-w-canvas-quic-spiral button:hover { border-color: var(--accent); color: var(--accent-text); }
+      .vg-w-canvas-quic-spiral button[data-active="true"] { border-color: var(--accent); color: var(--accent-text); background: var(--bg-soft); }
+      .vg-w-canvas-quic-spiral .legend { display: flex; gap: var(--s-3); font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+      .vg-w-canvas-quic-spiral .swatch { display: inline-block; width: 16px; height: 3px; vertical-align: middle; margin-right: 6px; }
+      .vg-w-canvas-quic-spiral canvas { width: 100%; height: auto; aspect-ratio: 16 / 7; display: block; border-bottom: 1px solid var(--line); }
+      .vg-w-canvas-quic-spiral figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); font-style: italic; }
+      .vg-w-canvas-quic-spiral .readout { font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); font-variant-numeric: tabular-nums; color: var(--ink); }
+    </style>
+
+    <div class="toolbar">
+      <button id="vg-w-canvas-quic-spiral-toggle">▷ play</button>
+      <button id="vg-w-canvas-quic-spiral-reset">↺ reset</button>
+      <button id="vg-w-canvas-quic-spiral-loss">⤓ inject loss</button>
+      <span style="margin-left: auto" class="readout" id="vg-w-canvas-quic-spiral-clock">t = 0.00 s · buggy cwnd = 10 · fixed cwnd = 10</span>
+    </div>
+
+    <div class="legend">
+      <span><span class="swatch" style="background: var(--accent)"></span>buggy (last_sent_time)</span>
+      <span><span class="swatch" style="background: var(--sage-deep)"></span>fixed (last_ack_time)</span>
+      <span><span class="swatch" style="background: var(--muted-2)"></span>cwnd = 2 floor</span>
+    </div>
+
+    <canvas id="vg-w-canvas-quic-spiral-canvas"></canvas>
+
+    <figcaption>兩條 CUBIC 曲線並排：相同的封包丟失、相同的 RTT、相同的 minimum cwnd。「buggy」用 <code>last_sent_time</code> 算 idle delta，每個 RTT 把 recovery 起點往未來推；「fixed」用 <code>last_ack_time</code> 算 idle delta，正常退出 recovery。點 ↺ reset 再按 ⤓ inject loss 觀察分歧的起點。</figcaption>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-canvas-quic-spiral');
+        const canvas = root.querySelector('canvas');
+        const ctx = canvas.getContext('2d');
+        const toggle = root.querySelector('#vg-w-canvas-quic-spiral-toggle');
+        const resetBtn = root.querySelector('#vg-w-canvas-quic-spiral-reset');
+        const lossBtn = root.querySelector('#vg-w-canvas-quic-spiral-loss');
+        const clock = root.querySelector('#vg-w-canvas-quic-spiral-clock');
+
+        function readVar(name) {
+          const v = getComputedStyle(root).getPropertyValue(name).trim();
+          return v || '#000';
+        }
+
+        function resize() {
+          const dpr = window.devicePixelRatio || 1;
+          const rect = canvas.getBoundingClientRect();
+          canvas.width = rect.width * dpr;
+          canvas.height = rect.height * dpr;
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        }
+        const ro = new ResizeObserver(resize);
+        ro.observe(canvas);
+        resize();
+
+        const RTT = 0.014;             // 14 ms
+        const MIN_CWND = 2;
+        const MAX_CWND = 64;
+        const W_MAX_INIT = 32;
+        const C = 0.4;                 // CUBIC C
+        const T_WINDOW = 1.2;          // seconds shown on chart
+        const PIX_PER_S = () => (canvas.getBoundingClientRect().width - 60) / T_WINDOW;
+
+        let running = false;
+        let t = 0;
+        let last = performance.now();
+
+        // Two parallel CUBIC simulators
+        function makeSim(useAckAnchor) {
+          return {
+            useAckAnchor,
+            cwnd: MAX_CWND / 2,
+            wMax: W_MAX_INIT,
+            inRecovery: false,
+            recoveryStart: -1e9,
+            epoch: 0,
+            lastSent: 0,
+            lastAck: 0,
+            bytesInFlight: 0,
+            history: [], // [t, cwnd] pairs
+            nextRttBoundary: RTT,
+            lossPending: false
+          };
+        }
+
+        let buggy = makeSim(false);
+        let fixed = makeSim(true);
+
+        function injectLoss() {
+          buggy.lossPending = true;
+          fixed.lossPending = true;
+          lossBtn.setAttribute('data-active', 'true');
+        }
+
+        function cubicGrow(sim, now) {
+          // K = cubeRoot(wMax * (1-beta) / C); beta = 0.7
+          const wMax = Math.max(sim.wMax, MIN_CWND + 0.01);
+          const K = Math.cbrt(wMax * 0.3 / C);
+          const tau = now - sim.epoch;
+          const target = C * Math.pow(tau - K, 3) + wMax;
+          sim.cwnd = Math.max(MIN_CWND, Math.min(MAX_CWND, target));
+        }
+
+        function tickRtt(sim, now) {
+          // Each RTT boundary: simulate sending a "burst", then ACK arrival.
+          // Recovery-start check uses the appropriate anchor.
+          if (sim.lossPending && !sim.inRecovery) {
+            sim.inRecovery = true;
+            sim.wMax = sim.cwnd;
+            sim.cwnd = MIN_CWND;
+            sim.recoveryStart = now;
+            sim.epoch = now;
+            sim.lossPending = false;
+          }
+          // bytes_in_flight goes to 0 at this RTT boundary (ACKs cleared previous burst)
+          sim.bytesInFlight = 0;
+          // Idle-exit accounting at the next "send":
+          const sendNow = now;
+          const anchor = sim.useAckAnchor ? sim.lastAck : sim.lastSent;
+          if (sim.bytesInFlight === 0 && anchor > 0) {
+            const delta = sendNow - anchor;
+            sim.recoveryStart += delta;  // ← the bug: pushed forward by full RTT in buggy mode
+            sim.epoch += delta;
+          }
+          // Send a burst
+          sim.lastSent = sendNow;
+          sim.bytesInFlight = sim.cwnd;
+          // The ACKs (for the previous burst) effectively arrived just before this boundary
+          sim.lastAck = sendNow - 0.0005; // tiny gap before send
+          // Exit recovery if recoveryStart is in the past (i.e., recovery has elapsed)
+          if (sim.inRecovery && now > sim.recoveryStart + 0.0001) {
+            sim.inRecovery = false;
+          }
+          // Grow cwnd if not in recovery
+          if (!sim.inRecovery) {
+            cubicGrow(sim, now);
+          } else {
+            sim.cwnd = MIN_CWND; // pinned
+          }
+          sim.history.push([now, sim.cwnd]);
+          if (sim.history.length > 400) sim.history.shift();
+        }
+
+        function step(dt) {
+          t += dt;
+          while (buggy.nextRttBoundary < t) {
+            tickRtt(buggy, buggy.nextRttBoundary);
+            buggy.nextRttBoundary += RTT;
+          }
+          while (fixed.nextRttBoundary < t) {
+            tickRtt(fixed, fixed.nextRttBoundary);
+            fixed.nextRttBoundary += RTT;
+          }
+        }
+
+        function draw() {
+          const W = canvas.getBoundingClientRect().width;
+          const H = canvas.getBoundingClientRect().height;
+          ctx.clearRect(0, 0, W, H);
+
+          const padL = 50, padR = 10, padT = 12, padB = 28;
+          const plotW = W - padL - padR;
+          const plotH = H - padT - padB;
+
+          // Time window: scroll to keep "now" near the right edge
+          const tStart = Math.max(0, t - T_WINDOW);
+          const tEnd = tStart + T_WINDOW;
+          function xOf(tt) { return padL + ((tt - tStart) / T_WINDOW) * plotW; }
+          function yOf(cw) { return padT + (1 - (cw - 0) / MAX_CWND) * plotH; }
+
+          // axes
+          ctx.strokeStyle = readVar('--line');
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.moveTo(padL, padT); ctx.lineTo(padL, padT + plotH); ctx.lineTo(padL + plotW, padT + plotH);
+          ctx.stroke();
+
+          // y ticks
+          ctx.font = '11px JetBrains Mono, monospace';
+          ctx.fillStyle = readVar('--muted');
+          ctx.textAlign = 'right';
+          for (const yv of [2, 16, 32, 48, 64]) {
+            const yy = yOf(yv);
+            ctx.fillText(String(yv), padL - 6, yy + 4);
+            ctx.strokeStyle = readVar('--line');
+            ctx.globalAlpha = 0.4;
+            ctx.beginPath(); ctx.moveTo(padL, yy); ctx.lineTo(padL + plotW, yy); ctx.stroke();
+            ctx.globalAlpha = 1;
+          }
+          ctx.textAlign = 'left';
+          ctx.fillText('cwnd (pkts)', padL - 40, padT - 2);
+
+          // floor at cwnd=2
+          ctx.strokeStyle = readVar('--muted-2');
+          ctx.setLineDash([4, 4]);
+          ctx.beginPath();
+          ctx.moveTo(padL, yOf(MIN_CWND)); ctx.lineTo(padL + plotW, yOf(MIN_CWND));
+          ctx.stroke();
+          ctx.setLineDash([]);
+
+          // x ticks
+          ctx.fillStyle = readVar('--muted');
+          ctx.textAlign = 'center';
+          const tick = 0.2;
+          for (let tv = Math.ceil(tStart / tick) * tick; tv <= tEnd; tv += tick) {
+            ctx.fillText(tv.toFixed(1) + 's', xOf(tv), padT + plotH + 16);
+          }
+          ctx.textAlign = 'left';
+
+          function drawSeries(sim, color, lineWidth) {
+            ctx.strokeStyle = color;
+            ctx.lineWidth = lineWidth;
+            ctx.beginPath();
+            let started = false;
+            for (const [tt, cw] of sim.history) {
+              if (tt < tStart) continue;
+              const x = xOf(tt);
+              const y = yOf(cw);
+              if (!started) { ctx.moveTo(x, y); started = true; }
+              else ctx.lineTo(x, y);
+            }
+            // extend to current t
+            if (started) {
+              const lastPt = sim.history[sim.history.length - 1];
+              if (lastPt && lastPt[0] >= tStart) {
+                ctx.lineTo(xOf(t), yOf(sim.cwnd));
+              }
+            }
+            ctx.stroke();
+          }
+
+          drawSeries(buggy, readVar('--accent'), 2);
+          drawSeries(fixed, readVar('--sage-deep'), 2);
+
+          // marker for current time
+          ctx.strokeStyle = readVar('--muted-2');
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.moveTo(xOf(t), padT); ctx.lineTo(xOf(t), padT + plotH);
+          ctx.stroke();
+        }
+
+        function frame(now) {
+          const dt = Math.min(0.1, (now - last) / 1000);
+          last = now;
+          if (running) step(dt);
+          draw();
+          clock.textContent =
+            't = ' + t.toFixed(2) + ' s · ' +
+            'buggy cwnd = ' + Math.round(buggy.cwnd) + ' · ' +
+            'fixed cwnd = ' + Math.round(fixed.cwnd);
+          requestAnimationFrame(frame);
+        }
+        requestAnimationFrame(frame);
+
+        toggle.addEventListener('click', () => {
+          running = !running;
+          toggle.textContent = running ? '⏸ pause' : '▷ play';
+          last = performance.now();
+        });
+        resetBtn.addEventListener('click', () => {
+          running = false;
+          toggle.textContent = '▷ play';
+          t = 0;
+          buggy = makeSim(false);
+          fixed = makeSim(true);
+          lossBtn.removeAttribute('data-active');
+        });
+        lossBtn.addEventListener('click', injectLoss);
+      })();
+    </script>
+  </figure>
+
+  <p>
+    把 simulation 跑起來，注入丟包，前 200 毫秒兩條曲線一致：兩者同步進入 recovery、cwnd 都被壓到 2、recovery 起點都被推到「上次 send 之後」。
+    從第二個 RTT 開始，分歧出現：fixed 版本用 <code>last_ack_time</code> 計算 delta，delta 是「上次 ACK 到現在」的微小差值，recovery 起點不會被推到未來，下一個 ACK 抵達時 <code>in_congestion_recovery()</code> 回傳 false，cwnd 沿 CUBIC 曲線重新成長。
+    buggy 版本用 <code>last_sent_time</code>，delta 是一個完整的 RTT，recovery 起點剛好被推到「下一個 send 的當下」——下一個 ACK 永遠認為自己還在 recovery，cwnd 永遠維持在 2。
+  </p>
+
+  <p>
+    注意這個 simulation 是教學用的——它的 CUBIC 曲線參數、recovery exit 判定、loss injection 行為都做了簡化，目的是讓兩條曲線的分歧清晰可見。
+    實際 quiche 與 Linux 的 CUBIC 還有 HyStart、TCP friendliness、Reno-friendly fallback 等多層機制，這個 simulation 都略過了。
+    但 idle exit 平移的核心錯位——也就是這個 bug 的本質——是忠實的。
+  </p>
+
+  <h2>定位的細節：qlog 揭露的訊號</h2>
+
+  <p>
+    從「測試失敗」到「修補上線」這幾週，最費時的不是寫程式碼，而是定位。
+    CUBIC 的內部狀態很多——<code>cwnd</code>、<code>ssthresh</code>、<code>w_max</code>、<code>k</code>、<code>recovery_start_time</code>、<code>epoch_start</code>——其中任何一個被誤算都能造成下載卡住的觀察現象。
+    要從這六七個變數裡指認出「<code>recovery_start_time</code> 是兇手」，需要的不是讀程式碼，而是讀資料。
+  </p>
+
+  <p>
+    qlog 是 QUIC 為這類定位設計的工具。
+    每個事件——封包送出、ACK 抵達、recovery 進入、recovery 退出、cwnd 變化——都會被記錄成一個時間戳記加上狀態快照的 JSON event。
+    對一條快速失敗的連線，10 秒裡可能會產生幾萬個 event；
+    用 qvis 之類的 viewer 把這些 event 畫成時序圖，反常之處會直接跳出來。
+  </p>
+
+  <p>在這個 bug 上，qvis 圖最顯眼的訊號有三個：</p>
+
+  <p>
+    第一，cwnd 曲線是一條近乎完美的水平線，停在 2700 位元組（兩個 1200 位元組 MTU 加一點 overhead）。
+    正常 CUBIC 曲線應該是一個三次多項式爬升，最差也是 saw-tooth；
+    一條死平的線等於告訴觀察者「成長路徑被某個守衛擋住」。
+  </p>
+
+  <p>
+    第二，recovery state 標記每隔 14 毫秒就翻轉一次。
+    從 in-recovery 到 out-of-recovery 到 in-recovery 到 out-of-recovery……6.7 秒內 999 次。
+    這個頻率正好對應 RTT，意味著每個 RTT 都觸發了一次完整的 recovery 進出循環。
+  </p>
+
+  <p>
+    第三，<code>recovery_start_time</code> 在 qlog 裡被記錄為一個明顯領先「現在」的時間戳記——具體來說，永遠領先約 0 到 14 毫秒，且這個 lead 在每個 send 之後被刷新。
+    看到這個訊號，工程師才把焦點從「進入 recovery 的條件」轉到「離開 recovery 的條件」——CUBIC 從來沒有錯誤地進入 recovery；
+    它只是錯誤地不離開。
+  </p>
+
+  <p>
+    定位之後，回頭看程式碼，那段移植過來的 idle exit 邏輯就「跳出來了」。
+    修補的設計者立刻看出 <code>last_sent_packet_time</code> 不是正確的 anchor——但要先看出來，前提是先看到 qlog 裡那個 999 次切換的訊號。
+  </p>
+
+  <p>
+    這也是為什麼 happy path 測試完全抓不到這類 bug：happy path 不會把連線推到「cwnd = minimum」這個狀態，<code>recovery_start_time</code> 的錯位永遠不會被觸發。
+    要看到這個 bug，必須要有「同時滿足三個邊界條件」的測試 fixture——這在工程文化上很容易被忽略，因為它的 setup 看起來像是「故意把連線弄壞」，跟一般的功能驗證直覺相反。
+  </p>
+
+  <p>
+    Cloudflare 內部的壓力測試套件是這個 bug 能被抓到的關鍵基礎建設。
+    它不是針對這個 bug 設計的——它是針對「QUIC 在惡劣網路下的所有表現」設計的，這個 bug 只是其中一個被它揭露的 case。
+    但這個套件的存在，把「邊界條件被測到」從「靠工程師個人警覺」變成「靠基礎建設自動覆蓋」。
+    對任何維護 transport-layer code 的團隊，這個層級的測試覆蓋是必要的——sample size 100 是太少，需要的是 1000+ 個壓力 run，並把所有 run 的 qlog 自動歸檔。
+  </p>
+
+  <p>
+    把這個故事連到實際數字：在這個壓力測試套件下，bug 觸發的失敗率穩定在 61%——相同的 100 個 run，每次跑都會看到大約 60-62 個失敗。
+    Reno 在同樣的設置下 100% 通過——這個對比本身就排除了「網路條件太惡劣，所以失敗是正常的」這種解釋。
+    一個失敗率穩定在 61% 的 bug 不是「不穩定」，而是「某個邊界條件以 61% 的機率被滿足」。
+    把這個機率歸因到三個條件的聯合機率（loss × cwnd = min × CA 階段），數字就對得上了。
+  </p>
+
+  <h2>修復、量化、與三個普遍結論</h2>
+
+  <p>
+    修復本身只動了三行：新增一個 <code>last_ack_time</code> 欄位到 CUBIC state，每次 ACK 抵達時更新（在 <code>on_packet_acked()</code> 裡），idle exit 的 delta 計算改為 <code>now − max(last_ack_time, last_sent_time)</code>。
+    三行程式碼，外加一行測試。
+  </p>
+
+  <pre data-kind="pseudocode"><code><em>// 修復後的 on_packet_acked（加 last_ack_time 更新）</em>
+fn on_packet_acked(&amp;mut self, now: Instant, acked_bytes: usize) {
+  self.bytes_in_flight = self.bytes_in_flight.saturating_sub(acked_bytes);
+  self.last_ack_time = now;                                  <em>// ← 新增</em>
+  if !self.in_congestion_recovery(now) {
+    self.cwnd_grow(now);
+  }
+}
+
+<em>// 修復後的 on_packet_sent（idle anchor 改成 max(last_ack, last_sent)）</em>
+fn on_packet_sent(&amp;mut self, now: Instant, sent_bytes: usize) {
+  if self.bytes_in_flight == 0 {
+    let anchor = self.last_ack_time.max(self.last_sent_packet_time);   <em>// ← 改了</em>
+    let delta = now - anchor;
+    self.recovery_epoch_start += delta;
+    self.congestion_recovery_start_time += delta;
+  }
+  self.bytes_in_flight += sent_bytes;
+  self.last_sent_packet_time = now;
+}</code></pre>
+
+  <p>
+    為什麼 <code>max</code>？因為這兩個錨點分別捕捉不同的事件：<code>last_ack_time</code> 抓「網路上最後一次有活動」，<code>last_sent_packet_time</code> 抓「應用層最後一次主動產生資料」。
+    真正的 idle 必須同時滿足「網路安靜」且「應用層安靜」——<code>max</code> 保證取兩者中最近的事件，這個事件之後才有可能是 idle 的起點。
+  </p>
+
+  <p>
+    修復後的測量數字：同樣的 100 個壓力測試 run，通過率從 39% 跳到 100%。
+    cwnd 曲線回到正常的 CUBIC 形狀——進入 recovery、降到 W_max × 0.7、然後沿三次曲線往上爬。
+    原本要 10 秒以上才能 timeout 的下載，現在 4-5 秒內完成。
+    recovery 切換頻率從 ~140 次/秒回到事件性的「每幾秒一次」——這對應 CUBIC 在這個網路條件下的真實 loss event 頻率。
+  </p>
+
+  <figure class="vg-w-table-quic-spiral">
+    <style>
+      .vg-w-table-quic-spiral table { width: 100%; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-quic-spiral thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.06em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); }
+      .vg-w-table-quic-spiral tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); }
+      .vg-w-table-quic-spiral td.num { font-variant-numeric: tabular-nums; text-align: right; }
+      .vg-w-table-quic-spiral td.delta-good { color: var(--sage-deep); font-variant-numeric: tabular-nums; text-align: right; }
+      .vg-w-table-quic-spiral td.delta-bad { color: var(--accent-text); font-variant-numeric: tabular-nums; text-align: right; }
+      .vg-w-table-quic-spiral figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); font-style: italic; margin-top: var(--s-2); }
+    </style>
+    <table>
+      <thead>
+        <tr>
+          <th>觀察指標</th>
+          <th class="num">buggy（last_sent_time）</th>
+          <th class="num">fixed（max(last_ack, last_sent)）</th>
+          <th class="num">變化</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>100 個壓力 run 通過率</td>
+          <td class="num">39%</td>
+          <td class="num">100%</td>
+          <td class="delta-good">+61 pp</td>
+        </tr>
+        <tr>
+          <td>穩定狀態 cwnd</td>
+          <td class="num">2,700 B（2 MTU）</td>
+          <td class="num">沿 CUBIC 曲線</td>
+          <td class="delta-good">恢復成長</td>
+        </tr>
+        <tr>
+          <td>recovery state 切換頻率</td>
+          <td class="num">~149 Hz</td>
+          <td class="num">事件性（≈ 0.1 Hz）</td>
+          <td class="delta-good">−3 個量級</td>
+        </tr>
+        <tr>
+          <td>6.7 秒內 state 轉換次數</td>
+          <td class="num">999</td>
+          <td class="num">&lt; 5</td>
+          <td class="delta-good">−200×</td>
+        </tr>
+        <tr>
+          <td>10 MB 下載完成時間</td>
+          <td class="num">timeout @ 10 s</td>
+          <td class="num">4-5 s</td>
+          <td class="delta-good">2-2.5× 速度</td>
+        </tr>
+        <tr>
+          <td>程式碼變動行數</td>
+          <td class="num">——</td>
+          <td class="num">+3 行（含 1 行新欄位）</td>
+          <td class="delta-good">最小 patch</td>
+        </tr>
+        <tr>
+          <td>定位耗時</td>
+          <td class="num">——</td>
+          <td class="num">數週 qlog 分析</td>
+          <td class="delta-bad">遠大於 patch 行數</td>
+        </tr>
+      </tbody>
+    </table>
+    <figcaption>修復前後的關鍵測量對比。值得注意的是「程式碼變動」與「定位耗時」之間的不對稱——這正是隱含假設失效類 bug 的標誌：fix 短、發現難。</figcaption>
+  </figure>
+
+  <p>
+    程式碼變動行數與定位耗時的不對稱，是這類 bug 的標誌。
+    Fix 永遠很短——因為錯位本身就是一個 anchor 寫錯。
+    但發現它需要：第一，正確的壓力測試 fixture（沒有它，bug 不會浮現）；
+    第二，能讀的 qlog（沒有它，定位是猜謎）；
+    第三，對 CUBIC 內部狀態的熟悉度（沒有它，看著 qlog 也認不出哪個變數該起疑）。
+    三個都到位的團隊不多。
+  </p>
 
   <figure>
-    <svg class="vg-w-timeline-quic-cubic" viewBox="0 0 480 110" role="img"
-         aria-label="QUIC CUBIC 死亡螺旋時序" style="width: 100%; height: auto; max-width: 480px;">
+    <svg class="vg-w-timeline-quic-cubic" viewBox="0 0 880 200" role="img"
+         aria-label="QUIC CUBIC idle 修補從核心到使用者空間的時序，與死亡螺旋的浮現與修復" style="width: 100%; height: auto; max-width: 880px;">
       <style>
-        .vg-w-timeline-quic-cubic text { font-family: EB Garamond, serif; font-size: 11px; }
-        .vg-w-timeline-quic-cubic .label { font-family: IM Fell English, serif; font-style: italic; }
+        .vg-w-timeline-quic-cubic text { font-family: EB Garamond, serif; font-size: 13px; }
+        .vg-w-timeline-quic-cubic .label { font-family: IM Fell English, serif; font-style: italic; font-size: 12px; }
+        .vg-w-timeline-quic-cubic .year { font-family: EB Garamond, serif; font-size: 16px; }
+        .vg-w-timeline-quic-cubic .num { font-family: JetBrains Mono, monospace; font-size: 11px; }
       </style>
       <defs>
-        <marker id="vg-w-tqc-arrow" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
+        <marker id="vg-w-timeline-quic-cubic-arr" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
           <path d="M0,0 L6,3 L0,6 Z" fill="var(--accent)"/>
         </marker>
       </defs>
-      <!-- Spine -->
-      <line x1="40" y1="55" x2="440" y2="55" stroke="var(--muted-2)" stroke-width="1.5"/>
-      <!-- Events -->
-      <!-- 2017 patch -->
-      <circle cx="80" cy="55" r="6" fill="var(--sage)"/>
-      <line x1="80" y1="49" x2="80" y2="18" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="3,2"/>
-      <text x="80" y="14" text-anchor="middle" fill="var(--ink)" class="label">2017</text>
-      <text x="80" y="78" text-anchor="middle" fill="var(--muted)" class="label">Linux CUBIC</text>
-      <text x="80" y="90" text-anchor="middle" fill="var(--muted)" class="label">idle 修補</text>
-      <!-- 2020 port -->
-      <circle cx="190" cy="55" r="6" fill="var(--ink-deep)"/>
-      <line x1="190" y1="49" x2="190" y2="18" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="3,2"/>
-      <text x="190" y="14" text-anchor="middle" fill="var(--ink)" class="label">2020</text>
-      <text x="190" y="78" text-anchor="middle" fill="var(--muted)" class="label">quiche 移植</text>
-      <text x="190" y="90" text-anchor="middle" fill="var(--muted)" class="label">（缺少核心回呼）</text>
-      <!-- Bug discovered -->
-      <circle cx="310" cy="55" r="6" fill="var(--accent)"/>
-      <line x1="310" y1="49" x2="310" y2="18" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="3,2"/>
-      <text x="310" y="14" text-anchor="middle" fill="var(--ink)" class="label">死亡螺旋</text>
-      <text x="310" y="78" text-anchor="middle" fill="var(--muted)" class="label">60% 測試失敗率</text>
-      <text x="310" y="90" text-anchor="middle" fill="var(--muted)" class="label">cwnd ≡ 2 封包</text>
-      <!-- Fix -->
-      <circle cx="420" cy="55" r="6" fill="var(--sage-deep)"/>
-      <line x1="420" y1="49" x2="420" y2="18" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="3,2"/>
-      <text x="420" y="14" text-anchor="middle" fill="var(--ink)" class="label">修復</text>
-      <text x="420" y="78" text-anchor="middle" fill="var(--muted)" class="label">last_ack_time</text>
-      <text x="420" y="90" text-anchor="middle" fill="var(--muted)" class="label">100% 通過</text>
+
+      <!-- spine -->
+      <line x1="60" y1="100" x2="820" y2="100" stroke="var(--muted-2)" stroke-width="1.5"/>
+
+      <!-- 2017 -->
+      <circle cx="120" cy="100" r="7" fill="var(--sage)"/>
+      <line x1="120" y1="94" x2="120" y2="46" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="3,2"/>
+      <text x="120" y="40" text-anchor="middle" fill="var(--ink)" class="year">2017</text>
+      <text x="120" y="124" text-anchor="middle" fill="var(--muted)" class="label">Linux CUBIC</text>
+      <text x="120" y="138" text-anchor="middle" fill="var(--muted)" class="label">idle epoch 修補</text>
+      <text x="120" y="158" text-anchor="middle" fill="var(--muted)" class="num">30927520 / c2e7204d</text>
+      <text x="120" y="174" text-anchor="middle" fill="var(--muted)" class="label">Dumazet / Cheng / Cardwell</text>
+
+      <!-- 2020 -->
+      <circle cx="320" cy="100" r="7" fill="var(--ink-deep)"/>
+      <line x1="320" y1="94" x2="320" y2="46" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="3,2"/>
+      <text x="320" y="40" text-anchor="middle" fill="var(--ink)" class="year">2020</text>
+      <text x="320" y="124" text-anchor="middle" fill="var(--muted)" class="label">quiche 移植</text>
+      <text x="320" y="138" text-anchor="middle" fill="var(--muted)" class="label">on_packet_sent() 判定</text>
+      <text x="320" y="158" text-anchor="middle" fill="var(--muted)" class="label">缺 ACK-side 錨點</text>
+      <text x="320" y="174" text-anchor="middle" fill="var(--muted)" class="label">happy path 全綠</text>
+
+      <!-- ~2026 死亡螺旋現形 -->
+      <circle cx="560" cy="100" r="7" fill="var(--accent)"/>
+      <line x1="560" y1="94" x2="560" y2="46" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="3,2"/>
+      <text x="560" y="40" text-anchor="middle" fill="var(--accent-text)" class="year">2026 春</text>
+      <text x="560" y="124" text-anchor="middle" fill="var(--muted)" class="label">壓力測試 61% 失敗</text>
+      <text x="560" y="138" text-anchor="middle" fill="var(--muted)" class="label">cwnd ≡ 2,700 B</text>
+      <text x="560" y="158" text-anchor="middle" fill="var(--muted)" class="num">999 transitions / 6.7 s</text>
+      <text x="560" y="174" text-anchor="middle" fill="var(--muted)" class="label">qlog 顯示 recovery 永不退出</text>
+
+      <!-- fix -->
+      <circle cx="760" cy="100" r="7" fill="var(--sage-deep)"/>
+      <line x1="760" y1="94" x2="760" y2="46" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="3,2"/>
+      <text x="760" y="40" text-anchor="middle" fill="var(--ink)" class="year">2026 春</text>
+      <text x="760" y="124" text-anchor="middle" fill="var(--muted)" class="label">+ last_ack_time</text>
+      <text x="760" y="138" text-anchor="middle" fill="var(--muted)" class="label">三行 patch</text>
+      <text x="760" y="158" text-anchor="middle" fill="var(--muted)" class="num">100% 通過率</text>
+      <text x="760" y="174" text-anchor="middle" fill="var(--muted)" class="label">下載回到 4-5 s</text>
+
+      <!-- arrows between events -->
+      <line x1="135" y1="100" x2="305" y2="100" stroke="var(--accent)" stroke-width="1.2" marker-end="url(#vg-w-timeline-quic-cubic-arr)" opacity="0.6"/>
+      <line x1="335" y1="100" x2="545" y2="100" stroke="var(--accent)" stroke-width="1.2" marker-end="url(#vg-w-timeline-quic-cubic-arr)" opacity="0.6"/>
+      <line x1="575" y1="100" x2="745" y2="100" stroke="var(--accent)" stroke-width="1.2" marker-end="url(#vg-w-timeline-quic-cubic-arr)" opacity="0.6"/>
+
+      <!-- gap label: "the silent six years" -->
+      <text x="440" y="92" text-anchor="middle" fill="var(--muted)" class="label">六年靜默——happy path 全綠，壓力 path 從未被跑</text>
     </svg>
-    <figcaption>CUBIC idle 修補從核心移植到使用者空間的時序，以及死亡螺旋的浮現與修復。</figcaption>
+    <figcaption>從 2017 年 Linux 核心修補，到 2020 年 quiche 移植時遺漏 ACK 錨點，到 2026 年壓力測試揭露死亡螺旋，到修補上線。中間六年「靜默」是這類 bug 的特徵——它不是漸進惡化的，而是在邊界條件第一次被觸發時瞬間現形。</figcaption>
   </figure>
 
-  <p>2020 年，quiche 移植這個修補。使用者空間 QUIC 沒有 TCP 核心層的回呼機制；quiche 選擇在 <code>on_packet_sent()</code> 裡檢查 <code>bytes_in_flight == 0</code> 來判斷閒置起始。問題在於：這個判斷發生在「送出封包之後」，而不是「最後一個 ACK 確認之後」。閒置時長被計算為 <code>now − last_sent_time</code>，實際上捕捉到的是一個完整的 RTT，而不是真正的閒置時間（幾乎為零）。</p>
+  <p>把這個故事抽出來，有三個對「核心 → 使用者空間」演算法移植普遍適用的結論：</p>
 
-  <p>當一條連線發生丟包、進入 recovery，然後 <code>bytes_in_flight</code> 在兩個封包確認後歸零，接著下一輪 <code>on_packet_sent()</code> 被呼叫，CUBIC 把這個 RTT 誤認為閒置時長，將 recovery 起始時間推到未來。此後每個 ACK 到達時，<code>in_congestion_recovery()</code> 回傳 true，CUBIC 跳過成長計算——擁塞窗口永遠卡在兩個封包的最低點。測試器觀察到每 ~14ms 就在 recovery 和 congestion avoidance 之間切換，999 次狀態轉換只需 6.7 秒，60% 的測試在 10 秒逾時前無法完成下載。</p>
+  <p>
+    <strong>結論一：trusted base 不是程式碼，是「呼叫時機」。
+    </strong>核心 TCP layer 提供給 CUBIC 的不只是 ACK 計數、in-flight bytes 這些 data；
+    它還提供「在恰當的時間點呼叫你」這個 contract。
+    當這些回呼被移植到不同的執行環境時，data 可以直譯，但 contract 必須重新驗證——「我是在 ACK 完成之後被呼叫，還是在 send 之前被呼叫？這兩者差一個 RTT 嗎？」是要明確問的問題。
+  </p>
 
-  <h2>why it matters</h2>
+  <p>
+    <strong>結論二：隱含假設往往藏在「時間相等」上。
+    </strong>核心程式碼裡 <code>last_ack_time</code> 跟 <code>last_sent_time</code> 在大多數時刻幾乎相等——所以可以用任一個來估計 idle 開始時點。
+    這個「幾乎相等」是個 statistical truth，不是個 invariant。
+    invariant 是「真正的 idle 必須兩個 anchor 都安靜」；
+    隱含假設是「我可以省一個 anchor，反正它們大多時候相等」。
+    Bug 出現在 invariant 與 statistical truth 第一次分歧的時刻。
+  </p>
 
-  <p>這個 bug 的兩個教訓比問題本身更值得記憶。第一個教訓：核心層的「精確語意」不一定能在使用者空間重現。TCP 的 CUBIC 實作依賴核心的回呼時間點——ACK 處理路徑、傳送路徑、計時器觸發——這些邊界在使用者空間 QUIC 裡未必對應相同的程式碼點。把核心補丁直譯成使用者空間代碼，看似等價，實際上語意已經偏移。</p>
+  <p>
+    <strong>結論三：邊界條件測試是結構性的基礎建設。
+    </strong>61% 的失敗率不是「壞運氣」——它是「該被測試的條件以 61% 機率出現」的觀測值。
+    要把這類 bug 從生產環境裡擋下來，邊界條件測試必須是 CI 的一部分，跟 happy path 同等地位。
+    對 transport layer code、congestion control、queue management 這類「狀態空間大但 happy path 很單純」的領域尤其關鍵。
+  </p>
 
-  <figure>
-    <svg class="vg-w-arch-quic-cwnd" viewBox="0 0 480 180" role="img"
-         aria-label="死亡螺旋的自我強化循環" style="width: 100%; height: auto; max-width: 480px;">
-      <style>
-        .vg-w-arch-quic-cwnd text { font-family: EB Garamond, serif; font-size: 11px; }
-        .vg-w-arch-quic-cwnd .step { font-family: IM Fell English, serif; font-style: italic; }
-      </style>
-      <defs>
-        <marker id="vg-w-aqc-arr" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
-          <path d="M0,0 L6,3 L0,6 Z" fill="var(--accent)"/>
-        </marker>
-      </defs>
-      <!-- Cycle boxes -->
-      <rect x="160" y="10" width="160" height="32" rx="4" fill="none" stroke="var(--muted-2)" stroke-width="1.2"/>
-      <text x="240" y="24" text-anchor="middle" fill="var(--ink)" class="step">bytes_in_flight → 0</text>
-      <text x="240" y="36" text-anchor="middle" fill="var(--muted)" class="step">（兩個封包確認）</text>
+  <p>
+    對在使用者空間實作擁塞控制的工程師而言，這個故事提供了一個具體的 checklist 項目：每一個依賴「時間點語意」的核心 TCP 修補，在移植時都必須重新確認使用者空間等價的觸發時機。
+    RFC 9438 §4.2-12 描述的行為是正確的；
+    問題永遠在「實作對 RFC 的詮釋是否與執行環境的邊界對齊」。
+    CUBIC、BBR、Reno 都有類似的 idle 處理；
+    移植任一者，這個檢查都要做一遍。
+  </p>
 
-      <rect x="320" y="74" width="140" height="32" rx="4" fill="none" stroke="var(--muted-2)" stroke-width="1.2"/>
-      <text x="390" y="88" text-anchor="middle" fill="var(--ink)" class="step">on_packet_sent()</text>
-      <text x="390" y="100" text-anchor="middle" fill="var(--muted)" class="step">idle = RTT（誤算）</text>
+  <p>
+    對在使用者空間實作 transport stack 的團隊而言，另一個收穫是「qlog 不是 debug 工具，是 production observability 的基礎」。
+    Cloudflare 能在數週內定位這個 bug，前提是邊緣節點預設就在記 qlog，並且 qlog 格式有業界標準的 viewer 可以即時分析。
+    如果這層基礎建設不到位，同樣的 bug 在生產環境跑五年都可能不會被發現——只會被歸因為「網路抖動」一筆帶過。
+  </p>
 
-      <rect x="160" y="138" width="160" height="32" rx="4" fill="none" stroke="var(--accent)" stroke-width="1.5"/>
-      <text x="240" y="152" text-anchor="middle" fill="var(--accent)" class="step">recovery 起始→未來</text>
-      <text x="240" y="164" text-anchor="middle" fill="var(--muted)" class="step">cwnd 卡在 2 封包</text>
+  <p>
+    對 transport 之外的 systems engineer 而言，這個故事的可移植教訓是「移植任何依賴回呼語意的核心程式碼到 userspace 之前，先把回呼的時間錨點寫成文件」。
+    核心程式碼通常沒有顯式說明 anchor——它假設讀者熟悉 TCP stack 的呼叫順序。
+    Userspace 實作必須把這份隱含知識變成顯式設計：每個 anchor 對應哪個事件、哪個函數負責更新它、它與其他 anchor 的關係是什麼。
+  </p>
 
-      <rect x="20" y="74" width="130" height="32" rx="4" fill="none" stroke="var(--muted-2)" stroke-width="1.2"/>
-      <text x="85" y="88" text-anchor="middle" fill="var(--ink)" class="step">每個 ACK</text>
-      <text x="85" y="100" text-anchor="middle" fill="var(--muted)" class="step">in_recovery = true</text>
+  <p>
+    最後一個觀察：這個 bug 不是 quiche 獨有的。
+    任何把 CUBIC 從核心移植到 userspace 的實作——picoquic、msquic、aioquic、quinn——都需要重新解決同一個 idle exit 偵測問題。
+    它們是否各自做對了？這是個值得審視的問題。
+    回呼語意的 trust 在每一個 port 都要重新被驗證一次；
+    沒有任何一次驗證可以「跳過」。
+  </p>
 
-      <!-- Arrows -->
-      <line x1="320" y1="26" x2="460" y2="26" stroke="var(--accent)" stroke-width="1.2" marker-end="url(#vg-w-aqc-arr)"/>
-      <line x1="460" y1="26" x2="460" y2="90" stroke="var(--accent)" stroke-width="1.2"/>
-      <line x1="460" y1="90" x2="462" y2="90" stroke="var(--accent)" stroke-width="1.2" marker-end="url(#vg-w-aqc-arr)"/>
-      <line x1="320" y1="90" x2="240" y2="154" stroke="var(--accent)" stroke-width="1.2" marker-end="url(#vg-w-aqc-arr)"/>
-      <line x1="160" y1="154" x2="85" y2="106" stroke="var(--accent)" stroke-width="1.2" marker-end="url(#vg-w-aqc-arr)"/>
-      <line x1="85" y1="74" x2="240" y2="42" stroke="var(--accent)" stroke-width="1.2" marker-end="url(#vg-w-aqc-arr)"/>
-    </svg>
-    <figcaption>死亡螺旋的自我強化循環：RTT 被誤判為閒置時長，recovery 起始點永遠追不上，cwnd 永遠被壓在最低點。</figcaption>
-  </figure>
+  <p>
+    從更高層的角度看，這個 bug 是「複雜軟體跨環境移植」這個更大命題的一個樣本。
+    CUBIC 是個有 20 年歷史、被研究透徹的演算法。
+    它的程式碼在 Linux 核心裡跑了十幾年、處理了 trillions 的封包。
+    把它移植到使用者空間應該是一個「教科書級別容易」的工作——但即便是這樣的演算法，移植時仍然會在「呼叫時機」這個微妙的維度上失手。
+    對任何在做 cross-environment porting 的團隊，這個故事是個值得標記的 reference case。
+  </p>
 
-  <p>第二個教訓：這類 bug 的重現條件極為苛刻——需要真實丟包、處於 congestion avoidance（不是 slow start）、且 cwnd 已被壓縮至最低點。三個條件缺一不可。在正常的 happy path 測試中，這個 bug 完全不會浮現；只有在「連線已有丟包歷史」的壓力測試下，才會以 60% 失敗率現形。</p>
+  <p>
+    下次當你看到一段被標註為「直接移植自 Linux <code>net/ipv4/tcp_cubic.c</code>」的程式碼，請多問一個問題：
+    那個 Linux 函數是被誰呼叫的、
+    在什麼時間點被呼叫的、
+    它依賴哪個 anchor 來計算時長？
+    這三個問題的答案，比函數本身的程式碼還重要——
+    因為移植時最容易遺漏的，正是這三個答案。
+  </p>
 
-  <h2>so what</h2>
+  <p>
+    把這個故事再壓縮一層：使用者空間 transport stack 的「相對於 Linux 核心」優勢，從來不是程式碼層面的——userspace 寫 Rust，kernel 寫 C，這不是優勢的本質。
+    優勢是 deploy velocity：核心修補要等發行版升級，userspace library 可以隨 application binary 一起 ship。
+    但 deploy velocity 是雙面刃：deploy 得快也意味著 bug 上線得快、惡化得久。
+    這個 bug 在 quiche 裡跑了將近六年；如果是在 Linux 核心裡，社群 review 與後續多輪 maintenance 應該會更早讓某個 anchor 不一致的問題被發現。
+    quiche 沒有那層 review velocity——它的 maintainer 圈相對 small，code path 的審視深度不可能跟核心同等。
+    這是 userspace transport 的隱性 cost，跟它的明顯 benefit 並存。
+  </p>
 
-  <p>修復非常直接：新增一個 <code>last_ack_time</code> 時間戳記，在 ACK 抵達時更新，idle 起始點改為 <code>max(last_ack_time, last_sent_time)</code>。這樣閒置時長才真正反映「最後一個確認之後到現在」，而不是「最後一次傳送之後到現在」。修復後測試通過率從 40% 回到 100%，cwnd 沿正常 CUBIC 曲線成長，下載在 4-5 秒內完成。</p>
+  <p>
+    從更實務的角度看，如果你今天正在設計或維護一個 userspace transport library，這個故事建議的 review checklist 大概是這樣：
+    第一，把每個依賴時間點的演算法（idle 偵測、loss detection、pacer rate adjustment、RTT 估計）的 anchor 列成顯式表格——「這個變數抓哪個事件、由哪個 callsite 更新、有哪些已知不一致的時刻」。
+    第二，為每個 anchor 寫一個 invariant：在什麼情況下這個 anchor 跟「真正想要捕捉的事件」可能差距很大？
+    第三，把那些 invariant 寫成 property-based test，用隨機種子跑數千次。
+    第四，在邊界條件下（cwnd 最低、rate 最低、queue 最深、loss 最高）反覆 fuzz test，並把所有 run 的內部狀態記錄成 qlog 等可分析的格式。
+    這四步加起來才是 transport layer 的 robust testing baseline——少了任何一步，就是把這個 bug 的下一個變形留給生產環境去發現。
+  </p>
 
-  <p>對於在使用者空間實作擁塞控制的工程師，這個故事提供了一個具體的 checklist 項目：每一個依賴「時間點語意」的核心 TCP 修補，在移植時都必須重新確認使用者空間等價的觸發時機。RFC 9438 §4.2-12 描述的行為是正確的；問題永遠在實作對 RFC 的詮釋是否與執行環境的邊界對齊。</p>
+  <p>
+    本文最後想提的一個觀察，是「壓力測試套件」這個 infrastructure 本身的 ROI。
+    寫一個能注入 loss、抖動、頻寬限制、reorder、duplicate 的 NetEm-class 壓力環境，
+    搭配一個能用 100+ 隨機種子並行跑、自動收集 qlog 的執行器，
+    這個 infrastructure 的工程成本可能是 1-2 個 quarter 的 senior engineer 時間。
+    它的回報是：每一個類似這個 CUBIC bug 的隱含假設失效，從「生產環境跑五年才浮現」壓縮到「PR review CI 就揭露」。
+    一個被壓縮到 PR CI 的 bug 比一個生產環境跑五年的 bug 便宜兩個量級——
+    quarter 級的 infrastructure 投資換來的是 trillion-packet 級別的可靠性。
+    對 Cloudflare 這個規模而言這個 trade-off 顯然 worth；對較小團隊而言，問題不是「要不要做」而是「做到什麼覆蓋深度才合理」。
+    答案隨團隊規模調整，但結構性的 stress test 應該永遠存在，哪怕只覆蓋幾個關鍵 callsite。
+  </p>
 
-  <p class="vg-deep-closer"><strong>Take-away</strong>：把核心 TCP 修補移植到使用者空間 QUIC 時，每個「時間點回呼」都必須重新核對語意等價——<code>last_sent_time</code> 和 <code>last_ack_time</code> 差一個 RTT，但那個 RTT 足以讓擁塞窗口永遠卡死。</p>
+  <p class="vg-deep-closer"><strong>Take-away</strong>：把核心 TCP 修補移植到使用者空間 QUIC 時，每個「時間點回呼」都必須重新核對語意等價——<code>last_sent_time</code> 與 <code>last_ack_time</code> 在 happy path 差幾百微秒，但在 cwnd 跌到最低點那一刻它們差一整個 RTT，而那個 RTT 足以讓擁塞窗口永遠卡死。</p>
 </div>
