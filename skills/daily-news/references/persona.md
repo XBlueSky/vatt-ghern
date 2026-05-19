@@ -44,16 +44,26 @@ What does NOT earn a place:
 1. **AI community major events** — model releases with architectural novelty,
    alignment / capability papers, infrastructure changes (compilers,
    tokenizers, serving stacks), provider strategy shifts
-2. **Systems languages & RFCs** — Rust / C++ / Zig major proposals, kernel
-   patches, language committee decisions, compiler advances
+2. **Systems languages & RFCs** — Rust / C++ / Zig / Go major proposals,
+   Linux kernel patches, language committee decisions, compiler advances
 3. **Servers, infrastructure, network protocols, distributed systems,
    high-performance architecture** — io_uring, eBPF, QUIC, BGP changes,
    datacenter networking, consensus algorithm advances
-4. **Storage & enterprise services** — storage architecture, databases (new
-   engines, major version, novel features), DevOps toolchains, security
-   advisories with broad blast radius
-5. **Industry big events** — major arch transitions at big tech / large OSS
-   projects, OSS license changes, antitrust outcomes affecting tech stacks
+4. **Web** — frontend frameworks (React / Vue / Svelte / Solid), web platform
+   (CSS / HTML / browser engines / Web APIs), build tooling (Vite / Bun /
+   Turbopack), WASM in browser, edge runtimes
+5. **Backend** — API design, auth / identity / OAuth, database app layer
+   (ORMs, drivers, query patterns), microservices / event-driven,
+   observability / SRE, DevOps, security advisories with broad blast radius
+
+**Industry-event triage**: events that don't fit slot 1–5 redistribute by
+angle, not by event class:
+
+- OSS license change (Redis / Elastic / Terraform pattern) → `systems`
+- OpenSSL / kernel CVE → `infra`
+- Vendor architecture shifts → `infra` if network/datacenter, `backend` if
+  app-layer (auth, queue, DB-as-service)
+- Antitrust / regulation outcomes → drop (not engineering)
 
 Within a day's 10, aim for **at least 3 different domains** to avoid
 single-domain days. If the day's harvest is genuinely all AI (e.g., a model

@@ -16,7 +16,7 @@ You are writing ONE deep-story for vatt'ghern's daily-news routine.
 - primary_url:    {{canonical URL of the primary source}}
 - variant_urls:   [{{URL}}, {{URL}}, ...]   (cross-source variants if any)
 - title:          {{Chinese headline, ≤ 24 chars}}
-- domain:         {{ai|systems|infra|storage|industry}}
+- domain:         {{ai|systems|infra|web|backend}}
 - archetype:      {{narrative|technical-deep-dive|investigation|comparison|explainer|freeform}}
 - summary:        {{2-3 sentence English/Chinese brief of what to cover}}
 - output_path:    src/posts/{{YYYY}}/{{MM}}/{{DD}}/deep-{{slug}}.html
