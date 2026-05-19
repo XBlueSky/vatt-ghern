@@ -95,6 +95,23 @@ for (const sidecarFile of sidecars) {
     if (!Array.isArray(data.news_ids) || data.news_ids.length !== 1) {
       violations.push(`${sidecarPath}: deep-story should reference exactly 1 news_id (got ${data.news_ids?.length ?? 0})`);
     }
+    // Widget contract: only applies to posts dated on/after effective date.
+    const WIDGET_CONTRACT_EFFECTIVE_DATE = "2026-06-01";
+    if (typeof data.date === "string" && data.date >= WIDGET_CONTRACT_EFFECTIVE_DATE) {
+      if (typeof data.widget_count !== "number" || data.widget_count < 3) {
+        violations.push(`${sidecarPath}: widget_count must be a number ≥ 3 (got ${data.widget_count})`);
+      }
+      if (!Array.isArray(data.widget_questions) || data.widget_questions.length === 0) {
+        violations.push(`${sidecarPath}: widget_questions[] required and non-empty`);
+      } else if (typeof data.widget_count === "number" && data.widget_questions.length !== data.widget_count) {
+        violations.push(`${sidecarPath}: widget_count (${data.widget_count}) != widget_questions.length (${data.widget_questions.length})`);
+      }
+      if (!Array.isArray(data.widget_templates) || data.widget_templates.length === 0) {
+        violations.push(`${sidecarPath}: widget_templates[] required and non-empty`);
+      } else if (typeof data.widget_count === "number" && data.widget_templates.length !== data.widget_count) {
+        violations.push(`${sidecarPath}: widget_count (${data.widget_count}) != widget_templates.length (${data.widget_templates.length})`);
+      }
+    }
   }
   if (data.title && /[^：]:[^/]/.test(data.title)) {
     // half-width colon in title prose (excluding url-like x://y)
