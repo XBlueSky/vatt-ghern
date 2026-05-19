@@ -289,7 +289,9 @@ function checkWidgetContract(path, html) {
   }
 
   // 4. Prose substance — CJK char count inside .vg-post-body, with widget code stripped.
-  // Floor 6000 CJK chars ≈ 2000 中文字 ≈ 8-10 分鐘讀完, the target depth for a vatt'ghern deep-story.
+  // Floor 4000 CJK chars ≈ 1300 中文字 ≈ 5-7 分鐘讀完. The target is density, not length;
+  // see tier-3-principles §11 ("density > length"). A widget-heavy deep-story can be
+  // shorter than a prose-only essay and still teach more.
   // We use char count not line count because Eleventy's render collapses paragraph
   // whitespace; lines are an unreliable proxy. Scope is .vg-post-body, not the whole
   // rendered page, so layout chrome (head meta, nav, footer) doesn't inflate the count.
@@ -300,8 +302,8 @@ function checkWidgetContract(path, html) {
     .replace(/<canvas[\s\S]*?<\/canvas>/g, "")
     .replace(/<[^>]+>/g, "");
   const cjkCharCount = (proseBody.match(/[一-鿿]/g) || []).length;
-  if (cjkCharCount < 6000) {
-    violations.push(`${path}: prose has ${cjkCharCount} CJK chars (widget contract requires ≥ 6000 CJK chars in .vg-post-body, widget code excluded)`);
+  if (cjkCharCount < 4000) {
+    violations.push(`${path}: prose has ${cjkCharCount} CJK chars (widget contract requires ≥ 4000 CJK chars in .vg-post-body, widget code excluded)`);
   }
 
   // 5. Inline <script src=...> is banned

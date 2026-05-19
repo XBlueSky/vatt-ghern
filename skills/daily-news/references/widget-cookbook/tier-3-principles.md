@@ -109,3 +109,33 @@ Before declaring a widget done, mentally verify:
 
 The Step 8.5 Playwright self-review catches some of this, but the author
 should catch it first.
+
+## 11. Density > length
+
+The prose floor is 4000 CJK chars (≈ 1300 中文字 ≈ 5-7 分鐘讀完). This is a
+*floor*, not a target. **Do not write to a length quota.** A 4500-char
+post with 4 high-density widgets answering 4 sharp conceptual questions
+beats an 8000-char post that hits the same target but pads with
+meta-reflection and "why this matters" repetition.
+
+Signs you're padding for length:
+
+- A paragraph that restates what the previous paragraph just said
+- "Meta" framing ("this section was about X, the next section will be about Y")
+- "Why this is important" without adding new information
+- Re-explaining what the widget right above already showed
+- Listing 7 takeaways when 3 cover the substance
+
+If you find yourself writing these to hit the floor, **stop and cut a
+widget instead** — fewer high-density widgets often produces a tighter,
+more informative post than more widgets with thin prose between them.
+The contract requires ≥ 3 widgets; nothing forces more.
+
+Reference points for "right length":
+
+- Bartosz Ciechanowski's `ciechanow.ski` posts: ~8000-12000 English words, 30-50 widgets — extreme density, extreme craft
+- Distill.pub article: ~4000-8000 English words, 5-15 widgets — middle ground
+- vatt'ghern deep-story target: ~4000-6000 CJK chars, 3-5 widgets — what we ship daily
+
+If your post is creeping past 6000 CJK chars, ask: is every paragraph
+earning its place? If 20% could be cut without losing substance, cut it.
