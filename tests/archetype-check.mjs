@@ -32,22 +32,6 @@ import { fileURLToPath } from "node:url";
 const here = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(here, "..");
 
-// Date gate: posts dated before WIDGET_CONTRACT_EFFECTIVE_DATE are
-// grandfathered to the pre-widget-cookbook contract. Update this
-// constant at PR merge time to the actual merge date.
-const WIDGET_CONTRACT_EFFECTIVE_DATE = "2026-06-01"; // YYYY-MM-DD
-
-function postDateFromPath(htmlPath) {
-  const m = htmlPath.match(/[/\\](\d{4})[/\\](\d{2})[/\\](\d{2})[/\\]/);
-  return m ? `${m[1]}-${m[2]}-${m[3]}` : null;
-}
-
-function isWidgetContractActive(htmlPath) {
-  const d = postDateFromPath(htmlPath);
-  if (!d) return false;
-  return d >= WIDGET_CONTRACT_EFFECTIVE_DATE;
-}
-
 const root = process.argv[2];
 if (!root) {
   process.stderr.write("Usage: archetype-check.mjs <dir>\n");
@@ -258,8 +242,6 @@ function extractPostBody(html) {
 }
 
 function checkWidgetContract(path, html) {
-  if (!isWidgetContractActive(path)) return; // legacy mode
-
   // Scope widget-contract checks to the post-body region only. Layout chrome
   // (JSON-LD, theme pre-paint, vg-progress, read-tracker) sits outside
   // .vg-post-body and would otherwise trip the IIFE / external-src bans.
@@ -306,18 +288,20 @@ function checkWidgetContract(path, html) {
     violations.push(`${path}: sidecar widget_count (${sidecar.widget_count}) != widget_templates.length (${sidecar.widget_templates.length})`);
   }
 
-  // 4. Prose line count ≥ 500
-  // Strip <script>, <style>, <svg>, <canvas> blocks and count remaining lines.
-  // (Uses full html — including a small amount of layout chrome — because the
-  // threshold is a floor for substance, not a ceiling.)
-  const stripped = html
+  // 4. Prose substance — CJK char count inside .vg-post-body, with widget code stripped.
+  // Floor 6000 CJK chars ≈ 2000 中文字 ≈ 8-10 分鐘讀完, the target depth for a vatt'ghern deep-story.
+  // We use char count not line count because Eleventy's render collapses paragraph
+  // whitespace; lines are an unreliable proxy. Scope is .vg-post-body, not the whole
+  // rendered page, so layout chrome (head meta, nav, footer) doesn't inflate the count.
+  const proseBody = body
     .replace(/<script[\s\S]*?<\/script>/g, "")
     .replace(/<style[\s\S]*?<\/style>/g, "")
     .replace(/<svg[\s\S]*?<\/svg>/g, "")
-    .replace(/<canvas[\s\S]*?<\/canvas>/g, "");
-  const proseLineCount = stripped.split("\n").filter((l) => l.trim().length > 0).length;
-  if (proseLineCount < 500) {
-    violations.push(`${path}: prose line count is ${proseLineCount} (widget contract requires ≥ 500 lines of prose, widget code excluded)`);
+    .replace(/<canvas[\s\S]*?<\/canvas>/g, "")
+    .replace(/<[^>]+>/g, "");
+  const cjkCharCount = (proseBody.match(/[一-鿿]/g) || []).length;
+  if (cjkCharCount < 6000) {
+    violations.push(`${path}: prose has ${cjkCharCount} CJK chars (widget contract requires ≥ 6000 CJK chars in .vg-post-body, widget code excluded)`);
   }
 
   // 5. Inline <script src=...> is banned
