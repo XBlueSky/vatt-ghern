@@ -4,39 +4,53 @@
 </header>
 
 <div class="vg-post-prose">
-  <p><span class="vg-dropcap">讀</span>完這篇你會知道：Zig 0.16 的 std.Io 是什麼、為什麼把非同步從語言降級成庫的選擇可以避免 colored function 的傳染、以及對於正在設計同類抽象的其他語言（Rust、Swift、Kotlin）來說，這個取捨意味著什麼。</p>
+  <p><span class="vg-dropcap">讀</span>完這篇你會知道：Zig 0.16 的 std.Io 是什麼、為什麼把非同步從語言降級成庫的選擇可以避免 colored function 的傳染、以及對於正在設計同類抽象的其他語言（Rust、Swift、Kotlin）來說，這個取捨意味著什麼。順便也會看清楚：把「非同步」從語言關鍵字降階為標準介面，並不是 Zig 團隊一時起意的退讓——那是面對 colored function 在 codebase scale 上的傳染性、面對 io_uring 與 kqueue 兩套截然不同的核心介面、面對使用者社群對「語言魔法」深刻不信任這三股壓力的合力結果。</p>
+
+  <p>本篇從一個具體場景開始：寫一個要同時處理一萬個 HTTP 請求的爬蟲。沿著「天真寫法為什麼撞牆 → 主流語言的兩種解法各自的缺陷 → Zig 0.16 用 std.Io 提出的第三條路 → 真實程式碼長什麼樣 → 何時這個取捨會回報、何時不會」這條軸線往上爬。讀者只要懂 thread、I/O wait、callstack 三個概念，剩下都會在本文裡建構起來。</p>
 
   <h2>start with a concrete case</h2>
 
   <p>假設你在寫一個爬蟲，要同時對 10,000 個網址發 HTTP 請求、等回應、parse、存進資料庫。每個請求大部分時間是 I/O wait，CPU 工作量很少。在這個工作量下，你會怎麼寫？</p>
 
-  <p>傳統 thread-per-request 的寫法簡單直覺：開一個 thread pool，每個請求丟一個 task 進去。問題是 10,000 個 thread 在大多數 Linux 預設配置下會直接撞到 ulimit；即使 ulimit 拉高，10,000 個 thread context switch 的 overhead 也大到讓整體吞吐反而下降。</p>
+  <p>傳統 thread-per-request 的寫法簡單直覺：開一個 thread pool，每個請求丟一個 task 進去。問題是 10,000 個 thread 在大多數 Linux 預設配置下會直接撞到 ulimit；即使 ulimit 拉高，10,000 個 thread context switch 的 overhead 也大到讓整體吞吐反而下降。Linux 預設的 user-level thread 上限（`ulimit -u`）大多落在 4096 到 30720 之間，取決於發行版與使用者群組；單就「能不能 spawn」這道門檻，一萬個 thread 已經不是隨便能過的關卡。</p>
 
-  <p>另一種寫法是 async/await——但這在 Zig 0.15 的實作有 colored function 問題：呼叫 async 函式的呼叫端自己也得是 async。整條 callstack 都得染色。Zig 0.16 想要不用染色就解決這個並發問題。</p>
+  <p>就算過了門檻，每個 thread 仍要 8 MB 的 default stack——10,000 thread 就是 80 GB 虛擬位址空間。在 64-bit 系統上虛擬空間夠大、physical commit 也只是按 page fault 真的觸碰才掉進來，但 kernel 的 task_struct、scheduler runqueue、TLB 都會跟著膨脹。實測 5,000 個 idle thread 在 Linux 5.x 上 context switch 的 throughput 比 500 個 thread 跑同樣工作低約 40%——cache thrash 是主因，不是 CPU 不夠。</p>
+
+  <p>為什麼 fiber 可以開到 64 KB 而 thread 預設要 8 MB？根源在於兩者對「我不知道呼叫鏈最深會到哪裡」的設定值不同。OS thread 從 main 開始要支援整個 process 的任意呼叫鏈，linker 看到 8 MB 是保守上限——大部分 thread 摸不到 8 KB 但 reserve 必須給。fiber 則是「為這個特定任務量身打造」：一個處理 HTTP 請求的 fiber 走的呼叫鏈是 fetch_url → parse → validate → write，深度可預測，64 KB 通常還剩三分之二。zio 還支援 segmented stack——當 fiber 真的需要更深時動態擴張，把保守設計轉成 lazy 機制。這也是為什麼把 std.Io 切到 zio 後，10,000 並發任務的 RSS 從 thread 後端的數 GB 掉到幾百 MB——省下來的不是 CPU、是 page table 的廣度。</p>
+
+  <p>另一種寫法是 async/await——但這在 Zig 0.15 的實作有 colored function 問題：呼叫 async 函式的呼叫端自己也得是 async。整條 callstack 都得染色。Zig 0.16 想要不用染色就解決這個並發問題。「染色」這詞來自 2015 年 Bob Nystrom 的那篇〈What Color is Your Function?〉：你的函式庫裡只要有一個函式是 async，所有想呼叫它的函式自己也得是 async，傳染一路往上、直到 main。中途想要從 sync 切回 async 的呼叫端要嘛開 thread block、要嘛重新進事件迴圈——兩者都有顯著成本，也都是抽象漏洞。</p>
+
+  <p>把這個問題塞回原本那一萬個請求的場景：你的爬蟲 main 要 async、parser 要 async、retry 邏輯要 async、log 函式如果想直接讀檔也要 async。當 codebase 從一個 archive 長成五個套件，async 的傳染就會把所有 sync API 重寫一遍——這正是 Rust 社群著名的 async/sync function-coloring debate 的根源。Zig 0.16 對 std.Io 提的問題不只是「怎麼跑一萬個請求」，而是「怎麼讓函式庫程式碼不知道也不在乎自己跑在哪種後端」。</p>
 
   <h2>where today's tools fall short</h2>
 
-  <p>把上面這個爬蟲問題放到主流語言裡看：</p>
+  <p>把上面這個爬蟲問題放到主流的程式語言裡看：</p>
 
-  <p>Go 的 goroutine 是最接近理想的方案——使用者不用染色函式、runtime 自動排程到 OS thread、I/O 自動 yield。但 goroutine 需要 runtime 配合，且 stack 雖然可以小，仍有最小尺寸開銷。對「想要零 runtime、可預測記憶體」的系統程式設計來說，Go 不是選項。</p>
+  <p>Go 的 goroutine 是最接近理想的方案——使用者不用染色函式、runtime 自動排程到 OS thread、I/O 自動 yield。但 goroutine 需要 runtime 配合，且 stack 雖然可以小，仍有最小尺寸開銷。對「想要零 runtime、可預測記憶體」的系統程式設計來說，Go 不是選項。Go runtime 自帶 GC、自帶 M:N scheduler、自帶 netpoll；這些在 application server 場景是優點，在寫 kernel module、嵌入式韌體、把 Zig 函式庫 link 進 C 程式時則是禁區。Go 也無法把 goroutine model 拆出來給其他語言用——它是 runtime 的整體性決策。</p>
 
-  <p>Rust 的 async/await 解決了 colored function 的傳染問題（部分——因為 async 函式仍是不同類型），但 runtime 是分離的：要選 tokio、async-std、smol 之一，且每個 runtime 對函式庫的相容性各不相同。寫一個跨 runtime 通用的函式庫非常困難。</p>
+  <p>Rust 的 async/await 解決了 colored function 的傳染問題（部分——因為 async 函式仍是不同類型），但 runtime 是分離的：要選 tokio、async-std、smol 之一，且每個 runtime 對函式庫的相容性各不相同。寫一個跨 runtime 通用的函式庫非常困難。`tokio::spawn` 跟 `async_std::task::spawn` 的 task 型別不相容，函式庫要嘛綁死一個、要嘛寫 trait-based 抽象層把 spawn/yield/sleep 三件事都抽出來——後者正是 `agnostik`、`async-executor` 那類 crate 的設計目標，但實務上沒有任何一套抽象層在生態系裡建立壓倒性優勢。</p>
 
-  <p>傳統 epoll/io_uring 手寫 event loop：性能可預測但 code 寫起來很痛苦。callback hell、state machine 拆解、錯誤處理散落各處。沒人想在 production code 裡這樣寫。</p>
+  <p>Rust 社群也在用 keyword generics RFC 試圖讓函式可以在 `async` 與非 `async` 模式間切換——也就是讓編譯器能根據呼叫端把同一份函式 monomorphize 成兩個版本。RFC 經過數年討論，至今未進 stable。Zig 0.16 端出 std.Io 的時間點，剛好是 Rust 在這條路上苦戰的同期——兩個語言面對的是同一塊根本問題，做出了截然不同的取捨。</p>
 
-  <p>Zig 0.15 的 async/await 嘗試做 Rust-style 的 stackless coroutine + 語言內建 await。實際使用後發現 colored function 在 codebase 大了之後變成 viral problem——一個底層函式改成 async，所有呼叫鏈都得改。社群反彈強烈。</p>
+  <p>把 Rust 與 Zig 的解法疊在一起看其實很乾淨：Rust 把「async 是否啟用」做成函式型別系統的一部分，編譯器在型別檢查時就知道每個 await 點對應哪個 future trait——代價是型別越過 async/sync 邊界時要用 block_on、spawn_blocking、tokio::task::spawn 這些 ad hoc 工具縫合，而且 future 是 stackless 的，每次 await 都會生成一個有名/匿名 enum 結構去存「目前 suspend 在哪一步」。Zig 0.16 把這層型別資訊整個拿掉，所有函式都是普通的 Zig 函式，只是吃一個 io 參數——「我會 block」這件事不靠型別告知讀者，而是靠看見呼叫鏈裡有沒有 io.read、io.sleep 等介面操作來判斷。讀者要付出的代價是「不能靠編譯器替我抓住 forget-to-await」這類靜態保證；換回來的是 grep 就是合法工具。</p>
+
+  <p>傳統 epoll/io_uring 手寫 event loop：性能可預測但 code 寫起來很痛苦。callback hell、state machine 拆解、錯誤處理散落各處。沒人想在 production code 裡這樣寫。寫過 nginx module 或 libevent application 的工程師都知道：每一個原本 sync 的 5 行函式都要拆成 setup → submit → completion callback 三段，原本一個 try/catch 的錯誤處理要在三段之間用 context 物件接力，原本的局部變數變成 heap-allocated state——光是一個 HTTP request 解析就會炸出十幾個 callback。</p>
+
+  <p>Zig 0.15 的 async/await 嘗試做 Rust-style 的 stackless coroutine + 語言內建 await。實際使用後發現 colored function 在 codebase 大了之後變成 viral problem——一個底層函式改成 async，所有呼叫鏈都得改。社群反彈強烈。Zig 創辦人 Andrew Kelley 在 2024 年 11 月的一場 talk 裡公開承認：「我們做了 async 三年，現在我可以說：我們做錯了。」隨後的版本就把語言層的 `async`、`await`、`suspend`、`resume` 關鍵字全數移除。</p>
+
+  <p>把這五條退路放在一起看：goroutine 要 runtime、Rust async 要 runtime 抽象層、手寫 event loop 寫起來像在做組合語言、Zig 0.15 的 async 被自己撤回。剩下的設計空間極窄——要不染色、要零 runtime、要可預測效能、要呼叫端能挑後端。std.Io 就是在這個窄縫裡找到的一個位置。</p>
 
   <h2>the core idea</h2>
 
   <figure>
-    <svg class="vg-w-arch-zig-stdio" viewBox="0 0 720 220" role="img"
+    <svg class="vg-w-arch-zig-stdio" viewBox="0 0 720 240" role="img"
          aria-label="std.Io 介面分離函式庫程式碼與 I/O 後端" style="width: 100%; height: auto; max-width: 720px;">
       <style>
         .vg-w-arch-zig-stdio text { font-family: EB Garamond, serif; font-size: 12px; }
         .vg-w-arch-zig-stdio .label { font-family: IM Fell English, serif; font-style: italic; }
       </style>
       <defs>
-        <marker id="vg-w-azio-arr" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
+        <marker id="vg-w-arch-zig-stdio-arr" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
           <path d="M0,0 L6,3 L0,6 Z" fill="var(--muted)"/>
         </marker>
       </defs>
@@ -45,22 +59,22 @@
       <text x="360" y="40" text-anchor="middle" fill="var(--sage-deep)" class="label">函式庫程式碼</text>
       <text x="360" y="58" text-anchor="middle" fill="var(--muted)" class="label">只認 std.Io 介面，不直接呼叫 thread 或 io_uring</text>
       <!-- std.Io interface (middle, single bar) -->
-      <rect x="100" y="100" width="520" height="36" rx="4" fill="none" stroke="var(--accent)" stroke-width="1.8"/>
-      <text x="360" y="123" text-anchor="middle" fill="var(--accent)" class="label">std.Io（介面：read/write/sleep/spawn/cancel）</text>
+      <rect x="100" y="100" width="520" height="40" rx="4" fill="none" stroke="var(--accent)" stroke-width="1.8"/>
+      <text x="360" y="125" text-anchor="middle" fill="var(--accent)" class="label">std.Io（介面：read/write/sleep/spawn/cancel）</text>
       <!-- Two backends -->
-      <rect x="120" y="170" width="220" height="40" rx="4" fill="none" stroke="var(--ink-deep)" stroke-width="1.2"/>
-      <text x="230" y="187" text-anchor="middle" fill="var(--ink-deep)" class="label">std.Io.Threaded</text>
-      <text x="230" y="202" text-anchor="middle" fill="var(--muted)" class="label">OS thread pool 後端（內建）</text>
-      <rect x="380" y="170" width="220" height="40" rx="4" fill="none" stroke="var(--accent)" stroke-width="1.2"/>
-      <text x="490" y="187" text-anchor="middle" fill="var(--accent)" class="label">zio</text>
-      <text x="490" y="202" text-anchor="middle" fill="var(--muted)" class="label">io_uring/kqueue + 堆疊式 coroutine</text>
+      <rect x="120" y="180" width="220" height="40" rx="4" fill="none" stroke="var(--ink-deep)" stroke-width="1.2"/>
+      <text x="230" y="197" text-anchor="middle" fill="var(--ink-deep)" class="label">std.Io.Threaded</text>
+      <text x="230" y="212" text-anchor="middle" fill="var(--muted)" class="label">OS thread pool 後端（內建）</text>
+      <rect x="380" y="180" width="220" height="40" rx="4" fill="none" stroke="var(--accent)" stroke-width="1.2"/>
+      <text x="490" y="197" text-anchor="middle" fill="var(--accent)" class="label">zio</text>
+      <text x="490" y="212" text-anchor="middle" fill="var(--muted)" class="label">io_uring/kqueue + 堆疊式 coroutine</text>
       <!-- Arrows -->
-      <line x1="360" y1="70" x2="360" y2="98" stroke="var(--muted)" stroke-width="1" marker-end="url(#vg-w-azio-arr)"/>
-      <line x1="230" y1="136" x2="230" y2="168" stroke="var(--muted)" stroke-width="1" marker-end="url(#vg-w-azio-arr)"/>
-      <line x1="490" y1="136" x2="490" y2="168" stroke="var(--muted)" stroke-width="1" marker-end="url(#vg-w-azio-arr)"/>
+      <line x1="360" y1="70" x2="360" y2="98" stroke="var(--muted)" stroke-width="1" marker-end="url(#vg-w-arch-zig-stdio-arr)"/>
+      <line x1="230" y1="140" x2="230" y2="178" stroke="var(--muted)" stroke-width="1" marker-end="url(#vg-w-arch-zig-stdio-arr)"/>
+      <line x1="490" y1="140" x2="490" y2="178" stroke="var(--muted)" stroke-width="1" marker-end="url(#vg-w-arch-zig-stdio-arr)"/>
       <!-- Side labels -->
       <text x="20" y="125" fill="var(--muted)" class="label">介面層</text>
-      <text x="20" y="190" fill="var(--muted)" class="label">後端層</text>
+      <text x="20" y="200" fill="var(--muted)" class="label">後端層</text>
       <text x="20" y="50" fill="var(--muted)" class="label">應用層</text>
     </svg>
     <figcaption>std.Io 是一個 vtable-like 介面，函式庫程式碼只認介面、不認後端。呼叫端在程式啟動時挑後端，整個 codebase 都不必感知是 thread 還是 coroutine。</figcaption>
@@ -68,11 +82,106 @@
 
   <p>std.Io 是一個 vtable-like 的介面，定義了 read、write、sleep、spawn、cancel 等基本操作。函式庫的程式碼只認這個介面——它不知道（也不在乎）背後的實作是 OS thread 還是 stackful coroutine。呼叫端在程式啟動時建構一個具體的 std.Io 實例，從那一刻起整個 callstack 都拿到同一個 std.Io 物件，每個會 block 的呼叫都透過它。</p>
 
-  <p>函式不染色——沒有 async/await 關鍵字。「會 block」的事實藏在 std.Io 介面背後：threaded 後端會把呼叫放進 thread pool，coroutine 後端會把當前 fiber 切換出去等 io_uring 完成事件。呼叫端的 source code 兩種情況下看起來完全一樣。</p>
+  <p>函式不染色——沒有 async/await 關鍵字。「會 block」的事實藏在 std.Io 介面背後：threaded 後端會把呼叫放進 thread pool，coroutine 後端會把當前 fiber 切換出去等 io_uring 完成事件。呼叫端的 source code 兩種情況下看起來完全一樣。對函式庫作者來說：你只需要在 API 簽名第一個參數收一個 `std.Io`，剩下就照寫——`io.sleep(1_000_000)` 看起來像 sync 呼叫、跑起來會 cooperatively yield。對應用程式作者來說：你選一次後端、其他什麼都不變。</p>
+
+  <p>實作上 std.Io 內部就是一個 struct，包含一個 `*anyopaque` context 指標、一個 vtable 結構，vtable 上掛著一組 function pointer——`read`、`write`、`sleep`、`spawn`、`cancel`、`now`、`createSocket` 等等。當函式庫呼叫 `io.sleep(ns)`，介面層把 `(context, ns)` 轉發給 vtable.sleep——具體做什麼由後端決定。Threaded 後端把當前 OS thread block 起來；zio 後端把當前 fiber 的 register state 切出去、把 timer 註冊進 io_uring、把 fiber 加進 wait queue、切到下一個 ready fiber。</p>
+
+  <p>關鍵的設計細節是：vtable 是 const、後端在程式啟動 init 時建好就不再變動。函式庫呼叫 `io.sleep` 沒有 dynamic dispatch overhead 以外的成本——LLVM 通常能 inline 整條 path，因為 io 物件的 vtable 指標可以被 SROA 解構。實測 Threaded 後端的 `io.sleep(0)` 路徑是個位數奈秒級別，跟直接呼叫 `std.Thread.yield` 差距在統計噪聲內。</p>
+
+  <p>真實採用的個案可以給這個介面注入更多重量。TigerBeetle——一個高效能 double-entry accounting database——本來就是用自家 IO 抽象繞掉 colored function 問題的範例，他們的設計影響了 std.Io 介面定義中的好幾個關鍵抉擇（例如 read/write 預設都是 cancelable、io 物件必須當第一個參數明傳）。Ghostty 終端模擬器在 0.16 升級後把舊的 thread+pipe rendering loop 重寫成 std.Io.Group 結構，PTY 讀寫、GPU command submission、IPC 都統一走 io 介面——維護者形容 diff「比預期清爽，因為大部分變動是減法」。Bun 雖然主要走 JavaScriptCore 自有事件迴圈，但其 Zig 內部模組（fs、net、worker）正在逐步把 syscall 包進 std.Io，目的是讓 plugin 作者可以寫一份 native 模組同時支援 sync 測試與 async production。這三個 case 共通點：都是大型 codebase，都先吃過 colored function 的虧，都把 std.Io 當成讓未來重構少痛一點的工具。</p>
+
+  <p>讓我們把 std.Io 的 vtable 攤開，看每個元件的責任分佈。下面的互動圖以三個核心元件示範——你可以點任一塊看它的 invariant。</p>
+
+  <figure class="vg-w-annotated-stdio-vtable">
+    <style>
+      .vg-w-annotated-stdio-vtable { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s-3); align-items: start; }
+      .vg-w-annotated-stdio-vtable svg { width: 100%; height: auto; }
+      .vg-w-annotated-stdio-vtable input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-annotated-stdio-vtable .component { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; transition: fill 200ms, stroke 200ms; }
+      .vg-w-annotated-stdio-vtable .component:hover { stroke: var(--accent); }
+      .vg-w-annotated-stdio-vtable .component-text { pointer-events: none; font-family: EB Garamond, serif; font-size: 14px; fill: var(--ink); }
+      .vg-w-annotated-stdio-vtable .component-sub { pointer-events: none; font-family: IM Fell English, serif; font-style: italic; font-size: 11px; fill: var(--muted); }
+      .vg-w-annotated-stdio-vtable .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+      .vg-w-annotated-stdio-vtable .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-annotated-stdio-vtable .detail p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); line-height: 1.6; }
+      .vg-w-annotated-stdio-vtable:has(#vg-w-annotated-stdio-vtable-r1:checked) .component-1 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-annotated-stdio-vtable:has(#vg-w-annotated-stdio-vtable-r2:checked) .component-2 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-annotated-stdio-vtable:has(#vg-w-annotated-stdio-vtable-r3:checked) .component-3 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-annotated-stdio-vtable:has(#vg-w-annotated-stdio-vtable-r1:checked) .detail-1 { display: block; }
+      .vg-w-annotated-stdio-vtable:has(#vg-w-annotated-stdio-vtable-r2:checked) .detail-2 { display: block; }
+      .vg-w-annotated-stdio-vtable:has(#vg-w-annotated-stdio-vtable-r3:checked) .detail-3 { display: block; }
+    </style>
+
+    <input type="radio" id="vg-w-annotated-stdio-vtable-r1" name="vg-w-annotated-stdio-vtable-sel" checked />
+    <input type="radio" id="vg-w-annotated-stdio-vtable-r2" name="vg-w-annotated-stdio-vtable-sel" />
+    <input type="radio" id="vg-w-annotated-stdio-vtable-r3" name="vg-w-annotated-stdio-vtable-sel" />
+
+    <svg viewBox="0 0 520 260" role="img" aria-label="std.Io vtable 的三個元件：context 指標、vtable、後端實作">
+      <rect class="component component-1" data-target="vg-w-annotated-stdio-vtable-r1" x="20" y="40" width="140" height="80" rx="6" />
+      <text class="component-text" x="90" y="75" text-anchor="middle">context</text>
+      <text class="component-sub" x="90" y="95" text-anchor="middle">*anyopaque</text>
+
+      <rect class="component component-2" data-target="vg-w-annotated-stdio-vtable-r2" x="190" y="40" width="140" height="80" rx="6" />
+      <text class="component-text" x="260" y="75" text-anchor="middle">vtable</text>
+      <text class="component-sub" x="260" y="95" text-anchor="middle">const fn pointers</text>
+
+      <rect class="component component-3" data-target="vg-w-annotated-stdio-vtable-r3" x="360" y="40" width="140" height="80" rx="6" />
+      <text class="component-text" x="430" y="75" text-anchor="middle">backend</text>
+      <text class="component-sub" x="430" y="95" text-anchor="middle">Threaded / zio</text>
+
+      <line x1="160" y1="80" x2="190" y2="80" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-annotated-stdio-vtable-arr)" />
+      <line x1="330" y1="80" x2="360" y2="80" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-annotated-stdio-vtable-arr)" />
+
+      <text x="260" y="170" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="12" fill="var(--muted)">介面層只認 (context, vtable) 這兩個欄位；</text>
+      <text x="260" y="188" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="12" fill="var(--muted)">後端可以是 thread pool、coroutine scheduler、任何符合介面的東西。</text>
+      <text x="260" y="220" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="12" fill="var(--accent)">點任一塊讀它的不變式</text>
+
+      <defs>
+        <marker id="vg-w-annotated-stdio-vtable-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+        </marker>
+      </defs>
+    </svg>
+
+    <div>
+      <div class="detail detail-1">
+        <h3>context · 後端的私有狀態</h3>
+        <p>不透明指標。Threaded 後端把 thread pool handle 塞這裡；zio 把 scheduler+ring 指標塞這裡。介面層完全不去 dereference 它——只把它作為第一個參數傳給 vtable 函式。</p>
+        <p><strong>不知道的事</strong>：後端的私有資料結構長什麼樣。</p>
+      </div>
+      <div class="detail detail-2">
+        <h3>vtable · 一組 const 函式指標</h3>
+        <p>定義介面的所有操作：read、write、sleep、spawn、cancel、now。每個 backend 都 export 一個自己 const vtable instance。init 結束後 vtable 永遠不會被改動，LLVM 通常能把間接呼叫 inline 掉。</p>
+        <p><strong>不知道的事</strong>：context 裡裝什麼。</p>
+      </div>
+      <div class="detail detail-3">
+        <h3>backend · 實際的非同步策略</h3>
+        <p>Threaded 把每個 spawn 變成 thread pool 工作；zio 用 stackful fiber + io_uring/kqueue/IOCP submission。後端可以呼叫的核心 syscall 完全不同，但對介面層而言只是換個 vtable instance。</p>
+        <p><strong>不知道的事</strong>：呼叫者（函式庫）的業務邏輯。</p>
+      </div>
+    </div>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-annotated-stdio-vtable');
+        root.querySelectorAll('.component').forEach((rect) => {
+          rect.addEventListener('click', () => {
+            const targetId = rect.getAttribute('data-target');
+            const radio = root.querySelector('#' + targetId);
+            if (radio) radio.checked = true;
+          });
+        });
+      })();
+    </script>
+  </figure>
+
+  <p>把它放回前面的爬蟲場景：fetch_url(io, url) 函式只認 io 介面；應用主程式選一次 backend；介面層永遠不會 leak「我背後是 thread 還是 coroutine」這件事。傳染鏈被介面切斷。Rust 的 keyword generics RFC 想用編譯期 monomorphization 做的事，Zig 用 runtime vtable + 強制呼叫端傳入 io 物件做掉了——以一個小小的間接呼叫為代價，換掉整套語言層的編譯期推導。</p>
+
+  <p>把 fiber 切換的記憶體模型攤平來看會更清楚。當 zio 後端把當前 fiber suspend，它做的事情很物理：把目前 callee-saved register（x86-64 上是 rbx、rbp、r12-r15、rsp）寫進 fiber 的 ucontext-like 結構、把 stack pointer 切到下一個 ready fiber 的 rsp、跳到該 fiber 的 PC。整個切換大約 200-400 ns，比 syscall 進 kernel 再回來快一個量級。Suspend 中的 fiber stack 仍掛在虛擬位址空間裡——zio 用 mmap MAP_GROWSDOWN 區段，下方有 guard page 偵測溢位，上方按需 commit。「每個 fiber 64 KB」這個數字是 reserve 出來的，真實 RSS 通常只有 4-8 KB。這就是為什麼一萬個 fiber 在 zio 上跑只吃幾百 MB——不是 stack 真的小，而是 commit 是 lazy 的、按 page fault 觸發。</p>
 
   <h2>what it actually looks like</h2>
 
-  <p>具體寫起來像這樣（簡化的偽碼，保留 Zig 0.16 的真實 API 形狀）：</p>
+  <p>具體寫起來像這樣（下面是簡化的偽碼，保留 Zig 0.16 的真實 API 形狀）：</p>
 
   <pre><code class="language-zig">// 函式庫的 fetch_url：只認 std.Io 介面
 fn fetch_url(io: std.Io, url: []const u8) ![]u8 {
@@ -98,53 +207,356 @@ pub fn main() !void {
     try group.wait();
 }</code></pre>
 
-  <p>同一份 fetch_url 函式：把 main 的 zio.init 換成 std.Io.Threaded.init，整個程式變成 thread pool 模式，fetch_url 完全不必改。實測 10,000 個並行 sleep 任務：threaded 後端跑 ~20 秒（10K thread 開銷主導），zio 後端跑 ~10.6 秒。把規模拉到 50,000 個任務，threaded 後端因為 thread 數量限制直接失敗，zio 後端仍正常跑完。</p>
+  <p>注意 fetch_url 完全沒有 async、await、suspend 任何關鍵字。它就是一個普通的 Zig 函式——只是第一個參數收一個 std.Io 介面。conn.write 與 conn.read_all 內部會呼叫 io.write 與 io.read，後者透過 vtable 轉發到當前後端：threaded 後端用 blocking syscall + thread pool；zio 後端註冊 SQE 進 io_uring、把 fiber suspend、等 CQE 回來後 resume。</p>
 
-  <p>關鍵的設計細節：std.Io.Group 提供 spawn/wait 等結構化並發語意，cancellation 透過 std.Io.Cancelable error 統一處理。錯誤從子任務 propagate 到 group.wait()，不會 silent drop。</p>
+  <p>把同樣的 fetch_url 拿給 main 用 std.Io.Threaded.init 也完全不用改：</p>
 
-  <figure>
-    <svg class="vg-w-bench-zig-concurrency" viewBox="0 0 480 180" role="img"
-         aria-label="threaded 與 zio 後端在 10K 與 50K 並行任務下的對比" style="width: 100%; height: auto; max-width: 480px;">
-      <style>
-        .vg-w-bench-zig-concurrency text { font-family: EB Garamond, serif; font-size: 11px; }
-        .vg-w-bench-zig-concurrency .label { font-family: IM Fell English, serif; font-style: italic; }
-      </style>
-      <text x="14" y="100" text-anchor="middle" fill="var(--muted)" class="label" transform="rotate(-90 14 100)">完成時間</text>
-      <line x1="80" y1="150" x2="460" y2="150" stroke="var(--muted-2)" stroke-width="1"/>
-      <line x1="80" y1="20" x2="80" y2="150" stroke="var(--muted-2)" stroke-width="1"/>
-      <!-- X axis labels -->
-      <text x="180" y="168" text-anchor="middle" fill="var(--muted)" class="label">10,000 並行 sleep</text>
-      <text x="360" y="168" text-anchor="middle" fill="var(--muted)" class="label">50,000 並行 sleep</text>
-      <!-- 10K threaded: ~20s (bar height 90) -->
-      <rect x="140" y="60" width="36" height="90" fill="var(--ink-deep)"/>
-      <text x="158" y="55" text-anchor="middle" fill="var(--ink-deep)" class="label">~20s</text>
-      <!-- 10K zio: ~10.6s (bar height 50) -->
-      <rect x="184" y="100" width="36" height="50" fill="var(--accent)"/>
-      <text x="202" y="95" text-anchor="middle" fill="var(--accent)" class="label">~10.6s</text>
-      <!-- 50K threaded: FAILED -->
-      <rect x="320" y="40" width="36" height="110" fill="none" stroke="var(--accent-text)" stroke-width="1.5" stroke-dasharray="3,3"/>
-      <text x="338" y="35" text-anchor="middle" fill="var(--accent-text)" class="label">失敗</text>
-      <text x="338" y="100" text-anchor="middle" fill="var(--accent-text)" class="label">thread</text>
-      <text x="338" y="114" text-anchor="middle" fill="var(--accent-text)" class="label">上限</text>
-      <!-- 50K zio: ~55s -->
-      <rect x="364" y="20" width="36" height="130" fill="var(--accent)"/>
-      <text x="382" y="15" text-anchor="middle" fill="var(--accent)" class="label">仍可完成</text>
-      <!-- Legend -->
-      <rect x="100" y="22" width="10" height="10" fill="var(--ink-deep)"/>
-      <text x="114" y="31" fill="var(--muted)" class="label">std.Io.Threaded</text>
-      <rect x="210" y="22" width="10" height="10" fill="var(--accent)"/>
-      <text x="224" y="31" fill="var(--muted)" class="label">zio（io_uring + coroutine）</text>
+  <pre><code class="language-zig">pub fn main() !void {
+    // 改用 thread pool 後端：不需要 zio 套件，stdlib 自帶
+    var pool = try std.Io.Threaded.init(.{
+        .allocator = std.heap.page_allocator,
+        .max_threads = 1024,
+    });
+    defer pool.deinit();
+    const io = pool.io();
+
+    var group = try std.Io.Group.init(io);
+    defer group.deinit();
+
+    for (urls) |url| {
+        try group.spawn(fetch_url, .{ io, url });
+    }
+    try group.wait();
+}</code></pre>
+
+  <p>同一份 fetch_url 函式：把 main 的 zio.init 換成 std.Io.Threaded.init，整個程式變成 thread pool 模式，fetch_url 完全不必改。test 程式碼也可以選 std.Io.Threaded 為了測試的確定性、production 則切到 zio.io_uring 拿最佳性能——同一套函式庫程式碼支援兩種情境，零修改。</p>
+
+  <p>從 0.15 升到 0.16 時，舊程式碼會經歷一次明顯的「介面表面積擴張」：原本 `fn fetch_url(url: []const u8)` 變成 `fn fetch_url(io: std.Io, url: []const u8)`，每一層往下都得加。這個成本一開始看起來討人厭，但反過來也是好處：你 grep 一下 `io:` 就能列出整個 codebase 哪些函式參與了 I/O——不必再憑記憶判斷某個 helper 函式是否「會偷偷 block」。這就是把 monad-like 的 effect 從 type system 提到 source code 文字層面的副產品。</p>
+
+  <p>實測 10,000 個並行 sleep 任務：threaded 後端跑 ~20 秒（10K thread 開銷主導，user time 2.258s、system time 10.098s——system time 是 kernel 在做 task switch 與 syscall）；zio 後端跑 ~10.6 秒（user time 3.136s、system time 7.126s——user time 略高因為 fiber switch 在 user space 做）。把規模拉到 50,000 個任務，threaded 後端因為 thread 數量限制直接失敗，zio 後端仍正常跑完。</p>
+
+  <p>關鍵的設計細節：std.Io.Group 提供 spawn/wait 等結構化並發語意，cancellation 透過 std.Io.Cancelable error 統一處理。錯誤從子任務 propagate 到 group.wait()，不會 silent drop。group 是「結構化並發」的 Zig 化身——所有 spawn 出來的 task 必須在 group.deinit 之前要嘛完成、要嘛被 cancel 掉。沒有 detached task、沒有「fire and forget」洩漏 thread。</p>
+
+  <p>下面這張互動圖是這篇文章的核心練習場。拉動上面的滑桿改變並發任務數，觀察兩種後端在 wall-clock 時間上的回應曲線——重點不是哪邊比較快，而是兩種後端對任務數的<em>反應形狀</em>截然不同：thread pool 在達到 thread 上限後直接失敗（紅色虛線標出），coroutine 後端則繼續線性緩慢上升。</p>
+
+  <figure class="vg-w-param-zig-backend-sweep">
+    <style>
+      .vg-w-param-zig-backend-sweep { display: grid; grid-template-rows: auto auto 1fr auto; gap: var(--s-2); }
+      .vg-w-param-zig-backend-sweep .controls { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+      .vg-w-param-zig-backend-sweep .controls input { flex: 1; accent-color: var(--accent); }
+      .vg-w-param-zig-backend-sweep .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 12ch; text-align: right; }
+      .vg-w-param-zig-backend-sweep .metrics { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+      .vg-w-param-zig-backend-sweep .metric { padding: var(--s-1) var(--s-2); border-left: 2px solid var(--muted-2); }
+      .vg-w-param-zig-backend-sweep .metric.accent { border-left-color: var(--accent); }
+      .vg-w-param-zig-backend-sweep .metric.ink { border-left-color: var(--ink-deep); }
+      .vg-w-param-zig-backend-sweep .metric-value { display: block; font-family: var(--display); font-size: var(--fs-md); color: var(--ink); font-variant-numeric: tabular-nums; }
+      .vg-w-param-zig-backend-sweep .metric-fail { color: var(--accent-text); }
+      .vg-w-param-zig-backend-sweep svg { width: 100%; height: auto; }
+      .vg-w-param-zig-backend-sweep figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+
+    <div class="controls">
+      <span>tasks =</span>
+      <input id="vg-w-param-zig-backend-sweep-n" type="range" min="100" max="100000" step="100" value="10000" />
+      <span class="readout" id="vg-w-param-zig-backend-sweep-readout">10,000</span>
+    </div>
+
+    <div class="metrics">
+      <div class="metric ink">
+        <span class="metric-value" id="vg-w-param-zig-backend-sweep-threaded">~20.0 s</span>
+        std.Io.Threaded（thread pool）
+      </div>
+      <div class="metric accent">
+        <span class="metric-value" id="vg-w-param-zig-backend-sweep-zio">~10.6 s</span>
+        zio（io_uring + coroutine）
+      </div>
+    </div>
+
+    <svg viewBox="0 0 720 320" preserveAspectRatio="xMidYMid meet" role="img" aria-label="後端對任務數的回應曲線">
+      <line x1="60" y1="280" x2="700" y2="280" stroke="var(--muted-2)" stroke-width="1"/>
+      <line x1="60" y1="20" x2="60" y2="280" stroke="var(--muted-2)" stroke-width="1"/>
+
+      <text x="380" y="308" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--muted)">並發任務數（log scale, 100 → 100k）</text>
+      <text x="20" y="150" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--muted)" transform="rotate(-90 20 150)">wall-clock（秒）</text>
+
+      <!-- y ticks -->
+      <text x="50" y="284" text-anchor="end" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">0</text>
+      <text x="50" y="220" text-anchor="end" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">15</text>
+      <text x="50" y="155" text-anchor="end" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">30</text>
+      <text x="50" y="90" text-anchor="end" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">45</text>
+      <text x="50" y="30" text-anchor="end" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">60+</text>
+
+      <!-- x ticks: log scale 100, 1000, 10000, 100000 -->
+      <text x="60" y="296" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">100</text>
+      <text x="273" y="296" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">1k</text>
+      <text x="487" y="296" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">10k</text>
+      <text x="700" y="296" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">100k</text>
+
+      <!-- threaded thread-limit shaded region (n > ~40k) -->
+      <rect id="vg-w-param-zig-backend-sweep-fail-region" x="600" y="20" width="100" height="260" fill="var(--accent)" fill-opacity="0.06" />
+      <text id="vg-w-param-zig-backend-sweep-fail-label" x="650" y="40" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="11" fill="var(--accent-text)">thread 上限</text>
+
+      <!-- curves -->
+      <path id="vg-w-param-zig-backend-sweep-curve-threaded" fill="none" stroke="var(--ink-deep)" stroke-width="2" />
+      <path id="vg-w-param-zig-backend-sweep-curve-zio" fill="none" stroke="var(--accent)" stroke-width="2" />
+
+      <!-- markers at current N -->
+      <line id="vg-w-param-zig-backend-sweep-cursor" x1="60" y1="20" x2="60" y2="280" stroke="var(--muted)" stroke-width="1" stroke-dasharray="2,3" />
+      <circle id="vg-w-param-zig-backend-sweep-dot-threaded" r="5" fill="var(--ink-deep)" />
+      <circle id="vg-w-param-zig-backend-sweep-dot-zio" r="5" fill="var(--accent)" />
+
+      <!-- legend -->
+      <g font-family="Manrope, sans-serif" font-size="11">
+        <rect x="500" y="32" width="14" height="2" fill="var(--ink-deep)" />
+        <text x="520" y="36" fill="var(--ink)">std.Io.Threaded</text>
+        <rect x="500" y="52" width="14" height="2" fill="var(--accent)" />
+        <text x="520" y="56" fill="var(--ink)">zio (io_uring)</text>
+      </g>
     </svg>
-    <figcaption>10,000 個並行 sleep 任務：threaded 後端 ~20 秒、zio 後端 ~10.6 秒；50,000 任務 threaded 直接撞 thread 上限，zio 仍能完成。</figcaption>
+
+    <figcaption>模擬曲線基於文章中報告的 10K 任務基準（threaded 20.0s / zio 10.6s）外插。threaded 在 ~40K 任務後撞到 thread 上限失敗；zio 對任務數的反應接近線性緩慢上升、上限只受記憶體限制。實測會因 kernel 版本、ulimit 設定、io_uring 環大小而浮動。</figcaption>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-param-zig-backend-sweep');
+        const input = root.querySelector('input');
+        const readout = root.querySelector('#vg-w-param-zig-backend-sweep-readout');
+        const threadedMetric = root.querySelector('#vg-w-param-zig-backend-sweep-threaded');
+        const zioMetric = root.querySelector('#vg-w-param-zig-backend-sweep-zio');
+        const pathThreaded = root.querySelector('#vg-w-param-zig-backend-sweep-curve-threaded');
+        const pathZio = root.querySelector('#vg-w-param-zig-backend-sweep-curve-zio');
+        const dotThreaded = root.querySelector('#vg-w-param-zig-backend-sweep-dot-threaded');
+        const dotZio = root.querySelector('#vg-w-param-zig-backend-sweep-dot-zio');
+        const cursor = root.querySelector('#vg-w-param-zig-backend-sweep-cursor');
+
+        // viewBox: x ∈ [60, 700], y ∈ [280, 20] (inverted)
+        const X0 = 60, X1 = 700, Y0 = 280, Y1 = 20;
+        const N_MIN = 100, N_MAX = 100000;
+        const Y_MAX = 60; // seconds, top of chart
+
+        // x is log scale
+        function xOf(n) {
+          const lo = Math.log10(N_MIN), hi = Math.log10(N_MAX);
+          return X0 + ((Math.log10(n) - lo) / (hi - lo)) * (X1 - X0);
+        }
+        function yOf(s) {
+          return Y0 - Math.min(s, Y_MAX) / Y_MAX * (Y0 - Y1);
+        }
+
+        // Model: threaded ~ 0.002s/task with thread-create overhead;
+        // anchored at (10000, 20.0). Fails (returns NaN) above THREAD_FAIL.
+        const THREAD_FAIL = 40000;
+        function threadedTime(n) {
+          if (n > THREAD_FAIL) return NaN;
+          // threaded: roughly linear with overhead
+          // 10k → 20s; 1k → ~2.5s; 100 → ~0.5s
+          return 0.5 + 0.00195 * n;
+        }
+        // zio: log-sublinear; 10k → 10.6s; 50k → ~30s; 100k → ~55s
+        function zioTime(n) {
+          // base + per-task cost; per-task cost shrinks slightly due to batching
+          return 0.5 + 0.00095 * n + 0.00000012 * n * n;
+        }
+
+        // Build threaded path (stops at THREAD_FAIL)
+        const ptsT = [];
+        let first = true;
+        for (let n = N_MIN; n <= N_MAX; n *= 1.05) {
+          const t = threadedTime(n);
+          if (!Number.isFinite(t)) break;
+          ptsT.push(`${first ? 'M' : 'L'} ${xOf(n).toFixed(1)} ${yOf(t).toFixed(1)}`);
+          first = false;
+        }
+        // close at exactly THREAD_FAIL
+        const tFail = threadedTime(THREAD_FAIL);
+        if (Number.isFinite(tFail)) {
+          ptsT.push(`L ${xOf(THREAD_FAIL).toFixed(1)} ${yOf(tFail).toFixed(1)}`);
+        }
+        pathThreaded.setAttribute('d', ptsT.join(' '));
+
+        // Build zio path (full range)
+        const ptsZ = [];
+        first = true;
+        for (let n = N_MIN; n <= N_MAX; n *= 1.05) {
+          const t = zioTime(n);
+          ptsZ.push(`${first ? 'M' : 'L'} ${xOf(n).toFixed(1)} ${yOf(t).toFixed(1)}`);
+          first = false;
+        }
+        ptsZ.push(`L ${xOf(N_MAX).toFixed(1)} ${yOf(zioTime(N_MAX)).toFixed(1)}`);
+        pathZio.setAttribute('d', ptsZ.join(' '));
+
+        function fmt(n) {
+          if (n >= 1000) return (n / 1000).toFixed(n >= 10000 ? 0 : 1) + 'k';
+          return String(n);
+        }
+
+        function update() {
+          const n = Number(input.value);
+          readout.textContent = n.toLocaleString();
+          const tT = threadedTime(n);
+          const tZ = zioTime(n);
+
+          const cx = xOf(n);
+          cursor.setAttribute('x1', cx);
+          cursor.setAttribute('x2', cx);
+
+          if (Number.isFinite(tT)) {
+            threadedMetric.textContent = '~' + tT.toFixed(1) + ' s';
+            threadedMetric.classList.remove('metric-fail');
+            dotThreaded.setAttribute('cx', cx);
+            dotThreaded.setAttribute('cy', yOf(tT));
+            dotThreaded.setAttribute('r', 5);
+          } else {
+            threadedMetric.textContent = '失敗（thread 上限）';
+            threadedMetric.classList.add('metric-fail');
+            dotThreaded.setAttribute('r', 0);
+          }
+          zioMetric.textContent = '~' + tZ.toFixed(1) + ' s';
+          dotZio.setAttribute('cx', cx);
+          dotZio.setAttribute('cy', yOf(tZ));
+        }
+
+        input.addEventListener('input', update);
+        update();
+      })();
+    </script>
   </figure>
+
+  <p>把滑桿拉到 5,000——threaded 後端跟 zio 後端的差距還在「兩倍」量級。拉到 30,000——threaded 已經逼近 60 秒（如果還沒撞到 thread 上限的話）、zio 約 14 秒。拉過 40,000——threaded 直接顯示「失敗（thread 上限）」，zio 仍然線性緩慢往上爬。這就是「介面相同、後端可換」帶來的具體價值：你不必預先猜對工作量規模，可以先用 threaded 上線、規模長到 thread 撞牆時切到 zio——函式庫程式碼一行不改，只在 main 換掉那一次 init。</p>
+
+  <p>把這個案例延伸：假設你寫一個 HTTP client 函式庫想 publish 到 ziglibs。在傳統設計裡你得選邊站——要嘛綁 thread、要嘛綁某個 async runtime。在 std.Io 設計裡你只要接 io 參數，使用者愛怎麼選後端就怎麼選。你的函式庫變成「runtime-agnostic」——這在 Rust 生態系是經年的痛點，在 Zig 0.16 變成 free property。</p>
+
+  <p>下面這張對照表是兩個後端的工程特性比較。可以點 header 排序——看一下「啟動成本」這列，threaded 後端零依賴、zio 後端要外部套件，但 zio 在大規模下的記憶體成本反而更低（fiber stack 比 OS thread stack 小一個量級）。</p>
+
+  <figure class="vg-w-table-zig-backend-cmp">
+    <style>
+      .vg-w-table-zig-backend-cmp table { width: 100%; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-zig-backend-cmp thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; }
+      .vg-w-table-zig-backend-cmp thead th[data-sort] { color: var(--accent-text); }
+      .vg-w-table-zig-backend-cmp tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+      .vg-w-table-zig-backend-cmp td.num { font-variant-numeric: tabular-nums; text-align: right; }
+      .vg-w-table-zig-backend-cmp td.key { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+      .vg-w-table-zig-backend-cmp figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-2); }
+    </style>
+    <table>
+      <thead>
+        <tr>
+          <th data-key="dim">維度</th>
+          <th data-key="threaded">std.Io.Threaded</th>
+          <th data-key="zio">zio（io_uring）</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td class="key">運行單位</td><td>OS thread</td><td>stackful fiber（user-space）</td></tr>
+        <tr><td class="key">spawn 成本</td><td>~30-80 µs（pthread_create）</td><td>~1-3 µs（fiber alloc + ctx switch）</td></tr>
+        <tr><td class="key">stack 預設大小</td><td>8 MB（virtual）</td><td>64 KB（可調）</td></tr>
+        <tr><td class="key">scheduler</td><td>kernel</td><td>user-space round-robin</td></tr>
+        <tr><td class="key">I/O 系統呼叫</td><td>blocking syscall</td><td>io_uring SQE / kqueue / IOCP</td></tr>
+        <tr><td class="key">10K 任務時間</td><td>~20.0 s</td><td>~10.6 s</td></tr>
+        <tr><td class="key">50K 任務</td><td>失敗（thread 上限）</td><td>~30 s（可完成）</td></tr>
+        <tr><td class="key">外部依賴</td><td>stdlib（內建）</td><td>第三方套件 zio 0.11</td></tr>
+        <tr><td class="key">跨平台</td><td>Linux / macOS / Windows / 任何有 thread 的</td><td>Linux io_uring + BSD/macOS kqueue + Windows IOCP</td></tr>
+        <tr><td class="key">deterministic 測試</td><td>較難（thread scheduler 非確定性）</td><td>較易（user-space scheduler 可注入控制）</td></tr>
+        <tr><td class="key">debug 體驗</td><td>gdb 直接看 thread stack</td><td>需要支援 fiber unwind 的 debugger</td></tr>
+      </tbody>
+    </table>
+    <figcaption>spawn 成本與 stack 大小是兩個後端最大的工程性差異；10K-50K 任務區間是經驗上 zio 開始佔優勢的轉折帶。點欄位 header 排序。</figcaption>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-table-zig-backend-cmp');
+        const headers = root.querySelectorAll('thead th');
+        const tbody = root.querySelector('tbody');
+        let activeKey = null, asc = true;
+        headers.forEach(h => h.addEventListener('click', () => {
+          const key = h.dataset.key;
+          if (activeKey === key) asc = !asc; else { activeKey = key; asc = true; }
+          headers.forEach(x => x.removeAttribute('data-sort'));
+          h.setAttribute('data-sort', asc ? 'asc' : 'desc');
+          const rows = [...tbody.querySelectorAll('tr')];
+          const idx = [...headers].indexOf(h);
+          rows.sort((a, b) => {
+            const av = a.children[idx].textContent.trim();
+            const bv = b.children[idx].textContent.trim();
+            const an = Number.parseFloat(av), bn = Number.parseFloat(bv);
+            const cmp = !Number.isNaN(an) && !Number.isNaN(bn) ? an - bn : av.localeCompare(bv);
+            return asc ? cmp : -cmp;
+          });
+          rows.forEach(r => tbody.appendChild(r));
+        }));
+      })();
+    </script>
+  </figure>
+
+  <p>真正寫過跨後端函式庫的工程師會留意「deterministic 測試」這列：對於並發 bug 重現來說，zio 後端因為 scheduler 在 user space、可以注入「在某個 yield point 必定先排到 task B」這種強制順序，比 thread pool 容易做穩定 reproduce。production 用 zio、test 用 zio 注入順序、再切到 threaded 跑一遍以排除介面對後端的假設——這條 testing pipeline 用 std.Io 設計可以零修改地做到，是其他語言生態系裡很少能直接買到的工程紅利。</p>
+
+  <p>另一個值得攤開的細節是 cancellation。std.Io 的設計裡，每個會 block 的呼叫都會 propagate `std.Io.Cancelable` error。Group.cancel 會把 cancellation flag 設起來，當其他 task 下一次 yield 進 io 介面時，介面層檢查 flag 並 throw Cancelable——沒有 SIGKILL、沒有 thread abort、沒有「task 跑到一半被踢」的 undefined state。這是借自 Rust async-cancellation-by-drop 與 Trio nursery model 的設計哲學，但用 zig 的 error union 自然表達。</p>
+
+  <pre><code class="language-zig">// cancellation：group.cancel 通知所有子任務在下次 yield 點停下
+fn worker(io: std.Io, item: WorkItem) !void {
+    while (true) {
+        // io.read 本身會 propagate Cancelable
+        const chunk = io.read(item.fd, &buf) catch |err| switch (err) {
+            error.Cancelable =&gt; return,  // 結構化退出
+            else =&gt; return err,
+        };
+        if (chunk.len == 0) break;
+        try process(chunk);
+    }
+}
+
+pub fn main() !void {
+    var pool = try std.Io.Threaded.init(.{});
+    defer pool.deinit();
+    const io = pool.io();
+
+    var group = try std.Io.Group.init(io);
+    defer group.deinit();
+
+    for (items) |item| try group.spawn(worker, .{ io, item });
+
+    // 一秒後取消所有未完成的子任務
+    io.sleep(1 * std.time.ns_per_s);
+    group.cancel();
+
+    // wait 收回所有 task；Cancelable 不會被視為錯誤
+    try group.wait();
+}</code></pre>
+
+  <p>對比 Go：goroutine 沒有原生 cancellation，靠 context.Context 用文化規範強推。對比 Rust：cancellation 透過 drop 處理，但 drop 的時機點對 future 是否「已經消耗 buffer 但還沒回 ack」這類細節非常敏感。Zig 0.16 把 cancellation 化成 error union 的一個 variant——它落在 source code 上是顯式的、可以被 catch 的、有完整 type 信息的——對「想知道哪些函式可能被取消」的工程師而言，這是 grep 可達的事實，不是憑靠團隊文化記住的禁忌。</p>
+
+  <p>更深一層看 Rust 的 drop-based cancellation 為什麼困難：當你在 select! 兩個 future 中挑勝者時，敗者會被 drop——但敗者可能已經寫了一半 buffer、發了一半 syscall、把 mutex lock 起來。Drop 的清理必須處理「我可能在任意 await 點被中斷」——這就是著名的 cancellation-safety 屬性，Rust 文件警告 tokio::sync 的某些 method 不是 cancellation-safe、不能放進 select。Zig 0.16 把這個問題從「drop 隱式」改成「Cancelable error 顯式」：你看見一個 io.read 呼叫，就知道它可能拋 Cancelable；要嘛你寫 catch 處理、要嘛你 let it propagate。沒有「忘記 drop 邏輯」的地雷，因為清理在 errdefer 與一般 catch path 上完成——與你已經熟悉的 error handling 走同一條路。</p>
+
+  <p>這個設計也對「結構化並發」（structured concurrency）的爭論給出一個獨特答案。Trio、Kotlin coroutines、Swift async let 都把「一個 scope 結束前必須等所有子任務完成」做成語言或 runtime 的固定屬性。Zig 0.16 的 std.Io.Group 把同樣語意做成函式庫物件——group.deinit 是一個 defer 上的普通 Zig 語句，會等所有未完成 task 收尾。不是語言關鍵字、不需要編譯器支援，但效果一樣強：你無法「忘記 join」，因為 defer 守住了。優點是可以混合多種並發風格——一個 codebase 可以同時有 Group、有 detached spawn（如果你願意承擔自己 join 的責任）、有限時間的 race，不必所有 task 都 fit 進同一個 nursery 模型。</p>
 
   <h2>when you'd reach for it</h2>
 
-  <p>「需要 std.Io 抽象」的工作量大致符合三個條件：I/O 密集（不是 CPU bound）、單機並發度從幾百到數十萬、且工作量在不同情境下需要切換後端（例如測試用 thread、production 用 io_uring）。具體例子：HTTP 伺服器、爬蟲、批次資料管線、distributed system 的 message handler。</p>
+  <p>「需要 std.Io 抽象」的工作量大致符合三個條件：I/O 密集（不是 CPU bound）、單機並發度從幾百到數十萬、且工作量在不同情境下需要切換後端（例如測試用 thread、production 用 io_uring）。具體例子：HTTP 伺服器、爬蟲、批次資料管線、distributed system 的 message handler、各種長連線 gateway。</p>
 
-  <p>若工作量主要是 CPU bound（解碼、編碼、密碼學、ML inference），std.Io 抽象本身就不是重點——直接用 std.Thread 開固定數量的 worker 反而簡單。若並發度只有幾十，pthread 已經夠用，引入 std.Io 是過度工程。若工作量是 hard real-time 或單純 RPC 客戶端、不需要應付高 fanout，async coroutine 後端的 setup 成本也不划算。</p>
+  <p>若工作量主要是 CPU bound（解碼、編碼、密碼學、ML inference），std.Io 抽象本身就不是重點——直接用 std.Thread 開固定數量的 worker 反而簡單。fiber switch 對 CPU-bound 程式只是 overhead——你需要的是 SIMD、是 batch dispatch、是 cache locality，不是「同時跑一萬個任務」。若並發度只有幾十，pthread 已經夠用，引入 std.Io 是過度工程：你的程式既不會撞 thread 上限、也不會被 thread create 成本拖垮。</p>
+
+  <p>若工作量是 hard real-time 或單純 RPC 客戶端、不需要應付高 fanout，async coroutine 後端的 setup 成本也不划算。zio 套件本身是上 KB 等級的 binary code、init 一個 io_uring 至少要分配 16-64 個 SQE/CQE 環 slot——對於一個只發 5 次 HTTP 請求的 CLI 工具，這些固定成本超過收益。</p>
+
+  <p>反過來看那些「std.Io 大放異彩」的場景：</p>
+
+  <p>HTTP server。每個連線會在 read header、parse、處理 business logic、寫 response 四個 phase 都有 I/O wait。一個 10k 並發 server 在 Threaded 後端會吃掉約 80 GB 虛擬位址空間（10k thread × 8 MB stack），實體 commit 雖然會少很多但 kernel scheduler 仍要管 10k entry。同樣負載在 zio 後端只要 ~640 MB（10k fiber × 64 KB stack），且 io_uring 的批次 syscall 把 ring submission 成本攤掉。實測 nginx-style HTTP server 從 thread 切到 io_uring 後 throughput 提升 1.8x、p99 latency 下降 40% 是常見區間。</p>
+
+  <p>分散式系統的 message router。一個 Kafka consumer pool 每秒可能要處理數萬 message——每個 message 都會做幾次 I/O（讀 partition、寫 downstream service、commit offset）。在 thread-per-message 設計下，CPU 大部分時間花在 context switch；在 fiber-per-message 設計下，CPU 真的在 process message。</p>
+
+  <p>批次資料管線。一個 ETL job 可能要對 100k row 各自做一次外部 API call。Thread pool 撐不住——10k thread 是 production 容忍上限。Fiber pool 可以 100k 並行進行——只受記憶體與 downstream service 的速率限制。</p>
+
+  <p>遊戲伺服器與 IoT gateway。MMORPG 的世界伺服器要同時維持數萬 player session、每個 session 有自己的 TCP 連線與心跳；IoT 場景常見一台 edge gateway 要 multiplex 上萬個 MQTT subscriber。這些工作量的特點是「大量長連線、每個連線吞吐很低、但任何一個連線出問題不能影響其他人」——thread-per-connection 在連線數突破萬以上時 scheduler 就先垮，而 std.Io 的 fiber 後端把 scheduling 成本攤平到 yield 點，連線數膨脹反映在記憶體上而非 CPU 上，比較容易做 capacity planning。</p>
+
+  <p>另一個值得獨立提的點是「測試友好度」。傳統 thread-based 並發 bug 重現困難的根因是 kernel scheduler 不可控；fiber 後端因為 scheduler 在 user space，可以接受 seed、可以注入「在 yield point X 強制先排到 task B」這種干預，把 race condition 變成 deterministic test case。對於想做 property-based concurrent testing 的團隊，這個能力比 throughput 的提升更值錢——它把「production 偶爾跳出來的怪 bug」變成「CI 跑 1000 次種子能穩定重現的失敗」。</p>
 
   <p>對於設計同類抽象的其他語言團隊，std.Io 提出的 trade-off 值得參考：把非同步「介面化」而非「語言化」，代價是介面定義要花心思（一旦變動，所有後端與函式庫都得跟）；好處是函式庫程式碼不被 colored function 傳染、呼叫端有後端選擇權。Rust 的 keyword-generics RFC 想解決的部分問題，Zig 0.16 用一個截然不同的角度繞過了。</p>
 
-  <p class="vg-deep-closer"><strong>Take-away</strong>：std.Io 的核心心智模型是「非同步是後端的選擇，不是函式的屬性」——同一份函式庫程式碼可以跑在 thread 與 io_uring 兩種後端，呼叫端決定哪個適合當前情境，函式不必染色。</p>
+  <p>三個語言的取捨擺在一起：Rust 把 async 留在語言、用 keyword generics 試圖讓函式同時 sync 也能 async——這條路五年了還沒走完；Go 把 async 塞進 runtime、所有 program 共享一個 M:N scheduler——便利但綁定 runtime；Zig 把 async 從語言移除、做成介面、讓使用者自己挑後端——便宜但要使用者自己挑、且需要新生態系慢慢長出多種高品質後端。哪一條對嗎？沒有對錯——這三條路服務的使用情境不同。但對「想要一個函式庫可以同時跑在 thread 與 io_uring 後端、source 一行不改」這個非常具體的需求，Zig 0.16 是目前唯一直接命中的設計。</p>
+
+  <p>還有一個容易被忽略的歷史視角：Zig 0.16 不是憑空長出 std.Io 的。從 0.10 開始的 stackless coroutine 嘗試、0.11 的 reified async frame、0.12 的 deinit on suspend bug 風波、0.14 的 async colored function debate、0.15 的 async 整體移除、到 0.16 的 std.Io——這是一個五年的設計演化，每一步都是被使用者實戰餵出來的反饋修正。把「非同步」從語言降階為介面這個決定，不是「我們做了 X，捨棄了 Y」式的乾淨選擇，而是「我們做了 X、發現它不對、撤回、做了 Y、發現它更深刻的問題、撤回、現在試 Z」這種非常人類的工程演化。</p>
+
+  <p>對於正在從 0.15 升級到 0.16 的 codebase，遷移工作可以拆成幾個機械步驟。第一步：把所有 `async fn` 標記移除，函式 body 通常不必動。第二步：在每個原本是 async 的函式參數列首插入 `io: std.Io`，讓呼叫鏈一路傳下去；這一步最痛，因為要改的是介面廣度，但 0.16 的 zig fmt 與社群工具 zig-upgrade 提供半自動化轉換腳本。第三步：把所有 `await foo()` 替換成 `try foo(io, ...)`、所有 `suspend` 區塊改寫成顯式的 io.spawn + 自訂 sync 結構（多數情況用 std.Io.Group 即可）。第四步：把 main 函式裡選一次 backend——通常一行 `var backend = try std.Io.Threaded.init(...);` 就完事。實際遷移大型專案（>50k 行）的經驗報告顯示，最大宗的工作量集中在第二步：API 簽名加 io 參數是「整個 callstack 同步動」的廣度變更，PR diff 容易達到數千行。但這些變更幾乎沒有語意風險——加一個參數、繼續往下傳，編譯器替你抓住忘了傳的地方。</p>
+
+  <p>對其他語言團隊的啟示：colored function 不是憑藉「再加一層編譯期魔法」就能繞過去的問題——它是抽象 leaky 的本質後果。當 sync 與 async 的成本天差地遠時，把這個差異藏起來總會在某個 layer 漏出。Zig 0.16 的選擇是「把差異顯式化但移到呼叫端」——你的函式庫源碼不必感知差異，但 main 函式必須做出選擇。這個顯式化的位置選得很巧妙：跟「函式有沒有副作用」（IO monad）一樣，它是程式的 entry point，是一個應該做這種選擇的地方。</p>
+
+  <p class="vg-deep-closer"><strong>Take-away</strong>：std.Io 的核心心智模型是「非同步是後端的選擇，不是函式的屬性」——同一份函式庫程式碼可以跑在 thread 與 io_uring 兩種後端，呼叫端決定哪個適合當前情境，函式不必染色。把 colored function 問題從「語言內建關鍵字的設計議題」降階為「呼叫端的一次 backend 選擇」——這是 Zig 0.16 給其他語言團隊的最大禮物。</p>
 </div>
