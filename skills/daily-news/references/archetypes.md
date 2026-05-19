@@ -266,7 +266,8 @@ For each candidate, score 0–10:
 - 3 pts: actionable for someone shipping code soon
 - 2 pts: substantial original material (not a paraphrase)
 - 2 pts: domain coverage bonus (item belongs to under-represented domain
-  today)
+  today — defined as ≤2 candidates in that domain in today's harvest;
+  computed mechanically by `scripts/decisions/score.mjs`)
 
 ## Deep-story selection (from today's items)
 
