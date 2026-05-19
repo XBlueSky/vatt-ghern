@@ -138,3 +138,151 @@ NOT have widget A's `<style>` define rules widget B depends on.
   collision)
 - `<script>` tags with `src=` attribute (banned in posts; bare script
   blocks allowed if IIFE)
+
+## Allowed JS toolkit (D-mode sandbox)
+
+The previous rules ("Rule 3: JS as IIFE", "Rule 6: no external assets")
+state what is BANNED. This section states what is AFFORDED. Sub-agents
+should not self-censor inside these allowances.
+
+### DOM access (scoped to widget root)
+
+- `document.querySelector` / `document.querySelectorAll` — prefer the
+  widget root as the starting point (`root.querySelector(...)`)
+- `element.addEventListener` — scoped to widget elements only;
+  never `document.addEventListener` without filtering on target
+- `element.appendChild`, `element.removeChild`, `element.replaceChild`
+- `element.setAttribute`, `element.removeAttribute`
+- `element.classList.add` / `remove` / `toggle`
+- `element.style.setProperty('--name', value)` for CSS custom property writes
+
+### Rendering primitives
+
+- Canvas 2D context (`canvas.getContext('2d')`) and its drawing methods
+- SVG namespace creation via
+  `document.createElementNS('http://www.w3.org/2000/svg', tag)`
+- Direct SVG attribute manipulation
+- CSS custom property reads (`getComputedStyle(el).getPropertyValue(...)`)
+
+### Calculation + data
+
+- All of `Math.*`, `Array.*` methods (`map`, `filter`, `reduce`, `sort`)
+- `Map`, `Set`, plain object literals
+- `JSON.parse`, `JSON.stringify`
+- `Number.isFinite`, `Number.isNaN`, `Number.parseFloat`
+
+### Timing / async
+
+- `requestAnimationFrame` (prefer over `setInterval`)
+- `setTimeout` (with bounded delay, e.g., ≤ 60s)
+- `Promise` for sequencing
+- `await` inside an async IIFE (`(async () => { ... })()`)
+
+### Observers
+
+- `IntersectionObserver`
+- `ResizeObserver`
+- `MutationObserver` (rare; usually not needed)
+
+### Pointer / input
+
+- `pointerdown` / `pointermove` / `pointerup` (unify mouse + touch)
+- `setPointerCapture` for drag tracking outside element bounds
+- `wheel` (with `preventDefault` only inside the widget)
+- `keydown` (scoped to focused widget elements, e.g., a focused `<button>`)
+
+### Explicitly banned
+
+- `fetch`, `XMLHttpRequest` (widgets are static; no network)
+- `eval`, `new Function(...)`
+- `document.write`
+- `<script src="...">` (external CDN load — see Rule 6)
+- ES module `import` (no CDN, no inline modules with imports)
+- `window.X = ...` (no globals — see Rule 3)
+
+## Allowed CSS toolkit (modern features safe to use)
+
+- `@container` (container queries) — see Tier-2 snippet `css-container-query`
+- `:has()` selector — broadly supported in 2026
+- `@scroll-timeline` / `animation-timeline: scroll()` — provide
+  `@supports not` fallback
+- `view-transition-name` + `::view-transition-*` pseudo-elements
+- `anchor-positioning` — provide fallback
+- CSS custom properties for interpolated values
+- `clip-path: polygon(...)` and `inset()`
+- `aspect-ratio`
+- `accent-color`
+
+## Per-widget budget (soft limits)
+
+If a single widget exceeds these, split into two widgets:
+
+- Inline JS: ~250 lines (including comments)
+- Inline CSS (in `<style>`): ~150 lines
+- Inline SVG markup: ~300 lines
+
+The budget reflects "one widget = one conceptual question". Widgets
+that exceed the budget usually try to answer multiple questions and
+benefit from being split.
+
+## Post-level `<style>` block — limited allowance
+
+Previously banned in `design-system.md` (Anti-patterns section).
+**Updated rule**: each widget MAY emit one post-level `<style>` block
+IFF every selector starts with `.vg-w-<widget-id>`. This enables:
+
+- Grid layouts that don't fit inside an SVG `<style>`
+- Container queries (`@container` cannot live inside an SVG)
+- View-transition-name on non-SVG elements
+
+Example (allowed):
+
+```html
+<figure class="vg-w-chart-foo">
+  <style>
+    .vg-w-chart-foo { display: grid; gap: var(--s-2); }
+    .vg-w-chart-foo .controls { display: flex; gap: var(--s-2); }
+    .vg-w-chart-foo svg { width: 100%; height: auto; }
+  </style>
+  <!-- ... -->
+</figure>
+```
+
+Example (banned — leaks beyond widget):
+
+```html
+<style>
+  figure { display: grid; }     /* affects all <figure> on the page */
+  .controls { display: flex; }  /* affects any .controls, anywhere */
+</style>
+```
+
+The `tests/archetype-check.mjs` enforcer rule changes from "any
+post-level `<style>` is a failure" to "any selector in a post-level
+`<style>` that does not start with `.vg-w-` is a failure".
+
+## Canvas sizing (DPR-aware)
+
+For `<canvas>` elements:
+
+```html
+<canvas style="width: 100%; height: auto; aspect-ratio: 16/9"></canvas>
+<script>
+  (function () {
+    const canvas = document.querySelector('canvas');
+    const ctx = canvas.getContext('2d');
+    function resize() {
+      const dpr = window.devicePixelRatio || 1;
+      const rect = canvas.getBoundingClientRect();
+      canvas.width = rect.width * dpr;
+      canvas.height = rect.height * dpr;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+    new ResizeObserver(resize).observe(canvas);
+    resize();
+  })();
+</script>
+```
+
+CSS controls the display size; JS sets the backing-store size to
+`displaySize × devicePixelRatio` for crisp rendering on retina screens.
