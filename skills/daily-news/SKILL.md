@@ -113,7 +113,9 @@ documents tier philosophy.
 ### Step 3: Score and filter
 
 For each candidate, assign a domain (ai / systems / infra / web / backend)
-and a 0–10 score per the rubric in `references/archetypes.md`.
+and a subjective score 0–8 covering the rubric's three subjective axes
+(`teaches non-obvious` + `actionable` + `substantial original`). The
+mechanical +2 domain-coverage bonus is added by the score module below.
 
 Drop candidates that:
 
@@ -122,6 +124,20 @@ Drop candidates that:
   `past_roundup_titles` (compute this manually — the formal check runs in
   step 8 via `check-dup.mjs`)
 - Violate the "what does NOT earn a place" rules in `persona.md`
+
+**Advisory check**: write the surviving candidates (each carrying
+`subjective_score: 0-8`, `domain`, `url`, `title`, `source_id`,
+`source_tier`) as a JSON array and pipe through the score module to add
+the objective `+2 domain coverage bonus` mechanically:
+
+```bash
+cat candidates.json | node skills/daily-news/scripts/decisions/score.mjs > scored.json
+```
+
+The module adds `coverage_bonus` and `score` fields. You MAY override the
+final `score` if you see a rubric mismatch (e.g., the +2 bonus pushed a
+marginal item into the deep-story tier). Record overrides in PR body
+under `### Advisory overrides`.
 
 ### Step 4: Pick today's items (domain coverage)
 
@@ -151,9 +167,23 @@ backend). Hard floor: ≥4 distinct domains. Per-domain cap: ≤6 items.
 Assign final `news_id` values as `YYYY-MM-DD-NN` (zero-padded) in
 ranked order.
 
+**Advisory check**: pipe scored candidates through the cover-domains
+module:
+
+```bash
+cat scored.json | node skills/daily-news/scripts/decisions/cover-domains.mjs > selected.json
+```
+
+The module returns `{ selected, skipped_domains, capped_domains }` with
+each selected item carrying a `rank_nn` field (`"01"`..`"10"`). Wrap with
+the date prefix to produce `news_id` values (`2026-05-19-01`, etc.). You
+MAY override the selection (e.g., swap a marginal pick for a higher-
+impact candidate the algorithm dropped). Record overrides in PR body
+under `### Advisory overrides`.
+
 **PR body must list**:
 - Domain distribution (e.g., "AI · 3 · SYSTEMS · 3 · INFRA · 2 ·
-  STORAGE · 1 · INDUSTRY · 1")
+  WEB · 1 · BACKEND · 1")
 - Any domain skipped (with reason: no qualifying candidates / all
   candidates failed dedup / etc.)
 - Any domain that hit the cap and had candidates dropped (e.g.,
@@ -167,13 +197,14 @@ than competing briefs. Pipe the merged `candidates[]` (Step 2's
 dispatcher + WebFetch results) through the clustering helper:
 
 ```bash
-echo '<candidates json array>' | npm run sources:cluster --silent
+cat candidates.json | node skills/daily-news/scripts/decisions/cluster.mjs > clusters.json
+# (npm run sources:cluster still works via the cluster-candidates.mjs shim)
 ```
 
 Or in-process:
 
 ```js
-import { clusterCandidates } from "./skills/daily-news/scripts/cluster-candidates.mjs";
+import { clusterCandidates } from "./skills/daily-news/scripts/decisions/cluster.mjs";
 const clusters = clusterCandidates(candidates);
 ```
 
@@ -230,6 +261,22 @@ Decision tree:
 **IMPORTANT**: Archetypes are SUGGESTIONS. When in doubt — or when
 forcing a structured archetype would worsen the prose — pick
 `freeform`. A forced fit produces worse content than free shape.
+
+**Advisory check**: for each ≥8 cluster, extract the 6 archetype signals
+(`time_ordered`, `structural_exposition`, `puzzle_with_hypotheses`,
+`multiple_options`, `concept_unknown`, `hybrid_or_unclear` — all booleans
+based on what the source URL reads like) and pipe through the archetype
+module:
+
+```bash
+echo '{"signals":{"time_ordered":true,"structural_exposition":false,"puzzle_with_hypotheses":false,"multiple_options":false,"concept_unknown":false,"hybrid_or_unclear":false}}' \
+  | node skills/daily-news/scripts/decisions/pick-archetype.mjs
+```
+
+The module returns `{ archetype, matched_signal }`. You MAY override
+(e.g., module said `narrative` but the post is structural exposition with
+a timeline framing, so `technical-deep-dive` fits better). Record
+overrides in PR body under `### Advisory overrides`.
 
 **Phrasing freedom**: archetype reference files describe the *arc*
 (e.g., setup → mechanism → consequence for narrative), not the exact
@@ -517,11 +564,11 @@ Lede: {{deep_lede_2}}
 
 ## Domain distribution
 
-AI · 3 · SYSTEMS · 3 · INFRA · 2 · STORAGE · 1 · INDUSTRY · 1
+AI · 3 · SYSTEMS · 3 · INFRA · 2 · WEB · 1 · BACKEND · 1
 
 ## Domains skipped today
 
-- (none) — or list each: e.g., "STORAGE: no qualifying candidates"
+- (none) — or list each: e.g., "WEB: no qualifying candidates"
 
 ## Domains capped (≤6 rule)
 
@@ -551,11 +598,19 @@ AI · 3 · SYSTEMS · 3 · INFRA · 2 · STORAGE · 1 · INDUSTRY · 1
 - {{deep_title_2}} — `technical-deep-dive`
 - {{deep_title_3}} — `freeform` (hybrid topic, no structured archetype fit cleanly)
 
-## Archetype overrides
+## Advisory overrides
 
-- (none) — or list each: e.g. `deep-foo`:選了 `freeform` 而非 `narrative`,
-  因為該題目沒有清晰時間線,強套 setup→mechanism→consequence 會讓 prose
-  變成「凡是事件都套同一個 H2 序列」的模板感。
+Records every place where Claude overrode a `scripts/decisions/*.mjs`
+module's output. Empty section = pure advisory consensus.
+
+- (none) — or list each:
+  - `score(2026-05-19-04)`: module said 9, kept 7. Reason: paraphrase, not
+    original.
+  - `cover-domains`: module dropped `2026-05-19-09` (backend, score 7); kept
+    in selection. Reason: novel architectural pattern worth higher signal.
+  - `archetype(deep-foo)`: 選了 `freeform` 而非 `narrative`,
+    因為該題目沒有清晰時間線,強套 setup→mechanism→consequence 會讓 prose
+    變成「凡是事件都套同一個 H2 序列」的模板感。
 
 ## Preview
 
