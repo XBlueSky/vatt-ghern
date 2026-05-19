@@ -35,6 +35,18 @@ const FETCHERS = {
   html_index: htmlIndexFetch,
 };
 
+const RETRYABLE_HTTP = /HTTP\s5\d\d/;
+const RETRYABLE_NETWORK = /ENOTFOUND|ECONNRESET|ETIMEDOUT|fetch failed|socket hang up/;
+
+function isRetryable(err) {
+  const msg = String(err?.message || err);
+  return RETRYABLE_HTTP.test(msg) || RETRYABLE_NETWORK.test(msg);
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 function readWebState() {
   if (!existsSync(WEB_STATE_PATH)) return {};
   try {
@@ -100,14 +112,29 @@ export async function fetchAll({ filter = {}, fetchImpl, priorWebState, writeSta
       fetchImpl,
       priorState: priorState[record.id] || {},
     };
+    let out;
     try {
-      const out = await fn(record, ctx);
-      if (out.candidates) allCandidates.push(...out.candidates);
-      if (out.deferred) deferred.push(out.deferred);
-      if (out.state_diff) stateDiffs[record.id] = out.state_diff;
+      out = await fn(record, ctx);
     } catch (e) {
-      failures.push({ id: record.id, error: String(e.message || e) });
+      if (!isRetryable(e)) {
+        failures.push({ id: record.id, error: String(e.message || e) });
+        continue;
+      }
+      await sleep(1000);
+      try {
+        out = await fn(record, ctx);
+      } catch (e2) {
+        failures.push({
+          id: record.id,
+          error: String(e2.message || e2),
+          retried: true,
+        });
+        continue;
+      }
     }
+    if (out.candidates) allCandidates.push(...out.candidates);
+    if (out.deferred) deferred.push(out.deferred);
+    if (out.state_diff) stateDiffs[record.id] = out.state_diff;
   }
 
   if (writeState && Object.keys(stateDiffs).length > 0) {
