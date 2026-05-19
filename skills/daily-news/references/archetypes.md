@@ -43,7 +43,7 @@ Each post lives in `src/posts/YYYY/MM/DD/<slug>.{html,11tydata.json}`.
   "archetype": "daily-roundup" | "daily-deep-story",
   "deep_archetype": "narrative" | "technical-deep-dive" | "investigation"
                     | "comparison" | "explainer" | "freeform",
-  "topics": ["systems" | "ai" | "infra" | "storage" | "industry" | "roundup"],
+  "topics": ["ai" | "systems" | "infra" | "web" | "backend" | "roundup"],
   "tags": ["string", ...],
   "sources": ["https://...", ...],
   "news_ids": ["YYYY-MM-DD-NN", ...],
@@ -189,8 +189,12 @@ unicode glyphs (↗, ✓, ↶) for chrome icons.
 **Domain grouping (mandatory)**: items render in this fixed display order:
 
 ```
-ai → systems → infra → storage → industry
+ai → systems → infra → web → backend
 ```
+
+> Legacy posts (pre-2026-05-19) tagged with `storage` or `industry` continue
+> to render under their original section headers. New posts must use one of
+> the five domains above.
 
 Within each domain, sort by score descending. Each non-empty domain emits
 exactly ONE section header at the top of its group:

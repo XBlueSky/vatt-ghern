@@ -62,6 +62,6 @@ For each candidate selected into today's 10:
 - `source_url` — the canonical link (publisher's site, not the aggregator)
 - `aggregator_url` — if found via HN/lobsters/daily.dev, also record this
 - `original_title` — the publisher's headline as-is
-- `domain` — one of: ai, systems, infra, storage, industry
+- `domain` — one of: ai, systems, infra, web, backend
 - `score` — 0–10 from the scoring rubric in `archetypes.md`
 - `news_id` — assigned as `YYYY-MM-DD-NN` in final ranking order

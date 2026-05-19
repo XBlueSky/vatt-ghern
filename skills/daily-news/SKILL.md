@@ -112,8 +112,8 @@ documents tier philosophy.
 
 ### Step 3: Score and filter
 
-For each candidate, assign a domain (ai / systems / infra / storage /
-industry) and a 0–10 score per the rubric in `references/archetypes.md`.
+For each candidate, assign a domain (ai / systems / infra / web / backend)
+and a 0–10 score per the rubric in `references/archetypes.md`.
 
 Drop candidates that:
 
@@ -125,8 +125,8 @@ Drop candidates that:
 
 ### Step 4: Pick today's items (domain coverage)
 
-Aim: all 5 priority domains represented (ai / systems / infra / storage /
-industry). Hard floor: ≥4 distinct domains. Per-domain cap: ≤6 items.
+Aim: all 5 priority domains represented (ai / systems / infra / web /
+backend). Hard floor: ≥4 distinct domains. Per-domain cap: ≤6 items.
 
 **Selection algorithm**:
 
@@ -280,7 +280,7 @@ Write to `src/posts/YYYY/MM/DD/roundup.html` plus matching
 **Required emit order** (NOT score order):
 
 Items render grouped by domain in this fixed order:
-`ai → systems → infra → storage → industry`. Within each domain, sort
+`ai → systems → infra → web → backend`. Within each domain, sort
 by score descending. Each non-empty domain emits exactly ONE section
 label header at the top of its group (with `<span class="vg-roundup-section-count">N 篇</span>`).
 Empty domains emit no section.
