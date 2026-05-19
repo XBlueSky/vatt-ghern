@@ -16,19 +16,12 @@
   </p>
 
   <p>
-    這篇文章不是 quiche 的咎責文。
-    它是一個關於「語意等價」的故事：
+    這不是 quiche 的咎責文，而是一個關於「語意等價」的故事：
     把核心層的演算法直譯到使用者空間，
     看似行為相同，
     實際上時間點已經偏移一個 RTT；
     而那個 RTT 在最壞情況下，
     足以讓擁塞窗口永遠卡死。
-    本文先把 2017 年的核心修補放回它的歷史脈絡，
-    再追蹤這個修補在 2020 年被移植到 quiche 時遺漏了什麼，
-    接著拆解死亡螺旋的自我強化機制、
-    量化它的觀測訊號、
-    講完修復方案，
-    最後抽出三個對「核心 → 使用者空間」演算法移植普遍適用的工程結論。
   </p>
 
   <h2>2017 年的核心修補：為什麼 epoch 需要被推平</h2>
@@ -90,14 +83,9 @@
   </p>
 
   <p>
-    本節的核心觀察：核心的 idle exit 偵測不是「在某段程式碼裡檢查條件」，而是「依賴 TCP layer 在恰當時機呼叫 <code>cwnd_event</code> 回呼」。
-    這條因果鏈裡，TCP layer 是 trusted base——它握有 ACK 與 send 兩端的時間錨點，並且在 idle 真正結束的那一個瞬間呼叫 CUBIC。
-    CUBIC 自己不需要決定「idle 是什麼」，它只負責執行「拿到 idle exit 訊號之後，把 epoch 平移」這一段邏輯。
-  </p>
-
-  <p>
-    這個 trusted base 在使用者空間 QUIC 裡並不存在。
-    下一節我們會看到，當 quiche 試著移植同一段邏輯時，它必須自己重建 idle exit 偵測——而它選擇的觸發點，剛好把核心抹掉的那個 RTT 偷渡回來。
+    核心的 idle exit 偵測依賴 TCP layer 在恰當時機呼叫 <code>cwnd_event</code> 回呼；
+    TCP layer 握有 ACK 與 send 兩端的時間錨點，並且在 idle 真正結束的那一個瞬間呼叫 CUBIC。
+    這個 trusted base 在使用者空間 QUIC 裡並不存在——quiche 必須自己重建 idle exit 偵測，而它選擇的觸發點，剛好把核心抹掉的那個 RTT 偷渡回來。
   </p>
 
   <h2>2020 年的移植：少了一個回呼的後果</h2>
@@ -162,18 +150,9 @@ fn on_packet_sent(&amp;mut self, now: Instant, sent_bytes: usize) {
   </p>
 
   <p>
-    「happy path 通過」這個事實，是這類 bug 最危險的特徵。
-    它不是直接的程式碼錯誤——程式碼讀起來完全合理，每一行都對應到核心邏輯的某個元素，註解可能還引用了 Linux 的 commit。
-    但隱藏的假設——「<code>last_sent_time</code> 跟 <code>last_ack_time</code> 在所有時刻幾乎相等」——是錯的。
-    它在 99% 的時刻正確；
-    剩下 1% 的時刻不正確，並且那 1% 剛好是「網路已經出問題、需要 CUBIC 表現得好」的時刻。
-  </p>
-
-  <p>
-    從 2020 到 bug 浮現之間，這段邏輯在 Cloudflare 的生產環境跑了將近六年。
-    Cloudflare 每秒處理數百萬個 QUIC 連線——絕大多數連線都不會撞到這個 bug，因為絕大多數連線都不會同時滿足「真實丟包、處於 congestion avoidance、cwnd 已被壓到 2」這三個條件。
-    但只要有少數連線撞到，那些連線就會表現為「下載永遠完成不了，最後 timeout」。
-    在公開的 SLI 上，這顯示為「P99.9 完成時間異常」——一個經常被歸因為「網路波動」的訊號。
+    隱藏的假設——「<code>last_sent_time</code> 跟 <code>last_ack_time</code> 在所有時刻幾乎相等」——在 99% 時刻正確，剩下 1% 剛好是「網路已經出問題、需要 CUBIC 表現得好」的時刻。
+    這段邏輯在 Cloudflare 生產環境跑了將近六年，絕大多數連線不會同時滿足「真實丟包、處於 congestion avoidance、cwnd 已被壓到 2」三個條件；
+    撞到的少數連線表現為「下載完不成、最後 timeout」，在 SLI 上顯示為「P99.9 完成時間異常」——一個經常被歸因為「網路波動」的訊號。
   </p>
 
   <p>
@@ -275,15 +254,6 @@ fn on_packet_sent(&amp;mut self, now: Instant, sent_bytes: usize) {
     第四，這個現象不會自動恢復。
     沒有 timer、沒有 timeout、沒有 reset 路徑會主動打破循環——除非應用層的 timeout 把整個連線砍掉重建。
     對使用者來說，就是「下載卡住、最後失敗」。
-  </p>
-
-  <p>
-    把這個機制畫成圖，比較容易看清「為什麼是自我強化」：每一次傳送都把 recovery 起點往未來推；
-    每一次 ACK 都因為 recovery 起點在未來而跳過成長；
-    跳過成長保證 cwnd 維持 minimum；
-    維持 minimum 保證下一個 RTT 又回到 <code>bytes_in_flight == 0</code>；
-    於是循環從頭開始。
-    沒有任何路徑能讓 cwnd 成長，因為成長路徑被 <code>in_congestion_recovery()</code> 守住，而那個守衛永遠拒絕通行。
   </p>
 
   <figure class="vg-w-canvas-quic-spiral">
@@ -562,15 +532,8 @@ fn on_packet_sent(&amp;mut self, now: Instant, sent_bytes: usize) {
   </figure>
 
   <p>
-    把 simulation 跑起來，注入丟包，前 200 毫秒兩條曲線一致：兩者同步進入 recovery、cwnd 都被壓到 2、recovery 起點都被推到「上次 send 之後」。
-    從第二個 RTT 開始，分歧出現：fixed 版本用 <code>last_ack_time</code> 計算 delta，delta 是「上次 ACK 到現在」的微小差值，recovery 起點不會被推到未來，下一個 ACK 抵達時 <code>in_congestion_recovery()</code> 回傳 false，cwnd 沿 CUBIC 曲線重新成長。
-    buggy 版本用 <code>last_sent_time</code>，delta 是一個完整的 RTT，recovery 起點剛好被推到「下一個 send 的當下」——下一個 ACK 永遠認為自己還在 recovery，cwnd 永遠維持在 2。
-  </p>
-
-  <p>
-    注意這個 simulation 是教學用的——它的 CUBIC 曲線參數、recovery exit 判定、loss injection 行為都做了簡化，目的是讓兩條曲線的分歧清晰可見。
-    實際 quiche 與 Linux 的 CUBIC 還有 HyStart、TCP friendliness、Reno-friendly fallback 等多層機制，這個 simulation 都略過了。
-    但 idle exit 平移的核心錯位——也就是這個 bug 的本質——是忠實的。
+    這個 simulation 是教學用的——CUBIC 曲線參數、recovery exit 判定、loss injection 都做了簡化，實際 quiche 與 Linux 的 CUBIC 還有 HyStart、TCP friendliness、Reno-friendly fallback 等多層機制都略過了。
+    但 idle exit 平移的核心錯位——這個 bug 的本質——是忠實的。
   </p>
 
   <h2>定位的細節：qlog 揭露的訊號</h2>
@@ -619,17 +582,9 @@ fn on_packet_sent(&amp;mut self, now: Instant, sent_bytes: usize) {
   </p>
 
   <p>
-    Cloudflare 內部的壓力測試套件是這個 bug 能被抓到的關鍵基礎建設。
-    它不是針對這個 bug 設計的——它是針對「QUIC 在惡劣網路下的所有表現」設計的，這個 bug 只是其中一個被它揭露的 case。
-    但這個套件的存在，把「邊界條件被測到」從「靠工程師個人警覺」變成「靠基礎建設自動覆蓋」。
-    對任何維護 transport-layer code 的團隊，這個層級的測試覆蓋是必要的——sample size 100 是太少，需要的是 1000+ 個壓力 run，並把所有 run 的 qlog 自動歸檔。
-  </p>
-
-  <p>
-    把這個故事連到實際數字：在這個壓力測試套件下，bug 觸發的失敗率穩定在 61%——相同的 100 個 run，每次跑都會看到大約 60-62 個失敗。
-    Reno 在同樣的設置下 100% 通過——這個對比本身就排除了「網路條件太惡劣，所以失敗是正常的」這種解釋。
-    一個失敗率穩定在 61% 的 bug 不是「不穩定」，而是「某個邊界條件以 61% 的機率被滿足」。
-    把這個機率歸因到三個條件的聯合機率（loss × cwnd = min × CA 階段），數字就對得上了。
+    Cloudflare 內部的壓力測試套件是這個 bug 能被抓到的關鍵基礎建設——它不是針對這個 bug 設計，而是針對「QUIC 在惡劣網路下的所有表現」設計的。
+    在這個套件下，bug 觸發的失敗率穩定在 61%——同樣設置下 Reno 100% 通過。
+    失敗率穩定在 61% 不是「不穩定」，而是「某個邊界條件以 61% 機率被滿足」——對應三個條件的聯合機率（loss × cwnd = min × CA 階段）。
   </p>
 
   <h2>修復、量化、與三個普遍結論</h2>
@@ -839,78 +794,9 @@ fn on_packet_sent(&amp;mut self, now: Instant, sent_bytes: usize) {
   </p>
 
   <p>
-    對在使用者空間實作擁塞控制的工程師而言，這個故事提供了一個具體的 checklist 項目：每一個依賴「時間點語意」的核心 TCP 修補，在移植時都必須重新確認使用者空間等價的觸發時機。
-    RFC 9438 §4.2-12 描述的行為是正確的；
-    問題永遠在「實作對 RFC 的詮釋是否與執行環境的邊界對齊」。
-    CUBIC、BBR、Reno 都有類似的 idle 處理；
-    移植任一者，這個檢查都要做一遍。
-  </p>
-
-  <p>
-    對在使用者空間實作 transport stack 的團隊而言，另一個收穫是「qlog 不是 debug 工具，是 production observability 的基礎」。
-    Cloudflare 能在數週內定位這個 bug，前提是邊緣節點預設就在記 qlog，並且 qlog 格式有業界標準的 viewer 可以即時分析。
-    如果這層基礎建設不到位，同樣的 bug 在生產環境跑五年都可能不會被發現——只會被歸因為「網路抖動」一筆帶過。
-  </p>
-
-  <p>
-    對 transport 之外的 systems engineer 而言，這個故事的可移植教訓是「移植任何依賴回呼語意的核心程式碼到 userspace 之前，先把回呼的時間錨點寫成文件」。
-    核心程式碼通常沒有顯式說明 anchor——它假設讀者熟悉 TCP stack 的呼叫順序。
-    Userspace 實作必須把這份隱含知識變成顯式設計：每個 anchor 對應哪個事件、哪個函數負責更新它、它與其他 anchor 的關係是什麼。
-  </p>
-
-  <p>
-    最後一個觀察：這個 bug 不是 quiche 獨有的。
-    任何把 CUBIC 從核心移植到 userspace 的實作——picoquic、msquic、aioquic、quinn——都需要重新解決同一個 idle exit 偵測問題。
-    它們是否各自做對了？這是個值得審視的問題。
-    回呼語意的 trust 在每一個 port 都要重新被驗證一次；
-    沒有任何一次驗證可以「跳過」。
-  </p>
-
-  <p>
-    從更高層的角度看，這個 bug 是「複雜軟體跨環境移植」這個更大命題的一個樣本。
-    CUBIC 是個有 20 年歷史、被研究透徹的演算法。
-    它的程式碼在 Linux 核心裡跑了十幾年、處理了 trillions 的封包。
-    把它移植到使用者空間應該是一個「教科書級別容易」的工作——但即便是這樣的演算法，移植時仍然會在「呼叫時機」這個微妙的維度上失手。
-    對任何在做 cross-environment porting 的團隊，這個故事是個值得標記的 reference case。
-  </p>
-
-  <p>
-    下次當你看到一段被標註為「直接移植自 Linux <code>net/ipv4/tcp_cubic.c</code>」的程式碼，請多問一個問題：
-    那個 Linux 函數是被誰呼叫的、
-    在什麼時間點被呼叫的、
-    它依賴哪個 anchor 來計算時長？
-    這三個問題的答案，比函數本身的程式碼還重要——
-    因為移植時最容易遺漏的，正是這三個答案。
-  </p>
-
-  <p>
-    把這個故事再壓縮一層：使用者空間 transport stack 的「相對於 Linux 核心」優勢，從來不是程式碼層面的——userspace 寫 Rust，kernel 寫 C，這不是優勢的本質。
-    優勢是 deploy velocity：核心修補要等發行版升級，userspace library 可以隨 application binary 一起 ship。
-    但 deploy velocity 是雙面刃：deploy 得快也意味著 bug 上線得快、惡化得久。
-    這個 bug 在 quiche 裡跑了將近六年；如果是在 Linux 核心裡，社群 review 與後續多輪 maintenance 應該會更早讓某個 anchor 不一致的問題被發現。
-    quiche 沒有那層 review velocity——它的 maintainer 圈相對 small，code path 的審視深度不可能跟核心同等。
-    這是 userspace transport 的隱性 cost，跟它的明顯 benefit 並存。
-  </p>
-
-  <p>
-    從更實務的角度看，如果你今天正在設計或維護一個 userspace transport library，這個故事建議的 review checklist 大概是這樣：
-    第一，把每個依賴時間點的演算法（idle 偵測、loss detection、pacer rate adjustment、RTT 估計）的 anchor 列成顯式表格——「這個變數抓哪個事件、由哪個 callsite 更新、有哪些已知不一致的時刻」。
-    第二，為每個 anchor 寫一個 invariant：在什麼情況下這個 anchor 跟「真正想要捕捉的事件」可能差距很大？
-    第三，把那些 invariant 寫成 property-based test，用隨機種子跑數千次。
-    第四，在邊界條件下（cwnd 最低、rate 最低、queue 最深、loss 最高）反覆 fuzz test，並把所有 run 的內部狀態記錄成 qlog 等可分析的格式。
-    這四步加起來才是 transport layer 的 robust testing baseline——少了任何一步，就是把這個 bug 的下一個變形留給生產環境去發現。
-  </p>
-
-  <p>
-    本文最後想提的一個觀察，是「壓力測試套件」這個 infrastructure 本身的 ROI。
-    寫一個能注入 loss、抖動、頻寬限制、reorder、duplicate 的 NetEm-class 壓力環境，
-    搭配一個能用 100+ 隨機種子並行跑、自動收集 qlog 的執行器，
-    這個 infrastructure 的工程成本可能是 1-2 個 quarter 的 senior engineer 時間。
-    它的回報是：每一個類似這個 CUBIC bug 的隱含假設失效，從「生產環境跑五年才浮現」壓縮到「PR review CI 就揭露」。
-    一個被壓縮到 PR CI 的 bug 比一個生產環境跑五年的 bug 便宜兩個量級——
-    quarter 級的 infrastructure 投資換來的是 trillion-packet 級別的可靠性。
-    對 Cloudflare 這個規模而言這個 trade-off 顯然 worth；對較小團隊而言，問題不是「要不要做」而是「做到什麼覆蓋深度才合理」。
-    答案隨團隊規模調整，但結構性的 stress test 應該永遠存在，哪怕只覆蓋幾個關鍵 callsite。
+    這個 bug 不是 quiche 獨有的——任何把 CUBIC 從核心移植到 userspace 的實作（picoquic、msquic、aioquic、quinn）都需要重新解決同一個 idle exit 偵測問題。
+    回呼語意的 trust 在每一個 port 都要重新被驗證一次。
+    對較小團隊而言，問題不是「要不要做壓力測試」而是「做到什麼覆蓋深度才合理」——但結構性的 stress test 應該永遠存在，哪怕只覆蓋幾個關鍵 callsite。
   </p>
 
   <p class="vg-deep-closer"><strong>Take-away</strong>：把核心 TCP 修補移植到使用者空間 QUIC 時，每個「時間點回呼」都必須重新核對語意等價——<code>last_sent_time</code> 與 <code>last_ack_time</code> 在 happy path 差幾百微秒，但在 cwnd 跌到最低點那一刻它們差一整個 RTT，而那個 RTT 足以讓擁塞窗口永遠卡死。</p>
