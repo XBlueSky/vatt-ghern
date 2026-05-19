@@ -34,22 +34,48 @@ You are writing ONE deep-story for vatt'ghern's daily-news routine.
 4. Read the design-system: skills/daily-news/references/design-system.md
 5. Read the widget-isolation contract:
    skills/daily-news/references/widget-isolation.md
-6. Write the HTML to {{output_path}} following the archetype's H2
+6. **Read the widget cookbook entry point**:
+   skills/daily-news/references/widget-cookbook/INDEX.md
+7. **Read mandatory cookbook files**:
+   - skills/daily-news/references/widget-cookbook/tier-3-principles.md
+   - skills/daily-news/references/widget-cookbook/anti-examples.md
+8. **Pick widgets from the cookbook**:
+   - exactly 1 Tier-1 template as the post's hero widget
+   - 2-4 Tier-2 snippets for supporting widgets
+   - Read the detail pages for the picked Tier-1 and Tier-2 entries
+   - In scratch (not the file), write a widget plan: each widget's
+     conceptual question + the picked template/snippet + the
+     data/state it operates on. If you cannot write a conceptual
+     question for a widget, drop it.
+9. Write the HTML to {{output_path}} following the archetype's H2
    sequence, widget budget, and closer label. Use the design-system
-   colors + typography. Inline SVG widgets MUST be ID-scoped per
-   widget-isolation rules.
-7. Write the sidecar to {{sidecar_path}} per the schema in
-   references/archetypes.md § Sidecar spec. `sources[]` MUST include
-   EVERY variant_url, not just the primary.
-8. Report back: path written, character count, archetype deviations
-   (if any) with reasoning.
+   colors + typography. Each widget MUST have a `.vg-w-<widget-id>`
+   class prefix on its root element.
+10. Write the sidecar to {{sidecar_path}} per the schema in
+    references/archetypes.md § Sidecar spec. `sources[]` MUST include
+    EVERY variant_url. Sidecar MUST include `widget_count`,
+    `widget_questions`, and `widget_templates` fields.
+11. Report back: path written, character count, archetype deviations
+    (if any) with reasoning, widget count, and widget templates used.
 
 ## Hard rules
 
-- 600-1200 lines of HTML.
+- **Prose ≥ 500 lines** (HTML inside `<p>`, `<h2>`, etc.). Widget
+  markup inside `<script>`, `<style>`, `<svg>`, `<canvas>` does NOT
+  count against the prose budget. The previous "600-1200 lines of
+  HTML" rule caused sub-agents to skimp on widget code; that rule is
+  removed.
+- **≥ 3 widgets total**. ≥ 1 must be a Tier-1 (interactive) hero
+  widget — that is, the widget includes at least one of: `<script>`
+  (interactive logic), `<input>` (user input), `<canvas>` (loop), or
+  scroll-driven CSS (`animation-timeline: scroll()`).
+- **Each widget carries a conceptual question** recorded in the
+  sidecar's `widget_questions` array (one entry per widget).
 - Persona invariants: `——` (CJK double em-dash) not `—`; `：` (CJK
   colon) not `:` in prose.
-- Inline SVG widgets ID-scoped (id pattern: `vg-{{news-id}}-{{purpose}}`).
+- Each widget has its `.vg-w-<widget-id>` class prefix. IDs inside
+  the widget are prefixed with the widget id (see widget-isolation
+  Rule 2).
 - ONLY tools: WebFetch, Read, Write. No Bash, no Edit on other days'
   posts, no Agent (no nested dispatch), no git operations.
 - Do NOT read past posts; the parent already handled dedup in Step 3.
@@ -62,7 +88,10 @@ Return a status block:
 - output_path: <path>
 - sidecar_path: <path>
 - char_count: <number>
+- prose_line_count: <number>  (excludes <script>, <style>, <svg>, <canvas>)
 - archetype: <name>
+- widget_count: <number>
+- widget_templates: <list of cookbook ids used>
 - archetype_deviations: <list or "none">
 - concerns: <list or "none">
 ````
