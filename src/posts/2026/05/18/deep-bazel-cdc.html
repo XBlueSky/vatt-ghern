@@ -8,7 +8,7 @@
 
   <p>這篇從演算法骨架往實作細節走：先看 rolling hash 為什麼能讓「內容前段插入一個 byte」不會位移後續所有 chunk；接著看 FastCDC 的 normalization 怎麼把切點的幾何分布縮緊到一個窄帶；再轉到 BuildBuddy 為何把 2 MiB 設為啟用門檻、Bazel 的 CAS（content-addressable storage）怎麼用 chunk digest 把原始 blob 串回來；最後看 production 數字、以及什麼樣的 build 會讓 CDC 退化成噪音。每一段都對應一個可以調整或翻轉的參數，懂了參數，就懂了 40% 的邊界在哪。</p>
 
-  <p>讀這篇之前最好先有兩個前置認識。第一，Bazel 的 remote cache 不是一個 blob store——它是 Action Cache 與 Content-Addressable Storage 兩層分離的設計，這套分離給了 CDC 一個天然的接點：CDC 只動 CAS 的儲存策略，不碰 Action Cache 的語意。第二，content-defined chunking 本質上是個老技術——rsync 在 90 年代末就用過，現代 FastCDC 是其加速版。但「把 CDC 落地到 build system 的 cache 層」是新東西，原因不是技術困難，而是要找到剛好「值得 chunk 的 blob 比例」與「能維持 protocol 兼容」的甜蜜點。BuildBuddy 顯然在內部跑了多輪 parameter sweep 才把 2 MiB 門檻與 19-bit mask 鎖定下來，這篇就是反推這些參數的依據。</p>
+  <p>讀這篇之前最好先有兩個前置認識。第一，Bazel 的 remote cache 是 Action Cache 與 Content-Addressable Storage 兩層分離的設計，CDC 只動 CAS 的儲存策略，不碰 Action Cache 的語意。第二，content-defined chunking 本身是老技術（rsync 90 年代末就用過），FastCDC 是其加速版；「把 CDC 落地到 build system 的 cache 層」是新東西。BuildBuddy 顯然跑了多輪 parameter sweep 才把 2 MiB 門檻與 19-bit mask 鎖定，這篇就是反推這些參數的依據。</p>
 
   <h2>rolling hash 與 gear-based boundary detection</h2>
 
@@ -20,7 +20,7 @@
 
   <p>G 表本身怎麼產出？FastCDC paper 與多數實作都用 PRNG 預生成 256 個 64-bit 整數，種子固定——重點不是隨機性「好」，而是兩件事：第一，所有部署的 client 與 server 必須用同一張 G 表，否則 chunk 邊界不會對齊、跨 client 的 dedup 直接失效；第二，G 表的 bit 應該足夠「平均」——每個 bit 在 256 個 entry 裡大約一半為 0 一半為 1，避免某些 bit 永遠是 0 造成 mask 命中機率扭曲。BuildBuddy 沒有公開他們的 G 表，但 Restic、borg、casync 用的是 paper 附錄的 reference table——這在開源 CDC 生態裡形成了事實 standard。如果未來 BuildBuddy 要跟外部工具互通 dedup（例如把 CAS 對接到 Restic backup），G 表的一致性會是第一個要對齊的東西。</p>
 
-  <p>為什麼是 Gear hash 而不是 Rabin？這是 BuildBuddy 沒明寫但對工程師關鍵的選擇。Rabin fingerprint 用多項式 mod 在 GF(2) 上做 rolling，每 byte 需要兩次表查、一次 XOR、一次 shift——CPU 預算大約 3.5 ns/byte。Gear hash 只一次 shift、一次表查、一次加法——大約 0.9 ns/byte。對 cache server 來說這是直接的 ingress 容量差：以 BuildBuddy hosted backend 的規模（尖峰每秒幾 GB），把 chunking CPU 砍掉四分之三等於把同一台機器的處理能力翻倍。第二個原因是 Rabin 的「視窗滑出」需要顯式維護一個 ring buffer 記錄 W byte，而 Gear hash 的 shift-out 是隱式的（被新 byte 的 shift 擠掉），實作短、cache line 命中也好——這在 hot loop 裡是看得到的差距。</p>
+  <p>為什麼是 Gear hash 而不是 Rabin？Rabin fingerprint 每 byte 約 3.5 ns，Gear hash 約 0.9 ns，差約四倍。Gear hash 的視窗滑出由 shift 隱式處理，不必維護 ring buffer，hot loop 更短。</p>
 
   <figure>
     <svg class="vg-w-arch-bazel-cdc-boundary" viewBox="0 0 880 320" role="img"
@@ -332,7 +332,7 @@ fn split(input):
 
   <p>Normalization 的 dedup 影響值得再說清楚。乍看之下「同一個位置可能用 strict 也可能用 loose mask」聽起來會破壞 dedup——但其實不會，因為 mask 的選擇由「當前 chunk 已累積長度」決定，而長度由「上一個切點位置」決定，上一個切點由前面內容決定。內容相同的兩個檔案，前面切到同一個位置，後面當然走同樣的 mask 決策——一切都是內容驅動。Normalization 沒有引入額外的隨機性，只是把「平均切點密度」做成 chunk 內部的位置函數。</p>
 
-  <p>相較於 Rabin fingerprint 的 CDC（rsync、restic 早期版本），FastCDC 借了什麼、發明了什麼？借的是 rolling-hash + mask test 這個整體結構——Rabin 早就在用。Gear hash 本身也不是 FastCDC 發明，它的雛形在更早的論文裡出現過。FastCDC 真正的貢獻是兩件事：第一，把 Gear hash 跟 chunking 場景結合，量出它比 Rabin 快 3-5 倍；第二，提出 normalization——讓 chunk size 從幾何分布變窄帶常態。restic 後續加了類似的 size guard 但沒有 dual-mask 設計，borgbackup 用的是 buzhash（另一種 rolling hash）但 chunk size 仍是幾何尾巴。BuildBuddy 把這兩個 FastCDC 創新整套搬進 Bazel CAS 路徑，並沒有再發明新演算法——他們的工程貢獻在「把學術 paper 嵌進 production protocol」，這比演算法本身難。</p>
+  <p>相較於 rsync、restic、borgbackup 等早期 CDC，FastCDC 借的是 rolling-hash + mask test 的整體結構，真正貢獻在兩件事：把 Gear hash 跟 chunking 場景結合（比 Rabin 快 3-5 倍）、提出 normalization 讓 chunk size 從幾何分布變窄帶常態。BuildBuddy 把這兩個 FastCDC 創新整套搬進 Bazel CAS 路徑，工程貢獻在「把學術 paper 嵌進 production protocol」。</p>
 
   <p>下面這個 widget 把 FastCDC 的 pipeline 拆成五個 stage，每一個是「rolling hash 一個位置」會經過的判斷：先 update hash，再看 chunk 已累積長度落在哪個區段，挑對應的 mask，做 mask test，命中就 emit chunk、重置狀態。點任一 stage 看它在做什麼。</p>
 
@@ -686,9 +686,7 @@ fn upload_blob(blob):
 
   <p>絕對值更直觀：兩週累積跳過約 300 TiB 重複 chunk，尖峰時段每小時節省超過 4 TiB。對於 monorepo 與 CI 高度依賴 remote cache 的團隊，這直接折算成 S3 / GCS 出口流量帳單；對於 self-hosted 的 remote cache，則是磁碟採購節奏的延後。BuildBuddy 自己負擔的是「我們的 hosted cache backend 出口帳單」，這個數字省下來直接落到 margin。</p>
 
-  <p>把 300 TiB 拆開來算更有感：兩週 14 天大約 336 小時，平均每小時 ~900 GiB、每秒 ~250 MiB 的「本來要傳但被跳過的 byte」。AWS 跨可用區出口大約 USD 0.01/GiB、跨 region 大約 USD 0.02/GiB——光帳單就省下 USD 6,000–12,000 兩週的網路成本，更不算 S3 PUT 計費與 storage class 折扣。對 BuildBuddy 規模這是直接落到 P&L 的數字；對自架 BuildBuddy 的客戶（例如 Stripe、Snap 這類大型 Bazel user）則是 NAS 採購延後幾個月，邊際效益更高。</p>
-
-  <p>Benchmark 的「50 個 commit」設計值得展開一下。對單一 commit 的 build cache miss 是 100%——這時候 CDC 沒幫助（沒有先前的 chunk 可以命中）。Benefit 從第二個 commit 開始累積：相同的 link 輸出、相同的 archive、相同的 deploy bundle 在連續 commit 之間 byte-stable，CDC 把這些 byte-stable 部分當成 chunk-level dedup 目標。50 個 commit 的累積，這個 benefit 趨近一個穩定值——40% 就是 BuildBuddy 自家 repo 在這個 workload 下的穩態。其他 repo 的數字會浮動：byte-stability 越好（reproducible build、minimal incidental change）的 repo 數字越漂亮。</p>
+  <p>Benchmark 的「50 個 commit」設計值得展開一下。對單一 commit 的 build cache miss 是 100%——這時候 CDC 沒幫助（沒有先前的 chunk 可以命中）。Benefit 從第二個 commit 開始累積：相同的 link 輸出、相同的 archive、相同的 deploy bundle 在連續 commit 之間 byte-stable，CDC 把這些 byte-stable 部分當成 chunk-level dedup 目標。50 個 commit 的累積，這個 benefit 趨近一個穩定值——40% 就是 BuildBuddy 自家 repo 在這個 workload 下的穩態。</p>
 
   <p>另一個值得注意的數字：85% 的 written-bytes dedup。這指的是 cache 服務寫入路徑上，「本來要寫入 cache 的 chunk」之中有多少其實已經存在、被跳過。85% 是極高的數字——這個比例說明 BuildBuddy 自家 repo（與類似的客戶 repo）的 build output 大多數 byte 在不同 commit 之間其實沒變，CDC 把這個事實兌現成 cache 寫入的 IOPS 與磁碟空間節省。20-40% 的 cache traffic 比例則涵蓋讀寫兩側，且把 4.2% 以下的小檔案（不經 CDC）也算進來——所以數字比 85% 低，但仍然是兩位數的整體改善。</p>
 
@@ -712,15 +710,11 @@ fn upload_blob(blob):
 
   <p>對前三點，有解。第一點：強制 reproducible build（Bazel 文件有完整的 `--repo_env`、`--action_env` 清單去除 timestamp）。第二點：穩定 linker 的 section 順序（lld 的 `--no-rosegment`、ld 的 `--no-keep-memory` 之類旗標）。第三點：把壓縮這一步從 cache 路徑挪出去——cache 大檔案的 uncompressed 版本，壓縮在 download 之後 client 端做。第四、五點本質上是 trade-off：要 release-grade obfuscation 或要 CDC dedup，二選一。</p>
 
-  <p>另一類退化情境是「極小或極高隨機性內容」。CDC 在 byte 完全隨機的 stream 上仍然能切——Gear hash 與 mask 還是會在某些位置命中——但切出來的 chunk 各自獨立、跟其他檔案不會有重疊，dedup ratio 接近 0。對加密過的 blob（例如 GPG-signed artifact、TLS-wrapped layer）這是 by-design：加密的目的就是讓 byte 看起來像隨機，CDC 沒辦法、也不該對加密 byte 找 pattern。實務上的處理是：在 build pipeline 把「待加密的原始 bytes」cache 起來、加密這一步放在 download 之後，跟壓縮一樣的策略。</p>
-
-  <p>還有一個微妙的失敗模式：「chunk 邊界對齊的 worst case」。如果 build 系統的修改恰好總是落在「跨多個連續 chunk 的位置」（例如有個寫死的偏移量在檔案中段被改），那 dedup 命中率會比平均差。FastCDC 的 mask 機率分布在「修改點在 chunk 內」與「修改點在 chunk 邊界」之間其實有差，前者只影響 1 個 chunk，後者影響 2 個。對 200 chunk 的 blob，這個差別在 single-insert 場景是 0.5% vs 1%——可以忽略；但對「每次 commit 都在同一個位置改」的反常 workload，這 1% 會穩定吃掉一部分節省。BuildBuddy production 數字（40% upload reduction）已經對這類 worst case 平均過——對個別 repo 可能更好也可能更差。</p>
-
-  <p>有一個 production 上實際看到、但 BuildBuddy blog 沒明寫的細節：CDC 對「rebuild from scratch」的 cold cache 場景沒有任何幫助——cache 是空的，第一次 build 不管切多少 chunk 都得全部上傳。CDC 的 benefit 完全來自「跟先前 build 的 chunk 重疊」這件事。所以對「每次 CI build 都 fresh clone + build」的團隊，CDC 的 benefit 在第一個 build 之後才開始累積。但「持續性 cache」（remote cache 跨 build 持續，例如 GitHub Actions cache 或自架 BuildBuddy）是 CDC 的甜蜜點——這也是 BuildBuddy 把 CDC 設成 default-on 候選的場景假設。</p>
+  <p>還有一個 cold-cache 限制：CDC 對「rebuild from scratch」沒有任何幫助——cache 是空的，第一次 build 不管切多少 chunk 都得全部上傳。Benefit 完全來自「跟先前 build 的 chunk 重疊」，所以「持續性 cache」（remote cache 跨 build 持續）才是 CDC 的甜蜜點。加密過的 blob 也是 by-design 的退化區——加密讓 byte 看起來像隨機，CDC 找不到 pattern；處理方式是把加密步驟挪到 cache 之後。</p>
 
   <p>還有一個操作細節：`--experimental_remote_cache_chunking` 是 Bazel 8.7 / 9.1+ 才有的旗標。對較舊 Bazel 版本，BuildBuddy 仍然能 serve cache，但 client 不會做 chunking——這是個漸進升級路徑，不需要強迫整個 org 同步升級 Bazel。Hosted cache backend 已經啟用 chunking 的話，舊 client 寫入仍是整檔 blob（不做 chunking），新 client 寫入會做 chunking——兩種 blob 在 CAS 上共存，read 路徑自動分辨（透過 reconstruction metadata 是否存在）。這個漸進性是 Bazel remote-cache protocol 的相容性設計給了空間。</p>
 
-  <p>最後一個值得記住的事實：CDC 不是 BuildBuddy 發明的——FastCDC paper 在 2016 年就發表了，Restic、borgbackup、rsync 的 newer 版本都用類似機制。把 FastCDC 帶進 Bazel cache 的真正貢獻不在演算法本身，而在「把這個機制 wire 進 Bazel 的 CAS protocol、保持 blob digest identity 不變、給出 production-grade 的 4.2% / 85% / 40% / 300 TiB 證據」——這是工程上難的部分。對其他 build system（Buck2、Pants、Nix）的維護者來說，這套參數與門檻是直接可借鑑的基線。Nix 的 store 本來就是 content-addressed，但顆粒度是整個 derivation output（通常一個目錄 tar 起來）；Buck2 的 RE protocol 跟 Bazel 共用 REAPI，理論上同一套 CDC 邏輯可以原樣搬過去。預期接下來 12-18 個月會看到至少一兩個 build system 跟進這個方向。</p>
+  <p>最後一個值得記住的事實：CDC 不是 BuildBuddy 發明的——FastCDC paper 在 2016 年就發表了。把 FastCDC 帶進 Bazel cache 的真正貢獻不在演算法本身，而在「把這個機制 wire 進 Bazel 的 CAS protocol、保持 blob digest identity 不變、給出 production-grade 的 4.2% / 85% / 40% / 300 TiB 證據」——這是工程上難的部分。</p>
 
   <p class="vg-deep-closer"><strong>What this enables</strong>：把 dedup 從「整檔 digest 比對」拉到「sub-file rolling-hash chunk 比對」，讓 Bazel 在每次源碼小變動時，只為真正新出現的 byte 付儲存與網路成本——前提是 build 本身已經是 byte-reproducible 的。</p>
 </div>
