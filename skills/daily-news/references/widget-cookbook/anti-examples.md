@@ -39,6 +39,29 @@ Adds no information. Slows perceived load. Delete.
 If the prose belongs in the post, just write it inline. If it doesn't,
 delete it. "Click to reveal" without a conceptual reason is filler.
 
+### A4. HTML `<label>` wrapping an SVG `<rect>`
+
+```html
+<svg viewBox="0 0 480 200">
+  <label for="my-radio">
+    <rect class="box" x="20" y="60" width="120" height="80" />
+    <text x="80" y="105">Router</text>
+  </label>
+</svg>
+```
+
+**SVG does not recognise the HTML `<label>` element.** Inside `<svg>`,
+`<label>` is treated as an unknown element, the wrapped `<rect>`
+becomes a layout orphan with `getBoundingClientRect()` returning
+0×0 — the box is silently invisible. CSS still resolves (`fill`,
+`stroke`), the DOM still exists, but nothing is painted. This bug
+fails silently — there is no console warning. The only way to catch
+it is a visual check (Playwright self-review in Step 8.5).
+
+Use the `data-target` + tiny JS handler pattern instead. See
+`tier-1-golden/annotated-diagram-walkthrough.md` for the SVG-safe
+working template.
+
 ## B. Repetition without contrast
 
 ### B1. Three near-identical bar charts
