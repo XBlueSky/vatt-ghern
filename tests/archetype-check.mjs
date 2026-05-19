@@ -243,11 +243,30 @@ function readSidecarRaw(htmlPath) {
   try { return JSON.parse(readFileSync(sidecarPath, "utf8")); } catch { return null; }
 }
 
+function extractPostBody(html) {
+  const openTag = /<div\s+class="vg-post-body"\s*>/;
+  const openMatch = html.match(openTag);
+  if (!openMatch) return html; // fallback: scan whole html (shouldn't happen for deep-stories)
+  const start = openMatch.index + openMatch[0].length;
+  // Find the closing aside (deterministic landmark in post.njk)
+  const asideIdx = html.indexOf('<aside class="vg-bards-note"', start);
+  if (asideIdx < 0) return html.slice(start); // fallback: rest of file
+  // Walk backwards from aside to find the </div> that closes vg-post-body
+  const closeIdx = html.lastIndexOf("</div>", asideIdx);
+  if (closeIdx < start) return html.slice(start, asideIdx);
+  return html.slice(start, closeIdx);
+}
+
 function checkWidgetContract(path, html) {
   if (!isWidgetContractActive(path)) return; // legacy mode
 
+  // Scope widget-contract checks to the post-body region only. Layout chrome
+  // (JSON-LD, theme pre-paint, vg-progress, read-tracker) sits outside
+  // .vg-post-body and would otherwise trip the IIFE / external-src bans.
+  const body = extractPostBody(html);
+
   // 1. Widget count: ≥ 3 elements with class="vg-w-*"
-  const widgetMatches = [...html.matchAll(/class="[^"]*\bvg-w-[a-z0-9-]+/g)];
+  const widgetMatches = [...body.matchAll(/class="[^"]*\bvg-w-[a-z0-9-]+/g)];
   // Deduplicate by capturing the actual class names per element root.
   const widgetClasses = new Set();
   for (const m of widgetMatches) {
@@ -259,10 +278,10 @@ function checkWidgetContract(path, html) {
   }
 
   // 2. At least 1 widget must be interactive
-  const hasScript = /<script\b/.test(html);
-  const hasInput = /<input\b/.test(html);
-  const hasCanvas = /<canvas\b/.test(html);
-  const hasScrollTimeline = /animation-timeline:\s*scroll\(/.test(html);
+  const hasScript = /<script\b/.test(body);
+  const hasInput = /<input\b/.test(body);
+  const hasCanvas = /<canvas\b/.test(body);
+  const hasScrollTimeline = /animation-timeline:\s*scroll\(/.test(body);
   if (!(hasScript || hasInput || hasCanvas || hasScrollTimeline)) {
     violations.push(`${path}: widget contract requires ≥ 1 interactive widget (<script>, <input>, <canvas>, or animation-timeline: scroll())`);
   }
@@ -289,6 +308,8 @@ function checkWidgetContract(path, html) {
 
   // 4. Prose line count ≥ 500
   // Strip <script>, <style>, <svg>, <canvas> blocks and count remaining lines.
+  // (Uses full html — including a small amount of layout chrome — because the
+  // threshold is a floor for substance, not a ceiling.)
   const stripped = html
     .replace(/<script[\s\S]*?<\/script>/g, "")
     .replace(/<style[\s\S]*?<\/style>/g, "")
@@ -300,25 +321,25 @@ function checkWidgetContract(path, html) {
   }
 
   // 5. Inline <script src=...> is banned
-  if (/<script[^>]+\bsrc=/.test(html)) {
+  if (/<script[^>]+\bsrc=/.test(body)) {
     violations.push(`${path}: external <script src=...> is banned in widget contract`);
   }
 
   // 6. Inline <script> blocks must be IIFE
-  for (const m of html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/g)) {
-    const body = m[1].trim();
-    if (body.length === 0) continue;
+  for (const m of body.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/g)) {
+    const scriptBody = m[1].trim();
+    if (scriptBody.length === 0) continue;
     // Allow forms: (function () {...})(); (() => {...})(); (async () => {...})(); (async function () {...})();
     const iifeOpeners = /^\(\s*(async\s+)?(function\s*\(|\(\s*\)\s*=>|[^)]*=>)/;
-    if (!iifeOpeners.test(body)) {
-      const snippet = body.slice(0, 60).replace(/\n/g, " ");
+    if (!iifeOpeners.test(scriptBody)) {
+      const snippet = scriptBody.slice(0, 60).replace(/\n/g, " ");
       violations.push(`${path}: inline <script> must be IIFE-wrapped (starts with: "${snippet}")`);
     }
   }
 
   // 7. Post-level <style> blocks must have every rule scoped to .vg-w-*
   // Detect <style> blocks that exist OUTSIDE any <svg> by stripping <svg>...</svg> first.
-  const noSvg = html.replace(/<svg[\s\S]*?<\/svg>/g, "");
+  const noSvg = body.replace(/<svg[\s\S]*?<\/svg>/g, "");
   for (const m of noSvg.matchAll(/<style\b[^>]*>([\s\S]*?)<\/style>/g)) {
     const block = m[1];
     // Split on '}' to get rule list (rough). Each rule has a selector portion before '{'.
