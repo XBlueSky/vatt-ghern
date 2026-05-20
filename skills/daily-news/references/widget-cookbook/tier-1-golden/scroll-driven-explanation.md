@@ -115,7 +115,7 @@ state change?"
       // because the shorter viewport otherwise leaves no stage active mid-scroll.
       // See tier-3-principles §12.1.E.
       const isMobile = window.matchMedia('(max-width: 720px)').matches;
-      const rootMargin = isMobile ? '-25% 0px -25% 0px' : '-40% 0px -40% 0px';
+      const rootMargin = isMobile ? '-50% 0px -40% 0px' : '-40% 0px -40% 0px';
       const io = new IntersectionObserver((entries) => {
         for (const e of entries) {
           if (e.isIntersecting) show(e.target.dataset.stage);

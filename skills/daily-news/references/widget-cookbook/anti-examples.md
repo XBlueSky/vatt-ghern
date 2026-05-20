@@ -238,7 +238,7 @@ Use viewport-relative rootMargin via `matchMedia`:
 
 ```js
 const isMobile = window.matchMedia('(max-width: 720px)').matches;
-const margin = isMobile ? '-25% 0px -25% 0px' : '-40% 0px -40% 0px';
+const margin = isMobile ? '-50% 0px -40% 0px' : '-40% 0px -40% 0px';
 ```
 
 See tier-3-principles §12.1.E.

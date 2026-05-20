@@ -110,7 +110,7 @@ needs a widget shape that none of the 5 Tier-1 templates produce, write a
 custom widget and STILL record a conceptual question for it. Free shape
 > forced fit. (Same principle as `freeform` archetype.)
 
-## 10. Test in dark mode + mobile
+## 10. Test in dark mode + mobile + keyboard
 
 Before declaring a widget done, mentally verify:
 
@@ -118,6 +118,28 @@ Before declaring a widget done, mentally verify:
 - Does the widget reflow / clip gracefully at 375px viewport?
 - Are tap targets ≥ 32px square on mobile?
 - Does the widget make sense without colour (colour-blind reader)?
+- **Keyboard a11y**: every clickable element (SVG `<rect>`, `<g>` with click
+  handler, any non-native interactive) must have `role="button"`,
+  `tabindex="0"`, `aria-label`, AND a `keydown` listener that triggers the
+  same click action on Enter/Space. SVG elements aren't keyboard-accessible
+  by default — without these four, sighted-mouse-only readers work, but
+  keyboard / screen-reader users can't interact at all.
+
+Example for an SVG clickable `<rect>`:
+
+```html
+<rect class="component" data-target="…-r1" role="button" tabindex="0" aria-label="select Router" x="…" y="…" width="…" height="…" />
+```
+
+```js
+rect.addEventListener('click', () => { /* set radio.checked */ });
+rect.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' || e.key === ' ') {
+    e.preventDefault();
+    rect.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  }
+});
+```
 
 The Step 8.5 Playwright self-review catches some of this, but the author
 should catch it first.
@@ -283,7 +305,7 @@ relative units that scale:
 
 ```js
 const isMobile = window.matchMedia('(max-width: 720px)').matches;
-const margin = isMobile ? '-25% 0px -25% 0px' : '-40% 0px -40% 0px';
+const margin = isMobile ? '-50% 0px -40% 0px' : '-40% 0px -40% 0px';
 const io = new IntersectionObserver(callback, { rootMargin: margin, threshold: 0 });
 ```
 
