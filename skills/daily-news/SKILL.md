@@ -855,7 +855,7 @@ A successful run produces:
   reduced from intended N by Step 7.5 Blocking drops)
 - One git branch `daily/YYYY-MM-DD` pushed to origin
 - One PR open against `main` with the body template above filled in,
-  including the four Step 7.5 content-quality sections
+  including the five Step 7.5 content-quality sections
 
 ## Why this is split across multiple references
 
