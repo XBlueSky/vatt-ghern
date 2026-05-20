@@ -392,9 +392,16 @@ The sidecar contract is unchanged:
 
 Issue all ≤3 dispatches in ONE response (single message containing
 multiple `Agent` tool blocks). Each dispatch uses
-`subagent_type: general-purpose` and passes the brief from Step 7a as
-the prompt — see `references/deep-story-brief.md` for the exact
-markdown template each sub-agent receives.
+`subagent_type: general-purpose` with **`model: "opus"` required** —
+author writing is a design-grade judgment task (archetype selection,
+H2 structuring, opener/closer crafting, material density), not
+mechanical pattern-matching. Default sub-agent model selection
+(cheap) is wrong here. If Opus is not available at dispatch time,
+report BLOCKED rather than fall back to a cheaper model — the routine
+should produce no PR rather than a PR of unknown calibration. The
+brief from Step 7a is passed as the prompt — see
+`references/deep-story-brief.md` for the exact markdown template
+each sub-agent receives.
 
 Sub-agents run concurrently; the parent waits for all to return before
 proceeding to Step 7c.
@@ -458,8 +465,14 @@ looks at story arc, hook strength, or whether H2s are template-shaped.
 
 For each post produced in Steps 6 + 7 (1 roundup + N deep-stories,
 max 3), dispatch **2 independent reviewer sub-agents** with
-`subagent_type: general-purpose`. Each reviewer's brief follows the
-template in
+`subagent_type: general-purpose` and **`model: "opus"` required**.
+Reviewer quality judgment (Axis 2 structural coherence, Axis 4 depth
+vs. paraphrase, Axis 6 anti-template) is a design-grade task. Running
+reviewer on the same model family as author also produces LLM-judging-LLM
+bias — using Opus widens the judgment-power gap when author defaults
+to Sonnet, and preserves judgment depth when author is also Opus. If
+Opus is unavailable at dispatch time, report BLOCKED rather than fall
+back. Each reviewer's brief follows the template in
 `${CLAUDE_PLUGIN_ROOT}/skills/daily-news/references/content-reviewer-brief.md`
 with the per-post values substituted.
 
@@ -506,9 +519,9 @@ original brief (from Step 7a — held by parent) PLUS:
   widget content (most prose findings should not touch widgets)
 
 Parent dispatches retry author sub-agents in parallel (one per post
-needing retry). After all retries return, re-dispatch the dual
-reviewers (Step 7.5a) for each retried post; consolidate again
-(Step 7.5b).
+needing retry) — **same `model: "opus"` requirement as Step 7b**.
+After all retries return, re-dispatch the dual reviewers (Step 7.5a,
+also Opus) for each retried post; consolidate again (Step 7.5b).
 
 Iteration budget per post:
 - **BLOCKING**: up to 5 retry rounds. If still BLOCKING after 5 →
@@ -531,7 +544,8 @@ roundup's blocking axes.
 
 After all per-post retries settle, count the number of deep-stories
 still in the batch (`N_final`). If `N_final >= 2`, dispatch ONE
-inter-post reviewer sub-agent with the inter-post brief variant from
+inter-post reviewer sub-agent (**`model: "opus"` required**, same
+rationale as Step 7.5a) with the inter-post brief variant from
 `content-reviewer-brief.md`. It scores Axis 7 only.
 
 If `batch_score < 7`:
@@ -539,8 +553,9 @@ If `batch_score < 7`:
 2. Construct a retry brief: original brief + "find another angle"
    instruction + the inter-post reviewer's justification on what
    makes this post too-similar-to-others.
-3. Dispatch one retry author sub-agent for that post.
-4. Re-dispatch the inter-post reviewer.
+3. Dispatch one retry author sub-agent for that post (Opus, per
+   Step 7b).
+4. Re-dispatch the inter-post reviewer (Opus, per above).
 5. Up to 2 inter-post retry rounds. If still `batch_score < 7`
    after round 2, accept and log to
    `## Inter-post diversity concerns`.

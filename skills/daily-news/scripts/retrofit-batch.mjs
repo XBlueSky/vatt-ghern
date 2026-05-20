@@ -59,6 +59,10 @@ const briefs = paths.map((p) => {
     sidecar_path: p.replace(/\.html$/, ".11tydata.json"),
     archetype: f.archetype,
     domain: f.domain,
+    dispatch_note:
+      "Dispatch this brief with model: \"opus\" required. Author writing " +
+      "is a design-grade judgment task per SKILL.md Step 7b. Do NOT fall " +
+      "back to a cheaper model — report BLOCKED instead.",
     brief: [
       `You are RETROFITTING an existing daily-deep-story for vatt'ghern.`,
       ``,
