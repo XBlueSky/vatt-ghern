@@ -38,7 +38,7 @@ state change?"
       .vg-w-scroll-EXAMPLE { grid-template-columns: 1fr; }
       .vg-w-scroll-EXAMPLE .figure-sticky {
         position: sticky;
-        top: 0;
+        top: var(--vg-header-h);
         order: -1;             /* move figure above stages */
         max-height: 55vh;
         background: var(--bg);
