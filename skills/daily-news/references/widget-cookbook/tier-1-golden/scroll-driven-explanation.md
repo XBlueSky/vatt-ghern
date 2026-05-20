@@ -36,7 +36,17 @@ state change?"
     .vg-w-scroll-EXAMPLE svg { width: 100%; height: auto; }
     @media (max-width: 720px) {
       .vg-w-scroll-EXAMPLE { grid-template-columns: 1fr; }
-      .vg-w-scroll-EXAMPLE .figure-sticky { position: static; }
+      .vg-w-scroll-EXAMPLE .figure-sticky {
+        position: sticky;
+        top: 0;
+        order: -1;             /* move figure above stages */
+        max-height: 55vh;
+        background: var(--bg);
+        z-index: 1;
+        padding: var(--s-2) 0;
+        margin-bottom: var(--s-2);
+      }
+      .vg-w-scroll-EXAMPLE .figure-sticky svg { max-height: 50vh; }
     }
   </style>
 

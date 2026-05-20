@@ -177,30 +177,49 @@ Fixed `width` and `height` attributes ignore mobile. Use
 If the only way to read a widget's data is to hover over a tooltip, mobile
 users lose. Either provide tap-to-toggle, or label the data inline.
 
-### F4. `position: sticky` figure in 2-column grid without mobile fallback
+### F4. `position: sticky` in 2-col grid, mobile collapses to "figure at bottom"
 
 ```css
 .vg-w-foo { display: grid; grid-template-columns: 1fr 1fr; }
 .vg-w-foo .figure-sticky { position: sticky; top: 32px; }
-/* … no @media query to undo sticky at mobile */
+@media (max-width: 720px) {
+  .vg-w-foo { grid-template-columns: 1fr; }
+  .vg-w-foo .figure-sticky { position: static; }   /* still wrong */
+}
 ```
 
-Desktop layout `[prose | sticky figure]` works fine. At mobile the grid
-collapses to single column, but the sticky stays on — it now creates dead
-space below each prose section because the figure is no longer beside
-anything. The reader scrolls 1000px of prose with an invisible figure
-glued to the wrong place.
+Desktop layout `[prose | sticky figure]` works. At mobile the grid
+collapses to single column. DOM order is usually `.stages` then
+`.figure-sticky`, so dropping sticky puts the figure *underneath* all
+the stage prose — the reader has to scroll past 1000px of "stage 1...
+stage 2... stage 3..." prose before they see any of the figure that
+those stages were referring to. By the time they reach the figure,
+the prose is out of viewport and the scroll-driven IntersectionObserver
+is no longer firing on anything visible. The whole scroll-driven
+mechanism becomes pure decoration on mobile.
 
-Always pair sticky with mobile fallback:
+**Right pattern**: at mobile, pin the figure to the *top* of the
+viewport with `order: -1` so it lifts above the stages, and cap its
+height to ~50vh so the prose underneath still has room:
 
 ```css
 @media (max-width: 720px) {
   .vg-w-foo { grid-template-columns: 1fr; }
-  .vg-w-foo .figure-sticky { position: static; }
+  .vg-w-foo .figure-sticky {
+    position: sticky;
+    top: 0;
+    order: -1;
+    max-height: 55vh;
+    background: var(--bg);
+    z-index: 1;
+    padding: var(--s-2) 0;
+  }
+  .vg-w-foo .figure-sticky svg { max-height: 50vh; }
 }
 ```
 
-See tier-3-principles §12.1.B.
+This is the standard scrollytelling pattern (Distill, Pudding, NYT
+Interactive). See tier-3-principles §12.1.B for the full version.
 
 ### F5. `IntersectionObserver` rootMargin -40% on mobile (scroll-driven inert)
 
