@@ -7,7 +7,7 @@
 
 <p><span class="vg-dropcap">這</span>是一份標準的 Elixir 服務遷上 Kubernetes 的部署，按照變更紀錄上的描述「沒什麼新鮮事」——直到 12:13 PDT 那一刻，那份 manifest 把 us-east1-b 區的 sessions service pod 副本數壓到只剩一半，安全機制還沒來得及把記憶體裡的 GenServer 狀態交棒出去，pod 就先被排程器殺掉了。</p>
 
-<p>Discord 的工程師 Bo Ingram 與 Stephen Birarda 在事後報告開頭引了一個很久沒聽到的比喻：「The sad trombone haunts our dreams. Womp, womp, womp...」這不是文采上的修飾。任何人經歷過一次連續切了三波 rollback 都失敗的當班，都會明白那種聲音在腦中揮之不去的感受——你看著儀表板上 mailbox 曲線從 0 萬一路漲到 100 萬，你的指令照理說該讓它下來，但它就是不動，或者跌一下又被新湧進來的流量打回去。這一篇就是把那 3 小時 17 分鐘裡，每一步發生了什麼、為什麼前三次救火沒用、第四次又為什麼救得起來、後續結構性的修補拼成什麼樣，按時間順序復現一次。</p>
+<p>Discord 的工程師 Bo Ingram 與 Stephen Birarda 在事後報告開頭引了一個很久沒聽到的比喻：「The sad trombone haunts our dreams. Womp, womp, womp...」這不是文采上的修飾——你看著儀表板上 mailbox 曲線從 0 萬一路漲到 100 萬，指令照理該讓它下來，但它就是不動，或者跌一下又被新湧進來的流量打回去。這一篇按時間順序復現那 3 小時 17 分鐘，並把前三次救火失敗、第四次成功、後續結構修補的邏輯拼回去。</p>
 
 <h2>一份誤設的 manifest——故事從這裡長出來</h2>
 
@@ -17,105 +17,136 @@
 
 <p>這個變更發生在 Discord 正在把 Elixir 服務逐步搬上 Kubernetes 的過程中。當時的目標是讓 sessions service——也就是負責管理「每一個使用者裝置 ↔ 連線」對應關係的核心服務——能享受 horizontal pod autoscaler 與滾動更新的好處。</p>
 
-<p>把 sessions service 搬上 Kubernetes 是合理的工程決定。每個服務都應該能夠 horizontal scale；每次部署都應該能夠 rolling update；每個節點都應該可以被 replace 而不影響整體服務。這是 Kubernetes 存在的全部意義。問題不在「為什麼搬」，而在「搬的過程中漏了什麼」。</p>
-
-<p>問題不在「縮減副本」這個動作本身，而在於 graceful draining 沒跑完。</p>
-
-<p>Elixir 的 sessions service 在每個 pod 裡跑著數以萬計的 GenServer process。每個 process 都拿著一個正在連線中的使用者裝置的 in-memory state。</p>
-
-<p>把這些 process 從一台 node 平順地搬到另一台 node，必須等「狀態交棒」流程跑完——對 GenServer 而言，這意味著 hibernate、序列化、跨 node 重建。</p>
-
-<p>Kubernetes 的預設 terminationGracePeriodSeconds 通常不夠這套儀式跑完。而那次部署偏偏沒有相應地調高、也沒有設定一個 admission webhook 去攔截不安全的縮容。</p>
+<p>問題不在「縮減副本」這個動作本身，而在於 graceful draining 沒跑完。Elixir 的 sessions service 在每個 pod 裡跑著數以萬計的 GenServer process，每個都拿著一個連線中的裝置 in-memory state；要把它們平順搬到另一台 node，必須等 hibernate、序列化、跨 node 重建跑完。Kubernetes 的預設 terminationGracePeriodSeconds 通常不夠這套儀式跑完——那次部署沒有調高，也沒有設 admission webhook 去攔截不安全的縮容。</p>
 
 <p>結果就是 sessions service 在那一瞬間被「ungracefully stopped」掉了一批 pod。</p>
 
 <p>事後報告給出的數字是：<strong>「17% of sessions across Discord were ungracefully stopped」</strong>。</p>
 
-<p>Discord 全球同時在線 session 數不會公開，但稍微估算就能體會，這代表了千萬量級的連線在毫無心理準備下被剪斷。對一個以即時通訊為主要使用情境的平台來說，這個比例不是小數。</p>
-
-<p>更關鍵的是，這 17% 並不是均勻分散——它們全集中在 us-east1-b 同一個 zone 裡。</p>
-
-<p>當這些 session 嘗試重連、轉到鄰近 zone 時，重連的流量就會形成一道朝著 us-east1-c 與 us-east1-d 灌過去的「reconnection storm」。後續所有故事，幾乎都長在這道風暴的不同岔路上。</p>
-
-<p>這也是分散式系統故障常見的一個結構特徵：故障的「物理位置」與故障的「影響範圍」往往不一致。Bug 出在 us-east1-b 的一個 deployment 設定，但被它打垮的是 us-east1-c、us-east1-d，最後是全球的 voice syncer fleet。當你的系統有 cross-zone failover 機制——這幾乎是現代分散式系統的標配——任何一個 zone 的局部問題都有機會經由 failover 路徑變成全域問題。</p>
+<p>更關鍵的是，這 17% 並不是均勻分散——它們全集中在 us-east1-b 同一個 zone 裡。當這些 session 嘗試重連、轉到鄰近 zone 時，重連的流量就會形成一道朝著 us-east1-c 與 us-east1-d 灌過去的「reconnection storm」。Bug 出在 us-east1-b 的一個 deployment 設定，但被它打垮的是 us-east1-c、us-east1-d，最後是全球的 voice syncer fleet——只要 cross-zone failover 機制存在，局部問題都有機會經 failover 變成全域問題。</p>
 
 <h3>從 sessions 切到 gateway——兩分鐘內第一波擴散</h3>
 
-<p>12:13 到 12:15 PDT 之間，Erlang/OTP 的 process linking 機制把這場意外從局部變成了全域。</p>
+<p>12:13 到 12:15 PDT 之間，Erlang/OTP 的 process linking 機制把這場意外從局部變成了全域。Elixir 用「let it crash」加 supervisor 樹：每個 GenServer 異常退出時，monitor 會發 <code>{:DOWN, ref, :process, pid, reason}</code> 給所有訂閱者。Discord 的 realtime 系統是高度互鏈的——每個 session 同時被 guild process、presence tracker、gateway connection 訂閱。事後報告用了 <strong>「flurry of messages」</strong> 來形容這道兩分鐘內爆發的訊號雜訊；每條清理路徑單看都合理，同時跑這麼多次本身就是負載。</p>
 
-<p>Elixir 的設計哲學是「let it crash」加上 supervisor 樹。</p>
-
-<p>當一個 GenServer 異常退出，它的 monitor 會發 <code>{:DOWN, ref, :process, pid, reason}</code> 訊息給所有訂閱者。</p>
-
-<p>Discord 的 realtime 系統是高度互鏈的：每個 session 同時被 guild process（也就是「伺服器」）、presence tracker、gateway connection 訂閱。</p>
-
-<p>事後報告用了一個動詞——<strong>「flurry of messages」</strong>——來形容那兩分鐘內整個系統內部的訊號雜訊。</p>
-
-<p>這個比喻很精準。它不是穩定的高流量，是一陣短時間內爆發的雜訊。所有 17% 被殺掉的 session 同時放出 DOWN 訊息，每個 DOWN 訊息又會觸發訂閱者各自的清理邏輯——guild process 要把這個 user 從成員快取裡踢掉、presence tracker 要更新使用者狀態、gateway connection 要決定要不要保留或關閉對應的 websocket。每一條清理路徑都是合理的；但同時跑這麼多次，本身就是負載。</p>
-
-<p>這道雜訊很快撞上了下一個瓶頸：gateway service。</p>
-
-<p>Gateway 是負責收發 websocket 的代理，前面是公網的 wss 連線，後面是 Discord 內部各 realtime 服務。</p>
-
-<p>原則上，當前端的 session 斷線時，websocket 也該斷。但實務上有大量 client 會立刻嘗試重連——Discord 的 client 端 SDK 預設就會在連線中斷後做指數退避的重連。</p>
-
-<p>於是 gateway 在 us-east1-b 區的節點同時要處理「上一批連線正在拆」與「下一批連線正在建」兩股流量。</p>
-
-<p>每個 host 上原本有 session start rate limit 來保護自己，但這個限制值在遷移過程中被「miscalibrated post-migration」——也就是說，新 host 的設定值並沒有按照新 pod 的 CPU/記憶體比例重新計算。</p>
-
-<p>於是 gateway 在湧入的 reconnection 面前等於沒有保護。</p>
-
-<p>Gateway memory capacity 圖顯示，us-east1-b 的節點記憶體佔用幾乎是垂直拉升到接近 100%。</p>
-
-<p>當 OOM killer 開始介入，那些節點重啟，把流量甩到 us-east1-c 與 us-east1-d——失敗自此跨越了 zone。</p>
-
-<p>這個傳染路徑要記住，因為它解釋了為什麼後面當 voice syncers 出狀況時，影響範圍是全球而不是局部：reconnection storm 已經在前 15 分鐘裡讓所有可用 zone 都進入「異常負載」狀態。</p>
-
-<p>當某個下游服務在第 30 分鐘開始撐不住時，整個 stack 已經處在一個「沒有任何 zone 還有 head-room」的脆弱狀態。這意味著任何小規模的擾動，都會被放大成跨 zone 的災難。</p>
+<p>這道雜訊很快撞上 gateway service。當前端 session 斷線、client SDK 立刻指數退避重連，gateway 同時要處理「上一批正在拆」與「下一批正在建」兩股流量。每個 host 原本有 session start rate limit 自保，但這個限制值在遷移過程中被「miscalibrated post-migration」——新 host 的設定值沒按新 pod 的 CPU/記憶體比例重算。Gateway 在湧入的 reconnection 面前等於沒有保護，us-east1-b 節點的記憶體幾乎垂直拉升到 100%；OOM killer 介入後，流量甩到 us-east1-c 與 us-east1-d——失敗自此跨越 zone。reconnection storm 在前 15 分鐘裡讓所有 zone 都進入「異常負載」，當下游 voice syncers 在第 30 分鐘開始撐不住時，整個 stack 已經處在「沒有任何 zone 還有 head-room」的脆弱狀態。</p>
 
 <h2>cascade 的真正長尾——voice syncers 的 mailbox 是怎麼漲到一百萬的</h2>
 
-<p>從 12:13 一直到 15:30，整個事件最難解的部分都集中在一個名字平淡無奇的內部服務：voice syncers。</p>
+<p>從 12:13 一直到 15:30，最難解的部分都集中在一個平淡無奇的內部服務：voice syncers——它「manages SFU endpoint placement across more than 25,000 external instances」。換成白話：你按下「加入語音頻道」時，session 端不會直接跟 SFU（Selective Forwarding Unit）談判，而是先打到 voice syncers，由它根據負載與地理位置決定接到哪台 SFU，再透過 HTTPS RPC 通知那台 SFU 收人。15 台 syncer 照顧 25,000+ 台 SFU，平時就已不算閒；reconnection storm 一來，所有通話中的 session 同時重建 SFU 關聯，負載瞬間倍增。</p>
 
-<p>Discord 用了一個段落來解釋它的職責——「manages SFU endpoint placement across more than 25,000 external instances」。</p>
+<p>voice syncers 內部用一個叫做 <strong>Holster</strong> 的函式庫池化 HTTP 連線，底層是 Erlang 的 <code>gun</code> HTTP client，連線生命周期由兩層 supervisor process 管理。Erlang process 是 actor model，靠 mailbox 通訊，主迴圈是一個 <code>receive</code> 區塊；這兩層 supervisor 用的是 <strong>selective receive</strong>，亦即在 receive 區塊裡用 pattern match 挑符合條件的訊息，不符合的跳過保留在 mailbox 裡。mailbox 短時這幾乎免費；一旦變長，每次 selective receive 都得從頭掃過所有未處理訊息，複雜度退化成 O(n)，而 spawn 變慢又讓 mailbox 變更長——它本身就是一個自我加速的退化模式。</p>
 
-<p>換成白話：當你按下「加入語音頻道」，session 端不會直接跟 SFU（Selective Forwarding Unit，負責轉發音視訊封包的那層）談判。</p>
+<p>事後 Discord 工程師量化測試出一個讓人印象深刻的數字：<strong>「we confirmed that this selective receive on a supervisor with a ~100k mailbox queue adds ~1ms to process spawn time」</strong>。1 毫秒聽起來不多，但每個 SFU RPC 都觸發一次新的 connection spawn——syncer 每秒鐘 spawn 幾百到幾千次時，1ms/次的 overhead 直接吃光 CPU。下面這張圖是這條退化關係的可操作版本：拖動 mailbox 深度與分區數 N，看 per-spawn overhead 與整體 throughput 怎麼變。</p>
 
-<p>而是先打到 voice syncers，由它根據負載與地理位置決定要把這通通話接到哪一台 SFU 上，再透過 HTTPS RPC 通知那台 SFU「來，把這個 user 收進來」。</p>
+<figure class="vg-w-param-selective-receive" style="margin: var(--s-4) 0;">
+  <style>
+    .vg-w-param-selective-receive { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--s-3); }
+    .vg-w-param-selective-receive .controls { display: grid; grid-template-columns: 1fr; gap: var(--s-2); }
+    .vg-w-param-selective-receive .row { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); }
+    .vg-w-param-selective-receive label { min-width: 16ch; color: var(--ink); }
+    .vg-w-param-selective-receive input[type=range] { flex: 1; accent-color: var(--accent); height: 28px; }
+    .vg-w-param-selective-receive .readout { font-variant-numeric: tabular-nums; color: var(--accent-text); min-width: 12ch; text-align: right; }
+    .vg-w-param-selective-receive svg { width: 100%; height: auto; }
+    .vg-w-param-selective-receive figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); padding-top: var(--s-2); }
+  </style>
+  <div class="controls">
+    <div class="row">
+      <label for="vg-w-param-sr-n">mailbox depth (n)</label>
+      <input id="vg-w-param-sr-n" type="range" min="100" max="1000000" step="100" value="100000" />
+      <span class="readout" id="vg-w-param-sr-n-out">100,000</span>
+    </div>
+    <div class="row">
+      <label for="vg-w-param-sr-p">partitions (N)</label>
+      <input id="vg-w-param-sr-p" type="range" min="1" max="64" step="1" value="1" />
+      <span class="readout" id="vg-w-param-sr-p-out">1</span>
+    </div>
+  </div>
+  <svg viewBox="0 0 880 280" role="img" aria-label="selective receive overhead curve under partition count">
+    <text x="440" y="22" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)" font-weight="600">selective-receive overhead per spawn vs effective mailbox depth (n/N)</text>
+    <line x1="70" y1="230" x2="860" y2="230" stroke="var(--ink)" stroke-width="1.5" />
+    <line x1="70" y1="50" x2="70" y2="230" stroke="var(--ink)" stroke-width="1.5" />
+    <text x="60" y="234" text-anchor="end" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">0</text>
+    <text x="60" y="186" text-anchor="end" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">2.5</text>
+    <text x="60" y="142" text-anchor="end" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">5.0</text>
+    <text x="60" y="98" text-anchor="end" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">7.5</text>
+    <text x="60" y="54" text-anchor="end" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">10 ms</text>
+    <text x="22" y="140" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)" transform="rotate(-90 22 140)">overhead / spawn</text>
+    <text x="465" y="265" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">effective queue depth per partition (log scale)</text>
+    <g id="vg-w-param-sr-grid"></g>
+    <path id="vg-w-param-sr-curve" d="" fill="none" stroke="var(--accent)" stroke-width="2" />
+    <line id="vg-w-param-sr-marker" x1="70" y1="50" x2="70" y2="230" stroke="var(--accent-text)" stroke-width="1.5" stroke-dasharray="4 3" />
+    <circle id="vg-w-param-sr-dot" cx="70" cy="230" r="5" fill="var(--accent-text)" />
+    <text id="vg-w-param-sr-label" x="80" y="80" font-family="EB Garamond, serif" font-size="13" fill="var(--accent-text)">overhead ≈ 0 ms</text>
+    <line x1="70" y1="98" x2="860" y2="98" stroke="var(--muted-2)" stroke-width="0.5" stroke-dasharray="2 4" />
+    <text x="855" y="93" text-anchor="end" font-family="EB Garamond, serif" font-size="10" fill="var(--muted)">~7.5ms · syncer fleet collapses</text>
+    <line x1="70" y1="190" x2="860" y2="190" stroke="var(--sage)" stroke-width="0.5" stroke-dasharray="2 4" />
+    <text x="855" y="185" text-anchor="end" font-family="EB Garamond, serif" font-size="10" fill="var(--sage-deep)">~2ms · safe operating zone</text>
+  </svg>
+  <figcaption>把 mailbox 切成 N 個分區之後，每個分區的有效深度是 n/N，selective receive 的 O(n) 也跟著縮到 O(n/N)。把 N 從 1 拉到 32，~1M 的單一 mailbox 退到 ~30k/分區，overhead 從吃光 CPU 落回亞毫秒區間。Discord 報告給出的「~1ms @ ~100k queue」是此曲線上的一個錨點。</figcaption>
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-param-selective-receive');
+      if (!root) return;
+      const nInp = root.querySelector('#vg-w-param-sr-n');
+      const pInp = root.querySelector('#vg-w-param-sr-p');
+      const nOut = root.querySelector('#vg-w-param-sr-n-out');
+      const pOut = root.querySelector('#vg-w-param-sr-p-out');
+      const curve = root.querySelector('#vg-w-param-sr-curve');
+      const marker = root.querySelector('#vg-w-param-sr-marker');
+      const dot = root.querySelector('#vg-w-param-sr-dot');
+      const label = root.querySelector('#vg-w-param-sr-label');
+      const X0 = 70, X1 = 860, Y0 = 230, Y1 = 50;
+      const NMIN = 100, NMAX = 1000000;
+      function fmtN(n) {
+        if (n >= 1000000) return (n / 1000000).toFixed(2) + 'M';
+        if (n >= 1000) return Math.round(n / 1000) + 'k';
+        return String(n);
+      }
+      function overheadMs(effective) {
+        return 1.0 * (effective / 100000);
+      }
+      function xOf(effective) {
+        const t = (Math.log10(effective) - Math.log10(NMIN)) / (Math.log10(NMAX) - Math.log10(NMIN));
+        return X0 + Math.max(0, Math.min(1, t)) * (X1 - X0);
+      }
+      function yOf(ms) {
+        const t = Math.max(0, Math.min(1, ms / 10));
+        return Y0 - t * (Y0 - Y1);
+      }
+      function drawCurve() {
+        const pts = [];
+        for (let i = 0; i <= 80; i++) {
+          const t = i / 80;
+          const eff = Math.pow(10, Math.log10(NMIN) + t * (Math.log10(NMAX) - Math.log10(NMIN)));
+          pts.push([xOf(eff), yOf(overheadMs(eff))]);
+        }
+        curve.setAttribute('d', pts.map((p, i) => (i ? 'L' : 'M') + p[0].toFixed(1) + ' ' + p[1].toFixed(1)).join(' '));
+      }
+      function update() {
+        const n = Number(nInp.value);
+        const p = Number(pInp.value);
+        const eff = Math.max(1, n / p);
+        const ms = overheadMs(eff);
+        nOut.textContent = fmtN(n);
+        pOut.textContent = String(p);
+        const x = xOf(eff);
+        const y = yOf(ms);
+        marker.setAttribute('x1', x); marker.setAttribute('x2', x);
+        dot.setAttribute('cx', x); dot.setAttribute('cy', y);
+        label.setAttribute('x', Math.min(x + 10, 760));
+        label.setAttribute('y', Math.max(y - 8, 60));
+        label.textContent = 'n/N = ' + fmtN(Math.round(eff)) + ' · overhead ≈ ' + ms.toFixed(2) + ' ms / spawn';
+      }
+      drawCurve();
+      nInp.addEventListener('input', update);
+      pInp.addEventListener('input', update);
+      update();
+    })();
+  </script>
+</figure>
 
-<p>15 台 syncer 實例要照顧 25,000+ 台 SFU。每秒鐘要處理的「endpoint select/create」請求，平時就已經不算少。</p>
-
-<p>當 reconnection storm 來臨時，所有正在語音通話中的 session 都嘗試重建到 SFU 的關聯，syncers 收到的負載瞬間倍增。</p>
-
-<p>瓶頸是怎麼被找出來的，是這次覆盤裡最有教育意義的部分。</p>
-
-<p>voice syncers 內部用了一個叫做 <strong>Holster</strong> 的內部函式庫來池化 HTTP 連線。</p>
-
-<p>Holster 底層用 Erlang 生態的 <code>gun</code> HTTP client。</p>
-
-<p>而 <code>gun</code> 的 connection 生命周期是由兩層 supervisor process 管理的。每當 syncer 需要對 SFU 發起新的 HTTPS RPC，連線建立的請求都要經過這兩層 supervisor 之一。</p>
-
-<p>Erlang 的 process 是 actor model：彼此之間靠 mailbox 通訊，process 主迴圈是一個 <code>receive ... end</code> 區塊。一般情況下這個機制非常便宜。</p>
-
-<p>但這兩層 supervisor 使用的是 <strong>selective receive</strong>——亦即它們在 receive 區塊裡用 pattern match 挑選符合條件的訊息，不符合的就跳過保留在 mailbox 裡。</p>
-
-<p>當 mailbox 短的時候這個動作幾乎免費。但 mailbox 一旦變長，每次 selective receive 都得從頭掃過所有未處理訊息，複雜度退化成 O(n)。</p>
-
-<p>這是 BEAM 一個冷門但決定性的細節：selective receive 的性能特性會隨 mailbox 長度二次惡化——每個 spawn 變慢、處理速度變慢、mailbox 又因此變更長。它本身就是一個自我加速的退化模式。</p>
-
-<p>事後 Discord 的工程師做了量化測試，給出了一個讓人印象深刻的數字：<strong>「we confirmed that this selective receive on a supervisor with a ~100k mailbox queue adds ~1ms to process spawn time」</strong>。</p>
-
-<p>1 毫秒聽起來不多，但每個 SFU RPC 都會觸發一次新的 connection spawn——當 syncer 每秒鐘要 spawn 幾百到幾千次 connection 時，1 毫秒/次的 overhead 直接吃光所有 CPU。</p>
-
-<p>更糟的是，這條 critical path 還跟 service discovery 黏在一起。</p>
-
-<p>voice syncers 透過 etcd 註冊自己的健康狀態：每個實例定期 refresh 一個 TTL，告訴 consistent hash ring 上的其他 service「我還活著，把流量送過來」。</p>
-
-<p>問題在於，這個 TTL refresh 的訊息也要經過同一組已經被連線請求塞爆的 supervisor mailbox。</p>
-
-<p>當 mailbox 排到一百萬則訊息深時，TTL refresh 根本來不及處理，etcd 就把那個實例從 ring 上拔掉了。</p>
-
-<p>這是事故設計上最殘酷的一個細節——control plane（service discovery）與 data plane（connection management）共享同一條 critical path，等於把「我還活著」的訊號跟「我正在處理流量」的訊號綁在一起。當後者卡住，前者也一起死。健康檢查機制本身變成了崩潰加速器。</p>
+<p>更糟的是，這條 critical path 還跟 service discovery 黏在一起。voice syncers 透過 etcd 註冊健康狀態：每個實例定期 refresh 一個 TTL 告訴 hash ring「我還活著」。問題是這個 TTL refresh 也要經過同一組被連線請求塞爆的 supervisor mailbox——排到 100 萬則時 refresh 根本來不及，etcd 就把實例從 ring 上拔掉。control plane（service discovery）與 data plane（connection management）共享同一條 critical path，把「我還活著」跟「我正在處理流量」綁在一起；後者卡住，前者也一起死。健康檢查機制本身變成崩潰加速器。</p>
 
 <p>結果是一個糟糕的正回饋迴圈：</p>
 
@@ -127,109 +158,169 @@
   <li>回到第 1 步</li>
 </ol>
 
-<p>正回饋迴圈是分散式系統最危險的一種失效模式。不像線性退化會在某個負載點停下來，正回饋會自我加速——每跑一輪迴圈，下一輪的速度更快、影響範圍更大。對抗它唯一有效的方法不是「修復某個壞掉的部位」，而是「切斷迴圈中至少一條邊」。</p>
-
-<p>儀表板上的「Endpoint Select/Create Success」指標在 12:14 PDT 跌到接近零。</p>
-
-<p>15 台 syncer 裡，當下只有一台序號 2-8 的實例還活著——但它一台要扛全球三分之一的流量，根本撐不住。</p>
-
-<p>同一時間，所有 15 台的 mailbox size 都顯示出穩定且持續成長的曲線。</p>
-
-<p>注意一個重要的觀察：問題不是某幾台「壞掉」——是 15 台同時走向同一個失敗模式。當你的儀表板看到這種「同步退化」的形狀，幾乎可以斷定問題不在實例本身，而在它們共同依賴的某個系統屬性——這次是上游沒有節流。</p>
+<p>正回饋迴圈是分散式系統最危險的失效模式：不像線性退化會在某個負載點停下來，每跑一輪迴圈下一輪就更快、影響範圍更大。對抗它的方法不是「修復某個壞掉的部位」，而是「切斷迴圈中至少一條邊」。儀表板上 12:14 PDT 「Endpoint Select/Create Success」跌到接近零；15 台 syncer 只剩 2-8 一台還活著但獨自扛不住全球三分之一流量。15 台 mailbox 同時走向同一個失敗模式——這種「同步退化」的形狀幾乎可以斷定問題不在實例本身，而在它們共同依賴的某個系統屬性，這次是上游沒有節流。</p>
 
 <h2>三次失敗的 rollback——為什麼救火比起火還難</h2>
 
-<p>從 12:43 到 13:09 PDT，on-call 團隊嘗試了三波恢復動作。</p>
+<p>從 12:43 到 13:09 PDT，on-call 嘗試了三波恢復動作，每一波都短暫地讓人鬆口氣再馬上把人打回深淵。</p>
 
-<p>每一波都短暫地讓人鬆口氣，再馬上把人打回深淵。</p>
+<p><strong>第一波（12:43 PDT）重啟單一實例</strong>：團隊挑了問題最嚴重的 2-13 完整重啟。新 process 起來、mailbox 歸零、etcd 註冊回 ring 上——但只持續不到一分鐘。上游發現有健康節點回來，立刻把累積的 retry 全灌過去，mailbox 三十秒內又從 0 漲到數十萬。當一個服務從「健康但過載」變成「健康且能接流量」，所有等在門外的請求會在第一個 epoch 同時湧入，對單一實例而言這個瞬間負載比平均高一個數量級。</p>
 
-<p>這段是這次覆盤裡最像戰爭故事的部分。</p>
+<p><strong>第二波（12:47 PDT）殺掉特定的 supervisor</strong>：只 kill 並重啟 <code>Holster.Pool</code> DynamicSupervisor，理論上清空 mailbox 但保留 etcd 註冊。結果同樣模式重現。這次嘗試其實透露一個重要訊號——如果 mailbox 清零後依然立刻被填滿，root cause 不在 mailbox 內容也不在 process 狀態，而在上游流量速率。</p>
 
-<p><strong>第一波（12:43 PDT）：重啟單一實例</strong>。</p>
+<p><strong>第三波（13:05 PDT）整個 cluster 同時重啟</strong>：賭同時清空 15 台的 mailbox 能讓整體得到「同步的喘息窗口」。事後報告稱這個瞬間「briefly recovered」——但下一秒所有上游同時發現 voice syncers 全體健康，把累積 50 分鐘的 retry queue 一次釋放出去。<strong>「cold-start thundering herd was too much to handle」</strong>。</p>
 
-<p>團隊先挑了一台問題最嚴重的 2-13 完整重啟，期望它從 cold start 開始重新接流量。</p>
+<p>三次失敗的共通結構是：問題從來不是 voice syncers 自己的狀態，而是上游沒有節流。Bo Ingram 與 Stephen Birarda 點明這條邏輯——「A sufficiently large traffic spike will find a bottleneck in your system」。經驗豐富的 on-call 會在「重啟看看」之前先問：「上游有沒有累積？下游有沒有節流？」</p>
 
-<p>重啟確實成功——新 process 起來、mailbox 歸零、etcd 註冊回 ring 上。</p>
-
-<p>但只持續了不到一分鐘。上游服務發現有一個健康節點回來，立刻把累積的 retry 全部灌過去，mailbox 在三十秒內又從 0 漲到數十萬。</p>
-
-<p>這是 thundering herd 的縮小版示範。當一個服務從「健康但過載」變成「健康且能接流量」，所有等在門外的請求會在第一個 epoch 裡同時湧入——對單一被選中的實例而言，這個瞬間負載比平均負載高出至少一個數量級。</p>
-
-<p><strong>第二波（12:47 PDT）：殺掉特定的 supervisor</strong>。</p>
-
-<p>團隊改變策略，不重啟整個實例，只 kill 並重啟 <code>Holster.Pool</code> 這個 DynamicSupervisor——理論上這應該清空 mailbox 但保留 etcd 註冊。</p>
-
-<p>結果同樣的模式重現：mailbox 短暫歸零後又漲回來。</p>
-
-<p>問題不在於「mailbox 清不掉」，而在於「清掉之後流量湧進來太快」。</p>
-
-<p>這次嘗試其實透露了一個重要的診斷訊號——但當時沒有人有閒情逸致去注意它。如果 mailbox 清零之後依然立刻被填滿，那麼 root cause 不在於「mailbox 內容」也不在於「process 狀態」，而在於「上游流量速率」。要解決問題就必須往上游找。</p>
-
-<p><strong>第三波（13:05 PDT）：整個 cluster 同時重啟</strong>。</p>
-
-<p>團隊賭一把，希望同時清空所有 15 台的 mailbox 能讓整體系統得到一個「同步的喘息窗口」。</p>
-
-<p>重啟瞬間 mailbox 全部歸零，事後報告稱這個瞬間「briefly recovered」。</p>
-
-<p>但下一秒，所有上游服務同時發現 voice syncers 全體健康，把累積了 50 分鐘的 retry queue 一次釋放出去。</p>
-
-<p>這就是傳說中的 <strong>cold-start thundering herd</strong>——15 台新生兒同時被一群餓壞的爸媽撲倒。</p>
-
-<p>事後檢討用了一句很乾淨的總結：<strong>「cold-start thundering herd was too much to handle」</strong>。</p>
-
-<p>三次失敗的共通結構是：問題從來不是 voice syncers 自己的狀態，而是上游沒有節流。</p>
-
-<p>Bo Ingram 與 Stephen Birarda 在覆盤裡點明了這條邏輯——「A sufficiently large traffic spike will find a bottleneck in your system」。</p>
-
-<p>只要進來的流量沒有被限速，無論 voice syncers 重啟幾次、清 mailbox 幾次，都會被同樣的流量打回去。</p>
-
-<p>對於任何處理過真實事故的人，這條邏輯都會很熟悉。事故當下你會很想去動最直接看得到問題的那個服務——它的儀表板紅了、它的 alert 在響——但很多時候，真正的解法在上游或下游某個離問題很遠的地方。經驗豐富的 on-call 會在「重啟看看」之前先問：「上游有沒有累積？下游有沒有節流？」</p>
+<figure class="vg-w-scrub-incident-clock" style="margin: var(--s-4) 0;">
+  <style>
+    .vg-w-scrub-incident-clock { display: grid; gap: var(--s-2); }
+    .vg-w-scrub-incident-clock svg { width: 100%; height: auto; touch-action: none; }
+    .vg-w-scrub-incident-clock .panel { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: var(--s-2); padding: var(--s-2); background: var(--bg-soft); border-left: 2px solid var(--accent); font-family: var(--serif); font-size: var(--fs-sm); }
+    .vg-w-scrub-incident-clock .panel .label { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+    .vg-w-scrub-incident-clock .panel .value { font-family: EB Garamond, serif; font-size: var(--fs-md); color: var(--accent-text); font-variant-numeric: tabular-nums; }
+    .vg-w-scrub-incident-clock .panel .narrate { grid-column: 1 / -1; color: var(--ink); }
+    .vg-w-scrub-incident-clock figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); padding-top: var(--s-2); }
+  </style>
+  <svg viewBox="0 0 880 220" role="img" aria-label="incident clock scrubber from 12:13 to 14:30 PDT">
+    <text x="440" y="20" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)" font-weight="600">incident clock · 12:13–14:30 PDT · drag handle to inspect state</text>
+    <g id="vg-w-scrub-incident-clock-success">
+      <text x="60" y="60" text-anchor="end" font-family="EB Garamond, serif" font-size="10" fill="var(--sage-deep)">success</text>
+      <text x="60" y="120" text-anchor="end" font-family="EB Garamond, serif" font-size="10" fill="var(--sage-deep)">0%</text>
+      <path id="vg-w-scrub-incident-clock-success-path" d="" fill="none" stroke="var(--sage)" stroke-width="1.8" />
+    </g>
+    <g id="vg-w-scrub-incident-clock-mailbox">
+      <text x="60" y="135" text-anchor="end" font-family="EB Garamond, serif" font-size="10" fill="var(--accent-text)">mailbox</text>
+      <text x="60" y="178" text-anchor="end" font-family="EB Garamond, serif" font-size="10" fill="var(--accent-text)">~1M</text>
+      <path id="vg-w-scrub-incident-clock-mailbox-path" d="" fill="none" stroke="var(--accent)" stroke-width="1.8" />
+    </g>
+    <line x1="70" y1="180" x2="860" y2="180" stroke="var(--ink)" stroke-width="1.5" />
+    <g id="vg-w-scrub-incident-clock-events"></g>
+    <line id="vg-w-scrub-incident-clock-handle-line" x1="70" y1="40" x2="70" y2="200" stroke="var(--accent-text)" stroke-width="2" />
+    <circle id="vg-w-scrub-incident-clock-handle" cx="70" cy="190" r="9" fill="var(--accent-text)" cursor="grab" />
+    <text id="vg-w-scrub-incident-clock-tick" x="70" y="215" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--ink)">12:13</text>
+  </svg>
+  <div class="panel">
+    <div><div class="label">endpoint create success</div><div class="value" id="vg-w-scrub-incident-clock-out-success">100%</div></div>
+    <div><div class="label">avg syncer mailbox</div><div class="value" id="vg-w-scrub-incident-clock-out-mailbox">~0</div></div>
+    <div class="narrate" id="vg-w-scrub-incident-clock-out-narrate">在 12:13 之前，voice control plane 各項指標都在綠燈區間。</div>
+  </div>
+  <figcaption>橘色是 15 台 syncer 平均 mailbox 深度、綠色是 endpoint create success rate（事故報告未提供逐分鐘讀數；曲線根據明文時間點與描述插值）。拖動把手或點擊軸線即可跳到任意時刻。</figcaption>
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-scrub-incident-clock');
+      if (!root) return;
+      const svg = root.querySelector('svg');
+      const handle = root.querySelector('#vg-w-scrub-incident-clock-handle');
+      const handleLine = root.querySelector('#vg-w-scrub-incident-clock-handle-line');
+      const tick = root.querySelector('#vg-w-scrub-incident-clock-tick');
+      const successPath = root.querySelector('#vg-w-scrub-incident-clock-success-path');
+      const mailboxPath = root.querySelector('#vg-w-scrub-incident-clock-mailbox-path');
+      const eventsG = root.querySelector('#vg-w-scrub-incident-clock-events');
+      const outSuccess = root.querySelector('#vg-w-scrub-incident-clock-out-success');
+      const outMailbox = root.querySelector('#vg-w-scrub-incident-clock-out-mailbox');
+      const outNarrate = root.querySelector('#vg-w-scrub-incident-clock-out-narrate');
+      const X0 = 70, X1 = 860;
+      const T0 = 12 * 60 + 13, T1 = 14 * 60 + 30;
+      const events = [
+        [12 * 60 + 13, '12:13', 1.0, 0, 'sessions pod 副本縮半；17% session 被 ungracefully 切斷。'],
+        [12 * 60 + 14, '12:14', 0.05, 0.05, 'endpoint create success 跌到接近零；syncer mailbox 起跑。'],
+        [12 * 60 + 30, '12:30', 0.05, 0.3, 'gateway us-east1-b OOM；failover 把流量推到 1c / 1d。'],
+        [12 * 60 + 43, '12:43', 0.06, 0.55, '第一波：重啟單一實例 2-13。mailbox 三十秒內重新填滿。'],
+        [12 * 60 + 47, '12:47', 0.06, 0.6, '第二波：kill Holster.Pool DynamicSupervisor。同樣失敗。'],
+        [13 * 60 + 5, '13:05', 0.1, 0.85, '第三波：full cluster restart。cold-start thundering herd 把全體再次打趴。'],
+        [13 * 60 + 43, '13:43', 0.25, 0.95, '第四波啟動：上游 rate limit + 15 台新 dispatcher 透過 terraform 上線。'],
+        [14 * 60 + 3, '14:03', 0.55, 0.5, '實例 2-3 重啟後維持低 mailbox——第一台真正恢復的實例。'],
+        [14 * 60 + 15, '14:15', 0.8, 0.25, '再重啟 5 台，4 台維持低 mailbox。'],
+        [14 * 60 + 26, '14:26', 0.95, 0.1, '最後一台恢復；doubled cluster 全體健康。3h17m。'],
+        [14 * 60 + 30, '14:30', 1.0, 0.05, '全綠；事故收尾。']
+      ];
+      function xOf(t) { return X0 + ((t - T0) / (T1 - T0)) * (X1 - X0); }
+      function yOfSuccess(v) { return 120 - v * 80; }
+      function yOfMailbox(v) { return 180 - v * 45; }
+      let sd = '', md = '';
+      for (let i = 0; i < events.length; i++) {
+        const e = events[i];
+        const x = xOf(e[0]);
+        sd += (i ? 'L' : 'M') + x.toFixed(1) + ' ' + yOfSuccess(e[2]).toFixed(1) + ' ';
+        md += (i ? 'L' : 'M') + x.toFixed(1) + ' ' + yOfMailbox(e[3]).toFixed(1) + ' ';
+      }
+      successPath.setAttribute('d', sd);
+      mailboxPath.setAttribute('d', md);
+      const NS = 'http://www.w3.org/2000/svg';
+      const tickEvents = events.filter(e => ['12:13', '12:43', '13:05', '13:43', '14:26'].includes(e[1]));
+      for (const e of tickEvents) {
+        const x = xOf(e[0]);
+        const c = document.createElementNS(NS, 'circle');
+        c.setAttribute('cx', x); c.setAttribute('cy', 180); c.setAttribute('r', 3);
+        c.setAttribute('fill', 'var(--muted)');
+        eventsG.appendChild(c);
+        const tx = document.createElementNS(NS, 'text');
+        tx.setAttribute('x', x); tx.setAttribute('y', 198);
+        tx.setAttribute('text-anchor', 'middle');
+        tx.setAttribute('font-family', 'EB Garamond, serif');
+        tx.setAttribute('font-size', 10);
+        tx.setAttribute('fill', 'var(--muted)');
+        tx.textContent = e[1];
+        eventsG.appendChild(tx);
+      }
+      function clamp(x) { return Math.max(X0, Math.min(X1, x)); }
+      function clientToSvgX(clientX) {
+        const pt = svg.createSVGPoint();
+        pt.x = clientX; pt.y = 0;
+        const sp = pt.matrixTransform(svg.getScreenCTM().inverse());
+        return clamp(sp.x);
+      }
+      function tToHHMM(t) {
+        const h = Math.floor(t / 60), m = Math.floor(t % 60);
+        return String(h) + ':' + String(m).padStart(2, '0');
+      }
+      function lerpEvents(t) {
+        let lo = events[0], hi = events[events.length - 1];
+        for (let i = 0; i < events.length - 1; i++) {
+          if (events[i][0] <= t && events[i + 1][0] >= t) { lo = events[i]; hi = events[i + 1]; break; }
+        }
+        const span = hi[0] - lo[0] || 1;
+        const f = (t - lo[0]) / span;
+        const success = lo[2] + (hi[2] - lo[2]) * f;
+        const mailbox = lo[3] + (hi[3] - lo[3]) * f;
+        return { success, mailbox, narrate: f < 0.5 ? lo[4] : hi[4] };
+      }
+      function update(x) {
+        handle.setAttribute('cx', x);
+        handleLine.setAttribute('x1', x); handleLine.setAttribute('x2', x);
+        tick.setAttribute('x', x);
+        const t = T0 + ((x - X0) / (X1 - X0)) * (T1 - T0);
+        tick.textContent = tToHHMM(t);
+        const s = lerpEvents(t);
+        outSuccess.textContent = Math.round(s.success * 100) + '%';
+        outMailbox.textContent = s.mailbox < 0.02 ? '~0' : (s.mailbox >= 0.95 ? '~1M' : Math.round(s.mailbox * 1000) + 'k');
+        outNarrate.textContent = s.narrate;
+      }
+      let dragging = false;
+      function start(e) { dragging = true; if (e.pointerId !== undefined) handle.setPointerCapture(e.pointerId); update(clientToSvgX(e.clientX)); }
+      function move(e) { if (!dragging) return; update(clientToSvgX(e.clientX)); }
+      function end() { dragging = false; }
+      handle.addEventListener('pointerdown', start);
+      handle.addEventListener('pointermove', move);
+      handle.addEventListener('pointerup', end);
+      svg.addEventListener('pointerdown', (e) => { if (e.target !== handle) { dragging = true; update(clientToSvgX(e.clientX)); } });
+      svg.addEventListener('pointermove', move);
+      svg.addEventListener('pointerup', end);
+      update(X0);
+    })();
+  </script>
+</figure>
 
 <h3>第四次嘗試——同時增加供給、減少需求</h3>
 
-<p>13:43 PDT 開始的這一波恢復動作不再是單一招式。</p>
+<p>13:43 PDT 開始的這一波不再是單一招式。團隊升級成兩條並行修復路徑——事後覆盤用一句很 SRE 味的話描述它：<strong>「your solutions either increase supply (adding additional services) or reduce demand (rate limiting inbound traffic)」</strong>。</p>
 
-<p>團隊把整個策略升級成兩條並行的修復路徑。</p>
+<p><strong>路徑一：上游 syncer spawn rate limit</strong>。team 緊急更新 call owner services（guilds、calls、streams）引入新的 rate limit；最關鍵的一條是針對 coordinator syncer——當一個 guild 有大量語音頻道時，coordinator 會為每個頻道 spawn 一個 child syncer，這種「對每個 X 都 spawn 一個 Y」的 unbounded fan-out 是放大效應的源頭，鎖住後 etcd 上看到的 syncer 創建速度立刻降一個數量級。</p>
 
-<p>事後覆盤用了一句很 SRE 味的話來描述它：<strong>「your solutions either increase supply (adding additional services) or reduce demand (rate limiting inbound traffic)」</strong>。</p>
+<p><strong>路徑二：水平擴容 SFU endpoint dispatcher</strong>。透過 GCP Terraform 加 Salt 配置，team 手動補上 15 台 dispatcher 把容量翻倍。把 per-instance load 砍半就等於把 mailbox queue 砍半，等於把 process spawn time 從幾毫秒拉回亞毫秒。事故狀態下跳過 release pipeline 是合理的選擇，但事後該回頭問：「為什麼這個動作平時沒做成一鍵化的 incident-response 工具？」</p>
 
-<p>這次他們同時做了兩件事。</p>
-
-<p><strong>路徑一：在上游服務加上 syncer spawn rate limit</strong>。</p>
-
-<p>team 緊急更新了 call owner services（guilds、calls、streams 三個）的設定，引入新的 rate limit。</p>
-
-<p>最關鍵的一條是針對 coordinator syncer 的限速。當一個 guild 有大量語音頻道時，coordinator syncer 會為每個頻道再 spawn 一個 child syncer。</p>
-
-<p>這個「unbounded spawning of child syncers」是放大效應的源頭。把它鎖住，etcd 上看到的 syncer 創建速度立刻降一個數量級。</p>
-
-<p>這個細節有教學價值：許多 amplification bug 都長這個形狀——「對每個 X 都 spawn 一個 Y」這種模式，當 X 變大時 Y 就以乘法速率成長。任何地方有這種 unbounded fan-out，都該預設加上 cap。</p>
-
-<p><strong>路徑二：水平擴容 SFU endpoint dispatcher</strong>。</p>
-
-<p>透過 GCP Terraform 加 Salt 配置，team 手動補上了 15 台額外的 dispatcher 實例，把整體容量翻倍。</p>
-
-<p>這不是優雅的擴容——是手動 provisioning，沒有經過正常的 release pipeline。</p>
-
-<p>但在那個時間點，把 per-instance load 砍半就等於把 selective receive 的 mailbox queue 砍半，就等於把 process spawn time 從幾毫秒拉回亞毫秒。</p>
-
-<p>事故狀態下「手動 provisioning」是合理的選擇。Release pipeline 平時的價值是避免 bad change 進入生產；但在事故狀態，你 absolutely sure 想做什麼、也願意承擔風險，跳過 pipeline 是合理的。重點是事後一定要回去問：「為什麼這個動作平時沒有作為一鍵化的 incident-response 工具？」</p>
-
-<p>13:43 PDT 的重啟結果與前三次有質的不同：這一次失敗的部位不是 <code>Holster.Pool</code>，而是底層的 <code>gun</code> supervisor。</p>
-
-<p>這代表新增的容量加上上游節流已經把瓶頸位置往下推了一層。</p>
-
-<p>實例還能保持 etcd 註冊，意味著至少可以承擔部分 RPC 負載。</p>
-
-<p>「失敗的部位換了」這個訊號在事故診斷裡非常重要——它告訴你「先前的瓶頸已經不是 critical bottleneck」，問題開始往下一層推。這意味著你的修補方向是對的，繼續往同一方向施力就會看到收斂。</p>
-
-<p>14:03 PDT，實例 2-3 重啟後 mailbox 持續維持在低位，第一台「真正恢復」的實例出現。</p>
-
-<p>14:15 重啟了五台，其中四台維持低 mailbox。</p>
-
-<p>14:26 最後一台恢復——doubled cluster 全體健康。</p>
-
-<p>從第一聲警報響到所有指標復原，總計 3 小時 17 分鐘。</p>
+<p>13:43 的重啟結果與前三次有質的不同：失敗的部位從 <code>Holster.Pool</code> 換到了底層 <code>gun</code> supervisor，實例還能保持 etcd 註冊。「失敗的部位換了」這個訊號在事故診斷裡非常重要——它告訴你先前的瓶頸已經不是 critical bottleneck，繼續往同一方向施力就會看到收斂。14:03 實例 2-3 第一台真正恢復；14:15 重啟五台，四台維持低 mailbox；14:26 最後一台恢復，doubled cluster 全體健康——總計 3 小時 17 分鐘。</p>
 
 <figure class="vg-w-scroll-discord-cascade">
   <style>
@@ -378,147 +469,25 @@
 
 <h2>結構性修補——把這條 critical path 永久拆掉</h2>
 
-<p>Discord 在事後報告裡列了四條軸線的後續修補。</p>
+<p>Discord 列了四條軸線的後續修補，都值得作為「自家系統還可能犯同樣錯」的檢查清單。</p>
 
-<p>這幾條都值得作為「自家系統還可能犯同樣錯」的檢查清單來讀。</p>
+<p><strong>部署層：Kubernetes admission webhook</strong>。在 Kubernetes 加一個 validating admission webhook 檢查 Elixir workload 的縮容請求——只有當 entity drain 跑完才放行。這把「graceful drain 必須跑完」這條原本只存在於工程師腦中的隱性契約，明文寫進 control plane 的 enforcement 裡。50 人的團隊可以靠口耳相傳維持「縮容前要 drain」，500 人不行——只有 enforcement 不會被忘記。</p>
 
-<p><strong>部署層：Kubernetes admission webhook</strong>。</p>
+<p><strong>架構層：PartitionSupervisor 取代 Holster.Pool 的單一 supervisor</strong>。原本所有 spawn/terminate 訊息都打到一個 mailbox；換成 Elixir 1.14 內建的 <code>PartitionSupervisor</code> 後切成 N 個分區（通常 N 等於 scheduler 數），每分區一個 mailbox，selective receive 的 O(n) 跟著切成 N 份。同時 gun 額外那層 supervision 也被拿掉，連線生命周期直接由 Holster.Pool 管理。修補哲學的精彩之處在於：不是「加大 mailbox」也不是「跳過 selective receive」，而是「把單一 contention point 切碎」。</p>
 
-<p>最直接的修補是在 Kubernetes 那一層加一個 validating admission webhook，專門用來檢查 Elixir workload 的縮容請求。</p>
+<p><strong>流控層：上下游同時加 rate limit</strong>。call owner services 統一更新成有合理的 syncer spawn rate limit；voice syncers 內部也補上 endpoint selection rate limit；另外多了一套「optional load shedding tool」，把先前手動操作的應急路徑變成可程式化呼叫的工具。事故當下寫過的每一條「手動 fix」，事後都該問：「能不能變成一條按鈕？」</p>
 
-<p>Webhook 會去問該 service「你現在有多少 GenServer process 還沒交棒？」——只有當 entity drain 真的跑完，admission 才會放行。</p>
+<p><strong>可觀測性層：mailbox health 變成一等公民</strong>。團隊新增了 HTTP connection pooling 的 mailbox health 監控、service discovery announcement 儀表板、voice-to-SFU RPC traffic 的細部 instrumentation。報告還提到「pursuing generic process mailbox monitoring across all Elixir services」——把「任何 process 的 mailbox 長度都該被監控」推到全公司。對跑其他語言的團隊，等價目標是：所有 message channel、worker queue、event loop 的 backlog 長度都該被監控；任何「訊息傳遞層的累積」都是 leading indicator，比 latency 或 error rate 提前一兩個訊號。</p>
 
-<p>這個修補的價值不在於它救了多少場後續事故，而在於它把「graceful drain 必須跑完」這條原本只存在於工程師腦中的隱性契約，明文寫進了 control plane 的 enforcement 裡。</p>
+<p><strong>更長期方向</strong>：A/V 基礎設施從手動管理的 GCP VM 搬上 Kubernetes；voice control plane 重新切成跨 region 架構，讓單一 region 的 connection spike 不再能拖垮全球。能在覆盤裡明白寫出「這些事還沒做」是難得的誠實——很多公司會把長期項目隱去。</p>
 
-<p>把隱性契約變成顯性 enforcement，是組織擴張時最重要的工程改良。一個 50 人的團隊可以靠口耳相傳維持「縮容前要 drain」這條規矩，但 500 人的團隊不行——當你不認識所有寫部署檔的人，唯一可靠的執行方式就是讓系統來做檢查。</p>
+<h3>給跑其他語言的人——三條可遷移的原則</h3>
 
-<p><strong>架構層：PartitionSupervisor 取代 Holster.Pool 的單一 supervisor</strong>。</p>
+<p><strong>O(n) selective receive 是 BEAM 一個冷門但會吃人的細節</strong>。receive 區塊在 mailbox 短時快得不像話，這讓開發者忘了它在 mailbox 長時會退化；任何用 pattern match 從 mailbox 挑特定訊息的路徑都要假設過載時會退化，不能避免就監控 mailbox length。BEAM 21+ 的 <code>receive ref</code> 編譯器最佳化能在某些情況把複雜度降回 O(1)，但 Holster.Pool 那次正好是 hint 無法應用的場景。對其他語言：Go 的 buffered channel、Rust tokio 的 mpsc、Node 的 event loop、Java 的 ThreadPoolExecutor queue——每一個都會在過載時退化到某種失敗模式，差別只在症狀。</p>
 
-<p>這是這次最關鍵的結構性修補。</p>
+<p><strong>service discovery 與 connection management 不該共享同一條 mailbox</strong>。control plane 與 data plane 必須是物理上分開的 process tree。Kubernetes 的 readiness probe 該走獨立的 endpoint 與 thread pool；資料庫的 health check 該走獨立 connection；gRPC server 的 health service 應該跑在獨立 sub-channel——任何「我還活著」的訊號路徑都不該跟「我正在處理業務」的路徑搶資源。</p>
 
-<p>原本 Holster.Pool 用一個 DynamicSupervisor 管所有 HTTP connection 的生命周期，所有 spawn/terminate 訊息都打到同一個 mailbox 裡。</p>
-
-<p>換成 Elixir 1.14 之後內建的 <code>PartitionSupervisor</code>，等於把單一 supervisor 切成 N 個分區（通常 N 等於 scheduler 數），每個分區自己一個 mailbox。</p>
-
-<p>selective receive 的 O(n) 退化也跟著被切成 N 份。</p>
-
-<p>同時，原本由 gun 額外多一層 supervision 也被拿掉——HTTP connection 的生命周期直接由 Holster.Pool 管理，少一層 hop 就少一條 critical path。</p>
-
-<p>這個修補哲學上的精彩之處在於：它不是「加大 mailbox」也不是「跳過 selective receive」，而是「把單一 contention point 切碎」。當你不能讓某個瓶頸消失，把它切成 N 份是退而求其次也最有效的方案。</p>
-
-<p><strong>流控層：上下游同時加 rate limit</strong>。</p>
-
-<p>call owner services（guilds、calls、streams）統一更新成有合理的 syncer spawn rate limit。</p>
-
-<p>voice syncers 內部也補上了 endpoint selection rate limit。</p>
-
-<p>另外多了一套「optional load shedding tool」，在偵測到過載時可以選擇性地強制 syncer 重建——把先前手動操作的應急路徑變成可程式化呼叫的工具。</p>
-
-<p>把 incident response 動作變成 first-class operator tool 是成熟的工程做法。事故當下你寫過的每一條「手動 fix」，事後都該問：「這個動作以後會不會再用到？如果會，能不能變成一條按鈕？」</p>
-
-<p><strong>可觀測性層：mailbox health 變成一等公民</strong>。</p>
-
-<p>團隊新增了 HTTP connection pooling 的 mailbox health 監控、service discovery announcement 的儀表板、以及 voice-to-SFU RPC traffic 的細部 instrumentation。</p>
-
-<p>報告裡還提到一條更廣的目標：「pursuing generic process mailbox monitoring across all Elixir services」——也就是把「任何 Elixir process 的 mailbox 長度都應該是被監控的指標」這個原則推到全公司。</p>
-
-<p>對於跑 BEAM 的團隊，這條值得抄。</p>
-
-<p>對於跑其他語言的團隊，等價的監控目標是：所有 message channel、所有 worker queue、所有 event loop 的 backlog 長度都該被監控。任何「訊息傳遞層的累積」都是 leading indicator，比 latency 或 error rate 提前一兩個訊號。</p>
-
-<p><strong>更長期的方向</strong>。</p>
-
-<p>A/V 基礎設施會從手動管理的 GCP VM 慢慢搬上 Kubernetes，享受 horizontal scaling 的便利。</p>
-
-<p>voice control plane 會被重新切成跨 region 架構，讓單一 region 的 connection spike 不再能拖垮全球。</p>
-
-<p>這兩條都是「需要做但不會在下一個 sprint 就做完」的長期工程。能在覆盤裡明白寫出「這些事還沒做」是難得的誠實——很多公司的覆盤會把長期項目隱去，只列「已修補」的部分，給讀者一種「都已經解決」的假象。Discord 沒有這麼做。</p>
-
-<h3>給其他人讀的注解——mailbox、selective receive 與你自己的服務</h3>
-
-<p>覆盤裡有幾個結論值得被抽出來，因為它們對任何跑 actor model 或 message queue 的服務都成立。</p>
-
-<p>第一條：<strong>O(n) selective receive 是 Erlang/OTP 一個冷門但會吃人的細節</strong>。</p>
-
-<p>BEAM 的 receive 區塊預設行為——掃 mailbox 找匹配 pattern——在 mailbox 短的時候快得不像話，這讓很多開發者忘了它在 mailbox 長的時候會變慢。</p>
-
-<p>如果你的 supervisor 或 GenServer 用了 pattern match 從 mailbox 裡挑特定訊息（例如 <code>receive {:reply, ^ref, msg} -&gt; ...</code>），就要假設這條路徑在過載時會退化。</p>
-
-<p>能避免就避免；不能避免就要監控 mailbox length。</p>
-
-<p>BEAM 21+ 有一個編譯器最佳化叫做 <code>receive ref</code> hint，可以在某些情況下把 selective receive 的複雜度從 O(n) 降回 O(1)——但前提是編譯器能識別 pattern 是針對某個唯一的 reference。Holster.Pool 那次跌進的洞，正好是 hint 沒辦法應用的場景。</p>
-
-<p>第二條：<strong>service discovery 跟 connection management 不應該共享同一條 mailbox</strong>。</p>
-
-<p>Discord 的事故展示了一個非常具體的反例：當 health TTL refresh 跟 connection spawn 走同一個 supervisor，過載的 connection spawn 會把 health refresh 餓死。</p>
-
-<p>然後 service discovery 把實例從 ring 上拔掉——加速崩潰。</p>
-
-<p>這條原則寫進設計守則可以很簡單：control plane 與 data plane 必須是物理上分開的 process tree。</p>
-
-<p>不只是 Elixir，這條原則對任何架構都成立。Kubernetes 的 readiness probe 該走獨立的 endpoint、獨立的 thread pool；資料庫的 health check 該走獨立的 connection；任何「我還活著」的訊號傳遞路徑都不該跟「我正在處理業務」的路徑搶資源。</p>
-
-<p>第三條：<strong>graceful drain 不是 deployment manifest 的可選欄位</strong>。</p>
-
-<p>對任何在 process 內部持有狀態的服務（Elixir GenServer、Go in-memory cache、Rust actor），terminationGracePeriodSeconds 必須跟 drain 流程的實際時長對齊。</p>
-
-<p>並且應該有 admission control 來確保不被誤改。</p>
-
-<p>一份 manifest 的 typo 不該能夠導致 17% session 失聯。</p>
-
-<p>第四條：<strong>cold-start thundering herd 是恢復流程的隱形殺手</strong>。</p>
-
-<p>Discord 的前三次嘗試告訴我們：當問題的源頭是「上游流量沒節流」，無論你重啟多少次，下一次重啟都會被同樣的流量打回去。</p>
-
-<p>恢復計畫必須同時包含「停止流量灌入」與「恢復服務容量」兩條軸線——只做其中一條等於不做。</p>
-
-<p>對抗 thundering herd 的常用工具包括：startup jitter（讓重啟時間隨機分散）、warm-up traffic（先讓實例承擔 1% 流量，再慢慢拉高）、circuit breaker（在實例還沒準備好時拒絕新流量）。Discord 的事故顯示，這些工具在 voice control plane 那一層是缺失的——後續修補裡應該都會補上。</p>
-
-<p>第五條：<strong>「increase supply 或 reduce demand」是一條乾淨的 SRE 公理</strong>。</p>
-
-<p>當系統撞到容量瓶頸時，能做的選擇只有兩個——多開實例（供給）或限速（需求）。</p>
-
-<p>值班時想清楚當下這個瓶頸該用哪一邊，比較容易跳出「再重啟看看」的循環。</p>
-
-<p>Discord 那一次最後是兩條同時做，這也是大多數真實災難恢復裡會選的答案。</p>
-
-<p>事故當下你會發現工程師有一種「我必須做點什麼」的衝動——這種衝動是好的，但要綁定在正確的問題框架上。「increase supply 或 reduce demand」就是這個框架。每一個事故當下的動作，問自己一句：「我這個動作是在增加供給還是減少需求？」答不出來就是在亂打。</p>
-
-<h3>把這次事故跟自家系統對照</h3>
-
-<p>如果你的團隊跑 Elixir，這次覆盤幾乎是現成的 checklist。</p>
-
-<p>但如果你跑的是其他語言，結構性的教訓也直接搬得過來——只要把「mailbox」換成「channel」、「supervisor」換成「worker pool」、「BEAM scheduler」換成「event loop」，整篇故事都可以重講一遍。</p>
-
-<p>Go 的 channel buffered 滿了之後 sender 會 block。</p>
-
-<p>跟 Erlang mailbox 漲長之後 selective receive 變慢，本質上是同一類問題：訊息傳遞層的反壓沒處理好，全系統一起被拖下水。</p>
-
-<p>Rust 的 tokio mpsc 如果 receiver 處理不過來，sender 端會看到 send 失敗——這時候要不要 retry、要不要 drop，是一個必須在設計時想清楚的決定。</p>
-
-<p>Node 的 event loop 如果有 CPU-bound 任務塞住，所有 socket 都跟著卡——這也是 mailbox 模式的變體。</p>
-
-<p>Java 的 ThreadPoolExecutor 如果 queue 是 unbounded，過載時 queue 會無限長到 OOM——對應於 Erlang 的 mailbox blowup。如果 queue 是 bounded，過載時 RejectedExecutionException 開始往上拋，對應於 tokio 的 send 失敗。每種語言都有同類型的工具，差別只在違反 invariant 時的具體症狀。</p>
-
-<p>Python 的 asyncio Queue、Ruby 的 SizedQueue、C++ 的 lock-free MPMC ring——每一個都會在過載時退化到某種失敗模式。寫 distributed system 的工程師，這些 failure mode 應該都要有 mental model。</p>
-
-<p>service discovery 跟 critical path 共享資源的問題就更普遍了。</p>
-
-<p>Kubernetes 的 readiness probe 如果跟主要的 request handling 共用同一個 thread pool，過載時 readiness probe 失敗，pod 被踢出 endpoint，剩下的 pod 接更多流量——同樣的迴圈，不同的語言。</p>
-
-<p>任何時候 health check 跟業務邏輯走同一條 critical path，都要把這個故事拿出來想一遍。</p>
-
-<p>對於 gRPC server，這意味著 health service 應該跑在獨立的 sub-channel 上；對於 HTTP server，這意味著 health endpoint 應該綁定到專屬 listener 上；對於資料庫 driver，這意味著 health query 應該走專屬 connection。每一層都要單獨想過。</p>
-
-<p>還有一條值得提的：deployment manifest 的人類因素。</p>
-
-<p>這次事故的觸發點不是某個複雜的演算法 bug，也不是某個冷門的 race condition——是一份 Kubernetes manifest 把 replicas 改錯了。</p>
-
-<p>任何依賴「工程師會記得手動把 terminationGracePeriodSeconds 調高」的流程都會在某個時間點失敗。</p>
-
-<p>把這條變成 admission webhook 強制檢查，是一個 organizational scale 的修補——它不只防住這次的特定錯誤，也防住未來所有「工程師忘了某個 best practice」的同類錯誤。</p>
-
-<p>這也是「policy as code」這個概念的價值所在：把 best practice 從文件、從 review 共識、從工程師的記憶力，遷移到 admission control 的 enforcement 裡。文件會被忘記、review 共識會被新人不知道、記憶力會被疲勞磨損。只有 enforcement 不會。</p>
+<p><strong>cold-start thundering herd 是恢復流程的隱形殺手</strong>。當源頭是「上游沒節流」，重啟多少次下次都會被同樣流量打回去。恢復計畫必須同時包含「停止流量灌入」與「恢復服務容量」兩條軸線。對抗工具包括 startup jitter、warm-up traffic、circuit breaker——這次事故顯示，這些工具在 voice control plane 那層是缺失的。</p>
 
 <h3>數字一覽——把這次事故壓成幾個關鍵指標</h3>
 
@@ -654,9 +623,7 @@
   <figcaption>before/after：左圖把所有 spawn/terminate 收進同一個 mailbox 並再經一層 gun supervision；右圖把 mailbox 切成 N 個分區，並把 gun supervision 折掉一層。</figcaption>
 </figure>
 
-<p>切成 N 個分區之所以管用，並不只是「分擔負載」這麼一句話可以概括的。selective receive 的退化是因為 BEAM 的 receive 區塊在 mailbox 長時要做 O(n) 掃描；當 N 個 mailbox 各自獨立，每個的 n 都只是原本的 1/N，掃描時間也跟著降到 1/N。對 voice syncers 的場景而言，這個分母通常是 BEAM scheduler 數，在現代多核 host 上輕鬆達到 16-32。一個 ~100k 的 mailbox 切成 32 份之後變成 ~3k——回到了 selective receive 還算便宜的區間。</p>
-
-<p>把 gun 的額外 supervisor 拿掉是另一個值得學的細節。許多 Erlang/Elixir 函式庫為了「保險」會在自己的 process 樹上再多一層 supervision，理論上是為了把不同責任分離。實務上，多一層 supervisor 就多一個訊號中轉點——對 critical path 而言這是純粹的 overhead。Discord 把 connection lifecycle 直接放回 Holster.Pool 管理，少一層 hop、少一個 mailbox 可能變慢的地方。</p>
+<p>切成 N 份之所以管用，不只是「分擔負載」這句話可以概括。selective receive 的退化是 O(n) 掃描；當 N 個 mailbox 各自獨立，每個的 n 都是原本的 1/N，掃描時間也跟著降到 1/N。voice syncers 的分母通常是 BEAM scheduler 數，在多核 host 上輕鬆 16-32：~100k 切成 32 份變成 ~3k，回到 selective receive 還算便宜的區間。拿掉 gun 額外那層 supervisor 是另一個值得學的細節——多一層 supervisor 就多一個訊號中轉點，對 critical path 是純粹 overhead。</p>
 
 <h3>mailbox 曲線——把那段崩壞畫成一張圖</h3>
 
@@ -732,39 +699,13 @@
 
 <h3>覆盤的氣質——一份願意承認「我們也會犯這種錯」的報告</h3>
 
-<p>讀完整份覆盤之後，留在腦中最深的不只是技術細節，還有 Discord 工程文化的某種氣質。</p>
-
-<p>報告開頭引「sad trombone」是一個很小的細節，但它說明了某種編輯立場——不掩飾恐懼、不掩飾自嘲、也不掩飾事故過程中那些「明明試了好幾次都沒救起來」的挫敗時刻。</p>
-
-<p>這是高品質 postmortem 才會有的姿態。</p>
-
-<p>Bo Ingram 與 Stephen Birarda 的署名也值得提。</p>
-
-<p>「Senior Staff Engineer」掛名寫覆盤，傳達的訊息很清楚：這個案子的學習價值高到值得最資深的人花時間寫好。</p>
-
-<p>許多公司會把 postmortem 推給比較淺的工程師當作「成長機會」，結果出來的東西是 checklist 風格，沒有 narrative、沒有 mechanism、也沒有反思——讀完之後讀者只記得「他們犯了某種錯，他們補了某種東西」，但腦中沒有留下可以遷移到自家系統的洞察。</p>
-
-<p>另一個值得學的習慣是：覆盤不只列出「我們做了什麼修補」，而是同時列出「我們還沒做的長期方向」。</p>
-
-<p>Discord 在最後特別提了「A/V infra 還沒上 Kubernetes」與「control plane 還沒跨 region」這兩個長期項。</p>
-
-<p>承認自己的系統還有沒補完的洞，比假裝一切都修好了要誠實得多。</p>
-
-<p>對任何要在自家寫 postmortem 的工程師——這份報告值得當作範本來參考。</p>
-
-<p>結構上它是 trigger → cascade → mitigation attempts → why they failed → final mitigation → structural fix → long-term roadmap，每一段都有具體的時間點與數字、有引用、有 self-criticism、也有可遷移的原則。</p>
-
-<p>技術寫作能達到這個水準的公司不多。</p>
-
-<p>把覆盤當成一種公共財，而不是內部問責文件——這個編輯立場本身就是工程文化的訊號。AWS post-event summaries 過去十年從非常乾的內部文件慢慢演化成更可讀的公開報告，Cloudflare 一直保持了較高的敘事密度，Stripe 的 postmortem 在金融基礎設施圈內被廣為引用。Discord 這次加入了這份名單——能寫到這個水準的公司，技術人才的吸引力本身也會跟著提升。</p>
+<p>讀完整份覆盤後，留在腦中最深的不只是技術細節，還有編輯立場——報告開頭引「sad trombone」、Bo Ingram 與 Stephen Birarda 的 Senior Staff Engineer 署名、明白寫出「A/V infra 還沒上 Kubernetes」與「control plane 還沒跨 region」這些尚未完成的長期項。結構上它是 trigger → cascade → mitigation attempts → why they failed → final mitigation → structural fix → long-term roadmap，每段都有具體時間點、數字、引用、self-criticism 與可遷移原則。把覆盤當公共財而不是內部問責文件，這個立場本身就是工程文化的訊號——Cloudflare、Stripe、AWS 過去十年都走過這條路，Discord 這次加入了這份名單。</p>
 
 <h2>從這次故事帶走的——壓回一個句子</h2>
 
-<p>如果要把這整篇覆盤壓成一句技術人都能記住的話：<strong>一行 Kubernetes manifest 的誤設，會經由 graceful drain 缺位、reconnection storm 跨 zone、Erlang selective receive 在長 mailbox 下退化、service discovery 與 connection management 共享 mailbox、cold-start thundering herd，這一連串平日各自無害的設計選擇，串成一條 3 小時 17 分鐘的全球語音崩潰路徑。</strong></p>
+<p>如果要把整篇覆盤壓成一句：<strong>一行 Kubernetes manifest 的誤設，會經由 graceful drain 缺位、reconnection storm 跨 zone、Erlang selective receive 在長 mailbox 下退化、service discovery 與 connection management 共享 mailbox、cold-start thundering herd，這一連串平日各自無害的設計選擇，串成一條 3 小時 17 分鐘的全球語音崩潰路徑。</strong></p>
 
-<p>每一個環節單獨來看都不算 critical bug——graceful drain 「應該」會跑完、selective receive 「通常」很快、service discovery 「平常」不會跟 connection 搶資源、reconnection 「一般」不會多到打爆 gateway。但當這些「應該、通常、平常」全部同時失敗，就會變成這次的 3 小時 17 分鐘。分散式系統的故障故事，幾乎永遠是這種「多個獨立 invariant 同時失效」的形狀。</p>
-
-<p>這也是為什麼這類覆盤值得讀得很細：你不會在自己的系統上遇到完全一樣的 Holster.Pool 故障，但你會遇到結構上相似的——某個 supervisor 的 mailbox 太長、某條 critical path 同時承擔了 health check 與業務邏輯、某次部署沒有 admission control 把住、某次救火忽略了上游節流。當那一天到來，你會慶幸自己讀過 Discord 這份覆盤。</p>
+<p>每一個環節單獨來看都不算 critical bug——graceful drain「應該」會跑完、selective receive「通常」很快、service discovery「平常」不會跟 connection 搶資源、reconnection「一般」不會多到打爆 gateway。當這些「應該、通常、平常」全部同時失敗，就會變成這次的 3 小時 17 分鐘。你不會在自己系統上遇到完全一樣的 Holster.Pool 故障，但你會遇到結構上相似的——當那一天到來，你會慶幸自己讀過 Discord 這份覆盤。</p>
 
 <p class="vg-deep-closer"><strong>The lesson</strong>：分散式系統的崩潰幾乎永遠不是「單一 bug」，而是多個各自無害的設計選擇在某個流量峰值下同時失效——你能做的不是消滅 bug，而是把每一條 critical path 上的 invariant 寫成可被 enforce 的契約。</p>
 
