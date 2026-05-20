@@ -33,7 +33,7 @@ Justification must quote the opener verbatim.
 ## Axis 2 — Structural coherence (archetype-aware)
 
 Reviewer reads
-`skills/daily-news/references/archetypes/deep-<archetype>.md` to know
+`skills/daily-news/references/archetypes/deep-{{archetype}}.md` to know
 the standard for this post's archetype. Standards switch:
 
 | Archetype | What measures | Good | Bad |

@@ -107,6 +107,7 @@ phrasing pattern? hook strategy? closer framing?).
 
 - Tools allowed: Read only.
 - Do NOT read posts outside this batch.
+- Do NOT read skills/daily-news/references/exemplars/.
 - Do NOT modify any file.
 ```
 
