@@ -338,6 +338,7 @@ A horizontally scrollable table beats a crushed-unreadable one.
 - **Hover-only affordances** — phones don't hover; expose via tap or always-visible
 - **font-size below 14px** — unreadable on phones
 - **`viewBox="0 0 480 200"`** — too narrow; SVG widgets should use 720+ width viewBox so labels have room when scaled down
+- **`<figure ... style="margin: ...">` inline style** — NEVER set `margin` (or any horizontal margin) inline on a `<figure>`. Site CSS uses `margin-left: calc(50% - 50vw + var(--gutter))` on mobile to break the figure out of the prose column so SVG widgets fill the viewport. Inline styles have higher specificity and clobber this, leaving the figure shifted left with a gap on one side and the widget touching the opposite viewport edge. Put vertical spacing inside the widget's own `<style>` block keyed to `.vg-w-NAME { margin: var(--s-4) 0; }` if you must — but ideally rely on site.css's `margin-top/bottom: var(--s-4)` defaults and write nothing.
 
 ### 12.3 Self-check before declaring DONE
 
@@ -349,6 +350,21 @@ widget verify:
 3. Is text legible? (≥14px on screen)
 4. Does the widget make sense without horizontal scroll? (or does it scroll cleanly when needed)
 5. For scroll-driven: do stages activate as you scroll? (not all-inert because rootMargin too tight)
+6. **Figure horizontal symmetry**: at 375px viewport, the figure's left
+   edge gap to viewport and right edge gap to viewport should match
+   (typically ~16px each side). If `left=32, right=0` or vice versa,
+   site.css's `margin-left: calc(...)` was clobbered — usually by an
+   inline `style="margin: ..."` declaration (see §12.2). Measure with:
+
+   ```js
+   document.querySelectorAll('figure[class*="vg-w-"]').forEach(f => {
+     const r = f.getBoundingClientRect();
+     console.log(f.className, 'L=', r.left, 'R=', window.innerWidth - r.right);
+   });
+   ```
+
+   Both numbers must be equal (within 1px). Don't trust visual judgement —
+   a 32px asymmetry is easy to miss until someone overlays a centerline.
 
 If any answer is "no", fix in the widget's own scoped CSS — do not
 defer to "we'll fix mobile later". Mobile is half the readers; "later"
