@@ -444,6 +444,134 @@ PR body must list:
   many returned DONE / DONE_WITH_CONCERNS / BLOCKED, and any
   re-dispatches needed.
 
+### Step 7.5: Content quality gate
+
+After Step 7c verifies骨架, run the content-quality reviewer pass on
+the roundup + each deep-story. This is the only step that judges
+whether the prose is actually good — Step 8 catches HTML / dedup /
+archetype-count failures, Step 8.5 catches visual issues, but neither
+looks at story arc, hook strength, or whether H2s are template-shaped.
+
+**Wallclock is NOT capped** in this step. Quality trumps speed.
+
+#### Step 7.5a: Dispatch dual reviewers (parallel)
+
+For each post produced in Steps 6 + 7 (1 roundup + N deep-stories,
+max 3), dispatch **2 independent reviewer sub-agents** with
+`subagent_type: general-purpose`. Each reviewer's brief follows the
+template in
+`${CLAUDE_PLUGIN_ROOT}/skills/daily-news/references/content-reviewer-brief.md`
+with the per-post values substituted.
+
+Total batch size: 2 × (1 + N) reviewer sub-agents, all dispatched in
+ONE response (single message with multiple `Agent` tool blocks).
+
+Each reviewer:
+- Tools: Read only
+- Reads: post HTML + sidecar + rubric file + archetype reference (if
+  deep-story) + persona file
+- Does NOT read: other posts, exemplars, other reviewer's output
+- Emits: ONE JSON object per the rubric's "Reviewer output format"
+  schema
+
+#### Step 7.5b: Consolidate dual-reviewer findings
+
+For each post, parent receives 2 reviewer outputs. For each axis:
+- `consensus_score = min(reviewer_A.score, reviewer_B.score)` (lower
+  = stricter gate)
+- `disagreement = |reviewer_A.score - reviewer_B.score|`
+
+If `disagreement >= 2` on any axis, record for PR body:
+`<output_path> Axis <name>: reviewer-A=<A>, reviewer-B=<B>`.
+
+Derive per-post `overall` from consensus scores using the rubric's
+band semantics:
+- Any consensus axis <= 3 → BLOCKING
+- Otherwise any consensus axis 4-6 → IMPORTANT
+- Otherwise any consensus axis 7-8 → PASS-with-notes
+- All consensus >= 9 → PASS
+
+#### Step 7.5c: Per-post retry loop
+
+For each post with `overall` BLOCKING or IMPORTANT, construct a retry
+brief for the author sub-agent. The retry brief is the post's
+original brief (from Step 7a — held by parent) PLUS:
+
+- The current `output_path` (existing draft is the starting point)
+- The reviewer findings: each weak axis, its consensus score, both
+  reviewers' justifications
+- Explicit instruction on the target level (axis must reach >= 7 to
+  exit BLOCKING; >= 7 to exit IMPORTANT)
+- Permission to keep widgets unchanged unless reviewer findings cite
+  widget content (most prose findings should not touch widgets)
+
+Parent dispatches retry author sub-agents in parallel (one per post
+needing retry). After all retries return, re-dispatch the dual
+reviewers (Step 7.5a) for each retried post; consolidate again
+(Step 7.5b).
+
+Iteration budget per post:
+- **BLOCKING**: up to 5 retry rounds. If still BLOCKING after 5 →
+  drop this post (N → N-1). Log to PR body under
+  `## Step 7.5 Blocking drops`.
+- **IMPORTANT**: up to 3 retry rounds. If still IMPORTANT after 3 →
+  accept the current draft, log to PR body under
+  `## Content Quality Concerns`.
+- **PASS-with-notes / PASS**: no retry; logged for transparency only.
+
+If a reviewer emits malformed JSON: re-dispatch that reviewer up to 2
+extra times. If still malformed, treat as a vote of BLOCKING on that
+post (drop the post).
+
+If the roundup itself reaches BLOCKING and exhausts retries: this is
+a routine failure. Do NOT open PR. Report BLOCKED status with the
+roundup's blocking axes.
+
+#### Step 7.5d: Inter-post diversity check (only when N_final >= 2)
+
+After all per-post retries settle, count the number of deep-stories
+still in the batch (`N_final`). If `N_final >= 2`, dispatch ONE
+inter-post reviewer sub-agent with the inter-post brief variant from
+`content-reviewer-brief.md`. It scores Axis 7 only.
+
+If `batch_score < 7`:
+1. Identify `most_similar_post` from the reviewer output.
+2. Construct a retry brief: original brief + "find another angle"
+   instruction + the inter-post reviewer's justification on what
+   makes this post too-similar-to-others.
+3. Dispatch one retry author sub-agent for that post.
+4. Re-dispatch the inter-post reviewer.
+5. Up to 2 inter-post retry rounds. If still `batch_score < 7`
+   after round 2, accept and log to
+   `## Inter-post diversity concerns`.
+
+`N_final = 1` → skip Step 7.5d entirely.
+
+#### Step 7.5e: Collate findings for PR body
+
+Parent now has, for each surviving post:
+- Final per-axis consensus scores
+- Final overall status
+- Retry rounds run
+- Reviewer disagreement notes (if any axis disagreed by >= 2)
+
+And, if N_final >= 2:
+- Final batch_score
+- Inter-post retries run
+
+These populate the PR body sections defined in Step 9's template
+(see Step 9 prose).
+
+#### Failure modes for Step 7.5
+
+| Scenario | Handling |
+|---|---|
+| One reviewer emits malformed JSON | Re-dispatch that reviewer (up to 2 retries). Still malformed → treat as BLOCKING vote on that post. |
+| Both reviewers crash on one post | Treat as BLOCKING for that post. Drop the post if it's a deep-story; abort routine if it's the roundup. |
+| All N deep-stories blocking-drop | Routine continues with roundup-only PR; PR title says "(0 deep stories)" and PR body documents the drops. |
+| Roundup blocking-drops | BLOCKED — do NOT open PR. Report status with roundup's blocking axes. |
+| Reviewer dispatch returns no output (network / tool failure) | Re-dispatch that reviewer once. Still nothing → treat as BLOCKING vote. |
+
 ### Step 8: Self-check (mechanical)
 
 Run the validation scripts:
@@ -644,6 +772,34 @@ AI · 3 · SYSTEMS · 3 · INFRA · 2 · WEB · 1 · BACKEND · 1
   did not fully resolve.
 - `/2026/05/16/roundup/`: drop cap baseline 2px below following line. Minor.
 
+## Content Quality Review
+
+For each post (roundup + deep-stories):
+- `<output_path>` — final status: PASS / PASS-with-notes / IMPORTANT-accepted / BLOCKED-dropped
+  - Axis 1 (Hook): <score> — "<short justification>"
+  - Axis 2 (Structural, <archetype>): <score> — "<short justification>"
+  - Axis 3 (Material): <score>
+  - Axis 4 (Depth): <score>
+  - Axis 5 (Relevance, <dimension>): <score>
+  - Axis 6 (Anti-template): <score>
+  - Retry rounds: <N>
+
+## Step 7.5 Blocking drops
+
+- (none) — or list: `<output_path>` (archetype), blocking axes, final scores, attempted retries
+
+## Content Quality Concerns
+
+- (none) — or list each post with axes still 4-6 after retry budget exhausted
+
+## Reviewer disagreements
+
+- (none) — or list: `<output_path>` Axis <name>: reviewer-A=<A>, reviewer-B=<B>. Human reviewer should look closely.
+
+## Inter-post diversity concerns
+
+- (none) — or batch_score=<N>, attempted retries=<M>, final state notes.
+
 ## Deep-story archetypes used today
 
 - {{deep_title_1}} — `narrative`
@@ -685,15 +841,21 @@ Do not merge. Wait for human review.
 | Step 8.5 visual: blocking issue still present after 5 iterations | Stop. Do NOT open PR. Report BLOCKED status with the offending screenshot path so a human can inspect. |
 | Step 8.5 visual: important issue still present after 3 iterations | Continue to Step 9. Write the issue into `## Visual Concerns` so reviewer knows. |
 | Step 8.5 visual: dev server fails to start | BLOCKED — likely a build break; cannot self-review without a live server. |
+| Step 7.5 content: all reviewer instances crash on one post | BLOCKED for that post. Drop deep-stories; abort routine for roundup. |
+| Step 7.5 content: post fails 5 BLOCKING retries | Drop the post (N → N-1). Log to PR body. Routine continues. |
+| Step 7.5 content: roundup fails 5 BLOCKING retries | Abort routine. Do NOT open PR. Report BLOCKED status. |
+| Step 7.5 content: inter-post diversity fails 2 retries | Accept and log to PR body. Routine continues. |
 
 ## Output expectations summary
 
 A successful run produces:
 
 - 1 × `roundup.html` + `roundup.11tydata.json` in `src/posts/YYYY/MM/DD/`
-- 1-3 × `deep-<slug>.html` + matching `.11tydata.json`
+- 0-3 × `deep-<slug>.html` + matching `.11tydata.json` (count may be
+  reduced from intended N by Step 7.5 Blocking drops)
 - One git branch `daily/YYYY-MM-DD` pushed to origin
-- One PR open against `main` with the body template above filled in
+- One PR open against `main` with the body template above filled in,
+  including the four Step 7.5 content-quality sections
 
 ## Why this is split across multiple references
 
