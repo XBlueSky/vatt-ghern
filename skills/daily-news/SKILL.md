@@ -446,7 +446,7 @@ PR body must list:
 
 ### Step 7.5: Content quality gate
 
-After Step 7c verifies骨架, run the content-quality reviewer pass on
+After Step 7c verifies structure, run the content-quality reviewer pass on
 the roundup + each deep-story. This is the only step that judges
 whether the prose is actually good — Step 8 catches HTML / dedup /
 archetype-count failures, Step 8.5 catches visual issues, but neither
@@ -782,6 +782,7 @@ For each post (roundup + deep-stories):
   - Axis 4 (Depth): <score>
   - Axis 5 (Relevance, <dimension>): <score>
   - Axis 6 (Anti-template): <score>
+  - (Axis 7 inter-post diversity: see § Inter-post diversity concerns below)
   - Retry rounds: <N>
 
 ## Step 7.5 Blocking drops
@@ -841,7 +842,7 @@ Do not merge. Wait for human review.
 | Step 8.5 visual: blocking issue still present after 5 iterations | Stop. Do NOT open PR. Report BLOCKED status with the offending screenshot path so a human can inspect. |
 | Step 8.5 visual: important issue still present after 3 iterations | Continue to Step 9. Write the issue into `## Visual Concerns` so reviewer knows. |
 | Step 8.5 visual: dev server fails to start | BLOCKED — likely a build break; cannot self-review without a live server. |
-| Step 7.5 content: all reviewer instances crash on one post | BLOCKED for that post. Drop deep-stories; abort routine for roundup. |
+| Step 7.5 content: all reviewer instances crash on one post | BLOCKED for that post. Drop that post if it's a deep-story; abort routine if it's the roundup. |
 | Step 7.5 content: post fails 5 BLOCKING retries | Drop the post (N → N-1). Log to PR body. Routine continues. |
 | Step 7.5 content: roundup fails 5 BLOCKING retries | Abort routine. Do NOT open PR. Report BLOCKED status. |
 | Step 7.5 content: inter-post diversity fails 2 retries | Accept and log to PR body. Routine continues. |
