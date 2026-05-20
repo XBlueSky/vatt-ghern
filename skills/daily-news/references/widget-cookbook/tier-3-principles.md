@@ -338,6 +338,7 @@ A horizontally scrollable table beats a crushed-unreadable one.
 - **Hover-only affordances** — phones don't hover; expose via tap or always-visible
 - **font-size below 14px** — unreadable on phones
 - **`viewBox="0 0 480 200"`** — too narrow; SVG widgets should use 720+ width viewBox so labels have room when scaled down
+- **`<figure ... style="margin: ...">` inline style** — NEVER set `margin` (or any horizontal margin) inline on a `<figure>`. Site CSS uses `margin-left: calc(50% - 50vw + var(--gutter))` on mobile to break the figure out of the prose column so SVG widgets fill the viewport. Inline styles have higher specificity and clobber this, leaving the figure shifted left with a gap on one side and the widget touching the opposite viewport edge. Put vertical spacing inside the widget's own `<style>` block keyed to `.vg-w-NAME { margin: var(--s-4) 0; }` if you must — but ideally rely on site.css's `margin-top/bottom: var(--s-4)` defaults and write nothing.
 
 ### 12.3 Self-check before declaring DONE
 
