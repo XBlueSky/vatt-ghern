@@ -357,14 +357,25 @@ widget verify:
    inline `style="margin: ..."` declaration (see §12.2). Measure with:
 
    ```js
-   document.querySelectorAll('figure[class*="vg-w-"]').forEach(f => {
+   // Neutralize Playwright's simulated scrollbar gutter (mobile has overlay scrollbar = 0px)
+   document.documentElement.style.overflow = 'hidden';
+   document.body.style.cssText = 'overflow: auto; width: 100vw; max-width: 100vw;';
+
+   // Select all post figures, not just ones with vg-w- on figure itself
+   // (some widgets put vg-w- on inner svg/div; figure tag is bare)
+   document.querySelectorAll('.vg-post-prose figure, .vg-post-body figure').forEach(f => {
      const r = f.getBoundingClientRect();
-     console.log(f.className, 'L=', r.left, 'R=', window.innerWidth - r.right);
+     const L = Math.round(r.left);
+     const R = Math.round(window.innerWidth - r.right);
+     const id = f.className || f.querySelector('[class*="vg-w-"]')?.className || '?';
+     console.log(id, 'L=', L, 'R=', R, 'diff=', Math.abs(L-R));
    });
    ```
 
    Both numbers must be equal (within 1px). Don't trust visual judgement —
    a 32px asymmetry is easy to miss until someone overlays a centerline.
+   Without the scrollbar-gutter neutralization above, Playwright reports a
+   spurious 7.5–15px diff that doesn't exist on real mobile devices.
 
 If any answer is "no", fix in the widget's own scoped CSS — do not
 defer to "we'll fix mobile later". Mobile is half the readers; "later"
