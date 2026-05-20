@@ -173,20 +173,50 @@ height.
 }
 ```
 
-**B. `position: sticky` inside grids must drop sticky at mobile**
+**B. `position: sticky` in 2-col grid: at mobile, flip to sticky-top**
 
-If desktop layout is `[prose | sticky figure]`, mobile must NOT keep
-the figure sticky — once the grid collapses, the figure is no longer
-"beside" anything and sticky just creates dead space below each prose
-section. Always pair sticky with a mobile fallback:
+Desktop layout `[prose | sticky figure]` works: reader scrolls prose
+on the left, the figure on the right stays put and updates as stages
+activate. At mobile the grid collapses — `.stages` ends up *above*
+`.figure-sticky` in source order, which means the figure sits below
+the entire scroll-driven narrative and never gets seen until after
+all the stage prose has scrolled past. The scroll-driven mechanism
+becomes pure decoration.
+
+**Wrong** (what we previously recommended):
+
+```css
+@media (max-width: 720px) {
+  .vg-w-EXAMPLE .figure-sticky { position: static; }   /* breaks scroll-driven */
+}
+```
+
+**Right** — pin the figure to the *top* of the viewport at mobile,
+re-order it above the stages with `order: -1`, and cap its height to
+~50vh so the prose underneath still has reading space:
 
 ```css
 .vg-w-EXAMPLE .figure-sticky { position: sticky; top: var(--s-4); }
 @media (max-width: 720px) {
   .vg-w-EXAMPLE { grid-template-columns: 1fr; }
-  .vg-w-EXAMPLE .figure-sticky { position: static; }
+  .vg-w-EXAMPLE .figure-sticky {
+    position: sticky;
+    top: 0;
+    order: -1;             /* lift figure above stages */
+    max-height: 55vh;
+    background: var(--bg); /* opaque so prose underneath doesn't bleed through */
+    z-index: 1;
+    padding: var(--s-2) 0;
+    margin-bottom: var(--s-2);
+  }
+  .vg-w-EXAMPLE .figure-sticky svg { max-height: 50vh; }
 }
 ```
+
+This is the standard "scrollytelling" pattern used by Distill.pub /
+Pudding / NYT Interactive: figure pinned to top half of the viewport
+on mobile, prose scrolls in the bottom half, figure updates as
+stages activate (via IntersectionObserver per §12.1.E).
 
 **C. Tap targets ≥ 44×44 px (Apple HIG) on mobile**
 
