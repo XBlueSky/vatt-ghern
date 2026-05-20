@@ -45,6 +45,11 @@ the standard for this post's archetype. Standards switch:
 | `explainer` | Layered build: prereq → concept → example → 邊界 | starts where reader is | assumes knowledge |
 | `freeform` | Coherence: each section serves one argument | all converge to one takeaway | sections unrelated |
 
+- **9-10**: All structural beats for this archetype present, in order, well-paced. No missing pieces.
+- **7-8**: Structure present but one beat is thin (e.g., narrative's resolution段太短, comparison's conclusion lacks a clear pick).
+- **4-6**: Two or more structural beats missing or out of order; or the structure of a different archetype was forced onto this post.
+- **0-3**: No discernible structure for the chosen archetype; reads as random points stitched together.
+
 Reviewer states which standard was used:
 "Structural coherence (technical-deep-dive archetype): 8/10 — ..."
 
@@ -132,11 +137,11 @@ score < 7.
 
 Reviewer sub-agent emits a single JSON object per post:
 
-```json
+```jsonc
 {
   "output_path": "src/posts/YYYY/MM/DD/<slug>.html",
-  "archetype": "narrative" | ... | null,
-  "domain": "ai" | ... | null,
+  "archetype": "narrative", // or technical-deep-dive | investigation | comparison | explainer | freeform | null (roundup)
+  "domain": "ai", // or systems | infra | web | backend | null (roundup)
   "axes": {
     "hook": {"score": 8, "justification": "..."},
     "structural": {"score": 7, "justification": "...", "standard_used": "narrative"},
@@ -145,7 +150,7 @@ Reviewer sub-agent emits a single JSON object per post:
     "relevance": {"score": 7, "justification": "...", "dimension_used": "actionability"},
     "anti_template": {"score": 9, "justification": "..."}
   },
-  "overall": "PASS" | "PASS-with-notes" | "IMPORTANT" | "BLOCKING"
+  "overall": "PASS" // or PASS-with-notes | IMPORTANT | BLOCKING
 }
 ```
 
@@ -159,7 +164,7 @@ For the inter-post (Axis 7) reviewer, output format is:
 
 ```json
 {
-  "batch_score": 7,
+  "batch_score": 5,
   "most_similar_post": "src/posts/.../deep-foo.html",
   "justification": "..."
 }
