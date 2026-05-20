@@ -499,9 +499,41 @@ sleep 2 && curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/
    screenshot the **viewport**, not the element. Element-level screenshots
    (`target=` in playwright) are unreliable when multiple `<figure>` or
    `<svg>` elements exist on the page (strict-mode selector violation).
-5. Mobile viewport check: resize to 375px, navigate to roundup once,
-   screenshot. Verify no layout collapse, no horizontal scroll, SVG widgets
-   scale.
+5. **Mobile audit — every deep-story, every widget** (added 2026-05-20
+   after PR #23/#24/#25 surfaced widespread mobile issues):
+
+   a. Resize browser to **375×812** (iPhone SE / small phone).
+
+   b. For each deep-story, navigate to the post URL.
+
+   c. For each widget inside `.vg-post-body figure[class*="vg-w-"]`:
+      - `widget.scrollIntoView({ block: 'center' })`
+      - Wait ~300ms for any sticky / IntersectionObserver to settle.
+      - Take a viewport screenshot.
+      - **Look at the screenshot**. Check:
+        - Is every SVG label / axis / chart annotation readable?
+          (Wide-aspect viewBox ≥4:1 widgets crush at 375px to ~80px
+          tall — labels collide. See tier-3 §12.1.D-pre for fix
+          patterns.)
+        - Are tap targets ≥ 32px? (range thumbs, buttons, divider
+          handles, SVG clickable rects.)
+        - Does the widget overflow horizontally? (any `bb.right > 400`)
+        - For scroll-driven widgets: does the sticky figure stay
+          visible below the site header (not hidden behind chrome)?
+          Site header is `position: sticky; top: 0; z-index: 50` ~100px
+          tall — sticky widget figures must use `top: var(--vg-header-h)`
+          per tier-3 §12.1.B.
+
+   d. Also scroll past each scroll-driven widget's stages and verify
+      the active stage class actually changes as the reader scrolls
+      (IntersectionObserver mobile rootMargin per §12.1.E).
+
+   e. Record findings for the post in the issue list (see severity
+      tiering below).
+
+6. **Roundup mobile check**: navigate to roundup at 375px, screenshot
+   the donut + top 3 item cards. Verify section labels render,
+   read-tracker buttons inject correctly, no horizontal scroll.
 
 **Look at each screenshot. Classify any issues by severity**:
 
@@ -510,6 +542,20 @@ sleep 2 && curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/
 | **Blocking** | Element overlap obscuring text; text cut off mid-character; SVG widget completely invisible (white-on-white in light mode, dark-on-dark in dark mode); page renders blank or with browser console errors; layout collapse where one column eats another | Fix the underlying CSS/HTML; rebuild; re-screenshot; re-classify. Up to **5 iterations**. If still blocking after 5 → stop and report BLOCKED status (do NOT open PR). |
 | **Important** | Awkward but readable spacing; SVG renders but legend overflows; sticky header overlaps card title on scroll; CJK wrap breaking a code identifier ugly | Fix in current iteration. Up to **3 iterations**. If still present after 3 → note in PR body under `## Visual Concerns` and continue to PR. |
 | **Minor** | Drop cap baseline 2-3px off; tag chip vertical alignment imperfect; line-height slightly tight | Record only. Note in PR body, do NOT iterate. |
+
+**When retrofitting / fixing existing posts (not just authoring new ones)**:
+the Step 8.5 audit MUST be re-run on every post that was modified. This
+applies to bulk widget retrofits, prose trims, density refactors, mobile
+fixes — any change that touches a post's HTML. Mechanical checks alone
+(Step 8) are insufficient because they do not look at the rendered page.
+
+PRs #23/#24/#25 each surfaced issues that would have been caught by a
+proper Step 8.5 audit but weren't because retrofits skipped Step 8.5:
+- Wide viewBox widgets crushed on mobile
+- Sticky figure hidden behind site header
+- Range thumbs untappable
+
+Rule: if you modify N posts, you run Step 8.5 on N posts. No exceptions.
 
 **Iteration budget rationale**: 5 blocking-tier iterations covers real-world
 fix cycles (a wrong CSS selector → rebuild → re-screenshot → still wrong →
