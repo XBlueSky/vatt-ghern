@@ -43,6 +43,8 @@ thing (set `radio.checked = true`); CSS does the rest.
     .vg-w-annotated-EXAMPLE input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
     .vg-w-annotated-EXAMPLE .component { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; transition: fill 200ms, stroke 200ms; }
     .vg-w-annotated-EXAMPLE .component:hover { stroke: var(--accent); }
+    .vg-w-annotated-EXAMPLE .component:focus { outline: none; }
+    .vg-w-annotated-EXAMPLE .component:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     .vg-w-annotated-EXAMPLE .component-text { pointer-events: none; }
     .vg-w-annotated-EXAMPLE .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
     .vg-w-annotated-EXAMPLE .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
@@ -152,7 +154,7 @@ thing (set `radio.checked = true`); CSS does the rest.
 2. **JS-driven selection if >6 states** — pure-CSS `:has()` selector list gets unwieldy past 5-6 components. Replace the radios entirely with a single `data-selected="N"` attribute on the root; toggle it from JS and switch all `:has(...)` rules to attribute selectors `[data-selected="N"]`.
 3. **Add edges with annotations** — describe what flows on each edge (request format, response format, timeout, retry). Make edges also clickable if the flow is the interesting part.
 4. **Highlight non-obvious dependencies** — when a component is selected, also dim the components it depends on transitively (add more `.component-N.dim-by-M` CSS rules).
-5. **Keyboard accessibility** — radios already get keyboard focus. Add `:focus-visible` outline on `.component` for visible mouse-keyboard parity.
+5. **Keyboard accessibility** — radios already get keyboard focus. The template ships `:focus { outline: none }` + `:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px }` on `.component` so mouse clicks don't show the ugly browser-default blue ring while keyboard Tab navigation still gets a visible outline. Keep both rules together — dropping `:focus` re-introduces the ugly ring; dropping `:focus-visible` breaks keyboard a11y.
 
 ## Common variations for different domains
 
