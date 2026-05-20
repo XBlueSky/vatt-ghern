@@ -110,7 +110,7 @@ needs a widget shape that none of the 5 Tier-1 templates produce, write a
 custom widget and STILL record a conceptual question for it. Free shape
 > forced fit. (Same principle as `freeform` archetype.)
 
-## 10. Test in dark mode + mobile
+## 10. Test in dark mode + mobile + keyboard
 
 Before declaring a widget done, mentally verify:
 
@@ -118,6 +118,28 @@ Before declaring a widget done, mentally verify:
 - Does the widget reflow / clip gracefully at 375px viewport?
 - Are tap targets ≥ 32px square on mobile?
 - Does the widget make sense without colour (colour-blind reader)?
+- **Keyboard a11y**: every clickable element (SVG `<rect>`, `<g>` with click
+  handler, any non-native interactive) must have `role="button"`,
+  `tabindex="0"`, `aria-label`, AND a `keydown` listener that triggers the
+  same click action on Enter/Space. SVG elements aren't keyboard-accessible
+  by default — without these four, sighted-mouse-only readers work, but
+  keyboard / screen-reader users can't interact at all.
+
+Example for an SVG clickable `<rect>`:
+
+```html
+<rect class="component" data-target="…-r1" role="button" tabindex="0" aria-label="select Router" x="…" y="…" width="…" height="…" />
+```
+
+```js
+rect.addEventListener('click', () => { /* set radio.checked */ });
+rect.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' || e.key === ' ') {
+    e.preventDefault();
+    rect.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  }
+});
+```
 
 The Step 8.5 Playwright self-review catches some of this, but the author
 should catch it first.
@@ -201,10 +223,10 @@ re-order it above the stages with `order: -1`, and cap its height to
   .vg-w-EXAMPLE { grid-template-columns: 1fr; }
   .vg-w-EXAMPLE .figure-sticky {
     position: sticky;
-    top: 0;
-    order: -1;             /* lift figure above stages */
+    top: var(--vg-header-h);   /* offset below the sticky site chrome (~100px) */
+    order: -1;                 /* lift figure above stages */
     max-height: 55vh;
-    background: var(--bg); /* opaque so prose underneath doesn't bleed through */
+    background: var(--bg);     /* opaque so prose underneath doesn't bleed through */
     z-index: 1;
     padding: var(--s-2) 0;
     margin-bottom: var(--s-2);
@@ -214,9 +236,14 @@ re-order it above the stages with `order: -1`, and cap its height to
 ```
 
 This is the standard "scrollytelling" pattern used by Distill.pub /
-Pudding / NYT Interactive: figure pinned to top half of the viewport
-on mobile, prose scrolls in the bottom half, figure updates as
-stages activate (via IntersectionObserver per §12.1.E).
+Pudding / NYT Interactive: figure pinned just below the site header,
+prose scrolls below, figure updates as stages activate (via
+IntersectionObserver per §12.1.E).
+
+The `--vg-header-h` CSS variable is defined in `src/static/site.css`
+(~100px). Using `top: 0` puts the figure *behind* the sticky site
+chrome (vatt'ghern site header is `position: sticky; top: 0; z-index: 50`)
+and its top half disappears under the header.
 
 **C. Tap targets ≥ 44×44 px (Apple HIG) on mobile**
 
@@ -230,6 +257,30 @@ account for SVG scale).
 .vg-w-EXAMPLE input[type="range"] { height: 36px; accent-color: var(--accent); }
 .vg-w-EXAMPLE button { min-height: 44px; min-width: 44px; padding: var(--s-1) var(--s-2); }
 ```
+
+**D-pre. SVG viewBox aspect: avoid 4:1+ for chart-shaped widgets**
+
+A widget authored with `viewBox="0 0 880 200"` (4.4:1) looks good at
+desktop where the figure is ~960px wide and the SVG is ~218px tall —
+labels readable, axis ticks visible. At mobile (~343px wide), the same
+viewBox renders at ~78px tall. Labels collide. Axes overlap. Charts
+become unreadable.
+
+**Guidance**: for any widget where labels need to be readable inside
+the SVG (charts, timelines, scrubbers, annotated diagrams), prefer
+viewBox aspect ratio between **2:1 and 3:2** (e.g., `0 0 720 320`,
+`0 0 480 280`, `0 0 640 360`). Reserve wider aspects (4:1+) for
+widgets where the SVG content is genuinely a wide strip (e.g., a
+horizontal timeline with sparse markers and no per-marker text inside
+the SVG — text goes in a stage panel beside it).
+
+If a wide viewBox is already authored, the mobile crush can be
+mitigated three ways (least to most invasive):
+1. Add `preserveAspectRatio="xMidYMid slice"` to crop instead of
+   letterbox at narrow widths
+2. Add a `@media (max-width: 720px)` rule: `.vg-w-X svg { min-height: 220px }`
+   plus explicit `max-height: 50vh` to bound height growth
+3. Re-author with a taller viewBox (2:1 or 3:2 aspect)
 
 **D. Canvas / SVG aspect-ratio adjusts at mobile**
 
@@ -254,7 +305,7 @@ relative units that scale:
 
 ```js
 const isMobile = window.matchMedia('(max-width: 720px)').matches;
-const margin = isMobile ? '-25% 0px -25% 0px' : '-40% 0px -40% 0px';
+const margin = isMobile ? '-50% 0px -40% 0px' : '-40% 0px -40% 0px';
 const io = new IntersectionObserver(callback, { rootMargin: margin, threshold: 0 });
 ```
 

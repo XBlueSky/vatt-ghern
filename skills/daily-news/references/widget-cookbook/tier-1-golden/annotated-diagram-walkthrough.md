@@ -64,15 +64,15 @@ thing (set `radio.checked = true`); CSS does the rest.
 
   <svg viewBox="0 0 480 200">
     <!-- Component 1: Router -->
-    <rect class="component component-1" data-target="vg-w-annotated-EXAMPLE-r1" x="20" y="60" width="120" height="80" />
+    <rect class="component component-1" data-target="vg-w-annotated-EXAMPLE-r1" role="button" tabindex="0" aria-label="select component 1" x="20" y="60" width="120" height="80" />
     <text class="component-text" x="80" y="105" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">Router</text>
 
     <!-- Component 2: Worker -->
-    <rect class="component component-2" data-target="vg-w-annotated-EXAMPLE-r2" x="180" y="60" width="120" height="80" />
+    <rect class="component component-2" data-target="vg-w-annotated-EXAMPLE-r2" role="button" tabindex="0" aria-label="select component 2" x="180" y="60" width="120" height="80" />
     <text class="component-text" x="240" y="105" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">Worker</text>
 
     <!-- Component 3: Store -->
-    <rect class="component component-3" data-target="vg-w-annotated-EXAMPLE-r3" x="340" y="60" width="120" height="80" />
+    <rect class="component component-3" data-target="vg-w-annotated-EXAMPLE-r3" role="button" tabindex="0" aria-label="select component 3" x="340" y="60" width="120" height="80" />
     <text class="component-text" x="400" y="105" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">Store</text>
 
     <line x1="140" y1="100" x2="180" y2="100" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-annotated-EXAMPLE-arrow)" />
@@ -113,6 +113,13 @@ thing (set `radio.checked = true`); CSS does the rest.
           const targetId = rect.getAttribute('data-target');
           const radio = root.querySelector('#' + targetId);
           if (radio) radio.checked = true;
+        });
+        // Keyboard a11y: rect has tabindex="0" + role="button"; Enter/Space triggers click
+        rect.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            rect.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+          }
         });
       });
     })();
