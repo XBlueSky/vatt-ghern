@@ -1,0 +1,7 @@
+# Exemplar: deep-cpp26-simd-critique — comparison
+
+**Why this is the exemplar:** The opener lands the counter-intuitive punch immediately: "C++26 終於把 std::simd 收進標準庫…工程師卻發現…執行效能比手寫差兩倍以上、需要的 shuffle 與 permute 完全沒有覆蓋——這個被等了十年的庫，原來不是給寫 SIMD 的人用的" — expectation, gap, and verdict in one movement. The Relevance axis scored 10 because the decision section ("該怎麼選") delivers an unambiguous self-classification matrix: Highway as default, ISPC for divergent lanes, VCL for x86-only, std::simd not yet — readers leave with a rule, not a summary. The H2 "執行期效能：std::simd 在熱迴圈跑輸 scalar" is the strongest in the post: it derives the ABI design choice → width choice → throughput-halving causal chain with named intrinsics, GCC 14 codegen issue, and SVE/RVV portability context.
+
+**Watch-for:** The first H2, "為何先看大表：對齊四個方案的維度差距", uses meta-framing (explaining why the table exists) rather than anchoring to a measurement axis, which reviewers flagged as slightly structural overhead rather than content. The opener also enumerates failure modes in a list-like cadence before the final punch — a subtle template-adjacency risk. Do not mimic the "four parallel axis H2s + decision section + table" skeleton verbatim; replicate the decision-matrix precision, not the structure.
+
+**Source:** src/posts/2026/05/17/deep-cpp26-simd-critique.html. Audit score: Hook 9 / Structural 9 / Material 9 / Depth 9 / Relevance 10 / Anti-template 9 = 55.

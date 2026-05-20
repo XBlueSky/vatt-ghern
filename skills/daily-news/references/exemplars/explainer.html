@@ -1,0 +1,707 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">Turso 工程師寫了一個只描述「open → create table → serialize → start reading → call sqlite3_deserialize() during active read transaction」的 Quint 模型，五步驟跑出來，SQLite 直接 crash 而不是回 SQLITE_BUSY——這份被測試了二十年的程式碼，倒在了一個五步的形式化 trace 上。</p>
+  <h1 class="vg-post-title">Quint，從零講起——TLA+ 風格 formal model 怎麼幫 Turso 找出 SQLite 十個 bug</h1>
+</header>
+
+<div class="vg-post-prose">
+
+<p><span class="vg-dropcap">看</span>完這篇之後，你會知道一件事：formal methods 在 2026 年並不是學術玩具，也不是 AWS 那種「我們有十個 PhD 在寫 TLA+」的特權。Turso 用 Quint——一個刻意降低門檻的 TLA+ 風格語言——把 SQLite 寫了二十年的 C API 重新「換句話說」一次，跑了一輪 model checker，找出十二個 SQLite 自己 fuzzer 抓不到的 bug。文章會從 state-space 是什麼開始講，到 Quint 的 simulator 與 model checker 各自負責什麼，最後落到一個你可以自己判斷的問題：你家的 storage layer，值不值得花一週寫個 Quint spec。</p>
+
+<h2>SQLite 二十年沒抓到的那五步——為什麼這是個值得停下來看的故事</h2>
+
+<p>先把案發現場攤開。SQLite 是這個產業裡被測試得最徹底的資料庫，沒有之一。它的 test suite 是程式碼本身的 100 倍——超過一百萬條測試案例。它跑 American Fuzzy Lop、跑 libfuzzer、跑 OSS-Fuzz 已經跑了將近十年，每天有大型雲端廠商的 CI 在用各種詭異的 query 餵它。在這樣的成熟度下，新加入的 contributor 通常只能在邊角案例裡找到問題：char encoding、極端大數值、特定平台的 alignment。</p>
+
+<p>但 Turso 這次找到的不是邊角案例。他們找到的是這種東西：</p>
+
+<blockquote>
+  <p>「sqlite3_deserialize() crashes instead of returning SQLITE_BUSY during an active read transaction.」</p>
+</blockquote>
+
+<p>翻成白話：你開了一個 read transaction（正在讀），這時候呼叫 sqlite3_deserialize() 想把另一份序列化的 database image 套上去。documented 的合約是回 SQLITE_BUSY 讓你重試。實際行為是 process 整個 crash 掉。</p>
+
+<p>這種 bug 不會被 fuzzer 抓到，原因很具體：fuzzer 餵的是 SQL statement 序列，它不知道「在一個 active read transaction 中間插入 deserialize C API call」這個組合本身是合法的——它也不會去探索 C API 之間的 interleaving。fuzzer 探索的是 statement 空間，這個 bug 住在 C API call 之間的 state 空間。兩個空間的維度不一樣。</p>
+
+<p>那 Turso 怎麼找到的？他們先用 Quint 寫了一份對「sqlite3_deserialize() 的合約」的描述：哪些 state 下可以呼叫、回什麼、不能呼叫時應該如何回應。然後讓 Quint 的 simulator 跑出一條「狀態、動作、狀態、動作」這樣的 trace，再把 trace 翻譯成 C 程式碼 actually 對 SQLite 跑。比對 documented behaviour 與實際行為，發現對不上。</p>
+
+<p>注意這裡的關鍵句：「Traces are just a sequence of states, not SQL statements. Those traces can then be translated into whatever you want to allow execution against the system.」這句話是整套方法的精髓。Quint 產生的不是 SQL，是 state sequence；reproducer 是把 state sequence 翻成你想要的執行單位——SQL statement、C API call、HTTP request 都可以。fuzzer 在 statement 層；formal model 在 state 層。</p>
+
+<p>這篇文章要回答的問題很簡單：state 是什麼？怎麼描述？Quint 是什麼樣子？為什麼它能找到 fuzzer 找不到的東西？跑下來 cost 多少？最後——你的系統適不適合也跑一輪？</p>
+
+<p>在繼續之前先標記一個容易誤會的點。Turso 找到的「12 個 bug」不是 12 個 implementation crash——其中有一條（sqlite3_uri_int64() 的 default 行為）作者明確說「a docs mismatch rather than a real bug」，不是 code 寫錯，是文件描述跟實作對不上。Formal methods 找到的東西，本來就是「documented contract 與 observed behaviour 之間的縫隙」——它不知道哪邊是對的，它只知道兩邊不一致，然後把不一致用 counterexample trace 攤在你面前。</p>
+
+
+<h2>state-space 是什麼——把系統當成一張圖來看</h2>
+
+<p>放下 SQLite 一下。先談 state 這個詞，因為下面所有東西都建立在這個詞上。</p>
+
+<p>把任何 stateful 系統想成一張有向圖（directed graph）。圖的每個節點是系統的一個 state——它包含所有「目前 system 知道的東西」。對一個簡單的 counter 來說，state 就是一個整數。對一個有兩個 connection、各自可能在 idle / reading / writing 三個階段的 database server 來說，state 是 (conn1, conn2) 這個 pair，每個分量取自三個值，總共 9 個 state。對 SQLite 的 sqlite3_deserialize() 合約來說，state 包括「目前是否在 read transaction」、「目前是否在 backup」、「目前是否有 active statement」、「memory database 是否已 deserialized」等等——大概十來個 boolean，組合起來可能上百到上千個 state。</p>
+
+<p>圖的每條邊是一個 action——一個會把系統從一個 state 推到另一個 state 的操作。在 SQLite 裡，action 包括 sqlite3_open、sqlite3_exec("BEGIN")、sqlite3_step、sqlite3_deserialize 等等。每個 action 都可以寫成一個「pre-condition → post-condition」：在什麼樣的 state 下這個 action 合法、執行完之後 state 變成什麼。</p>
+
+<p>整套 formal model 的工作就是：</p>
+
+<ol>
+<li>定義 state 的 shape——通常是一個 record，由幾個欄位組成。</li>
+<li>定義 init——系統的初始 state（圖的起點）。</li>
+<li>定義一組 action——每個 action 是一個 (current state → next state) 的關係。</li>
+<li>定義 invariant——所有 reachable state 都必須滿足的性質。比方說「如果在 active read transaction，那麼 deserialize 必須回 BUSY 而不是 crash」。</li>
+</ol>
+
+<p>有了這四樣東西，你就有了一張完整的 state graph 的描述——雖然你沒有真的把整張圖畫出來。Model checker 的工作就是替你把圖走一遍：從 init 開始，沿著 action 邊往外擴展，每走到一個新 state 就檢查 invariant。如果某個 state violation，它印出從 init 到那個 state 的 trace——一條導致 bug 的 step-by-step path。</p>
+
+<p>注意這跟 unit test 的差別。Unit test 是你手動寫「set up 這個 state，跑這個 action，assert 那個 state」。Formal model 是你描述合約，由工具去「窮舉所有可能 reachable 的 state」並 assert invariant。你不用想到 5-step trace，工具替你想。</p>
+
+<p>另一個常見的混淆：state 不等於 variable。一個 system 裡有 1000 個 variable，不代表它有 1000 個 state——它的 state 是「所有 variable 取值的笛卡爾積之中，reachable 的那個子集」。對 sqlite3_deserialize() 的 model 來說，原文 SQLite 的 internal 變數可能有上萬個，但 model 只挑出影響合約的 4 ~ 7 個 boolean 抽象成 state。這個「挑出哪些 variable 進 state」是寫 spec 的核心藝術，挑得太多 state-space 爆炸跑不完，挑得太少 model 與 reality 差太遠 counterexample 沒意義。</p>
+
+<p>還有一個概念要先放進腦子裡：action 的 non-determinism。Model checker 不假設 action 之間有固定順序，它假設「在每個 state，所有 enabled 的 action 都可能下一個觸發」。所以從同一個 state 出發，可能走出 5 條不同的後續路徑——這 5 條都會被 model checker 探索。Non-determinism 是 formal methods 與 unit test 最深的差異：unit test 一條 path 一個結果，formal model 同時看 N 條 path 的 N 個結果。</p>
+
+<p>從工程意義講，這條 non-determinism 本來就符合真實系統的特性——multi-threaded code、distributed system、async runtime 都是「多個 enabled action 同時可能觸發」。寫單元測試時你被迫做出順序假設，formal model 允許你「不假設順序」並讓工具窮舉所有 interleaving。對 race condition 這類問題，這正是 sweet spot。但「窮舉」這個詞，正是問題所在。</p>
+
+<p>把上面 SQLite 例子推到極端：假設你的模型有 |A| = 10 種 action，每個 action 在某些 state 下適用。從 init 開始走一步，你可能到達 10 個新 state。走兩步，最多到達 100 個。走 N 步，最多到達 10^N 個。這就是 state-space explosion——隨著 trace 長度線性增加，可達 state 數量指數增加。實務上加上對稱性消除、equivalence class、symbolic execution 等技巧可以壓縮一些，但本質的指數性質沒辦法消除。</p>
+
+<p>所以「窮舉所有 state」幾乎永遠是不可能的——對任何有意義的系統來說。Model checker 的真實做法是 bounded exploration：限制 trace 長度 ≤ N，限制 state count ≤ M。在這個有限的盒子裡窮舉。</p>
+
+<p>下面這段是 Quint spec 的最小形狀，先把語法的氛圍放進腦子裡，後面會慢慢補細節：</p>
+
+<pre data-kind="pseudocode"><code>module sqlite_deserialize {
+  // state shape
+  var inReadTxn: bool
+  var inBackup:  bool
+  var memDbDeserialized: bool
+
+  action init = all {
+    inReadTxn' = false,
+    inBackup'  = false,
+    memDbDeserialized' = false
+  }
+
+  // contract: in active read txn, deserialize must return BUSY, not crash
+  invariant deserializeBusyContract =
+    inReadTxn implies not(memDbDeserialized')
+}
+</code></pre>
+
+<p>下面這個 widget 把 state-space 增長的關係畫出來，你可以拖動 N 看一下兩條曲線是怎麼分開的——naive 的指數線與 bounded 線之間那條縫，就是 model checker 能跑完的工程價值。</p>
+
+<figure class="vg-w-param-demo-state-space">
+  <style>
+    .vg-w-param-demo-state-space { display: grid; grid-template-rows: auto 1fr auto; gap: var(--s-2); }
+    .vg-w-param-demo-state-space .controls { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+    .vg-w-param-demo-state-space .controls input { flex: 1; accent-color: var(--accent); }
+    .vg-w-param-demo-state-space .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 12ch; text-align: right; }
+    .vg-w-param-demo-state-space svg { width: 100%; height: auto; }
+    .vg-w-param-demo-state-space figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+  </style>
+
+  <div class="controls">
+    <label for="vg-w-param-demo-state-space-x">trace length N =</label>
+    <input id="vg-w-param-demo-state-space-x-input" type="range" min="1" max="20" value="6" />
+    <span class="readout" id="vg-w-param-demo-state-space-readout">6 步 / 10^6 個</span>
+  </div>
+
+  <svg viewBox="0 0 720 320" preserveAspectRatio="xMidYMid meet" role="img" aria-label="state-space growth chart">
+    <line x1="60" y1="280" x2="700" y2="280" stroke="var(--muted-2)" stroke-width="1" />
+    <line x1="60" y1="20"  x2="60"  y2="280" stroke="var(--muted-2)" stroke-width="1" />
+    <text x="380" y="310" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--muted)">trace length N (steps)</text>
+    <text x="22"  y="150" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--muted)" transform="rotate(-90 22 150)">log10(reachable states)</text>
+
+    <g font-family="JetBrains Mono, monospace" font-size="10" fill="var(--muted)">
+      <text x="56" y="284" text-anchor="end">10^0</text>
+      <text x="56" y="218" text-anchor="end">10^5</text>
+      <text x="56" y="152" text-anchor="end">10^10</text>
+      <text x="56" y="86" text-anchor="end">10^15</text>
+      <text x="56" y="24" text-anchor="end">10^20</text>
+    </g>
+
+    <path id="vg-w-param-demo-state-space-curve-naive" fill="none" stroke="var(--accent)" stroke-width="2" />
+    <path id="vg-w-param-demo-state-space-curve-bounded" fill="none" stroke="var(--sage-deep)" stroke-width="2" />
+
+    <circle id="vg-w-param-demo-state-space-dot-naive" r="5" fill="var(--accent)" />
+    <circle id="vg-w-param-demo-state-space-dot-bounded" r="5" fill="var(--sage-deep)" />
+
+    <g font-family="Manrope, sans-serif" font-size="12">
+      <rect x="460" y="34" width="14" height="2" fill="var(--accent)" />
+      <text x="482" y="38" fill="var(--ink)">naive |A|^N (A=10)</text>
+      <rect x="460" y="54" width="14" height="2" fill="var(--sage-deep)" />
+      <text x="482" y="58" fill="var(--ink)">bounded（去重後可達 state 數）</text>
+    </g>
+  </svg>
+
+  <figcaption>橙色是 naive 上界——每一步都產生 |A| 個新 state；綠色是 model checker 實際走的路徑數（簡化為 N · |A| · log N 級的成長，反映 equivalence pruning 與重複合併）。N=6 時 naive 已經 10^6，而 bounded 只在 10^3 量級。Model checker 的工程價值正落在這條縫裡。</figcaption>
+
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-param-demo-state-space');
+      const input = root.querySelector('input');
+      const readout = root.querySelector('.readout');
+      const pathNaive = root.querySelector('#vg-w-param-demo-state-space-curve-naive');
+      const pathBounded = root.querySelector('#vg-w-param-demo-state-space-curve-bounded');
+      const dotNaive = root.querySelector('#vg-w-param-demo-state-space-dot-naive');
+      const dotBounded = root.querySelector('#vg-w-param-demo-state-space-dot-bounded');
+
+      const X0 = 60, X1 = 700, Y0 = 280, Y1 = 20;
+      const N_MAX = 20;
+      const A = 10;
+      const LOG_MAX = 20;
+
+      function xOf(n) { return X0 + ((n - 1) / (N_MAX - 1)) * (X1 - X0); }
+      function yOfLog(log10val) {
+        return Y0 - (Math.max(0, Math.min(LOG_MAX, log10val)) / LOG_MAX) * (Y0 - Y1);
+      }
+
+      function logNaive(n) { return n * Math.log10(A); }
+      function logBounded(n) {
+        const raw = n * A * Math.log2(Math.max(2, n));
+        return Math.log10(Math.max(1, raw));
+      }
+
+      const ptsN = [], ptsB = [];
+      for (let n = 1; n <= N_MAX; n++) {
+        const xN = xOf(n).toFixed(1);
+        ptsN.push(`${n === 1 ? 'M' : 'L'} ${xN} ${yOfLog(logNaive(n)).toFixed(1)}`);
+        ptsB.push(`${n === 1 ? 'M' : 'L'} ${xN} ${yOfLog(logBounded(n)).toFixed(1)}`);
+      }
+      pathNaive.setAttribute('d', ptsN.join(' '));
+      pathBounded.setAttribute('d', ptsB.join(' '));
+
+      function fmtBig(log10val) {
+        if (log10val < 4) return Math.round(Math.pow(10, log10val)).toLocaleString();
+        const exp = Math.floor(log10val);
+        const mant = Math.pow(10, log10val - exp);
+        return `${mant.toFixed(1)}×10^${exp}`;
+      }
+
+      function update() {
+        const n = Number(input.value);
+        const lN = logNaive(n);
+        const lB = logBounded(n);
+        readout.textContent = `${n} 步 / naive ${fmtBig(lN)}`;
+        dotNaive.setAttribute('cx', xOf(n)); dotNaive.setAttribute('cy', yOfLog(lN));
+        dotBounded.setAttribute('cx', xOf(n)); dotBounded.setAttribute('cy', yOfLog(lB));
+      }
+      input.addEventListener('input', update);
+      update();
+    })();
+  </script>
+</figure>
+
+<p>拖到 N=20 你會看到 naive 線條已經衝到 10^20，現代 CPU 一輩子算不完。但 bounded 線條還在 10^3 ~ 10^4 量級。這就是為什麼 model checker 可以「跑完」——它不窮舉真實 state graph，它在一個壓縮過的等價類圖上跑。能不能壓得乾淨，是 model checker 工程品質的核心。</p>
+
+<p>實務上，Quint 的 model checker（Apalache，由 Informal Systems 開發）採用 symbolic model checking——把 state 用 SMT 變數表示而不是具體值，讓 solver 一次推理一整個等價類。這比逐個 state 走（explicit-state model checking）通常快幾個數量級，代價是某些 state 結構（unbounded set、深度遞迴的 record）會讓 SMT solver 卡住。</p>
+
+<p>「窮舉到深度 N」這個條件值得停下來再嚼一下。它有兩個意涵：</p>
+
+<p>第一，model checker 不保證找出所有 bug。它只保證找出長度 ≤ N 的 trace 上的 bug。如果你的 bug 需要 N+1 步才能觸發——例如某個 leak 要連續 100 次 retry 才會 overflow——而你只跑 depth=20，那個 bug model checker 不會回報。所以實務上的 N 是個 cost / coverage 的 tradeoff，沒有「正確」的值。</p>
+
+<p>第二，找不到 counterexample 不等於 spec 正確。可能是 spec 太抽象——你 modeled 的 invariant 太弱，所有 violation 都剛好不違反那個弱條件。所以 spec 設計的另一半是「invariant 要寫得多嚴」——夠嚴才有意義，太嚴又可能無法 model 真實系統。Turso 的做法是：每個 documented contract 都翻成一條 invariant，所以 spec 的 invariant 集合與文件的 contract 集合是對齊的。</p>
+
+
+<h2>Quint 是什麼——TLA+ 的後代，把語法重寫成現代工程師看得懂的樣子</h2>
+
+<p>到這裡你已經知道 model checker 在做什麼。Quint 是這套思路在 2026 年的一個落地實作。</p>
+
+<p>Quint 由 Informal Systems 開發，目標是「把 TLA+ 的能力封裝在一個現代工程師願意打開 editor 寫的語言裡」。TLA+ 是 Leslie Lamport 在 1990 年代設計的——數學味很重，語法依賴 ASCII 的 ad-hoc 圖形（`/\` 是 and、`\/` 是 or、`\A` 是 forall），TLA+ 的 editor experience 直到 2020 年才有一個能用的 LSP。新人學 TLA+ 大概花一週才能讀懂第一份 spec。</p>
+
+<p>Quint 的設計選擇是：</p>
+
+<ul>
+<li>類 TypeScript / Rust 的語法。`val`、`def`、`action`、`run` 是 keyword，看起來像一般語言。</li>
+<li>強型別系統。state record 的每個欄位、每個 action 的輸入輸出，都有 type，會被 type checker 檢查。TLA+ 是 untyped，寫錯欄位名稱要跑 model checker 才會發現。</li>
+<li>built-in 的 simulator——隨機跑 trace，不做窮舉，幾秒鐘就回。先用 simulator 撈一些 trace 跑 sanity check，再上 model checker 做窮舉。</li>
+<li>後端接 Apalache（symbolic model checker），共享 TLA+ 生態系的工具。Quint 編譯成 TLA+ 給 Apalache 吃。</li>
+<li>標準的 dev tooling：LSP、syntax highlighting、`quint test`、`quint run`、`quint verify`。</li>
+</ul>
+
+<p>下面這個 tab widget 把 TLA+ 與 Quint 寫同一個「open / read / deserialize」action 並排放給你看。重點不是哪個語法比較短——是兩者表達能力相同，但 Quint 的 surface 對寫過 TypeScript 的人來說可讀性高一個數量級。</p>
+
+<div class="vg-w-tabs-quint-vs-tla">
+  <style>
+    .vg-w-tabs-quint-vs-tla { display: grid; gap: var(--s-2); }
+    .vg-w-tabs-quint-vs-tla input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+    .vg-w-tabs-quint-vs-tla .tabs { display: flex; gap: var(--s-2); border-bottom: 1px solid var(--line); }
+    .vg-w-tabs-quint-vs-tla .tab { font-family: var(--sans); font-size: var(--fs-sm); padding: var(--s-1) var(--s-2); cursor: pointer; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+    .vg-w-tabs-quint-vs-tla .panel { display: none; padding: var(--s-2) 0; }
+    .vg-w-tabs-quint-vs-tla:has(#vg-w-tabs-quint-vs-tla-t1:checked) .panel-1 { display: block; }
+    .vg-w-tabs-quint-vs-tla:has(#vg-w-tabs-quint-vs-tla-t1:checked) [for="vg-w-tabs-quint-vs-tla-t1"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    .vg-w-tabs-quint-vs-tla:has(#vg-w-tabs-quint-vs-tla-t2:checked) .panel-2 { display: block; }
+    .vg-w-tabs-quint-vs-tla:has(#vg-w-tabs-quint-vs-tla-t2:checked) [for="vg-w-tabs-quint-vs-tla-t2"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    .vg-w-tabs-quint-vs-tla:has(#vg-w-tabs-quint-vs-tla-t3:checked) .panel-3 { display: block; }
+    .vg-w-tabs-quint-vs-tla:has(#vg-w-tabs-quint-vs-tla-t3:checked) [for="vg-w-tabs-quint-vs-tla-t3"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+  </style>
+  <input type="radio" id="vg-w-tabs-quint-vs-tla-t1" name="vg-w-tabs-quint-vs-tla-sel" checked />
+  <input type="radio" id="vg-w-tabs-quint-vs-tla-t2" name="vg-w-tabs-quint-vs-tla-sel" />
+  <input type="radio" id="vg-w-tabs-quint-vs-tla-t3" name="vg-w-tabs-quint-vs-tla-sel" />
+  <div class="tabs">
+    <label class="tab" for="vg-w-tabs-quint-vs-tla-t1">Quint</label>
+    <label class="tab" for="vg-w-tabs-quint-vs-tla-t2">TLA+</label>
+    <label class="tab" for="vg-w-tabs-quint-vs-tla-t3">行為對照</label>
+  </div>
+  <div class="panel panel-1">
+<pre data-kind="pseudocode"><code>module sqlite_deserialize {
+  type DbState = {
+    opened: bool,
+    inReadTxn: bool,
+    inBackup: bool,
+    deserialized: bool,
+  }
+
+  var s: DbState
+
+  action init = all {
+    s' = { opened: false, inReadTxn: false,
+           inBackup: false, deserialized: false }
+  }
+
+  action open = all {
+    not(s.opened),
+    s' = { ...s, opened: true }
+  }
+
+  action beginRead = all {
+    s.opened,
+    not(s.inReadTxn),
+    s' = { ...s, inReadTxn: true }
+  }
+
+  action deserialize = all {
+    s.opened,
+    // documented：如果 inReadTxn，應該回 BUSY 而不是 crash
+    s' = { ...s, deserialized: true }
+  }
+
+  val Safety = s.inReadTxn implies not(s.deserialized)
+
+  run sample = init.then(open).then(beginRead).then(deserialize)
+}</code></pre>
+  </div>
+  <div class="panel panel-2">
+<pre data-kind="pseudocode"><code>------------------------------ MODULE sqlite_deserialize ------------------------------
+VARIABLE opened, inReadTxn, inBackup, deserialized
+vars == &lt;&lt;opened, inReadTxn, inBackup, deserialized&gt;&gt;
+
+Init == /\ opened = FALSE
+        /\ inReadTxn = FALSE
+        /\ inBackup = FALSE
+        /\ deserialized = FALSE
+
+Open == /\ ~opened
+        /\ opened' = TRUE
+        /\ UNCHANGED &lt;&lt;inReadTxn, inBackup, deserialized&gt;&gt;
+
+BeginRead == /\ opened
+             /\ ~inReadTxn
+             /\ inReadTxn' = TRUE
+             /\ UNCHANGED &lt;&lt;opened, inBackup, deserialized&gt;&gt;
+
+Deserialize == /\ opened
+               /\ deserialized' = TRUE
+               /\ UNCHANGED &lt;&lt;opened, inReadTxn, inBackup&gt;&gt;
+
+Next == Open \/ BeginRead \/ Deserialize
+
+Safety == inReadTxn =&gt; ~deserialized
+=======================================================================================</code></pre>
+  </div>
+  <div class="panel panel-3">
+<pre data-kind="pseudocode"><code>// 兩份 spec 表達的東西完全等價：
+
+// 1. state 由四個 boolean 組成
+//    Quint 用 record；TLA+ 用 4 個 VARIABLE。
+
+// 2. action 是 pre-condition + post-state 的 conjunction
+//    Quint：all { 條件1, 條件2, s' = ... }
+//    TLA+：/\ 條件1 /\ 條件2 /\ 變數' = ...
+
+// 3. 沒變的欄位
+//    Quint：用 { ...s, fieldX: value } 自動 carry over
+//    TLA+：必須顯式寫 UNCHANGED &lt;&lt;欄位列表&gt;&gt;
+//    這條讓 TLA+ 在欄位多的 spec 變得非常吵雜。
+
+// 4. invariant
+//    Quint：implies 是中綴 keyword
+//    TLA+：=&gt; 是符號
+//    語意完全相同。
+
+// 5. type
+//    Quint 有 DbState type alias；TLA+ 沒有。
+//    對應的代價是 TLA+ 寫錯欄位名 model checker 才會發現。</code></pre>
+  </div>
+</div>
+
+<p>看完上面三個 tab 你大概抓到了：Quint 不是發明新的語意，它是 reskin TLA+。Apalache 在背後做的事情兩者都一樣。差別在 surface——對於從沒摸過 formal methods 的工程師，Quint 的 onboarding cost 大約是 TLA+ 的 1/3，因為它走的是「你已經會 TypeScript，只是要學一個多了 actions 與 invariants 的 dialect」這條路徑。</p>
+
+<p>Quint 有一個獨有的 keyword：<code>run</code>。它讓你寫固定路徑當 test case（<code>init.then(open).then(beginRead).then(deserialize)</code>），橋接「unit test 思維」與「model checking 思維」——新手從 <code>run</code> 起步，熟練後讓 model checker 自由探索。再加上 record spread 語法 <code>{ ...s, opened: true }</code>（默認沒提到的欄位不變，反過來於 TLA+ 的 UNCHANGED），以及編譯期 type checker，這幾個 ergonomic 細節把大型 spec 的維護成本壓得遠低於 TLA+。</p>
+
+<h2>simulator 與 model checker 各自負責什麼——兩個工具，兩種 coverage</h2>
+
+<p>Quint 提供兩種跑 spec 的方式，差異要分清楚，因為它們找的是不同類別的問題。</p>
+
+<p><strong>simulator</strong>：從 init 開始，每一步隨機選一個 enabled action 走下去。產生一條長度為 N 的 trace。檢查 invariant，violation 就回報。重複 K 次。</p>
+
+<p><strong>model checker</strong>：從 init 開始，用 BFS（或 symbolic execution）窮舉所有長度 ≤ N 的 reachable state。任何一個 state 違反 invariant 都回報，並印出最短的 counterexample trace。</p>
+
+<p>對一個有 |A| = 10 個 action 的系統，simulator 跑 1000 次 length-10 的 trace，covers 10^4 個 random path。Model checker 跑同樣的 N=10，covers 整整 10^10 個（理論上界）reachable path，但實際透過 symbolic pruning 可能壓到 10^5 ~ 10^7。</p>
+
+<p>關鍵差別不是數量，是「分布」。Simulator 是隨機抽樣——大部分樣本長得很像（都先 open、都先 begin transaction），corner case 很少被選到。Model checker 是窮舉——每一個 reachable corner case 都會被走過，不論 prefix 多奇怪。下面這張圖把這件事畫出來。</p>
+
+<figure class="vg-w-arch-sim-vs-mc">
+  <style>
+    .vg-w-arch-sim-vs-mc figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-2); }
+    .vg-w-arch-sim-vs-mc svg { width: 100%; height: auto; }
+  </style>
+  <svg viewBox="0 0 720 360" preserveAspectRatio="xMidYMid meet" role="img" aria-label="simulator vs model checker coverage">
+    <defs>
+      <radialGradient id="vg-w-arch-sim-vs-mc-grad-sim" cx="50%" cy="50%" r="50%">
+        <stop offset="0%" stop-color="var(--accent)" stop-opacity="0.35" />
+        <stop offset="100%" stop-color="var(--accent)" stop-opacity="0.05" />
+      </radialGradient>
+      <radialGradient id="vg-w-arch-sim-vs-mc-grad-mc" cx="50%" cy="50%" r="50%">
+        <stop offset="0%" stop-color="var(--sage-deep)" stop-opacity="0.35" />
+        <stop offset="100%" stop-color="var(--sage-deep)" stop-opacity="0.05" />
+      </radialGradient>
+    </defs>
+
+    <rect x="20" y="20" width="680" height="320" fill="none" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="4 4" />
+    <text x="34" y="40" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)" letter-spacing="0.08em">REACHABLE STATE SPACE (THEORETICAL)</text>
+
+    <ellipse cx="240" cy="200" rx="160" ry="110" fill="url(#vg-w-arch-sim-vs-mc-grad-sim)" stroke="var(--accent)" stroke-width="1.5" />
+    <text x="240" y="100" text-anchor="middle" font-family="EB Garamond, serif" font-size="16" fill="var(--accent-text)">SIMULATOR</text>
+    <text x="240" y="118" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">隨機 trace × K 次</text>
+
+    <ellipse cx="480" cy="200" rx="160" ry="110" fill="url(#vg-w-arch-sim-vs-mc-grad-mc)" stroke="var(--sage-deep)" stroke-width="1.5" />
+    <text x="480" y="100" text-anchor="middle" font-family="EB Garamond, serif" font-size="16" fill="var(--sage-deep)">MODEL CHECKER</text>
+    <text x="480" y="118" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">bounded BFS / symbolic</text>
+
+    <circle cx="200" cy="200" r="3" fill="var(--accent)" />
+    <circle cx="230" cy="180" r="3" fill="var(--accent)" />
+    <circle cx="260" cy="220" r="3" fill="var(--accent)" />
+    <circle cx="195" cy="225" r="3" fill="var(--accent)" />
+    <circle cx="240" cy="240" r="3" fill="var(--accent)" />
+    <circle cx="285" cy="195" r="3" fill="var(--accent)" />
+
+    <g fill="var(--sage-deep)">
+      <circle cx="420" cy="180" r="2" /><circle cx="440" cy="170" r="2" /><circle cx="460" cy="175" r="2" /><circle cx="480" cy="170" r="2" /><circle cx="500" cy="175" r="2" /><circle cx="520" cy="170" r="2" /><circle cx="540" cy="180" r="2" /><circle cx="420" cy="200" r="2" /><circle cx="440" cy="195" r="2" /><circle cx="460" cy="195" r="2" /><circle cx="480" cy="195" r="2" /><circle cx="500" cy="200" r="2" /><circle cx="520" cy="195" r="2" /><circle cx="540" cy="200" r="2" /><circle cx="420" cy="220" r="2" /><circle cx="440" cy="215" r="2" /><circle cx="460" cy="220" r="2" /><circle cx="480" cy="225" r="2" /><circle cx="500" cy="220" r="2" /><circle cx="520" cy="215" r="2" /><circle cx="540" cy="220" r="2" />
+    </g>
+
+    <circle cx="640" cy="290" r="6" fill="var(--accent)" stroke="var(--ink)" stroke-width="1.5" />
+    <text x="640" y="320" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--ink)">corner-case</text>
+    <text x="640" y="335" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--ink)">bug</text>
+    <line x1="630" y1="285" x2="555" y2="225" stroke="var(--ink)" stroke-width="1" stroke-dasharray="3 3" />
+
+    <text x="360" y="345" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--muted)" font-style="italic">
+      簡單情境兩者都 cover；只有 model checker 會探到深邏輯角落
+    </text>
+  </svg>
+  <figcaption>橙圈內是 simulator 抽到的少數 path；綠圈內是 model checker 窮舉的稠密 path。bug 就住在「reachable 但 simulator 隨機抽不到」的位置——sqlite3_deserialize() crash 就是其中一個。</figcaption>
+</figure>
+
+<p>Turso 內部本來就有 Deterministic Simulation Testing（DST）——這就是它們公開講過很多次的 turmoil-style 隨機 SQL 生成。原文是這樣比較的：「formal methods explore parts of the specification that the Turso simulator previously could not. The general concepts are similar, but instead of generating a random sequence of SQL statements and enforcing system-level properties, Quint generates a list of traces.」</p>
+
+<p>注意「a list of traces」——不是 random、不是無盡的，是有限、明確、可重複的 trace 集合。每條 trace 都是 model checker 從 spec 推出來的，每條都對應一個「reachable state 配上一條到達它的路徑」。從 DST 的角度看，這像是 randomness 的反義詞——「我不要隨機，我要 systematic」。</p>
+
+<p>用兩者搭配的 workflow 是：</p>
+
+<ol>
+<li>先用 simulator 跑幾百條 random trace 做 spec 自身的 sanity check——確認 model 至少 syntactically 可跑、沒有 obvious 卡死。</li>
+<li>再用 model checker 跑 bounded exhaustive，找出 invariant violation。這一步通常需要 minutes 到 hours，看 spec 複雜度。</li>
+<li>對找到的 counterexample trace，翻譯成實際 system 的 reproducer（SQL、C API call 序列、HTTP request）。</li>
+<li>在真實 system 上跑這個 reproducer，看是不是真的 violate 預期。</li>
+</ol>
+
+<p>Step 4 很重要：model 找到的 violation 可能是 model 本身寫錯（你描述的合約跟 documented 的對不上）。所以每個 counterexample 都必須在實際 system 上重現過，才算是真的 bug。Turso 找到 12 個 bug，意思就是它們對 12 個 model checker 給的 counterexample 做了 reproducer，每一個都在真實 SQLite 上重現了 documented 與實際行為不一致。</p>
+
+<p>實際操作上 step 3 的 reproducer 通常長這樣——一條 5 步的 trace 翻譯成 C：</p>
+
+<pre data-kind="pseudocode"><code><em>// counterexample trace 翻譯成 C reproducer</em>
+sqlite3 *db;
+sqlite3_open(":memory:", &amp;db);                    <em>// open</em>
+sqlite3_exec(db, "CREATE TABLE t(x);", 0, 0, 0);  <em>// create table</em>
+
+unsigned char *serialized;
+sqlite3_int64 size;
+serialized = sqlite3_serialize(db, "main",
+                               &amp;size, 0);          <em>// serialize</em>
+
+sqlite3_stmt *stmt;
+sqlite3_prepare_v2(db, "SELECT x FROM t",
+                   -1, &amp;stmt, 0);
+sqlite3_step(stmt);                               <em>// start reading</em>
+
+<em>// expected: SQLITE_BUSY (documented)</em>
+<em>// observed: process crash</em>
+int rc = sqlite3_deserialize(db, "main",
+                             serialized, size, size,
+                             SQLITE_DESERIALIZE_FREEONCLOSE);</code></pre>
+
+<p>這段 C 直接從 Quint 的 trace 來。每一行 C call 對應 trace 上的一個 action。執行起來最後一行不回 SQLITE_BUSY 而是 segfault——文章開頭那個 bug 的真實復現。把 scrubber 拖到不同步，看每一步 model 端 4 個 boolean 怎麼演化、到第 5 步為什麼 invariant 必然被 violation：</p>
+
+<figure class="vg-w-scrubber-trace">
+  <style>
+    .vg-w-scrubber-trace { display: grid; gap: var(--s-2); margin: var(--s-3) 0; }
+    .vg-w-scrubber-trace .scrub { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+    .vg-w-scrubber-trace .scrub input { flex: 1; accent-color: var(--accent); }
+    .vg-w-scrubber-trace .step-label { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 7ch; }
+    .vg-w-scrubber-trace svg { width: 100%; height: auto; }
+    .vg-w-scrubber-trace figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+  </style>
+  <div class="scrub">
+    <label for="vg-w-scrubber-trace-x">step =</label>
+    <input id="vg-w-scrubber-trace-x" type="range" min="0" max="5" value="0" step="1" />
+    <span class="step-label" id="vg-w-scrubber-trace-readout">0 / 5</span>
+  </div>
+  <svg viewBox="0 0 720 280" preserveAspectRatio="xMidYMid meet" role="img" aria-label="counterexample trace lifecycle">
+    <g font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">
+      <text x="30" y="30" font-family="Manrope, sans-serif" letter-spacing="0.06em" fill="var(--muted)">STATE FIELDS</text>
+      <text x="30" y="60">opened</text>
+      <text x="30" y="92">inReadTxn</text>
+      <text x="30" y="124">serialized</text>
+      <text x="30" y="156">deserialized</text>
+    </g>
+
+    <g id="vg-w-scrubber-trace-cells" font-family="JetBrains Mono, monospace" font-size="11"></g>
+
+    <g font-family="EB Garamond, serif" font-size="12" fill="var(--ink)">
+      <text x="180" y="200" id="vg-w-scrubber-trace-action-label" text-anchor="middle" font-style="italic">— init —</text>
+    </g>
+
+    <g id="vg-w-scrubber-trace-invariant" font-family="Manrope, sans-serif" font-size="12">
+      <rect x="30" y="225" width="660" height="40" rx="6" fill="var(--surface-2)" stroke="var(--line)" stroke-width="1" id="vg-w-scrubber-trace-inv-box" />
+      <text x="50" y="250" id="vg-w-scrubber-trace-inv-text" fill="var(--muted)">invariant inReadTxn ⇒ ¬deserialized · 目前 holds</text>
+    </g>
+
+    <line x1="180" y1="40" x2="180" y2="180" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="2 3" />
+    <line x1="280" y1="40" x2="280" y2="180" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="2 3" />
+    <line x1="380" y1="40" x2="380" y2="180" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="2 3" />
+    <line x1="480" y1="40" x2="480" y2="180" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="2 3" />
+    <line x1="580" y1="40" x2="580" y2="180" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="2 3" />
+    <line x1="680" y1="40" x2="680" y2="180" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="2 3" />
+
+    <g font-family="Manrope, sans-serif" font-size="10" fill="var(--muted)" letter-spacing="0.06em">
+      <text x="180" y="180" text-anchor="middle">S0</text>
+      <text x="280" y="180" text-anchor="middle">S1</text>
+      <text x="380" y="180" text-anchor="middle">S2</text>
+      <text x="480" y="180" text-anchor="middle">S3</text>
+      <text x="580" y="180" text-anchor="middle">S4</text>
+      <text x="680" y="180" text-anchor="middle">S5</text>
+    </g>
+  </svg>
+  <figcaption>5 步從 init 到 violation。每格 ● 表 true、○ 表 false。step 5 的紅框表示 invariant 從 hold 翻成 violated——這正是 model checker 印出 counterexample 的瞬間。</figcaption>
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-scrubber-trace');
+      const input = root.querySelector('input');
+      const readout = root.querySelector('#vg-w-scrubber-trace-readout');
+      const cellsG = root.querySelector('#vg-w-scrubber-trace-cells');
+      const actionLabel = root.querySelector('#vg-w-scrubber-trace-action-label');
+      const invBox = root.querySelector('#vg-w-scrubber-trace-inv-box');
+      const invText = root.querySelector('#vg-w-scrubber-trace-inv-text');
+
+      const states = [
+        { opened: 0, inReadTxn: 0, serialized: 0, deserialized: 0 },
+        { opened: 1, inReadTxn: 0, serialized: 0, deserialized: 0 },
+        { opened: 1, inReadTxn: 0, serialized: 1, deserialized: 0 },
+        { opened: 1, inReadTxn: 0, serialized: 1, deserialized: 0 },
+        { opened: 1, inReadTxn: 1, serialized: 1, deserialized: 0 },
+        { opened: 1, inReadTxn: 1, serialized: 1, deserialized: 1 },
+      ];
+      const actions = ['init', 'open + create', 'serialize', 'prepare stmt', 'step (begin read)', 'deserialize → CRASH'];
+      const xs = [180, 280, 380, 480, 580, 680];
+      const ys = { opened: 60, inReadTxn: 92, serialized: 124, deserialized: 156 };
+      const fields = ['opened', 'inReadTxn', 'serialized', 'deserialized'];
+
+      function render(stepIdx) {
+        while (cellsG.firstChild) cellsG.removeChild(cellsG.firstChild);
+        for (let i = 0; i <= stepIdx; i++) {
+          fields.forEach(f => {
+            const cx = xs[i], cy = ys[f];
+            const v = states[i][f];
+            const isCurrent = i === stepIdx;
+            const c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+            c.setAttribute('cx', cx); c.setAttribute('cy', cy - 4);
+            c.setAttribute('r', isCurrent ? '6' : '4');
+            c.setAttribute('fill', v ? 'var(--accent)' : 'transparent');
+            c.setAttribute('stroke', v ? 'var(--accent)' : 'var(--muted-2)');
+            c.setAttribute('stroke-width', '1.5');
+            cellsG.appendChild(c);
+          });
+        }
+        actionLabel.setAttribute('x', xs[stepIdx]);
+        actionLabel.textContent = `${stepIdx}. ${actions[stepIdx]}`;
+        const violated = stepIdx === 5;
+        invBox.setAttribute('stroke', violated ? 'var(--accent)' : 'var(--line)');
+        invBox.setAttribute('stroke-width', violated ? '2' : '1');
+        invBox.setAttribute('fill', violated ? 'color-mix(in srgb, var(--accent) 14%, var(--surface-2))' : 'var(--surface-2)');
+        invText.setAttribute('fill', violated ? 'var(--accent-text)' : 'var(--muted)');
+        invText.textContent = violated
+          ? 'invariant inReadTxn ⇒ ¬deserialized · VIOLATED（counterexample 印出）'
+          : 'invariant inReadTxn ⇒ ¬deserialized · 目前 holds';
+        readout.textContent = `${stepIdx} / 5`;
+      }
+      input.addEventListener('input', () => render(Number(input.value)));
+      render(0);
+    })();
+  </script>
+</figure>
+
+<p>Trace 翻 reproducer 這個步驟在不同 system 有不同形式：</p>
+
+<ul>
+<li>對 SQL database，trace 翻成 SQL statement + connection-level API call。</li>
+<li>對 distributed consensus 演算法，trace 翻成 node 之間的 message sequence + 進入特定 phase 的 trigger。</li>
+<li>對 HTTP API，trace 翻成 curl 序列 + cookie / session state 設定。</li>
+<li>對 protocol implementation（QUIC、TLS），trace 翻成 packet sequence + handshake state。</li>
+</ul>
+
+<p>這層轉譯目前主要是 manual 的（每條 trace 約 10 ~ 30 分鐘），所以 model checker 噴出 100 條 trace 你不會全部翻——你會挑 invariant 最關鍵、看起來最容易重現的幾條。</p>
+
+<h2>那十二個 bug——分類看就能猜到 Quint 為什麼擅長這些</h2>
+
+<p>下面這張表把 Turso 公布的 12 個 bug 攤開。Bug 的 surface 名稱、所在 subsystem、bug 的本質類別、Quint model 約略需要描述幾個 state field。表是可排序的，按 surface 排可以看到哪個 subsystem 最暴露。</p>
+
+<figure class="vg-w-table-quint-bugs">
+  <style>
+    .vg-w-table-quint-bugs table { width: 100%; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+    .vg-w-table-quint-bugs thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; }
+    .vg-w-table-quint-bugs thead th[data-sort] { color: var(--accent-text); }
+    .vg-w-table-quint-bugs tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+    .vg-w-table-quint-bugs td.num { font-variant-numeric: tabular-nums; text-align: right; }
+    .vg-w-table-quint-bugs figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-2); }
+  </style>
+  <table>
+    <thead>
+      <tr>
+        <th data-key="surface">surface / API</th>
+        <th data-key="subsystem">subsystem</th>
+        <th data-key="kind">bug 類別</th>
+        <th data-key="fields" class="num">state fields ≈</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td>sqlite3_deserialize() crash on active read</td><td>memory db</td><td>crash instead of BUSY</td><td class="num">5</td></tr>
+      <tr><td>deserialize during backup interleaving</td><td>memory db / backup</td><td>crash</td><td class="num">7</td></tr>
+      <tr><td>EXISTS-to-join LIMIT/OFFSET</td><td>query planner</td><td>wrong result</td><td class="num">6</td></tr>
+      <tr><td>Nested EXISTS-to-join correlation loss</td><td>query planner</td><td>wrong result</td><td class="num">8</td></tr>
+      <tr><td>Quoted constraint with embedded quotes</td><td>schema / DDL</td><td>undroppable constraint</td><td class="num">4</td></tr>
+      <tr><td>UPDATE one-pass + correlated BETWEEN</td><td>query planner</td><td>wrong result regression</td><td class="num">7</td></tr>
+      <tr><td>ALTER ADD CHECK on internal sqlite_ tables</td><td>schema / DDL</td><td>crash</td><td class="num">4</td></tr>
+      <tr><td>sqlite3_mutex 128-byte alignment UB</td><td>core / mutex</td><td>undefined behaviour</td><td class="num">2</td></tr>
+      <tr><td>NULL pzErr crash in changegroup_change_finish</td><td>session ext</td><td>null deref</td><td class="num">3</td></tr>
+      <tr><td>xfer optimisation bypasses BLOB type via ANY</td><td>query planner / xfer</td><td>integrity_check fail</td><td class="num">6</td></tr>
+      <tr><td>xfer optimisation bypasses CHECK constraints</td><td>query planner / xfer</td><td>db inconsistency</td><td class="num">6</td></tr>
+      <tr><td>sqlite3_uri_int64() invalid value default</td><td>uri parsing</td><td>docs/code mismatch</td><td class="num">3</td></tr>
+    </tbody>
+  </table>
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-table-quint-bugs');
+      const headers = root.querySelectorAll('thead th');
+      const tbody = root.querySelector('tbody');
+      let activeKey = null, asc = true;
+      headers.forEach(h => h.addEventListener('click', () => {
+        const key = h.dataset.key;
+        if (activeKey === key) asc = !asc; else { activeKey = key; asc = true; }
+        headers.forEach(x => x.removeAttribute('data-sort'));
+        h.setAttribute('data-sort', asc ? 'asc' : 'desc');
+        const rows = [...tbody.querySelectorAll('tr')];
+        const idx = [...headers].indexOf(h);
+        rows.sort((a, b) => {
+          const av = a.children[idx].textContent.trim();
+          const bv = b.children[idx].textContent.trim();
+          const an = Number(av), bn = Number(bv);
+          const cmp = !Number.isNaN(an) && !Number.isNaN(bn) ? an - bn : av.localeCompare(bv);
+          return asc ? cmp : -cmp;
+        });
+        rows.forEach(r => tbody.appendChild(r));
+      }));
+    })();
+  </script>
+  <figcaption>Bug 名稱是 Turso 原文用語，state field 數是大致估計——實際 Quint spec 通常還會加 auxiliary ghost 變數做 invariant 表述。點欄位 header 可排序。</figcaption>
+</figure>
+
+<p>排一輪會看到一個模式：query planner 與 memory db / backup 各佔三四個，schema / DDL 拿到兩個。這跟「哪個 subsystem 最有 state interleaving」吻合——query planner 的 rewrite optimisation（EXISTS-to-join、xfer、one-pass UPDATE）中間 state 豐富，每個 rewrite 都是一個 state transition；memory db 與 backup 之間有跨 connection 的 mutual exclusion，是天然 state machine。反過來看，alignment UB 與 NULL pzErr 的 state 結構很淺——它們是 unit-test 量級問題，但 Quint trace 用「呼叫順序」找，所以「先呼叫 changegroup_finish 再讀 pzErr」這種 sequence 是免費副產物。</p>
+
+<p>EXISTS-to-join 那條是 query planner 的 rewrite optimization——<code>SELECT * FROM A WHERE EXISTS (SELECT 1 FROM B WHERE B.x = A.x)</code> 被 rewrite 成 join 利用 index。Quint model：state 包含 plan strategy、LIMIT/OFFSET 計數器、join 中間結果；action 包含 apply rewrite、apply LIMIT、emit row；invariant 是「最終 emitted rows = 不 rewrite 時的數量」。Model checker 找到的 trace：rewrite 後 LIMIT 計數器把 join 重複列也算進去，invariant violation。翻成 SQL 餵 SQLite，bug 確認。xfer optimisation 那兩條（BLOB ANY、CHECK constraint）也是同一個套路——把「target 是否啟用 xfer」當 state，invariant「啟用 xfer ⇒ source/target compatible」，model checker 直接展示反例。</p>
+
+<h2>把 Quint 帶回自己家——什麼樣的系統值得寫 spec</h2>
+
+<p>讀到這裡你應該已經能回答最初那個問題：值不值得花一週寫個 Quint spec？答案是有條件的「值得」——條件可以列成 checklist：</p>
+
+<ul>
+<li><strong>你的系統有明確的 state machine 行為</strong>——有 transaction、有 lifecycle、有 lock、有 lease、有 retry budget。如果是 stateless API gateway，formal model 的價值不高。</li>
+<li><strong>你有一份 documented 合約</strong>——RFC、API doc、internal design doc，描述「在什麼 state 下呼叫什麼 action 應該得到什麼結果」。沒有合約就沒有 invariant 可以 check。</li>
+<li><strong>state 之間的 interleaving 很豐富</strong>——多個 connection、多個 worker、多階段 protocol、optimization 會 rewrite 路徑。狀態夾角越多，fuzzer 越抓不到，formal model 越值得。</li>
+<li><strong>bug 的後果代價高</strong>——資料 corruption、安全漏洞、calibration 失誤。寫 Quint spec 的成本（人天）需要被找到的 bug 的成本（incident、CVE、loss of trust）攤銷。</li>
+<li><strong>系統的核心邏輯已經穩定</strong>——formal model 是描述「合約」，合約一直在變，spec 也要一直 rewrite。穩定的核心 + 變動的周邊是最佳場景。</li>
+</ul>
+
+<p>反過來，這些情境通常不值得：</p>
+
+<ul>
+<li>純 stateless 的 transformer / parser / formatter——unit test 就夠。</li>
+<li>UI 邏輯——state space 大但價值密度低。</li>
+<li>還在快速迭代的 prototype——spec 跟 code 同時改，兩邊一直對不上。</li>
+<li>沒有 documented 合約可參考的內部腳本工具。</li>
+</ul>
+
+<p>實務上怎麼開始？Turso 文章建議的入手法是：「Take one documented SQLite C API contract, then model only the state and properties needed for that.」——挑一個小的、邊界清楚的 API，只 model 跟它有關的 state，不要試圖一次 model 整個系統。整個系統的 spec 通常會大到 model checker 跑不完，最後變成負擔。</p>
+
+<p>一個 typical Quint spec 對單一 API 的長度大概是 100 ~ 300 行——包括 state record、5 ~ 10 個 action、3 ~ 5 個 invariant、若干 helper definition。寫 + 跑 + debug 大概一個工程師 3 ~ 5 天。如果有現成的 TLA+ spec 可以參考，會更快。</p>
+
+<p>還有一個常被忽略的 by-product：寫 Quint spec 強迫你把「documented 但沒寫成可機器讀的形式」的合約逼出來。很多 bug 不是 code 寫錯，是 doc 跟 code 從來沒對齊——sqlite3_uri_int64() 那條「docs mismatch」正是這類，code 沒錯 doc 錯，但這種不一致比 code bug 更危險，因為 downstream 照 doc 寫。Team 至少需要一個人花兩三週成為 Quint 認真 user（讀 tutorial、寫過兩三個 small spec、能讀 Apalache 錯誤訊息），這個人撐起來之後，其他 team 可以用 review 方式 contribute——formal review 比 formal authoring 容易很多。</p>
+
+<p>Quint repo 在 github.com/informalsystems/quint，有 onboarding tutorial、VS Code extension、example library。從 example 裡找一個你看得懂的（counter、bank、two-phase commit），改幾個 action 跑跑看，半小時內你就能看到自己的第一條 counterexample trace 從 terminal 跳出來——那一刻是這套工具最動人的瞬間，因為你會發現你「想到」的合約跟你「寫出來」的 spec 之間，原來有這麼大的縫。</p>
+
+<p>跟 Property-Based Testing 比，PBT 在「input 空間」生成（字串、list），Quint 在「state-action 空間」生成；PBT 通常 stateless，Quint 天然 stateful。對 stateful protocol，Quint 完勝；對純函數，PBT 更輕量——兩者互補不是替代。跟 TLA+ 比，Quint 能力等價（編譯成 TLA+ 給 Apalache 吃），差別是 ergonomic 與型別系統，liveness / fairness 的學術資源 TLA+ 仍佔優。</p>
+
+<p>把整篇收束成一句話：Quint 不是給你「程式正確性的證明」，是給你「對你自己合約的窮舉式 review」。前者是學術理想，後者是工程現實——工程現實已經足夠用來抓 SQLite 二十年沒被抓到的 12 個 bug。</p>
+
+<p>真的開始寫之後，會踩到幾個典型坑——點 tab 切換看每一條的具體陷阱與修法。</p>
+
+<div class="vg-w-tabs-pitfalls">
+  <style>
+    .vg-w-tabs-pitfalls { display: grid; gap: var(--s-2); margin: var(--s-3) 0; }
+    .vg-w-tabs-pitfalls input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+    .vg-w-tabs-pitfalls .tabs { display: flex; flex-wrap: wrap; gap: var(--s-1); border-bottom: 1px solid var(--line); }
+    .vg-w-tabs-pitfalls .tab { font-family: var(--sans); font-size: var(--fs-xs); padding: var(--s-1) var(--s-2); cursor: pointer; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+    .vg-w-tabs-pitfalls .panel { display: none; padding: var(--s-2) 0; font-family: var(--serif); font-size: var(--fs-sm); line-height: 1.55; }
+    .vg-w-tabs-pitfalls .panel strong { color: var(--accent-text); }
+    .vg-w-tabs-pitfalls:has(#vg-w-tabs-pitfalls-p1:checked) .panel-1 { display: block; }
+    .vg-w-tabs-pitfalls:has(#vg-w-tabs-pitfalls-p1:checked) [for="vg-w-tabs-pitfalls-p1"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    .vg-w-tabs-pitfalls:has(#vg-w-tabs-pitfalls-p2:checked) .panel-2 { display: block; }
+    .vg-w-tabs-pitfalls:has(#vg-w-tabs-pitfalls-p2:checked) [for="vg-w-tabs-pitfalls-p2"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    .vg-w-tabs-pitfalls:has(#vg-w-tabs-pitfalls-p3:checked) .panel-3 { display: block; }
+    .vg-w-tabs-pitfalls:has(#vg-w-tabs-pitfalls-p3:checked) [for="vg-w-tabs-pitfalls-p3"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    .vg-w-tabs-pitfalls:has(#vg-w-tabs-pitfalls-p4:checked) .panel-4 { display: block; }
+    .vg-w-tabs-pitfalls:has(#vg-w-tabs-pitfalls-p4:checked) [for="vg-w-tabs-pitfalls-p4"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    .vg-w-tabs-pitfalls:has(#vg-w-tabs-pitfalls-p5:checked) .panel-5 { display: block; }
+    .vg-w-tabs-pitfalls:has(#vg-w-tabs-pitfalls-p5:checked) [for="vg-w-tabs-pitfalls-p5"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    .vg-w-tabs-pitfalls:has(#vg-w-tabs-pitfalls-p6:checked) .panel-6 { display: block; }
+    .vg-w-tabs-pitfalls:has(#vg-w-tabs-pitfalls-p6:checked) [for="vg-w-tabs-pitfalls-p6"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+  </style>
+  <input type="radio" id="vg-w-tabs-pitfalls-p1" name="vg-w-tabs-pitfalls-sel" checked />
+  <input type="radio" id="vg-w-tabs-pitfalls-p2" name="vg-w-tabs-pitfalls-sel" />
+  <input type="radio" id="vg-w-tabs-pitfalls-p3" name="vg-w-tabs-pitfalls-sel" />
+  <input type="radio" id="vg-w-tabs-pitfalls-p4" name="vg-w-tabs-pitfalls-sel" />
+  <input type="radio" id="vg-w-tabs-pitfalls-p5" name="vg-w-tabs-pitfalls-sel" />
+  <input type="radio" id="vg-w-tabs-pitfalls-p6" name="vg-w-tabs-pitfalls-sel" />
+  <div class="tabs">
+    <label class="tab" for="vg-w-tabs-pitfalls-p1">坑 1 · state 太細</label>
+    <label class="tab" for="vg-w-tabs-pitfalls-p2">坑 2 · action 太粗</label>
+    <label class="tab" for="vg-w-tabs-pitfalls-p3">坑 3 · tautology</label>
+    <label class="tab" for="vg-w-tabs-pitfalls-p4">坑 4 · init 過嚴</label>
+    <label class="tab" for="vg-w-tabs-pitfalls-p5">坑 5 · 跑太久</label>
+    <label class="tab" for="vg-w-tabs-pitfalls-p6">坑 6 · trace 短</label>
+  </div>
+  <div class="panel panel-1"><strong>把 state 寫太細</strong>：把實作裡所有變數搬進 state record。違背 spec 抽象原則——你 model 的是合約，不是實作。內部 cache、buffer、page mapping 都不該進 state。規則：每個欄位都對應一條 documented contract。</div>
+  <div class="panel panel-2"><strong>把 action 寫太粗</strong>：把「open + create table + insert」合併成單一 action。model checker 看不到中間 state，就找不到「table 已建但 row 還沒插」這個 invariant violation。一個 action 對應一次可觀察 API call，不更少也不更多。</div>
+  <div class="panel panel-3"><strong>invariant 寫成 tautology</strong>：寫 <code>opened = opened</code> 或 <code>true</code>。永遠不會 violation，跑完報「無問題」但什麼也沒驗證。問自己：哪些 state 是 documented 說「絕對不該出現」的？那個的反面就是 invariant。</div>
+  <div class="panel panel-4"><strong>忽略 init 的不確定性</strong>：真實系統 initial state 通常不固定，db 可能已有資料、connection 可能已 open。spec init 應該是「all valid starting states」，用 <code>any { ... }</code> 表達 non-deterministic。忘掉這層會錯失「特定 init 下才出現」的 bug。</div>
+  <div class="panel panel-5"><strong>跑太久不知道縮哪</strong>：model checker 卡一小時沒回應。要縮的不是 N（trace 深度），是 state space。兇手通常是某個欄位值域太大（integer transaction ID）。改成 symbolic abstraction（只區分 zero / non-zero），從跑不完變秒回。</div>
+  <div class="panel panel-6"><strong>以為 trace 短就 bug 簡單</strong>：counterexample 短不代表修起來容易。Turso 的 deserialize crash 是 5 步 trace，但修正涉及 SQLite 內部好幾個 module 的協調。trace 是「最短反例」，不是「最簡單修法」。</div>
+</div>
+
+<p>不擅長的場景也要明說：<strong>floating-point arithmetic</strong>（SMT solver 對浮點支援差一個量級）、<strong>外部 timing / wall-clock</strong>（Quint 是 logical step，沒有 wall-clock；要用 timed automata）、<strong>weak memory ordering</strong>（C++/Rust 的 acquire/release/relaxed 用 herd7 / CDSChecker 更合適）、<strong>UI 視覺行為</strong>（spec 是 logical contract）、<strong>ML 模型的 statistical 性質</strong>（probabilistic model checking 用 PRISM / Storm）。明確列出 limitation 反而讓 sweet spot 更清楚——multi-step API contract、distributed protocol、state-machine backend、access control rule、replication invariant，這些都是 Quint 的場子。Turso 是 storage 公司，代價高，投資合理；你的系統如果代價沒這麼高，formal methods 是「知道有這條路、但今年不一定要走」——但「不一定要走」跟「不知道有這條路」是兩件事。</p>
+
+<p class="vg-deep-closer"><strong>Take-away</strong>：fuzzer 在 statement 空間裡撒網，Quint 在 state 空間裡推演——當你的 bug 住在「合法的呼叫序列在合法的 state 排列下違反 documented 合約」這個維度，前者永遠抓不到，後者一條 5 步 trace 就能逼出來。</p>
+
+</div>

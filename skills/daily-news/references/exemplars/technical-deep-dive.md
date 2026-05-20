@@ -1,0 +1,7 @@
+# Exemplar: deep-modal-cold-starts — technical-deep-dive
+
+**Why this is the exemplar:** The opener deploys a counter-intuitive observation immediately: "Modal 沒有把這條路上的任何一步『加速』，而是把它切成四段，每段都套一層快照，最後只剩 ~50 秒" — a named workload (vLLM), specific numbers (2,000→50 s, 40x), and the core design insight in one sentence. The structural arc is textbook for the archetype: an overview paragraph with Q1 2026 production figures (35M + 15M restores), then four component H2s in strict pipeline order (LP / FUSE / C/R / CUDA-checkpoint), then a Reducto case study, then composition trade-offs — every section earns its place. Depth is demonstrated through precise causal chains: the gzip single-thread bottleneck on FUSE, the CPU micro-architecture snapshot family derivation, the LP vs HPA reactive/predictive contrast, and the CUDA-checkpoint NCCL all-reduce deadlock reasoning.
+
+**Watch-for:** Every axis landed at 9 rather than 10: reviewers noted the opener's "What this enables" framing could be sharper (less forward-pointing), and the H2 "四層 compose 的代價與邊界" uses a mildly canonical label rather than a measurement-specific phrase. The benchmark table (vLLM 95,679→13,797 ms) and the Slacker FAST '16 / Marc Brooker quotes are cited correctly — match this attribution density, but find your own H2 language. Do not copy the "four-layer pipeline order" H2 skeleton for a different subject.
+
+**Source:** src/posts/2026/05/19/deep-modal-cold-starts.html. Audit score: Hook 9 / Structural 9 / Material 9 / Depth 9 / Relevance 9 / Anti-template 9 = 54.

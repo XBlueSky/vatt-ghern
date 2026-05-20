@@ -51,3 +51,8 @@ up to 3 concurrent — see
 `skills/daily-news/references/deep-story-brief.md` for the contract.
 Sequential authoring previously took ~2-3 minutes; parallel is bounded
 by the slowest single brief (~60s).
+
+- **Content-quality gate (Step 7.5)** — dual LLM reviewers score each
+  post on a 7-axis rubric before mechanical and visual checks. Low
+  scores trigger retry; reviewer disagreement surfaces for human
+  review.
