@@ -28,10 +28,13 @@ changing input X affect the trajectory?"
   <style>
     .vg-w-canvas-EXAMPLE { display: grid; grid-template-rows: auto 1fr auto; gap: var(--s-2); }
     .vg-w-canvas-EXAMPLE .toolbar { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
-    .vg-w-canvas-EXAMPLE button { font-family: var(--sans); font-size: var(--fs-sm); padding: 4px 12px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); cursor: pointer; }
+    .vg-w-canvas-EXAMPLE button { font-family: var(--sans); font-size: var(--fs-sm); padding: 6px 14px; min-height: 44px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); cursor: pointer; }
     .vg-w-canvas-EXAMPLE button:hover { border-color: var(--accent); color: var(--accent-text); }
     .vg-w-canvas-EXAMPLE canvas { width: 100%; height: auto; aspect-ratio: 16 / 9; display: block; }
     .vg-w-canvas-EXAMPLE figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    @media (max-width: 720px) {
+      .vg-w-canvas-EXAMPLE canvas { aspect-ratio: 4 / 3; }
+    }
   </style>
 
   <div class="toolbar">

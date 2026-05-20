@@ -177,6 +177,70 @@ Fixed `width` and `height` attributes ignore mobile. Use
 If the only way to read a widget's data is to hover over a tooltip, mobile
 users lose. Either provide tap-to-toggle, or label the data inline.
 
+### F4. `position: sticky` figure in 2-column grid without mobile fallback
+
+```css
+.vg-w-foo { display: grid; grid-template-columns: 1fr 1fr; }
+.vg-w-foo .figure-sticky { position: sticky; top: 32px; }
+/* … no @media query to undo sticky at mobile */
+```
+
+Desktop layout `[prose | sticky figure]` works fine. At mobile the grid
+collapses to single column, but the sticky stays on — it now creates dead
+space below each prose section because the figure is no longer beside
+anything. The reader scrolls 1000px of prose with an invisible figure
+glued to the wrong place.
+
+Always pair sticky with mobile fallback:
+
+```css
+@media (max-width: 720px) {
+  .vg-w-foo { grid-template-columns: 1fr; }
+  .vg-w-foo .figure-sticky { position: static; }
+}
+```
+
+See tier-3-principles §12.1.B.
+
+### F5. `IntersectionObserver` rootMargin -40% on mobile (scroll-driven inert)
+
+```js
+const io = new IntersectionObserver(cb, { rootMargin: '-40% 0px -40% 0px' });
+```
+
+Desktop viewport ~900px tall → 20% activation band = 180px, big enough
+to overlap any stage section. Phone viewport ~667px tall → 20% band =
+~133px, often narrower than a stage section. Result: no stage activates
+at all — the scroll-driven widget is silently inert on mobile.
+
+Use viewport-relative rootMargin via `matchMedia`:
+
+```js
+const isMobile = window.matchMedia('(max-width: 720px)').matches;
+const margin = isMobile ? '-25% 0px -25% 0px' : '-40% 0px -40% 0px';
+```
+
+See tier-3-principles §12.1.E.
+
+### F6. Tap targets < 32px (sliders, buttons, drag handles)
+
+```css
+.vg-w-foo input[type="range"] { /* default 16px thumb */ }
+.vg-w-foo .divider { width: 2px; cursor: ew-resize; }
+```
+
+Default 16px range thumb is barely tappable on mobile; 2px-wide
+divider line cannot be grabbed at all by a fingertip. Wrap fine
+elements in a ≥32px hit area:
+
+```css
+.vg-w-foo input[type="range"] { height: 36px; accent-color: var(--accent); }
+.vg-w-foo .divider { width: 32px; cursor: ew-resize; touch-action: none; }
+.vg-w-foo .divider::before { content: ''; position: absolute; left: 50%; top: 0; bottom: 0; width: 2px; transform: translateX(-50%); background: var(--accent); }
+```
+
+See tier-3-principles §12.1.C and §12.1.F.
+
 ## G. The summary test
 
 Before shipping a widget, ask:

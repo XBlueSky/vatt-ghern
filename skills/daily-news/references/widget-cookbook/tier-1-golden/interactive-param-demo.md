@@ -29,7 +29,7 @@ plateau).
   <style>
     .vg-w-param-demo-EXAMPLE { display: grid; grid-template-rows: auto 1fr auto; gap: var(--s-2); }
     .vg-w-param-demo-EXAMPLE .controls { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
-    .vg-w-param-demo-EXAMPLE .controls input { flex: 1; accent-color: var(--accent); }
+    .vg-w-param-demo-EXAMPLE .controls input { flex: 1; height: 36px; accent-color: var(--accent); touch-action: none; }
     .vg-w-param-demo-EXAMPLE .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 8ch; text-align: right; }
     .vg-w-param-demo-EXAMPLE svg { width: 100%; height: auto; }
     .vg-w-param-demo-EXAMPLE figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }

@@ -101,11 +101,16 @@ state change?"
         for (const k of Object.keys(groups)) groups[k].style.opacity = String(k === String(stage) ? 1 : 0);
       }
 
+      // rootMargin scales with viewport: phone (≤720px) needs narrower margin
+      // because the shorter viewport otherwise leaves no stage active mid-scroll.
+      // See tier-3-principles §12.1.E.
+      const isMobile = window.matchMedia('(max-width: 720px)').matches;
+      const rootMargin = isMobile ? '-25% 0px -25% 0px' : '-40% 0px -40% 0px';
       const io = new IntersectionObserver((entries) => {
         for (const e of entries) {
           if (e.isIntersecting) show(e.target.dataset.stage);
         }
-      }, { rootMargin: '-40% 0px -40% 0px', threshold: 0 });
+      }, { rootMargin, threshold: 0 });
 
       for (const s of stages) io.observe(s);
       show(1);

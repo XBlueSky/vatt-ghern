@@ -64,15 +64,27 @@ up, how a congestion window grows, how a build graph traverses.
 
 ## 6. Per-deep-story widget budget
 
-- **≥ 3 widgets total per deep-story.**
+- **Widget density ≥ 1.2 widgets per 1000 CJK chars** of prose.
+  - 4000-char post → 5 widgets
+  - 5000-char post → 6 widgets
+  - 6000-char post → 7-8 widgets
+  - 7000-char post → 8-9 widgets
+  - The longer the post, the more widgets it needs. A 7000-char post
+    with 3 widgets is a wall of text with token decoration; the
+    contract requires it to either grow widgets or trim prose.
+- **Hard floor: ≥ 5 widgets total per deep-story**, regardless of length.
 - **≥ 1 must be a Tier 1 hero widget** with genuine interaction (input,
   drag, canvas loop, scroll-driven, or sortable data).
 - **Each widget carries a conceptual question** recorded in the sidecar
   JSON's `widget_questions` array.
-- **Prose ≥ 500 lines** (HTML inside `<p>`, `<h2>`, etc.). Widget code
-  (inside `<script>`, `<style>`, `<svg>`, `<canvas>`) does NOT count
-  against the prose budget — old "600-1200 lines of HTML" caused
-  sub-agents to skimp on widget code to stay in budget.
+- **Prose ≥ 4000 CJK chars** (see §11 for "density > length"). Widget
+  code (inside `<script>`, `<style>`, `<svg>`, `<canvas>`) does NOT
+  count toward this floor.
+
+The previous contract said "≥ 3 widgets" — sub-agents read this as a
+target rather than a floor and stopped at 3-4, producing prose-heavy
+posts. The density rule binds widget count to prose length so a post
+can never grow to wall-of-text shape.
 
 ## 7. The conceptual question is the spec
 
@@ -139,3 +151,124 @@ Reference points for "right length":
 
 If your post is creeping past 6000 CJK chars, ask: is every paragraph
 earning its place? If 20% could be cut without losing substance, cut it.
+
+## 12. Mobile layout contract
+
+Every widget MUST work at **375px viewport width** (iPhone SE / small
+phone). Sub-agents repeatedly default to desktop-only patterns that
+silently break on mobile: sticky in 2-column grids that hide the
+sticky element below the fold; tap targets too small for fingers;
+canvas aspect ratios that crush detail; scroll-driven widgets that
+go inert because the observer margin doesn't match phone viewport
+height.
+
+### 12.1 Required patterns
+
+**A. Two-column grids collapse to one column at ≤720px**
+
+```css
+.vg-w-EXAMPLE { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s-3); }
+@media (max-width: 720px) {
+  .vg-w-EXAMPLE { grid-template-columns: 1fr; }
+}
+```
+
+**B. `position: sticky` inside grids must drop sticky at mobile**
+
+If desktop layout is `[prose | sticky figure]`, mobile must NOT keep
+the figure sticky — once the grid collapses, the figure is no longer
+"beside" anything and sticky just creates dead space below each prose
+section. Always pair sticky with a mobile fallback:
+
+```css
+.vg-w-EXAMPLE .figure-sticky { position: sticky; top: var(--s-4); }
+@media (max-width: 720px) {
+  .vg-w-EXAMPLE { grid-template-columns: 1fr; }
+  .vg-w-EXAMPLE .figure-sticky { position: static; }
+}
+```
+
+**C. Tap targets ≥ 44×44 px (Apple HIG) on mobile**
+
+`range` input thumbs default to ~16px — too small. Either set
+explicit height on the input or use `accent-color` with a larger
+custom thumb. Slider tracks at ≥32px height. Buttons at ≥44px square.
+SVG clickable rects at ≥44px in CSS pixels (not viewBox units —
+account for SVG scale).
+
+```css
+.vg-w-EXAMPLE input[type="range"] { height: 36px; accent-color: var(--accent); }
+.vg-w-EXAMPLE button { min-height: 44px; min-width: 44px; padding: var(--s-1) var(--s-2); }
+```
+
+**D. Canvas / SVG aspect-ratio adjusts at mobile**
+
+Desktop 16:9 canvas (e.g., queue simulation) crushes to ~211px tall
+at 375px viewport — labels overlap, animation cramped. Switch to a
+taller aspect-ratio at mobile:
+
+```css
+.vg-w-EXAMPLE canvas { aspect-ratio: 16 / 9; }
+@media (max-width: 720px) {
+  .vg-w-EXAMPLE canvas { aspect-ratio: 4 / 3; }
+}
+```
+
+**E. Scroll-driven explanation: IntersectionObserver rootMargin must
+account for phone viewport**
+
+Desktop `rootMargin: '-40% 0px -40% 0px'` gives a ~20vh activation
+band. On 667px-tall mobile that's only ~133px — narrower than most
+stage sections, so nothing activates between stages. Use viewport-
+relative units that scale:
+
+```js
+const isMobile = window.matchMedia('(max-width: 720px)').matches;
+const margin = isMobile ? '-25% 0px -25% 0px' : '-40% 0px -40% 0px';
+const io = new IntersectionObserver(callback, { rootMargin: margin, threshold: 0 });
+```
+
+**F. before-after-slider divider: at least 32px hit area**
+
+The visible divider line can be 2px; the *invisible* drag handle area
+around it should be ≥32px wide for finger drag. Wrap the line in a
+transparent grab strip:
+
+```html
+<div class="divider" style="position: absolute; top: 0; bottom: 0; width: 32px; transform: translateX(-50%); cursor: ew-resize; touch-action: none;">
+  <div style="position: absolute; left: 50%; top: 0; bottom: 0; width: 2px; transform: translateX(-50%); background: var(--accent);"></div>
+</div>
+```
+
+**G. Tables: enable horizontal scroll at mobile, never let columns crush**
+
+```css
+.vg-w-EXAMPLE { overflow-x: auto; }
+.vg-w-EXAMPLE table { min-width: 480px; }
+```
+
+A horizontally scrollable table beats a crushed-unreadable one.
+
+### 12.2 Anti-patterns specific to mobile
+
+- **`<input type="range">` without `touch-action: none`** — page scrolls when user tries to drag
+- **`width: 480px` or any fixed pixel width** — never use; always `width: 100%` with `max-width` constraint
+- **`@media (max-width: 480px)`** — too narrow a breakpoint; 720px catches more phones (and small tablets in portrait)
+- **Hover-only affordances** — phones don't hover; expose via tap or always-visible
+- **font-size below 14px** — unreadable on phones
+- **`viewBox="0 0 480 200"`** — too narrow; SVG widgets should use 720+ width viewBox so labels have room when scaled down
+
+### 12.3 Self-check before declaring DONE
+
+Resize your dev-server browser to 375px and scroll through. For each
+widget verify:
+
+1. Does it visibly render? (not 0×0, not clipped to invisibility)
+2. Do interactive controls accept finger taps? (no 16px slider thumbs)
+3. Is text legible? (≥14px on screen)
+4. Does the widget make sense without horizontal scroll? (or does it scroll cleanly when needed)
+5. For scroll-driven: do stages activate as you scroll? (not all-inert because rootMargin too tight)
+
+If any answer is "no", fix in the widget's own scoped CSS — do not
+defer to "we'll fix mobile later". Mobile is half the readers; "later"
+is "never".
