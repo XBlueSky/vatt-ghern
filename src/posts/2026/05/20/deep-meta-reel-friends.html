@@ -4,217 +4,13 @@
 </header>
 
 <div class="vg-post-prose">
-<p><span class="vg-dropcap">M</span>eta 在 5 月 13 日這篇〈Reel Friends: Building Social Discovery that Scales to Billions〉裡，把先前 3 月那篇 Friend Bubbles 工程文裡藏著的 retrieval / ranking / online learning 三層架構，往「為什麼這麼設計」的方向講開來。重點不是「Reels 加了一個朋友推薦功能」這個 product 敘事，而是當一條 social signal 要進到本來就以 video embedding 為核心的 recommendation stack，怎麼避免它退化成「在 ranker 後面塞一個 if friend then boost」的廉價拼裝。</p>
+<p><span class="vg-dropcap">M</span>eta 在 5 月 13 日這篇〈Reel Friends: Building Social Discovery that Scales to Billions〉，把先前 3 月那篇 Friend Bubbles 工程文裡藏著的 retrieval / ranking / online learning 三層架構，往「為什麼這麼設計」的方向講開來。重點不是「Reels 加了一個朋友推薦功能」這個 product 敘事，而是當一條 social signal 要進到本來就以 video embedding 為核心的 recommender，怎麼避免它退化成「在 ranker 後面塞一個 if friend then boost」的廉價拼裝。</p>
 
-<p>這篇 deep-dive 把整套系統拆成五個 component，逐一講它各自擔什麼責任、它刻意不知道什麼、以及它跟相鄰 component 的 contract。讀完之後，你應該能清楚回答這幾個問題：closeness model 為什麼要兩個版本而不是一個；retrieval 為什麼是分層而不是單一 ANN lookup；MTML ranker 為什麼要 early-stage 跟 late-stage 各跑一次；以及為什麼整套系統的工程瓶頸不在 GPU、不在 embedding 維度，而在那個「video prefetch window」的幾百毫秒。</p>
+<p>先講一句話的 mental model：Reel Friends 不是獨立的 recommender，它是一條穿過 Reels 既有 retrieval / ranking 漏斗的「social-aware 旁路」。旁路上的每一個 stage，都得在不破壞主漏斗 SLA 的前提下，把 friend-aware 的 candidate 跟 friend-aware 的 signal 塞進去。整個工程的精彩之處，就在於「塞進去」這四個字背後的全部 trade-off。</p>
 
-<p>先講一句話的 mental model：Reel Friends 不是一個獨立的 recommender，它是一條穿過 Reels 既有 retrieval / ranking 漏斗的「social-aware 旁路」。旁路上的每一個 stage，都得在不破壞主漏斗 SLA 的前提下，把 friend-aware 的 candidate 跟 friend-aware 的 signal 塞進去。整個工程的精彩之處，就在於「塞進去」這四個字背後的全部 trade-off。</p>
+<p>整套系統拆成五個 component：closeness model、retrieval、MTML ranker、video prefetch window、online learning loop。下面那張可點擊的 architecture diagram 是讀這篇文的單一入口——點任一個 box 看它的責任跟它刻意不知道什麼。剩下的章節各自展開三個非顯然的設計決策、那個倒推架構形狀的 forcing function、以及 component 之間的 contract 為什麼是真正的工程價值。</p>
 
-<h2>Closeness model——為什麼是兩個</h2>
-
-<p>整個系統最上游的零件，是用來判斷「兩個帳號之間到底有多熟」的 closeness model。Meta 在文章裡明說這不是一個 model，而是兩個 complementary models 並排運作：一個 survey-based，一個 context-specific。理解為什麼是兩個，就理解了這個系統的第一個非顯然的設計決策。</p>
-
-<p>survey-based 的那一支，input 是 social-graph features——mutual friends、connection strength、interaction patterns——加上 user attributes。它的訓練 label 來自 user surveys：直接問使用者「你跟這個人有多熟」，再用 social-graph features 去學一個能在沒問的人身上 predict 的 model。換句話說，這支 model 的「ground truth」是人類自己標的 closeness，它輸出的是一個與 surface behavior 無關、相對穩定的「結構性親近度」分數。</p>
-
-<p>structural closeness 的好處是穩定、覆蓋率高、可以提前 batch precompute——文章裡那句「weekly inference over trillions of person-to-person connections across Facebook friends」就在講這支 model：以週為單位，把整張 Facebook friend graph 上所有的 edges 都跑一次 inference，把分數 materialize 進 feature store。trillions 的 edges 用 weekly cadence 才壓得下成本；如果想做到日級或小時級，運算成本會以 friend graph 的密度線性放大。</p>
-
-<p>但 weekly 的 inference cadence 對某些場景太慢。你最近三天剛開始密集互動的某個同事、你昨天剛加為好友的某個人、你跟某位朋友的 chat 突然炸熱——這些都不會在週級的 graph snapshot 裡反映出來。這就是 context-specific 那一支存在的原因。它讀的是 on-platform activity signals：likes、comments、reshares 這類 real interactions，並且——關鍵在這——它讀的是更新得比週級快得多的 signal stream。</p>
-
-<p>於是兩支 model 形成一個 frequency-orthogonal 的組合：survey-based 給你 stable structural closeness，context-specific 給你 fast-moving behavioral closeness。retrieval 階段拿到的 closeness score，是這兩個 signal 的融合——不是簡單相加，而是針對「這個 viewer 對這個 friend 的當下熟悉程度」做的 conditional 預測。</p>
-
-<p>注意這裡有個容易被忽略的 invariant：context-specific 那一支不會替代 survey-based。如果你跟某個朋友最近完全沒互動，context-specific 的訊號接近零，但 survey-based 仍然會給出一個 baseline closeness 來反映你們的結構性關係——你跟你姊還是你姊，即使你們上週都沒按彼此的貼文。把這個 baseline 拿掉的系統，會在 cold case（少互動但實際很熟）跟 bursty case（最近多互動但其實只是短暫）之間反覆過擬合。</p>
-
-<p>把 closeness 拆成兩支，等同於 explicitly 把 representation 分成兩個 frequency band，再各自找最適合的 model class 跟 training cadence。這是這個系統第一個結構性決策：你預測的不是一個 scalar，而是一個 multi-component vector，每個 component 對應不同的時間尺度。</p>
-
-<p>這個拆分還有一個 evaluation 上的好處。survey-based 那一支有明確的 ground truth——使用者調查回答——可以直接算 prediction error。context-specific 那一支沒有這種 explicit label，它的品質要靠 downstream metric（最終 engagement、retention）回推。如果把兩件事揉成一個 model，你的 evaluation 會被 downstream metric 主導，survey ground truth 被稀釋。分開之後，structural 那一支可以用 supervised metric 直接 monitor，behavioral 那一支用 downstream proxy——兩條 evaluation pipeline 互相校準，比單一 pipeline 健壯得多。</p>
-
-<p>另一個容易被忽略的細節：trillions of edges 這個規模本身就決定了 model class 的選擇。在 trillion-edge graph 上跑一輪 GNN training，message passing 的 memory footprint 是天文數字；即使是常見的 mini-batch sampling 技術，要在週級內收斂也很困難。所以 survey-based 那一支幾乎不可能是 vanilla GNN，更可能是某種 hybrid——比如先用便宜的 graph 特徵（mutual friends count、Adamic-Adar、Jaccard similarity）做 feature engineering，再用 MLP / GBDT 做 supervised learning。GNN 的部分如果有，可能也只用在 closeness score 比較密集的 sub-graph 上，而不是整張 trillion-edge graph。</p>
-
-<h2>Retrieval——為什麼分層而不是 single ANN</h2>
-
-<p>有了 closeness model 之後，下一個問題：怎麼從 viewer 出發找出「該 viewer 的朋友互動過、且該 viewer 可能會喜歡的 reels」？文章裡的描述是 retrieval stage「sources candidate videos based on close friends, as identified by the closeness model」——一句話帶過，但這句話底下藏了整個系統最大的工程成本。</p>
-
-<p>第一個誘惑性的設計：把所有東西塞進一個巨大的 embedding ANN index。把 (viewer, friend pairs) 跟 video 都壓進同一個 embedding space，retrieval 變成一次 approximate nearest neighbor lookup。這個方案在 paper 上很乾淨，在 production 上會死得很快——因為 social-graph 的 signal 跟 content-similarity 的 signal 是兩種完全不同 topology 的東西，硬塞進同一個 metric space 會讓 ANN 在 high-recall 區段瘋狂退化。</p>
-
-<p>具體一點講，social-graph 是 sparse 且 discrete 的——人跟人之間要嘛是朋友要嘛不是，朋友之間的「熟度」是一個有界、有結構的 scalar；content similarity 是 dense 且 continuous 的——任何兩個 reel 之間都有一個非零的 cosine similarity。把這兩種 signal 塞進同一個 embedding，等於要求 embedding 同時 encode 兩種完全不同的 metric structure，最後結果通常是兩邊都做不好。實務上常見的失敗模式是 social signal 被 content signal 淹沒——因為 content embedding 的 magnitude 大、覆蓋面廣，social 那一塊變成 noise floor。</p>
-
-<p>Reels 的做法是分層 retrieval：先用 social graph 把 candidate 集合縮到「跟你 closeness 高的 friends 最近互動過的 reels」這個尺寸已經可控的子集，然後在這個子集上才跑 content-based 的 embedding 比對。換句話說，social graph 是第一層的 hard filter，embedding 是第二層的 soft scorer。順序顛倒——先 embedding 再 social filter——會浪費所有 ANN 算力在最終會被 social filter 砍掉的 candidate 上。</p>
-
-<p>第一層的 social graph traversal 本身也不是 naïve 的「列出你所有朋友、抓他們最近的活動」。Meta 在這裡用 closeness score 做了 top-K 截斷：對每個 viewer，先取 closeness 最高的若干 friends（具體 K 值文章沒明說，但從 latency budget 反推應該在數十到數百的量級）。截斷之後再去抓這些 friends 最近 N 天內互動過的 reels，得到一個 candidate pool。</p>
-
-<p>candidate pool 的大小是這套系統的 key tunable。pool 太小，下游 ranker 沒得選；pool 太大，下游 ranker 的算力被稀釋。「scales to billions」這個 title 不是說「最終會推 billions 個 reel 給你」——是說 candidate generation 的搜索空間，跨 viewer × candidate video 的 cartesian product，是十億級的。也就是說，每一個 viewer 的 retrieval pool 可能只有幾百到幾千個 candidate，但整個系統需要對全平台的 viewers 同時維持這個 pool。</p>
-
-<p>把這個規模具體化一下：假設 Facebook 月活使用者落在 30 億等級，平均每個 viewer 的 top-K friends 是 100，每個 friend 最近一週互動過的 reel 是 20——光是 raw social pool 就是 30B × 2000 = 60 trillion 的 viewer-candidate pair。當然絕大多數 pair 不會 materialize 成實際的 retrieval request（不是每個 viewer 都在線、不是每次 request 都需要 fresh pool），但 system design 必須能 handle 這個 worst-case 的記憶體跟 I/O footprint。從這個角度看，「分層」不只是 ML 上的乾淨設計——它是為了讓每一層的 compute 跟 storage 都落在可以工程化的等級。</p>
-
-<p>第二層的 embedding scorer 才是真正把 candidate pool 收斂到 ranker 可承受規模的地方。這裡的 embedding 不只是 video 自己的內容 embedding，還會把 viewer 的興趣 embedding、friend 的 behavior embedding 一起進來——這幾個 embedding 在 dot product 之外還會做一些非線性組合。具體 architecture 文章沒展開，但 industry standard 的做法是 two-tower 變體：viewer + friend context 為一塔，video 為另一塔，offline 把所有 video 的 tower output 預算好，online 只算 viewer tower 跟做 dot product。</p>
-
-<p>分層 retrieval 的另一個 hidden benefit：第一層的 social filter 是 hard rule，可以 exact filter，不會有 ANN 那種 recall-precision trade-off。意思是，如果你的朋友裡有人按了某個 reel，這個 reel 進 candidate pool 的機率是 1，不是 0.97。對 social discovery 這個 product 來說，這個 guarantee 比 embedding 的 generalization 重要得多——使用者預期看到的是「我朋友看的東西」，不是「跟我朋友看的東西很像的東西」。</p>
-
-<p>還有一個分層帶來的 evaluation 解耦。retrieval 的 metric 是 recall@K——真正會被 engagement 的 reel 進 pool 的比例。ranker 的 metric 是 ranking quality (NDCG / engagement uplift)。如果 retrieval 跟 ranking 是同一個系統，這兩個 metric 會打架——optimize 一個會傷害另一個。分層之後，retrieval team 可以 obsess on recall，ranker team 可以 obsess on quality，兩邊的 A/B test 不互相 contaminate。</p>
-
-<p>第二層的 embedding scorer 在這個架構裡其實扮演兩個角色：一個是 candidate ranking（給 first-pass score），一個是 candidate filtering（砍掉明顯不相關的）。這兩個角色用同一個 model 完成，但 downstream 的處理方式不同——前者把 score 傳給 late-stage ranker 當 feature，後者直接砍掉 score 低於閾值的 candidate。閾值怎麼定？通常不是固定值，而是動態調整以保證 candidate pool 大小落在一個區間（比如總是輸出 50 個 candidate，不管原始 pool 有多大）。</p>
-
-<p>更深一層的問題是：social hard filter + embedding soft score 這個 pipeline，對沒有朋友活動的 viewer 怎麼辦？冷啟動使用者、剛加入平台的帳號、朋友很少的人——這些場景下 social filter 會輸出極小的 pool 甚至空集合。這時系統需要 fall back 到純 content-based retrieval。fall back 的設計本身又是另一個 trade-off：fall back 太快會讓 social 體驗稀釋，fall back 太慢會讓冷啟動使用者看到空頁。Meta 在文章裡沒展開這部分，但從產品形態推測，bubble UI 應該是 conditional 顯示——只在 social filter 有夠多 candidate 時才出現，否則整個 bubble feature 對該使用者就 silent disable。</p>
-
-<h2>Ranking——MTML 雙階段與 conditional probability term</h2>
-
-<p>candidate pool 到手之後，下一步是 ranking。Meta 在這個 stage 上下了一個關鍵字：MTML——multi-task, multi-label，且同時部署在 early-stage 跟 late-stage。這四個字每一個都有 trade-off。</p>
-
-<p>multi-task：同一個 model 同時 predict 好幾個目標——watch time、likes、comments、shares、follows——每個 task 一個 head，shared backbone 共用 representation。multi-label：每個 sample 可以同時觸發多個 label（一個 reel 可能被 watch 完 + 被按 love + 被 share，三個 label 同時為 1）。把 multi-task 跟 multi-label 揉在一起的好處是，shared representation 學到的 video × viewer 表徵被多個 supervision signal 同時拉著，比起單目標 model 更不容易 overfit 任何一個 metric 的 noise。</p>
-
-<p>但 MTML 在 Reel Friends 這個場景下有個特別的 wrinkle：friend-bubble interaction 不只是「另一個 label」，它是一個 conditional 的概念。一個 reel 出現在 friend bubble 裡，是因為它先通過了 social filter；它的 engagement 行為應該被解讀為「在已知有 bubble impression 的 condition 下，使用者選擇 engage 的機率」。文章裡那個關鍵 term，P(video engagement | bubble impression)，就是在 ranker 的 loss 裡明寫的條件機率。</p>
-
-<p>為什麼要把它寫成條件機率而不是 joint？因為如果直接 model P(engagement, bubble impression)，model 會學到「凡是進 bubble 的 reel 都比較容易被 engage」這種 surface correlation——但這只是 selection bias，不代表 bubble 本身有 causal effect。conditional 形式逼著 model 在「已經知道是 bubble 出來的」這個前提下，去學「viewer 在這個 specific 條件下到底會不會 engage」，把 social filtering 帶來的 selection bias 從 engagement prediction 裡分離出去。</p>
-
-<p>再來是 early-stage / late-stage 雙部署。同一個 MTML model 部署在 ranker pipeline 的兩個不同位置：early-stage 是 candidate pool 還很大（幾百到幾千）的時候，跑一個簡化版的 ranking，把 pool 收斂到幾十；late-stage 是最終排序，pool 已經小到可以用更貴的 features（包括 real-time signals）做精細打分。兩個 stage 共享 model architecture，但跑的 feature subset 不同——early-stage 用 cheap features，late-stage 用 expensive features。</p>
-
-<p>這個雙部署的非顯然好處：因為兩個 stage 共用 model，early-stage 的 ranking 跟 late-stage 的 ranking 在 representation 上是一致的，不會出現「early-stage 認為這個 reel 第三名、late-stage 卻完全不認得它」的 representation drift。這是經典的 cascade ranking 痛點——上下游 model 各自獨立訓練時，下游永遠在處理一個被上游意外篩掉一半好 candidate 的 input distribution。共享 backbone 在工程上付出的代價，就是換來這個 representation 一致性。</p>
-
-<p>還有一個值得提的細節：文章特別點出「expressive reactions such as love or laughter drive stronger downstream engagement than simple likes」。意思是 MTML 的 multiple labels 並不是被同等對待的，model 會學到 love / laugh 這類 expressive reaction 是比 like 更強的 engagement predictor。這在 loss weighting 上應該有反映——expressive 的 label weight 比 like 高。當然 paper 沒給具體權重，但這個 observation 暗示 ranker 在 label engineering 上不是「全部 label 平均」的 naive 設定。</p>
-
-<p>為什麼 expressive reaction 是更強的 predictor？因為 like 的 cost 太低——使用者點 like 幾乎不思考，這個 signal 的 noise 比例高。love / laugh 需要使用者多一個 click（從 like 按鈕長按或滑過去），這個 marginal cost 過濾掉了很多隨手的 like，留下來的都是「真的覺得這個 reel 不錯」的人。從 information theory 的角度看，cost 較高的 signal 通常 carry 較高的 information per event，跟使用者留存率的 correlation 也更強。MTML 的 multi-label 設計恰好讓 model 可以同時看到 like 跟 love，自動學到兩者之間 information density 的差距，並把更高的 weight 給更稀有但更可靠的 signal。</p>
-
-<p>還有一個經常被外界誤解的點：MTML 不是「同時 optimize 多個目標」這麼簡單。它的真正力量在於 multi-task learning 的 regularization effect——多個 task 共用 backbone 會迫使 representation 學到一個泛化到所有 task 的 latent space，而不是 overfit 到任何單一 task 的 noise。這對 ranker 特別關鍵，因為任何單一 engagement metric 都有 reward hacking 的風險（為了 maximize watch time，model 可能會傾向推超長 reel；為了 maximize like，model 可能會傾向推 clickbait）。multiple supervision 互相牽制，讓 model 學到的 representation 不容易被任何單一 metric 帶歪。</p>
-
-<p>conditional probability term P(engagement | bubble impression) 在實作層面還有一個常被忽視的細節：它需要 logging system 同時記錄 positive 跟 negative 的 bubble impression——也就是，每次 bubble 顯示出來但使用者沒有 engage 的事件，也要被 log 進來作為 negative sample。如果只 log positive，model 看到的 data distribution 就是條件機率分母為 1 的退化情況，learn 不到任何東西。Meta 在這方面的工程紀律應該是 strict 的——bubble 的 impression event 應該以 client-side instrumentation 完整 capture，不管 viewer 有沒有 interact。</p>
-
-<h2>Feature freshness vs prefetch window——三條不能違反的鐵律</h2>
-
-<p>到目前為止我們講的都是 model side。但這套系統能不能上線、能不能在十億級 user base 上跑得動，最終卡的不是 model quality 而是 serving constraints。Meta 在 Friend Bubbles 那篇文章裡明確寫出三條 nonnegotiable 的 performance constraints，這三條構成整個 serving stack 的 hard limits。</p>
-
-<p>第一條：smooth scrolling。Reels 的本質是 vertical scrolling 短影片串，任何讓 scroll 卡頓的東西都會被使用者立刻感知。對 ranking 系統的意思是，無論 friend-bubble metadata 從哪裡取、closeness score 多新鮮、retrieval pool 多大，都不能在 main thread 上 block。</p>
-
-<p>第二條：no regressions in load latency。Reels 的影片載入時間是直接影響留存的核心指標。加入 friend-bubble 這個新 feature，必須做到把 metadata 抓回來、把 bubble UI render 出來，全部塞進原本就為 video prefetch 預留的時間窗——不允許這個新功能多花一毫秒。</p>
-
-<p>第三條：low CPU overhead for metadata fetch。client 端 device CPU 是稀缺資源，friend-bubble metadata 的 parsing、closeness 顯示邏輯、bubble UI render，都不能占用顯著的 CPU 預算。</p>
-
-<p>這三條看起來只是 client-side 的 perf engineering，但它們倒推回來，會徹底決定 server-side 的 architecture。具體做法：friend-bubble metadata retrieval 被「pinned to that same prefetch window」——也就是說，當 Reels client 預取下一支影片的內容時，friend-bubble metadata 是搭著同一個 prefetch request 一起回來的，不是另開一條 request。</p>
-
-<p>為什麼這個決定這麼關鍵？因為它把整個 serving pipeline 的時間預算定死了。Reels 的 video prefetch window 是一個既有的、被精細優化過的時間窗——大概在數百毫秒等級，包含 ranker 決定下一支影片、CDN edge 把 video bytes 推到 client、metadata 隨包附帶。friend-bubble 的所有 server-side 計算必須在這個 window 裡完成；超過一毫秒，第二條 nonnegotiable 就被違反。</p>
-
-<p>這直接約束了上游每一個 component 的 latency budget。closeness model 不可能 online 推理——必須是 precomputed feature lookup。retrieval 的第一層 social filter 必須是 indexed lookup 而不是 graph traversal——你不可能在 video prefetch window 裡跑一次「BFS 我的好友、抓他們最近活動」的 graph query。embedding 比對必須走 ANN 而不是 exact search——數百毫秒不夠你掃幾千個 dot product。ranker 的 early-stage 必須用 cheap features——expensive features 留到 candidate pool 縮小後才能用。</p>
-
-<p>整套架構在 paper 上看像是「先 closeness、再 retrieval、再 ranking」的 layered design 出於 ML clarity；實際上它是被 prefetch window 這個 hardware-level 的 wall clock 預算 forced 出來的 architecture。所有的 layering、所有的 precompute、所有的 feature freshness trade-off，都是為了讓最後一段 online compute 能塞進那個 wall clock。</p>
-
-<p>feature freshness 的 trade-off 在這個 budget 底下變得很清楚：你想要的 signal 越新鮮，計算就要越靠近 request time；越靠近 request time，就越擠壓 video prefetch window。Meta 的解法是 stratify by frequency：closeness 的 structural 部分是 weekly precompute（trillions edges 級的東西本來就只能 weekly），closeness 的 behavioral 部分是 minute-to-hour 級的 streaming feature，retrieval 的 candidate pool 是 second-level cache，ranker 的最終排序是 online inference。每一層 freshness 對應一個成本層級，工程紀律不是「全都 real-time」也不是「全都 batch」，而是「把對的東西放在對的 freshness 層」。</p>
-
-<p>「pinned to that same prefetch window」這個動詞挑得很精準。pin 跟 attach 不一樣——attach 是「附帶在上面」，pin 是「釘進去、不能分開」。意思是 friend-bubble metadata 不是另開一個 sidecar request，也不是「能搭便車就搭便車，不行就 fallback」，而是強制性地跟 video prefetch 共用同一個 request、同一個 response cycle、同一條 TCP 連線。這個強制性帶來兩個工程約束：一是 server-side 要在同一個 endpoint 上同時 serve 兩種資料；二是 metadata 的 size 必須小到不會 measurably 拖慢 prefetch 的 transfer time。第二個約束特別 tight——video bytes 動輒幾 MB，metadata 必須在 KB 等級才不會影響 percentile 級的 transfer latency。</p>
-
-<p>「low CPU overhead for metadata fetch」這條 client-side 的鐵律也值得展開。Reels 的 client 是 mobile app，跑在從 iPhone 16 Pro 到五年前的 Android low-end device 不等的硬體上。任何 server 送回來的 metadata 都要在 client 端 parse、layout、render。如果 metadata 結構複雜（比如要在 client 端跑一個小 model 來決定 bubble UI 的 layout），低階裝置會吃不消，整個 scrolling 體驗就崩了。所以 metadata 的 schema 必須極簡——大概就是 「友圈成員的 user id 列表 + 各自的 reaction type + 一個 ordering hint」這種 wire format，client 直接拿來 render，不做任何二次計算。這條約束又反過來限制了 server-side 能塞什麼進 metadata：複雜的 ranking score、複雜的 explanation、複雜的 per-friend recommendation reason 都不行。</p>
-
-<p>把三條 nonnegotiable 串起來看，會發現它們不是獨立的——它們組成一個自洽的 design philosophy：使用者體驗的順滑性質從來不被 ML quality 妥協。如果某個 ML upgrade 會違反任一條，那個 upgrade 就不會 ship，不管 offline metric 多漂亮。這在大平台的 ML team 是難得的紀律——很多 team 在 paper 上會宣稱 user experience 是第一位，但實際 release 過程裡，metric 改善大的 model 即使會傷一點 latency 也會被推上線。Meta 在 Reels 這個產品上的紀律似乎更硬：三條鐵律是 hard gate，不是 soft trade-off。</p>
-
-<h2>Online learning loop——integrity 跟 feedback 的同時 joint train</h2>
-
-<p>最後一個 component 是 online learning loop。Meta 的描述是 friend-bubble interaction data「flows back into model training」——這聽起來很 generic，但它在這個系統裡有個特別的意涵。</p>
-
-<p>online learning 在 ranker 上的常見實作是 streaming gradient update：當使用者對某個 bubble reel 做出 interaction（看完、按 love、留言、跳過），這個 interaction 會以 event 形式進入 training pipeline，model weight 以接近 real-time 的速度更新。這對 freshness 很重要——使用者今天突然開始喜歡 cooking reels，ranker 不必等到明天的 batch retrain 才知道。</p>
-
-<p>但 social discovery 場景下，online learning 有個 batch ranker 沒有的特殊挑戰：reward signal 的 sample-selection bias。能成為 training sample 的，只有「進入了 bubble 並被觀察到 interaction」的那些 reel——但 bubble 顯示哪些 reel，本身又是 ranker 決定的。這形成一個經典的 feedback loop：ranker 偏好的 reel 被多看，被多看的 reel 提供更多 training signal，更強化 ranker 的偏好。</p>
-
-<p>P(video engagement | bubble impression) 這個 conditional 的形式在這裡又一次發揮作用。把 ranker 寫成條件機率，意味著它原則上不是在學「無條件下 reel 有多好」，而是在學「在我已經選擇 surface 它的條件下，它的 engagement 機率」。這把 selection bias 數學上吸收進了 conditioning variable，讓 online update 不會單純把「我自己偏好」當成「使用者偏好」來自我強化。當然這不是 free lunch——它要求 logging system 完整記錄每一個 bubble impression 的 condition，不能只 log positive interaction。</p>
-
-<p>另一個跟 online learning 同時 joint train 的東西是 integrity constraint。Meta 沒有在這篇文章裡 explicit 列出哪些 integrity rules，但從產品角度可以推出來：不允許 surface 違反 community standards 的內容、不允許 amplify 某些類型的 sensitive content、不允許在 minor 帳號之間 surface 不適當的互動。這些 rule 在 ranker 訓練時是以 auxiliary loss / constraint head 的形式進來——同一個 MTML model，在 engagement head 之外還有 integrity head，這些 head 的 loss 跟 engagement 的 loss 一起 backprop，最終的 ranking score 是 engagement score 經過 integrity 過濾或 reweight 後的結果。</p>
-
-<p>joint train 而不是 post-filter 的好處是 representation level 的對齊：model 學到的 video × viewer representation 同時要服務 engagement prediction 跟 integrity classification，這逼著 backbone 不能學到那種「engagement 很高但有 integrity 風險」的 short-cut representation。post-filter 的做法則是先學一個純 engagement model 再用獨立的 classifier 過濾——這在 distribution 邊緣會反覆失敗，因為 engagement model 會把 representation 學到 integrity classifier 的 decision boundary 上。</p>
-
-<p>online learning 跟 integrity 的耦合，也是 Reel Friends 比一般「給朋友推朋友的影片」工程上難得多的地方。一個純 product 角度的實作會把這兩件事拆開：一個 team 做 ranker、另一個 team 做 integrity filter。Meta 這套做法把它們 joint 起來，付出的代價是 model team 必須同時掌握 engagement metric 跟 integrity metric 的訓練細節；換來的好處是 representation 一致、online update 不會在兩個目標之間搖擺。</p>
-
-<p>online learning 還有一個 stability 上的隱形課題。streaming gradient update 的 update rate 設得太高，model 會被噪聲帶歪——比如使用者今天偶然多看了幾個 cooking reel，ranker 立刻 collapse 到只推 cooking。設得太低，又失去 online learning 的意義，跟 daily batch 沒差多少。實務上會用 EMA（exponential moving average）平滑 update，或者用 importance sampling 把 streaming sample 的 weight 調低。具體的 hyperparameter 也是這套系統最敏感的環節之一——一次 hyperparameter 錯誤可能就讓 ranker 在 24 小時內 collapse。</p>
-
-<p>另一個常見的 online learning failure mode 是 catastrophic forgetting：新進來的 streaming sample 在 representation space 上太密集，舊的 representation 被沖刷掉。對 social discovery 來說這特別危險——使用者跟好朋友的長期關係是「舊 signal」，最近一週的爆炸性互動是「新 signal」，如果 model 對新 signal overfit，就會忘掉長期關係的重要性。緩解方法通常是 replay buffer——把舊的 sample 維持一個池子，每次 update 時混合新舊一起 train。這套機制在文章裡沒提，但對任何成熟的 online learning 系統來說都是必備的。</p>
-
-<p>integrity head 在 jointly trained 之外，還有一個 inference-time 的責任：當 engagement score 跟 integrity score 出現矛盾時，誰贏？常見的設計是 integrity 有 veto 權——只要 integrity score 超過一個 threshold（表示「這 reel 有風險」），不管 engagement score 多高都不 surface。這個 veto 機制讓 integrity 不只是「降權」而是「絕對否決」，避免 high-engagement-high-risk 的內容透過總分加權繞過防線。trade-off 是 veto threshold 設得太嚴格會誤殺良性內容，太鬆會放過有問題的內容——這通常需要 policy team 跟 model team 反覆校準。</p>
-
-<h2>把五個 component 拼起來——資料流跟 contract</h2>
-
-<p>講完五個 component，再退一步看整體 data flow。每個 user request 進來時，系統實際上不會 from-scratch 跑這五件事——大部分 component 的輸出都已經 precomputed，request time 只觸發少數幾個 lookup 跟一次 online inference。</p>
-
-<p>request time 上發生的事大概是這樣的順序：</p>
-
-<p>第一步，viewer id 進來。從 feature store lookup 該 viewer 的 top-K close friends（survey-based + context-specific 的融合結果，每小時級更新一次）。這個 lookup 是 indexed key-value query，預期 latency 在 single-digit ms。</p>
-
-<p>第二步，對這些 friends 各自 lookup 他們最近 N 天的 interaction 過的 reels，匯成 candidate pool。這個 lookup 同樣 indexed，但可能跨多個 shard（friends 可能散落在不同 user-id range 的 shard 上），latency 在十幾 ms。</p>
-
-<p>第三步，candidate pool 進 embedding-based first-pass scorer，砍到幾十個。這一步包含 viewer tower 的 online forward pass，加上跟 video tower 預算好的 embedding 做 dot product。latency 在二十到五十 ms 之間。</p>
-
-<p>第四步，這幾十個 candidate 進 late-stage MTML ranker，加上 real-time features（viewer 當下的 session state、device context、最近幾分鐘的 interaction），算出最終排序。late-stage 用得起 expensive features 是因為 pool 已經縮到幾十個。latency 在三十到八十 ms。</p>
-
-<p>第五步，最終排序 + bubble metadata 被 pinned 進 video prefetch response，跟 video bytes 一起回到 client。client 端 parse metadata，render bubble UI。整個過程必須塞進 video prefetch window 的剩餘預算。</p>
-
-<p>request time 之後（也就是 viewer 看完、有了 interaction 之後）發生的事，跑在另一條 pipeline 上：</p>
-
-<p>interaction event 進 streaming pipeline。每個 event 包含 viewer id、reel id、interaction type、bubble impression condition（這個 reel 是不是 bubble surface 的、closeness 多少、ranking position 是第幾）等 context。</p>
-
-<p>streaming pipeline 把 event 路由到三個 downstream consumer：context-specific closeness model 的 streaming feature updater、ranker 的 online learning trainer、integrity head 的 supervised signal collector。</p>
-
-<p>每個 consumer 以自己的 cadence 把 update apply 到對應的 model state。closeness 是 minute 級，ranker 是 minute 到 hour 級，integrity 視 policy team 的 labeling cycle 而定。這些 update 不需要在 request window 內完成——它們是 next-request 的 input。</p>
-
-<p>整條 pipeline 的整體 wall-clock budget 大約是 100 到 250 ms，根據 video prefetch window 的設計目標而定。預算分配大致是：closeness lookup 10 ms、retrieval social filter 20 ms、embedding scorer 30 ms、early-stage ranker 40 ms、late-stage ranker 60 ms、metadata packaging + network 留 30 ms。這只是粗估；實際上每個區段都會做極致的 tail-latency 控制，p99 必須遠低於 p50 的兩倍。</p>
-
-<p>每個 component 不知道什麼、刻意不知道什麼，是整套系統能維持 modularity 的關鍵 invariant。</p>
-
-<p>closeness model 不知道使用者最終會看到哪些 reel。</p>
-
-<p>它只輸出 closeness score，不參與 ranking。</p>
-
-<p>把 closeness 跟 ranking 解耦的好處是，你可以獨立 evaluate closeness——比如直接拿 survey ground truth 去比對——不需要靠 downstream engagement metric 回頭推。</p>
-
-<p>retrieval 不知道某個 candidate 最終的 ranking score 是多少。</p>
-
-<p>它只決定誰進 pool。</p>
-
-<p>retrieval 的 metric 是 recall（真正會被 engage 的 reel 進 pool 的比例），不是 ranking quality。</p>
-
-<p>把這兩個 metric 分開讓兩個 stage 可以各自 optimize——retrieval team 可以 obsess 在 recall@K 上、ranker team 可以 obsess 在 NDCG 上，兩個 metric 的 A/B test 不會互相 contaminate。</p>
-
-<p>ranker 不知道某個 reel 為什麼進 pool。</p>
-
-<p>它收到的是一個 candidate set，看不到 closeness score 是怎麼算的、social filter 用了哪些 rule。</p>
-
-<p>這保證 ranker 對 friend-aware 跟 non-friend-aware 的 candidate 用同一套 model 評分，不會出現 social filter 鬆綁時 ranker 完全不會排序的情況。</p>
-
-<p>online learning loop 不知道 ranking 是怎麼把 score 排出來的。</p>
-
-<p>它只看到 (impression, interaction) 配對，學 conditional probability。</p>
-
-<p>loop 本身不嵌入 ranking 邏輯——這讓 ranker 跟 learning loop 可以分別替換。比如下一代 ranker 換成新 architecture，learning loop 不需要重寫；learning loop 換成新算法（比如從 SGD 換到 Adam），ranker 不需要 retrain。</p>
-
-<p>integrity head 跟 engagement head 在 model 內部 jointly trained，但兩者的 supervision signal 分別來自不同的 labeling pipeline。</p>
-
-<p>engagement 是隱式 label（看完 / 按讚 / 跳過），integrity 是顯式 label（policy team 標的）。</p>
-
-<p>jointly train 的是 representation，不是 supervision——兩個 supervision pipeline 仍然獨立，這保證 integrity team 對 integrity label 的標準有完全 control，policy 變動不需要 model team 配合改架構。</p>
-
-<p>讀完這五個 component，回過頭看開頭那句反問：把「朋友看過、朋友按過 love」塞進 Reels，為什麼不是「在 ranker 後面塞一個 if friend then boost」就好？</p>
-
-<p>因為 friend boost 是 surface-level signal 注入，這套系統做的是 representation-level joint modeling。surface-level 注入會在三個地方失敗：</p>
-
-<p>一、它把 closeness 當成 binary（朋友 / 非朋友），不區分 structural 跟 behavioral 的 frequency band，於是「久不互動的舊朋友」跟「最近天天 chat 的同事」被一視同仁。一個你五年沒講過話的高中同學，跟你昨天才一起加班到半夜的同事，被丟進同一個 boost bucket。最後產品體驗是「為什麼這個我都不認識的人的影片一直出現」。</p>
-
-<p>二、它的 retrieval 仍然是 content-based ANN，social signal 在 retrieval stage 是 post-hoc rerank，pool 裡根本沒有的好朋友 reel 不會因為 boost 而出現——一個 reel 沒進 pool，後面 ranker 跟 boost 都救不了它。換句話說 friend boost 的 ceiling 被 content ANN 的 recall 釘死。如果你的興趣跟你朋友的興趣交集本來就少（這在現實裡是常態，朋友之間口味本來就會分歧），content ANN pool 裡根本撈不到朋友看過的 reel，boost 對著一個空集合做乘法。</p>
-
-<p>三、它的 ranker 沒有 conditioned 在 bubble impression 上，於是 selection bias 直接污染 engagement model，online learning loop 會把「我朋友看的東西」的 signal 跟「使用者本人喜歡什麼」的 signal 混在一起，幾個月後 model 會 collapse 到「永遠推朋友看的東西」這種退化解。這個 collapse 不是一個 bug 而是一個 attractor——只要 sample selection 跟 reward signal 之間有 feedback loop，沒有 conditioning 的 unconditional model 在足夠的 online steps 之後一定會走到這個 fixed point。實作上看起來是 metric 慢慢退化、品質慢慢下降，但底下是個熱力學意義上的不可逆過程。</p>
-
-<p>Reel Friends 把 social 從一個 post-hoc rerank signal 提升到 first-class structural component，付出的代價是五個 component 都要重新對 social-aware 的 distribution 做設計；換來的是 social discovery 跟 content discovery 在 representation level 上的同一致性。前者是工程量，後者是 product moat——很容易被低估，但只有後者能在使用者越用越多之後維持品質。</p>
-
-<p>還有一件事必須誠實點出：Meta 這次的 engineering post 給的 architectural 細節仍然偏 product-narrative 而非 paper-grade。具體沒講的東西包括 closeness model 的 architecture（DNN？GNN？兩者組合？）、embedding 的 dimensionality、retrieval 第一層 top-K 的具體 K 值、ranker 的 backbone（transformer-based？經典 deep FM？）、integrity head 的具體 loss 形式、online learning 的 update frequency 跟 staleness 容忍度。這些是真正的 paper 該回答的問題；engineering blog 出於 competitive 與 policy 考量，把這層細節留白是預期內的。</p>
-
-<p>不過從產業 baseline 推測，這套 stack 大概率長這樣：closeness 是 graph neural network + 經典 social-graph feature 的 hybrid；embedding 在 256–1024 維之間，跑 two-tower with serving-side cosine；ranker 是 DLRM-style 或更近期的 transformer-on-features，scaling 到幾百 million 參數；integrity head 走 multi-task auxiliary loss；online learning 是 minute-level streaming update。這些都是業界 2024–2026 年的 best practice baseline，Meta 沒理由偏離太遠。</p>
-
-<p>真正的工程精彩之處反而不在這些 model 細節，而在「怎麼讓這套東西在 prefetch window 裡跑完」這件事——那是把 ML 系統 ship 到十億級 user 的真正分水嶺，遠比 model architecture 本身重要。Reel Friends 這篇文章值得讀的點就在這：它不是在炫耀 model size 或 GPU 數，而是在講「為了讓使用者捲動不卡頓，我們把整個 retrieval / ranking 漏斗重組成這個形狀」。</p>
-
-<p>Reel Friends 是 social-aware Reels recommendation 的具體案例，但底下那些設計決策可以遷移到其他「在既有 recommender 上注入新 signal」的情境。整理三條：</p>
-
-<p>一、任何「新的 contextual signal」進入既有 ranker，先問它的 frequency band。是 weekly 的 structural、hourly 的 behavioral、real-time 的 session？不同 band 對應不同 storage 跟 compute layer。把所有 band 揉成一個 feature 是 anti-pattern——你會被最慢的那個拖累 freshness，被最快的那個拖累 cost。常見的失敗形式是把一個本該 weekly batch 的 signal 強行做成 hourly，結果 compute cost 暴漲十倍但 metric 改善不到 1%；或者反過來把一個本該 real-time 的 signal 留在 daily batch，使用者在 session 內的興趣轉變完全捕捉不到。</p>
-
-<p>二、任何「signal-aware candidate generation」要先做 hard filter 再做 soft score，不要顛倒。hard filter 不會被 ANN 的 recall 退化吃掉，soft score 只在 hard filter 縮過的 pool 上做。順序反了，soft score 的算力大部分浪費在會被 hard filter 砍掉的 candidate。這個原則在 search 領域已經是 textbook（先用 BM25 縮 pool，再用 dense embedding 排序），但 recommendation 系統因為歷史上 content-based ANN 是核心，反而容易忘掉這條。Reel Friends 提醒了大家：當你加上一個結構性的 hard signal（social graph、location radius、language match），它應該在 retrieval 的最前面，不是最後面。</p>
-
-<p>三、任何「新 signal 帶來的 selection bias」必須在 loss 形式裡 explicit 處理，不能依賴後處理或 post-filter。joint train 一個 conditional model，比 train 一個 unconditional model 再 filter 要 robust 一個數量級——尤其在 online learning 場景下。這條原則的反例隨處可見：A/B test 顯示「ranker + post-filter」比「沒 filter 的 ranker」短期 metric 好，於是 ship；半年後發現 ranker 學歪了，metric 重新退化，team 才回頭意識到 post-filter 不是 free lunch——它在 training data distribution 上製造了一個 ranker 看不到的 hole，而那個 hole 會在 online learning 裡慢慢吞噬 representation quality。</p>
-
-<p>這三條都不是 Meta 獨有的——任何做 large-scale recommender 的 team 早晚會踩到。Reel Friends 的價值是把它們在同一個系統內示範了一次完整的工程實踐。把這篇文章當作 case study 來讀，比當作 product announcement 來讀有用得多。</p>
-
-<p class="vg-deep-closer"><strong>What this enables</strong>：把 social 從一個事後 rerank 的 signal，升格成 retrieval / ranking / online learning 三層 jointly modeled 的 first-class component，於是「朋友看過的 reels」不再是 ranker 後面一個 boost 開關，而是整套 distribution 從上游就 social-aware——這是 social discovery 跟 friend boost 之間的本質差距，也是這套架構真正在為十億級 user base 解的問題。</p>
+<h2>五個 component 的責任邊界</h2>
 
 <figure class="vg-w-annotated-reel-friends-arch">
   <style>
@@ -291,33 +87,33 @@
   <div>
     <div class="detail detail-1">
       <h3>closeness model · responsibility</h3>
-      <p>Output a per-edge closeness score over the Facebook friend graph. Two complementary models combine: survey-based (社交圖結構 + 使用者屬性，週級 batch inference 跑遍 trillions of edges) and context-specific (likes / comments / reshares 的 streaming signals，更新得比週快得多)。</p>
+      <p>Output a per-edge closeness score over the Facebook friend graph. 兩個 complementary model 並排：survey-based（社交圖結構 + 使用者屬性，週級 batch 跑遍 trillions of edges）跟 context-specific（likes / comments / reshares 的 streaming signals）。</p>
       <p><strong>Does not know</strong>：哪些 candidate 之後會被 retrieve、哪些 reel 會被 surface。它只交付 closeness vector。</p>
-      <p class="hint">把 closeness 拆成 frequency-orthogonal 兩支，是為了同時兼顧 structural stability 跟 behavioral freshness。</p>
+      <p class="hint">兩支拆開是為了同時兼顧 structural stability 跟 behavioral freshness。</p>
     </div>
     <div class="detail detail-2">
       <h3>retrieval · responsibility</h3>
-      <p>從 closeness 高的 top-K friends 抓取他們最近互動過的 reels，組出 candidate pool。先 social hard filter 再 embedding soft score——順序不能反。</p>
+      <p>從 closeness 高的 top-K friends 抓他們最近互動過的 reels，組出 candidate pool。先 social hard filter 再 embedding soft score——順序不能反。</p>
       <p><strong>Does not know</strong>：candidate 的 final ranking、ranker 用哪些 feature。它只負責 recall。</p>
-      <p class="hint">分層的關鍵 invariant：朋友按過的 reel 進 pool 的機率是 1，不是 ANN 的 0.97。</p>
+      <p class="hint">朋友按過的 reel 進 pool 的機率是 1，不是 ANN 的 0.97——這是 social discovery 跟 friend boost 的本質差。</p>
     </div>
     <div class="detail detail-3">
       <h3>MTML ranker · responsibility</h3>
-      <p>multi-task multi-label，同時 predict watch time / like / love / share / follow / integrity violation。同一個 model 部署在 early-stage（cheap features，pool 還大）跟 late-stage（expensive features，pool 已縮）。loss 用 P(engagement | bubble impression) 條件機率形式，把 selection bias 數學上吸收掉。</p>
+      <p>multi-task multi-label，同時 predict watch time / like / love / share / follow / integrity。同一個 model 部署在 early-stage（cheap features，pool 還大）跟 late-stage（expensive features，pool 已縮）。loss 用 P(engagement | bubble impression) 條件機率形式，把 selection bias 數學上吸收掉。</p>
       <p><strong>Does not know</strong>：candidate 為什麼進 pool、closeness 是怎麼算的。對 friend / non-friend candidate 用同一套 model 評分。</p>
-      <p class="hint">expressive reactions (love / laughter) 比 simple like 是更強的 engagement predictor——label weight 不平均。</p>
+      <p class="hint">expressive reactions (love / laughter) 比 simple like 更強，label weight 不平均。</p>
     </div>
     <div class="detail detail-4">
       <h3>video prefetch window · responsibility</h3>
       <p>把 friend-bubble metadata「pinned to that same prefetch window」——隨 video bytes 一起被預取，不另開 request。整個 server-side ranking 必須塞進這個窗口。三條 nonnegotiable：smooth scrolling、no load latency regression、low CPU overhead for metadata fetch。</p>
       <p><strong>Does not know</strong>：上游 model 細節。它只在意 wall-clock budget 有沒有被吃光。</p>
-      <p class="hint">所有上游 component 的 latency budget 都是被這個 window 倒推出來的——這才是真正的 architecture forcing function。</p>
+      <p class="hint">所有上游 component 的 latency budget 都是被這個 window 倒推出來的 forcing function。</p>
     </div>
     <div class="detail detail-5">
       <h3>online learning loop · responsibility</h3>
-      <p>interaction event 進 streaming pipeline，更新 closeness (context-specific 那一支)、ranker、integrity head 三個地方的 model state。conditional 形式讓 update 不會單純把「我自己偏好」自我強化。integrity 用 auxiliary loss 跟 engagement jointly trained——representation level 對齊，不是 post-filter。</p>
+      <p>interaction event 進 streaming pipeline，更新 closeness (context-specific 那一支)、ranker、integrity head 三處。conditional 形式讓 update 不會把「我自己偏好」自我強化。integrity 用 auxiliary loss 跟 engagement jointly trained——representation level 對齊，不是 post-filter。</p>
       <p><strong>Does not know</strong>：ranking 是怎麼排出來的。它只看 (impression, interaction) pair。</p>
-      <p class="hint">把 ranker 跟 learning loop 解耦，這兩個 component 可以分別替換。</p>
+      <p class="hint">解耦讓 ranker 跟 learning loop 可以分別替換。</p>
     </div>
   </div>
 
@@ -335,9 +131,216 @@
   </script>
 </figure>
 
-<p>上面那張 architecture diagram 把五個 component 攤平，點任何一個 box 都會展開它的責任跟它刻意不知道什麼。注意那個被三條 nonnegotiable 卡住的 prefetch window——它在圖上看起來只是中段一個 box，實際上它是整套 architecture 的 forcing function，所有上游 component 的設計都是被它倒推出來的。</p>
+<p>讀完之後你應該能清楚回答這幾個問題：closeness model 為什麼要兩個版本而不是一個；retrieval 為什麼是分層而不是單一 ANN lookup；MTML ranker 為什麼要 early-stage 跟 late-stage 各跑一次；以及為什麼整套系統的工程瓶頸不在 GPU、不在 embedding 維度，而在那個「video prefetch window」的幾百毫秒。</p>
 
-<p>接下來再用一張對照表，把 frequency band、storage layer、compute pattern 在一個維度上對齊看清楚。這張表的重點不是「列出有哪些 component」（上面 diagram 已經做了），而是把 freshness vs cost vs compute pattern 這三個變數放在同一個座標系，讓你看到「為什麼某個 signal 必須在某個 layer」的 trade-off 結構。</p>
+<h2>Decision 1：closeness 為什麼是兩支 model</h2>
+
+<p>structural 那支（survey-based）的 label 來自使用者調查直接問「跟這個人有多熟」，input 是 social-graph features——mutual friends、connection strength、interaction patterns。文章裡那句「weekly inference over trillions of person-to-person connections」就在講這支：以週為單位跑遍 Facebook friend graph 所有 edges，把分數 materialize 進 feature store。trillions edges 用 weekly cadence 才壓得下成本；想做到日級，運算成本會線性放大。</p>
+
+<p>但 weekly 對「昨天剛加好友」「最近三天密集互動」的場景太慢。context-specific 那支讀 likes / comments / reshares 的 streaming signal，更新得比週快得多，補上 fast-moving 的那一段。兩支不是替代關係：最近沒互動的好朋友，context-specific 信號近零，但 survey-based 仍給出 baseline——你姊還是你姊，即使你們上週沒按彼此貼文。把這個 baseline 拿掉的系統，會在 cold case（少互動但實際很熟）跟 bursty case（最近多互動但其實只是短暫）之間反覆過擬合。</p>
+
+<p>等同於把 representation 拆成兩個 frequency band，再各自找最適合的 model class 跟 training cadence。這個拆分還有 evaluation 上的好處：survey-based 有明確的 ground truth（使用者調查回答），可以直接算 prediction error；context-specific 沒有 explicit label，品質要靠 downstream metric 回推。揉成一個 model 的話，survey ground truth 會被 downstream metric 稀釋——你會發現 model 越練越「迎合 engagement」、跟使用者實際標的 closeness 慢慢偏離，但因為 downstream metric 在改善，team 不會立刻發現偏離。分開之後，structural 那一支可以用 supervised metric 直接 monitor，behavioral 那一支用 downstream proxy——兩條 evaluation pipeline 互相校準，比單一 pipeline 健壯得多。</p>
+
+<p>retrieval 階段拿到的 closeness score，是這兩個 signal 的融合——不是簡單相加，而是針對「這個 viewer 對這個 friend 的當下熟悉程度」做的 conditional 預測。融合方式文章沒明說，但從 product 行為推測，比較可能是加權平均加 cold-start fallback（context-specific 信號近零時退回 structural 的 baseline，而不是把整個 score 拉到零）。</p>
+
+<p>trillions of edges 這個規模本身也決定了 model class。在 trillion-edge graph 上跑一輪 GNN training，message passing 的 memory footprint 是天文數字，週級內收斂很困難。所以 survey-based 那支幾乎不可能是 vanilla GNN——更可能是 hybrid：先用便宜的 graph 特徵（mutual friends count、Adamic-Adar、Jaccard similarity）做 feature engineering，再用 MLP / GBDT 做 supervised learning。GNN 部分如果有，也只用在比較密集的 sub-graph 上，而不是整張 trillion-edge graph。</p>
+
+<h2>Decision 2：retrieval 為什麼是分層而不是 single ANN</h2>
+
+<p>誘惑性的設計：把 (viewer, friend) pairs 跟 video 都壓進同一個 embedding space，retrieval 變一次 approximate nearest neighbor lookup。paper 上乾淨，production 上會死得很快——social-graph 是 sparse 且 discrete 的（人跟人之間要嘛是朋友要嘛不是，朋友之間的熟度是有界 scalar），content similarity 是 dense 且 continuous 的（任何兩個 reel 之間都有非零 cosine similarity）。塞進同一個 embedding 等於要求 representation 同時 encode 兩種完全不同的 metric structure，最後通常是兩邊都做不好。實務上常見的失敗模式是 social signal 被 content signal 淹沒——因為 content embedding 的 magnitude 大、覆蓋面廣，social 那一塊在整體分數裡變成 noise floor，再也不重要。</p>
+
+<p>Reels 改成分層：先用 social graph 把 candidate 集合縮到「跟你 closeness 高的 friends 最近互動過的 reels」這個尺寸可控的子集，然後在這個子集上才跑 content-based embedding 比對。social graph 是第一層 hard filter，embedding 是第二層 soft scorer——順序顛倒會把 ANN 算力浪費在會被 social filter 砍掉的 candidate 上。</p>
+
+<p>第一層的 social filter 是 hard rule，不會有 ANN 那種 recall-precision trade-off：朋友按過某個 reel，這個 reel 進 candidate pool 的機率是 1，不是 0.97。對 social discovery 這個 product 來說，這個 guarantee 比 embedding 的 generalization 重要得多——使用者預期看到「我朋友看的東西」，不是「跟我朋友看的東西很像的東西」。分層還帶來 evaluation 解耦：retrieval 的 metric 是 recall@K，ranker 的 metric 是 ranking quality；同一個系統時這兩個 metric 會打架，分層之後各自 optimize。</p>
+
+<p>下面這個 slider widget 把規模算給你看：top-K friends 跟 per-friend recent reels 兩個 knob，乘起來決定 raw social pool 的 cartesian size。Meta 月活約 30 億，所以 worst-case 全平台 viewer-candidate pair 是十億甚至兆級。當然絕大多數 pair 不會 materialize 成實際 retrieval request，但 system design 必須能 handle 這個 footprint。</p>
+
+<figure class="vg-w-pool-explosion">
+  <style>
+    .vg-w-pool-explosion { margin: var(--s-4) 0; padding: var(--s-3); border: 1px solid var(--line); background: var(--bg-soft); }
+    .vg-w-pool-explosion .controls { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s-3); margin-bottom: var(--s-3); }
+    @media (max-width: 520px) { .vg-w-pool-explosion .controls { grid-template-columns: 1fr; } }
+    .vg-w-pool-explosion label.knob { display: grid; gap: var(--s-1); font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+    .vg-w-pool-explosion .val { font-family: var(--sans); font-variant-numeric: tabular-nums; font-size: var(--fs-md); color: var(--accent-text); }
+    .vg-w-pool-explosion input[type=range] { width: 100%; accent-color: var(--accent); min-height: 32px; touch-action: none; }
+    .vg-w-pool-explosion svg { width: 100%; height: auto; display: block; margin-top: var(--s-2); }
+    .vg-w-pool-explosion .reading { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--s-2); margin-top: var(--s-2); font-family: var(--serif); font-size: var(--fs-sm); }
+    .vg-w-pool-explosion .reading .cell { padding: var(--s-1) var(--s-2); border-left: 2px solid var(--muted-2); }
+    .vg-w-pool-explosion .reading .cell strong { display: block; font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin-bottom: 2px; }
+    .vg-w-pool-explosion .reading .cell.warn { border-left-color: var(--accent); color: var(--accent-text); }
+    .vg-w-pool-explosion caption { font-family: var(--scribed); color: var(--muted); font-size: var(--fs-xs); display: block; margin-bottom: var(--s-2); }
+  </style>
+  <span class="caption" style="font-family: var(--scribed); color: var(--muted); font-size: var(--fs-xs); display: block; margin-bottom: var(--s-2);">拖兩個 slider：top-K friends × 每個 friend 最近一週互動過的 reels，乘起來是每個 viewer 的 raw social pool。Meta 月活約 30 億，所以 worst-case viewer-candidate cartesian product 在十億～兆級。</span>
+  <div class="controls">
+    <label class="knob">top-K close friends per viewer <span class="val" id="vg-w-pool-explosion-k-val">100</span>
+      <input type="range" id="vg-w-pool-explosion-k" min="10" max="500" step="10" value="100" />
+    </label>
+    <label class="knob">recent reels per friend (last 7d) <span class="val" id="vg-w-pool-explosion-r-val">20</span>
+      <input type="range" id="vg-w-pool-explosion-r" min="5" max="100" step="5" value="20" />
+    </label>
+  </div>
+  <svg viewBox="0 0 600 160" role="img" aria-label="Per-viewer pool grows linearly in both axes">
+    <rect x="20" y="20" width="560" height="100" fill="none" stroke="var(--line)" />
+    <text x="20" y="14" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">raw social pool per viewer (log scale)</text>
+    <line x1="20" y1="120" x2="580" y2="120" stroke="var(--ink)" stroke-width="1" />
+    <line x1="20" y1="20" x2="20" y2="120" stroke="var(--ink)" stroke-width="1" />
+    <line id="vg-w-pool-explosion-tick-100" x1="20" y1="100" x2="580" y2="100" stroke="var(--muted-2)" stroke-dasharray="2 4" />
+    <text x="585" y="103" font-family="EB Garamond, serif" font-size="10" fill="var(--muted)">1e2</text>
+    <line x1="20" y1="80" x2="580" y2="80" stroke="var(--muted-2)" stroke-dasharray="2 4" />
+    <text x="585" y="83" font-family="EB Garamond, serif" font-size="10" fill="var(--muted)">1e3</text>
+    <line x1="20" y1="60" x2="580" y2="60" stroke="var(--muted-2)" stroke-dasharray="2 4" />
+    <text x="585" y="63" font-family="EB Garamond, serif" font-size="10" fill="var(--muted)">1e4</text>
+    <line x1="20" y1="40" x2="580" y2="40" stroke="var(--muted-2)" stroke-dasharray="2 4" />
+    <text x="585" y="43" font-family="EB Garamond, serif" font-size="10" fill="var(--muted)">1e5</text>
+    <rect id="vg-w-pool-explosion-bar" x="20" y="70" width="280" height="50" fill="var(--accent)" fill-opacity="0.35" stroke="var(--accent)" stroke-width="1.5" />
+    <text id="vg-w-pool-explosion-label" x="160" y="100" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">2000</text>
+    <line x1="20" y1="50" x2="580" y2="50" stroke="var(--accent-text)" stroke-width="1" stroke-dasharray="4 2" />
+    <text x="580" y="48" text-anchor="end" font-family="EB Garamond, serif" font-size="10" fill="var(--accent-text)" font-style="italic">ranker 的可承受 pool ≈ 50</text>
+  </svg>
+  <div class="reading">
+    <div class="cell"><strong>per-viewer pool</strong><span id="vg-w-pool-explosion-pool">2,000</span></div>
+    <div class="cell"><strong>× 30 億 viewer</strong><span id="vg-w-pool-explosion-global">6.0 × 10¹²</span></div>
+    <div class="cell warn"><strong>need to shrink ÷</strong><span id="vg-w-pool-explosion-ratio">40×</span> before ranker</div>
+  </div>
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-pool-explosion');
+      const kIn = root.querySelector('#vg-w-pool-explosion-k');
+      const rIn = root.querySelector('#vg-w-pool-explosion-r');
+      const kVal = root.querySelector('#vg-w-pool-explosion-k-val');
+      const rVal = root.querySelector('#vg-w-pool-explosion-r-val');
+      const bar = root.querySelector('#vg-w-pool-explosion-bar');
+      const lbl = root.querySelector('#vg-w-pool-explosion-label');
+      const pool = root.querySelector('#vg-w-pool-explosion-pool');
+      const glob = root.querySelector('#vg-w-pool-explosion-global');
+      const ratio = root.querySelector('#vg-w-pool-explosion-ratio');
+      function fmt(n) { return n.toLocaleString('en-US'); }
+      function sci(n) { const e = Math.floor(Math.log10(n)); const m = (n / Math.pow(10, e)).toFixed(1); return m + ' × 10' + String(e).split('').map(d => '⁰¹²³⁴⁵⁶⁷⁸⁹'[+d]).join(''); }
+      function update() {
+        const k = +kIn.value, r = +rIn.value;
+        kVal.textContent = k;
+        rVal.textContent = r;
+        const p = k * r;
+        pool.textContent = fmt(p);
+        const g = p * 3e9;
+        glob.textContent = sci(g);
+        ratio.textContent = Math.max(1, Math.round(p / 50)) + '×';
+        // log-scale bar from 1e2..1e5 → x:20..580
+        const logP = Math.log10(Math.max(100, p));
+        const w = Math.min(560, Math.max(10, (logP - 2) / 3 * 560));
+        bar.setAttribute('width', w);
+        lbl.setAttribute('x', 20 + w / 2);
+        lbl.textContent = fmt(p);
+      }
+      kIn.addEventListener('input', update);
+      rIn.addEventListener('input', update);
+      update();
+    })();
+  </script>
+</figure>
+
+<p>把 K = 100、R = 20 當 baseline，raw pool 就 2000；乘以三十億月活，每個 request 的 worst-case storage / I/O footprint 落在十二兆級。social hard filter 必須在最前面，是因為它能用 indexed lookup 把這個 cartesian product 砍到 single-digit ms 內收斂；之後 embedding scorer 的 ANN 算力，只花在收斂後的小 pool 上。embedding scorer 本身是 two-tower 變體：viewer + friend context 為一塔，video 為另一塔，offline 把所有 video tower output 預算好，online 只算 viewer tower 跟做 dot product。把這個 trade-off 弄反——先 ANN 再 social filter——意味著你要先付出十億級的 dot product 算力，再砍掉其中 99% 的 candidate，這在 production 上根本撐不住。</p>
+
+<p>還有一個分層帶不出來但必須處理的場景：冷啟動使用者、剛加入平台的帳號、朋友很少的人——這些情況下 social filter 會輸出極小的 pool 甚至空集合，系統需要 fall back 到純 content-based retrieval。fall back 太快會讓 social 體驗稀釋，太慢會讓冷啟動使用者看到空頁。從產品形態推測，bubble UI 應該是 conditional 顯示——只在 social filter 有夠多 candidate 時才出現，否則整個 bubble feature 對該使用者就 silent disable。</p>
+
+<h2>Decision 3：MTML ranker 的 conditional loss</h2>
+
+<p>MTML = multi-task multi-label：同一個 model 同時 predict 好幾個目標（watch time、likes、comments、shares、follows），每個 task 一個 head，shared backbone 共用 representation。multi-label 是每個 sample 可以同時觸發多個 label——一個 reel 可能被 watch 完 + 被按 love + 被 share 三個 label 同時為 1。揉在一起的好處是 shared representation 被多個 supervision signal 同時拉著，比起單目標 model 更不容易 overfit 任何一個 metric 的 noise。</p>
+
+<p>部署在 early-stage 跟 late-stage，shared backbone——early 用 cheap features 砍 pool 從幾千到幾十，late 用 expensive real-time features 精排。雙部署的關鍵好處是 representation 一致：不會出現「early-stage 認為第三名、late-stage 完全不認得它」的 cascade drift。這是經典 cascade ranking 痛點——上下游 model 各自獨立訓練時，下游永遠在處理一個被上游意外篩掉一半好 candidate 的 input distribution。共享 backbone 換來的就是這個一致性。</p>
+
+<p>真正非顯然的是那個 loss：P(video engagement | bubble impression)。為什麼是條件機率而不是 joint？因為 joint P(engagement, bubble impression) 會學到「凡是進 bubble 的 reel 都比較容易被 engage」這種 surface correlation——但這只是 selection bias，不是 bubble 本身的 causal effect。conditional 形式逼 model 在「已經知道是 bubble surface 的」前提下學「viewer 在這個 specific 條件下到底會不會 engage」，把 social filtering 帶來的 selection bias 數學上吸收進 conditioning variable。實作層面這需要 logging system 完整記錄每個 bubble impression（包含 positive 跟 negative），不能只 log 有 interaction 的事件。</p>
+
+<p>還有一個 label engineering 細節：文章特別指出「expressive reactions such as love or laughter drive stronger downstream engagement than simple likes」。like 的 cost 太低——使用者點 like 幾乎不思考，signal noise 比例高；love / laugh 需要多一個 click，這個 marginal cost 過濾掉很多隨手的 like，留下來的都是「真的覺得這個 reel 不錯」的人。從 information theory 角度看，cost 較高的 signal carry 較高的 information per event，跟留存率的 correlation 也更強。MTML 的 multi-label 設計剛好讓 model 同時看到 like 跟 love，自動學到兩者之間 information density 的差距，並把更高 weight 給更稀有但更可靠的 signal。</p>
+
+<p>還有一個容易被外界誤解的點：MTML 的真正力量不在「同時 optimize 多個目標」這句話本身，而在 multi-task learning 帶來的 regularization effect——多個 task 共用 backbone 會迫使 representation 學到一個泛化到所有 task 的 latent space，而不是 overfit 到任何單一 task 的 noise。這對 ranker 特別關鍵，因為任何單一 engagement metric 都有 reward hacking 的風險：為了 maximize watch time，model 可能會傾向推超長 reel；為了 maximize like，model 可能會傾向推 clickbait。multiple supervision 互相牽制，讓 representation 不容易被任何單一 metric 帶歪。</p>
+
+<p>下面這張圖把兩種訓練方式的 long-term 行為畫出來——unconditional model 在 online learning loop 下會 collapse 到 fixed point（永遠推朋友看過的東西），conditional model 維持 stable。這不是 paper 報的真實數字，是把 feedback-loop 的 dynamics 用 logistic + selection bias 的 toy 模型跑出來給你看 attractor 長什麼樣。</p>
+
+<figure class="vg-w-collapse-curve">
+  <style>
+    .vg-w-collapse-curve { margin: var(--s-4) 0; }
+    .vg-w-collapse-curve svg { width: 100%; height: auto; display: block; }
+    .vg-w-collapse-curve .legend { display: flex; gap: var(--s-3); flex-wrap: wrap; font-family: var(--sans); font-size: var(--fs-xs); margin-top: var(--s-1); }
+    .vg-w-collapse-curve .legend span { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); }
+    .vg-w-collapse-curve .legend i { width: 16px; height: 2px; display: inline-block; }
+    .vg-w-collapse-curve caption { font-family: var(--scribed); color: var(--muted); font-size: var(--fs-xs); display: block; margin-bottom: var(--s-2); }
+  </style>
+  <span class="caption" style="font-family: var(--scribed); color: var(--muted); font-size: var(--fs-xs); display: block; margin-bottom: var(--s-2);">toy simulation：兩個 ranker 各跑 200 個 online learning step。x 軸是 step，y 軸是 surface-content diversity（不同 reel 類型在 top-10 surface 的 entropy，1.0 = max diversity, 0 = 全推同一類）。</span>
+  <svg viewBox="0 0 640 280" role="img" aria-label="Unconditional ranker collapses; conditional ranker stays stable">
+    <rect x="50" y="20" width="540" height="200" fill="none" stroke="var(--line)" />
+    <line x1="50" y1="220" x2="590" y2="220" stroke="var(--ink)" stroke-width="1" />
+    <line x1="50" y1="20" x2="50" y2="220" stroke="var(--ink)" stroke-width="1" />
+    <!-- y axis ticks: 0, 0.25, 0.5, 0.75, 1.0 -->
+    <g font-family="EB Garamond, serif" font-size="10" fill="var(--muted)">
+      <line x1="50" y1="220" x2="46" y2="220" stroke="var(--ink)" /><text x="42" y="223" text-anchor="end">0.0</text>
+      <line x1="50" y1="170" x2="46" y2="170" stroke="var(--ink)" /><text x="42" y="173" text-anchor="end">0.25</text>
+      <line x1="50" y1="120" x2="46" y2="120" stroke="var(--ink)" /><text x="42" y="123" text-anchor="end">0.50</text>
+      <line x1="50" y1="70" x2="46" y2="70" stroke="var(--ink)" /><text x="42" y="73" text-anchor="end">0.75</text>
+      <line x1="50" y1="20" x2="46" y2="20" stroke="var(--ink)" /><text x="42" y="23" text-anchor="end">1.00</text>
+      <text x="50" y="240" font-family="EB Garamond, serif" font-size="11">step 0</text>
+      <text x="320" y="240" text-anchor="middle" font-family="EB Garamond, serif" font-size="11">100</text>
+      <text x="590" y="240" text-anchor="end" font-family="EB Garamond, serif" font-size="11">200</text>
+      <text x="18" y="120" transform="rotate(-90, 18, 120)" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)" font-style="italic">surface diversity (entropy)</text>
+    </g>
+    <!-- conditional model: starts at 0.85, stays roughly there with mild oscillation -->
+    <path id="vg-w-collapse-curve-cond" stroke="var(--accent)" stroke-width="2" fill="none" />
+    <!-- unconditional model: starts at 0.85, decays to ~0.15 over 200 steps -->
+    <path id="vg-w-collapse-curve-uncond" stroke="var(--ink)" stroke-width="2" fill="none" stroke-dasharray="4 3" />
+    <!-- annotations -->
+    <text x="580" y="55" text-anchor="end" font-family="EB Garamond, serif" font-size="11" fill="var(--accent-text)" font-style="italic">conditional · stays diverse</text>
+    <text x="580" y="200" text-anchor="end" font-family="EB Garamond, serif" font-size="11" fill="var(--ink)" font-style="italic">unconditional · collapses to fixed point</text>
+    <line x1="430" y1="190" x2="430" y2="220" stroke="var(--muted-2)" stroke-dasharray="2 3" />
+    <text x="430" y="260" text-anchor="middle" font-family="EB Garamond, serif" font-size="10" fill="var(--muted)" font-style="italic">≈ step 140: diversity 已不可逆退化</text>
+  </svg>
+  <div class="legend">
+    <span><i style="background: var(--accent);"></i> conditional P(engage | bubble impression)</span>
+    <span><i style="background: var(--ink); border-top: 1px dashed var(--ink);"></i> unconditional P(engage, bubble impression)</span>
+  </div>
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-collapse-curve');
+      const cond = root.querySelector('#vg-w-collapse-curve-cond');
+      const unc  = root.querySelector('#vg-w-collapse-curve-uncond');
+      function x(step) { return 50 + (step / 200) * 540; }
+      function y(div)  { return 220 - div * 200; }
+      const N = 200;
+      // conditional: bounded oscillation around 0.85 (deterministic for reproducibility)
+      let cPts = [];
+      for (let i = 0; i <= N; i++) {
+        const base = 0.85;
+        const osc = 0.04 * Math.sin(i * 0.18) + 0.03 * Math.sin(i * 0.05 + 1.1);
+        cPts.push([x(i), y(base + osc)]);
+      }
+      // unconditional: monotone decay 0.85 → 0.12 via logistic-style feedback
+      let uPts = [];
+      let v = 0.85;
+      for (let i = 0; i <= N; i++) {
+        // dv/dt = -k * v * (v - floor) — collapses to floor=0.12
+        const floor = 0.12;
+        const k = 0.022;
+        v = v - k * v * (v - floor) + 0.005 * Math.sin(i * 0.4);
+        if (v < floor) v = floor + 0.01;
+        uPts.push([x(i), y(v)]);
+      }
+      function toPath(pts) { return 'M ' + pts.map(p => p[0].toFixed(1) + ' ' + p[1].toFixed(1)).join(' L '); }
+      cond.setAttribute('d', toPath(cPts));
+      unc.setAttribute('d', toPath(uPts));
+    })();
+  </script>
+</figure>
+
+<p>collapse 不是 bug 是 attractor——只要 sample selection 跟 reward signal 之間有 feedback loop，沒有 conditioning 的 unconditional model 在足夠 online steps 之後一定走到這個 fixed point。實作上看起來是 metric 慢慢退化、品質慢慢下降，底下是熱力學意義上的不可逆過程。Reel Friends 把 ranker 寫成條件機率，等同於把 selection bias 從 representation 上隔離，online update 不會把「我自己偏好」當成「使用者偏好」自我強化。</p>
+
+<p>integrity 跟 engagement 在這個 MTML 內 jointly trained——同一個 backbone 之外有 engagement head 跟 integrity head。joint train 而不是 post-filter 的好處是 representation level 的對齊：backbone 同時要服務 engagement prediction 跟 integrity classification，逼著它不能學到「engagement 很高但有 integrity 風險」的 short-cut representation。post-filter 的做法則是先學純 engagement model 再用獨立 classifier 過濾——這在 distribution 邊緣會反覆失敗，因為 engagement model 會把 representation 學到 integrity classifier 的 decision boundary 上。inference time 通常還有 integrity veto：只要 integrity score 超過 threshold，不管 engagement score 多高都不 surface。</p>
+
+<h2>Forcing function：video prefetch window</h2>
+
+<p>整套架構在 paper 上看像是 layered design 出於 ML clarity；實際上它是被 prefetch window 這個 hardware-level 的 wall clock 預算 forced 出來的。Reels 的 video prefetch window 是一個既有的、被精細優化過的時間窗——大概在數百毫秒等級，包含 ranker 決定下一支影片、CDN edge 把 video bytes 推到 client、metadata 隨包附帶。friend-bubble 的所有 server-side 計算必須在這個 window 裡完成。</p>
+
+<p>三條 nonnegotiable 倒推回來決定所有事：smooth scrolling 要求 main thread 不能 block；no regression in load latency 要求 metadata + bubble UI 全部塞進原本就為 video prefetch 預留的時間窗；low CPU overhead for metadata fetch 要求 client-side parsing 極簡。具體做法是把 friend-bubble metadata「pinned to that same prefetch window」——隨 video bytes 一起被預取，不另開 request、不另開 TCP 連線、不另開 endpoint。pin 跟 attach 不一樣——pin 是釘進去、不能分開。</p>
+
+<p>這直接約束上游每個 component：closeness 不可能 online 推理，必須 precomputed feature lookup；retrieval 第一層必須是 indexed lookup 而不是 graph traversal——你不可能在 prefetch window 裡跑「BFS 我的好友、抓他們最近活動」的 graph query；embedding 比對必須走 ANN 而不是 exact search；ranker 的 early-stage 必須用 cheap features。所有 layering、所有 precompute、所有 freshness trade-off，都是為了讓最後一段 online compute 能塞進這個 wall clock。下面這張表把每個 signal 的 freshness band / storage / compute / latency budget 對齊看，點欄位標題可排序。</p>
 
 <figure class="vg-w-table-reel-friends-freshness">
   <style>
@@ -445,11 +448,112 @@
   </script>
 </figure>
 
-<p>幾個值得停下來看的格子：integrity head 的 latency budget 是 0，因為它是 shared backbone 的 auxiliary head——同一個 forward pass 順便輸出 integrity score，不需要額外 inference。這就是 representation-level joint training 在 serving 上的免費午餐：integrity 不再是另一條 latency 路徑。對照之下，post-filter 的做法會在 ranker 之後再跑一個獨立 classifier，那一段就要從 prefetch window 裡再切一塊。</p>
+<p>integrity head 的 latency budget 是 0——同一個 forward pass 順便輸出 integrity score，這是 representation-level joint training 在 serving 上的免費午餐。post-filter 的做法則要再切一塊 window 給獨立 classifier。closeness 的兩支也都是 N/A：request time 拿到的永遠是 lookup，不是 inference。把 closeness inference 放在 request path 上的 alternative 設計，會直接讓那 ~10 ms 變成 ~100 ms，等於吃掉 prefetch window 的 sizable fraction。</p>
 
-<p>另一個非顯然的格子：closeness 的兩個版本，structural 是 N/A（offline），behavioral 也是 N/A（offline 或 near-online streaming，但仍不是 per-request 計算）。意思是 request time 拿到的 closeness 永遠是 lookup，不是 inference。把 closeness inference 放在 request path 上的 alternative 設計，會直接讓那 ~10 ms 變成 ~100 ms——而 ~100 ms 就是 prefetch window 的一個 sizable fraction，會擠壓掉 ranker 的空間。</p>
+<p>下面這個 latency 拖把把 per-request 預算逐段排出來，從 closeness lookup 到 metadata packaging。把整條總和拉到接近或超過 prefetch window 的紅線，看哪個區段最先失守。</p>
 
-<p>再來最後一個 widget：用 tab 把 architecture 的「naive 設計」「Meta 實際做法」「為什麼 naive 會崩」三個角度並排，讓你可以快速來回對照。這不只是 prose 的視覺重複——它把上面 prose 散布在五個 H2 裡的設計決策 collapse 成一個 side-by-side 對比視圖。</p>
+<figure class="vg-w-latency-scrub">
+  <style>
+    .vg-w-latency-scrub { margin: var(--s-4) 0; padding: var(--s-3); border: 1px solid var(--line); background: var(--bg-soft); }
+    .vg-w-latency-scrub svg { width: 100%; height: auto; display: block; }
+    .vg-w-latency-scrub .total { font-family: var(--sans); font-size: var(--fs-sm); margin-top: var(--s-2); color: var(--muted); display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap; gap: var(--s-2); }
+    .vg-w-latency-scrub .total b { font-variant-numeric: tabular-nums; font-size: var(--fs-md); color: var(--ink); }
+    .vg-w-latency-scrub .total .verdict { font-family: var(--scribed); font-size: var(--fs-sm); }
+    .vg-w-latency-scrub .total .verdict.ok { color: var(--accent-text); }
+    .vg-w-latency-scrub .total .verdict.bad { color: #c0392b; }
+    .vg-w-latency-scrub .controls { display: grid; grid-template-columns: 1fr; gap: var(--s-1); margin-top: var(--s-2); }
+    .vg-w-latency-scrub label.knob { display: grid; grid-template-columns: 160px 1fr 50px; gap: var(--s-2); align-items: center; font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); }
+    .vg-w-latency-scrub label.knob .v { font-variant-numeric: tabular-nums; text-align: right; color: var(--accent-text); }
+    .vg-w-latency-scrub input[type=range] { width: 100%; accent-color: var(--accent); min-height: 32px; touch-action: none; }
+    .vg-w-latency-scrub caption { font-family: var(--scribed); color: var(--muted); font-size: var(--fs-xs); display: block; margin-bottom: var(--s-2); }
+  </style>
+  <span class="caption" style="font-family: var(--scribed); color: var(--muted); font-size: var(--fs-xs); display: block; margin-bottom: var(--s-2);">拖每段的 ms 數，看 stacked bar 撞到 250 ms 紅線時哪個 stage 先把預算吃光。</span>
+  <svg viewBox="0 0 640 120" role="img" aria-label="Per-request latency budget across pipeline stages">
+    <rect x="20" y="40" width="600" height="40" fill="var(--bg)" stroke="var(--line)" />
+    <g id="vg-w-latency-scrub-segs"></g>
+    <line x1="20" y1="35" x2="20" y2="85" stroke="var(--ink)" />
+    <line x1="620" y1="35" x2="620" y2="85" stroke="var(--ink)" />
+    <line id="vg-w-latency-scrub-redline" x1="520" y1="30" x2="520" y2="90" stroke="#c0392b" stroke-width="1.5" stroke-dasharray="3 3" />
+    <text x="525" y="28" font-family="EB Garamond, serif" font-size="11" fill="#c0392b" font-style="italic">prefetch window cap · 250 ms</text>
+    <text x="20" y="105" font-family="EB Garamond, serif" font-size="10" fill="var(--muted)">0 ms</text>
+    <text x="620" y="105" text-anchor="end" font-family="EB Garamond, serif" font-size="10" fill="var(--muted)">300 ms</text>
+  </svg>
+  <div class="total"><span>total wall clock</span><b id="vg-w-latency-scrub-total">170 ms</b><span class="verdict" id="vg-w-latency-scrub-verdict">within budget ✓</span></div>
+  <div class="controls">
+    <label class="knob">closeness lookup <input type="range" min="2" max="40" step="1" value="10" data-seg="0" /><span class="v">10</span></label>
+    <label class="knob">retrieval · social filter <input type="range" min="5" max="80" step="1" value="20" data-seg="1" /><span class="v">20</span></label>
+    <label class="knob">embedding scorer <input type="range" min="10" max="120" step="2" value="30" data-seg="2" /><span class="v">30</span></label>
+    <label class="knob">ranker · early-stage <input type="range" min="10" max="150" step="2" value="40" data-seg="3" /><span class="v">40</span></label>
+    <label class="knob">ranker · late-stage <input type="range" min="20" max="200" step="2" value="60" data-seg="4" /><span class="v">60</span></label>
+    <label class="knob">metadata + network <input type="range" min="5" max="80" step="1" value="10" data-seg="5" /><span class="v">10</span></label>
+  </div>
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-latency-scrub');
+      const segG = root.querySelector('#vg-w-latency-scrub-segs');
+      const totalEl = root.querySelector('#vg-w-latency-scrub-total');
+      const verdict = root.querySelector('#vg-w-latency-scrub-verdict');
+      const inputs = root.querySelectorAll('input[type=range]');
+      const colors = ['var(--accent)', 'var(--accent)', 'var(--ink)', 'var(--ink)', 'var(--ink)', 'var(--muted-2)'];
+      const opacities = [0.55, 0.35, 0.55, 0.4, 0.7, 0.6];
+      const labels = ['closeness', 'social filter', 'embed', 'early ranker', 'late ranker', 'meta+net'];
+      function render() {
+        const vals = [...inputs].map(i => +i.value);
+        const total = vals.reduce((a, b) => a + b, 0);
+        const scale = 600 / 300; // 300 ms wide
+        let x = 20;
+        segG.innerHTML = '';
+        vals.forEach((v, i) => {
+          const w = v * scale;
+          const ns = 'http://www.w3.org/2000/svg';
+          const r = document.createElementNS(ns, 'rect');
+          r.setAttribute('x', x); r.setAttribute('y', 40);
+          r.setAttribute('width', w); r.setAttribute('height', 40);
+          r.setAttribute('fill', colors[i]);
+          r.setAttribute('fill-opacity', opacities[i]);
+          r.setAttribute('stroke', 'var(--ink)');
+          r.setAttribute('stroke-width', '0.5');
+          segG.appendChild(r);
+          if (w > 30) {
+            const t = document.createElementNS(ns, 'text');
+            t.setAttribute('x', x + w / 2);
+            t.setAttribute('y', 64);
+            t.setAttribute('text-anchor', 'middle');
+            t.setAttribute('font-family', 'EB Garamond, serif');
+            t.setAttribute('font-size', '10');
+            t.setAttribute('fill', 'var(--ink)');
+            t.textContent = labels[i];
+            segG.appendChild(t); min-height: 32px; touch-action: none; }
+          x += w;
+        });
+        totalEl.textContent = total + ' ms';
+        if (total <= 250) { verdict.textContent = 'within budget ✓'; verdict.className = 'verdict ok'; }
+        else { verdict.textContent = 'overflows prefetch window — scroll will jank'; verdict.className = 'verdict bad'; }
+        inputs.forEach(i => { i.parentElement.querySelector('.v').textContent = i.value; });
+      }
+      inputs.forEach(i => i.addEventListener('input', render));
+      render();
+    })();
+  </script>
+</figure>
+
+<p>把 late-stage ranker 拉到 100 ms、把 embedding scorer 拉到 60 ms，total 就直接撞紅線。要救回來只能在更上游動刀——比如砍 top-K friends 從 100 降到 50（pool 變小，late-stage 用得起更便宜的 features）、或者把 closeness 從「精算後 lookup」改成「快取後 lookup」（lookup 從 10 ms 變 3 ms）。每一個 ms 的省都來自上游的設計決策，不是 late-stage 自己能解決的。</p>
+
+<p>還有一個容易被忽略的細節：metadata 的 size 必須小到不會 measurably 拖慢 prefetch 的 transfer time。video bytes 動輒幾 MB，metadata 必須在 KB 等級才不會影響 percentile 級的 transfer latency。所以 metadata schema 必須極簡——大概就是「友圈成員的 user id 列表 + 各自的 reaction type + 一個 ordering hint」這種 wire format，client 直接拿來 render，不做任何二次計算。這條約束又反過來限制了 server-side 能塞什麼進 metadata：複雜的 ranking score、複雜的 explanation、複雜的 per-friend recommendation reason 都不行。</p>
+
+<h2>Online learning 跟 component contract</h2>
+
+<p>online learning 在 ranker 上的常見實作是 streaming gradient update：使用者對某個 bubble reel 做出 interaction，event 進 training pipeline，model weight 以接近 real-time 的速度更新。對 freshness 很重要——使用者今天突然開始喜歡 cooking reels，ranker 不必等到明天的 batch retrain 才知道。但 update rate 設太高會被噪聲帶歪——偶然多看了幾個 cooking reel，ranker 立刻 collapse 到只推 cooking。設太低又失去意義，跟 daily batch 沒差。實務上會用 EMA 平滑、或 importance sampling 把 streaming weight 調低。</p>
+
+<p>另一個 failure mode 是 catastrophic forgetting：新進的 streaming sample 在 representation space 上太密集，舊的 representation 被沖刷掉。對 social discovery 特別危險——跟好朋友的長期關係是「舊 signal」，最近一週的爆炸性互動是「新 signal」，如果 model 對新 signal overfit 就會忘掉長期關係的重要性。緩解通常是 replay buffer——把舊的 sample 維持一個池子，每次 update 混合新舊一起 train。文章沒提，但任何成熟 online learning 系統都必備。</p>
+
+<p>online learning 跟 integrity 的耦合也是 Reel Friends 比一般「給朋友推朋友的影片」工程上難得多的地方。純 product 角度的實作會把這兩件事拆開：一個 team 做 ranker、另一個 team 做 integrity filter。Meta 這套把它們 joint 起來，付出的代價是 model team 必須同時掌握 engagement metric 跟 integrity metric 的訓練細節；換來的好處是 representation 一致、online update 不會在兩個目標之間搖擺。</p>
+
+<p>把五個 component 串起來看，整套系統能 long-term iterate 的關鍵 invariant 是「每個 component 刻意不知道相鄰 component 的細節」。closeness model 不知道 candidate 之後會被怎麼 retrieve；retrieval 不知道 candidate 的 final ranking；ranker 不知道某個 reel 為什麼進 pool，對 friend / non-friend candidate 用同一套 model 評分；online learning loop 不知道 ranking 是怎麼排出來的，只看 (impression, interaction) 配對。這幾組 cross-component invariant 看起來是 ML clarity，實際上是 organizational scalability——當你的 closeness model 知道太多 retrieval 內部細節，你就很難在不破壞 retrieval 的前提下改 closeness model；每改一處都要協調三個 team，最後沒人敢動任何東西。</p>
+
+<p>反過來說，每個 component 的 internal complexity 可以很高：closeness model 內部可以是 hybrid GNN、retrieval 內部可以是 multi-stage cascade、ranker 內部可以是 hundreds-of-million 參數的 transformer。internal complexity 高沒關係，只要 interface 乾淨，每個 component 就可以 independently scale up 而不衝擊其他 team。這是分散式系統「small interface, large implementation」原則在 ML 系統上的對應。</p>
+
+<h2>把整套放在 naive vs real 的對照裡</h2>
 
 <figure class="vg-w-tabs-reel-friends-naive-vs-real">
   <style>
@@ -475,22 +579,22 @@
   <div class="tabs">
     <label class="tab" for="vg-w-tabs-reel-friends-naive-vs-real-t1">naive 設計</label>
     <label class="tab" for="vg-w-tabs-reel-friends-naive-vs-real-t2">Meta 實際做法</label>
-    <label class="tab" for="vg-w-tabs-reel-friends-naive-vs-real-t3">為什麼 naive 會崩</label>
+    <label class="tab" for="vg-w-tabs-reel-friends-naive-vs-real-t3">naive 為什麼會崩</label>
   </div>
   <div class="panel panel-1">
     <h4>"friend boost" 的 1 sprint 版本</h4>
-    <p>所有事都丟給既有 ranker，最後再做 post-hoc rerank。</p>
+    <p>所有事丟給既有 ranker，最後做 post-hoc rerank。</p>
     <ul>
       <li>closeness：binary friend / non-friend，沒有 graded score</li>
       <li>retrieval：照舊 content-based ANN，朋友信號完全不參與 candidate generation</li>
-      <li>ranking：既有 model 跑完，最後一步乘上一個 friend_boost = 1.2 的乘數</li>
+      <li>ranking：既有 model 跑完，最後乘上一個 friend_boost = 1.2</li>
       <li>integrity：另一個 post-filter classifier，獨立部署</li>
       <li>online learning：照舊用同一個 ranker，沒有 conditioning</li>
     </ul>
   </div>
   <div class="panel panel-2">
     <h4>Reel Friends 的 representation-level 做法</h4>
-    <p>把 social signal 從 first principles 進到每一層 model，joint train，joint serve。</p>
+    <p>從 first principles 進到每一層 model，joint train，joint serve。</p>
     <ul>
       <li>closeness：survey-based + context-specific 雙 model，frequency-orthogonal 融合，weekly + streaming</li>
       <li>retrieval：social hard filter 第一層，embedding soft score 第二層，順序不可顛倒</li>
@@ -500,32 +604,19 @@
     </ul>
   </div>
   <div class="panel panel-3">
-    <h4>naive 設計在規模化下的三個 collapse mode</h4>
-    <p>不是「naive 設計能跑但效果差」——是「naive 設計幾個月後會 collapse 到退化解」。</p>
+    <h4>三個 collapse mode</h4>
+    <p>不是「naive 設計能跑但效果差」——是「幾個月後 collapse 到退化解」。</p>
     <ul>
       <li><strong>collapse 1：</strong>binary closeness 讓久不互動的舊朋友跟天天 chat 的同事被同等對待，bubble 變雜訊</li>
-      <li><strong>collapse 2：</strong>post-hoc boost 只能 rerank pool 內已有的 reel，pool 裡沒有的朋友 reel 永遠進不來——recall ceiling 一開始就被 content ANN 釘住</li>
-      <li><strong>collapse 3：</strong>沒有 conditioning 的 online learning，把 selection bias 累積進 engagement model，幾個月後 ranker 學到「永遠推朋友看過的東西」，因為這個 sub-population 的 reward signal 被觀察得最多</li>
+      <li><strong>collapse 2：</strong>post-hoc boost 只能 rerank pool 內已有的 reel，pool 裡沒有的朋友 reel 永遠進不來——recall ceiling 被 content ANN 釘死</li>
+      <li><strong>collapse 3：</strong>沒有 conditioning 的 online learning 把 selection bias 累積進 engagement model，ranker 慢慢 collapse 到「永遠推朋友看過的東西」</li>
     </ul>
   </div>
 </figure>
 
-<p>這三個 tab 是同一張對照表的三個切片——naive、real、failure mode——但它們聯動才能傳達「為什麼這套設計不是過度工程」這件事。任何單獨的 tab 都不完整：只看 naive 你會覺得「也還好」，只看 real 你會覺得「為什麼這麼複雜」，只看 collapse mode 才會明白：複雜性是被失敗模式驅動的，不是被 perfectionism 驅動的。</p>
+<p>三個 collapse mode 對齊看：binary closeness 讓 bubble 變雜訊、post-hoc boost 被 content ANN 的 recall 釘住 ceiling、unconditional online learning 把 selection bias 滾雪球。三個失敗模式都不會在第一週的 metric 上出現——它們是慢性病，幾個月之後才看得到形狀，到時候 representation 已經被汙染、用任何 post-hoc 修補都救不回來。Reel Friends 把 social 從一個 post-hoc rerank signal 提升到 first-class structural component，付出的代價是五個 component 都要重新對 social-aware distribution 做設計；換來的是 social discovery 跟 content discovery 在 representation level 上的同一致性。前者是工程量，後者是 product moat——很容易被低估，但只有後者能在使用者越用越多之後維持品質。</p>
 
-<p>還有一件值得停下來想的事——這套設計裡的「component 不知道相鄰 component 的細節」這個 invariant，其實是大型 ML 系統能 long-term iterate 的關鍵。當你的 closeness model 知道太多 retrieval 的內部細節，你就很難在不破壞 retrieval 的前提下改 closeness model；當你的 ranker 直接依賴 retrieval 的 ANN index schema，retrieval team 就動不了那個 schema。這些隱形的 cross-component dependency 會在 organizational scale 上變成 velocity killer——每改一處都要協調三個 team，最後沒人敢動任何東西。Meta 在這套系統裡把 contract 拉得很乾淨，看起來是 ML clarity，實際上是 organizational scalability。</p>
+<p>真正的 moat 不在任何單一 component 上，而在 component 之間的 interface contract：closeness 跟 retrieval 之間（top-K friends 列表 + closeness vector）、retrieval 跟 ranker 之間（candidate pool + pool-internal score）、ranker 跟 serving 之間（按 prefetch window pin 住的 metadata schema）、ranker 跟 online learning 之間（log (impression, interaction, condition) tuple）。這四組 interface 是 system design 真正的價值——把它們設計對，每個 component 才能 independently iterate。Meta 在這篇文章裡實際上是在示範這四組 contract 怎麼定，這對其他 team 的參考價值，遠超過任何單一 component 的 model architecture 細節。</p>
 
-<p>反過來說，每個 component 的 internal complexity 其實可以很高——closeness model 內部可以是 hybrid GNN，retrieval 內部可以是 multi-stage cascade，ranker 內部可以是 hundreds-of-million 參數的 transformer，integrity head 內部可以有自己的 multi-task setup。internal complexity 高沒關係，只要 interface 乾淨，每個 component 就可以 independently scale up internal complexity 而不衝擊其他 team。這是分散式系統設計常講的「small interface, large implementation」原則在 ML 系統上的對應。</p>
-
-<p>對台灣或亞洲市場想做類似 social discovery 的 team 來說，這套架構有一個特別需要注意的 cultural 適配：closeness 的定義在不同文化裡不一樣。Meta 的 survey ground truth 主要來自西方使用者習慣的「friendship」概念，但東亞的社交關係包含更多 hierarchical 維度——同事、長輩、學長學姐、客戶——這些關係不會被簡單的「close / not close」標籤捕捉。如果要把這套架構複製到 LINE 或 Whoscall 之類的本地產品，closeness model 的 label schema 跟 training data 設計可能需要重寫，而不是直接 reuse Meta 的方法論。這是 product localization 的工程體現——表面上是 ML 系統，底下是文化模型。</p>
-
-<p>另一個跨文化考量是 integrity 的定義。Meta 的 integrity head 訓練資料來自 Meta 全球的 policy framework，但每個地區的 community standards 不一樣——什麼算 sensitive content、什麼算 misinformation、什麼算 minor protection，在台灣、日本、韓國、東南亞各有不同的政策邊界。jointly trained 的 integrity head 在跨地區部署時，需要 per-region 的 sub-head 或者 fine-tuning，這又是另一層 architectural decision，文章裡同樣沒展開。</p>
-
-<p>到這邊整套 Reel Friends 的架構就講完了。回頭看一下：trillions of person-to-person edges 跑 weekly inference，五個 component 構成一條從 closeness 到 ranking 到 online learning 的完整 social-aware 漏斗，所有 server-side 計算被 video prefetch window 這個 wall-clock 預算反向約束架構形狀。每一個設計決策都有對應的 failure mode，每一個 abstraction boundary 都有對應的 invariant。這套東西的工程精彩之處，就在於把這些 trade-off 攤開放在五個 modular component 上，而不是揉成一團 monolithic ranker。</p>
-
-<p>對於正在做 large-scale recommender 的 team，這篇文章值得放在書架的位置上不只是「Meta 又發了什麼東西」，而是它示範了一個比較少被工程文章寫出來的 pattern——「product feature ↔ ML architecture ↔ serving constraint」三者之間的閉環設計。大多數 ML 系統的設計文章只講 ML，serving 文章只講 serving，product 文章只講 UX。Reel Friends 把三者糾結在一起講清楚：為了 social discovery 這個 product feature，ML architecture 必須是分層的、joint trained 的；為了符合 serving constraint，ML architecture 又必須在 freshness band 上嚴格 stratify。三者互相約束、互相塑形，最後得到的不是一個 elegant 的 abstract architecture，而是一個被現實 forces 出來的、看起來甚至有點 ad hoc 的具體形狀。</p>
-
-<p>這個「被 forces 出來」的特質，在 senior engineer 看 architecture diagram 時應該是一個 positive signal。Diagrams 看起來太對稱、太 elegant 的系統，通常意味著它還沒被真實的 production 壓力反覆磨過。Reel Friends 的 architecture 不對稱——closeness 是兩支 model 拼出來的、ranker 是同一個 model 在兩個 stage 跑、integrity 是 auxiliary head 而不是獨立 service——這些不對稱性本身是 production 經驗的痕跡。乾淨的 abstract architecture 是 paper-grade，現實 production 系統必然不對稱。</p>
-
-<p>最後一個觀察：這套系統的真正 moat 不在任何單一 component 上，而在 component 之間的 interface contract。closeness model 跟 retrieval 之間的 contract（top-K friends 列表 + closeness vector）、retrieval 跟 ranker 之間的 contract（candidate pool + pool-internal score）、ranker 跟 serving 之間的 contract（按 prefetch window pin 住的 metadata schema）、ranker 跟 online learning 之間的 contract（log (impression, interaction, condition) tuple）——這四組 interface 是 system design 真正的價值。把它們設計對，每個 component 才能 independently iterate。Meta 在這篇文章裡實際上是在示範這四組 contract 怎麼定，這對其他 team 的參考價值，遠遠超過任何單一 component 的 model architecture 細節。</p>
-
+<p class="vg-deep-closer"><strong>What this enables</strong>：把 social 從事後 rerank 的 signal，升格成 retrieval / ranking / online learning 三層 jointly modeled 的 first-class component。朋友看過的 reels 不再是 ranker 後面一個 boost 開關，而是整套 distribution 從上游就 social-aware——這是 social discovery 跟 friend boost 之間的本質差距。</p>
 </div>

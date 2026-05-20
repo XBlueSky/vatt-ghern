@@ -53,6 +53,9 @@ thing (set `radio.checked = true`); CSS does the rest.
     .vg-w-annotated-EXAMPLE:has(#vg-w-annotated-EXAMPLE-r1:checked) .detail-1 { display: block; }
     .vg-w-annotated-EXAMPLE:has(#vg-w-annotated-EXAMPLE-r2:checked) .detail-2 { display: block; }
     .vg-w-annotated-EXAMPLE:has(#vg-w-annotated-EXAMPLE-r3:checked) .detail-3 { display: block; }
+    @media (max-width: 720px) {
+      .vg-w-annotated-EXAMPLE { grid-template-columns: 1fr; }
+    }
   </style>
 
   <input type="radio" id="vg-w-annotated-EXAMPLE-r1" name="vg-w-annotated-EXAMPLE-sel" checked />

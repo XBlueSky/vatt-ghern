@@ -19,15 +19,19 @@
     .vg-w-ba-EXAMPLE .after { clip-path: polygon(0 0, 50% 0, 50% 100%, 0 100%); }
     .vg-w-ba-EXAMPLE .divider {
       position: absolute; top: 0; bottom: 0; left: 50%;
-      width: 2px; background: var(--accent);
-      transform: translateX(-1px);
-      cursor: ew-resize;
+      width: 32px; transform: translateX(-50%);
+      cursor: ew-resize; touch-action: none;
+    }
+    .vg-w-ba-EXAMPLE .divider::before {
+      content: ''; position: absolute; left: 50%; top: 0; bottom: 0;
+      width: 2px; transform: translateX(-50%);
+      background: var(--accent);
     }
     .vg-w-ba-EXAMPLE .divider::after {
       content: '↔'; position: absolute; left: 50%; top: 50%;
       transform: translate(-50%, -50%);
       background: var(--accent); color: var(--bg);
-      width: 28px; height: 28px; border-radius: 50%;
+      width: 32px; height: 32px; border-radius: 50%;
       display: grid; place-items: center;
       font-family: var(--sans); font-size: 16px;
     }

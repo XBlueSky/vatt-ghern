@@ -247,16 +247,17 @@ function checkWidgetContract(path, html) {
   // .vg-post-body and would otherwise trip the IIFE / external-src bans.
   const body = extractPostBody(html);
 
-  // 1. Widget count: ≥ 3 elements with class="vg-w-*"
+  // 1. Widget count: hard floor ≥ 5 widgets, plus density ≥ 1.2 per 1000 CJK chars.
+  // The density rule (added 2026-05-20) binds widget count to prose length so longer
+  // posts can't degrade into wall-of-text shape. See tier-3-principles §6.
   const widgetMatches = [...body.matchAll(/class="[^"]*\bvg-w-[a-z0-9-]+/g)];
-  // Deduplicate by capturing the actual class names per element root.
   const widgetClasses = new Set();
   for (const m of widgetMatches) {
     const cls = m[0].match(/vg-w-[a-z0-9-]+/);
     if (cls) widgetClasses.add(cls[0]);
   }
-  if (widgetClasses.size < 3) {
-    violations.push(`${path}: widget contract requires ≥ 3 widgets (vg-w-* classes), found ${widgetClasses.size}`);
+  if (widgetClasses.size < 5) {
+    violations.push(`${path}: widget contract requires ≥ 5 widgets (vg-w-* classes), found ${widgetClasses.size}`);
   }
 
   // 2. At least 1 widget must be interactive
@@ -304,6 +305,15 @@ function checkWidgetContract(path, html) {
   const cjkCharCount = (proseBody.match(/[一-鿿]/g) || []).length;
   if (cjkCharCount < 4000) {
     violations.push(`${path}: prose has ${cjkCharCount} CJK chars (widget contract requires ≥ 4000 CJK chars in .vg-post-body, widget code excluded)`);
+  }
+
+  // 4b. Widget density: ≥ 1.2 widgets per 1000 CJK chars of prose.
+  // Stops long posts from degrading into wall-of-text. See tier-3-principles §6.
+  if (cjkCharCount >= 4000 && widgetClasses.size > 0) {
+    const requiredWidgets = Math.ceil((cjkCharCount / 1000) * 1.2);
+    if (widgetClasses.size < requiredWidgets) {
+      violations.push(`${path}: widget density too low — ${widgetClasses.size} widgets for ${cjkCharCount} CJK chars (require ≥ ${requiredWidgets} widgets at 1.2/1000 chars; add widgets or trim prose)`);
+    }
   }
 
   // 5. Inline <script src=...> is banned

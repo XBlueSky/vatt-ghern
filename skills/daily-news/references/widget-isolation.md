@@ -286,3 +286,21 @@ For `<canvas>` elements:
 
 CSS controls the display size; JS sets the backing-store size to
 `displaySize × devicePixelRatio` for crisp rendering on retina screens.
+
+## Mobile layout — required patterns
+
+Every widget MUST work at 375px viewport. See tier-3-principles §12 for
+the full Mobile Layout Contract. The mandatory patterns are:
+
+1. **Two-column grids collapse at ≤720px** — `@media (max-width: 720px) { .vg-w-X { grid-template-columns: 1fr } }`
+2. **`position: sticky` drops at mobile** — `@media (max-width: 720px) { .vg-w-X .figure-sticky { position: static } }`
+3. **Tap targets ≥ 32px** — range inputs `height: 36px`, buttons `min-height: 44px`, drag handles wrapped in 32px-wide hit areas
+4. **Canvas aspect-ratio adjusts at mobile** — `@media (max-width: 720px) { canvas { aspect-ratio: 4/3 } }` (was 16/9 at desktop)
+5. **Scroll-driven IntersectionObserver rootMargin scales with viewport** — `isMobile ? '-25%' : '-40%'`
+6. **`touch-action: none` on draggable elements** — prevents page scroll fighting your drag
+7. **Tables `overflow-x: auto` + `min-width: 480px`** — better to scroll horizontally than to crush columns
+
+The `tests/archetype-check.mjs` enforcer does not yet test these
+mechanically (no headless mobile rendering). The author is responsible
+for self-checking at 375px in dev tools or Playwright before declaring
+DONE. See anti-examples §F4-F6 for common mobile breaks to avoid.
