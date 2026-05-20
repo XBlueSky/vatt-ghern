@@ -39,7 +39,17 @@ You are writing ONE deep-story for vatt'ghern's daily-news routine.
 7. **Read mandatory cookbook files**:
    - skills/daily-news/references/widget-cookbook/tier-3-principles.md
    - skills/daily-news/references/widget-cookbook/anti-examples.md
-8. **Pick widgets from the cookbook**:
+8. **Read the exemplar for your archetype** (calibration on what
+   "good" looks like — NOT a template to clone):
+   - skills/daily-news/references/exemplars/{{archetype}}.html
+   - skills/daily-news/references/exemplars/{{archetype}}.md (annotation)
+   If both files exist, read both fully. If they do NOT exist
+   (empty exemplar slot for this archetype), skip this step and
+   proceed — the rubric + archetype reference are enough.
+   Do NOT copy H2 phrasings, opener structure, widget choices, or
+   closer language from the exemplar. The annotation's
+   "Watch-for" section reinforces this.
+9. **Pick widgets from the cookbook**:
    - exactly 1 Tier-1 template as the post's hero widget
    - 2-4 Tier-2 snippets for supporting widgets
    - Read the detail pages for the picked Tier-1 and Tier-2 entries
@@ -47,15 +57,15 @@ You are writing ONE deep-story for vatt'ghern's daily-news routine.
      conceptual question + the picked template/snippet + the
      data/state it operates on. If you cannot write a conceptual
      question for a widget, drop it.
-9. Write the HTML to {{output_path}} following the archetype's H2
-   sequence, widget budget, and closer label. Use the design-system
-   colors + typography. Each widget MUST have a `.vg-w-<widget-id>`
-   class prefix on its root element.
-10. Write the sidecar to {{sidecar_path}} per the schema in
+10. Write the HTML to {{output_path}} following the archetype's H2
+    sequence, widget budget, and closer label. Use the design-system
+    colors + typography. Each widget MUST have a `.vg-w-<widget-id>`
+    class prefix on its root element.
+11. Write the sidecar to {{sidecar_path}} per the schema in
     references/archetypes.md § Sidecar spec. `sources[]` MUST include
     EVERY variant_url. Sidecar MUST include `widget_count`,
     `widget_questions`, and `widget_templates` fields.
-11. Report back: path written, character count, archetype deviations
+12. Report back: path written, character count, archetype deviations
     (if any) with reasoning, widget count, and widget templates used.
 
 ## Hard rules
