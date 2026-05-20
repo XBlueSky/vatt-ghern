@@ -1,0 +1,7 @@
+# Exemplar: deep-meta-reel-friends — freeform
+
+**Why this is the exemplar:** The opener earns its counter-intuitive framing: "把『朋友看過、朋友按過 love』這件事塞進 Reels 推薦系統聽起來像個前端功能…直到你發現要把它做對，得先在 trillions 級的 person-to-person edges 上每週重跑一次 closeness inference，並把 friend-bubble metadata 釘進原本就極度敏感的 video prefetch window 裡" — the "sounds like a frontend feature until" structure delivers the complexity surprise efficiently. The analytical depth in the three Decision H2s adds genuine layers: Decision 2 builds a metric-space incompatibility argument for retrieval layering, Decision 3's conditional P(engage|impression) absorbs selection bias mathematically, and the prefetch-window section inverts the forcing-function framing to derive why the architecture constraint is non-negotiable.
+
+**Watch-for:** Material axis scored 7 (the weakest in the audit set for this post): latency numbers (10-30 ms range) are authorial estimates rather than source-attributed figures, and the GNN infeasibility claim is an extension not directly cited from the Meta blog. The three consecutive "Decision N:" H2s also create a mild structural template parallel that reviewers flagged (Anti-template 8). This is a freeform post — the "Decision N" H2 scaffold should not be replicated; the bar to hold is the analytical depth and thesis convergence, not the parallel-H2 device.
+
+**Source:** src/posts/2026/05/20/deep-meta-reel-friends.html. Audit score: Hook 9 / Structural 8 / Material 7 / Depth 9 / Relevance 9 / Anti-template 8 = 50.

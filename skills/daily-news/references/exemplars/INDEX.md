@@ -16,12 +16,12 @@ For each archetype the library has two files:
 
 | Archetype | Status | Source post (if present) |
 |---|---|---|
-| narrative | <empty / present> | <path or ->  |
-| technical-deep-dive | <empty / present> | <path or -> |
-| investigation | <empty / present> | <path or -> |
-| comparison | <empty / present> | <path or -> |
-| explainer | <empty / present> | <path or -> |
-| freeform | <empty / present> | <path or -> |
+| narrative | present | src/posts/2026/05/20/deep-discord-voice-outage.html |
+| technical-deep-dive | present | src/posts/2026/05/19/deep-modal-cold-starts.html |
+| investigation | empty | - |
+| comparison | present | src/posts/2026/05/17/deep-cpp26-simd-critique.html |
+| explainer | present | src/posts/2026/05/18/deep-slack-agent-context.html |
+| freeform | present | src/posts/2026/05/20/deep-meta-reel-friends.html |
 
 When status is `<empty>`, the author sub-agent's archetype-fallback
 applies (skip the exemplar read, proceed with rubric + archetype

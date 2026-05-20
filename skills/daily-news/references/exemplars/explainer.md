@@ -1,0 +1,7 @@
+# Exemplar: deep-slack-agent-context — explainer
+
+**Why this is the exemplar:** The opener grounds the reader in a specific scenario before delivering the counter-intuitive answer: "一個 agent 在跑安全調查，第一個小時叫了三十個工具、看了五份 log、發了兩個 SQL…Slack 安全工程的回答是：根本不要把訊息歷史往下一輪傳" — concrete load numbers (30 tool calls, 5 logs, 2 SQL) followed by the surprising solution in one sentence. The H2 "the core idea — three structured resources, zero message history" delivers the densest analytical value in the post: it derives why the Journal slice is O(tasks) not O(tokens), explains how the gap-feedback loop converts random exploration to goal-directed behavior, and grounds the asymmetric model allocation rationale. Material is strong: 170K reviewed findings with a 5-tier distribution, a specimen with 6,046 events and confidence 0.83, two verbatim Slack engineering quotes, and named credibility tier thresholds.
+
+**Watch-for:** Structural axis scored 8 (the weakest axis): the 5-beat ladder is present but the "where today's tools fall short" section doubles as a long alternatives table, over-weighting the comparison framing relative to the core explainer arc. The phrase "where today's tools fall short" was also flagged as mildly generic by a reviewer. Do not copy the 5-beat H2 sequence or the alternatives-table structure — use this post as a calibration on specificity and derivation depth, not as a structural template.
+
+**Source:** src/posts/2026/05/18/deep-slack-agent-context.html. Audit score: Hook 9 / Structural 8 / Material 9 / Depth 9 / Relevance 9 / Anti-template 9 = 53.

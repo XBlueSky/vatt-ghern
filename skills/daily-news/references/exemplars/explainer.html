@@ -1,0 +1,743 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">一個 agent 在跑安全調查，第一個小時叫了三十個工具、看了五份 log、發了兩個 SQL；第二個小時，它要 plan 下一步。問題是：它的 message buffer 已經塞滿了第一個小時的工具呼叫與回應，token 預算開始吃緊。把全部歷史交給下一輪、它讀不完；丟掉太多、它會忘掉重要證據。Slack 安全工程的回答是：根本不要把訊息歷史往下一輪傳。</p>
+  <h1 class="vg-post-title">{{ title }}</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p><span class="vg-dropcap">這</span>篇講 Slack 安全工程在 long-running agentic 任務上的上下文設計：訊息歷史不傳，三個結構化資源（Director's Journal、Critic's Review、Critic's Timeline）取而代之。對於正在做 agent 應用、想避開「context window 吃滿就崩」的工程師，這個三件式設計是一個值得抄的骨架。下面從一個具體的安全調查案例開始，看完整個 round-trip 後，你會知道為什麼 message history 不是 long-run agent 該選的工作記憶模型。</p>
+
+  <p>先說結論的形狀：Slack 的這套系統在生產環境跑下來累積了超過 170,000 條被審查的 finding，其中 37.7% 被評為 trustworthy、25.4% 為 highly-plausible，而 15.4% 被標為 misguided——這些 misguided 的 finding 從來沒進過最終的可信 timeline。一條 hallucination 要在這個系統裡存活，必須「比真實證據更 coherent」，而這個門檻設得夠高，足以讓多數幻覺被擋下。</p>
+
+  <h2>start with a concrete case</h2>
+
+  <p>想像 Slack 內部安全團隊在凌晨 03:17 收到一個 alert：某個服務帳號的 API 呼叫頻率突然飆高。要不要 page 人？這個判斷本身需要先回答十幾個小問題：這個帳號平常的 baseline 是多少？此刻發出的請求落在哪些路由？來源 IP 屬於哪個 region？最近這個帳號的 secret 是不是被 rotate 過？有沒有同一段時間其他帳號也出現異常？這個 alert 是不是落在某個剛部署的 service 的 cold-start window 裡？</p>
+
+  <p>每個小問題都對應一個工具呼叫——查 metrics、查 audit log、查 IP intelligence、查 secret store、查 deploy history、查 incident timeline。一輪調查可能用上幾十到幾百個工具呼叫，跑幾個小時。Slack 自己提到的一個 specimen 案例：4 個 Expert agent 分頭調查同一條 alert，產生了 6,046 個 events，最終 Timeline 收斂到 confidence 0.83 的判斷——這是個 false positive，是 detection rule 的 pathname matching 把 package install hook 誤認成 kernel module load。</p>
+
+  <p>這個案例的數字值得停下來看一下：6,046 個 events，4 個 Expert，幾十分鐘的調查。把這 6,046 個 events 全部塞進 message buffer、串接到一個 LLM context window 裡，會是什麼光景？答案：兩種失敗模式都會發生。</p>
+
+  <p>第一種：tokens 不夠。即使是 200K context window 的大模型，6,046 個 events——每個 event 平均一個 tool call 加一段 response，少說 200 個 token、多則上千——很快就會把 200K 吃滿。當你還在第三輪 reasoning step，prompt 已經逼近上限，剩下給 model 自己生成的 token quota 變得很窄。</p>
+
+  <p>第二種：tokens 夠、但 model 找不到關鍵證據。LLM 對 long context 的 retrieval 是有名的弱項——「needle in a haystack」這個 benchmark 出現的原因正是如此。一條真正關鍵的 finding 埋在 5,000 個 events 中間，model 在做最後 plan 時很可能直接漏掉，即使它名義上「看得到」整個 history。</p>
+
+  <p>這就是 long-run agent 真正的痛點：不是模型不夠強、不是 context window 不夠大、是工作記憶的 organization 不對。Slack 的觀察是——「Complex security investigations can span hundreds of inference requests and generate megabytes of output」——megabyte 級別的中間產出，從來就不該被當成「LLM 可以直接讀」的東西。</p>
+
+  <h2>where today's tools fall short</h2>
+
+  <p>主流的 agent 框架——LangChain、AutoGPT、ReAct、CrewAI——預設都是「message history 滾大」式設計：每一輪 reasoning step 都把先前所有 tool call 與 response 串接在 prompt 裡。短任務沒問題，長任務一定撞牆。常見的補救手段有四種，每種都有缺陷。</p>
+
+  <p>常見補救手段有四種，每種都有缺陷。第一種是 sliding window——只保留最近 N 輪。對「順時序執行」任務尚可，但「需要回頭比對」的調查任務會把第 1 輪挖出的可疑帳號名稱在第 50 輪悄悄丟掉，model 在 plan 時無法把它跟新出現的 IP 連起來。第二種是 summarization——讓 LLM 把舊歷史壓縮成摘要。問題是 hallucination 會在壓縮過程被放大：一個沒發生的事件被壓進摘要後，下一輪 LLM 當事實處理，後續所有 reasoning 都基於這個假事實，而原始 evidence 已經丟掉，無法還原。</p>
+
+  <p>第三種是 RAG retrieval over chat history——把歷史 embedding 到 vector store，按需要 retrieve。問題是 embedding 不一定捕捉到「這條 log 跟那條 IP 屬於同一個 attacker chain」的語意，retrieval 拿回來的 chunk 可能字面相似但語意無關；對結構化 evidence（時序、ID、metric 名）的召回相關性可能掉到 60% 以下。第四種是 tool-based memory——把記憶當外部 tool，agent 主動 read/write。這是當前比較有前途的方向，但 schema 怎麼設計是新問題：free-form scratchpad 容易變成第二個 chat history；過度結構化又限制了 model 的表達。Slack 的三件式可以視為這條路徑走到頭的一個答案——把「memory schema」與「memory 的讀寫權限」綁定到三個角色上。</p>
+
+  <p>四種都共享一個前提：訊息歷史是主要的工作記憶。Slack 的選擇是把這個前提整個換掉。下面這張表把四種 fallback 跟 Slack 的三件式設計擺在一起對比：</p>
+
+  <figure class="vg-w-table-context-approaches">
+    <style>
+      .vg-w-table-context-approaches table { width: 100%; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-context-approaches thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; }
+      .vg-w-table-context-approaches thead th[data-sort] { color: var(--accent-text); }
+      .vg-w-table-context-approaches tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+      .vg-w-table-context-approaches td.tag { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.03em; }
+      .vg-w-table-context-approaches td.good { color: var(--sage-deep); }
+      .vg-w-table-context-approaches td.bad { color: var(--accent-text); }
+      .vg-w-table-context-approaches figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-2); }
+    </style>
+    <table>
+      <thead>
+        <tr>
+          <th data-key="approach">approach</th>
+          <th data-key="memory">memory shape</th>
+          <th data-key="strength">strength</th>
+          <th data-key="weakness">main failure</th>
+          <th data-key="fit">fits</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="tag">full history</td>
+          <td>append all turns</td>
+          <td class="good">simplest, no design</td>
+          <td class="bad">token blow-up &amp; lost-in-middle</td>
+          <td>short tasks (&lt; 20 turns)</td>
+        </tr>
+        <tr>
+          <td class="tag">sliding window</td>
+          <td>keep last N turns</td>
+          <td class="good">bounded token cost</td>
+          <td class="bad">old key findings vanish</td>
+          <td>linear pipelines</td>
+        </tr>
+        <tr>
+          <td class="tag">summarization</td>
+          <td>LLM compresses old</td>
+          <td class="good">long-range hint preserved</td>
+          <td class="bad">hallucination amplified in summary</td>
+          <td>narrative tasks</td>
+        </tr>
+        <tr>
+          <td class="tag">RAG over history</td>
+          <td>vector store + retrieve</td>
+          <td class="good">selective recall</td>
+          <td class="bad">retrieval misses, latency cost</td>
+          <td>FAQ-shaped agents</td>
+        </tr>
+        <tr>
+          <td class="tag">three-resource</td>
+          <td>Journal / Review / Timeline</td>
+          <td class="good">structured, auditable, role-isolated</td>
+          <td class="bad">high engineering overhead</td>
+          <td>multi-hour investigations</td>
+        </tr>
+      </tbody>
+    </table>
+    <figcaption>五種 context strategy 的取捨。Slack 的三件式設計犧牲的是「快速做出一個 prototype」的便利——換來的是 megabyte 級調查的可運行性與可審計性。Click 表頭可排序。</figcaption>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-table-context-approaches');
+        const headers = root.querySelectorAll('thead th');
+        const tbody = root.querySelector('tbody');
+        let activeKey = null, asc = true;
+        headers.forEach(h => h.addEventListener('click', () => {
+          const key = h.dataset.key;
+          if (activeKey === key) { asc = !asc; } else { activeKey = key; asc = true; }
+          headers.forEach(x => x.removeAttribute('data-sort'));
+          h.setAttribute('data-sort', asc ? 'asc' : 'desc');
+          const rows = [...tbody.querySelectorAll('tr')];
+          const idx = [...headers].indexOf(h);
+          rows.sort((a, b) => {
+            const av = a.children[idx].textContent.trim();
+            const bv = b.children[idx].textContent.trim();
+            return asc ? av.localeCompare(bv) : bv.localeCompare(av);
+          });
+          rows.forEach(r => tbody.appendChild(r));
+        }));
+      })();
+    </script>
+  </figure>
+
+  <p>前四種是「對某類任務的權宜之計」、是在 message history 這個 paradigm 內補洞；最後一種是「為某類任務專門設計的架構」、直接換掉 paradigm。Slack 選後者的代價是：你必須先想清楚 agent 在做什麼工作，才能設計出對應的結構化資源——schema 一開始要選對，選錯了重做成本不低。</p>
+
+  <h2>the core idea — three structured resources, zero message history</h2>
+
+  <p>不在 agent 之間傳訊息歷史。每次 agent 被呼叫，只看三個明確結構化的共享資源。先看整體架構：</p>
+
+  <figure class="vg-w-arch-three-roles">
+    <style>
+      .vg-w-arch-three-roles { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s-3); align-items: start; }
+      @media (max-width: 700px) { .vg-w-arch-three-roles { grid-template-columns: 1fr; } }
+      .vg-w-arch-three-roles svg { width: 100%; height: auto; }
+      .vg-w-arch-three-roles input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-arch-three-roles .role { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; transition: fill 200ms, stroke 200ms; }
+      .vg-w-arch-three-roles .role:hover { stroke: var(--accent); }
+      .vg-w-arch-three-roles .resource { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.2; cursor: pointer; transition: fill 200ms, stroke 200ms; }
+      .vg-w-arch-three-roles .resource:hover { stroke: var(--sage-deep); }
+      .vg-w-arch-three-roles .label-text { pointer-events: none; }
+      .vg-w-arch-three-roles .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; font-family: var(--serif); }
+      .vg-w-arch-three-roles .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-arch-three-roles .detail p { margin: 0 0 var(--s-1) 0; font-size: var(--fs-sm); }
+      .vg-w-arch-three-roles figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); grid-column: 1 / -1; margin-top: var(--s-2); }
+
+      .vg-w-arch-three-roles:has(#vg-w-arch-three-roles-r1:checked) .role-director { fill: var(--accent); fill-opacity: 0.18; stroke: var(--accent); }
+      .vg-w-arch-three-roles:has(#vg-w-arch-three-roles-r2:checked) .role-expert { fill: var(--accent); fill-opacity: 0.18; stroke: var(--accent); }
+      .vg-w-arch-three-roles:has(#vg-w-arch-three-roles-r3:checked) .role-critic { fill: var(--accent); fill-opacity: 0.18; stroke: var(--accent); }
+      .vg-w-arch-three-roles:has(#vg-w-arch-three-roles-r4:checked) .res-journal { fill: var(--sage); fill-opacity: 0.18; stroke: var(--sage-deep); }
+      .vg-w-arch-three-roles:has(#vg-w-arch-three-roles-r5:checked) .res-review { fill: var(--sage); fill-opacity: 0.18; stroke: var(--sage-deep); }
+      .vg-w-arch-three-roles:has(#vg-w-arch-three-roles-r6:checked) .res-timeline { fill: var(--sage); fill-opacity: 0.18; stroke: var(--sage-deep); }
+
+      .vg-w-arch-three-roles:has(#vg-w-arch-three-roles-r1:checked) .detail-1 { display: block; }
+      .vg-w-arch-three-roles:has(#vg-w-arch-three-roles-r2:checked) .detail-2 { display: block; }
+      .vg-w-arch-three-roles:has(#vg-w-arch-three-roles-r3:checked) .detail-3 { display: block; }
+      .vg-w-arch-three-roles:has(#vg-w-arch-three-roles-r4:checked) .detail-4 { display: block; }
+      .vg-w-arch-three-roles:has(#vg-w-arch-three-roles-r5:checked) .detail-5 { display: block; }
+      .vg-w-arch-three-roles:has(#vg-w-arch-three-roles-r6:checked) .detail-6 { display: block; }
+    </style>
+
+    <input type="radio" id="vg-w-arch-three-roles-r1" aria-label="select option 1" name="vg-w-arch-three-roles-sel" checked />
+    <input type="radio" id="vg-w-arch-three-roles-r2" aria-label="select option 2" name="vg-w-arch-three-roles-sel" />
+    <input type="radio" id="vg-w-arch-three-roles-r3" aria-label="select option 3" name="vg-w-arch-three-roles-sel" />
+    <input type="radio" id="vg-w-arch-three-roles-r4" aria-label="select option 4" name="vg-w-arch-three-roles-sel" />
+    <input type="radio" id="vg-w-arch-three-roles-r5" aria-label="select option 5" name="vg-w-arch-three-roles-sel" />
+    <input type="radio" id="vg-w-arch-three-roles-r6" aria-label="select option 6" name="vg-w-arch-three-roles-sel" />
+
+    <svg viewBox="0 0 720 360" preserveAspectRatio="xMidYMid meet">
+      <defs>
+        <marker id="vg-w-arch-three-roles-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--muted)" />
+        </marker>
+      </defs>
+
+      <text x="360" y="22" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">click any role or resource to read its responsibility</text>
+
+      <rect class="role role-director" data-target="vg-w-arch-three-roles-r1" x="40" y="50" width="160" height="60" rx="6"  role="button" tabindex="0" />
+      <text class="label-text" x="120" y="78" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">Director</text>
+      <text class="label-text" x="120" y="96" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="12" fill="var(--muted)">orchestrate</text>
+
+      <rect class="role role-expert" data-target="vg-w-arch-three-roles-r2" x="280" y="50" width="160" height="60" rx="6"  role="button" tabindex="0" />
+      <text class="label-text" x="360" y="78" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">Expert (n)</text>
+      <text class="label-text" x="360" y="96" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="12" fill="var(--muted)">investigate, tool-call</text>
+
+      <rect class="role role-critic" data-target="vg-w-arch-three-roles-r3" x="520" y="50" width="160" height="60" rx="6"  role="button" tabindex="0" />
+      <text class="label-text" x="600" y="78" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">Critic</text>
+      <text class="label-text" x="600" y="96" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="12" fill="var(--muted)">validate, score</text>
+
+      <rect class="resource res-journal" data-target="vg-w-arch-three-roles-r4" x="40" y="200" width="200" height="80" rx="6"  role="button" tabindex="0" />
+      <text class="label-text" x="140" y="226" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">Director's Journal</text>
+      <text class="label-text" x="140" y="246" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="11" fill="var(--muted)">decisions / observations</text>
+      <text class="label-text" x="140" y="262" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="11" fill="var(--muted)">findings / questions</text>
+      <text class="label-text" x="140" y="278" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="11" fill="var(--muted)">actions / hypotheses</text>
+
+      <rect class="resource res-review" data-target="vg-w-arch-three-roles-r5" x="260" y="200" width="200" height="80" rx="6"  role="button" tabindex="0" />
+      <text class="label-text" x="360" y="226" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">Critic's Review</text>
+      <text class="label-text" x="360" y="246" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="11" fill="var(--muted)">per-finding credibility</text>
+      <text class="label-text" x="360" y="262" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="11" fill="var(--muted)">0.0 — 1.0 scale</text>
+      <text class="label-text" x="360" y="278" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="11" fill="var(--muted)">corroboration notes</text>
+
+      <rect class="resource res-timeline" data-target="vg-w-arch-three-roles-r6" x="480" y="200" width="200" height="80" rx="6"  role="button" tabindex="0" />
+      <text class="label-text" x="580" y="226" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">Critic's Timeline</text>
+      <text class="label-text" x="580" y="246" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="11" fill="var(--muted)">consolidated narrative</text>
+      <text class="label-text" x="580" y="262" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="11" fill="var(--muted)">evidential / temporal /</text>
+      <text class="label-text" x="580" y="278" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="11" fill="var(--muted)">logical gaps marked</text>
+
+      <line x1="120" y1="112" x2="140" y2="198" stroke="var(--muted)" stroke-width="1" marker-end="url(#vg-w-arch-three-roles-arr)" />
+      <line x1="360" y1="112" x2="360" y2="198" stroke="var(--muted)" stroke-width="1" marker-end="url(#vg-w-arch-three-roles-arr)" />
+      <line x1="600" y1="112" x2="580" y2="198" stroke="var(--muted)" stroke-width="1" marker-end="url(#vg-w-arch-three-roles-arr)" />
+      <line x1="600" y1="112" x2="360" y2="198" stroke="var(--muted)" stroke-width="1" stroke-dasharray="3,2" marker-end="url(#vg-w-arch-three-roles-arr)" />
+
+      <line x1="200" y1="80" x2="280" y2="80" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="2,3" />
+      <text x="240" y="74" text-anchor="middle" font-family="Manrope, sans-serif" font-size="10" fill="var(--muted)">task</text>
+      <line x1="440" y1="80" x2="520" y2="80" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="2,3" />
+      <text x="480" y="74" text-anchor="middle" font-family="Manrope, sans-serif" font-size="10" fill="var(--muted)">finding</text>
+
+      <text x="360" y="330" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="12" fill="var(--ink-soft)">agents communicate only via the three structured resources below</text>
+      <text x="360" y="348" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="12" fill="var(--ink-soft)">no message history passes between invocations</text>
+    </svg>
+
+    <div>
+      <div class="detail detail-1">
+        <h3>Director · responsibility</h3>
+        <p>Plans the investigation: looks at Journal + Timeline, decides the next sub-task, dispatches it to an Expert with a narrow scope. Records decisions, observations, hypotheses back into Journal.</p>
+        <p><strong>Does not see</strong>: raw tool output, Expert's chain-of-thought, other Experts' parallel work.</p>
+      </div>
+      <div class="detail detail-2">
+        <h3>Expert · responsibility</h3>
+        <p>Receives one sub-task plus a Journal slice relevant to it. Calls tools (查 audit log、查 IP intelligence、查 metric API). Returns a single structured finding: claim + evidence references.</p>
+        <p><strong>Does not see</strong>: full Journal, the Timeline, other Experts' findings, prior rounds' tool calls.</p>
+      </div>
+      <div class="detail detail-3">
+        <h3>Critic · responsibility</h3>
+        <p>Reviews every Expert finding in one pass. Assigns credibility 0.0–1.0. Builds new Timeline from prior Timeline + Review + Journal, flagging evidential / temporal / logical gaps. Uses a stronger model than Expert.</p>
+        <p><strong>Does not see</strong>: live tool sessions; only get_tool_call / get_tool_result reads.</p>
+      </div>
+      <div class="detail detail-4">
+        <h3>Director's Journal · contents</h3>
+        <p>Six entry types: decision, observation, finding, question, action, hypothesis. Each tagged with phase, round, timestamp. Acts as the Director's working memory across rounds.</p>
+        <p><strong>Property</strong>: append-only; entries are not edited, only superseded by later entries.</p>
+      </div>
+      <div class="detail detail-5">
+        <h3>Critic's Review · contents</h3>
+        <p>One entry per Expert finding: credibility score (Trustworthy ≥ 0.9, Highly-plausible ≥ 0.7, Plausible ≥ 0.5, Speculative ≥ 0.3, Misguided &lt; 0.3), citations to evidence, contradiction notes.</p>
+        <p><strong>Property</strong>: regenerated each round; not a running log but a snapshot.</p>
+      </div>
+      <div class="detail detail-6">
+        <h3>Critic's Timeline · contents</h3>
+        <p>Chronological narrative built only from findings above the credibility threshold, plus a top-3 list of significant gaps (evidential, temporal, logical). Carries an overall narrative-coherence confidence score.</p>
+        <p><strong>Property</strong>: this is the artifact that survives across rounds; everything else is regenerated.</p>
+      </div>
+    </div>
+
+    <figcaption>選 Director / Expert / Critic 看 role 職責；選 Journal / Review / Timeline 看資源結構。注意箭頭：所有 agent 都對某些資源「寫」、某些資源「讀」，但 agent 之間沒有 message edge——溝通完全通過資源中介。</figcaption>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-arch-three-roles');
+        root.querySelectorAll('.role, .resource').forEach((shape) => {
+          shape.addEventListener('click', () => {
+            const targetId = shape.getAttribute('data-target');
+            const radio = root.querySelector('#' + targetId);
+            if (radio) radio.checked = true;
+          });
+          shape.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              shape.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            }
+          });
+        });
+      })();
+    </script>
+  </figure>
+
+  <p>三者的角色分工是這個設計的關鍵。Director 知道「下一步該做什麼」，但不直接看 raw tool output——它的視角是「Journal 上有什麼決策、Timeline 上有什麼可信事實、缺什麼證據要補」。Expert 直接接觸 tool 跑 ReAct loop（5-20 個 tool call），最後輸出一條結構化 finding——claim + evidence_refs + confidence_hint。Critic 用比 Expert 更強的 reasoning model，每輪一次性 review 所有 finding；它有四個工具——get_tool_call、get_tool_result、get_journal_entry、get_timeline_snapshot——可以主動 fetch 原始 evidence，比對 claim 能否從 evidence 推出來，並標出與 Timeline 上 prior fact 的矛盾。Journal 採六種 entry type：decision、observation、finding、question、action、hypothesis，每條帶 phase / round / timestamp，append-only。具體長什麼樣？以 specimen case 為例：</p>
+
+  <figure class="vg-w-journal-entry-types">
+    <style>
+      .vg-w-journal-entry-types { display: grid; gap: var(--s-2); }
+      .vg-w-journal-entry-types input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-journal-entry-types .tabs { display: flex; flex-wrap: wrap; gap: 2px; border-bottom: 1.5px solid var(--ink); }
+      .vg-w-journal-entry-types .tabs label { padding: var(--s-1) var(--s-2); font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; cursor: pointer; color: var(--muted); border: 1px solid transparent; border-bottom: none; transition: color 150ms; user-select: none; }
+      .vg-w-journal-entry-types .tabs label:hover { color: var(--ink); }
+      .vg-w-journal-entry-types .panel { display: none; padding: var(--s-2); background: var(--bg-soft); border-left: 2px solid var(--accent); font-family: var(--mono, ui-monospace, SFMono-Regular, monospace); font-size: var(--fs-sm); }
+      .vg-w-journal-entry-types .panel pre { margin: 0; white-space: pre-wrap; word-break: break-word; line-height: 1.55; font-size: var(--fs-sm); color: var(--ink); }
+      .vg-w-journal-entry-types .panel .gloss { display: block; margin-top: var(--s-2); padding-top: var(--s-1); border-top: 1px dashed var(--muted-2); font-family: var(--serif); font-style: italic; color: var(--muted); white-space: normal; }
+      .vg-w-journal-entry-types .k { color: var(--accent-text); }
+      .vg-w-journal-entry-types .s { color: var(--sage-deep); }
+      .vg-w-journal-entry-types figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+
+      .vg-w-journal-entry-types:has(#vg-w-journal-entry-types-t1:checked) label[for="vg-w-journal-entry-types-t1"],
+      .vg-w-journal-entry-types:has(#vg-w-journal-entry-types-t2:checked) label[for="vg-w-journal-entry-types-t2"],
+      .vg-w-journal-entry-types:has(#vg-w-journal-entry-types-t3:checked) label[for="vg-w-journal-entry-types-t3"],
+      .vg-w-journal-entry-types:has(#vg-w-journal-entry-types-t4:checked) label[for="vg-w-journal-entry-types-t4"],
+      .vg-w-journal-entry-types:has(#vg-w-journal-entry-types-t5:checked) label[for="vg-w-journal-entry-types-t5"],
+      .vg-w-journal-entry-types:has(#vg-w-journal-entry-types-t6:checked) label[for="vg-w-journal-entry-types-t6"] {
+        color: var(--accent-text); border-color: var(--ink); border-bottom: 1.5px solid var(--bg-soft); background: var(--bg-soft); margin-bottom: -1.5px;
+      }
+      .vg-w-journal-entry-types:has(#vg-w-journal-entry-types-t1:checked) .panel-1,
+      .vg-w-journal-entry-types:has(#vg-w-journal-entry-types-t2:checked) .panel-2,
+      .vg-w-journal-entry-types:has(#vg-w-journal-entry-types-t3:checked) .panel-3,
+      .vg-w-journal-entry-types:has(#vg-w-journal-entry-types-t4:checked) .panel-4,
+      .vg-w-journal-entry-types:has(#vg-w-journal-entry-types-t5:checked) .panel-5,
+      .vg-w-journal-entry-types:has(#vg-w-journal-entry-types-t6:checked) .panel-6 { display: block; }
+    </style>
+
+    <input type="radio" id="vg-w-journal-entry-types-t1" name="vg-w-journal-entry-types-sel" checked />
+    <input type="radio" id="vg-w-journal-entry-types-t2" name="vg-w-journal-entry-types-sel" />
+    <input type="radio" id="vg-w-journal-entry-types-t3" name="vg-w-journal-entry-types-sel" />
+    <input type="radio" id="vg-w-journal-entry-types-t4" name="vg-w-journal-entry-types-sel" />
+    <input type="radio" id="vg-w-journal-entry-types-t5" name="vg-w-journal-entry-types-sel" />
+    <input type="radio" id="vg-w-journal-entry-types-t6" name="vg-w-journal-entry-types-sel" />
+
+    <div class="tabs">
+      <label for="vg-w-journal-entry-types-t1">decision</label>
+      <label for="vg-w-journal-entry-types-t2">observation</label>
+      <label for="vg-w-journal-entry-types-t3">finding</label>
+      <label for="vg-w-journal-entry-types-t4">question</label>
+      <label for="vg-w-journal-entry-types-t5">action</label>
+      <label for="vg-w-journal-entry-types-t6">hypothesis</label>
+    </div>
+
+    <div class="panel panel-1"><pre>{
+  <span class="k">"type"</span>: <span class="s">"decision"</span>,
+  <span class="k">"phase"</span>: <span class="s">"triage"</span>,
+  <span class="k">"round"</span>: 3,
+  <span class="k">"ts"</span>: <span class="s">"03:24:11Z"</span>,
+  <span class="k">"body"</span>: <span class="s">"split investigation into 4 parallel Experts; assign by data source (audit-log / IP-intel / deploy / secret-store)"</span>,
+  <span class="k">"rationale_ref"</span>: <span class="s">"hypothesis#2"</span>
+}<span class="gloss">Director-only. Records what was chosen and the prior entry that justified it. Never edited; if reversed, a later decision entry supersedes it.</span></pre></div>
+
+    <div class="panel panel-2"><pre>{
+  <span class="k">"type"</span>: <span class="s">"observation"</span>,
+  <span class="k">"phase"</span>: <span class="s">"triage"</span>,
+  <span class="k">"round"</span>: 1,
+  <span class="k">"ts"</span>: <span class="s">"03:17:42Z"</span>,
+  <span class="k">"body"</span>: <span class="s">"service-account svc-deploy-7 request rate 14× baseline in last 6 minutes"</span>,
+  <span class="k">"source"</span>: <span class="s">"alert-payload"</span>
+}<span class="gloss">A raw fact the Director has read. Distinct from finding — observation is what's directly given by tooling or alerts; finding is what an Expert has interpreted.</span></pre></div>
+
+    <div class="panel panel-3"><pre>{
+  <span class="k">"type"</span>: <span class="s">"finding"</span>,
+  <span class="k">"phase"</span>: <span class="s">"investigate"</span>,
+  <span class="k">"round"</span>: 5,
+  <span class="k">"ts"</span>: <span class="s">"03:31:08Z"</span>,
+  <span class="k">"expert"</span>: <span class="s">"Expert-A"</span>,
+  <span class="k">"claim"</span>: <span class="s">"syscall pattern matches kernel module load signature"</span>,
+  <span class="k">"evidence_refs"</span>: [<span class="s">"tool_call#0044"</span>, <span class="s">"tool_call#0047"</span>],
+  <span class="k">"confidence_hint"</span>: 0.7
+}<span class="gloss">An Expert's structured output, mirrored into the Journal. Critic will later score this against evidence — the final credibility lives in the Review, not here.</span></pre></div>
+
+    <div class="panel panel-4"><pre>{
+  <span class="k">"type"</span>: <span class="s">"question"</span>,
+  <span class="k">"phase"</span>: <span class="s">"investigate"</span>,
+  <span class="k">"round"</span>: 6,
+  <span class="k">"ts"</span>: <span class="s">"03:33:50Z"</span>,
+  <span class="k">"body"</span>: <span class="s">"was a deploy of svc-deploy-7 underway during the 03:17 window?"</span>,
+  <span class="k">"raised_by"</span>: <span class="s">"Critic"</span>,
+  <span class="k">"gap_ref"</span>: <span class="s">"timeline.gap#temporal-1"</span>
+}<span class="gloss">An open question that something downstream must answer. Often surfaced by Critic from a Timeline gap and consumed by Director to plan the next sub-task.</span></pre></div>
+
+    <div class="panel panel-5"><pre>{
+  <span class="k">"type"</span>: <span class="s">"action"</span>,
+  <span class="k">"phase"</span>: <span class="s">"investigate"</span>,
+  <span class="k">"round"</span>: 7,
+  <span class="k">"ts"</span>: <span class="s">"03:34:02Z"</span>,
+  <span class="k">"actor"</span>: <span class="s">"Director"</span>,
+  <span class="k">"body"</span>: <span class="s">"dispatch Expert-D: query deploy_history(svc-deploy-7, 03:00Z—03:30Z)"</span>,
+  <span class="k">"resolves"</span>: <span class="s">"question#11"</span>
+}<span class="gloss">A concrete dispatched task — closes the loop on a question. Lets replay tooling reconstruct exactly which Expert was given which scope.</span></pre></div>
+
+    <div class="panel panel-6"><pre>{
+  <span class="k">"type"</span>: <span class="s">"hypothesis"</span>,
+  <span class="k">"phase"</span>: <span class="s">"triage"</span>,
+  <span class="k">"round"</span>: 2,
+  <span class="k">"ts"</span>: <span class="s">"03:22:30Z"</span>,
+  <span class="k">"body"</span>: <span class="s">"the spike is a benign deploy hook, not lateral movement"</span>,
+  <span class="k">"status"</span>: <span class="s">"open"</span>,
+  <span class="k">"supports"</span>: [], <span class="k">"contradicts"</span>: [<span class="s">"finding#5"</span>]
+}<span class="gloss">An explicit guess the Director is testing. Carries running pointers to evidence that supports or contradicts it — Critic updates these as new findings come in.</span></pre></div>
+
+    <figcaption>六種 entry 都是同一個 schema 家族（type / phase / round / ts / body + 角色相關欄位）。Click 標籤切換看每一型。注意：entry 之間靠 ref 互連（rationale_ref、resolves、gap_ref、supports/contradicts）——這張 graph 是 Director 推理的真正載體，message history 從來不需要存在。</figcaption>
+  </figure>
+
+  <p>用 4 個 Expert 的 specimen case 做 trace：Director 起手在 Journal 寫下「假設這是 lateral movement attempt」，分派 4 個並行 task。Expert D 回報「服務帳號昨晚跑了一次 package install hook」、Expert A 回報「audit log 顯示異常 syscall 跟 kernel module load 模式相符」。Critic 拿到這兩條矛盾線索，發 get_tool_result 看 Expert A 的 raw syscall log，發現 detection rule 用的是 pathname matching，而 package install hook 的 path 剛好落在 kernel module 的 pathname pattern 裡——Critic 把 Expert A 的 finding 評為 0.83 confidence 但在 Timeline attach 一條「detection rule false positive」的 logical gap。Director 下一輪看到這個 gap，停止 escalation。整個調查共 6,046 events，但 Director 在任何單一輪次裡都不需要看超過 ~50 條 Journal entry。</p>
+
+  <p>幻覺只能通過「跟其他證據一致」這道關卡才能進 timeline。Slack 的原話是：「A hallucination can only survive this process if it is more coherent with the body of evidence than any real observation it competes with.」一個孤立的幻覺很容易被擋；一個跟周圍假事實互相支持的幻覺鏈這套系統會放它過去——但這種情況極罕見，因為造一條 self-consistent 的幻覺鏈本身就難。credibility 分為五階：trustworthy (≥0.9)、highly-plausible (≥0.7)、plausible (≥0.5，進 Timeline 的最低門檻)、speculative (≥0.3，留 Journal 不進 Timeline)、misguided (&lt;0.3，直接 dropped)。0.5 這個 threshold 的意義是：低於它的 finding 即使後來被新證據翻案，也不會污染 Timeline 的敘事連貫性。</p>
+
+  <h2>what it actually looks like — the worked example</h2>
+
+  <p>每一輪的呼叫流程概念上像這樣。先看 pseudocode，然後逐句解釋：</p>
+
+  <pre data-kind="pseudocode"><code><em>// 一輪迭代</em>
+loop:
+  <em>// Director 看 Journal + Timeline，決定下一個 sub-task</em>
+  task = director.plan(journal, timeline)
+  if done(timeline): break
+
+  <em>// Expert 拿 task 與相關的 Journal 切片（不是整個 history）</em>
+  <em>// Journal slice 大小是 O(任務數) 而非 O(token 數)</em>
+  slice = journal.slice(relevant_to: task)
+  finding = expert.investigate(task, slice)
+
+  <em>// Critic 評估 finding，寫入 Review</em>
+  <em>// Critic 可以用 get_tool_call / get_tool_result 主動 fetch 證據</em>
+  review = critic.assess(finding, evidence_access: tool_results)
+  reviews.append(review)
+
+  <em>// 若 review 通過門檻，把它合進 Timeline</em>
+  if review.credibility &gt;= 0.5:
+    timeline = critic.consolidate(
+      reviews,
+      prior: timeline,
+      journal: journal,
+    )
+
+  <em>// Director 把這一輪結論記進 Journal</em>
+  journal.append({
+    type: "finding",
+    task: task,
+    finding: finding,
+    review: review,
+    phase: current_phase,
+    round: round_n,
+    ts: now,
+  })
+</code></pre>
+
+  <p>幾個重點：第一，<code>expert.investigate</code> 的輸入是 task + Journal 的相關切片，不是「完整的 chat history」。Journal 的切片大小是可預測的（O(任務數) 而非 O(token 數)）。每個 task 約對應 Journal 上幾條 entry，幾百個 task 累積下來的 slice 也才幾十條 entry——遠比 message history 的線性 token 累積友善。</p>
+
+  <p>第二，Critic 在 consolidate 時主動標出邏輯缺口，這些缺口會回饋給 Director，下一輪的 plan 會優先補洞。Slack 文件提到 Critic 找的是三類缺口：evidential（缺證據）、temporal（時序對不上）、logical（推論斷層）。Top-3 gap 直接寫進 Timeline 的 metadata，Director 下一輪一定會看到。這把「Director 該問什麼」從「LLM 隨意 brainstorm」變成「結構化從 gap 推回 task」，是這套系統從「隨機探索」收斂到「目標導向調查」的關鍵機制。</p>
+
+  <p>第三，Critic 用的是「比 Expert 更強的模型」。例如 Expert 用一般推理模型、Critic 用 reasoning 模型。這把驗證的品質與成本分離開——Expert 跑得快但會錯，Critic 跑得貴但少錯。為什麼這個 split 划算？因為 Expert 要做的事是 tool-calling（每個 task 可能要呼叫 5-20 個 tool），這部分用一般模型就夠；Critic 要做的事是 reasoning over evidence（看一堆 finding，判斷哪條站得住），這部分 reasoning model 顯著優於一般模型——而且 Critic 只跑一次/輪，token 量遠小於 Expert，貴一點的單價也吃得起。這個非對稱的模型分配是把 LLM 成本控制在合理範圍的關鍵。</p>
+
+  <p>第四，整個 loop 沒有「把上一輪 chat 接到 prompt」這個動作。每個 agent 在被呼叫時，prompt 是「靜態 instruction + 當前 Journal/Timeline 切片」——stateless invocation 的形狀，跟 HTTP request 一樣可以分散、可以 retry、可以 audit。同一輪可以平行跑 4 個 Expert、結果寫回 Journal 不會互相污染——這是 specimen case 能在合理時間內處理 6,046 events 的關鍵。</p>
+
+  <p>看看 Critic 的評分如何分布在生產資料上。Slack 累積了超過 170K 條 reviewed finding：</p>
+
+  <figure class="vg-w-chart-credibility">
+    <style>
+      .vg-w-chart-credibility { display: grid; gap: var(--s-2); }
+      .vg-w-chart-credibility svg { width: 100%; height: auto; }
+      .vg-w-chart-credibility figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+
+    <svg viewBox="0 0 720 340" preserveAspectRatio="xMidYMid meet">
+      <g id="vg-w-chart-credibility-axes"></g>
+      <g id="vg-w-chart-credibility-bars"></g>
+      <g id="vg-w-chart-credibility-annot"></g>
+    </svg>
+
+    <figcaption>Slack 在系統上線後累積超過 170,000 條 reviewed finding 的 Critic 評分分布。Threshold 是 0.5——任何低於 0.5 的 finding 從不進 Timeline。Source: Slack Engineering, May 2026.</figcaption>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-chart-credibility');
+        const axesG = root.querySelector('#vg-w-chart-credibility-axes');
+        const barsG = root.querySelector('#vg-w-chart-credibility-bars');
+        const annotG = root.querySelector('#vg-w-chart-credibility-annot');
+
+        const data = [
+          { tier: 'trustworthy',     range: '0.9 — 1.0',  pct: 37.7, color: 'var(--sage-deep)', above: true },
+          { tier: 'highly-plausible',range: '0.7 — 0.89', pct: 25.4, color: 'var(--sage)',      above: true },
+          { tier: 'plausible',       range: '0.5 — 0.69', pct: 11.1, color: 'var(--ink-deep)',  above: true },
+          { tier: 'speculative',     range: '0.3 — 0.49', pct: 10.4, color: 'var(--muted)',     above: false },
+          { tier: 'misguided',       range: '0.0 — 0.29', pct: 15.4, color: 'var(--accent)',    above: false },
+        ];
+
+        const X0 = 80, X1 = 690, Y0 = 250, Y1 = 50;
+        const maxY = 40;
+        const yOf = v => Y0 - (v / maxY) * (Y0 - Y1);
+        const xOf = i => X0 + (i + 0.5) * (X1 - X0) / data.length;
+        const barW = (X1 - X0) / data.length * 0.6;
+
+        const NS = 'http://www.w3.org/2000/svg';
+        function el(tag, attrs) {
+          const e = document.createElementNS(NS, tag);
+          for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+          return e;
+        }
+
+        axesG.appendChild(el('line', { x1: X0, y1: Y0, x2: X1, y2: Y0, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+        axesG.appendChild(el('line', { x1: X0, y1: Y0, x2: X0, y2: Y1, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+
+        for (let v = 0; v <= maxY; v += 10) {
+          const y = yOf(v);
+          axesG.appendChild(el('line', { x1: X0 - 4, y1: y, x2: X0, y2: y, stroke: 'var(--muted-2)' }));
+          axesG.appendChild(el('line', { x1: X0, y1: y, x2: X1, y2: y, stroke: 'var(--muted-2)', 'stroke-dasharray': '2,4', opacity: 0.5 }));
+          const t = el('text', { x: X0 - 8, y: y + 4, 'text-anchor': 'end', 'font-family': 'Manrope, sans-serif', 'font-size': 11, fill: 'var(--muted)' });
+          t.textContent = String(v) + '%';
+          axesG.appendChild(t);
+        }
+
+        const yLabel = el('text', { x: 20, y: (Y0 + Y1) / 2, 'text-anchor': 'middle', 'font-family': 'EB Garamond, serif', 'font-size': 13, fill: 'var(--muted)', transform: `rotate(-90 20 ${(Y0 + Y1) / 2})` });
+        yLabel.textContent = 'share of findings';
+        axesG.appendChild(yLabel);
+
+        const thrY = yOf(0);
+        const xThrAt = X0 + 3 * (X1 - X0) / data.length;
+        annotG.appendChild(el('line', { x1: xThrAt, y1: Y1 - 10, x2: xThrAt, y2: Y0 + 30, stroke: 'var(--accent)', 'stroke-width': 1, 'stroke-dasharray': '4,3' }));
+        const thrLabel = el('text', { x: xThrAt, y: Y1 - 18, 'text-anchor': 'middle', 'font-family': 'IM Fell English, serif', 'font-style': 'italic', 'font-size': 12, fill: 'var(--accent-text)' });
+        thrLabel.textContent = 'threshold = 0.5';
+        annotG.appendChild(thrLabel);
+        const thrLabel2 = el('text', { x: xThrAt - 4, y: Y0 + 50, 'text-anchor': 'end', 'font-family': 'Manrope, sans-serif', 'font-size': 11, fill: 'var(--accent-text)' });
+        thrLabel2.textContent = '↑ enters Timeline';
+        annotG.appendChild(thrLabel2);
+        const thrLabel3 = el('text', { x: xThrAt + 4, y: Y0 + 50, 'text-anchor': 'start', 'font-family': 'Manrope, sans-serif', 'font-size': 11, fill: 'var(--muted)' });
+        thrLabel3.textContent = 'dropped ↓';
+        annotG.appendChild(thrLabel3);
+
+        data.forEach((d, i) => {
+          const x = xOf(i) - barW / 2;
+          const y = yOf(d.pct);
+          const h = Y0 - y;
+          barsG.appendChild(el('rect', { x, y, width: barW, height: h, fill: d.color, opacity: 0.78 }));
+
+          const vt = el('text', { x: xOf(i), y: y - 8, 'text-anchor': 'middle', 'font-family': 'Manrope, sans-serif', 'font-size': 12, fill: 'var(--ink)' });
+          vt.textContent = d.pct.toFixed(1) + '%';
+          barsG.appendChild(vt);
+
+          const lt = el('text', { x: xOf(i), y: Y0 + 18, 'text-anchor': 'middle', 'font-family': 'EB Garamond, serif', 'font-size': 12, fill: 'var(--ink)' });
+          lt.textContent = d.tier;
+          axesG.appendChild(lt);
+
+          const lt2 = el('text', { x: xOf(i), y: Y0 + 32, 'text-anchor': 'middle', 'font-family': 'Manrope, sans-serif', 'font-size': 10, fill: 'var(--muted)' });
+          lt2.textContent = d.range;
+          axesG.appendChild(lt2);
+        });
+
+        const tot = el('text', { x: (X0 + X1) / 2, y: 28, 'text-anchor': 'middle', 'font-family': 'EB Garamond, serif', 'font-size': 14, fill: 'var(--ink)' });
+        tot.textContent = '170,000+ reviewed findings — credibility distribution';
+        annotG.appendChild(tot);
+
+        const note = el('text', { x: X1, y: Y1 - 18, 'text-anchor': 'end', 'font-family': 'IM Fell English, serif', 'font-style': 'italic', 'font-size': 12, fill: 'var(--ink-soft)' });
+        note.textContent = '63.1% enter Timeline · 25.8% dropped · 11.1% borderline';
+        annotG.appendChild(note);
+      })();
+    </script>
+  </figure>
+
+  <p>讀這張圖的時候，注意三點。第一，trustworthy + highly-plausible 合計 63.1%——這是「乾淨的」evidence base，Timeline 主要建立在這上面。第二，misguided 15.4% 是 hallucination 的「漏網上界」：如果某條 finding 完全沒有證據支持、或誤讀資料，它就掉在這一段，根本進不了 Timeline。Slack 提供的這個數字相當珍貴——它把「LLM 在 long-run agentic 任務上的幻覺率」這個一直靠估計的數字，給出了一個可審計的下界，也讓 hallucination 從「玄學討論」變成「可觀測指標」。</p>
+
+  <p>第三，speculative 10.4% 與 plausible 11.1% 加起來 21.5% 是「borderline」區。這些 finding 的命運取決於 threshold 設在哪：threshold = 0.5 的話 speculative 全部掉、plausible 全部進；threshold = 0.7 的話 plausible 也掉。Slack 預設選 0.5，但這個 dial 是可調的——對「不能漏 alert 但可以多查幾個 false positive」的 use case 可以調低；對「signal-to-noise 要極高」的 use case 可以調高到 0.7。實務上把 threshold 變成 use-case-dependent 的旋鈕、而非寫死的常數，是把這套系統部署到不同領域時最值得保留的彈性。</p>
+
+  <p>把 170K 這個母體再進一步拆解：misguided + speculative 合計 25.8% 是這套系統的「假設拒絕率」——如果 Expert 在沒有 Critic 的情況下直接輸出，這 25.8% 會原樣進下游 incident report、進 on-call paging。15.4% 純粹 misguided 的部分裡，常見模式有三種：(1) Expert 對 raw evidence 的解讀錯誤（例如把 timestamp 誤讀成 epoch ms vs ms-since-boot）；(2) Expert 把不相關的 evidence 強行串連（confirmation bias 的 LLM 版本）；(3) Expert 直接編造一條沒有 evidence 支持的 claim（純 hallucination）。第三類最危險——好在 Critic 用 get_tool_result 主動 verify 的設計能把它幾乎完全攔下。整個系統的 false-positive rate（trustworthy 但其實是錯的）沒有官方數字，但從 specimen case 的 0.83 false positive 看，存在但可接受——重點在於 false positive 的 evidence chain 是 traceable 的，事後可以重現為什麼系統做出那個判斷。</p>
+
+  <p>現在來看 trade-off 的另一面：投入結構化資源的 token 成本是值得的嗎？這張互動圖讓你拖動 investigation 的長度，看「naive message-history」與「three-resource」兩種設計的 context 使用差別：</p>
+
+  <figure class="vg-w-param-context-budget">
+    <style>
+      .vg-w-param-context-budget { display: grid; grid-template-rows: auto auto 1fr auto; gap: var(--s-2); }
+      .vg-w-param-context-budget .controls { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); flex-wrap: wrap; }
+      .vg-w-param-context-budget .controls input { flex: 1; min-width: 180px; accent-color: var(--accent); height: 32px; }
+      .vg-w-param-context-budget .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 6ch; text-align: right; }
+      .vg-w-param-context-budget .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); }
+      .vg-w-param-context-budget .stat { padding: var(--s-1) var(--s-2); border-left: 2px solid var(--muted-2); }
+      .vg-w-param-context-budget .stat .k { font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+      .vg-w-param-context-budget .stat .v { font-family: var(--display); font-size: 1.4rem; color: var(--ink); font-variant-numeric: tabular-nums; }
+      .vg-w-param-context-budget .stat.accent .v { color: var(--accent-text); }
+      .vg-w-param-context-budget .stat.sage .v { color: var(--sage-deep); }
+      .vg-w-param-context-budget svg { width: 100%; height: auto; }
+      .vg-w-param-context-budget figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+
+    <div class="controls">
+      <label for="vg-w-param-context-budget-x">investigation length =</label>
+      <input id="vg-w-param-context-budget-x" type="range" min="1" max="500" step="1" value="100" />
+      <span class="readout" id="vg-w-param-context-budget-x-readout">100</span>
+      <span>tool calls</span>
+    </div>
+
+    <div class="stats">
+      <div class="stat accent">
+        <div class="k">naive history tokens</div>
+        <div class="v" id="vg-w-param-context-budget-naive">—</div>
+      </div>
+      <div class="stat sage">
+        <div class="k">three-resource tokens</div>
+        <div class="v" id="vg-w-param-context-budget-struct">—</div>
+      </div>
+      <div class="stat">
+        <div class="k">savings ratio</div>
+        <div class="v" id="vg-w-param-context-budget-ratio">—</div>
+      </div>
+    </div>
+
+    <svg viewBox="0 0 720 320" preserveAspectRatio="xMidYMid meet">
+      <line x1="70" y1="270" x2="700" y2="270" stroke="var(--muted-2)" stroke-width="1" />
+      <line x1="70" y1="30"  x2="70"  y2="270" stroke="var(--muted-2)" stroke-width="1" />
+
+      <text x="385" y="302" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--muted)">investigation length (tool calls)</text>
+      <text x="22" y="150" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--muted)" transform="rotate(-90 22 150)">prompt tokens (log scale)</text>
+
+      <g id="vg-w-param-context-budget-axticks"></g>
+
+      <line id="vg-w-param-context-budget-ctxlimit" x1="70" y1="70" x2="700" y2="70" stroke="var(--accent)" stroke-width="1" stroke-dasharray="4,3" opacity="0.7" />
+      <text x="700" y="64" text-anchor="end" font-family="IM Fell English, serif" font-style="italic" font-size="12" fill="var(--accent-text)">200K context limit</text>
+
+      <path id="vg-w-param-context-budget-naive-path" fill="none" stroke="var(--accent)" stroke-width="2" />
+      <path id="vg-w-param-context-budget-struct-path" fill="none" stroke="var(--sage-deep)" stroke-width="2" />
+
+      <circle id="vg-w-param-context-budget-naive-dot" r="5" fill="var(--accent)" />
+      <circle id="vg-w-param-context-budget-struct-dot" r="5" fill="var(--sage-deep)" />
+
+      <g font-family="Manrope, sans-serif" font-size="12">
+        <rect x="520" y="100" width="14" height="2" fill="var(--accent)" />
+        <text x="540" y="104" fill="var(--ink)">naive: O(N · t)</text>
+        <rect x="520" y="120" width="14" height="2" fill="var(--sage-deep)" />
+        <text x="540" y="124" fill="var(--ink)">three-resource: O(log N · t)</text>
+      </g>
+
+      <text x="385" y="20" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">prompt-token cost vs investigation length</text>
+    </svg>
+
+    <figcaption>每個 tool call 平均產生 ~250 token 輸出（保守估計）。Naive 設計把全部歷史塞進 prompt（線性 N）；three-resource 設計只塞 Journal slice + Timeline + Review（次線性 log N，因為 Journal 切片大小不隨 N 增長）。橫向虛線是 200K context window 的上界——naive 在 ~800 calls 撞線，three-resource 在 ~30,000 calls 才會撞線。</figcaption>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-param-context-budget');
+        const input = root.querySelector('input');
+        const readout = root.querySelector('#vg-w-param-context-budget-x-readout');
+        const naiveStat = root.querySelector('#vg-w-param-context-budget-naive');
+        const structStat = root.querySelector('#vg-w-param-context-budget-struct');
+        const ratioStat = root.querySelector('#vg-w-param-context-budget-ratio');
+        const naivePath = root.querySelector('#vg-w-param-context-budget-naive-path');
+        const structPath = root.querySelector('#vg-w-param-context-budget-struct-path');
+        const naiveDot = root.querySelector('#vg-w-param-context-budget-naive-dot');
+        const structDot = root.querySelector('#vg-w-param-context-budget-struct-dot');
+        const axticks = root.querySelector('#vg-w-param-context-budget-axticks');
+
+        const X0 = 70, X1 = 700, Y0 = 270, Y1 = 30;
+        const N_MAX = 500;
+        const TOKENS_PER_CALL = 250;
+        const BASE_INSTR = 1500;
+        const CTX_LIMIT = 200000;
+
+        const Y_MIN_LOG = Math.log10(1000);
+        const Y_MAX_LOG = Math.log10(1000000);
+
+        function xOf(n) { return X0 + (n / N_MAX) * (X1 - X0); }
+        function yOf(tokens) {
+          const lv = Math.log10(Math.max(1000, tokens));
+          const clamped = Math.max(Y_MIN_LOG, Math.min(Y_MAX_LOG, lv));
+          return Y0 - ((clamped - Y_MIN_LOG) / (Y_MAX_LOG - Y_MIN_LOG)) * (Y0 - Y1);
+        }
+
+        function naiveTokens(n) { return BASE_INSTR + n * TOKENS_PER_CALL; }
+        function structTokens(n) {
+          const journalSlice = 80 * Math.log2(Math.max(2, n));
+          const timeline = 2000 + 30 * Math.sqrt(n);
+          const review = 1200;
+          return BASE_INSTR + journalSlice + timeline + review;
+        }
+
+        const NS = 'http://www.w3.org/2000/svg';
+        function el(tag, attrs) {
+          const e = document.createElementNS(NS, tag);
+          for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+          return e;
+        }
+
+        const tickValues = [1000, 10000, 100000, 1000000];
+        tickValues.forEach(v => {
+          const y = yOf(v);
+          axticks.appendChild(el('line', { x1: X0 - 4, y1: y, x2: X0, y2: y, stroke: 'var(--muted-2)' }));
+          axticks.appendChild(el('line', { x1: X0, y1: y, x2: X1, y2: y, stroke: 'var(--muted-2)', 'stroke-dasharray': '2,4', opacity: 0.4 }));
+          const label = v >= 1000000 ? '1M' : (v >= 1000 ? (v / 1000) + 'K' : v);
+          const t = el('text', { x: X0 - 8, y: y + 4, 'text-anchor': 'end', 'font-family': 'Manrope, sans-serif', 'font-size': 11, fill: 'var(--muted)' });
+          t.textContent = label;
+          axticks.appendChild(t);
+        });
+        [0, 100, 200, 300, 400, 500].forEach(n => {
+          const x = xOf(n);
+          axticks.appendChild(el('line', { x1: x, y1: Y0, x2: x, y2: Y0 + 4, stroke: 'var(--muted-2)' }));
+          const t = el('text', { x, y: Y0 + 18, 'text-anchor': 'middle', 'font-family': 'Manrope, sans-serif', 'font-size': 11, fill: 'var(--muted)' });
+          t.textContent = String(n);
+          axticks.appendChild(t);
+        });
+
+        const limY = yOf(CTX_LIMIT);
+        const limLine = root.querySelector('#vg-w-param-context-budget-ctxlimit');
+        if (limLine) { limLine.setAttribute('y1', limY); limLine.setAttribute('y2', limY); }
+
+        const naivePts = [], structPts = [];
+        for (let n = 1; n <= N_MAX; n++) {
+          naivePts.push(`${n === 1 ? 'M' : 'L'} ${xOf(n).toFixed(1)} ${yOf(naiveTokens(n)).toFixed(1)}`);
+          structPts.push(`${n === 1 ? 'M' : 'L'} ${xOf(n).toFixed(1)} ${yOf(structTokens(n)).toFixed(1)}`);
+        }
+        naivePath.setAttribute('d', naivePts.join(' '));
+        structPath.setAttribute('d', structPts.join(' '));
+
+        function fmt(n) {
+          if (n >= 1000000) return (n / 1000000).toFixed(2) + 'M';
+          if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
+          return String(Math.round(n));
+        }
+
+        function update() {
+          const n = Number(input.value);
+          readout.textContent = String(n);
+          const a = naiveTokens(n);
+          const b = structTokens(n);
+          naiveStat.textContent = fmt(a);
+          structStat.textContent = fmt(b);
+          ratioStat.textContent = (a / b).toFixed(1) + '×';
+          naiveDot.setAttribute('cx', xOf(n));
+          naiveDot.setAttribute('cy', yOf(a));
+          structDot.setAttribute('cx', xOf(n));
+          structDot.setAttribute('cy', yOf(b));
+        }
+
+        input.addEventListener('input', update);
+        update();
+      })();
+    </script>
+  </figure>
+
+  <p>拖到 N = 100：naive 已經要 26.5K 個 token，structured 仍只要 ~6K，差距 ~4×。拖到 N = 500：naive 飆到 ~126K（200K context 用掉 63%），structured 維持在 ~5K，差距 ~25×。再外推：naive 在 ~800 tool calls 就會撞 200K context limit；structured 設計在 ~30,000 tool calls 才會撞線。這個一到兩個數量級的差距，就是「換掉 paradigm 而非補洞」的回報。</p>
+
+  <p>注意這張圖的隱含假設：structured 設計的 token 數是「LLM 看到的 prompt size」，不是「系統處理的 token 總量」。Critic 每輪也要看相當多的 evidence（透過 get_tool_call fetch），但這些 fetch 不堆進下一輪的 prompt，所以 context 不會雪球滾大。系統總 token 開銷沒降，但「單次 LLM call 的 prompt size」降得很厲害——而後者才是 context window 的瓶頸。</p>
+
+  <h2>when you'd reach for it</h2>
+
+  <p>這個三件式設計適合三類場景：</p>
+
+  <p>第一，任務時長以小時計、需要幾百次 tool call 的調查 / planning agent。Slack 自己的場景是安全調查，其他類似的：incident postmortem 自動化、bug bisection、合規 audit、code review for large PR、reverse-engineering 一個未知 binary。這些任務有共同點——evidence 是 high-dimensional 的（很多 source 之間互相 cross-reference）、結論需要 traceability、且錯了一條中間 finding 可能整個下游推論都歪掉。把這類任務交給「滾大的 chat history」式 agent，相當於請一個資深工程師看著一堆未排序的便利貼做決策——技術上可行，但任何規模放大都會失敗。</p>
+
+  <p>第二，容忍「驗證有延遲」的 use case——Critic 的評分必然落後 Expert 一步。如果你做的是 user-facing 對話 agent，user 等不了 Critic 跑完才回答；但如果是 background investigation，Critic 多花一分鐘來確認 finding 站得住，是合理的延遲。實際上 Critic 用 reasoning model 跑通常要 30 秒到 2 分鐘，每輪都要等——但因為 Critic 看的是已經彙總過的 finding，而不是原始 evidence stream，這個延遲是可預測的、可以平行化的（多條 finding 同時送 Critic 處理）。對 background agent 來說，「多花 30 秒、少誤判一條」幾乎永遠是划算的。</p>
+
+  <p>第三，對幻覺 cost 敏感的應用：安全、合規、醫療、法務、財務分析。這些領域的特徵是「一個錯誤結論的下游成本遠大於多跑一個 Critic 的成本」。15.4% 的 hallucination 過濾率，在這些場景換算成減少的事故 / 法律暴露 / 醫療誤判，回報是巨大的。換個角度說：在 high-stakes 領域，「Critic 多跑一次」這個成本最多是幾分美金；「一條 hallucination 進了 final report」的成本可能是幾萬美金的事故處理、幾十萬美金的合規罰款、甚至更高量級的責任承擔。這個 ratio 不對等到讓 Critic 永遠值得跑。</p>
+
+  <p>不適合的場景有三類：</p>
+
+  <p>第一，秒級回應的對話 agent——三角驗證的延遲吃不消。chat assistant、code completion、語音助理這類，Critic 來不及跑就要回答 user。對這類 agent，message-history-style 加上短 context window 就夠。</p>
+
+  <p>第二，任務本質就是「按順序執行幾個固定步驟」——message history 反而比結構化資源輕量。例如 ETL pipeline 的 LLM step、CI/CD 的 release note 生成、固定模板的報表填寫。這些任務沒有「需要回頭比對證據」的特性，結構化資源是 overkill。判斷標準很簡單：如果你的 agent 主要做的是「執行」而非「調查」、流程是線性的而非樹狀的、需要 verify 的中間結論少於三五條，那 message history + 短 context 就夠，三件式只會增加 latency 跟維護成本。</p>
+
+  <p>第三，小型 agent 系統，工程開銷比節省的 token 更貴。三件式的成本是「每個 finding 多一次 Critic LLM 呼叫」與「維護三份共享資源的 state machine」。如果你的 agent 每天只跑十次任務、每次 tool call 不到 10 個，那麼三件式的 setup cost 一輩子也賺不回來。要 build 這套基礎設施，至少要寫 Journal 的 append-only 存儲（外加 schema 演進）、Critic 的 evaluation prompt 與 evidence-fetching tool、Timeline 的 consolidation logic、以及三者的 versioning 與 observability——保守估計兩三人月的工程投入。小團隊用 LangChain + sliding window 三天就能跑起來的東西，沒必要從一開始就上三件式。</p>
+
+  <p>還有一個間接好處：因為三份資源都是「結構化 + 帶時間戳」的，系統可以在事後 audit——回放 Director 在每一步看到的 Journal 切片，重現 Critic 為什麼把某條 finding 評為 misguided。傳統「滾大的 message history」式 agent 在出事時除錯極為困難——你能拿到的是一個 4MB 的 prompt-log，沒有結構。Journal 的 append-only 屬性同時把 replay-from-Journal 的能力預留好了：截到 round N、餵給 Director、看它在那個時點會不會做出不同決策。</p>
+
+  <p>對工程實踐還有兩個附加價值。第一，三份資源天然是好的 unit-test 介面——可以 mock 一個 Journal 餵給 Director，斷言它選了哪個 task；可以 mock 一組 finding 餵給 Critic，斷言它怎麼評分。Message-history 式 agent 的測試是「給一段 chat 看 agent 回什麼」，介面太 fuzzy。第二，三份資源是 typed structure 而非 free text，可以直接拉 metric——Critic 評分中位數、speculative 占比、Timeline 上 gap 數量的曲線——把 agent 系統從「黑盒推理」變成「有 dashboard 的服務」。</p>
+
+  <p>最後一個 caveat：這篇講的是「single investigation」尺度上的設計，不直接回答跨 session 的記憶該怎麼存。對「跨 session 學習、需要長期 memory consolidation」的場景，要再疊一層 episodic memory store 或 case-based reasoning 索引——但這些是疊在三件式之上，不是替代它。把 single-session 的 context 管理先做對，跨 session 的問題才有清楚的介面可以接。</p>
+
+  <p class="vg-deep-closer"><strong>Take-away</strong>：long-run agent 的工作記憶不該是訊息歷史——把它換成幾份角色化的結構資源（決策、評分、敘事），加上一個「比 Expert 更強的 Critic」做幻覺過濾，agent 系統就從「越跑越亂」變成「越跑越收斂」。</p>
+</div>
