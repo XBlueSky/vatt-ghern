@@ -16,11 +16,11 @@ For each archetype the library has two files:
 
 | Archetype | Status | Source post (if present) |
 |---|---|---|
-| narrative | present | src/posts/2026/05/20/deep-discord-voice-outage.html |
+| narrative | present | src/posts/2026/05/19/deep-notion-vector-search.html |
 | technical-deep-dive | present | src/posts/2026/05/19/deep-modal-cold-starts.html |
 | investigation | empty | - |
 | comparison | present | src/posts/2026/05/17/deep-cpp26-simd-critique.html |
-| explainer | present | src/posts/2026/05/18/deep-slack-agent-context.html |
+| explainer | present | src/posts/2026/05/20/deep-turso-quint-sqlite.html |
 | freeform | present | src/posts/2026/05/20/deep-meta-reel-friends.html |
 
 When status is `<empty>`, the author sub-agent's archetype-fallback

@@ -1,742 +1,1127 @@
 <header class="vg-deep-hero">
-  <p class="vg-deep-opener">在 us-east1-b 那個 12:13 PDT 的時刻，一份 Kubernetes 部署檔把 session 管理 pod 的副本數砍了一半，graceful draining 還沒跑完，17% 的 session 就被硬切斷——這道裂口最終要花掉 voice 團隊 3 小時 17 分鐘，並讓 15 台 voice syncer 的 Erlang mailbox 同時膨脹到接近一百萬則訊息才補得起來。</p>
-  <h1 class="vg-post-title">Discord 3/25 語音崩盤覆盤——一行誤設掀翻 voice control plane</h1>
+  <p class="vg-deep-opener">2023 年 11 月 Notion AI Q&amp;A 上線那一刻，數百萬 workspace 同時排上了候補名單；負責後端向量搜尋的小組買進了一批 dedicated pod，storage 與 compute 綁在同一台機器，按「資料庫開機時間」計費。兩年之後，這些 pod 全部消失，取而代之的是 Turbopuffer 的 object-storage namespace、DynamoDB 裡的 xxHash64、以及一條跑在 Ray Serve 上的 embedding 服務——總成本砍掉九成、p50 query latency 從 100 ms 壓到 50 ms。</p>
+  <h1 class="vg-post-title">{{ title }}</h1>
 </header>
 
 <div class="vg-post-prose">
+  <p>
+    <span class="vg-dropcap">這</span>篇是 Notion 向量搜尋兩年的演進——四個階段，每一段都對應一條成本曲線或一個架構瓶頸，沒有 big-bang rewrite。組件本身並不稀奇（<code>Spark</code>、<code>Kafka</code>、<code>Turbopuffer</code>、<code>Ray</code>、<code>DynamoDB</code> 都是現成的），值得記下的是每一次切換背後的判斷：什麼條件下，「換掉這一塊」比「再優化原本那塊」便宜。
+  </p>
 
-<p><span class="vg-dropcap">這</span>是一份標準的 Elixir 服務遷上 Kubernetes 的部署，按照變更紀錄上的描述「沒什麼新鮮事」——直到 12:13 PDT 那一刻，那份 manifest 把 us-east1-b 區的 sessions service pod 副本數壓到只剩一半，安全機制還沒來得及把記憶體裡的 GenServer 狀態交棒出去，pod 就先被排程器殺掉了。</p>
+  <p>
+    四段的順序不是任意的：每段都依賴前段提供的可量測信號。pod → serverless 拆掉的是 over-provision 固定成本，順帶把容量成本從 dedicated SSD 變成 object storage；後者一旦切到，下一段才有條件再砍重複工作（hash diff 的儲存建在 DynamoDB 上、跟 vector storage 解耦）。下面這個 scroll-driven walkthrough 把時間線攤開——每一格的重點不是「畫了哪些 box」，而是「這一段砍掉了什麼計費邊界」。
+  </p>
 
-<p>Discord 的工程師 Bo Ingram 與 Stephen Birarda 在事後報告開頭引了一個很久沒聽到的比喻：「The sad trombone haunts our dreams. Womp, womp, womp...」這不是文采上的修飾——你看著儀表板上 mailbox 曲線從 0 萬一路漲到 100 萬，指令照理該讓它下來，但它就是不動，或者跌一下又被新湧進來的流量打回去。這一篇按時間順序復現那 3 小時 17 分鐘，並把前三次救火失敗、第四次成功、後續結構修補的邏輯拼回去。</p>
-
-<h2>一份誤設的 manifest——故事從這裡長出來</h2>
-
-<p>整個事件的「起爆點」其實只有一行。</p>
-
-<p>一份 Kubernetes deployment 的 replicas 從原本的數值改成大約一半——就這麼簡單。</p>
-
-<p>這個變更發生在 Discord 正在把 Elixir 服務逐步搬上 Kubernetes 的過程中。當時的目標是讓 sessions service——也就是負責管理「每一個使用者裝置 ↔ 連線」對應關係的核心服務——能享受 horizontal pod autoscaler 與滾動更新的好處。</p>
-
-<p>問題不在「縮減副本」這個動作本身，而在於 graceful draining 沒跑完。Elixir 的 sessions service 在每個 pod 裡跑著數以萬計的 GenServer process，每個都拿著一個連線中的裝置 in-memory state；要把它們平順搬到另一台 node，必須等 hibernate、序列化、跨 node 重建跑完。Kubernetes 的預設 terminationGracePeriodSeconds 通常不夠這套儀式跑完——那次部署沒有調高，也沒有設 admission webhook 去攔截不安全的縮容。</p>
-
-<p>結果就是 sessions service 在那一瞬間被「ungracefully stopped」掉了一批 pod。</p>
-
-<p>事後報告給出的數字是：<strong>「17% of sessions across Discord were ungracefully stopped」</strong>。</p>
-
-<p>更關鍵的是，這 17% 並不是均勻分散——它們全集中在 us-east1-b 同一個 zone 裡。當這些 session 嘗試重連、轉到鄰近 zone 時，重連的流量就會形成一道朝著 us-east1-c 與 us-east1-d 灌過去的「reconnection storm」。Bug 出在 us-east1-b 的一個 deployment 設定，但被它打垮的是 us-east1-c、us-east1-d，最後是全球的 voice syncer fleet——只要 cross-zone failover 機制存在，局部問題都有機會經 failover 變成全域問題。</p>
-
-<h3>從 sessions 切到 gateway——兩分鐘內第一波擴散</h3>
-
-<p>12:13 到 12:15 PDT 之間，Erlang/OTP 的 process linking 機制把這場意外從局部變成了全域。Elixir 用「let it crash」加 supervisor 樹：每個 GenServer 異常退出時，monitor 會發 <code>{:DOWN, ref, :process, pid, reason}</code> 給所有訂閱者。Discord 的 realtime 系統是高度互鏈的——每個 session 同時被 guild process、presence tracker、gateway connection 訂閱。事後報告用了 <strong>「flurry of messages」</strong> 來形容這道兩分鐘內爆發的訊號雜訊；每條清理路徑單看都合理，同時跑這麼多次本身就是負載。</p>
-
-<p>這道雜訊很快撞上 gateway service。當前端 session 斷線、client SDK 立刻指數退避重連，gateway 同時要處理「上一批正在拆」與「下一批正在建」兩股流量。每個 host 原本有 session start rate limit 自保，但這個限制值在遷移過程中被「miscalibrated post-migration」——新 host 的設定值沒按新 pod 的 CPU/記憶體比例重算。Gateway 在湧入的 reconnection 面前等於沒有保護，us-east1-b 節點的記憶體幾乎垂直拉升到 100%；OOM killer 介入後，流量甩到 us-east1-c 與 us-east1-d——失敗自此跨越 zone。reconnection storm 在前 15 分鐘裡讓所有 zone 都進入「異常負載」，當下游 voice syncers 在第 30 分鐘開始撐不住時，整個 stack 已經處在「沒有任何 zone 還有 head-room」的脆弱狀態。</p>
-
-<h2>cascade 的真正長尾——voice syncers 的 mailbox 是怎麼漲到一百萬的</h2>
-
-<p>從 12:13 一直到 15:30，最難解的部分都集中在一個平淡無奇的內部服務：voice syncers——它「manages SFU endpoint placement across more than 25,000 external instances」。換成白話：你按下「加入語音頻道」時，session 端不會直接跟 SFU（Selective Forwarding Unit）談判，而是先打到 voice syncers，由它根據負載與地理位置決定接到哪台 SFU，再透過 HTTPS RPC 通知那台 SFU 收人。15 台 syncer 照顧 25,000+ 台 SFU，平時就已不算閒；reconnection storm 一來，所有通話中的 session 同時重建 SFU 關聯，負載瞬間倍增。</p>
-
-<p>voice syncers 內部用一個叫做 <strong>Holster</strong> 的函式庫池化 HTTP 連線，底層是 Erlang 的 <code>gun</code> HTTP client，連線生命周期由兩層 supervisor process 管理。Erlang process 是 actor model，靠 mailbox 通訊，主迴圈是一個 <code>receive</code> 區塊；這兩層 supervisor 用的是 <strong>selective receive</strong>，亦即在 receive 區塊裡用 pattern match 挑符合條件的訊息，不符合的跳過保留在 mailbox 裡。mailbox 短時這幾乎免費；一旦變長，每次 selective receive 都得從頭掃過所有未處理訊息，複雜度退化成 O(n)，而 spawn 變慢又讓 mailbox 變更長——它本身就是一個自我加速的退化模式。</p>
-
-<p>事後 Discord 工程師量化測試出一個讓人印象深刻的數字：<strong>「we confirmed that this selective receive on a supervisor with a ~100k mailbox queue adds ~1ms to process spawn time」</strong>。1 毫秒聽起來不多，但每個 SFU RPC 都觸發一次新的 connection spawn——syncer 每秒鐘 spawn 幾百到幾千次時，1ms/次的 overhead 直接吃光 CPU。下面這張圖是這條退化關係的可操作版本：拖動 mailbox 深度與分區數 N，看 per-spawn overhead 與整體 throughput 怎麼變。</p>
-
-<figure class="vg-w-param-selective-receive">
-  <style>
-    .vg-w-param-selective-receive { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--s-3); }
-    .vg-w-param-selective-receive .controls { display: grid; grid-template-columns: 1fr; gap: var(--s-2); }
-    .vg-w-param-selective-receive .row { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); }
-    .vg-w-param-selective-receive label { min-width: 16ch; color: var(--ink); }
-    .vg-w-param-selective-receive input[type=range] { flex: 1; accent-color: var(--accent); height: 36px; touch-action: none; }
-    .vg-w-param-selective-receive .readout { font-variant-numeric: tabular-nums; color: var(--accent-text); min-width: 12ch; text-align: right; }
-    .vg-w-param-selective-receive svg { width: 100%; height: auto; }
-    .vg-w-param-selective-receive figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); padding-top: var(--s-2); }
-  
-    @media (max-width: 720px) {
-      .vg-w-param-selective-receive svg { aspect-ratio: 16 / 9; min-height: 220px; height: auto; }
-      .vg-w-param-selective-receive svg text { font-size: 22px; }
-    }
-  </style>
-  <div class="controls">
-    <div class="row">
-      <label for="vg-w-param-sr-n">mailbox depth (n)</label>
-      <input id="vg-w-param-sr-n" type="range" min="100" max="1000000" step="100" value="100000" />
-      <span class="readout" id="vg-w-param-sr-n-out">100,000</span>
-    </div>
-    <div class="row">
-      <label for="vg-w-param-sr-p">partitions (N)</label>
-      <input id="vg-w-param-sr-p" type="range" min="1" max="64" step="1" value="1" />
-      <span class="readout" id="vg-w-param-sr-p-out">1</span>
-    </div>
-  </div>
-  <svg viewBox="0 0 880 280" role="img" aria-label="selective receive overhead curve under partition count">
-    <text x="440" y="22" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)" font-weight="600">selective-receive overhead per spawn vs effective mailbox depth (n/N)</text>
-    <line x1="70" y1="230" x2="860" y2="230" stroke="var(--ink)" stroke-width="1.5" />
-    <line x1="70" y1="50" x2="70" y2="230" stroke="var(--ink)" stroke-width="1.5" />
-    <text x="60" y="234" text-anchor="end" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">0</text>
-    <text x="60" y="186" text-anchor="end" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">2.5</text>
-    <text x="60" y="142" text-anchor="end" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">5.0</text>
-    <text x="60" y="98" text-anchor="end" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">7.5</text>
-    <text x="60" y="54" text-anchor="end" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">10 ms</text>
-    <text x="22" y="140" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)" transform="rotate(-90 22 140)">overhead / spawn</text>
-    <text x="465" y="265" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">effective queue depth per partition (log scale)</text>
-    <g id="vg-w-param-sr-grid"></g>
-    <path id="vg-w-param-sr-curve" d="" fill="none" stroke="var(--accent)" stroke-width="2" />
-    <line id="vg-w-param-sr-marker" x1="70" y1="50" x2="70" y2="230" stroke="var(--accent-text)" stroke-width="1.5" stroke-dasharray="4 3" />
-    <circle id="vg-w-param-sr-dot" cx="70" cy="230" r="5" fill="var(--accent-text)" />
-    <text id="vg-w-param-sr-label" x="80" y="80" font-family="EB Garamond, serif" font-size="13" fill="var(--accent-text)">overhead ≈ 0 ms</text>
-    <line x1="70" y1="98" x2="860" y2="98" stroke="var(--muted-2)" stroke-width="0.5" stroke-dasharray="2 4" />
-    <text x="855" y="93" text-anchor="end" font-family="EB Garamond, serif" font-size="10" fill="var(--muted)">~7.5ms · syncer fleet collapses</text>
-    <line x1="70" y1="190" x2="860" y2="190" stroke="var(--sage)" stroke-width="0.5" stroke-dasharray="2 4" />
-    <text x="855" y="185" text-anchor="end" font-family="EB Garamond, serif" font-size="10" fill="var(--sage-deep)">~2ms · safe operating zone</text>
-  </svg>
-  <figcaption>把 mailbox 切成 N 個分區之後，每個分區的有效深度是 n/N，selective receive 的 O(n) 也跟著縮到 O(n/N)。把 N 從 1 拉到 32，~1M 的單一 mailbox 退到 ~30k/分區，overhead 從吃光 CPU 落回亞毫秒區間。Discord 報告給出的「~1ms @ ~100k queue」是此曲線上的一個錨點。</figcaption>
-  <script>
-    (function () {
-      const root = document.querySelector('.vg-w-param-selective-receive');
-      if (!root) return;
-      const nInp = root.querySelector('#vg-w-param-sr-n');
-      const pInp = root.querySelector('#vg-w-param-sr-p');
-      const nOut = root.querySelector('#vg-w-param-sr-n-out');
-      const pOut = root.querySelector('#vg-w-param-sr-p-out');
-      const curve = root.querySelector('#vg-w-param-sr-curve');
-      const marker = root.querySelector('#vg-w-param-sr-marker');
-      const dot = root.querySelector('#vg-w-param-sr-dot');
-      const label = root.querySelector('#vg-w-param-sr-label');
-      const X0 = 70, X1 = 860, Y0 = 230, Y1 = 50;
-      const NMIN = 100, NMAX = 1000000;
-      function fmtN(n) {
-        if (n >= 1000000) return (n / 1000000).toFixed(2) + 'M';
-        if (n >= 1000) return Math.round(n / 1000) + 'k';
-        return String(n);
-      }
-      function overheadMs(effective) {
-        return 1.0 * (effective / 100000);
-      }
-      function xOf(effective) {
-        const t = (Math.log10(effective) - Math.log10(NMIN)) / (Math.log10(NMAX) - Math.log10(NMIN));
-        return X0 + Math.max(0, Math.min(1, t)) * (X1 - X0);
-      }
-      function yOf(ms) {
-        const t = Math.max(0, Math.min(1, ms / 10));
-        return Y0 - t * (Y0 - Y1);
-      }
-      function drawCurve() {
-        const pts = [];
-        for (let i = 0; i <= 80; i++) {
-          const t = i / 80;
-          const eff = Math.pow(10, Math.log10(NMIN) + t * (Math.log10(NMAX) - Math.log10(NMIN)));
-          pts.push([xOf(eff), yOf(overheadMs(eff))]);
+  <figure class="vg-w-scroll-notion-vector-evolution">
+    <style>
+      .vg-w-scroll-notion-vector-evolution { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s-3); align-items: start; margin: var(--s-4) 0; }
+      .vg-w-scroll-notion-vector-evolution .stages { display: flex; flex-direction: column; gap: var(--s-3); }
+      .vg-w-scroll-notion-vector-evolution .stage { padding: var(--s-2) var(--s-3); border-left: 2px solid var(--muted-2); transition: border-color 200ms; min-height: 38vh; display: flex; flex-direction: column; justify-content: center; }
+      .vg-w-scroll-notion-vector-evolution .stage.active { border-color: var(--accent); }
+      .vg-w-scroll-notion-vector-evolution .stage h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--ink); }
+      .vg-w-scroll-notion-vector-evolution .stage .when { font-family: var(--display); font-size: var(--fs-md); color: var(--accent-text); margin-bottom: var(--s-1); }
+      .vg-w-scroll-notion-vector-evolution .stage p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-scroll-notion-vector-evolution .stage .cut { font-family: var(--scribed); color: var(--accent-text); }
+      .vg-w-scroll-notion-vector-evolution .figure-sticky { position: sticky; top: var(--s-4); }
+      .vg-w-scroll-notion-vector-evolution svg { width: 100%; height: auto; }
+      .vg-w-scroll-notion-vector-evolution .stage-group { opacity: 0; transition: opacity 240ms ease-out; }
+      .vg-w-scroll-notion-vector-evolution .stage-group.visible { opacity: 1; }
+      .vg-w-scroll-notion-vector-evolution .axis-text { font-family: EB Garamond, serif; font-size: 12px; }
+      .vg-w-scroll-notion-vector-evolution .axis-text.title { font-size: 14px; }
+      @media (max-width: 720px) {
+        .vg-w-scroll-notion-vector-evolution { grid-template-columns: 1fr; }
+        .vg-w-scroll-notion-vector-evolution .figure-sticky {
+          position: sticky;
+          top: var(--vg-header-h);
+          order: -1;
+          max-height: 55vh;
+          background: var(--bg);
+          z-index: 1;
+          padding: var(--s-2) 0;
+          margin-bottom: var(--s-2);
         }
-        curve.setAttribute('d', pts.map((p, i) => (i ? 'L' : 'M') + p[0].toFixed(1) + ' ' + p[1].toFixed(1)).join(' '));
+        .vg-w-scroll-notion-vector-evolution .figure-sticky svg { max-height: 50vh; }
+        .vg-w-scroll-notion-vector-evolution .stage { min-height: 0; }
       }
-      function update() {
-        const n = Number(nInp.value);
-        const p = Number(pInp.value);
-        const eff = Math.max(1, n / p);
-        const ms = overheadMs(eff);
-        nOut.textContent = fmtN(n);
-        pOut.textContent = String(p);
-        const x = xOf(eff);
-        const y = yOf(ms);
-        marker.setAttribute('x1', x); marker.setAttribute('x2', x);
-        dot.setAttribute('cx', x); dot.setAttribute('cy', y);
-        label.setAttribute('x', Math.min(x + 10, 760));
-        label.setAttribute('y', Math.max(y - 8, 60));
-        label.textContent = 'n/N = ' + fmtN(Math.round(eff)) + ' · overhead ≈ ' + ms.toFixed(2) + ' ms / spawn';
-      }
-      drawCurve();
-      nInp.addEventListener('input', update);
-      pInp.addEventListener('input', update);
-      update();
-    })();
-  </script>
-</figure>
+    </style>
 
-<p>更糟的是，這條 critical path 還跟 service discovery 黏在一起。voice syncers 透過 etcd 註冊健康狀態：每個實例定期 refresh 一個 TTL 告訴 hash ring「我還活著」。問題是這個 TTL refresh 也要經過同一組被連線請求塞爆的 supervisor mailbox——排到 100 萬則時 refresh 根本來不及，etcd 就把實例從 ring 上拔掉。control plane（service discovery）與 data plane（connection management）共享同一條 critical path，把「我還活著」跟「我正在處理流量」綁在一起；後者卡住，前者也一起死。健康檢查機制本身變成崩潰加速器。</p>
+    <div class="stages">
+      <section class="stage" data-stage="1">
+        <div class="when">2023.11 · dedicated pod</div>
+        <h3>Stage 1 · 上線即爆量</h3>
+        <p>storage 與 compute 綁在同一台 pod；workspace-ID 範圍分片、靠 generation 路由抗擴容；按開機時間計費，所以 over-provision 是必繳費用。</p>
+        <p class="cut">這一段付的：headroom 的固定成本。</p>
+      </section>
+      <section class="stage" data-stage="2">
+        <div class="when">2024.05 · serverless 解耦</div>
+        <h3>Stage 2 · 砍 over-provision</h3>
+        <p>同廠商內把 storage 與 compute 解耦，計費從「開機時間」改成「實際 query 與儲存用量」。對波動明顯的流量立刻省下 50% 峰值成本，但年費仍以百萬美元計。</p>
+        <p class="cut">這一段砍的：恆定 provisioning 的固定成本。</p>
+      </section>
+      <section class="stage" data-stage="3">
+        <div class="when">2025.01 · Turbopuffer</div>
+        <h3>Stage 3 · 換引擎、拆路由</h3>
+        <p>vector index 直接建在 object storage 上；workspace = namespace，application 端不再分片、不再維護 generation 路由。搜尋成本 −60%、EMR −35%、p50 70-100ms → 50-70ms。</p>
+        <p class="cut">這一段砍的：dedicated SSD 容量的結構性成本。</p>
+      </section>
+      <section class="stage" data-stage="4">
+        <div class="when">2025.07 · xxHash64 + Ray</div>
+        <h3>Stage 4 · 砍重複工作 + 收 GPU</h3>
+        <p>Page State + xxHash64 把 ingestion 工作量砍 70%；embedding 服務從外部 API + 內部 GPU pod 整合到 Ray Serve，preprocessing 與 inference 共用機器，embedding infra −90%。</p>
+        <p class="cut">這一段砍的：沒變內容仍要 re-embed 的隱性成本 + 外部 API 的 per-token 邊界。</p>
+      </section>
+    </div>
 
-<p>結果是一個糟糕的正回饋迴圈：</p>
+    <div class="figure-sticky">
+      <svg viewBox="0 0 480 360" role="img"
+           aria-label="Notion 向量搜尋四階段的架構快照——左邊卡片切換時，右邊圖隨之變化">
+        <defs>
+          <marker id="vg-w-scroll-notion-vector-evolution-arr"
+                  markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
+            <path d="M0,0 L6,3 L0,6 Z" fill="var(--muted)"/>
+          </marker>
+        </defs>
 
-<ol>
-  <li>mailbox 變長 → process spawn 變慢 → endpoint create 失敗率上升</li>
-  <li>endpoint create 失敗 → 上游服務重試 → mailbox 變更長</li>
-  <li>TTL refresh 排不上 → etcd 把實例移出 ring</li>
-  <li>剩下的健康實例要承擔更多 failover 流量 → 它們的 mailbox 也開始堆</li>
-  <li>回到第 1 步</li>
-</ol>
+        <text x="240" y="22" text-anchor="middle" fill="var(--ink)" class="axis-text title">
+          每階段的架構快照
+        </text>
 
-<p>正回饋迴圈是分散式系統最危險的失效模式：不像線性退化會在某個負載點停下來，每跑一輪迴圈下一輪就更快、影響範圍更大。對抗它的方法不是「修復某個壞掉的部位」，而是「切斷迴圈中至少一條邊」。儀表板上 12:14 PDT 「Endpoint Select/Create Success」跌到接近零；15 台 syncer 只剩 2-8 一台還活著但獨自扛不住全球三分之一流量。15 台 mailbox 同時走向同一個失敗模式——這種「同步退化」的形狀幾乎可以斷定問題不在實例本身，而在它們共同依賴的某個系統屬性，這次是上游沒有節流。</p>
+        <!-- Stage 1: dedicated pod -->
+        <g class="stage-group" id="vg-w-scroll-notion-vector-evolution-stage-1">
+          <rect x="40" y="60" width="100" height="36" rx="4" fill="none" stroke="var(--muted-2)" stroke-width="1.2"/>
+          <text x="90" y="82" text-anchor="middle" fill="var(--ink)" class="axis-text">Spark + Kafka</text>
+          <line x1="140" y1="78" x2="180" y2="78" stroke="var(--muted)" stroke-width="1"
+                marker-end="url(#vg-w-scroll-notion-vector-evolution-arr)"/>
+          <rect x="180" y="60" width="120" height="36" rx="4" fill="none" stroke="var(--accent)" stroke-width="1.5"/>
+          <text x="240" y="82" text-anchor="middle" fill="var(--accent-text)" class="axis-text">generation router</text>
 
-<h2>三次失敗的 rollback——為什麼救火比起火還難</h2>
+          <line x1="240" y1="96" x2="180" y2="140" stroke="var(--muted)" stroke-width="1"
+                marker-end="url(#vg-w-scroll-notion-vector-evolution-arr)"/>
+          <line x1="240" y1="96" x2="240" y2="140" stroke="var(--muted)" stroke-width="1"
+                marker-end="url(#vg-w-scroll-notion-vector-evolution-arr)"/>
+          <line x1="240" y1="96" x2="300" y2="140" stroke="var(--muted)" stroke-width="1"
+                marker-end="url(#vg-w-scroll-notion-vector-evolution-arr)"/>
 
-<p>從 12:43 到 13:09 PDT，on-call 嘗試了三波恢復動作，每一波都短暫地讓人鬆口氣再馬上把人打回深淵。</p>
+          <rect x="140" y="140" width="80" height="60" rx="4" fill="var(--accent)" fill-opacity="0.08" stroke="var(--accent)" stroke-width="1.2"/>
+          <text x="180" y="166" text-anchor="middle" fill="var(--ink)" class="axis-text">pod gen-0</text>
+          <text x="180" y="182" text-anchor="middle" fill="var(--muted)" class="axis-text">storage+compute</text>
+          <rect x="200" y="140" width="80" height="60" rx="4" fill="var(--accent)" fill-opacity="0.08" stroke="var(--accent)" stroke-width="1.2"/>
+          <text x="240" y="166" text-anchor="middle" fill="var(--ink)" class="axis-text">pod gen-1</text>
+          <text x="240" y="182" text-anchor="middle" fill="var(--muted)" class="axis-text">綁定計費</text>
+          <rect x="260" y="140" width="80" height="60" rx="4" fill="var(--accent)" fill-opacity="0.08" stroke="var(--accent)" stroke-width="1.2"/>
+          <text x="300" y="166" text-anchor="middle" fill="var(--ink)" class="axis-text">pod gen-2</text>
+          <text x="300" y="182" text-anchor="middle" fill="var(--muted)" class="axis-text">over-provision</text>
 
-<p><strong>第一波（12:43 PDT）重啟單一實例</strong>：團隊挑了問題最嚴重的 2-13 完整重啟。新 process 起來、mailbox 歸零、etcd 註冊回 ring 上——但只持續不到一分鐘。上游發現有健康節點回來，立刻把累積的 retry 全灌過去，mailbox 三十秒內又從 0 漲到數十萬。當一個服務從「健康但過載」變成「健康且能接流量」，所有等在門外的請求會在第一個 epoch 同時湧入，對單一實例而言這個瞬間負載比平均高一個數量級。</p>
+          <rect x="60" y="240" width="360" height="80" rx="6" fill="none" stroke="var(--accent)" stroke-width="1.2" stroke-dasharray="4,3"/>
+          <text x="240" y="262" text-anchor="middle" fill="var(--accent-text)" class="axis-text">付的是「資料庫開機時間」</text>
+          <text x="240" y="280" text-anchor="middle" fill="var(--muted)" class="axis-text">用不用滿都計費，業務波形跟計費結構反向</text>
+          <text x="240" y="300" text-anchor="middle" fill="var(--muted)" class="axis-text">generation 數量單調增、reshard 不可行</text>
+        </g>
 
-<p><strong>第二波（12:47 PDT）殺掉特定的 supervisor</strong>：只 kill 並重啟 <code>Holster.Pool</code> DynamicSupervisor，理論上清空 mailbox 但保留 etcd 註冊。結果同樣模式重現。這次嘗試其實透露一個重要訊號——如果 mailbox 清零後依然立刻被填滿，root cause 不在 mailbox 內容也不在 process 狀態，而在上游流量速率。</p>
+        <!-- Stage 2: serverless decoupled -->
+        <g class="stage-group" id="vg-w-scroll-notion-vector-evolution-stage-2">
+          <rect x="40" y="60" width="100" height="36" rx="4" fill="none" stroke="var(--muted-2)" stroke-width="1.2"/>
+          <text x="90" y="82" text-anchor="middle" fill="var(--ink)" class="axis-text">Spark + Kafka</text>
+          <line x1="140" y1="78" x2="180" y2="78" stroke="var(--muted)" stroke-width="1"
+                marker-end="url(#vg-w-scroll-notion-vector-evolution-arr)"/>
+          <rect x="180" y="60" width="120" height="36" rx="4" fill="none" stroke="var(--muted-2)" stroke-width="1.2"/>
+          <text x="240" y="82" text-anchor="middle" fill="var(--muted)" class="axis-text">generation router</text>
 
-<p><strong>第三波（13:05 PDT）整個 cluster 同時重啟</strong>：賭同時清空 15 台的 mailbox 能讓整體得到「同步的喘息窗口」。事後報告稱這個瞬間「briefly recovered」——但下一秒所有上游同時發現 voice syncers 全體健康，把累積 50 分鐘的 retry queue 一次釋放出去。<strong>「cold-start thundering herd was too much to handle」</strong>。</p>
+          <line x1="240" y1="96" x2="180" y2="140" stroke="var(--muted)" stroke-width="1"
+                marker-end="url(#vg-w-scroll-notion-vector-evolution-arr)"/>
+          <line x1="240" y1="96" x2="240" y2="140" stroke="var(--muted)" stroke-width="1"
+                marker-end="url(#vg-w-scroll-notion-vector-evolution-arr)"/>
+          <line x1="240" y1="96" x2="300" y2="140" stroke="var(--muted)" stroke-width="1"
+                marker-end="url(#vg-w-scroll-notion-vector-evolution-arr)"/>
 
-<p>三次失敗的共通結構是：問題從來不是 voice syncers 自己的狀態，而是上游沒有節流。Bo Ingram 與 Stephen Birarda 點明這條邏輯——「A sufficiently large traffic spike will find a bottleneck in your system」。經驗豐富的 on-call 會在「重啟看看」之前先問：「上游有沒有累積？下游有沒有節流？」</p>
+          <rect x="140" y="140" width="200" height="60" rx="6" fill="var(--ink-deep)" fill-opacity="0.08"
+                stroke="var(--ink-deep)" stroke-width="1.5"/>
+          <text x="240" y="166" text-anchor="middle" fill="var(--ink-deep)" class="axis-text">serverless vector DB</text>
+          <text x="240" y="182" text-anchor="middle" fill="var(--muted)" class="axis-text">storage / compute 解耦、按用量計費</text>
 
-<figure class="vg-w-scrub-incident-clock">
-  <style>
-    .vg-w-scrub-incident-clock { display: grid; gap: var(--s-2); }
-    .vg-w-scrub-incident-clock svg { width: 100%; height: auto; touch-action: none; }
-    .vg-w-scrub-incident-clock .panel { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: var(--s-2); padding: var(--s-2); background: var(--bg-soft); border-left: 2px solid var(--accent); font-family: var(--serif); font-size: var(--fs-sm); }
-    .vg-w-scrub-incident-clock .panel .label { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
-    .vg-w-scrub-incident-clock .panel .value { font-family: EB Garamond, serif; font-size: var(--fs-md); color: var(--accent-text); font-variant-numeric: tabular-nums; }
-    .vg-w-scrub-incident-clock .panel .narrate { grid-column: 1 / -1; color: var(--ink); }
-    .vg-w-scrub-incident-clock figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); padding-top: var(--s-2); }
-    @media (max-width: 720px) {
-      .vg-w-scrub-incident-clock svg { aspect-ratio: 2 / 1; min-height: 200px; }
-      .vg-w-scrub-incident-clock svg text { font-size: 22px; }
-    }
-</style>
-  <svg viewBox="0 0 880 220" role="img" aria-label="incident clock scrubber from 12:13 to 14:30 PDT">
-    <text x="440" y="20" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)" font-weight="600">incident clock · 12:13–14:30 PDT · drag handle to inspect state</text>
-    <g id="vg-w-scrub-incident-clock-success">
-      <text x="60" y="60" text-anchor="end" font-family="EB Garamond, serif" font-size="10" fill="var(--sage-deep)">success</text>
-      <text x="60" y="120" text-anchor="end" font-family="EB Garamond, serif" font-size="10" fill="var(--sage-deep)">0%</text>
-      <path id="vg-w-scrub-incident-clock-success-path" d="" fill="none" stroke="var(--sage)" stroke-width="1.8" />
-    </g>
-    <g id="vg-w-scrub-incident-clock-mailbox">
-      <text x="60" y="135" text-anchor="end" font-family="EB Garamond, serif" font-size="10" fill="var(--accent-text)">mailbox</text>
-      <text x="60" y="178" text-anchor="end" font-family="EB Garamond, serif" font-size="10" fill="var(--accent-text)">~1M</text>
-      <path id="vg-w-scrub-incident-clock-mailbox-path" d="" fill="none" stroke="var(--accent)" stroke-width="1.8" />
-    </g>
-    <line x1="70" y1="180" x2="860" y2="180" stroke="var(--ink)" stroke-width="1.5" />
-    <g id="vg-w-scrub-incident-clock-events"></g>
-    <line id="vg-w-scrub-incident-clock-handle-line" x1="70" y1="40" x2="70" y2="200" stroke="var(--accent-text)" stroke-width="2" />
-    <circle id="vg-w-scrub-incident-clock-handle" cx="70" cy="190" r="9" fill="var(--accent-text)" cursor="grab" />
-    <text id="vg-w-scrub-incident-clock-tick" x="70" y="215" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--ink)">12:13</text>
-  </svg>
-  <div class="panel">
-    <div><div class="label">endpoint create success</div><div class="value" id="vg-w-scrub-incident-clock-out-success">100%</div></div>
-    <div><div class="label">avg syncer mailbox</div><div class="value" id="vg-w-scrub-incident-clock-out-mailbox">~0</div></div>
-    <div class="narrate" id="vg-w-scrub-incident-clock-out-narrate">在 12:13 之前，voice control plane 各項指標都在綠燈區間。</div>
-  </div>
-  <figcaption>橘色是 15 台 syncer 平均 mailbox 深度、綠色是 endpoint create success rate（事故報告未提供逐分鐘讀數；曲線根據明文時間點與描述插值）。拖動把手或點擊軸線即可跳到任意時刻。</figcaption>
-  <script>
-    (function () {
-      const root = document.querySelector('.vg-w-scrub-incident-clock');
-      if (!root) return;
-      const svg = root.querySelector('svg');
-      const handle = root.querySelector('#vg-w-scrub-incident-clock-handle');
-      const handleLine = root.querySelector('#vg-w-scrub-incident-clock-handle-line');
-      const tick = root.querySelector('#vg-w-scrub-incident-clock-tick');
-      const successPath = root.querySelector('#vg-w-scrub-incident-clock-success-path');
-      const mailboxPath = root.querySelector('#vg-w-scrub-incident-clock-mailbox-path');
-      const eventsG = root.querySelector('#vg-w-scrub-incident-clock-events');
-      const outSuccess = root.querySelector('#vg-w-scrub-incident-clock-out-success');
-      const outMailbox = root.querySelector('#vg-w-scrub-incident-clock-out-mailbox');
-      const outNarrate = root.querySelector('#vg-w-scrub-incident-clock-out-narrate');
-      const X0 = 70, X1 = 860;
-      const T0 = 12 * 60 + 13, T1 = 14 * 60 + 30;
-      const events = [
-        [12 * 60 + 13, '12:13', 1.0, 0, 'sessions pod 副本縮半；17% session 被 ungracefully 切斷。'],
-        [12 * 60 + 14, '12:14', 0.05, 0.05, 'endpoint create success 跌到接近零；syncer mailbox 起跑。'],
-        [12 * 60 + 30, '12:30', 0.05, 0.3, 'gateway us-east1-b OOM；failover 把流量推到 1c / 1d。'],
-        [12 * 60 + 43, '12:43', 0.06, 0.55, '第一波：重啟單一實例 2-13。mailbox 三十秒內重新填滿。'],
-        [12 * 60 + 47, '12:47', 0.06, 0.6, '第二波：kill Holster.Pool DynamicSupervisor。同樣失敗。'],
-        [13 * 60 + 5, '13:05', 0.1, 0.85, '第三波：full cluster restart。cold-start thundering herd 把全體再次打趴。'],
-        [13 * 60 + 43, '13:43', 0.25, 0.95, '第四波啟動：上游 rate limit + 15 台新 dispatcher 透過 terraform 上線。'],
-        [14 * 60 + 3, '14:03', 0.55, 0.5, '實例 2-3 重啟後維持低 mailbox——第一台真正恢復的實例。'],
-        [14 * 60 + 15, '14:15', 0.8, 0.25, '再重啟 5 台，4 台維持低 mailbox。'],
-        [14 * 60 + 26, '14:26', 0.95, 0.1, '最後一台恢復；doubled cluster 全體健康。3h17m。'],
-        [14 * 60 + 30, '14:30', 1.0, 0.05, '全綠；事故收尾。']
-      ];
-      function xOf(t) { return X0 + ((t - T0) / (T1 - T0)) * (X1 - X0); }
-      function yOfSuccess(v) { return 120 - v * 80; }
-      function yOfMailbox(v) { return 180 - v * 45; }
-      let sd = '', md = '';
-      for (let i = 0; i < events.length; i++) {
-        const e = events[i];
-        const x = xOf(e[0]);
-        sd += (i ? 'L' : 'M') + x.toFixed(1) + ' ' + yOfSuccess(e[2]).toFixed(1) + ' ';
-        md += (i ? 'L' : 'M') + x.toFixed(1) + ' ' + yOfMailbox(e[3]).toFixed(1) + ' ';
-      }
-      successPath.setAttribute('d', sd);
-      mailboxPath.setAttribute('d', md);
-      const NS = 'http://www.w3.org/2000/svg';
-      const tickEvents = events.filter(e => ['12:13', '12:43', '13:05', '13:43', '14:26'].includes(e[1]));
-      for (const e of tickEvents) {
-        const x = xOf(e[0]);
-        const c = document.createElementNS(NS, 'circle');
-        c.setAttribute('cx', x); c.setAttribute('cy', 180); c.setAttribute('r', 3);
-        c.setAttribute('fill', 'var(--muted)');
-        eventsG.appendChild(c);
-        const tx = document.createElementNS(NS, 'text');
-        tx.setAttribute('x', x); tx.setAttribute('y', 198);
-        tx.setAttribute('text-anchor', 'middle');
-        tx.setAttribute('font-family', 'EB Garamond, serif');
-        tx.setAttribute('font-size', 10);
-        tx.setAttribute('fill', 'var(--muted)');
-        tx.textContent = e[1];
-        eventsG.appendChild(tx);
-      }
-      function clamp(x) { return Math.max(X0, Math.min(X1, x)); }
-      function clientToSvgX(clientX) {
-        const pt = svg.createSVGPoint();
-        pt.x = clientX; pt.y = 0;
-        const sp = pt.matrixTransform(svg.getScreenCTM().inverse());
-        return clamp(sp.x);
-      }
-      function tToHHMM(t) {
-        const h = Math.floor(t / 60), m = Math.floor(t % 60);
-        return String(h) + ':' + String(m).padStart(2, '0');
-      }
-      function lerpEvents(t) {
-        let lo = events[0], hi = events[events.length - 1];
-        for (let i = 0; i < events.length - 1; i++) {
-          if (events[i][0] <= t && events[i + 1][0] >= t) { lo = events[i]; hi = events[i + 1]; break; }
+          <rect x="60" y="240" width="360" height="80" rx="6" fill="none" stroke="var(--ink-deep)" stroke-width="1.2" stroke-dasharray="4,3"/>
+          <text x="240" y="262" text-anchor="middle" fill="var(--ink-deep)" class="axis-text">付的是「實際 query / storage 用量」</text>
+          <text x="240" y="280" text-anchor="middle" fill="var(--muted)" class="axis-text">夜間低谷自動省回來，省 50% 峰值成本</text>
+          <text x="240" y="300" text-anchor="middle" fill="var(--muted)" class="axis-text">但年費仍上百萬，且引擎本身沒變</text>
+        </g>
+
+        <!-- Stage 3: Turbopuffer -->
+        <g class="stage-group" id="vg-w-scroll-notion-vector-evolution-stage-3">
+          <rect x="40" y="60" width="100" height="36" rx="4" fill="none" stroke="var(--muted-2)" stroke-width="1.2"/>
+          <text x="90" y="82" text-anchor="middle" fill="var(--ink)" class="axis-text">Spark + Kafka</text>
+          <line x1="140" y1="78" x2="180" y2="78" stroke="var(--sage)" stroke-width="1"
+                marker-end="url(#vg-w-scroll-notion-vector-evolution-arr)"/>
+          <rect x="180" y="60" width="120" height="36" rx="4" fill="none" stroke="var(--sage-deep)" stroke-width="1.5"/>
+          <text x="240" y="82" text-anchor="middle" fill="var(--sage-deep)" class="axis-text">namespace = workspace</text>
+
+          <line x1="240" y1="96" x2="240" y2="140" stroke="var(--sage)" stroke-width="1"
+                marker-end="url(#vg-w-scroll-notion-vector-evolution-arr)"/>
+
+          <rect x="140" y="140" width="200" height="60" rx="6" fill="var(--sage-deep)" fill-opacity="0.08"
+                stroke="var(--sage-deep)" stroke-width="1.5"/>
+          <text x="240" y="166" text-anchor="middle" fill="var(--sage-deep)" class="axis-text">Turbopuffer (vector on S3)</text>
+          <text x="240" y="182" text-anchor="middle" fill="var(--muted)" class="axis-text">object storage + 每個 namespace 獨立</text>
+
+          <rect x="60" y="240" width="360" height="80" rx="6" fill="none" stroke="var(--sage-deep)" stroke-width="1.2" stroke-dasharray="4,3"/>
+          <text x="240" y="262" text-anchor="middle" fill="var(--sage-deep)" class="axis-text">application 端的「分片表」整層消失</text>
+          <text x="240" y="280" text-anchor="middle" fill="var(--muted)" class="axis-text">搜尋成本 −60%、EMR −35%、p50 50-70ms</text>
+          <text x="240" y="300" text-anchor="middle" fill="var(--muted)" class="axis-text">數十億筆 vector 用 generation cutover 搬完</text>
+        </g>
+
+        <!-- Stage 4: xxHash + Ray -->
+        <g class="stage-group" id="vg-w-scroll-notion-vector-evolution-stage-4">
+          <rect x="20" y="60" width="80" height="36" rx="4" fill="none" stroke="var(--muted-2)" stroke-width="1.2"/>
+          <text x="60" y="82" text-anchor="middle" fill="var(--ink)" class="axis-text">page edit</text>
+          <line x1="100" y1="78" x2="130" y2="78" stroke="var(--muted)" stroke-width="1"
+                marker-end="url(#vg-w-scroll-notion-vector-evolution-arr)"/>
+
+          <rect x="130" y="60" width="110" height="36" rx="4" fill="var(--accent)" fill-opacity="0.08"
+                stroke="var(--accent)" stroke-width="1.5"/>
+          <text x="185" y="82" text-anchor="middle" fill="var(--accent-text)" class="axis-text">xxHash64 diff</text>
+
+          <line x1="240" y1="78" x2="280" y2="78" stroke="var(--muted)" stroke-width="1"
+                marker-end="url(#vg-w-scroll-notion-vector-evolution-arr)"/>
+          <rect x="280" y="60" width="90" height="36" rx="4" fill="none" stroke="var(--muted-2)" stroke-width="1.2"/>
+          <text x="325" y="82" text-anchor="middle" fill="var(--ink)" class="axis-text">DynamoDB</text>
+
+          <line x1="185" y1="96" x2="185" y2="130" stroke="var(--muted)" stroke-width="1"
+                marker-end="url(#vg-w-scroll-notion-vector-evolution-arr)"/>
+
+          <rect x="100" y="130" width="180" height="50" rx="6" fill="var(--sage-deep)" fill-opacity="0.08"
+                stroke="var(--sage-deep)" stroke-width="1.5"/>
+          <text x="190" y="150" text-anchor="middle" fill="var(--sage-deep)" class="axis-text">Ray Serve embedding</text>
+          <text x="190" y="166" text-anchor="middle" fill="var(--muted)" class="axis-text">CPU preproc + GPU inference 同機</text>
+
+          <line x1="280" y1="155" x2="320" y2="155" stroke="var(--sage)" stroke-width="1"
+                marker-end="url(#vg-w-scroll-notion-vector-evolution-arr)"/>
+          <rect x="320" y="130" width="120" height="50" rx="6" fill="var(--sage-deep)" fill-opacity="0.08"
+                stroke="var(--sage-deep)" stroke-width="1.5"/>
+          <text x="380" y="150" text-anchor="middle" fill="var(--sage-deep)" class="axis-text">Turbopuffer</text>
+          <text x="380" y="166" text-anchor="middle" fill="var(--muted)" class="axis-text">namespace</text>
+
+          <rect x="60" y="240" width="360" height="80" rx="6" fill="none" stroke="var(--sage-deep)" stroke-width="1.2" stroke-dasharray="4,3"/>
+          <text x="240" y="262" text-anchor="middle" fill="var(--sage-deep)" class="axis-text">沒變的 span 完全 skip，只變 metadata 走 PATCH</text>
+          <text x="240" y="280" text-anchor="middle" fill="var(--muted)" class="axis-text">外部 API 與 GPU pod 同步退場、embedding infra −90%</text>
+          <text x="240" y="300" text-anchor="middle" fill="var(--muted)" class="axis-text">兩年累積：onboarding 600x、p50 −50ms、年成本 −90%</text>
+        </g>
+      </svg>
+    </div>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-scroll-notion-vector-evolution');
+        if (!root) return;
+        const stages = root.querySelectorAll('.stage');
+        const groups = {
+          1: root.querySelector('#vg-w-scroll-notion-vector-evolution-stage-1'),
+          2: root.querySelector('#vg-w-scroll-notion-vector-evolution-stage-2'),
+          3: root.querySelector('#vg-w-scroll-notion-vector-evolution-stage-3'),
+          4: root.querySelector('#vg-w-scroll-notion-vector-evolution-stage-4'),
+        };
+        function show(stage) {
+          for (const s of stages) {
+            s.classList.toggle('active', s.dataset.stage === String(stage));
+          }
+          for (const k of Object.keys(groups)) {
+            const g = groups[k];
+            if (!g) continue;
+            g.classList.toggle('visible', k === String(stage));
+          }
         }
-        const span = hi[0] - lo[0] || 1;
-        const f = (t - lo[0]) / span;
-        const success = lo[2] + (hi[2] - lo[2]) * f;
-        const mailbox = lo[3] + (hi[3] - lo[3]) * f;
-        return { success, mailbox, narrate: f < 0.5 ? lo[4] : hi[4] };
-      }
-      function update(x) {
-        handle.setAttribute('cx', x);
-        handleLine.setAttribute('x1', x); handleLine.setAttribute('x2', x);
-        tick.setAttribute('x', x);
-        const t = T0 + ((x - X0) / (X1 - X0)) * (T1 - T0);
-        tick.textContent = tToHHMM(t);
-        const s = lerpEvents(t);
-        outSuccess.textContent = Math.round(s.success * 100) + '%';
-        outMailbox.textContent = s.mailbox < 0.02 ? '~0' : (s.mailbox >= 0.95 ? '~1M' : Math.round(s.mailbox * 1000) + 'k');
-        outNarrate.textContent = s.narrate;
-      }
-      let dragging = false;
-      function start(e) { dragging = true; if (e.pointerId !== undefined) handle.setPointerCapture(e.pointerId); update(clientToSvgX(e.clientX)); }
-      function move(e) { if (!dragging) return; update(clientToSvgX(e.clientX)); }
-      function end() { dragging = false; }
-      handle.addEventListener('pointerdown', start);
-      handle.addEventListener('pointermove', move);
-      handle.addEventListener('pointerup', end);
-      svg.addEventListener('pointerdown', (e) => { if (e.target !== handle) { dragging = true; update(clientToSvgX(e.clientX)); } });
-      svg.addEventListener('pointermove', move);
-      svg.addEventListener('pointerup', end);
-      update(X0);
-    })();
-  </script>
-</figure>
+        const io = new IntersectionObserver((entries) => {
+          for (const e of entries) {
+            if (e.isIntersecting) show(e.target.dataset.stage);
+          }
+        }, { rootMargin: window.matchMedia('(max-width: 720px)').matches ? '-50% 0px -40% 0px' : '-40% 0px -40% 0px', threshold: 0 });
+        for (const s of stages) io.observe(s);
+        show(1);
+      })();
+    </script>
+  </figure>
 
-<h3>第四次嘗試——同時增加供給、減少需求</h3>
+  <h2>2023 年的 dedicated pod——storage 與 compute 為什麼綁在一起就撐不住</h2>
 
-<p>13:43 PDT 開始的這一波不再是單一招式。團隊升級成兩條並行修復路徑——事後覆盤用一句很 SRE 味的話描述它：<strong>「your solutions either increase supply (adding additional services) or reduce demand (rate limiting inbound traffic)」</strong>。</p>
+  <p>
+    第一版架構在 2023 年 11 月 Notion AI Q&amp;A 上線那天就跑起來了。兩條 ingestion path 同時餵向量資料庫：offline 那條由 <code>Apache Spark</code> 跑批次、對既有頁面做 chunking、呼叫 embedding API、bulk-load 到向量索引；online 那條由 <code>Kafka</code> consumer 處理即時編輯，端到端延遲控制在 sub-minute。Dual-path 的設計後來成為所有引擎切換的 silent enabler——新引擎可以掛在同一條 Kafka 後面雙寫，query path 用 feature flag 切讀。
+  </p>
 
-<p><strong>路徑一：上游 syncer spawn rate limit</strong>。team 緊急更新 call owner services（guilds、calls、streams）引入新的 rate limit；最關鍵的一條是針對 coordinator syncer——當一個 guild 有大量語音頻道時，coordinator 會為每個頻道 spawn 一個 child syncer，這種「對每個 X 都 spawn 一個 Y」的 unbounded fan-out 是放大效應的源頭，鎖住後 etcd 上看到的 syncer 創建速度立刻降一個數量級。</p>
+  <p>
+    痛點在「向量資料庫長什麼樣」。當時用的是 dedicated pod——每個 pod 是一整台機器，storage 跟 compute 綁在一起。Notion 把 workspace ID 當分片 key、用 range partitioning 散到不同 pod 群，這個設計刻意模仿了既有 Postgres 的分片邏輯，讓 oncall 對「workspace 在哪台機器」的回答跨服務一致。
+  </p>
 
-<p><strong>路徑二：水平擴容 SFU endpoint dispatcher</strong>。透過 GCP Terraform 加 Salt 配置，team 手動補上 15 台 dispatcher 把容量翻倍。把 per-instance load 砍半就等於把 mailbox queue 砍半，等於把 process spawn time 從幾毫秒拉回亞毫秒。事故狀態下跳過 release pipeline 是合理的選擇，但事後該回頭問：「為什麼這個動作平時沒做成一鍵化的 incident-response 工具？」</p>
+  <p>
+    為了應付容量擴張，他們做了一個 generation-based 路由：一組 index 接近容量上限時，provision 新 generation 的 index、把新 workspace onboarding 導向新 generation，舊資料不動。不去 reshard 是因為在 pod 模型下要麼 pause 寫入要麼承擔 race condition，對「不能停 onboarding」是不可接受的。這個 generation 思維後來被沿用到 Turbopuffer 搬遷——把 cohort 維度埋進系統設計的早期，後面所有大遷移都會更便宜。
+  </p>
 
-<p>13:43 的重啟結果與前三次有質的不同：失敗的部位從 <code>Holster.Pool</code> 換到了底層 <code>gun</code> supervisor，實例還能保持 etcd 註冊。「失敗的部位換了」這個訊號在事故診斷裡非常重要——它告訴你先前的瓶頸已經不是 critical bottleneck，繼續往同一方向施力就會看到收斂。14:03 實例 2-3 第一台真正恢復；14:15 重啟五台，四台維持低 mailbox；14:26 最後一台恢復，doubled cluster 全體健康——總計 3 小時 17 分鐘。</p>
+  <p>
+    問題出在計費：Pod 廠商按「資料庫開機時間」計費，不是按實際使用量——預留出來不管用不用，帳單持續累積。Notion AI 上線一個月後 index 就接近容量，要保留 headroom 就得長期 over-provision；白天高峰、夜間低谷的業務波形跟「按開機時間付費」完全反向，沒辦法在低谷把錢省回來。同時多代共存讓 oncall 變成「先看 workspace 在哪一代 → 看那一代的健康 → 看那台 pod 的狀態」，alert 還得逐代調 threshold，配置文件單調膨脹。
+  </p>
 
-<figure class="vg-w-scroll-discord-cascade">
-  <style>
-    .vg-w-scroll-discord-cascade { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s-3); align-items: start; margin: var(--s-4) 0; }
-    .vg-w-scroll-discord-cascade .stages { display: flex; flex-direction: column; gap: var(--s-3); }
-    .vg-w-scroll-discord-cascade .stage { padding: var(--s-2); border-left: 2px solid var(--muted-2); transition: border-color 200ms; }
-    .vg-w-scroll-discord-cascade .stage.active { border-color: var(--accent); }
-    .vg-w-scroll-discord-cascade .stage h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--ink); }
-    .vg-w-scroll-discord-cascade .stage p { margin: 0; font-family: var(--serif); font-size: var(--fs-sm); }
-    .vg-w-scroll-discord-cascade .figure-sticky { position: sticky; top: var(--s-4); }
-    .vg-w-scroll-discord-cascade svg { width: 100%; height: auto; }
-    @media (max-width: 720px) {
-      .vg-w-scroll-discord-cascade { grid-template-columns: 1fr; }
-      .vg-w-scroll-discord-cascade .figure-sticky {
-        position: sticky;
-        top: var(--vg-header-h);
-        order: -1;
-        max-height: 55vh;
-        background: var(--bg);
-        z-index: 1;
-        padding: var(--s-2) 0;
-        margin-bottom: var(--s-2);
-      }
-      .vg-w-scroll-discord-cascade .figure-sticky svg { max-height: 50vh; }
-    }
-  </style>
+  <pre data-kind="pseudocode"><code><em>// 2023 年的查詢路徑——pod model 下的路由</em>
+def search(workspace_id, query_text):
+    generation = lookup_generation(workspace_id)   <em>// 哪一代</em>
+    pod_id     = range_shard(workspace_id, generation)  <em>// 哪台 pod</em>
+    query_vec  = embed(query_text)                 <em>// 走外部 API</em>
+    return pods[pod_id].ann_search(query_vec, top_k=20)
 
-  <div class="stages">
-    <section class="stage" data-stage="1">
-      <h3>Stage 1 · 12:13 PDT — pod terminated</h3>
-      <p>Kubernetes 在 graceful drain 完成前就 SIGTERM 掉 us-east1-b 的 sessions pod，17% 全球 session 同時失聯。</p>
-    </section>
-    <section class="stage" data-stage="2">
-      <h3>Stage 2 · 12:13–12:15 — DOWN flurry</h3>
-      <p>每個被殺掉的 GenServer 對 guild、presence、gateway 送出 <code>{:DOWN, ...}</code> 訊息，realtime 內部訊號量暴衝。</p>
-    </section>
-    <section class="stage" data-stage="3">
-      <h3>Stage 3 · 12:15–12:30 — gateway OOM</h3>
-      <p>Reconnection storm 撞上 miscalibrated per-host session rate limit，us-east1-b 的 gateway 記憶體拉到 ~100%，故障跨 zone 擴散到 1c 與 1d。</p>
-    </section>
-    <section class="stage" data-stage="4">
-      <h3>Stage 4 · 12:13–14:26 — syncer mailbox blowup</h3>
-      <p>15 台 voice syncer 的 Holster.Pool selective receive 在 ~100k mailbox queue 下每次 process spawn 多 ~1ms，雪崩成 ~1M 訊息深的 queue。</p>
-    </section>
-    <section class="stage" data-stage="5">
-      <h3>Stage 5 · etcd ring 失血</h3>
-      <p>TTL refresh 卡在同一個 mailbox 裡排隊，etcd 將實例從 consistent hash ring 移除，存活實例承擔 failover 流量直至全體被打垮。</p>
-    </section>
-  </div>
+<em>// generation 滿了：</em>
+<em>//   不 reshard 既有資料，而是 provision 新的 index set、</em>
+<em>//   把新 workspace 都導向 generation N+1。</em>
+<em>//   代價：路由表越來越胖、跨 generation reindex 是噩夢。</em>
+</code></pre>
 
-  <div class="figure-sticky">
-    <svg viewBox="0 0 480 400" role="img" aria-label="voice control plane cascade stages">
+  <p>
+    2023 年底到 2024 年 4 月之間，這套架構靠著「持續加 pod、持續調 generation」撐住業務擴張。具體數字：daily onboarding 容量提升 600 倍（從每天數百個 workspace 到單日數十萬量級），active workspace 15 倍、vector DB 容量 8 倍，4 月時把累積的百萬等級候補清空。但帳單也以類似節奏在增加——候補清空提供了一個自然的休息窗口，問題從「能不能跑」切到「跑得起多久」。
+  </p>
+
+  <pre data-kind="config"><code><em># Pod model 下的「能 scale 但不能省」</em>
+<em># 假設一個 workspace 平均使用率 30%，pod 在 50% headroom 下 provision</em>
+<em>#  → 實際付費容量 = 1.5x 預期峰值 ≈ 5x 平均實際使用</em>
+<em>#  → 每多 1 個 workspace，固定成本是平均使用的 ~5 倍</em>
+<em>#  → 沒有空間用「夜間關機」省錢，因為 pod 是恆定 provisioned</em>
+storage:  bound to pod, paid by uptime
+compute:  bound to pod, paid by uptime
+scaling:  add pods → add fixed cost
+shrink:   ~impossible (data lives on the pod)
+</code></pre>
+
+  <h2>2024 年 serverless 化：解耦 + 換 Turbopuffer，砍 60% 搜尋成本</h2>
+
+  <p>
+    2024 年 5 月做的第一個動作是同一家廠商內部的方案切換——從 dedicated pod 改成 serverless 模式。技術差別只有一個關鍵字：storage 與 compute 解耦，計費從「資料庫開機時間」變成「實際 query 與儲存用量」。對 Notion 這種「白天高峰、夜間低谷、跨時區但仍有明顯波形」的查詢流量，serverless 立刻把峰值的 over-provision 浪費省掉，整體成本相對 pod 模式降了 50%。容量限制也消失了——不需要再為「快滿了」provision 新 generation，理論上 generation 路由表可以開始凍結。
+  </p>
+
+  <p>
+    這個切換本身的工程量並不小（要驗證 query latency 沒有 regression、要設計 traffic 遷移節奏），但比起後面要做的 Turbopuffer 遷移仍算「同一家廠商內」的局部優化。Notion 的描述是「省下幾百萬美元」——對單一基礎設施項目來說已經是顯著金額，但仍不滿足成本目標。
+  </p>
+
+  <p>
+    但 50% 不夠。Serverless 之後年度跑率仍然是「以百萬美元為單位」，向量資料庫單一項目就佔了很大一塊預算。同時 Notion 工程團隊系統性地評估了當時市場上的其他向量搜尋引擎——這個評估的關鍵候選是 <code>Turbopuffer</code>，一個把整個 vector index 建在 object storage 之上的新進向量資料庫。
+  </p>
+
+  <p>
+    選 Turbopuffer 的判斷有三層：
+  </p>
+
+  <ol>
+    <li>
+      <strong>成本結構</strong>——object storage 比 dedicated SSD 容量便宜一個數量級，對「冷資料佔比高、熱查詢集中」的工作量友善。Notion 的 workspace 分佈長尾很長：少數活躍 workspace 貢獻多數查詢，大量低活躍 workspace 的資料只是偶爾被讀。把這些長尾 namespace 放在 object storage 上，每 GB 月費可以從 dedicated SSD 的「以 cents 計」降到「以 fractions of cents 計」。
+    </li>
+    <li>
+      <strong>架構簡化</strong>——Turbopuffer 把每個 namespace 視為獨立 index，不需要 application 層維護分片表，workspace-ID 直接對應一個 namespace，原本的 range partitioning + generation 路由整套可以拆掉。對 application 程式碼來說，「我要查 workspace X」變成 <code>turbopuffer.namespace(workspace_id).query(...)</code>，路由邏輯從 application 完全消失。
+    </li>
+    <li>
+      <strong>批次寫入支援</strong>——對 Notion 這種「會做大批量 re-indexing」的工作量提供了相對便宜的 bulk modification API，讓「換 embedding model 重 embed 全站」這種動作的成本可控。
+    </li>
+  </ol>
+
+  <p>
+    第二層其實是最隱性也最大筆的回報——把 application 程式碼裡的「路由邏輯」整層刪掉，意味著後續所有 retrieval feature（BM25 hybrid、metadata filter）都不再需要繞 generation router。一次性 SDK 遷移成本 vs 長期累積的 abstraction tax，多數情況前者勝。下面這張 chart 把四階段成本與 p50 latency 一起畫——兩條曲線同時往好的方向走，這在基礎設施重構裡並不常見。
+  </p>
+
+  <figure class="vg-w-chart-notion-cost-latency">
+    <style>
+      .vg-w-chart-notion-cost-latency { display: grid; gap: var(--s-2); margin: var(--s-4) 0; }
+      .vg-w-chart-notion-cost-latency svg { width: 100%; height: auto; max-width: 880px; }
+      .vg-w-chart-notion-cost-latency figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+    <svg viewBox="0 0 880 360" preserveAspectRatio="xMidYMid meet" role="img"
+         aria-label="四階段累積成本下降與 p50 latency 改善的雙序列折線圖">
+      <g id="vg-w-chart-notion-cost-latency-axes"></g>
+      <g id="vg-w-chart-notion-cost-latency-series"></g>
+    </svg>
+    <figcaption>
+      Notion 向量搜尋兩年——相對 vector DB 成本（左軸，以 2023.11 pod 為 100%）與 p50 query latency（右軸，ms）。
+      數字來源：Notion blog post (May 2026)。成本下降的每一段對應一次計費邊界的搬移，不是同質壓縮。
+    </figcaption>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-chart-notion-cost-latency');
+        if (!root) return;
+        const axesG = root.querySelector('#vg-w-chart-notion-cost-latency-axes');
+        const seriesG = root.querySelector('#vg-w-chart-notion-cost-latency-series');
+
+        // Real data from the Notion blog post.
+        // [label, relative-cost-percent, p50-latency-ms (typical/observed)]
+        const data = [
+          ['2023.11\npod', 100, 100],
+          ['2024.05\nserverless', 50, 85],
+          ['2025.01\nTurbopuffer', 20, 60],
+          ['2025.07\nxxHash+Ray', 10, 50],
+        ];
+
+        const X0 = 90, X1 = 800, Y0 = 290, Y1 = 50;
+        const maxCost = 100;
+        const maxLat = 120;
+        const yCost = v => Y0 - (v / maxCost) * (Y0 - Y1);
+        const yLat = v => Y0 - (v / maxLat) * (Y0 - Y1);
+        const xOf = i => X0 + (i + 0.5) * (X1 - X0) / data.length;
+
+        const NS = 'http://www.w3.org/2000/svg';
+        function el(tag, attrs) {
+          const e = document.createElementNS(NS, tag);
+          for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+          return e;
+        }
+
+        // Title
+        const title = el('text', {
+          x: 440, y: 26, 'text-anchor': 'middle',
+          'font-family': 'EB Garamond, serif', 'font-size': 14, fill: 'var(--ink)'
+        });
+        title.textContent = '相對成本 vs p50 latency——兩條曲線同時往左下走';
+        axesG.appendChild(title);
+
+        // Plot frame
+        axesG.appendChild(el('line', { x1: X0, y1: Y0, x2: X1, y2: Y0, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+        axesG.appendChild(el('line', { x1: X0, y1: Y0, x2: X0, y2: Y1, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+        axesG.appendChild(el('line', { x1: X1, y1: Y0, x2: X1, y2: Y1, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+
+        // Left axis: cost percent (0..100)
+        for (let v = 0; v <= 100; v += 25) {
+          const y = yCost(v);
+          axesG.appendChild(el('line', { x1: X0 - 4, y1: y, x2: X0, y2: y, stroke: 'var(--muted-2)' }));
+          const t = el('text', {
+            x: X0 - 8, y: y + 4, 'text-anchor': 'end',
+            'font-family': 'Manrope, sans-serif', 'font-size': 11, fill: 'var(--muted)'
+          });
+          t.textContent = v + '%';
+          axesG.appendChild(t);
+          if (v > 0 && v < 100) {
+            axesG.appendChild(el('line', {
+              x1: X0, y1: y, x2: X1, y2: y,
+              stroke: 'var(--muted-2)', 'stroke-width': 0.5, 'stroke-dasharray': '2,3'
+            }));
+          }
+        }
+
+        // Right axis: latency ms (0..120)
+        for (let v = 0; v <= 120; v += 30) {
+          const y = yLat(v);
+          axesG.appendChild(el('line', { x1: X1, y1: y, x2: X1 + 4, y2: y, stroke: 'var(--muted-2)' }));
+          const t = el('text', {
+            x: X1 + 8, y: y + 4, 'text-anchor': 'start',
+            'font-family': 'Manrope, sans-serif', 'font-size': 11, fill: 'var(--muted)'
+          });
+          t.textContent = v;
+          axesG.appendChild(t);
+        }
+
+        // X labels
+        data.forEach((d, i) => {
+          const lines = d[0].split('\n');
+          lines.forEach((line, j) => {
+            const t = el('text', {
+              x: xOf(i), y: Y0 + 20 + j * 14, 'text-anchor': 'middle',
+              'font-family': 'Manrope, sans-serif', 'font-size': 11, fill: 'var(--muted)'
+            });
+            t.textContent = line;
+            axesG.appendChild(t);
+          });
+        });
+
+        // Axis labels
+        const yl1 = el('text', {
+          x: 28, y: (Y0 + Y1) / 2, 'text-anchor': 'middle',
+          'font-family': 'EB Garamond, serif', 'font-size': 13, fill: 'var(--accent-text)',
+          transform: `rotate(-90 28 ${(Y0 + Y1) / 2})`
+        });
+        yl1.textContent = '相對 vector DB 成本（%，2023.11 = 100）';
+        axesG.appendChild(yl1);
+
+        const yl2 = el('text', {
+          x: 855, y: (Y0 + Y1) / 2, 'text-anchor': 'middle',
+          'font-family': 'EB Garamond, serif', 'font-size': 13, fill: 'var(--sage-deep)',
+          transform: `rotate(90 855 ${(Y0 + Y1) / 2})`
+        });
+        yl2.textContent = 'p50 query latency (ms)';
+        axesG.appendChild(yl2);
+
+        // Cost bars (background)
+        data.forEach((d, i) => {
+          const w = 80;
+          const y = yCost(d[1]);
+          seriesG.appendChild(el('rect', {
+            x: xOf(i) - w / 2, y, width: w, height: Y0 - y,
+            fill: 'var(--accent)', 'fill-opacity': 0.18, stroke: 'var(--accent)', 'stroke-width': 1
+          }));
+          const t = el('text', {
+            x: xOf(i), y: y - 6, 'text-anchor': 'middle',
+            'font-family': 'EB Garamond, serif', 'font-size': 12, fill: 'var(--accent-text)'
+          });
+          t.textContent = d[1] + '%';
+          seriesG.appendChild(t);
+        });
+
+        // Latency line (sage)
+        const latPath = data.map((d, i) => `${i === 0 ? 'M' : 'L'} ${xOf(i)} ${yLat(d[2])}`).join(' ');
+        seriesG.appendChild(el('path', {
+          d: latPath, fill: 'none', stroke: 'var(--sage-deep)', 'stroke-width': 1.8
+        }));
+        data.forEach((d, i) => {
+          seriesG.appendChild(el('circle', {
+            cx: xOf(i), cy: yLat(d[2]), r: 4,
+            fill: 'var(--bg)', stroke: 'var(--sage-deep)', 'stroke-width': 1.8
+          }));
+          const t = el('text', {
+            x: xOf(i) + 8, y: yLat(d[2]) - 8, 'text-anchor': 'start',
+            'font-family': 'Manrope, sans-serif', 'font-size': 11, fill: 'var(--sage-deep)'
+          });
+          t.textContent = d[2] + 'ms';
+          seriesG.appendChild(t);
+        });
+
+        // Legend
+        const lg = el('g', { 'font-family': 'Manrope, sans-serif', 'font-size': 12 });
+        lg.appendChild(el('rect', { x: 580, y: 50, width: 14, height: 8, fill: 'var(--accent)', 'fill-opacity': 0.18, stroke: 'var(--accent)', 'stroke-width': 1 }));
+        const l1 = el('text', { x: 600, y: 58, fill: 'var(--ink)' });
+        l1.textContent = '相對成本';
+        lg.appendChild(l1);
+        lg.appendChild(el('line', { x1: 580, y1: 76, x2: 594, y2: 76, stroke: 'var(--sage-deep)', 'stroke-width': 1.8 }));
+        lg.appendChild(el('circle', { cx: 587, cy: 76, r: 3, fill: 'var(--bg)', stroke: 'var(--sage-deep)', 'stroke-width': 1.5 }));
+        const l2 = el('text', { x: 600, y: 80, fill: 'var(--ink)' });
+        l2.textContent = 'p50 latency';
+        lg.appendChild(l2);
+        seriesG.appendChild(lg);
+
+        // Annotation: "每段砍掉的是不同性質的成本"
+        const an = el('text', {
+          x: 440, y: Y0 + 56, 'text-anchor': 'middle',
+          'font-family': 'IM Fell English, serif', 'font-style': 'italic', 'font-size': 12, fill: 'var(--muted)'
+        });
+        an.textContent = '每段砍掉的是不同性質的計費邊界——疊乘成 10 倍降幅';
+        axesG.appendChild(an);
+      })();
+    </script>
+  </figure>
+
+  <figure class="vg-w-arch-notion-turbopuffer-before-after">
+    <svg viewBox="0 0 880 380" role="img"
+         aria-label="Pod 架構與 Turbopuffer 架構對照"
+         style="width: 100%; height: auto; max-width: 880px;">
+      <style>
+        .vg-w-arch-notion-turbopuffer-before-after text { font-family: EB Garamond, serif; font-size: 12px; }
+        .vg-w-arch-notion-turbopuffer-before-after .label { font-family: IM Fell English, serif; font-style: italic; }
+        .vg-w-arch-notion-turbopuffer-before-after .title { font-family: EB Garamond, serif; font-size: 14px; }
+      </style>
       <defs>
-        <marker id="vg-w-scroll-discord-cascade-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
-          <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--accent)" />
+        <marker id="vg-w-arch-notion-turbopuffer-before-after-arr"
+                markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
+          <path d="M0,0 L6,3 L0,6 Z" fill="var(--muted)"/>
         </marker>
       </defs>
-      <g id="vg-w-scroll-discord-cascade-stage-1">
-        <rect x="40" y="40" width="160" height="60" fill="none" stroke="var(--ink)" stroke-width="1.5" />
-        <text x="120" y="65" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">sessions / us-east1-b</text>
-        <text x="120" y="85" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">replicas halved</text>
-        <line x1="120" y1="115" x2="120" y2="160" stroke="var(--accent)" stroke-width="2" marker-end="url(#vg-w-scroll-discord-cascade-arrow)" />
-        <text x="220" y="140" font-family="EB Garamond, serif" font-size="14" fill="var(--accent-text)">17% sessions cut</text>
-      </g>
-      <g id="vg-w-scroll-discord-cascade-stage-2" style="opacity:0">
-        <rect x="40" y="40" width="160" height="60" fill="var(--accent)" fill-opacity="0.15" stroke="var(--accent)" stroke-width="1.5" />
-        <text x="120" y="75" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">{:DOWN, ...}</text>
-        <line x1="200" y1="70" x2="280" y2="70" stroke="var(--accent)" stroke-width="2" marker-end="url(#vg-w-scroll-discord-cascade-arrow)" />
-        <line x1="200" y1="70" x2="280" y2="130" stroke="var(--accent)" stroke-width="2" marker-end="url(#vg-w-scroll-discord-cascade-arrow)" />
-        <line x1="200" y1="70" x2="280" y2="200" stroke="var(--accent)" stroke-width="2" marker-end="url(#vg-w-scroll-discord-cascade-arrow)" />
-        <rect x="290" y="50" width="140" height="40" fill="none" stroke="var(--ink)" stroke-width="1.5" />
-        <text x="360" y="75" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">guild</text>
-        <rect x="290" y="110" width="140" height="40" fill="none" stroke="var(--ink)" stroke-width="1.5" />
-        <text x="360" y="135" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">presence</text>
-        <rect x="290" y="180" width="140" height="40" fill="none" stroke="var(--ink)" stroke-width="1.5" />
-        <text x="360" y="205" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">gateway</text>
-      </g>
-      <g id="vg-w-scroll-discord-cascade-stage-3" style="opacity:0">
-        <rect x="40" y="40" width="120" height="50" fill="var(--accent)" fill-opacity="0.25" stroke="var(--accent)" stroke-width="1.5" />
-        <text x="100" y="60" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--ink)">gateway us-east1-b</text>
-        <text x="100" y="78" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--accent-text)">mem ≈ 100%</text>
-        <rect x="180" y="40" width="120" height="50" fill="none" stroke="var(--ink)" stroke-width="1.5" />
-        <text x="240" y="60" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--ink)">gateway us-east1-c</text>
-        <text x="240" y="78" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">failover load</text>
-        <rect x="320" y="40" width="120" height="50" fill="none" stroke="var(--ink)" stroke-width="1.5" />
-        <text x="380" y="60" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--ink)">gateway us-east1-d</text>
-        <text x="380" y="78" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">failover load</text>
-        <line x1="100" y1="95" x2="240" y2="95" stroke="var(--accent)" stroke-width="2" marker-end="url(#vg-w-scroll-discord-cascade-arrow)" />
-        <line x1="100" y1="95" x2="380" y2="95" stroke="var(--accent)" stroke-width="2" marker-end="url(#vg-w-scroll-discord-cascade-arrow)" />
-        <text x="240" y="140" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--muted)">miscalibrated rate limit</text>
-        <text x="240" y="160" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--muted)">reconnection storm crosses zones</text>
-      </g>
-      <g id="vg-w-scroll-discord-cascade-stage-4" style="opacity:0">
-        <rect x="40" y="40" width="160" height="50" fill="none" stroke="var(--ink)" stroke-width="1.5" />
-        <text x="120" y="60" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--ink)">voice syncer × 15</text>
-        <text x="120" y="78" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">Holster.Pool</text>
-        <rect x="60" y="110" width="120" height="220" fill="var(--accent)" fill-opacity="0.18" stroke="var(--accent)" stroke-width="1.5" />
-        <text x="120" y="130" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--ink)">mailbox</text>
-        <text x="120" y="240" text-anchor="middle" font-family="EB Garamond, serif" font-size="18" fill="var(--accent-text)">~1M msgs</text>
-        <text x="120" y="260" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">selective receive</text>
-        <text x="120" y="278" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">+1ms / spawn</text>
-        <rect x="250" y="60" width="180" height="240" fill="none" stroke="var(--muted)" stroke-width="1" />
-        <text x="340" y="80" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">25,000+ SFU</text>
-        <line x1="180" y1="115" x2="250" y2="115" stroke="var(--accent)" stroke-width="1.5" />
-        <line x1="180" y1="170" x2="250" y2="170" stroke="var(--accent)" stroke-width="1.5" />
-        <line x1="180" y1="225" x2="250" y2="225" stroke="var(--accent)" stroke-width="1.5" />
-        <line x1="180" y1="280" x2="250" y2="280" stroke="var(--accent)" stroke-width="1.5" />
-        <text x="218" y="350" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">HTTPS RPC backed up</text>
-      </g>
-      <g id="vg-w-scroll-discord-cascade-stage-5" style="opacity:0">
-        <circle cx="240" cy="180" r="120" fill="none" stroke="var(--muted)" stroke-width="1" stroke-dasharray="4 4" />
-        <text x="240" y="60" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">consistent hash ring</text>
-        <text x="240" y="78" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">etcd-backed</text>
-        <circle cx="240" cy="60" r="6" fill="var(--accent)" />
-        <circle cx="330" cy="100" r="6" fill="var(--muted-2)" />
-        <circle cx="360" cy="180" r="6" fill="var(--muted-2)" />
-        <circle cx="330" cy="260" r="6" fill="var(--muted-2)" />
-        <circle cx="240" cy="300" r="6" fill="var(--muted-2)" />
-        <circle cx="150" cy="260" r="6" fill="var(--accent)" />
-        <circle cx="120" cy="180" r="6" fill="var(--muted-2)" />
-        <circle cx="150" cy="100" r="6" fill="var(--muted-2)" />
-        <text x="240" y="340" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--accent-text)">TTL refresh starved → instances ejected</text>
-        <text x="240" y="358" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">remaining nodes inherit all failover</text>
+
+      <!-- BEFORE block: Pod model -->
+      <text x="20" y="30" fill="var(--muted)" class="label">舊（dedicated pod，2023.11 - 2024）</text>
+
+      <rect x="40" y="48" width="140" height="44" rx="4" fill="none"
+            stroke="var(--muted-2)" stroke-width="1.2"/>
+      <text x="110" y="68" text-anchor="middle" fill="var(--ink)" class="label">Spark 批次</text>
+      <text x="110" y="84" text-anchor="middle" fill="var(--muted)" class="label">offline ingest</text>
+
+      <rect x="40" y="104" width="140" height="44" rx="4" fill="none"
+            stroke="var(--muted-2)" stroke-width="1.2"/>
+      <text x="110" y="124" text-anchor="middle" fill="var(--ink)" class="label">Kafka consumer</text>
+      <text x="110" y="140" text-anchor="middle" fill="var(--muted)" class="label">online edit</text>
+
+      <rect x="220" y="60" width="180" height="116" rx="6" fill="none"
+            stroke="var(--accent)" stroke-width="1.5"/>
+      <text x="310" y="80" text-anchor="middle" fill="var(--accent-text)" class="label">range routing</text>
+      <text x="310" y="96" text-anchor="middle" fill="var(--muted)" class="label">workspace-ID 分片</text>
+      <text x="310" y="112" text-anchor="middle" fill="var(--muted)" class="label">generation ID 路由</text>
+      <text x="310" y="138" text-anchor="middle" fill="var(--muted)" class="label">gen-0 / gen-1 / gen-2 ...</text>
+      <text x="310" y="156" text-anchor="middle" fill="var(--muted)" class="label">每代獨立 pod 群</text>
+
+      <rect x="440" y="48" width="160" height="44" rx="4" fill="none"
+            stroke="var(--muted-2)" stroke-width="1.2"/>
+      <text x="520" y="68" text-anchor="middle" fill="var(--ink)" class="label">pod cluster A</text>
+      <text x="520" y="84" text-anchor="middle" fill="var(--muted)" class="label">storage + compute 綁定</text>
+
+      <rect x="440" y="104" width="160" height="44" rx="4" fill="none"
+            stroke="var(--muted-2)" stroke-width="1.2"/>
+      <text x="520" y="124" text-anchor="middle" fill="var(--ink)" class="label">pod cluster B</text>
+      <text x="520" y="140" text-anchor="middle" fill="var(--muted)" class="label">按開機時間計費</text>
+
+      <rect x="640" y="76" width="180" height="44" rx="4" fill="none"
+            stroke="var(--accent)" stroke-width="1.2"/>
+      <text x="730" y="96" text-anchor="middle" fill="var(--accent-text)" class="label">$$$ over-provision</text>
+      <text x="730" y="112" text-anchor="middle" fill="var(--muted)" class="label">capacity headroom 是固定費用</text>
+
+      <line x1="180" y1="70" x2="218" y2="98" stroke="var(--muted)"
+            stroke-width="1" marker-end="url(#vg-w-arch-notion-turbopuffer-before-after-arr)"/>
+      <line x1="180" y1="126" x2="218" y2="118" stroke="var(--muted)"
+            stroke-width="1" marker-end="url(#vg-w-arch-notion-turbopuffer-before-after-arr)"/>
+      <line x1="400" y1="100" x2="438" y2="70" stroke="var(--muted)"
+            stroke-width="1" marker-end="url(#vg-w-arch-notion-turbopuffer-before-after-arr)"/>
+      <line x1="400" y1="120" x2="438" y2="126" stroke="var(--muted)"
+            stroke-width="1" marker-end="url(#vg-w-arch-notion-turbopuffer-before-after-arr)"/>
+      <line x1="600" y1="98" x2="638" y2="98" stroke="var(--muted)"
+            stroke-width="1" marker-end="url(#vg-w-arch-notion-turbopuffer-before-after-arr)"/>
+
+      <!-- divider -->
+      <line x1="40" y1="200" x2="840" y2="200" stroke="var(--muted-2)"
+            stroke-width="1" stroke-dasharray="4,3"/>
+
+      <!-- AFTER block: Turbopuffer -->
+      <text x="20" y="222" fill="var(--muted)" class="label">新（Turbopuffer，2025.01）</text>
+
+      <rect x="40" y="240" width="140" height="44" rx="4" fill="none"
+            stroke="var(--accent)" stroke-width="1.5"/>
+      <text x="110" y="260" text-anchor="middle" fill="var(--ink)" class="label">Spark 批次</text>
+      <text x="110" y="276" text-anchor="middle" fill="var(--muted)" class="label">offline ingest</text>
+
+      <rect x="40" y="296" width="140" height="44" rx="4" fill="none"
+            stroke="var(--accent)" stroke-width="1.5"/>
+      <text x="110" y="316" text-anchor="middle" fill="var(--ink)" class="label">Kafka consumer</text>
+      <text x="110" y="332" text-anchor="middle" fill="var(--muted)" class="label">online edit</text>
+
+      <rect x="220" y="250" width="180" height="80" rx="6" fill="none"
+            stroke="var(--sage-deep)" stroke-width="1.5"/>
+      <text x="310" y="270" text-anchor="middle" fill="var(--sage-deep)" class="label">namespace = workspace</text>
+      <text x="310" y="288" text-anchor="middle" fill="var(--muted)" class="label">application 端不再分片</text>
+      <text x="310" y="306" text-anchor="middle" fill="var(--muted)" class="label">不再維護 generation 路由</text>
+      <text x="310" y="322" text-anchor="middle" fill="var(--muted)" class="label">每個 namespace 自包含</text>
+
+      <rect x="440" y="250" width="160" height="80" rx="6" fill="none"
+            stroke="var(--sage-deep)" stroke-width="1.5"/>
+      <text x="520" y="272" text-anchor="middle" fill="var(--sage-deep)" class="title">Turbopuffer</text>
+      <text x="520" y="294" text-anchor="middle" fill="var(--muted)" class="label">vector index on</text>
+      <text x="520" y="310" text-anchor="middle" fill="var(--muted)" class="label">object storage</text>
+      <text x="520" y="326" text-anchor="middle" fill="var(--muted)" class="label">按用量計費</text>
+
+      <rect x="640" y="262" width="180" height="56" rx="4" fill="none"
+            stroke="var(--sage)" stroke-width="1.2"/>
+      <text x="730" y="282" text-anchor="middle" fill="var(--sage-deep)" class="label">搜尋成本 −60%</text>
+      <text x="730" y="300" text-anchor="middle" fill="var(--muted)" class="label">EMR −35%</text>
+      <text x="730" y="316" text-anchor="middle" fill="var(--muted)" class="label">p50 50-70ms</text>
+
+      <line x1="180" y1="262" x2="218" y2="280" stroke="var(--accent)"
+            stroke-width="1" marker-end="url(#vg-w-arch-notion-turbopuffer-before-after-arr)"/>
+      <line x1="180" y1="318" x2="218" y2="304" stroke="var(--accent)"
+            stroke-width="1" marker-end="url(#vg-w-arch-notion-turbopuffer-before-after-arr)"/>
+      <line x1="400" y1="290" x2="438" y2="290" stroke="var(--accent)"
+            stroke-width="1" marker-end="url(#vg-w-arch-notion-turbopuffer-before-after-arr)"/>
+      <line x1="600" y1="290" x2="638" y2="290" stroke="var(--accent)"
+            stroke-width="1" marker-end="url(#vg-w-arch-notion-turbopuffer-before-after-arr)"/>
+
+      <text x="440" y="365" text-anchor="middle" fill="var(--muted)" class="label">
+        application 端的「路由邏輯」整層消失，向量資料庫從「分散式叢集」變回「per-workspace 命名空間」
+      </text>
+    </svg>
+    <figcaption>
+      舊架構需要 application 維護分片表 + generation 路由 + 兩座 pod 群；新架構讓 Turbopuffer 把
+      namespace 當分片單位，application 端只需要把 workspace ID 當 namespace 名稱使用。
+    </figcaption>
+  </figure>
+
+  <p>
+    2024 年 5 月到 2025 年 1 月，Notion 用約八個月把多達數十億筆 vector object 從 pod 模式搬到 Turbopuffer。搬遷策略沿用了原本就在用的 generation-based 思路——不去 reshard 既有 generation，而是把新 workspace cohort 導向「新一代」的 Turbopuffer namespace，逐代切換、逐代驗證；每搬完一代就可以把對應的 pod cluster 退役。這個策略最大的好處是避開了「為了搬遷而 pause onboarding」的風險——onboarding 流量在整個搬遷期間沒有中斷。
+  </p>
+
+  <p>
+    搬遷的安全網來自 Notion 早期就一直在做的雙寫實踐：在切換的中段，新舊兩個引擎同時收寫入、應用層的讀取路徑可以按 feature flag 切到任一邊；當對應 cohort 的「新引擎讀寫驗證」連續一段時間 zero diff，就把這 cohort 的讀路徑切過去、舊引擎進入唯讀狀態；唯讀一段時間沒有客訴或差異後，舊引擎這份 cohort 的資料才會真的被刪掉。這個模式對任何「資料層引擎更換」都適用——關鍵不是技術細節，而是把「驗證 → 切讀 → 退役」三段顯式化，每段都有可以 rollback 的視窗。
+  </p>
+
+  <p>
+    同時做了兩件附帶優化：（a）藉著 full re-indexing 的機會把 embedding model 換成更新版本，後者在召回率與語意理解上都更好；（b）把 Spark offline pipeline 的 throughput 重新調過，配合 <code>Airflow</code> 的 scheduling 讓白天/夜間的 onboarding 容量可以靈活伸縮。「順手換 model」這個動作在獨立做的時候是個 painful 的全站重 embed 工程，但既然遷移本身就要全資料量過一遍 Spark + embedding pipeline，這個成本被 amortize 掉了——好的遷移時機是「順便」做其他原本要單獨付成本的事。
+  </p>
+
+  <p>
+    完成後的數字：搜尋引擎成本 −60%、AWS EMR compute −35%、p50 query latency 從 70-100 ms 降到 50-70 ms。latency 改善的一半來自引擎本身、另一半來自路由層消失（application 不需要做 generation lookup → shard lookup → pod address resolution 這一連串 lookup）——對 tail latency 來說後者價值通常更大。EMR −35% 是順手的紅利：原本分片路由讓 Spark 按 generation 切批次、每代獨立啟動成本；切到 namespace 模型後 Spark 直接以 workspace 為單位 parallel，啟動成本均攤掉。同時 full re-indexing 的門檻也下降，「想換新 embedding model」這種實驗變便宜。
+  </p>
+
+  <h2>2025 年 Page State Project：xxHash64 把 re-embed 量砍 70%</h2>
+
+  <p>
+    2025 年 7 月做的第一件事是 Page State Project——這個專案處理一個原本一直被忽略的浪費：頁面只要被編輯，無論改動是「整段重寫」還是「一個字元變動」，原本的 ingestion pipeline 都會把整頁重新 chunk、重新 embed、重新上傳。對 Notion 這種高編輯頻率的產品，這個語意意味著大量的「重複工作」——同一個 paragraph 因為旁邊的 typo 修正而被反覆 re-embed。
+  </p>
+
+  <p>
+    這個浪費為什麼能存在這麼久？因為它在帳單上不會自己跳出來——embedding API 按 token 計費，月底拿到總量，沒有任何維度告訴你「其中有多少 token 對應的內容其實沒變」。要看出這個浪費，必須在 application 層先建立可以跨時間 dedupe 的 span ID，後續的 hash diff、Merkle tree、CDC 模式才能落地。
+  </p>
+
+  <p>
+    解法的概念很直接：對每個 span（chunked 之後的文字單位）算兩個 hash——一個 hash text 內容、一個 hash metadata（權限、作者、頁面屬性等）——把這對 hash 與 span ID 一起存進 <code>DynamoDB</code>，一個頁面一筆 record、record 內含這個頁面所有 span 的 hash struct。下次同一頁變更時，先把新版的所有 span 算一次 hash，跟 DynamoDB 裡的舊版逐 span 對：
+  </p>
+
+  <pre data-kind="pseudocode"><code><em>// Page State Project：用 xxHash64 判斷哪些 span 真的變了</em>
+def reindex_page(page_id, new_spans):
+    old_state = dynamodb.get(page_id)              <em>// span_id -&gt; (text_hash, meta_hash)</em>
+    new_state = {}
+    to_embed  = []
+    to_patch  = []
+    for span in new_spans:
+        new_th = xxhash64(span.text)
+        new_mh = xxhash64(span.metadata)
+        new_state[span.id] = (new_th, new_mh)
+
+        if span.id not in old_state:
+            to_embed.append(span)                  <em>// 新 span：完整 embed</em>
+        else:
+            old_th, old_mh = old_state[span.id]
+            if old_th != new_th:
+                to_embed.append(span)              <em>// 內容變了：re-embed</em>
+            elif old_mh != new_mh:
+                to_patch.append(span)              <em>// 只有 metadata 變：PATCH，不重 embed</em>
+            <em>// 兩者都相同：什麼都不做</em>
+
+    dynamodb.put(page_id, new_state)
+    if to_embed:  embed_and_upsert(to_embed)
+    if to_patch:  turbopuffer.patch_metadata(to_patch)
+</code></pre>
+
+  <p>
+    這個邏輯把 ingestion 工作拆成三個 case：完全沒變的 span 不動；只有 metadata 變了的 span（例如權限調整、作者改名）走 PATCH 路徑、直接更新 Turbopuffer 裡的 metadata 而不重新呼叫 embedding API；真正內容變動的 span 才走完整 chunk → embed → upsert 流程。在 Notion 的實際編輯分佈下，這個拆分把 ingestion pipeline 的資料量砍了 70%——同時省 embedding API 費用與 Turbopuffer 寫入費用，這兩塊都是按用量計費。
+  </p>
+
+  <p>
+    metadata-only PATCH 那條特別關鍵：權限是頁面層級屬性，所有 span 共享同一個 metadata，舊版 pipeline 動一次牽動全頁 re-embed。企業場景「把某文件分享給新部門」很頻繁，把 text 與 metadata 拆成兩個獨立 hash 後，這條昂貴路徑變成廉價 PATCH。為什麼選 <code>xxHash64</code> 而非 SHA-256 或 32-bit hash？這個 hash 不是用於 cryptographic 安全（沒人會刻意造 collision），純粹是 change detection——這個前提下 xxHash64 就是甜蜜點。下面這張表把取捨並排起來，點 header 可以排序。
+  </p>
+
+  <figure class="vg-w-table-notion-hash-tradeoff">
+    <style>
+      .vg-w-table-notion-hash-tradeoff { margin: var(--s-4) 0; }
+      .vg-w-table-notion-hash-tradeoff table { width: 100%; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-notion-hash-tradeoff thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; }
+      .vg-w-table-notion-hash-tradeoff thead th[data-sort] { color: var(--accent-text); }
+      .vg-w-table-notion-hash-tradeoff thead th[data-sort="asc"]::after { content: " ↑"; }
+      .vg-w-table-notion-hash-tradeoff thead th[data-sort="desc"]::after { content: " ↓"; }
+      .vg-w-table-notion-hash-tradeoff tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); }
+      .vg-w-table-notion-hash-tradeoff td.num { font-variant-numeric: tabular-nums; text-align: right; }
+      .vg-w-table-notion-hash-tradeoff tr.pick td { color: var(--accent-text); }
+      .vg-w-table-notion-hash-tradeoff tr.pick td:first-child::before { content: "★ "; color: var(--accent); }
+      .vg-w-table-notion-hash-tradeoff figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-2); }
+    </style>
+    <table>
+      <thead>
+        <tr>
+          <th data-key="name">hash</th>
+          <th data-key="bytes" class="num">size (bytes)</th>
+          <th data-key="throughput" class="num">throughput (GB/s)</th>
+          <th data-key="collision">collision @ 1e9</th>
+          <th data-key="fit">適用情境</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr class="pick"><td>xxHash64</td><td class="num">8</td><td class="num">7.5</td><td>可忽略</td><td>change detection（Notion 選這個）</td></tr>
+        <tr><td>SHA-256</td><td class="num">32</td><td class="num">0.4</td><td>cryptographically negligible</td><td>cryptographic identity / signing</td></tr>
+        <tr><td>xxHash32</td><td class="num">4</td><td class="num">7.5</td><td>可觀察（~10%）</td><td>small key dedupe, 不要在 1e9 規模上用</td></tr>
+        <tr><td>MD5</td><td class="num">16</td><td class="num">0.7</td><td>cryptographically broken</td><td>legacy compatibility（沒有新理由選）</td></tr>
+        <tr><td>CRC32</td><td class="num">4</td><td class="num">12</td><td>不適用</td><td>傳輸層 checksum，不是 content fingerprint</td></tr>
+        <tr><td>BLAKE3</td><td class="num">32</td><td class="num">3.5</td><td>cryptographically negligible</td><td>需要密碼學安全且 SHA-256 太慢的情境</td></tr>
+      </tbody>
+    </table>
+    <figcaption>
+      Hash 演算法取捨表——點欄位 header 排序。Throughput 數字是 modern x86 single-core 概略值，
+      實際隨 SIMD 支援與輸入長度浮動。Notion 選 xxHash64 的關鍵在第三、第四欄：1e9 規模仍夠安全，
+      但速度比 cryptographic hash 快一個數量級。
+    </figcaption>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-table-notion-hash-tradeoff');
+        if (!root) return;
+        const headers = root.querySelectorAll('thead th');
+        const tbody = root.querySelector('tbody');
+        let activeKey = null, asc = true;
+        headers.forEach(h => h.addEventListener('click', () => {
+          const key = h.dataset.key;
+          if (activeKey === key) { asc = !asc; } else { activeKey = key; asc = true; }
+          headers.forEach(x => x.removeAttribute('data-sort'));
+          h.setAttribute('data-sort', asc ? 'asc' : 'desc');
+          const rows = [...tbody.querySelectorAll('tr')];
+          const idx = [...headers].indexOf(h);
+          rows.sort((a, b) => {
+            const av = a.children[idx].textContent.trim();
+            const bv = b.children[idx].textContent.trim();
+            const an = Number(av), bn = Number(bv);
+            const cmp = !Number.isNaN(an) && !Number.isNaN(bn)
+              ? an - bn
+              : av.localeCompare(bv);
+            return asc ? cmp : -cmp;
+          });
+          rows.forEach(r => tbody.appendChild(r));
+        }));
+      })();
+    </script>
+  </figure>
+
+  <p>
+    關鍵欄位是「適用情境」——選 hash 不是看哪個「最強」，而是看哪個對應你的 threat model。Change detection 的 threat 是「兩個不同 span 偶然算出同一個 hash」，這個機率在 64-bit + 1e9 scale 上遠低於 disk error rate；沒理由再多付 SHA-256 那 20x CPU 與 4x storage。反過來如果攻擊者可以選擇 input（例如 build cache 要抗 supply chain attack），那 xxHash64 不夠，BLAKE3 才是甜蜜點——hash 選擇是個三維問題（速度、size、threat model），不是一維比較。
+  </p>
+
+  <h2>Ray Serve 收尾——拆掉 GPU pod 的雙重計算</h2>
+
+  <p>
+    同個月（2025 年 7 月）做的第二件事是 embedding 服務的整個搬家：從原本掛在外部 embedding API 與內部 GPU pod 上的兩條路徑，整個搬到 <code>Ray</code> / <code>Anyscale</code> 上跑。要解的痛點有三個：
+  </p>
+
+  <ol>
+    <li>
+      <strong>「雙重計算」問題</strong>——舊架構下，Spark 做 preprocessing（chunking、normalization、metadata 抽取），完成後把結果丟給 embedding API，又被計算一次 token。同樣的 token stream 在不同層被算兩次，這是純粹的浪費。
+    </li>
+    <li>
+      <strong>外部 API 可靠性綁定</strong>——embedding API 的延遲、rate limit、故障時間，直接決定 ingestion pipeline 與 query path 的可用性，沒有降級路徑。Embedding model provider 一旦發 incident，Notion 的 ingestion 就會 backlog；reactor 沒有「先用本地 fallback model」的選項，因為架構上根本沒有本地 model。
+    </li>
+    <li>
+      <strong>難看的 pipelining</strong>——為了配合 rate limit，工程師得寫一堆 S3 batching 跟 retry 邏輯把資料分批送過去，這些 batch 是手寫的、不容易調整。每次想換 batch size、加 retry policy，都得改 Spark job 的 partitioning，跟 embedding pipeline 的物理特性綁太緊。
+    </li>
+  </ol>
+
+  <p>
+    Ray 的賣點對應這三點：
+  </p>
+
+  <ul>
+    <li>
+      Ray 把 preprocessing 與 inference 放在同一個 compute layer，GPU-bound 的 embedding inference 跟 CPU-bound 的 preprocessing 可以在同一台機器上 pipeline 起來，把 GPU 利用率推高同時消掉 double compute。Notion 引用的措辭是「pipelining GPU-bound inference with CPU-bound preprocessing on the same machines, keeping utilization high」——這句話的具體含義是：當 GPU 在算 batch N 的 embedding 時，同一台機器的 CPU 正在 chunk batch N+1、normalize batch N+2，三件事 overlap 進行，GPU 不會空等資料。
+    </li>
+    <li>
+      Embedding model 改成在 Ray 上跑開源模型，不再受外部 API gate。Notion 在文章裡強調的 model flexibility 包括「想試新 model 不需要等 provider 開放」、「可以用 fine-tune 過的內部模型」、「可以隨時 fallback 到 cheaper model」——這些自由度在綁外部 API 時都不存在。
+    </li>
+    <li>
+      <code>Ray Serve</code> 把模型包成持久 GPU-resident 的 deployment，配置用 YAML 描述 batching、replication、autoscaling，model serving 是普通 Python——對 query path 來說，embedding 從「外部 HTTP 呼叫」變成「同 cluster 內的 RPC」，把第三方 API 的網路 hop 從 critical path 上拿掉。一次外部 HTTP 來回在跨區情境通常是 20-50 ms 起跳；同 cluster RPC 通常 1-5 ms。對 query path 的 p50 50 ms 預算來說，這是值得砍的一塊。
+    </li>
+  </ul>
+
+  <p>
+    下面這個架構圖把 2025.07 之後的最終 stack 攤開來——點選任一個元件可以看它的責任與「它不知道的東西」。每個元件的責任邊界都是有意識劃出來的：xxHash64 不知道 span 的語意（它只看 byte stream）、Turbopuffer 不知道 workspace 的 ACL（namespace 只是字串）、Ray Serve 不知道 vector 之後會被誰查（它只 embed 然後回傳）。這種「明確的不知道」是組件可以被獨立替換的前提。
+  </p>
+
+  <figure class="vg-w-annotated-notion-final-arch">
+    <style>
+      .vg-w-annotated-notion-final-arch { display: grid; grid-template-columns: 1.4fr 1fr; gap: var(--s-3); align-items: start; margin: var(--s-4) 0; }
+      .vg-w-annotated-notion-final-arch svg { width: 100%; height: auto; }
+      .vg-w-annotated-notion-final-arch input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-annotated-notion-final-arch .component { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; transition: fill 200ms, stroke 200ms; }
+      .vg-w-annotated-notion-final-arch .component:hover { stroke: var(--accent); }
+      .vg-w-annotated-notion-final-arch .component-text { pointer-events: none; }
+      .vg-w-annotated-notion-final-arch .detail { padding: var(--s-2) var(--s-3); border-left: 2px solid var(--accent); display: none; }
+      .vg-w-annotated-notion-final-arch .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-annotated-notion-final-arch .detail p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-annotated-notion-final-arch .detail .knows { color: var(--ink); }
+      .vg-w-annotated-notion-final-arch .detail .doesnt { color: var(--muted); font-family: var(--scribed); }
+      .vg-w-annotated-notion-final-arch:has(#vg-w-annotated-notion-final-arch-r1:checked) .component-1 { fill: var(--accent); fill-opacity: 0.18; stroke: var(--accent); }
+      .vg-w-annotated-notion-final-arch:has(#vg-w-annotated-notion-final-arch-r2:checked) .component-2 { fill: var(--accent); fill-opacity: 0.18; stroke: var(--accent); }
+      .vg-w-annotated-notion-final-arch:has(#vg-w-annotated-notion-final-arch-r3:checked) .component-3 { fill: var(--accent); fill-opacity: 0.18; stroke: var(--accent); }
+      .vg-w-annotated-notion-final-arch:has(#vg-w-annotated-notion-final-arch-r4:checked) .component-4 { fill: var(--accent); fill-opacity: 0.18; stroke: var(--accent); }
+      .vg-w-annotated-notion-final-arch:has(#vg-w-annotated-notion-final-arch-r5:checked) .component-5 { fill: var(--accent); fill-opacity: 0.18; stroke: var(--accent); }
+      .vg-w-annotated-notion-final-arch:has(#vg-w-annotated-notion-final-arch-r6:checked) .component-6 { fill: var(--accent); fill-opacity: 0.18; stroke: var(--accent); }
+      .vg-w-annotated-notion-final-arch:has(#vg-w-annotated-notion-final-arch-r1:checked) .detail-1 { display: block; }
+      .vg-w-annotated-notion-final-arch:has(#vg-w-annotated-notion-final-arch-r2:checked) .detail-2 { display: block; }
+      .vg-w-annotated-notion-final-arch:has(#vg-w-annotated-notion-final-arch-r3:checked) .detail-3 { display: block; }
+      .vg-w-annotated-notion-final-arch:has(#vg-w-annotated-notion-final-arch-r4:checked) .detail-4 { display: block; }
+      .vg-w-annotated-notion-final-arch:has(#vg-w-annotated-notion-final-arch-r5:checked) .detail-5 { display: block; }
+      .vg-w-annotated-notion-final-arch:has(#vg-w-annotated-notion-final-arch-r6:checked) .detail-6 { display: block; }
+      .vg-w-annotated-notion-final-arch .hint { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-2); }
+      @media (max-width: 720px) {
+        .vg-w-annotated-notion-final-arch { grid-template-columns: 1fr; }
+      }
+    </style>
+
+    <input type="radio" id="vg-w-annotated-notion-final-arch-r1" aria-label="select option 1" name="vg-w-annotated-notion-final-arch-sel" checked />
+    <input type="radio" id="vg-w-annotated-notion-final-arch-r2" aria-label="select option 2" name="vg-w-annotated-notion-final-arch-sel" />
+    <input type="radio" id="vg-w-annotated-notion-final-arch-r3" aria-label="select option 3" name="vg-w-annotated-notion-final-arch-sel" />
+    <input type="radio" id="vg-w-annotated-notion-final-arch-r4" aria-label="select option 4" name="vg-w-annotated-notion-final-arch-sel" />
+    <input type="radio" id="vg-w-annotated-notion-final-arch-r5" aria-label="select option 5" name="vg-w-annotated-notion-final-arch-sel" />
+    <input type="radio" id="vg-w-annotated-notion-final-arch-r6" aria-label="select option 6" name="vg-w-annotated-notion-final-arch-sel" />
+
+    <svg viewBox="0 0 520 360" role="img"
+         aria-label="2025.07 之後的最終向量搜尋架構，每個元件可點開查看責任邊界">
+      <defs>
+        <marker id="vg-w-annotated-notion-final-arch-arr"
+                viewBox="0 0 10 10" refX="9" refY="5"
+                markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+        </marker>
+      </defs>
+
+      <text x="260" y="22" text-anchor="middle"
+            font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">
+        2025.07 之後——點任一元件看責任邊界
+      </text>
+
+      <!-- Component 1: Kafka -->
+      <rect class="component component-1" data-target="vg-w-annotated-notion-final-arch-r1"
+            x="30" y="60" width="120" height="56" rx="4" role="button" tabindex="0" />
+      <text class="component-text" x="90" y="86" text-anchor="middle"
+            font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">Kafka</text>
+      <text class="component-text" x="90" y="102" text-anchor="middle"
+            font-family="IM Fell English, serif" font-style="italic" font-size="11" fill="var(--muted)">edit stream</text>
+
+      <!-- Component 2: Spark -->
+      <rect class="component component-2" data-target="vg-w-annotated-notion-final-arch-r2"
+            x="30" y="140" width="120" height="56" rx="4" role="button" tabindex="0" />
+      <text class="component-text" x="90" y="166" text-anchor="middle"
+            font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">Spark</text>
+      <text class="component-text" x="90" y="182" text-anchor="middle"
+            font-family="IM Fell English, serif" font-style="italic" font-size="11" fill="var(--muted)">offline bulk</text>
+
+      <!-- Component 3: xxHash64 + DynamoDB -->
+      <rect class="component component-3" data-target="vg-w-annotated-notion-final-arch-r3"
+            x="190" y="100" width="140" height="76" rx="4" role="button" tabindex="0" />
+      <text class="component-text" x="260" y="128" text-anchor="middle"
+            font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">xxHash64 diff</text>
+      <text class="component-text" x="260" y="146" text-anchor="middle"
+            font-family="EB Garamond, serif" font-size="12" fill="var(--ink)">+ DynamoDB</text>
+      <text class="component-text" x="260" y="164" text-anchor="middle"
+            font-family="IM Fell English, serif" font-style="italic" font-size="11" fill="var(--muted)">page state</text>
+
+      <!-- Component 4: Ray Serve -->
+      <rect class="component component-4" data-target="vg-w-annotated-notion-final-arch-r4"
+            x="190" y="220" width="140" height="56" rx="4" role="button" tabindex="0" />
+      <text class="component-text" x="260" y="246" text-anchor="middle"
+            font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">Ray Serve</text>
+      <text class="component-text" x="260" y="262" text-anchor="middle"
+            font-family="IM Fell English, serif" font-style="italic" font-size="11" fill="var(--muted)">embedding</text>
+
+      <!-- Component 5: Turbopuffer -->
+      <rect class="component component-5" data-target="vg-w-annotated-notion-final-arch-r5"
+            x="370" y="140" width="120" height="76" rx="4" role="button" tabindex="0" />
+      <text class="component-text" x="430" y="168" text-anchor="middle"
+            font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">Turbopuffer</text>
+      <text class="component-text" x="430" y="186" text-anchor="middle"
+            font-family="IM Fell English, serif" font-style="italic" font-size="11" fill="var(--muted)">namespace</text>
+      <text class="component-text" x="430" y="200" text-anchor="middle"
+            font-family="IM Fell English, serif" font-style="italic" font-size="11" fill="var(--muted)">= workspace</text>
+
+      <!-- Component 6: Query path -->
+      <rect class="component component-6" data-target="vg-w-annotated-notion-final-arch-r6"
+            x="190" y="300" width="300" height="48" rx="4" role="button" tabindex="0" />
+      <text class="component-text" x="340" y="324" text-anchor="middle"
+            font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">Query path</text>
+      <text class="component-text" x="340" y="340" text-anchor="middle"
+            font-family="IM Fell English, serif" font-style="italic" font-size="11" fill="var(--muted)">Q&amp;A retrieval · p50 ~50 ms</text>
+
+      <!-- Edges with currentColor so arrows follow text color -->
+      <g style="color: var(--muted)">
+        <line x1="150" y1="88" x2="186" y2="130" stroke="currentColor" stroke-width="1.2"
+              marker-end="url(#vg-w-annotated-notion-final-arch-arr)"/>
+        <line x1="150" y1="168" x2="186" y2="146" stroke="currentColor" stroke-width="1.2"
+              marker-end="url(#vg-w-annotated-notion-final-arch-arr)"/>
+        <line x1="260" y1="176" x2="260" y2="216" stroke="currentColor" stroke-width="1.2"
+              marker-end="url(#vg-w-annotated-notion-final-arch-arr)"/>
+        <line x1="330" y1="248" x2="370" y2="200" stroke="currentColor" stroke-width="1.2"
+              marker-end="url(#vg-w-annotated-notion-final-arch-arr)"/>
+        <line x1="330" y1="138" x2="370" y2="170" stroke="currentColor" stroke-width="1.2"
+              marker-end="url(#vg-w-annotated-notion-final-arch-arr)"/>
+        <line x1="430" y1="216" x2="390" y2="298" stroke="currentColor" stroke-width="1.2" stroke-dasharray="3,3"
+              marker-end="url(#vg-w-annotated-notion-final-arch-arr)"/>
+        <line x1="260" y1="276" x2="260" y2="298" stroke="currentColor" stroke-width="1.2" stroke-dasharray="3,3"
+              marker-end="url(#vg-w-annotated-notion-final-arch-arr)"/>
       </g>
     </svg>
-  </div>
 
-  <script>
-    (function () {
-      const root = document.querySelector('.vg-w-scroll-discord-cascade');
-      if (!root) return;
-      const stages = root.querySelectorAll('.stage');
-      const groups = {
-        1: root.querySelector('#vg-w-scroll-discord-cascade-stage-1'),
-        2: root.querySelector('#vg-w-scroll-discord-cascade-stage-2'),
-        3: root.querySelector('#vg-w-scroll-discord-cascade-stage-3'),
-        4: root.querySelector('#vg-w-scroll-discord-cascade-stage-4'),
-        5: root.querySelector('#vg-w-scroll-discord-cascade-stage-5')
-      };
-      function show(stage) {
-        for (const s of stages) s.classList.toggle('active', s.dataset.stage === String(stage));
-        for (const k of Object.keys(groups)) {
-          if (groups[k]) groups[k].style.opacity = String(k === String(stage) ? 1 : 0);
-        }
-      }
-      const io = new IntersectionObserver((entries) => {
-        for (const e of entries) {
-          if (e.isIntersecting) show(e.target.dataset.stage);
-        }
-      }, { rootMargin: window.matchMedia('(max-width: 720px)').matches ? '-50% 0px -40% 0px' : '-40% 0px -40% 0px', threshold: 0 });
-      for (const s of stages) io.observe(s);
-      show(1);
-    })();
-  </script>
-</figure>
+    <div>
+      <div class="detail detail-1">
+        <h3>Kafka · 責任</h3>
+        <p class="knows">承接所有 page edit 事件，提供 at-least-once delivery、partition 化的事件流；
+        是 ingestion 「online」路徑的唯一入口。</p>
+        <p class="doesnt">不知道：事件的內容語意、哪些事件需要 re-embed、哪些只要 metadata patch。
+        後面的 xxHash64 diff 才能回答這個問題。</p>
+      </div>
+      <div class="detail detail-2">
+        <h3>Spark · 責任</h3>
+        <p class="knows">處理 bootstrapping 與 bulk re-indexing——把整個 workspace 的內容 chunk、
+        normalize、走後面的 hash diff + embedding 流程。</p>
+        <p class="doesnt">不知道：online edit 怎麼走（那是 Kafka 路徑）、單個 span 是否需要 re-embed
+        （由 xxHash64 diff 決定）。Spark 純粹是 throughput 引擎。</p>
+      </div>
+      <div class="detail detail-3">
+        <h3>xxHash64 diff + DynamoDB · 責任</h3>
+        <p class="knows">給每個 span 算 text hash + metadata hash、查 DynamoDB 裡的舊版、輸出三種
+        決策：skip / metadata-only PATCH / full re-embed。把「重複工作」這個浪費類別從整條 pipeline 拿掉。</p>
+        <p class="doesnt">不知道：span 的語意內容、哪個 embedding model 在用、最終結果寫到哪個
+        Turbopuffer namespace。它只看 byte stream。</p>
+      </div>
+      <div class="detail detail-4">
+        <h3>Ray Serve · 責任</h3>
+        <p class="knows">把 embedding model 包成 GPU-resident 的常駐 deployment，提供 dynamic
+        batching、autoscaling；CPU preprocessing 與 GPU inference 在同一機 pipeline。把外部
+        embedding API 與內部 GPU pod 兩條路一起收掉。</p>
+        <p class="doesnt">不知道：哪些 span 應該被 embed（diff 已經 filter 過）、結果要寫到哪。
+        它只接 token batch、回傳 vector。</p>
+      </div>
+      <div class="detail detail-5">
+        <h3>Turbopuffer · 責任</h3>
+        <p class="knows">vector index on object storage；每個 workspace 對應一個 namespace；
+        ANN search、metadata filter、bulk modify 都在 namespace scope 內。</p>
+        <p class="doesnt">不知道：workspace 的 ACL（namespace 只是字串）、誰會查 query、上游用了哪個
+        embedding model。它只認 vector + metadata。</p>
+      </div>
+      <div class="detail detail-6">
+        <h3>Query path · 責任</h3>
+        <p class="knows">把使用者查詢字串送進 Ray Serve embed → 拿 query vector → 對應 workspace
+        的 Turbopuffer namespace ANN search → 回傳 top-K。p50 50 ms。</p>
+        <p class="doesnt">不知道：vector 是怎麼產生的、什麼時候更新的、underlying storage 是
+        SSD 還是 object storage。對 query path 來說，這些都是封裝下面的細節。</p>
+      </div>
+      <p class="hint">點擊任一元件查看細節。資訊邊界與責任邊界對齊——每個 box 都有它「明確不知道」的事，這是可以被獨立替換的前提。</p>
+    </div>
 
-<h2>結構性修補——把這條 critical path 永久拆掉</h2>
-
-<p>Discord 列了四條軸線的後續修補，都值得作為「自家系統還可能犯同樣錯」的檢查清單。</p>
-
-<p><strong>部署層：Kubernetes admission webhook</strong>。在 Kubernetes 加一個 validating admission webhook 檢查 Elixir workload 的縮容請求——只有當 entity drain 跑完才放行。這把「graceful drain 必須跑完」這條原本只存在於工程師腦中的隱性契約，明文寫進 control plane 的 enforcement 裡。50 人的團隊可以靠口耳相傳維持「縮容前要 drain」，500 人不行——只有 enforcement 不會被忘記。</p>
-
-<p><strong>架構層：PartitionSupervisor 取代 Holster.Pool 的單一 supervisor</strong>。原本所有 spawn/terminate 訊息都打到一個 mailbox；換成 Elixir 1.14 內建的 <code>PartitionSupervisor</code> 後切成 N 個分區（通常 N 等於 scheduler 數），每分區一個 mailbox，selective receive 的 O(n) 跟著切成 N 份。同時 gun 額外那層 supervision 也被拿掉，連線生命周期直接由 Holster.Pool 管理。修補哲學的精彩之處在於：不是「加大 mailbox」也不是「跳過 selective receive」，而是「把單一 contention point 切碎」。</p>
-
-<p><strong>流控層：上下游同時加 rate limit</strong>。call owner services 統一更新成有合理的 syncer spawn rate limit；voice syncers 內部也補上 endpoint selection rate limit；另外多了一套「optional load shedding tool」，把先前手動操作的應急路徑變成可程式化呼叫的工具。事故當下寫過的每一條「手動 fix」，事後都該問：「能不能變成一條按鈕？」</p>
-
-<p><strong>可觀測性層：mailbox health 變成一等公民</strong>。團隊新增了 HTTP connection pooling 的 mailbox health 監控、service discovery announcement 儀表板、voice-to-SFU RPC traffic 的細部 instrumentation。報告還提到「pursuing generic process mailbox monitoring across all Elixir services」——把「任何 process 的 mailbox 長度都該被監控」推到全公司。對跑其他語言的團隊，等價目標是：所有 message channel、worker queue、event loop 的 backlog 長度都該被監控；任何「訊息傳遞層的累積」都是 leading indicator，比 latency 或 error rate 提前一兩個訊號。</p>
-
-<p><strong>更長期方向</strong>：A/V 基礎設施從手動管理的 GCP VM 搬上 Kubernetes；voice control plane 重新切成跨 region 架構，讓單一 region 的 connection spike 不再能拖垮全球。能在覆盤裡明白寫出「這些事還沒做」是難得的誠實——很多公司會把長期項目隱去。</p>
-
-<h3>給跑其他語言的人——三條可遷移的原則</h3>
-
-<p><strong>O(n) selective receive 是 BEAM 一個冷門但會吃人的細節</strong>。receive 區塊在 mailbox 短時快得不像話，這讓開發者忘了它在 mailbox 長時會退化；任何用 pattern match 從 mailbox 挑特定訊息的路徑都要假設過載時會退化，不能避免就監控 mailbox length。BEAM 21+ 的 <code>receive ref</code> 編譯器最佳化能在某些情況把複雜度降回 O(1)，但 Holster.Pool 那次正好是 hint 無法應用的場景。對其他語言：Go 的 buffered channel、Rust tokio 的 mpsc、Node 的 event loop、Java 的 ThreadPoolExecutor queue——每一個都會在過載時退化到某種失敗模式，差別只在症狀。</p>
-
-<p><strong>service discovery 與 connection management 不該共享同一條 mailbox</strong>。control plane 與 data plane 必須是物理上分開的 process tree。Kubernetes 的 readiness probe 該走獨立的 endpoint 與 thread pool；資料庫的 health check 該走獨立 connection；gRPC server 的 health service 應該跑在獨立 sub-channel——任何「我還活著」的訊號路徑都不該跟「我正在處理業務」的路徑搶資源。</p>
-
-<p><strong>cold-start thundering herd 是恢復流程的隱形殺手</strong>。當源頭是「上游沒節流」，重啟多少次下次都會被同樣流量打回去。恢復計畫必須同時包含「停止流量灌入」與「恢復服務容量」兩條軸線。對抗工具包括 startup jitter、warm-up traffic、circuit breaker——這次事故顯示，這些工具在 voice control plane 那層是缺失的。</p>
-
-<h3>數字一覽——把這次事故壓成幾個關鍵指標</h3>
-
-<p>下面這張表把整起事件的關鍵時間軸與當下狀態壓在一起，方便要回頭查特定時刻時不用回去刷整份報告。每一列都對應覆盤裡明文寫出的時間與動作。</p>
-
-<figure class="vg-w-table-discord-timeline">
-  <style>
-    .vg-w-table-discord-timeline table { width: 100%; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
-    .vg-w-table-discord-timeline thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; }
-    .vg-w-table-discord-timeline thead th[data-sort] { color: var(--accent-text); }
-    .vg-w-table-discord-timeline tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
-    .vg-w-table-discord-timeline td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
-    .vg-w-table-discord-timeline td.outcome-fail { color: var(--accent-text); }
-    .vg-w-table-discord-timeline td.outcome-ok { color: var(--ink); }
-    .vg-w-table-discord-timeline caption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); text-align: left; padding: var(--s-2) 0; }
-  </style>
-  <table>
-    <caption>3/25 incident — operator action ledger（click a header to sort）</caption>
-    <thead>
-      <tr>
-        <th data-key="time" class="num">time (PDT)</th>
-        <th data-key="action">operator action</th>
-        <th data-key="outcome">outcome</th>
-      </tr>
-    </thead>
-    <tbody>
-      <tr><td class="num">12:13</td><td>k8s scale-down halves us-east1-b sessions pods</td><td class="outcome-fail">17% sessions ungracefully stopped</td></tr>
-      <tr><td class="num">12:15</td><td>gateway us-east1-b begins memory climb</td><td class="outcome-fail">nodes restart; failover spreads to 1c, 1d</td></tr>
-      <tr><td class="num">12:14</td><td>endpoint select/create success drops</td><td class="outcome-fail">near zero across all 15 syncers</td></tr>
-      <tr><td class="num">12:43</td><td>restart syncer instance 2-13</td><td class="outcome-fail">mailbox regrew within seconds</td></tr>
-      <tr><td class="num">12:47</td><td>kill Holster.Pool DynamicSupervisor on 2-1</td><td class="outcome-fail">same regrowth pattern</td></tr>
-      <tr><td class="num">13:05</td><td>full cluster restart</td><td class="outcome-fail">cold-start thundering herd</td></tr>
-      <tr><td class="num">13:43</td><td>upstream rate limits + 15 extra dispatchers via terraform</td><td class="outcome-ok">gun supervisor backs up but etcd holds</td></tr>
-      <tr><td class="num">14:03</td><td>restart instance 2-3</td><td class="outcome-ok">first instance with stable low mailbox</td></tr>
-      <tr><td class="num">14:15</td><td>restart 5 instances</td><td class="outcome-ok">4 of 5 fully recovered</td></tr>
-      <tr><td class="num">14:26</td><td>last instance recovers</td><td class="outcome-ok">doubled cluster healthy</td></tr>
-    </tbody>
-  </table>
-  <script>
-    (function () {
-      const root = document.querySelector('.vg-w-table-discord-timeline');
-      if (!root) return;
-      const headers = root.querySelectorAll('thead th');
-      const tbody = root.querySelector('tbody');
-      let activeKey = null, asc = true;
-      headers.forEach(h => h.addEventListener('click', () => {
-        const key = h.dataset.key;
-        if (activeKey === key) asc = !asc; else { activeKey = key; asc = true; }
-        headers.forEach(x => x.removeAttribute('data-sort'));
-        h.setAttribute('data-sort', asc ? 'asc' : 'desc');
-        const rows = [...tbody.querySelectorAll('tr')];
-        const idx = [...headers].indexOf(h);
-        rows.sort((a, b) => {
-          const av = a.children[idx].textContent.trim();
-          const bv = b.children[idx].textContent.trim();
-          const an = Number(av.replace(':', '.'));
-          const bn = Number(bv.replace(':', '.'));
-          const cmp = !Number.isNaN(an) && !Number.isNaN(bn) && key === 'time' ? an - bn : av.localeCompare(bv);
-          return asc ? cmp : -cmp;
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-annotated-notion-final-arch');
+        if (!root) return;
+        root.querySelectorAll('.component').forEach((rect) => {
+          rect.addEventListener('click', () => {
+            const targetId = rect.getAttribute('data-target');
+            const radio = root.querySelector('#' + targetId);
+            if (radio) radio.checked = true;
+          });
+          rect.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); rect.dispatchEvent(new MouseEvent('click', { bubbles: true })); } });
         });
-        rows.forEach(r => tbody.appendChild(r));
-      }));
-    })();
-  </script>
-</figure>
+      })();
+    </script>
+  </figure>
 
-<p>把這張表按時間排序時你會看到一條很乾淨的劃分線：13:43 PDT 之前的所有 operator action 結果都是 outcome-fail，之後則是連續四列 outcome-ok。前三次救火為什麼失敗、第四次為什麼成功，差別就在於「是不是把上游也鎖住了」。</p>
+  <p>
+    Embedding 基礎設施成本 −90%，來自：拿掉外部 API per-token 計費、用開源 model 取代付費 model、preprocessing 與 inference 共用機器推高 GPU 利用率、query path 從外部 HTTP 變成同 cluster RPC。Ray 上的 embedding model 是 GPU-resident 常駐 deployment，不是 cold-start serverless function——request 進來時 model 已在 GPU 上，搭配 sub-millisecond 窗口的 dynamic batching 把 batch=1 的 kernel launch overhead 避掉，同時把每筆 query 額外等待控制在 1-2 ms。窗口長度是 tail latency vs throughput 的 tradeoff，必須為它設 explicit budget。
+  </p>
 
-<h3>把 Holster.Pool 換成 PartitionSupervisor——結構性的關鍵</h3>
+  <h2>把四個階段串起來看到什麼</h2>
 
-<p>如果整篇覆盤要挑一張圖留下，那會是 voice syncers 的 HTTP connection 池在事故前後的結構對比。事故前，所有 connection 的 spawn/terminate 訊息都打到一個 <code>Holster.Pool</code> 的 DynamicSupervisor 的 mailbox 裡；事故後，這個單一 mailbox 被 PartitionSupervisor 切成多個分區，每個分區自己一個 mailbox，selective receive 的 O(n) 也跟著切成 O(n/N)。</p>
+  <figure>
+    <svg class="vg-w-flow-notion-ingest-shift" viewBox="0 0 880 320" role="img"
+         aria-label="Ingestion 流程的四階段變化"
+         style="width: 100%; height: auto; max-width: 880px;">
+      <style>
+        .vg-w-flow-notion-ingest-shift text { font-family: EB Garamond, serif; font-size: 12px; }
+        .vg-w-flow-notion-ingest-shift .label { font-family: IM Fell English, serif; font-style: italic; }
+        .vg-w-flow-notion-ingest-shift .title { font-family: EB Garamond, serif; font-size: 14px; }
+      </style>
+      <defs>
+        <marker id="vg-w-flow-notion-ingest-shift-arr"
+                markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
+          <path d="M0,0 L6,3 L0,6 Z" fill="var(--muted)"/>
+        </marker>
+      </defs>
 
-<figure class="vg-w-arch-discord-syncers-before-after">
-  <style>
-    .vg-w-arch-discord-syncers-before-after { display: grid; gap: var(--s-3); }
-    .vg-w-arch-discord-syncers-before-after svg { width: 100%; height: auto; }
-    .vg-w-arch-discord-syncers-before-after figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); padding-top: var(--s-2); }
-  </style>
-  <svg viewBox="0 0 880 360" role="img" aria-label="Holster.Pool single supervisor versus PartitionSupervisor">
-    <text x="220" y="30" text-anchor="middle" font-family="EB Garamond, serif" font-size="18" fill="var(--ink)" font-weight="600">before — single Holster.Pool</text>
-    <text x="660" y="30" text-anchor="middle" font-family="EB Garamond, serif" font-size="18" fill="var(--ink)" font-weight="600">after — PartitionSupervisor</text>
+      <text x="440" y="22" text-anchor="middle" fill="var(--ink)" class="title">
+        Ingestion 路徑的兩段對照：頁面 edit 進來後要做什麼
+      </text>
 
-    <line x1="440" y1="50" x2="440" y2="340" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="4 4" />
+      <!-- OLD ingest -->
+      <text x="20" y="62" fill="var(--muted)" class="label">舊 ingestion（pod + 外部 embedding API）</text>
 
-    <rect x="80" y="60" width="280" height="50" fill="none" stroke="var(--ink)" stroke-width="1.5" />
-    <text x="220" y="85" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">voice syncer process</text>
-    <text x="220" y="102" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">spawn / terminate requests</text>
+      <rect x="40" y="80" width="120" height="40" rx="4" fill="none"
+            stroke="var(--muted-2)" stroke-width="1.2"/>
+      <text x="100" y="98" text-anchor="middle" fill="var(--ink)" class="label">page edit</text>
+      <text x="100" y="112" text-anchor="middle" fill="var(--muted)" class="label">Kafka event</text>
 
-    <line x1="220" y1="115" x2="220" y2="155" stroke="var(--accent)" stroke-width="2" />
-    <line x1="160" y1="115" x2="160" y2="155" stroke="var(--accent)" stroke-width="2" />
-    <line x1="280" y1="115" x2="280" y2="155" stroke="var(--accent)" stroke-width="2" />
-    <line x1="100" y1="115" x2="100" y2="155" stroke="var(--accent)" stroke-width="2" />
-    <line x1="340" y1="115" x2="340" y2="155" stroke="var(--accent)" stroke-width="2" />
+      <rect x="190" y="80" width="120" height="40" rx="4" fill="none"
+            stroke="var(--accent)" stroke-width="1.2"/>
+      <text x="250" y="98" text-anchor="middle" fill="var(--ink)" class="label">re-chunk 整頁</text>
+      <text x="250" y="112" text-anchor="middle" fill="var(--accent-text)" class="label">無條件</text>
 
-    <rect x="80" y="155" width="280" height="60" fill="var(--accent)" fill-opacity="0.2" stroke="var(--accent)" stroke-width="1.5" />
-    <text x="220" y="180" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--accent-text)">single supervisor mailbox</text>
-    <text x="220" y="200" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">selective receive · O(n)</text>
+      <rect x="340" y="80" width="120" height="40" rx="4" fill="none"
+            stroke="var(--accent)" stroke-width="1.2"/>
+      <text x="400" y="98" text-anchor="middle" fill="var(--ink)" class="label">embed 整頁所有 span</text>
+      <text x="400" y="112" text-anchor="middle" fill="var(--accent-text)" class="label">外部 API、付 token 費</text>
 
-    <rect x="80" y="235" width="280" height="50" fill="none" stroke="var(--ink)" stroke-width="1.5" />
-    <text x="220" y="260" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">gun http connections</text>
-    <text x="220" y="277" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">extra supervision layer</text>
+      <rect x="490" y="80" width="120" height="40" rx="4" fill="none"
+            stroke="var(--accent)" stroke-width="1.2"/>
+      <text x="550" y="98" text-anchor="middle" fill="var(--ink)" class="label">upload 全部 vector</text>
+      <text x="550" y="112" text-anchor="middle" fill="var(--accent-text)" class="label">+ metadata</text>
 
-    <text x="220" y="320" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--accent-text)">~1M msgs in queue · +1ms / spawn</text>
+      <rect x="640" y="80" width="160" height="40" rx="4" fill="none"
+            stroke="var(--accent)" stroke-width="1.2"/>
+      <text x="720" y="98" text-anchor="middle" fill="var(--accent-text)" class="label">pod cluster 寫入</text>
+      <text x="720" y="112" text-anchor="middle" fill="var(--muted)" class="label">storage + compute 綁定</text>
 
-    <rect x="500" y="60" width="320" height="50" fill="none" stroke="var(--ink)" stroke-width="1.5" />
-    <text x="660" y="85" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">voice syncer process</text>
-    <text x="660" y="102" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">spawn / terminate requests</text>
+      <line x1="160" y1="100" x2="188" y2="100" stroke="var(--muted)"
+            stroke-width="1" marker-end="url(#vg-w-flow-notion-ingest-shift-arr)"/>
+      <line x1="310" y1="100" x2="338" y2="100" stroke="var(--muted)"
+            stroke-width="1" marker-end="url(#vg-w-flow-notion-ingest-shift-arr)"/>
+      <line x1="460" y1="100" x2="488" y2="100" stroke="var(--muted)"
+            stroke-width="1" marker-end="url(#vg-w-flow-notion-ingest-shift-arr)"/>
+      <line x1="610" y1="100" x2="638" y2="100" stroke="var(--muted)"
+            stroke-width="1" marker-end="url(#vg-w-flow-notion-ingest-shift-arr)"/>
 
-    <line x1="540" y1="115" x2="540" y2="155" stroke="var(--accent)" stroke-width="2" />
-    <line x1="620" y1="115" x2="620" y2="155" stroke="var(--accent)" stroke-width="2" />
-    <line x1="700" y1="115" x2="700" y2="155" stroke="var(--accent)" stroke-width="2" />
-    <line x1="780" y1="115" x2="780" y2="155" stroke="var(--accent)" stroke-width="2" />
+      <text x="440" y="148" text-anchor="middle" fill="var(--muted)" class="label">
+        每次編輯都做完整四步，無視變動量；token 成本與寫入成本都按整頁計費
+      </text>
 
-    <rect x="500" y="155" width="60" height="60" fill="var(--accent)" fill-opacity="0.15" stroke="var(--accent)" stroke-width="1.5" />
-    <text x="530" y="185" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--accent-text)">part 1</text>
-    <text x="530" y="200" text-anchor="middle" font-family="EB Garamond, serif" font-size="10" fill="var(--muted)">mbox</text>
-    <rect x="580" y="155" width="60" height="60" fill="var(--accent)" fill-opacity="0.15" stroke="var(--accent)" stroke-width="1.5" />
-    <text x="610" y="185" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--accent-text)">part 2</text>
-    <text x="610" y="200" text-anchor="middle" font-family="EB Garamond, serif" font-size="10" fill="var(--muted)">mbox</text>
-    <rect x="660" y="155" width="60" height="60" fill="var(--accent)" fill-opacity="0.15" stroke="var(--accent)" stroke-width="1.5" />
-    <text x="690" y="185" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--accent-text)">part 3</text>
-    <text x="690" y="200" text-anchor="middle" font-family="EB Garamond, serif" font-size="10" fill="var(--muted)">mbox</text>
-    <rect x="740" y="155" width="60" height="60" fill="var(--accent)" fill-opacity="0.15" stroke="var(--accent)" stroke-width="1.5" />
-    <text x="770" y="185" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--accent-text)">part N</text>
-    <text x="770" y="200" text-anchor="middle" font-family="EB Garamond, serif" font-size="10" fill="var(--muted)">mbox</text>
+      <!-- divider -->
+      <line x1="40" y1="170" x2="840" y2="170" stroke="var(--muted-2)"
+            stroke-width="1" stroke-dasharray="4,3"/>
 
-    <rect x="500" y="235" width="320" height="50" fill="none" stroke="var(--ink)" stroke-width="1.5" />
-    <text x="660" y="260" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">gun http connections</text>
-    <text x="660" y="277" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">direct lifecycle in Holster.Pool</text>
+      <!-- NEW ingest -->
+      <text x="20" y="194" fill="var(--muted)" class="label">新 ingestion（Page State + Turbopuffer + Ray）</text>
 
-    <text x="660" y="320" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">contention sharded into N partitions · selective receive · O(n/N)</text>
-  </svg>
-  <figcaption>before/after：左圖把所有 spawn/terminate 收進同一個 mailbox 並再經一層 gun supervision；右圖把 mailbox 切成 N 個分區，並把 gun supervision 折掉一層。</figcaption>
-</figure>
+      <rect x="40" y="212" width="120" height="40" rx="4" fill="none"
+            stroke="var(--sage-deep)" stroke-width="1.2"/>
+      <text x="100" y="230" text-anchor="middle" fill="var(--ink)" class="label">page edit</text>
+      <text x="100" y="244" text-anchor="middle" fill="var(--muted)" class="label">Kafka event</text>
 
-<p>切成 N 份之所以管用，不只是「分擔負載」這句話可以概括。selective receive 的退化是 O(n) 掃描；當 N 個 mailbox 各自獨立，每個的 n 都是原本的 1/N，掃描時間也跟著降到 1/N。voice syncers 的分母通常是 BEAM scheduler 數，在多核 host 上輕鬆 16-32：~100k 切成 32 份變成 ~3k，回到 selective receive 還算便宜的區間。拿掉 gun 額外那層 supervisor 是另一個值得學的細節——多一層 supervisor 就多一個訊號中轉點，對 critical path 是純粹 overhead。</p>
+      <rect x="190" y="212" width="120" height="40" rx="4" fill="none"
+            stroke="var(--sage-deep)" stroke-width="1.5"/>
+      <text x="250" y="230" text-anchor="middle" fill="var(--sage-deep)" class="label">xxHash64 diff</text>
+      <text x="250" y="244" text-anchor="middle" fill="var(--muted)" class="label">查 DynamoDB</text>
 
-<h3>mailbox 曲線——把那段崩壞畫成一張圖</h3>
+      <rect x="340" y="190" width="130" height="36" rx="4" fill="none"
+            stroke="var(--sage)" stroke-width="1.2"/>
+      <text x="405" y="206" text-anchor="middle" fill="var(--ink)" class="label">unchanged：skip</text>
+      <text x="405" y="220" text-anchor="middle" fill="var(--muted)" class="label">完全不做事</text>
 
-<p>為了把這段事故從文字裡抽出來變得更可感，下面這張靜態長條圖把 15 台 syncer 實例在事故高峰時的 mailbox 大小排在一起。每一根 bar 都對應一個實例，依照事後 dashboard 上的相對深度排序。它的價值不在「精確還原當下每個實例的數字」——Discord 沒有逐台公開讀數——而是在於凸顯一個現象：當瓶頸是上游流量時，崩壞的分佈不是少數實例壞掉、其他人健康，而是<strong>所有 15 台一起朝同一個方向走</strong>。</p>
+      <rect x="340" y="232" width="130" height="36" rx="4" fill="none"
+            stroke="var(--ink-deep)" stroke-width="1.2"/>
+      <text x="405" y="248" text-anchor="middle" fill="var(--ink-deep)" class="label">metadata only：PATCH</text>
+      <text x="405" y="262" text-anchor="middle" fill="var(--muted)" class="label">不 re-embed</text>
 
-<figure class="vg-w-chart-discord-mailbox">
-  <style>
-    .vg-w-chart-discord-mailbox svg { width: 100%; height: auto; }
-    .vg-w-chart-discord-mailbox figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); padding-top: var(--s-2); }
-  
-    @media (max-width: 720px) {
-      .vg-w-chart-discord-mailbox svg { aspect-ratio: 16 / 9; min-height: 220px; height: auto; }
-      .vg-w-chart-discord-mailbox svg text { font-size: 22px; }
-      .vg-w-chart-discord-mailbox svg text.instance-label {
-        font-size: 14px;
-        transform-box: fill-box;
-        transform-origin: center;
-        transform: rotate(-45deg) translate(-6px, 4px);
-      }
-    }
-  </style>
-  <svg viewBox="0 0 880 320" role="img" aria-label="voice syncer mailbox depth across 15 instances at incident peak">
-    <text x="440" y="28" text-anchor="middle" font-family="EB Garamond, serif" font-size="18" fill="var(--ink)" font-weight="600">syncer mailbox depth at incident peak</text>
-    <text x="440" y="48" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--muted)">total mailbox by size · 15 instances · ~13:00 PDT</text>
+      <rect x="340" y="274" width="130" height="36" rx="4" fill="none"
+            stroke="var(--accent)" stroke-width="1.2"/>
+      <text x="405" y="290" text-anchor="middle" fill="var(--accent-text)" class="label">text changed：embed</text>
+      <text x="405" y="304" text-anchor="middle" fill="var(--muted)" class="label">只改動的 span</text>
 
-    <line x1="70" y1="270" x2="860" y2="270" stroke="var(--ink)" stroke-width="1.5" />
-    <line x1="70" y1="70" x2="70" y2="270" stroke="var(--ink)" stroke-width="1.5" />
+      <rect x="500" y="232" width="140" height="40" rx="4" fill="none"
+            stroke="var(--sage-deep)" stroke-width="1.5"/>
+      <text x="570" y="250" text-anchor="middle" fill="var(--sage-deep)" class="label">Ray Serve embed</text>
+      <text x="570" y="264" text-anchor="middle" fill="var(--muted)" class="label">同 cluster RPC</text>
 
-    <text x="60" y="275" text-anchor="end" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">0</text>
-    <text x="60" y="225" text-anchor="end" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">250k</text>
-    <text x="60" y="175" text-anchor="end" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">500k</text>
-    <text x="60" y="125" text-anchor="end" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">750k</text>
-    <text x="60" y="78" text-anchor="end" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">~1M</text>
+      <rect x="670" y="232" width="150" height="40" rx="4" fill="none"
+            stroke="var(--sage-deep)" stroke-width="1.5"/>
+      <text x="745" y="250" text-anchor="middle" fill="var(--sage-deep)" class="label">Turbopuffer namespace</text>
+      <text x="745" y="264" text-anchor="middle" fill="var(--muted)" class="label">workspace = namespace</text>
 
-    <line x1="70" y1="225" x2="860" y2="225" stroke="var(--muted-2)" stroke-width="0.5" stroke-dasharray="2 4" />
-    <line x1="70" y1="175" x2="860" y2="175" stroke="var(--muted-2)" stroke-width="0.5" stroke-dasharray="2 4" />
-    <line x1="70" y1="125" x2="860" y2="125" stroke="var(--muted-2)" stroke-width="0.5" stroke-dasharray="2 4" />
-    <line x1="70" y1="78" x2="860" y2="78" stroke="var(--accent)" stroke-width="0.8" stroke-dasharray="3 3" />
+      <line x1="160" y1="232" x2="188" y2="232" stroke="var(--muted)"
+            stroke-width="1" marker-end="url(#vg-w-flow-notion-ingest-shift-arr)"/>
+      <line x1="310" y1="232" x2="338" y2="208" stroke="var(--muted)"
+            stroke-width="1" marker-end="url(#vg-w-flow-notion-ingest-shift-arr)"/>
+      <line x1="310" y1="232" x2="338" y2="250" stroke="var(--muted)"
+            stroke-width="1" marker-end="url(#vg-w-flow-notion-ingest-shift-arr)"/>
+      <line x1="310" y1="232" x2="338" y2="292" stroke="var(--muted)"
+            stroke-width="1" marker-end="url(#vg-w-flow-notion-ingest-shift-arr)"/>
 
-    <rect x="90" y="90" width="40" height="180" fill="var(--accent)" fill-opacity="0.7" />
-    <rect x="140" y="95" width="40" height="175" fill="var(--accent)" fill-opacity="0.7" />
-    <rect x="190" y="100" width="40" height="170" fill="var(--accent)" fill-opacity="0.7" />
-    <rect x="240" y="105" width="40" height="165" fill="var(--accent)" fill-opacity="0.65" />
-    <rect x="290" y="110" width="40" height="160" fill="var(--accent)" fill-opacity="0.65" />
-    <rect x="340" y="120" width="40" height="150" fill="var(--accent)" fill-opacity="0.65" />
-    <rect x="390" y="125" width="40" height="145" fill="var(--accent)" fill-opacity="0.6" />
-    <rect x="440" y="130" width="40" height="140" fill="var(--accent)" fill-opacity="0.6" />
-    <rect x="490" y="140" width="40" height="130" fill="var(--accent)" fill-opacity="0.55" />
-    <rect x="540" y="145" width="40" height="125" fill="var(--accent)" fill-opacity="0.55" />
-    <rect x="590" y="155" width="40" height="115" fill="var(--accent)" fill-opacity="0.5" />
-    <rect x="640" y="170" width="40" height="100" fill="var(--accent)" fill-opacity="0.5" />
-    <rect x="690" y="180" width="40" height="90" fill="var(--accent)" fill-opacity="0.45" />
-    <rect x="740" y="195" width="40" height="75" fill="var(--accent)" fill-opacity="0.45" />
-    <rect x="790" y="220" width="40" height="50" fill="var(--sage)" fill-opacity="0.7" />
+      <line x1="470" y1="292" x2="500" y2="270" stroke="var(--muted)"
+            stroke-width="1" marker-end="url(#vg-w-flow-notion-ingest-shift-arr)"/>
+      <line x1="470" y1="250" x2="500" y2="252" stroke="var(--muted)"
+            stroke-width="1" marker-end="url(#vg-w-flow-notion-ingest-shift-arr)"/>
+      <line x1="640" y1="252" x2="668" y2="252" stroke="var(--muted)"
+            stroke-width="1" marker-end="url(#vg-w-flow-notion-ingest-shift-arr)"/>
+    </svg>
+    <figcaption>
+      舊 ingestion 對每個 edit 走完整四步、每段都按整頁計費；新 ingestion 先用 xxHash64 把工作量
+      切成三類，多數變動只是 metadata patch 或完全 skip，只有真內容改動才會走 Ray Serve embed。
+    </figcaption>
+  </figure>
 
-    <text class="instance-label" x="110" y="287" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">2-13</text>
-    <text class="instance-label" x="160" y="287" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">2-1</text>
-    <text class="instance-label" x="210" y="287" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">2-5</text>
-    <text class="instance-label" x="260" y="287" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">2-11</text>
-    <text class="instance-label" x="310" y="287" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">2-7</text>
-    <text class="instance-label" x="360" y="287" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">2-2</text>
-    <text class="instance-label" x="410" y="287" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">2-14</text>
-    <text class="instance-label" x="460" y="287" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">2-4</text>
-    <text class="instance-label" x="510" y="287" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">2-9</text>
-    <text class="instance-label" x="560" y="287" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">2-12</text>
-    <text class="instance-label" x="610" y="287" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">2-6</text>
-    <text class="instance-label" x="660" y="287" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">2-10</text>
-    <text class="instance-label" x="710" y="287" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">2-15</text>
-    <text class="instance-label" x="760" y="287" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">2-3</text>
-    <text class="instance-label" x="810" y="287" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">2-8</text>
+  <p>
+    四個階段背後其實是同一條 thesis：<strong>不要在錯誤的計費邊界上付固定成本</strong>。第一段拆掉的是「按開機時間計費」的固定成本（換 serverless）；第二段拆掉的是「dedicated SSD 容量」的固定成本（換 object-storage based 引擎）；第三段拆掉的是「為了沒變的 span 重做工作」的隱性固定成本（hash diff）；第四段拆掉的是「外部 API 的 per-token + 雙重 compute」的固定成本（Ray 收編）。每一段都對應「停止為某種不必要的恆定支出付費」。
+  </p>
 
-    <text x="465" y="310" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">instance id（sorted by mailbox depth）</text>
+  <p>
+    對工程同行有四個可以直接拿去用的「決策觸發條件」：（1）資料庫帳單裡「未使用容量」佔比超過 30%，檢查計費模型是不是按 uptime 而非用量——這是換 serverless / object-storage 引擎的訊號。（2）application 程式碼裡路由邏輯開始長出多層 lookup（generation → shard → pod），重新評估底層能不能用 namespace 抽象掉。（3）ingestion pipeline cost 與「實際變動量」的比值大於 2x，引入 content-defined diff（hash、Merkle、CDC）——重複工作被計費系統隱藏得最深，需要主動量測才看得見。（4）embedding / inference 成本超過總基礎設施支出 20%，認真評估「自己跑 vs API 呼叫」——這個門檻會隨開源模型品質持續下移。
+  </p>
 
-    <line x1="800" y1="78" x2="830" y2="60" stroke="var(--muted)" stroke-width="1" />
-    <text x="830" y="55" text-anchor="end" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">~1M cap line</text>
+  <p>
+    這四個觸發條件不依賴 Notion 的具體業務形態——任何「資料規模單調增、編輯頻率高、有 retrieval 需求」的系統（Slack、Linear、Copilot 的 codebase indexer、Glean、所有 enterprise search 產品）都會撞到這四道牆，只是各自處於不同階段。Notion 演進跨度兩年、平均每階段 6-7 個月：這個節奏不是巧合，每段都需要時間把上一段穩定下來、量出真實 cost shape、設計下一步。一年做完大概率每段都做不徹底；三年才做完業務已被成本壓垮。
+  </p>
 
-    <line x1="810" y1="220" x2="780" y2="240" stroke="var(--muted)" stroke-width="1" />
-    <text x="775" y="252" text-anchor="end" font-family="EB Garamond, serif" font-size="11" fill="var(--sage-deep)">2-8 · the lone survivor</text>
-  </svg>
-  <figcaption>同色長條代表事故高峰時各 syncer 實例的 mailbox 深度（依深度由大到小排序）。橘色虛線是 ~1M cap、綠色那根是事故期間唯一勉強維持運作的 2-8——它一台要扛全球三分之一流量。</figcaption>
-</figure>
+  <p>
+    所有四階段順序之所以對，是因為每段都依賴前段提供的可量測信號——day-one 的 Notion 沒有「未使用容量佔比」、沒有「重複 embed 量」、甚至沒有 span ID。「先撐住、再量、再砍」不是延誤，而是必要的時序。把 Notion 兩年的故事壓回一句話：<strong>架構演進的真正生產力來自「把不對的計費邊界找出來、然後一段段拆掉」</strong>。技術選型（Turbopuffer、Ray、xxHash64）只是執行這個動作的工具；哪條邊界該動、什麼時候動、什麼順序動，才是真正值得記下的內容。對讀者下週的工作具體含義：先別急著評估「換 Pinecone / Qdrant / Weaviate」，先打開最近 3 個月雲端帳單，把 vector DB 與 embedding 支出按「固定 provision、按用量、按 token」三類拆——失衡的那一類就是該動的邊界。
+  </p>
 
-<p>這張圖傳達的訊息很單純：壞掉不是因為某幾台異常，而是因為整個 fleet 都被同一道上游流量壓著走。當你的故障曲線長這個形狀，你的恢復計畫就<strong>不可能</strong>是「重啟壞掉的那幾台」——因為沒有「壞掉的那幾台」。恢復計畫必須處理上游。</p>
-
-<h3>覆盤的氣質——一份願意承認「我們也會犯這種錯」的報告</h3>
-
-<p>讀完整份覆盤後，留在腦中最深的不只是技術細節，還有編輯立場——報告開頭引「sad trombone」、Bo Ingram 與 Stephen Birarda 的 Senior Staff Engineer 署名、明白寫出「A/V infra 還沒上 Kubernetes」與「control plane 還沒跨 region」這些尚未完成的長期項。結構上它是 trigger → cascade → mitigation attempts → why they failed → final mitigation → structural fix → long-term roadmap，每段都有具體時間點、數字、引用、self-criticism 與可遷移原則。把覆盤當公共財而不是內部問責文件，這個立場本身就是工程文化的訊號——Cloudflare、Stripe、AWS 過去十年都走過這條路，Discord 這次加入了這份名單。</p>
-
-<h2>從這次故事帶走的——壓回一個句子</h2>
-
-<p>如果要把整篇覆盤壓成一句：<strong>一行 Kubernetes manifest 的誤設，會經由 graceful drain 缺位、reconnection storm 跨 zone、Erlang selective receive 在長 mailbox 下退化、service discovery 與 connection management 共享 mailbox、cold-start thundering herd，這一連串平日各自無害的設計選擇，串成一條 3 小時 17 分鐘的全球語音崩潰路徑。</strong></p>
-
-<p>每一個環節單獨來看都不算 critical bug——graceful drain「應該」會跑完、selective receive「通常」很快、service discovery「平常」不會跟 connection 搶資源、reconnection「一般」不會多到打爆 gateway。當這些「應該、通常、平常」全部同時失敗，就會變成這次的 3 小時 17 分鐘。你不會在自己系統上遇到完全一樣的 Holster.Pool 故障，但你會遇到結構上相似的——當那一天到來，你會慶幸自己讀過 Discord 這份覆盤。</p>
-
-<p class="vg-deep-closer"><strong>The lesson</strong>：分散式系統的崩潰幾乎永遠不是「單一 bug」，而是多個各自無害的設計選擇在某個流量峰值下同時失效——你能做的不是消滅 bug，而是把每一條 critical path 上的 invariant 寫成可被 enforce 的契約。</p>
-
+  <p class="vg-deep-closer">
+    <strong>What changes</strong>：兩年下來，Notion 把「向量搜尋」從一個寫死在外部供應商與 GPU pod 上的固定支出，重組成一條 namespace-on-object-storage + hash-diff + 自家 Ray 集群的可伸縮 pipeline——對任何要從「demo 規模」走到「平台規模」的 retrieval 系統，這四個階段的順序（解耦計費 → 換引擎降結構性成本 → 砍重複工作 → 整合 compute layer）就是預設模板。
+  </p>
 </div>
