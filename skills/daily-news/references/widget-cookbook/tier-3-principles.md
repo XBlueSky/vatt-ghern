@@ -350,6 +350,21 @@ widget verify:
 3. Is text legible? (≥14px on screen)
 4. Does the widget make sense without horizontal scroll? (or does it scroll cleanly when needed)
 5. For scroll-driven: do stages activate as you scroll? (not all-inert because rootMargin too tight)
+6. **Figure horizontal symmetry**: at 375px viewport, the figure's left
+   edge gap to viewport and right edge gap to viewport should match
+   (typically ~16px each side). If `left=32, right=0` or vice versa,
+   site.css's `margin-left: calc(...)` was clobbered — usually by an
+   inline `style="margin: ..."` declaration (see §12.2). Measure with:
+
+   ```js
+   document.querySelectorAll('figure[class*="vg-w-"]').forEach(f => {
+     const r = f.getBoundingClientRect();
+     console.log(f.className, 'L=', r.left, 'R=', window.innerWidth - r.right);
+   });
+   ```
+
+   Both numbers must be equal (within 1px). Don't trust visual judgement —
+   a 32px asymmetry is easy to miss until someone overlays a centerline.
 
 If any answer is "no", fix in the widget's own scoped CSS — do not
 defer to "we'll fix mobile later". Mobile is half the readers; "later"
