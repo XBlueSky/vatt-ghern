@@ -68,3 +68,15 @@ Implementation: `src/static/read-tracker.js`.
 - Deep-story card: top hairline + title + lede.
 - Post-trail: chrome strip with topic crumb, date, tags, read-toggle.
 - Share buttons: copy link + Twitter + Threads, IM Fell italic text links.
+
+## Routine quality gates
+
+**Step 7.5 — Content quality gate**: dual independent reviewer
+sub-agents score each post on a 7-axis rubric (hook strength, structural
+coherence, material grounding, depth vs. paraphrase, relevance,
+intra-post anti-template, inter-post diversity). Low scores trigger
+bounded retry on the author sub-agent (5 BLOCKING / 3 IMPORTANT).
+Reviewer disagreement surfaces in the PR body for human reviewer
+attention. Full rubric and reviewer brief in
+`skills/daily-news/references/content-quality-rubric.md` and
+`content-reviewer-brief.md`.
