@@ -285,36 +285,15 @@
   <h2>為什麼不能用維護視窗——PB/day 寫入下的時序壓力</h2>
 
   <p>
-    要理解這套方法為什麼長這個形狀，得先從「不能用維護視窗」這個前提推回去。Meta 引用的數字：每天「several petabytes of social graph data」從 MySQL 的數一數二大規模部署搬進 data warehouse，由 change data capture（CDC）做 incremental ingestion；後面有 tens of thousands 的 ingestion job 把這些 raw stream 加工成各 product 用的 table。
+    Meta 的數字：每天 several petabytes of social graph data 從 MySQL 走 CDC 進 warehouse；後面有 tens of thousands 的 ingestion job 加工成各 product table。這條 path 沒辦法「暫停半小時」——CDC 是 incremental、下游讀分鐘級 partition，停掉等於上游 backlog 撐爆 buffer + 下游 staleness 同時惡化。30 分鐘維護視窗就是 TB 級補追，catch-up 跟 live stream 競爭 IO 在某些壓力曲線下會發散——永遠追不上、最終 OOM。
   </p>
 
   <p>
-    這條 ingestion path 沒辦法「暫停半小時」這種操作——CDC 是 incremental 的，下游消費者讀的是分鐘級的最新 partition，停掉它意味著（a）MySQL 那邊累積寫入 backlog 直到撐爆 buffer，（b）下游所有 dashboard、ML feature pipeline、ad ranking 模型輸入同時 staleness 增加。對 PB/day 的流量量級，三十分鐘 backlog 就是 TB 量級的補追工作，而補追過程本身又會跟 live stream 競爭資源，很容易雪崩。
-  </p>
-
-  <p>
-    具體推一下這個雪崩怎麼發生。假設 live ingestion rate 是 X、系統設計時為 peak 預留了 1.5× 的 headroom——也就是峰值容量是 1.5X。維護視窗期間 backlog 累積 30 分鐘，總量是 0.5X × 0.5 hour = 0.25 hour-X。等於是 15 分鐘的「需要立刻補完」資料。視窗結束後系統繼續以 1.5X 容量跑，但 live stream 持續以 X 在進來——可用 catch-up bandwidth 只剩 0.5X。要追完 0.25 hour-X 的 backlog 需要 0.25/0.5 = 0.5 hour，也就是 30 分鐘。
-  </p>
-
-  <p>
-    但這只是 best case。實際上 catch-up 期間 catch-up 工作會跟 live stream 競爭 shuffle bandwidth、disk IO、scheduler slot——「同時跑兩份的成本不是線性疊加」。catch-up batch 多半要做 random access（讀 backlog buffer 的某個 offset 段），而 live stream 是 sequential append；這兩種 IO pattern 在 storage 層互相打架。經驗法則：catch-up 期間 effective throughput 折半到 0.25X，那 30 分鐘的 backlog 實際要花 60 分鐘才追得完——而這 60 分鐘內 live stream 又累積了新的 backlog。在某些壓力曲線下，這個遞迴關係會發散：永遠追不上、buffer 持續增長、最終 OOM。這就是為什麼大型資料管線的維護視窗在文件上看起來 OK、實際跑下去會雪崩。
-  </p>
-
-  <p>
-    這就是為什麼「dual-run + 對帳」是這類遷移的唯一可行解：新舊兩條 path 都跑、舊的負責出 production 資料、新的在 shadow 跑——shadow 出錯不會打到 consumer，但能即時量出「新版跟舊版到底差多少」。把這個量出來，才有勇氣把讀切過去。Notion 的向量搜尋遷移、Stripe 的支付資料層升級、Google Spanner 從 BigTable 接管 Ads 資料的歷史故事，背後都是同一套 dual-run + reconciliation pattern——技術細節各異，但時序骨架完全相同。
-  </p>
-
-  <p>
-    Meta 強調 MySQL 是「one of the world's largest MySQL deployments」——這個 detail 不是 brag，而是說明 ingestion 上游的特性決定了下游選項。MySQL 沒有原生「snapshot at timestamp T，保留 N 天 read-after-write consistency」這種接口；要做雙跑就只能靠 CDC log 當共同 ground truth，新舊兩邊都從同一條 binlog 消費。這個約束反過來規定了 dual-run 必須的設計：兩邊都是 stateless consumer、各自累積 state、可以從同一個 binlog offset 重新 replay。沒有這個 invariant，shadow phase 就跑不起來——因為新舊兩邊看不到一致的 input。
-  </p>
-
-  <p>
-    binlog 作為共同 ground truth 還帶來一個 subtle 的設計優勢：reconciler 不只能 compare prod / shadow 的 partition output，也能比對「同一個 binlog event 是否在兩邊都被消費」。這給出第二層 invariant 監控——除了 partition diff，還能即時偵測「shadow consumer 是不是 lag 了」「shadow 是不是 silently drop 了某些 event」。在 shadow phase 早期這個訊號比 partition diff 更敏感，因為 partition diff 要等整個 partition 寫完才看得到、而 binlog lag 是分鐘級可見。
+    這就是為什麼「dual-run + 對帳」是這類遷移的唯一可行解：新舊兩條 path 都跑、舊的負責出 production、新的在 shadow 跑——shadow 出錯不會打到 consumer，但能即時量出「新版跟舊版差多少」。把這個量出來，才有勇氣把讀切過去。MySQL 沒有原生「snapshot at T」接口，新舊兩邊只能靠 CDC binlog 當共同 ground truth、stateless consumer 各自累積 state——這個 invariant 決定了 dual-run 的設計形狀。
   </p>
 
   <pre data-kind="config"><code><em># PB/day 寫入下「不能用維護視窗」的算術</em>
-write_rate           ≈ several PB / day
-                     ≈ tens of GB / s 持續
+write_rate           ≈ several PB / day ≈ tens of GB / s 持續
 maintenance window   = 30 min hypothetical
 backlog_during_pause ≈ write_rate × 30 min ≈ 多個 TB
 catch_up_capacity    ≈ peak_throughput − live_rate  <em>// 小於 live_rate 自己</em>
@@ -325,57 +304,13 @@ risk_during_catchup  = live stream 與 backlog 互搶資源 → cascade
 </code></pre>
 
   <p>
-    「不能停」這個限制反過來決定了 control plane 的形狀。傳統「先 build new, then dump-and-load, then switch reads」的 pattern 不適用——因為 dump 過程已經是 stale 的，load 完之後落差只會更大。Meta 的做法是讓兩邊都跑 incremental，把「比對」這件事當成持續性的背景工作，不是 cutover 那一刻的單點驗證。
-  </p>
-
-  <p>
-    這也解釋了為什麼 platform 要先做 batch curation——幾萬個 job 不可能同時上 shadow。每多一條 shadow job 就多一份 compute 與 storage 開銷（同樣 input、同樣計算、寫到不同位置），整個 fleet 同時雙跑會把容量翻倍。Meta 強調的設計細節：「avoided creating shadow jobs with unresolved issues to prevent unnecessary full dump operations」——full dump 是 slow and expensive 的，shadow 一上就要把對應 source 全部過一遍，所以「先確認 job 本身沒有 known issue 才上 shadow」是把昂貴資源花在會通過 verification 的 job 上，不浪費在已知會 fail 的試誤。Capacity envelope 不是抽象限制——它是「同時可雙跑多少條」的具體上限，決定了批次節奏。
-  </p>
-
-  <p>
-    Batch curation 的分類維度——throughput、priority、special-case——對應的是三個不同 risk axis。Throughput 高的 job 上 shadow 後對 cluster capacity 的擠壓最重，所以要錯開時間排程；priority 高的 job（例如 ads ranking feature）對 landing latency 的 SLA 最嚴格，必須額外 negotiate criteria；special-case 是「行為跟其他 job 不一樣」的 outlier——可能依賴特殊 schema 約定、可能有自製的 retry logic、可能跟某個 hardcoded calendar partition 強耦合，這類 job 不能套用 generic shadow pipeline，需要 case-by-case 處理。把這三個 axis 拆開是讓 oncall 排序負荷時有可操作的維度，不是把所有 job 倒進同一個 queue。
-  </p>
-
-  <p>
-    另一個容量優化是 snapshot reuse：legacy 系統已經對某些 partition 留有 snapshot，新 job 起跑時直接拿這份 snapshot 當初始狀態，後續只追 incremental——避開「shadow job 上線當下重新 full-dump 一整個 source table」的最昂貴操作。對「跑了七年累積出來的歷史資料」這種規模，full dump 可能要花數天甚至數週的 cluster time，能省下這一塊對整個 migration timeline 是數量級的改善。
-  </p>
-
-  <p>
-    Snapshot reuse 還有一個常被忽略的 side effect：它把「shadow job 的第一個 hour」的 reconciliation 訊號變得有意義。如果 shadow job 是從零開始 full-dump，那它第一個 hour 的 partition 內容是「dump 期間到某個時點的所有資料」——這跟 prod job 的「過去這個 hour 的 incremental」結構不同，無法直接 diff。等到 shadow job 從 full-dump 切到 incremental，又要再花一段時間才能跟 prod job 的時序對齊。snapshot reuse 直接讓 shadow job 從一個跟 prod job 一致的 baseline 起跑，第一個 hour 就能產生有意義的 diff 訊號——把 verification 起跑時間提前數天甚至數週。
+    這個限制規定了 batch curation——幾萬個 job 不可能同時上 shadow。三個 axis（throughput / priority / special-case）讓 oncall 排序時有可操作維度；Meta 的「avoided creating shadow jobs with unresolved issues」是把 full dump 資源花在會通過 verification 的 job 上。Snapshot reuse 進一步把新 job 從 legacy snapshot 起跑、只追 incremental，第一個 hour 就能產生有意義 diff。
   </p>
 
   <h2>Shadow phase 怎麼把「差異」變成可操作的訊號</h2>
 
   <p>
-    Shadow phase 的核心是一個 custom analysis 工具：每小時把 production 與 shadow 寫入的對應 partition 拿出來比對，計算 row count 與 checksum，並把 mismatch 記到 Scuba（Meta 內部的 real-time analysis engine）。這個工具不只報「哪個 partition 有 diff」——它還挑出 example problematic row 並附上 debug context，讓 oncall 可以直接從 alert 跳到具體的 root cause 線索。
-  </p>
-
-  <p>
-    這個設計把 reconciliation 從一個離線 batch job 變成了高頻信號源。如果只在週末跑一次 diff，每次發現問題都是「過去一週某時刻出錯」，回溯成本極高；每小時跑、自動帶 sample row，回溯窗口縮到 1 小時內，幾乎可以直接定位到哪個 schema 變更或哪段 logic 改動造成的。
-  </p>
-
-  <p>
-    Scuba 在這裡的角色不是「另一個監控工具」——它是 reconciler 的 sink，把 diff 結果以結構化方式累積。Mismatch 寫進 Scuba 時帶上：partition ID、shadow vs prod 的 row count、checksum diff 的欄位分佈、最多 N 筆 sample row 的具體內容、發生時間、shadow job 版本 hash。Oncall 接到 alert 後直接打開 Scuba query，過去 7 天同一個 job 的 divergence 歷史就攤在眼前——「這是 first occurrence 還是 recurring pattern」「diff 是否跟 deploy 時點相關」這些問題都能在分鐘內回答。沒有這層結構化 sink，alert 只是「partition X has diff」，root cause 還要花一兩個小時翻 log 找上下文。
-  </p>
-
-  <p>
-    Checksum 跟 row count 是兩種互補的訊號。Row count diff 抓的是「某些 row 在新版被 drop 或 duplicate」這種類別錯誤——數量級的不一致。Checksum diff 抓的是「row 數對但內容不對」——某個欄位被算錯、某個 join 用錯 key、某個 type cast 把 timestamp 變成 string。光看 row count 漏掉後者，光看 checksum 漏掉前者。兩個都跑，coverage 才完整。
-  </p>
-
-  <p>
-    Checksum 的算法選擇也有 tradeoff。對 ingestion 這種寫入量 PB/day 的情境，checksum 不能用 SHA-256 那種 cryptographic hash——CPU 開銷會把 reconciler 自己變成瓶頸。常見做法是用 xxHash64 或 BLAKE3：兩者都是 non-cryptographic hash（threat model 不是惡意 collision，是 silent corruption），speed 比 SHA-256 快一個數量級，collision rate 在 64-bit 空間對 PB 規模仍可忽略。每個 row 算一個 hash，partition 級的 checksum 是這些 row-hash 的 XOR 或 commutative aggregation——order-independent，不需要 sort 整個 partition 才能比對。這個 detail 對 reconciler 的 latency 與 scale 都至關重要。
-  </p>
-
-  <p>
-    每小時這個 cadence 也不是任意挑的。太頻繁——例如每 5 分鐘——會讓 reconciler 本身的 IO 量級接近 ingestion 自己，等於把 capacity 翻倍只為了驗證。太稀疏——例如每天一次——就喪失了「在 alert 觸發時離 root cause 還夠近」這個價值。Hourly 大概是 sweet spot：partition 通常以小時為單位 commit，hourly diff 等於「每個 partition 寫入後立刻驗」，cadence 配合資料結構天然對齊，reconciler 自身的 overhead 也控制在 ingestion 的個位數百分比。
-  </p>
-
-  <p>
-    把 reconciler 當成「另一個 ETL job」來理解會比較貼切——它讀兩個 input（prod partition、shadow partition），計算一個 output（diff report），寫到 sink（Scuba）。這個 framing 提醒一件重要的事：reconciler 自己也會 fail、自己也需要 monitoring。如果 reconciler 因為某個 transient error 連續幾小時沒跑、然後 backfill 跑完發現 100 個 partition 都有 diff——那 100 個 diff 是「真的有問題」還是「reconciler 自己的 bug 造成的假訊號」？這個 meta-validation 問題很容易被忽略，但它決定了 reconciler 是不是真的能被信任。實踐上常見的做法是讓 reconciler 自己有一條 known-good baseline——比如某個歷史上 zero divergence 的 partition——每次 reconciler 啟動先 self-check 跑這條 baseline，確認結果是 zero、再進入正式 diff 階段。
-  </p>
-
-  <p>
-    Reconciler 還有一個 design choice 值得提：sample row 怎麼挑。當 diff 出現時，reconciler 要把幾筆 problematic row 附在 alert 上提供 debug context。但「哪幾筆」很關鍵——隨機 sample 可能挑到代表性不足的 outlier，按錯誤類型聚類 sample 又會增加 reconciler 自己的複雜度。Meta 用詞是「identified example problematic rows」——這個「example」暗示 reconciler 有挑選邏輯，可能是按 hash 分桶後每桶取一筆、或是按欄位的 diff pattern 聚類。具體實作沒明說，但「sample 挑選策略」這件事本身對 alert 的可 debug 性影響極大。
+    Shadow phase 的核心是一個 custom analysis 工具：每小時對 prod / shadow 對應 partition 算 row count + checksum（row count 抓 drop / duplicate，checksum 抓 transform 錯誤），mismatch 寫進 Scuba 附 sample row。Oncall 直接從 alert 跳到 root cause，不必翻 log。
   </p>
 
   <p>
@@ -683,35 +618,15 @@ del legacy_job, shadow_table                        <em>// 確認沒有任何 re
 </code></pre>
 
   <p>
-    這個對稱結構還有一個 side benefit：rollback 變成 trivial。在 reverse-shadow 階段，如果發現新版有 regression，把 traffic 切回讀 shadow（也就是舊 job）只是改一行 routing config——不需要重新 hot-swap engine、不需要 replay events、不需要等舊 job 重啟。舊 job 一直在跑、shadow table 一直在被寫，rollback 從「rebuild + replay 數小時」壓縮成「切讀路徑 + 等下一個 partition」。
+    這個對稱結構讓 rollback 變成 trivial：在 reverse-shadow 階段，如果發現新版有 regression，把讀切回 shadow（舊 job）只是改一行 routing config——不需要 hot-swap engine、replay events 或重啟。Rollback 從「rebuild + replay 數小時」壓縮成「切讀路徑 + 等下一個 partition」。對 PB/day 這不是 nice-to-have、是 hard requirement——4 小時的 rollback window 等於 4 小時的 downstream bad data。
   </p>
 
   <p>
-    rollback 的便宜這件事在 PB/day 環境下不是 nice-to-have，是 hard requirement——如果 rollback 要花 4 小時，那 4 小時內出來的所有 downstream 都會看到 bad data。reverse-shadow 把這個窗口壓到 ~1 個 partition 的時間（分鐘級到小時級依 table 而異），讓「快速回退」變成可行動作而不是理論安全網。
+    Cleanup 的時機靠「continued monitoring」決定，不是 hardcoded 的「N 天退役」。因為 production input 有 weekly / monthly seasonality 與特殊事件——shadow phase 可能還沒見過所有 pattern。Cutover 後負載條件改變（成為 main path、被 reader 直接打），測試條件就改了；reverse-shadow 是承認這個 epistemic 限制：唯一可靠的答案是「持續對照、等證據累積」，而不是「shadow 過了所以 OK」。
   </p>
 
   <p>
-    換個角度想：如果沒有 reverse-shadow phase，cutover 後 prod 跟「上一個版本」之間的關係就只剩 backup snapshot——而 backup 通常是日級、不是 hourly。萬一 cutover 後第三天才發現某個 edge case 跑錯，要 rollback 到三天前的 snapshot 並補追整整 72 小時的 backlog——這個操作的成本通常超過「忍著 bug 想辦法 forward-fix」。Reverse-shadow 把 rollback option 持續保持 fresh，不是「應急 backup」這種 stale 視角。
-  </p>
-
-  <p>
-    這層對稱性還對「新版引入新 bug」的場景特別有用。Cutover 後新版才會接觸到完整的 production input 分佈——包括所有 corner case、tail behavior、cross-team 的奇怪 schema 約定。Shadow phase 雖然也用 production CDC，但 reader 對它的依賴是零，所以一些只在 reader 行為下觸發的 latent bug（例如某個 join 在某種 query pattern 下才會出問題）只有 cutover 後才浮現。Reverse-shadow 期間持續對帳，剛好抓得到這類「shadow 過了但 prod 才有的」回歸。
-  </p>
-
-  <p>
-    這也是為什麼很多 senior infra engineer 強調「shadow 跑兩週 zero divergence」不等於「可以一勞永逸切讀」——shadow phase 只能驗證新版在「shadow 路徑承擔的負載 pattern 下」的正確性，cutover 後負載 pattern 改變（成為 production 主路徑、被所有 reader 直接呼叫），測試條件就改了。Reverse-shadow 是承認這個 epistemic 限制：對「新負載條件下會不會出新 bug」這個問題，唯一可靠的答案是「持續對照、等時間累積證據」，不是「shadow 過了所以一定 OK」。
-  </p>
-
-  <p>
-    Cleanup phase 的時機則靠「continued monitoring」決定——文章措辭是「continued dual monitoring; removed legacy shadow job upon success」。沒有 hardcoded 的「跑滿 14 天就退役」這種規則，而是看實際的 zero-divergence 持續時間與 critical-table 的 owner 是否確認穩定。對 critical table 通常會留更長的觀察期；對風險低的 table 觀察期短。這也對應 stage 1 的批次分類——分類不是只決定上 shadow 的順序，也決定 cleanup 的速度。
-  </p>
-
-  <p>
-    為什麼不用固定 timer？因為「跑滿 N 天 = 安全」這個假設只在 input 分佈 stationary 時成立。實際 production input 有 weekly seasonality（週末跟工作日 pattern 不同）、monthly seasonality（月初月底有 reporting cycle）、特殊事件（產品發布、節慶、突發新聞）——所有這些 axis 都會讓 input 分佈往新方向 shift，shadow phase 沒見過的 pattern 在 cleanup 之前可能還沒跑過一遍。「等到 zero divergence cover 過所有重要 seasonality」這個 criterion 比「跑滿固定天數」更穩——但這意味著 cleanup 的時機必須由 owner 與 platform 共同 judge，不能完全 automate。
-  </p>
-
-  <p>
-    下面這張 before-after 圖把 customer-owned 架構和 self-managed warehouse service 並排——拖動分隔條看 control plane 在哪一層、ownership 在哪一層、observability 在哪一層。重點是「同樣的 CDC 入口 + 同樣的 warehouse 終點」之間，platform 把整個中段抽象化了。
+    下面這張 before-after 圖把 customer-owned 與 self-managed warehouse service 並排——「同樣的 CDC 入口 + 同樣的 warehouse 終點」之間，platform 把整個中段抽象化了。
   </p>
 
   <figure class="vg-w-ba-meta-control-plane">
@@ -830,114 +745,26 @@ del legacy_job, shadow_table                        <em>// 確認沒有任何 re
   <h2>對讀者下週工作的具體含義</h2>
 
   <p>
-    Meta 這套方法不是只給「跟 Meta 同規模」的人看的——任何一個團隊在做「資料層引擎更換」「跨產品 schema 統一」「ETL 控制面收編」時都會撞到相同的時序限制與相同的對帳需求。差別只是規模：你可能不是 PB/day、而是 GB/day；不是幾萬個 job、而是幾百個；不是 100% zero-downtime、而是「能接受 5 分鐘維護視窗但 1 小時就太久」——但「dual-run + 對帳 + 顯式三段」這個結構是普遍適用的。
-  </p>
-
-  <p>
-    幾個常見變體值得提一下。如果你的系統是「事件驅動」而不是「partition 為單位寫」——例如 message queue → service → DB 這種——shadow phase 的對帳對象就不是 partition，而是「同一個 input event 經過新舊兩條 path 後的最終 state」。具體做法可以是：每個 event 經過兩條 path 處理、各自寫到不同 store、reconciler 定期 sample 一批 event ID 做 state diff。粒度比 partition 細，但結構是同一個。
-  </p>
-
-  <p>
-    如果你的系統是「online OLTP DB」——例如把 MySQL primary 從 5.7 升到 8.0 但不能 downtime——shadow phase 對應的是 dual-write：每筆 write 同時寫舊 5.7 與新 8.0、read 仍走舊 5.7、reconciler 比對兩邊的 state。Reverse-shadow 對應 read 切到新 8.0、舊 5.7 仍被寫當對照。Cleanup 對應停寫舊 5.7。GitHub、Stripe 都公開描述過類似的 MySQL major version migration——時序骨架跟 Meta 的 ingestion migration 一模一樣，差別只是「partition diff」變成「row-level state diff」。
-  </p>
-
-  <p>
-    如果你的系統是「ML feature pipeline」——例如把 feature serving 從一個版本切到另一個——shadow phase 對應的是 dual-compute：兩個版本對同一個 input 各自算 feature value、reconciler 算 distribution drift。這個情境下「diff」不是 exact equality（feature value 可能因為新算法本來就略有不同），而是 statistical bound——確保新版的 feature 分佈跟舊版「夠接近」、或者退化在預期範圍內。Reconciler 的具體實作不同，但「上 shadow → 量訊號 → 切讀 → 留對照 → 退役」這個五步骨架完全可以平移。
-  </p>
-
-  <p>
-    把這幾個變體放在一起看會發現一個 pattern：reconciliation 的形狀因 system 而異——partition diff、event-level state diff、row-level state diff、distribution diff——但 reconciliation 必須是 quantifiable 的，必須能用一個數字回答「新版跟舊版的差距是 0 嗎？」這個問題。如果 reconciler 只能輸出「看起來差不多」而沒有可比較的 number，cutover 決策就退回到「人工 review」這個 unscalable 的循環。Quantifiability 是這套方法的隱性 hard requirement——所有抽象細節都對它 funnel。
-  </p>
-
-  <p>
-    把 Meta 的做法翻譯成可以直接拿來檢查自己 migration plan 的清單：
+    這套方法從 GB/day 到 PB/day 都成立——差別只是規模。把 Meta 的做法翻譯成可直接拿來檢查自己 migration plan 的清單：
   </p>
 
   <ol>
     <li>
-      <strong>遷移前：盤點批次邊界</strong>。先把所有要動的 job 按 throughput / priority / known-issue 切成獨立批次，known-issue 那批暫時不上 shadow——避免做「明知會 fail 的雙跑」浪費 capacity。如果你發不出這個分類，先停下來想：是「不知道每個 job 在做什麼」還是「不知道每個 job 出錯時誰會 page」？兩種狀況都該先補完再啟動遷移。
+      <strong>遷移前：盤點批次邊界</strong>。按 throughput / priority / known-issue 切成獨立批次，known-issue 那批暫時不上 shadow——避免做「明知會 fail 的雙跑」浪費 capacity，也讓 shadow alert 的 signal-to-noise ratio 不被汙染。
     </li>
     <li>
-      <strong>shadow 階段：reconciliation 不能是事後</strong>。每小時級別的 row count + checksum 對帳要在 day 1 就存在——不要等「跑一週看看」才上對帳。Reconciliation 工具同時要能挑 example row 並附 debug context，光報「diff 1.3%」沒辦法 debug。對帳產生的訊號是後面所有決策的基礎，先建好它才有資格往下推。
+      <strong>shadow 階段：reconciliation 不能是事後</strong>。每小時級別的 row count + checksum 對帳要在 day 1 就存在——不要等「跑一週看看」才上對帳。Reconciliation 工具同時要能挑 example row 並附 debug context，光報「diff 1.3%」沒辦法 debug。
     </li>
     <li>
-      <strong>cutover 不是切換、是 promotion + demotion</strong>。Reverse-shadow 概念很重要——cutover 的本質是「reader 開始讀新版」，但舊版要繼續跑當對照，這樣 cutover 後的 input drift / edge case 才能被即時偵測。把舊版砍掉是 cleanup 階段做的事，不是 cutover 那一刻做的。
+      <strong>cutover 不是切換、是 promotion + demotion</strong>。Reverse-shadow 是核心——cutover 後舊版要繼續跑當對照，這樣 input drift 與 edge case 才能被即時偵測。砍舊版是 cleanup 階段做的事。
     </li>
     <li>
-      <strong>quality 是 partition 屬性、不是「整個系統 OK / 不 OK」</strong>。把 partition-level quality metadata 設計成 first-class：bad partition 可以被 quarantine 而不影響其他 partition、fixed delta 可以跟 older clean 合併成新 candidate。這個設計讓「出問題」與「資料不可用」不再等價——出問題只是某個 partition 被標、整體 query path 仍能服務。
+      <strong>quality 是 partition 屬性、不是「整個系統 OK / 不 OK」</strong>。bad partition 可以被 quarantine 而不影響其他 partition、fixed delta 可以跟 older clean 合併。出問題不再等於資料不可用。
     </li>
     <li>
-      <strong>cleanup 是「依訊號決定」、不是「跑滿 N 天」</strong>。決定何時退役 legacy 要看「連續多久 zero divergence」，配合 critical-table owner 的確認。Hardcoded 的「跑 14 天就刪」是把信號替換成日曆——對 critical table 觀察期應該更長、對風險低的可以短，這個彈性比固定 timer 更安全。
+      <strong>cleanup 依訊號決定、不是「跑滿 N 天」</strong>。退役 legacy 看「連續多久 zero divergence」，配合 critical-table owner 確認。Hardcoded 的「跑 14 天就刪」是把信號替換成日曆。
     </li>
   </ol>
-
-  <p>
-    Meta 的描述刻意強調了一個容易被忽略的執行細節：要儘早避免做「會 fail 的雙跑」——上 shadow 之前先把 known issue 處理掉，否則你會把 capacity 花在已知會 fail 的試誤上，而 shadow job 的 full dump 是「typically slow and expensive」。這聽起來像 obvious 的常識，但實際團隊很容易在「先讓 shadow 上線、再 iterate fix」這條路上走——結果是 shadow job 失敗的 noise 淹掉真正的 divergence signal，oncall 對 alert 變麻木，整個 reconciliation 機制的價值被稀釋。先處理 known issue、再上 shadow，是把對帳的 signal-to-noise ratio 守住。
-  </p>
-
-  <p>
-    Signal-to-noise 這件事在大型遷移裡比想像中重要。當 shadow phase 跑了一個月、累積了幾千個 partition diff 訊號，oncall 對 alert 的注意力是有限資源——如果 50% 的 alert 來自「已知 issue」、25% 來自「shadow job 環境問題」、只有 25% 是「真正的 divergence」，oncall 就會把 alert 當噪音看待，真正的 divergence 也就會被略過。這個動態在心理學上叫 alert fatigue，在遷移情境裡會直接吞掉 reconciliation 的價值。Meta 強調 known issue 排除不是潔癖，是把訊號的「資訊密度」守住——確保 oncall 收到 alert 時值得認真看。
-  </p>
-
-  <p>
-    另一個容易被低估的細節是 snapshot reuse。如果你有 legacy 系統留下的 snapshot，新 job 起跑時拿這份 snapshot 當初始狀態、後續只追 incremental——避開「shadow job 上線當下重新 full-dump 一整個 source table」。這個優化在規模小時看不太出來，但在「歷史資料累積數年、source table 有 TB 量級」時就是「遷移可行 vs 不可行」的差別——full dump 可能要花數天 cluster time、且這段時間 shadow 還無法產出對帳訊號。
-  </p>
-
-  <p>
-    Snapshot reuse 對 timeline 的 cascade 影響也值得算一下。假設沒有 snapshot reuse，每個 shadow job 上線要花 3 天 full dump、然後才能進入 hourly diff 階段；假設 shadow phase 需要 7 天 zero divergence 才能 promote 到 reverse-shadow；reverse-shadow 又需要 7 天才能進入 cleanup。整個遷移單個 job 的最短時間是 3+7+7 = 17 天。如果有 snapshot reuse、full dump 省到 1 天，最短時間變成 1+7+7 = 15 天——12% 節省。但這只是 best case。實際上 full dump 期間 cluster IO 被吃掉、其他 shadow job 不能同時起跑，整個 fleet 的 throughput 都下降；snapshot reuse 把這個 cluster-wide bottleneck 拿掉，等於是把可以並行雙跑的 job 數量整體拉高。對「幾萬個 job」這種規模，並行度的提升才是真正的時間 saver。
-  </p>
-
-  <p>
-    Conway's law 的角度也值得想想。一個 migration 跨越「平台 team build 機制 / product team negotiate criteria / data infra team owns reconciler」這幾個組織邊界——每個邊界都會在最終架構裡留下痕跡。Meta 把 reconciler 設計成 generic 工具（不綁特定 table）、把 criteria negotiation 設計成 per-critical-table opt-in（保留 owner autonomy）、把 retirement 設計成 owner-confirmed（不是 platform 單方決定）——這些設計選擇都在尊重既有組織邊界的同時推進架構變更。如果忽略組織邊界、強行把 retirement 變成「platform 看 metric OK 就退役」，就會踩到 product team 對 platform 的信任——下次遷移會更難啟動。
-  </p>
-
-  <p>
-    最後一個重點是「control plane 在哪」這個問題。Meta 的最終目標不是「換掉某個引擎」，而是把 ingestion 的控制面從 customer-owned 收進 platform-owned。這意味著 schema registry、quality 監控、SLA 定義、oncall 路徑全部統一到一條線。對任何在類似情境的人，這個觀點很重要：技術上「換新 job」是相對容易的部分；難的是同時把「ingestion 怎麼跑、出問題誰處理、schema 改動怎麼 review」這些 sociotechnical 邊界一起搬。後者搬不動，技術換新只是換一套等待生鏽的 glue。Conway's law 在資料層遷移裡是雙向的——架構決定組織，組織也決定架構能不能落地。
-  </p>
-
-  <p>
-    從 Meta 的 case study 抽象出來，整個遷移可以壓回一句話：<strong>在不能停的 pipeline 上換引擎，靠的不是「切換瞬間的勇氣」，而是「把 cutover 拆成可量測的三段，每段都有 rollback 視窗」</strong>。Shadow phase 提供切換前的 confidence、reverse-shadow phase 提供切換後的 safety net、cleanup phase 只在 confidence 累積到一定程度後才動手。三段都依賴同一個 reconciliation 機制持續產出訊號——這個機制本身比任何引擎都更值得投資建好。
-  </p>
-
-  <p>
-    最後值得注意的是：這套方法論的真正成本不在 reconciler 本身——它在 capacity envelope。雙跑期間整個 ingestion fleet 的 compute 與 storage 是一份 production + 一份 shadow 在同時消耗；對 PB/day 量級，這意味著至少 1.5-2× 的暫時 capacity。如果 platform 沒有這個 elastic headroom，雙跑就跑不起來——這就是為什麼大型遷移幾乎都需要先做 capacity buildout，才能啟動 shadow phase。Meta 沒明說，但「我們有能力在數萬個 job 同時雙跑」這件事本身就是 hyperscaler 級別的競爭壁壘——中型公司常常因為 capacity 預算不夠而被迫走 maintenance-window 路線，付的代價就是 downstream 的 staleness 與 incident 風險。
-  </p>
-
-  <p>
-    對讀者具體有用的還有一個觀點：把 shadow phase 看成「在生產上跑的整合測試」。傳統測試環境永遠跟生產有差距——資料量、流量分佈、邊界條件都不一樣。Shadow phase 把新版直接放在 production CDC 後面跑、用真實流量驗證、用 reconciler 給確定性的 pass/fail 訊號——這比任何 staging 環境都更接近 ground truth。從這個角度看，shadow phase 不是「遷移專用機制」，它是「在生產上做 testing 的方法論」——任何要對核心系統做大改動的場景（不只是 migration，也包括 algorithm 變更、新 schema 推出、storage layer 升級）都可以借這個 pattern。對團隊組織而言，把 shadow 跑成例行能力比把它當一次性遷移工具更有價值。
-  </p>
-
-  <p>
-    再延伸一步：reconciliation 機制本身可以被當成 platform feature 對外暴露。一旦 platform 有能力在任意兩條 data path 之間做 row-count + checksum diff，這個能力就可以用來支援很多其他用例——A/B 測試兩個 ML feature 版本是否一致、驗證 backfill job 是否跟 live job 對齊、檢查不同地區 replica 之間的 drift。reconciler 是 migration 的 enabling technology，但它的應用面遠超出 migration 本身——這是把「一次性遷移投資」變成「長期 platform capability」的關鍵思維。
-  </p>
-
-  <p>
-    對應到團隊組織層面，這也意味著 platform team 在做 ingestion migration 時要把 reconciler 的設計獨立於某次 migration——當作通用工具來建。把它跟「這次特定 migration」綁太緊，下一次遷移時又要從頭做一份；當作 platform capability 建，下一次只要 declare「我要對這兩條 path 跑對帳」就能用。Meta 的描述中 reconciler 是 generic 的（任何 partition 都能比對 row count + checksum），這個設計選擇看起來只是泛化，實際上是把工具的 lifetime 從 single-use 延長到 platform-lifetime。
-  </p>
-
-  <p>
-    從職涯角度也順便提一下：對 platform infra engineer 來說，「能設計與運作這套 dual-run + reconciliation 機制」這個能力，比「會用某個特定工具」更值得長期投資。工具會換、引擎會換、cloud provider 會換，但「在生產上做不可逆變更時如何維持驗證可追溯」這個方法論在十年後仍然有效。Meta 文章本質上是把這套方法論寫進 industry 公開資產——讀懂它、把它變成自己技能組的一部分，是這類 case study 最有價值的取出方式。
-  </p>
-
-  <p>
-    Migration 結束後還有一個常被忽略的工作——把 migration 期間 build 的 capability 沉澱進 platform 的 long-term offering。Reconciler、quality metadata、partition-level routing——這些都是為了 migration 而生但 migration 結束後仍然有價值的 building block。如果這些 capability 在 migration 結束後被當廢料 retire，platform team 就要在下一次 migration 時重新發明一遍。Meta 的描述強調「self-managed warehouse service」這個結果——隱含的訊息是 migration 過程中 build 的所有 capability 都成為 service 的一部分，不是 throwaway 的 migration tooling。
-  </p>
-
-  <p>
-    再多想一層——「migration 結束」這件事本身是個 illusion。任何持續運作的 production system 在它的 lifetime 裡都會經歷多次 migration——從引擎 A 到引擎 B、從 schema v1 到 v2、從 region X 到 region Y。把每次 migration 都當成「一次性事件」是一種錯覺；正確的視角是「migration 是 platform 的 ongoing capability」。Meta 把 dual-run + reconciliation + 三段顯式化建成 platform 自己的 building block，意味著下次再有遷移需求，啟動成本是「draft 一份 migration spec」而不是「重新發明驗證機制」。這就是把一次性投資攤平到 platform-lifetime 的具體含義。
-  </p>
-
-  <p>
-    最後一個延伸思考是 cost-of-not-migrating。讀這類 case study 時容易聚焦在「遷移的代價」——capacity overhead、oncall load、跨組織協調成本——但 cost-of-not-migrating 同樣需要量化。Customer-owned ingestion 在 landing time SLA 變嚴後撐不住，意味著「不遷移」的成本包括：SLA miss 造成的 downstream incident、無法跨團隊統一 observability 的 debug 時間損耗、新需求（GDPR / compliance / privacy schema）要在數百個 codebase 重複實作、無法做平台級優化（compute backend swap、storage tier migration）。把這些都計入後，遷移的相對成本通常比直覺低——而且越晚做、cost-of-not-migrating 累積越多。Meta 的決策時機背後是這個算術，不只是「我們想用新引擎」的偏好。
-  </p>
-
-  <p>
-    最後對「想複製這套方法但規模沒這麼大」的團隊有個務實的提醒：方法骨架可以借，但實作細節要按比例縮。Hourly diff 對 PB/day 是合理的；對 GB/day 可能 daily 就夠。Custom Scuba-style sink 對 Meta 是值得自己做的；對小規模團隊用 Snowflake / BigQuery query + dashboard 工具就足夠。Partition-level quality metadata 在大 fleet 上是必要的；在小 fleet 上一個 PostgreSQL table 加 status column 就能 cover。重點不在「複製 Meta 的具體實作」，而在「複製這套時序骨架」——dual-run / reconciliation / 三段顯式化 / rollback 視窗——這套骨架的價值跟資料規模 orthogonal，從 GB 到 PB 都成立。
-  </p>
-
-  <p>
-    這套方法論的「文化遺產」也值得一提：把「換引擎」這種高風險動作變成可重複的工程實踐，意味著 platform team 在面對「下次該不該重構某條 pipeline」這類決策時，可以從「太冒險」的回答變成「有 playbook、可以做」。當組織內部累積出「遷移是可預測工程」的共識，就會解鎖更多原本被風險規避邏輯壓著的優化機會——這是 invisible 但長期效應極大的 capability investment。
-  </p>
 
   <p class="vg-deep-closer">
     <strong>The lesson</strong>：PB/day 等級的 ingestion migration 沒有「big-bang cutover」這條路——dual-run + 對帳 + 顯式三段（shadow / reverse-shadow / cleanup）是時序層面唯一可行的骨架；把 partition 級別的 quality metadata 設成 first-class、把 reconciliation 跑成每小時，是讓「rollback 仍便宜」的前提；把 known-issue job 排除在 shadow 外、用 legacy snapshot 當新 job 初始狀態，是讓「對帳訊號不被 noise 淹掉」與「capacity envelope 不爆」的工程紀律。
