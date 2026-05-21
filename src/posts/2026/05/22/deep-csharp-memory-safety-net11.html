@@ -1,0 +1,909 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">過去二十年 C# 的 `unsafe` 是一面旗，掛上去意思是「在這段裡我關掉 borrow / null / bounds check，請自己小心」。.NET 11 把這面旗拆成四張票——對齊、生命週期、所有權傳遞、NULL 前提——一張一張寫進函式簽名與 `/// &lt;safety&gt;` 區塊裡，再要求每個呼叫點明確表態。動機在文件第一段就講白：要讓 AI 生成的程式碼有東西可以拒絕。</p>
+  <h1 class="vg-post-title">{{ title }}</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p>
+    <span class="vg-dropcap">微</span>軟 .NET 團隊在 5 月 20 日的 devblog
+    「Improving C# Memory Safety」公布 C# 16 的記憶體安全重新設計，
+    跟 .NET 11 preview 一起出貨、.NET 12 進 production。
+  </p>
+
+  <p>
+    表面看是語法調整——`unsafe` 從「方法 body 內部的局部關鍵字」變成
+    「方法簽名的一部分」、引入 `safe` 修飾 P/Invoke、要求所有呼叫點寫
+    `unsafe { }`——但這層語法調整背後是更基本的概念位移：把 unsafe 從
+    implementation 屬性提升為 caller-facing contract，把「呼叫端要保證
+    什麼」標進型別系統。
+  </p>
+
+  <p>
+    文件原文寫得很直接：「An agent generating code against
+    `MemoryMarshal.ReadByte` has to either propagate `unsafe` upward to
+    its caller or suppress it with guards at the boundary.」這句話是整個
+    設計的支點——重點不是讓人類少寫 bug，而是讓編譯器能拒絕掉 LLM 隨手
+    寫出來的東西。
+  </p>
+
+  <p>
+    下方四個小節各拆一張票：第一段先看舊 `unsafe` 在哪裡漏氣、第二段看
+    新簽名的契約結構、第三段看跨 assembly 的兼容矩陣、第四段看遷移路徑
+    長什麼樣。
+  </p>
+
+  <p>
+    實作參照是 dotnet/designs 的 caller-unsafe spec 與 roslyn PR #82547，
+    runtime 端用 `reduce-unsafe` label 追蹤所有遷移 PR（#127394、#127485
+    等）。所有程式碼片段是文件裡引用的 real signature，沒有 fabricate。
+  </p>
+
+  <h2>舊 `unsafe` 為什麼是一張無資訊的旗</h2>
+
+  <p>
+    先看舊模型。
+    C# 1.0 起 `unsafe` 是個布林開關——在方法上掛 `unsafe`，意思是「我這個方法的 body 裡允許做指標運算、stackalloc、可變指標 cast」，僅此而已。
+    對呼叫端：
+    完全透明。
+    `unsafe void M()` 跟普通 `void M()` 在 call site 完全長一樣，呼叫者不需要任何儀式、不需要表態自己理解了什麼前提。
+    文件給的最小例子：
+  </p>
+
+  <pre><code class="language-csharp">// 舊模型——C# 1.0 起的語意
+unsafe void M() { }
+void Caller() { M(); }  // Legal——no ceremony required</code></pre>
+
+  <p>這段在編譯器眼裡跟下面這段沒有差別：</p>
+
+  <pre><code class="language-csharp">void M() { }
+void Caller() { M(); }</code></pre>
+
+  <p>
+    問題在 `M` 的作者可能依賴某些 invariant——`ptr` 不為 null、`ofs` 在範圍內、傳進來的 `Span` 還沒被 dispose——但這些 invariant 沒有任何地方寫下來，也沒有任何地方檢查。
+    如果有寫，通常是埋在 XML doc comment 的散文裡，編譯器看不到、analyzer 沒興趣。
+    .NET runtime 自己的 `Encoding.GetString` 就是典型例子——這個 method 在 BCL 裡長這樣：
+  </p>
+
+  <pre><code class="language-csharp">public unsafe string GetString(byte* bytes, int byteCount)
+{
+    ArgumentNullException.ThrowIfNull(bytes);
+    ArgumentOutOfRangeException.ThrowIfNegative(byteCount);
+    return string.CreateStringFromEncoding(bytes, byteCount, this);
+}</code></pre>
+
+  <p>
+    注意三件事：
+    第一，`unsafe` 修飾的是 method 自己，意思是 method body 可以做指標運算（這裡的 `byte* bytes` 參數）。
+    第二，呼叫端要傳一個 `byte*` 進來，呼叫者必須自己在 `unsafe` block 裡才能取得這個指標——`unsafe` 已經傳染到 caller，但這個傳染是因為指標型別的存在、不是因為 method 簽名上掛了 `unsafe`。
+    第三：
+    method 在 body 裡做了 `ThrowIfNull(bytes)` 跟 `ThrowIfNegative(byteCount)`，這代表 method 作者*知道*呼叫端可能傳錯，所以做了 runtime 防禦——但 callee 端的防禦次數遠不如 BCL 內部其他類似 method 的「就 trust caller、不檢查」一致。
+    同一份 BCL 裡風格不統一，新人 contributor 不知道該抄哪個。
+  </p>
+
+  <p>
+    更深的問題在於：
+    `unsafe void M()` 這個簽名沒有告訴呼叫端任何事。
+    為什麼這個 method 是 unsafe？是因為它解引用指標？因為它假設 buffer 是某個對齊？因為它要求 caller 還持有 owning reference？因為它接受可能為 null 的指標但 caller 必須先檢查？這些都可以是 unsafe 的理由——舊模型沒有任何機制讓作者標出*哪一種*。
+    對 LLM 來說這是災難級的問題：
+    模型看不到 invariant，看到的只是「這個 method 可以呼叫」，於是它就呼叫了，編譯也通過了。
+    bug 在 runtime 才爆。
+    下面這個 widget 把 `ReadByte(IntPtr ptr, int ofs)` 拆成四張票面、每張對應一條 caller-facing 保證——這是 C# 16 重新設計的核心心智模型：
+  </p>
+
+  <figure class="vg-w-annotated-csharp-unsafe-contracts" data-svg-scroll="720">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M9 11.5a3 3 0 1 0 6 0 3 3 0 0 0-6 0z"/>
+        <path d="M12 2v3M12 19v3M2 12h3M19 12h3"/>
+      </svg>
+      <span>click a contract chip to read which caller obligation it owns · 4 obligations</span>
+    </p>
+    <style>
+      .vg-w-annotated-csharp-unsafe-contracts { display: grid; grid-template-columns: 1fr; gap: var(--s-3); align-items: start; }
+      @media (min-width: 720px) { .vg-w-annotated-csharp-unsafe-contracts { grid-template-columns: 1.3fr 1fr; } }
+      .vg-w-annotated-csharp-unsafe-contracts svg.main { width: 100%; height: auto; max-width: 880px; }
+      .vg-w-annotated-csharp-unsafe-contracts input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-annotated-csharp-unsafe-contracts .chip { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; transition: fill 200ms, stroke 200ms; }
+      .vg-w-annotated-csharp-unsafe-contracts .chip:hover { stroke: var(--accent); }
+      .vg-w-annotated-csharp-unsafe-contracts .chip:focus { outline: none; }
+      .vg-w-annotated-csharp-unsafe-contracts .chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+      .vg-w-annotated-csharp-unsafe-contracts .chip-text { pointer-events: none; }
+      .vg-w-annotated-csharp-unsafe-contracts .sig { pointer-events: none; }
+      .vg-w-annotated-csharp-unsafe-contracts .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+      .vg-w-annotated-csharp-unsafe-contracts .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-annotated-csharp-unsafe-contracts .detail p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-annotated-csharp-unsafe-contracts:has(#vg-w-annotated-csharp-unsafe-contracts-r1:checked) .chip-1 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+      .vg-w-annotated-csharp-unsafe-contracts:has(#vg-w-annotated-csharp-unsafe-contracts-r2:checked) .chip-2 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+      .vg-w-annotated-csharp-unsafe-contracts:has(#vg-w-annotated-csharp-unsafe-contracts-r3:checked) .chip-3 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+      .vg-w-annotated-csharp-unsafe-contracts:has(#vg-w-annotated-csharp-unsafe-contracts-r4:checked) .chip-4 { fill: var(--sage-deep); fill-opacity: 0.32; stroke: var(--sage-deep); }
+      .vg-w-annotated-csharp-unsafe-contracts:has(#vg-w-annotated-csharp-unsafe-contracts-r1:checked) .detail-1 { display: block; }
+      .vg-w-annotated-csharp-unsafe-contracts:has(#vg-w-annotated-csharp-unsafe-contracts-r2:checked) .detail-2 { display: block; }
+      .vg-w-annotated-csharp-unsafe-contracts:has(#vg-w-annotated-csharp-unsafe-contracts-r3:checked) .detail-3 { display: block; }
+      .vg-w-annotated-csharp-unsafe-contracts:has(#vg-w-annotated-csharp-unsafe-contracts-r4:checked) .detail-4 { display: block; }
+      .vg-w-annotated-csharp-unsafe-contracts .hint { font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin: 0 0 var(--s-1) 0; }
+    </style>
+
+    <input type="radio" id="vg-w-annotated-csharp-unsafe-contracts-r1" aria-label="select contract 1" name="vg-w-annotated-csharp-unsafe-contracts-sel" checked />
+    <input type="radio" id="vg-w-annotated-csharp-unsafe-contracts-r2" aria-label="select contract 2" name="vg-w-annotated-csharp-unsafe-contracts-sel" />
+    <input type="radio" id="vg-w-annotated-csharp-unsafe-contracts-r3" aria-label="select contract 3" name="vg-w-annotated-csharp-unsafe-contracts-sel" />
+    <input type="radio" id="vg-w-annotated-csharp-unsafe-contracts-r4" aria-label="select contract 4" name="vg-w-annotated-csharp-unsafe-contracts-sel" />
+
+    <svg class="main" viewBox="0 0 720 360" role="img"
+         aria-label="C# 16 unsafe 簽名拆解——四張票面對應四種 caller obligation">
+      <text x="360" y="28" text-anchor="middle" fill="var(--ink)" font-family="IM Fell English, serif" font-style="italic" font-size="14">unsafe byte ReadByte(IntPtr ptr, int ofs)——簽名背後的四張票</text>
+
+      <!-- Signature line (decorative) -->
+      <rect x="40" y="56" width="640" height="44" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1"/>
+      <text class="sig" x="60" y="84" font-family="JetBrains Mono, monospace" font-size="14" fill="var(--accent-text)">unsafe</text>
+      <text class="sig" x="138" y="84" font-family="JetBrains Mono, monospace" font-size="14" fill="var(--ink)">byte ReadByte(IntPtr ptr, int ofs)</text>
+
+      <!-- 4 contract chips, each pointing back to the signature -->
+      <!-- Chip 1: Alignment -->
+      <rect class="chip chip-1" data-target="vg-w-annotated-csharp-unsafe-contracts-r1" role="button" tabindex="0" aria-label="alignment contract" x="40" y="148" width="150" height="68" rx="4"/>
+      <text class="chip-text" x="115" y="176" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">對齊</text>
+      <text class="chip-text" x="115" y="198" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">alignment</text>
+      <line x1="115" y1="148" x2="115" y2="100" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="2,3"/>
+
+      <!-- Chip 2: Lifetime -->
+      <rect class="chip chip-2" data-target="vg-w-annotated-csharp-unsafe-contracts-r2" role="button" tabindex="0" aria-label="lifetime contract" x="210" y="148" width="150" height="68" rx="4"/>
+      <text class="chip-text" x="285" y="176" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">生命週期</text>
+      <text class="chip-text" x="285" y="198" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">lifetime</text>
+      <line x1="285" y1="148" x2="285" y2="100" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="2,3"/>
+
+      <!-- Chip 3: Ownership -->
+      <rect class="chip chip-3" data-target="vg-w-annotated-csharp-unsafe-contracts-r3" role="button" tabindex="0" aria-label="ownership contract" x="380" y="148" width="150" height="68" rx="4"/>
+      <text class="chip-text" x="455" y="176" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">所有權傳遞</text>
+      <text class="chip-text" x="455" y="198" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">ownership</text>
+      <line x1="455" y1="148" x2="455" y2="100" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="2,3"/>
+
+      <!-- Chip 4: Null precondition -->
+      <rect class="chip chip-4" data-target="vg-w-annotated-csharp-unsafe-contracts-r4" role="button" tabindex="0" aria-label="null precondition contract" x="550" y="148" width="130" height="68" rx="4"/>
+      <text class="chip-text" x="615" y="176" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">NULL 前提</text>
+      <text class="chip-text" x="615" y="198" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">non-null</text>
+      <line x1="615" y1="148" x2="615" y2="100" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="2,3"/>
+
+      <!-- safety doc block placeholder -->
+      <rect x="40" y="248" width="640" height="78" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="3,3"/>
+      <text x="60" y="270" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--muted)">/// &lt;safety&gt;</text>
+      <text x="60" y="290" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--muted)">///   The sum of ptr and ofs must address a byte the caller is</text>
+      <text x="60" y="306" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--muted)">///   permitted to read.</text>
+      <text x="60" y="322" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--muted)">/// &lt;/safety&gt;</text>
+
+      <text x="360" y="350" text-anchor="middle" fill="var(--muted)" font-family="IM Fell English, serif" font-style="italic" font-size="11">每張票面都是一條 caller 必須親手簽下的保證——舊模型把這四張票折成一面旗</text>
+    </svg>
+
+    <div>
+      <p class="hint">click a chip above</p>
+      <div class="detail detail-1">
+        <h3>對齊 · 呼叫端的責任</h3>
+        <p>
+    caller 保證 <code>ptr + ofs</code> 指向的位址符合該型別所需的對齊（讀 <code>byte</code> 是 1，讀 <code>int</code> 是 4，讀 <code>long</code> 是 8）。
+    alignment 違反在 x86 多半 silently 慢一點、在 ARM / RISC-V 直接拋 SIGBUS。
+  </p>
+        <p><strong>callee 不負責</strong>：不做 runtime align check。如果 caller 給的位址錯位，行為 undefined。</p>
+      </div>
+      <div class="detail detail-2">
+        <h3>生命週期 · 呼叫端的責任</h3>
+        <p>
+    caller 保證在這個 method return 之前，<code>ptr</code> 指向的記憶體都還活著——背後的 array、stackalloc buffer、fixed object 還沒被 GC 回收、stack frame 還沒 pop、unmanaged allocation 還沒 free。
+    method 不會 escape 這個指標到外部。
+  </p>
+        <p><strong>callee 不負責</strong>：不追蹤 lifetime、不延長 owner 的存活、不對 free 後 use 做任何防禦。</p>
+      </div>
+      <div class="detail detail-3">
+        <h3>所有權傳遞 · 呼叫端的責任</h3>
+        <p>
+    caller 表態：
+    這個指標只是 borrow（method return 後 ownership 還在 caller 手上），或者 transfer（caller 之後不能再用，由 callee 接手釋放）。
+    舊模型完全沒有區分；C# 16 用 attribute（<code>[Borrowed]</code>、<code>[Transferred]</code>）標進簽名。
+  </p>
+        <p><strong>callee 不負責</strong>：不能自行決定該不該 free——契約清楚由 caller 端的標註決定。</p>
+      </div>
+      <div class="detail detail-4">
+        <h3>NULL 前提 · 呼叫端的責任</h3>
+        <p>
+    caller 保證傳進來的 pointer / IntPtr 不是 null。
+    一個 unsafe method 對 null 可以選擇兩種立場——「拒絕 null（caller 必須先檢查）」或「容忍 null（callee 做 throw）」。
+    <code>Encoding.GetString</code> 屬於後者（<code>ArgumentNullException.ThrowIfNull(bytes)</code>），但這應該被簽名顯式宣告，而不是要求 caller 讀 source。
+  </p>
+        <p><strong>callee 不負責</strong>：當契約是「拒絕 null」時，callee 不做 null check——多寫一行 if 都是契約退化。</p>
+      </div>
+    </div>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-annotated-csharp-unsafe-contracts');
+        root.querySelectorAll('.chip').forEach((rect) => {
+          rect.addEventListener('click', () => {
+            const targetId = rect.getAttribute('data-target');
+            const radio = root.querySelector('#' + targetId);
+            if (radio) radio.checked = true;
+          });
+          rect.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              rect.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            }
+          });
+        });
+      })();
+    </script>
+  </figure>
+
+  <p>
+    這四張票面的關鍵是它們互不重疊。
+    一個 method 可以同時要求 alignment 與 non-null 但不要求 ownership transfer——那就是兩張票。
+    另一個 method 可能只要求 lifetime——一張票。
+    舊模型把任意組合的 obligation 都壓進同一個 `unsafe` 旗，呼叫端無從區分；新模型要求作者*明說*哪幾張票被簽進來。
+    文件原句：
+    「Pointer types in signatures no longer propagate unsafety. Only pointer dereferences are unsafe.」——指標型別本身不再是 unsafe 的傳染源，真正的 unsafe 在 dereference 那個動作。
+    這代表「在 method 簽名上傳一個 `byte*`」不再自動讓 caller 進入 unsafe 模式；只有 method 真的解引用了那個指標，才會觸發 caller 端的 `unsafe { }` 要求。
+    這一條看似小但對 wrapper / shim 的設計影響很大——可以寫一個只是把 `byte*` 包裝起來再轉手出去的 safe wrapper，自己不解引用、不掛 `unsafe`。
+  </p>
+
+  <h2>新簽名的契約結構——`unsafe`、`safe`、`/// &lt;safety&gt;`</h2>
+
+  <p>
+    C# 16 在語法層面做了三件事：
+    第一，`unsafe` 從「實作層 keyword」升格為「簽名層 keyword」，意思變成「呼叫此 method 需要某些 caller-side obligation」；第二，引入 `safe` 修飾 `extern` 宣告，讓 P/Invoke 也能標記為「我這個 native call 不需要 caller 提供任何特殊保證」；第三，要求 `/// &lt;safety&gt;` doc block 明文寫出每條 obligation——analyzer 在缺失時發 warning（不是 error）。
+    文件給的 P/Invoke 範例：
+  </p>
+
+  <pre><code class="language-csharp">// .NET 11 之前：每個 P/Invoke 都得讓 caller 自己決定要不要 unsafe
+internal static extern int getpid();
+
+// C# 16：用 safe 標記宣告「這個 extern call 對 caller 完全透明」
+internal static safe partial int getpid();</code></pre>
+
+  <p>
+    注意 `safe` 是個*減量*標記——它不是讓 unsafe method 變 safe，而是讓本來預設會被當 unsafe 處理的 `extern` 宣告（因為 native call 的本質）明確表態「這個 native function 不需要 caller 做任何特別準備、可以從 safe context 直接呼叫」。
+    `getpid()` 是個好例子：
+    它不接受任何指標、不寫回 buffer、沒有 lifetime concern。
+    標 `safe` 讓 caller 不用包 `unsafe { }`，編譯器也不會對它發 unsafety 警告。
+  </p>
+
+  <p>
+    對 method 簽名本體，`/// &lt;safety&gt;` 塊是 obligation 的承載格式。
+    文件原始範例：
+  </p>
+
+  <pre><code class="language-csharp">/// &lt;safety&gt;
+/// The sum of &lt;paramref name="ptr"/&gt; and &lt;paramref name="ofs"/&gt; must address a byte
+/// the caller is permitted to read.
+/// &lt;/safety&gt;
+public static unsafe byte ReadByte(IntPtr ptr, int ofs)</code></pre>
+
+  <p>
+    這段 doc 本身仍是「人類讀的英文散文」——並沒有變成可機讀的 attribute。
+    為什麼不直接做 attribute？文件講的理由是：
+    obligation 的種類太多、需要的 expressiveness 接近自然語言；硬塞進 attribute 會逼出一堆膨脹的型別系統（想想 SAL annotations 的歷史）。
+    `/// &lt;safety&gt;` 是個現實主義的妥協：
+    它在 IDE 裡會浮出 tooltip、被 analyzer 偵測有無存在、被 LLM 讀進 context window——但編譯器不解析它的內容。
+    實作者的工程負擔比 SAL 級的 annotation 輕得多。
+  </p>
+
+  <p>內部實作用 `// SAFETY:` 註解，學自 Rust convention：</p>
+
+  <pre><code class="language-csharp">private readonly unsafe int _length; // 此 field 帶 invariant
+
+internal unsafe ReadOnlySpan&lt;byte&gt; DangerousKeySpan {
+    get {
+        // SAFETY: handle 由 SafeHandle 保護生命週期，_length 在 ctor 後不可變
+        unsafe {
+            return new ReadOnlySpan&lt;byte&gt;((void*)handle, _length);
+        }
+    }
+}</code></pre>
+
+  <p>
+    `&lt;safety&gt;` 是 caller-facing（公開 doc），`// SAFETY:` 是 callee-facing（內部 reviewer 看的）。
+    兩者分工跟 Rust 的 `unsafe fn` doc comment vs `unsafe { /* SAFETY: */ }` 一模一樣——C# 團隊在 design doc 裡也明確說這是 deliberate borrowing。
+    從 review 流程的角度看，這個分工讓 PR reviewer 有明確的 checklist：
+    看 `&lt;safety&gt;` 是否完整描述了所有 obligation、看每個 `unsafe { }` block 之前是否有對應的 `// SAFETY:` 解釋為什麼這個 block 滿足了上游 method 的 obligation。
+  </p>
+
+  <p>
+    還有一個語法層的變化容易被忽略：
+    `unsafe` 作為 type modifier 被廢除。
+    過去可以寫 `unsafe class Foo { ... }`，意思是「這個 class 裡所有 member 都隱式 unsafe」。
+    C# 16 拒絕這個寫法——unsafe scope 只能在 method / property / field 層級宣告，class 層級的 wildcard 被 error 掉。
+    理由是：
+    在 class 層級開 unsafe 跟舊 `unsafe` 旗一樣是無資訊的——讓人類與 LLM 都不知道哪些 member 真的有 unsafe obligation。
+    強制下沉到 member 層級，逼作者每次只標記真正需要的那一個。
+  </p>
+
+  <p>
+    整理一下：
+    caller 在新模型下面對一個 unsafe member 時看到的訊息密度，從「這裡是 unsafe」升到「這裡是 unsafe，因為（對齊 / 生命週期 / 所有權 / null）四張票中的某些子集，請看 `&lt;safety&gt;` 塊」。
+    對 LLM 來說這個密度差距大——LLM 在 prompt window 裡讀到 `&lt;safety&gt;` 塊，就有辦法判斷自己該不該呼叫、該不該往上 propagate `unsafe`、該不該在 boundary 寫 guard。
+    下面是新模型下的最小 caller 三選一——傳染、抑制、邊界守衛：
+  </p>
+
+  <pre><code class="language-csharp">// 新模型——C# 16
+/// &lt;safety&gt;Caller must satisfy obligation 1.&lt;/safety&gt;
+unsafe void M() { }
+
+// 路徑 A: caller 也標 unsafe，把 obligation 往上 propagate
+unsafe void Caller1() {
+    unsafe { M(); }   // 呼叫點仍需 unsafe block——傳染給 Caller1 的呼叫者
+}
+
+// 路徑 B: caller 在 boundary 做檢查、suppress obligation
+void Caller2() {
+    if (/* obligation 1 not satisfied */) throw new Exception();
+    unsafe { M(); }   // 此 caller 自己是 safe，因為 obligation 已被 runtime guard 接住
+}
+
+// 路徑 C（編譯錯誤）：直接呼叫不寫 unsafe block
+void Caller3() {
+    M();              // ERROR: unsafe member 必須在 unsafe block 內呼叫
+}</code></pre>
+
+  <p>
+    路徑 A 是 propagation——把 unsafe 沿著 call chain 往上傳，直到某個層級願意當 boundary。
+    路徑 B 是 suppression——這層自己用 runtime check 把 obligation 攔下來，對 caller 而言這個 method 是 safe。
+    路徑 C 是錯的，編譯器直接拒絕。
+    文件原句：
+    「Violations are compile errors, not warnings.」這是新模型的關鍵設計選擇——讓 unsafe 違規從 lint warning 升級成 hard error，避免 warning fatigue 把問題沖掉。
+    下方 tab widget 把這三條路徑並排放，看一個普通 method 在三種寫法下分別長什麼樣：
+  </p>
+
+  <figure class="vg-w-tabs-csharp-migration">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="3" y="3" width="18" height="18" rx="2"/>
+        <path d="M3 9h18M9 21V9"/>
+      </svg>
+      <span>switch tabs to compare the three caller paths · 3 tabs</span>
+    </p>
+    <style>
+      .vg-w-tabs-csharp-migration { display: grid; gap: var(--s-2); }
+      .vg-w-tabs-csharp-migration input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-tabs-csharp-migration .tabs { display: flex; gap: var(--s-2); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+      .vg-w-tabs-csharp-migration .tab { font-family: var(--sans); font-size: var(--fs-sm); padding: var(--s-1) var(--s-2); cursor: pointer; color: var(--muted); min-height: 44px; display: flex; align-items: center; }
+      .vg-w-tabs-csharp-migration .panel { display: none; padding: var(--s-2) 0; }
+      .vg-w-tabs-csharp-migration .panel pre { margin: 0; }
+      .vg-w-tabs-csharp-migration .panel-head { font-family: var(--scribed); font-style: italic; color: var(--muted); font-size: var(--fs-sm); margin: 0 0 var(--s-1) 0; }
+      .vg-w-tabs-csharp-migration:has(#vg-w-tabs-csharp-migration-t1:checked) .panel-1 { display: block; }
+      .vg-w-tabs-csharp-migration:has(#vg-w-tabs-csharp-migration-t1:checked) [for="vg-w-tabs-csharp-migration-t1"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-csharp-migration:has(#vg-w-tabs-csharp-migration-t2:checked) .panel-2 { display: block; }
+      .vg-w-tabs-csharp-migration:has(#vg-w-tabs-csharp-migration-t2:checked) [for="vg-w-tabs-csharp-migration-t2"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-csharp-migration:has(#vg-w-tabs-csharp-migration-t3:checked) .panel-3 { display: block; }
+      .vg-w-tabs-csharp-migration:has(#vg-w-tabs-csharp-migration-t3:checked) [for="vg-w-tabs-csharp-migration-t3"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    </style>
+    <input type="radio" id="vg-w-tabs-csharp-migration-t1" name="vg-w-tabs-csharp-migration-sel" checked aria-label="select propagate path" />
+    <input type="radio" id="vg-w-tabs-csharp-migration-t2" name="vg-w-tabs-csharp-migration-sel" aria-label="select boundary suppress path" />
+    <input type="radio" id="vg-w-tabs-csharp-migration-t3" name="vg-w-tabs-csharp-migration-sel" aria-label="select compile error path" />
+    <div class="tabs" role="tablist">
+      <label class="tab" for="vg-w-tabs-csharp-migration-t1">A · propagate</label>
+      <label class="tab" for="vg-w-tabs-csharp-migration-t2">B · boundary suppress</label>
+      <label class="tab" for="vg-w-tabs-csharp-migration-t3">C · compile error</label>
+    </div>
+    <div class="panel panel-1">
+      <p class="panel-head">把 obligation 往上傳——caller 自己也是 unsafe，呼叫鏈一路傳到某層當 boundary</p>
+      <pre><code class="language-csharp">/// &lt;safety&gt;Sum of ptr and ofs must point to readable memory.&lt;/safety&gt;
+public static unsafe byte ReadByte(IntPtr ptr, int ofs) { /* ... */ }
+
+/// &lt;safety&gt;Inherits obligation from ReadByte: ptr+ofs readable.&lt;/safety&gt;
+public unsafe byte ReadChecksum(IntPtr ptr) {
+    unsafe {
+        // SAFETY: caller of ReadChecksum 已承擔 ptr+0 readable 的義務
+        return ReadByte(ptr, 0);
+    }
+}
+
+// 終點層在哪？某個 application-level entry point——
+// 它對使用者 input 做 validation 之後才開始下 unsafe call</code></pre>
+    </div>
+    <div class="panel panel-2">
+      <p class="panel-head">在 boundary 用 runtime guard 把 obligation 攔住——caller 對外是 safe</p>
+      <pre><code class="language-csharp">/// &lt;safety&gt;Sum of ptr and ofs must point to readable memory.&lt;/safety&gt;
+public static unsafe byte ReadByte(IntPtr ptr, int ofs) { /* ... */ }
+
+// 注意：這個 wrapper 自己 NOT marked unsafe——boundary 在這裡
+public byte SafeReadFirstByte(byte[] buffer) {
+    ArgumentNullException.ThrowIfNull(buffer);
+    if (buffer.Length == 0) throw new ArgumentException(nameof(buffer));
+
+    fixed (byte* ptr = buffer) {
+        unsafe {
+            // SAFETY: buffer 非空已驗、fixed pin 保證 lifetime
+            return ReadByte((IntPtr)ptr, 0);
+        }
+    }
+}
+
+// caller 從此可以無痛呼叫 SafeReadFirstByte——不用包 unsafe block</code></pre>
+    </div>
+    <div class="panel panel-3">
+      <p class="panel-head">忘了寫 unsafe block——編譯器直接拒絕，不是 warning</p>
+      <pre><code class="language-csharp">/// &lt;safety&gt;Sum of ptr and ofs must point to readable memory.&lt;/safety&gt;
+public static unsafe byte ReadByte(IntPtr ptr, int ofs) { /* ... */ }
+
+public byte BrokenCaller(IntPtr ptr) {
+    return ReadByte(ptr, 0);
+    // CS9999: cannot invoke unsafe member 'ReadByte' outside of an
+    // 'unsafe' block. Either:
+    //   - wrap call site in unsafe { ... } and mark this method unsafe
+    //   - wrap call site in unsafe { ... } and add a runtime guard for
+    //     ptr+0 readability before the call
+}
+
+// 舊模型這段是合法的——新模型直接 break。這就是 opt-in 機制的意義</code></pre>
+    </div>
+  </figure>
+
+  <p>
+    對 LLM 來說，路徑 A 跟路徑 B 的差別是「我要不要主張自己理解這個 obligation」。
+    路徑 A 把責任丟給上游，但簽名上得標 unsafe、得寫 `&lt;safety&gt;` 塊；路徑 B 則是主張「我可以自己驗」，這對 LLM 而言是更高難度——模型必須生成一段可以接住 obligation 的 runtime guard、而且這段 guard 必須完整覆蓋簽名上列出的所有 obligation 條目。
+    這是設計上故意的不對稱：
+    路徑 A 容易但會傳染，路徑 B 困難但會終止傳染。
+    生態圈最終會收斂到「在 BCL / framework 級的 wrapper 上用路徑 B，把 obligation 攔在 framework 入口；application code 一律是 safe」。
+  </p>
+
+  <h2>跨 assembly 的兼容矩陣——opt-in 機制怎麼避免大爆炸</h2>
+
+  <p>
+    這個重新設計面臨的最大現實阻力是：
+    .NET 生態裡已經有十幾年積累的 unsafe 程式碼。
+    如果 C# 16 直接 break 舊行為，幾乎所有依賴 BCL unsafe API 的 NuGet package 都會 stop compile。
+    微軟的解法是 opt-in：
+    新模型由 csproj 的一個新 property（名稱在 .NET 11 preview 期間 finalize 中，文件用 placeholder）控制。
+    Opt-in 關閉時，編譯器套用 C# 1.0 老規則；Opt-in 打開時，套用新規則。
+    這個 opt-in 跟已有的 `&lt;AllowUnsafeBlocks&gt;` 是兩個獨立 switch——前者控制「整個檔案能不能有 unsafe 關鍵字」、後者控制「unsafe 是 old-style 還是 caller-contract-style」。
+  </p>
+
+  <p>但跨 assembly 邊界出現複合情況——當 opt-in 的 caller 呼叫一個還沒 opt-in 的 callee（或反過來），編譯器要做什麼？文件給了一個四象限的相容矩陣，把這四種交叉組合下的行為說清楚：</p>
+
+  <figure class="vg-w-table-csharp-optin-matrix">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/>
+        <path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+      </svg>
+      <span>click column header to sort · 4 columns × 4 rows</span>
+    </p>
+    <style>
+      .vg-w-table-csharp-optin-matrix { overflow-x: auto; }
+      .vg-w-table-csharp-optin-matrix table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-csharp-optin-matrix thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; }
+      .vg-w-table-csharp-optin-matrix thead th[data-sort] { color: var(--accent-text); }
+      .vg-w-table-csharp-optin-matrix thead th[data-sort]::after { content: ' ▾'; font-size: 0.7em; }
+      .vg-w-table-csharp-optin-matrix thead th[data-sort="asc"]::after { content: ' ▴'; font-size: 0.7em; }
+      .vg-w-table-csharp-optin-matrix tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+      .vg-w-table-csharp-optin-matrix td.flag { font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); color: var(--muted); }
+      .vg-w-table-csharp-optin-matrix td.rule { font-family: var(--scribed); font-style: italic; color: var(--accent-text); }
+      .vg-w-table-csharp-optin-matrix tbody tr:hover td { background: var(--bg-soft); }
+      .vg-w-table-csharp-optin-matrix caption { text-align: left; caption-side: top; font-family: var(--scribed); font-style: italic; color: var(--muted); font-size: var(--fs-sm); padding: var(--s-1) 0; }
+    </style>
+    <table>
+      <caption>caller × callee 的四象限——opt-in 狀態決定編譯器套哪一套規則。點欄位標題排序。</caption>
+      <thead>
+        <tr>
+          <th data-key="caller">caller 端</th>
+          <th data-key="callee">callee 端</th>
+          <th data-key="rule">編譯器套用</th>
+          <th data-key="note">說明</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="flag">opt-in</td>
+          <td class="flag">opt-in</td>
+          <td class="rule">C# 16 完整模型</td>
+          <td>呼叫端必須包 <code>unsafe { }</code>、必須讀 callee 的 <code>&lt;safety&gt;</code>、違規是 compile error</td>
+        </tr>
+        <tr>
+          <td class="flag">opt-in</td>
+          <td class="flag">legacy</td>
+          <td class="rule">compat 模式</td>
+          <td>把 callee 簽名中所有 pointer-typed parameter 視為 implicit unsafe——保守側：寧可多要 caller 寫 <code>unsafe { }</code></td>
+        </tr>
+        <tr>
+          <td class="flag">legacy</td>
+          <td class="flag">opt-in</td>
+          <td class="rule">legacy 規則</td>
+          <td>callee 端的 <code>&lt;safety&gt;</code> 仍存在於 IDE tooltip，但編譯器不對 caller 強制——caller 自己沒 opt-in</td>
+        </tr>
+        <tr>
+          <td class="flag">legacy</td>
+          <td class="flag">legacy</td>
+          <td class="rule">C# 1.0 規則</td>
+          <td>完全不變——old code 跑 old rules，零遷移成本</td>
+        </tr>
+      </tbody>
+    </table>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-table-csharp-optin-matrix');
+        const headers = root.querySelectorAll('thead th');
+        const tbody = root.querySelector('tbody');
+        let activeKey = null, asc = true;
+        headers.forEach((h, idx) => h.addEventListener('click', () => {
+          const key = h.dataset.key;
+          if (activeKey === key) asc = !asc; else { activeKey = key; asc = true; }
+          headers.forEach((x) => x.removeAttribute('data-sort'));
+          h.setAttribute('data-sort', asc ? 'asc' : 'desc');
+          const rows = Array.from(tbody.querySelectorAll('tr'));
+          rows.sort((a, b) => {
+            const av = a.children[idx].textContent.trim();
+            const bv = b.children[idx].textContent.trim();
+            const cmp = av.localeCompare(bv);
+            return asc ? cmp : -cmp;
+          });
+          rows.forEach((r) => tbody.appendChild(r));
+        }));
+      })();
+    </script>
+  </figure>
+
+  <p>
+    第二象限（opt-in caller × legacy callee）是設計上最微妙的一格。
+    這格代表「我的 application 已經升級，但我依賴的 NuGet 還沒」。
+    直覺上會想要*寬鬆*處理——舊 callee 沒有 `&lt;safety&gt;` 塊、沒有清楚 obligation，跟 legacy 模式跑就好。
+    但文件選的是*保守*處理：
+    把舊 callee 的 pointer-typed parameter 全部視為 implicit unsafe，逼 opt-in 的 caller 包 `unsafe { }`。
+    這個選擇背後的邏輯是：
+    opt-in 的開發者已經明確表態「我願意承擔新模型的工程負擔」，那麼他們應該對任何進入舊 BCL / 舊 NuGet 的 call site 都做一次 boundary 表態，不應該因為 callee 還沒升級就退回 implicit safety。
+    這是把「不確定的舊程式碼」當「可能有問題的舊程式碼」處理——比過度信任安全。
+  </p>
+
+  <p>
+    第三象限（legacy caller × opt-in callee）反過來：
+    我還在跑舊 csproj，但我用的 BCL 已經是 .NET 11 / 12 升級過的。
+    這格走 legacy 規則——callee 上的 `&lt;safety&gt;` 塊在編譯期不被 enforce、IDE 仍然會顯示 tooltip 給開發者讀，但編譯器不會因為 caller 沒包 `unsafe { }` 就 break。
+    這保證 BCL 升級不會打爆所有舊 application。
+    .NET runtime 自己的遷移策略也是這樣設計的——`reduce-unsafe` label 下的 PR 一個個把舊 BCL method 改成新簽名（#127394 把 `MemoryMarshal` 的一系列方法 opt-in、#127485 把 `Encoding` 的若干 unsafe overload 改寫），但這些 PR 對 legacy caller 完全透明。
+  </p>
+
+  <p>
+    opt-in 機制的代價是兩種規則必須長期共存。
+    文件給的 timeline：
+    C# 16 在 .NET 11（2026 Q4）進 preview、opt-in only；.NET 12 進 production、仍是 opt-in only；後續 release 才考慮把它升為 default。
+    意思是至少 18 個月內 ecosystem 會處於混合狀態——新的 BCL method 跟舊的 BCL method 同時存在，新 application 跟舊 application 用同一份 runtime。
+    這個過渡期的長度跟 nullable reference type（C# 8 → .NET 6 的 default 化大約走了三年）相當。
+    比較性地說，nullable 的軌跡是好參考：
+    先 opt-in、生態圈逐步補完 annotation、再轉 default、最後舊行為被視為 anti-pattern。
+    C# 16 unsafe 重新設計很可能走同樣四階段曲線。
+  </p>
+
+  <h2>遷移路徑——舊 unsafe 慣用法在新模型下長什麼樣</h2>
+
+  <p>
+    對 application 作者，遷移最直接的工作量在 call site。
+    下面這個 before/after slider 把同一個 `MemoryMarshal.ReadByte` 呼叫點放在 C# 1.0 模型 vs C# 16 模型，左右拖動可以對比兩邊的儀式量差。
+    `.before` 是舊寫法、`.after` 是新寫法：
+  </p>
+
+  <figure class="vg-w-ba-csharp-callsite" data-svg-scroll="720">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M18 8L22 12L18 16"/>
+        <path d="M2 12H22"/>
+        <path d="M6 8L2 12L6 16"/>
+      </svg>
+      <span>drag the divider to compare old vs new call-site ceremony · 2 panels</span>
+    </p>
+    <style>
+      .vg-w-ba-csharp-callsite { position: relative; aspect-ratio: 16 / 9; overflow: hidden; border: 1px solid var(--line); background: var(--bg-soft); }
+      @media (max-width: 720px) { .vg-w-ba-csharp-callsite { aspect-ratio: 4 / 3; } }
+      .vg-w-ba-csharp-callsite .layer { position: absolute; inset: 0; }
+      .vg-w-ba-csharp-callsite .after { clip-path: polygon(50% 0, 100% 0, 100% 100%, 50% 100%); }
+      .vg-w-ba-csharp-callsite svg { width: 100%; height: 100%; }
+      .vg-w-ba-csharp-callsite .divider {
+        position: absolute; top: 0; bottom: 0; left: 50%;
+        width: 32px; transform: translateX(-50%);
+        cursor: ew-resize; touch-action: none;
+        z-index: 3;
+      }
+      .vg-w-ba-csharp-callsite .divider::before {
+        content: ''; position: absolute; left: 50%; top: 0; bottom: 0;
+        width: 2px; transform: translateX(-50%);
+        background: var(--accent);
+      }
+      .vg-w-ba-csharp-callsite .divider::after {
+        content: '↔'; position: absolute; left: 50%; top: 50%;
+        transform: translate(-50%, -50%);
+        background: var(--accent); color: var(--bg);
+        width: 32px; height: 32px; border-radius: 50%;
+        display: grid; place-items: center;
+        font-family: var(--sans); font-size: 16px;
+      }
+    </style>
+
+    <svg class="layer before" viewBox="0 0 720 405" id="vg-w-ba-csharp-callsite-before" preserveAspectRatio="xMidYMid meet">
+      <rect width="720" height="405" fill="var(--bg-soft)"/>
+      <text x="20" y="34" font-family="IM Fell English, serif" font-style="italic" font-size="16" fill="var(--muted)">before · C# 1.0 model</text>
+      <text x="20" y="58" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--muted)">// caller 無儀式、無 obligation 認知</text>
+      <text x="20" y="90" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--ink)">public byte Probe(IntPtr buf) {</text>
+      <text x="36" y="116" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--ink)">return MemoryMarshal.ReadByte(buf, 0);</text>
+      <text x="20" y="142" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--ink)">}</text>
+      <text x="20" y="186" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--muted)">// 編譯：通過</text>
+      <text x="20" y="212" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--muted)">// runtime：buf=IntPtr.Zero ——&gt; AccessViolation</text>
+      <text x="20" y="238" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--muted)">//                  buf 已 free ——&gt; UB</text>
+      <text x="20" y="264" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--muted)">// 沒任何地方寫下 obligation</text>
+      <text x="20" y="320" font-family="EB Garamond, serif" font-size="14" fill="var(--accent-text)">儀式量：0</text>
+      <text x="20" y="346" font-family="EB Garamond, serif" font-size="14" fill="var(--accent-text)">obligation 可見性：0</text>
+      <text x="20" y="372" font-family="EB Garamond, serif" font-size="14" fill="var(--accent-text)">編譯期防禦：無</text>
+    </svg>
+
+    <svg class="layer after" viewBox="0 0 720 405" id="vg-w-ba-csharp-callsite-after" preserveAspectRatio="xMidYMid meet">
+      <rect width="720" height="405" fill="var(--bg)"/>
+      <text x="20" y="34" font-family="IM Fell English, serif" font-style="italic" font-size="16" fill="var(--accent-text)">after · C# 16 model</text>
+      <text x="20" y="58" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--muted)">/// &lt;safety&gt;buf must point to a readable byte.&lt;/safety&gt;</text>
+      <text x="20" y="84" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--ink)">public unsafe byte Probe(IntPtr buf) {</text>
+      <text x="36" y="110" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--muted)">// SAFETY: caller of Probe 承擔 buf readable</text>
+      <text x="36" y="136" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--ink)">unsafe {</text>
+      <text x="52" y="162" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--ink)">return MemoryMarshal.ReadByte(buf, 0);</text>
+      <text x="36" y="188" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--ink)">}</text>
+      <text x="20" y="214" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--ink)">}</text>
+      <text x="20" y="258" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--sage-deep)">// 編譯：通過——obligation 已往上 propagate</text>
+      <text x="20" y="284" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--sage-deep)">// 漏寫 unsafe { } ——&gt; compile error</text>
+      <text x="20" y="320" font-family="EB Garamond, serif" font-size="14" fill="var(--accent-text)">儀式量：+3 lines</text>
+      <text x="20" y="346" font-family="EB Garamond, serif" font-size="14" fill="var(--accent-text)">obligation 可見性：簽名+doc</text>
+      <text x="20" y="372" font-family="EB Garamond, serif" font-size="14" fill="var(--accent-text)">編譯期防禦：缺失=error</text>
+    </svg>
+
+    <div class="divider" id="vg-w-ba-csharp-callsite-divider"></div>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-ba-csharp-callsite');
+        const after = root.querySelector('#vg-w-ba-csharp-callsite-after');
+        const divider = root.querySelector('#vg-w-ba-csharp-callsite-divider');
+        let dragging = false;
+        function setPct(pct) {
+          const clamped = Math.max(0, Math.min(100, pct));
+          after.style.clipPath = 'polygon(' + clamped + '% 0, 100% 0, 100% 100%, ' + clamped + '% 100%)';
+          divider.style.left = clamped + '%';
+        }
+        divider.addEventListener('pointerdown', (e) => {
+          dragging = true;
+          divider.setPointerCapture(e.pointerId);
+        });
+        root.addEventListener('pointermove', (e) => {
+          if (!dragging) return;
+          const rect = root.getBoundingClientRect();
+          setPct(((e.clientX - rect.left) / rect.width) * 100);
+        });
+        root.addEventListener('pointerup', () => { dragging = false; });
+        root.addEventListener('pointercancel', () => { dragging = false; });
+      })();
+    </script>
+    <figcaption>同一個 `MemoryMarshal.ReadByte(buf, 0)` 呼叫——左邊舊模型 1 行、右邊新模型 5 行（含 doc）。看起來儀式多了，但每一行都是把過去藏在文件 prose 裡的 obligation 提到表面，編譯器看得到、LLM 讀得到、reviewer 找得到。</figcaption>
+  </figure>
+
+  <p>幾個慣用模式的遷移路線值得記下來：</p>
+
+  <p>
+    第一，`fixed (byte* p = array)` 區塊維持不變——這個語法本來就是 boundary suppression 的早期版本，作者已經明確表態 array 在 block 內被 pinned、lifetime 收斂。
+    新模型下 `fixed` 區塊內部仍是 unsafe context、區塊出口仍是 safe context，唯一差別是現在每個 unsafe call 都得額外包 `unsafe { }`。
+    實際上多數 `fixed` 區塊只會多一層大括號縮排：
+  </p>
+
+  <pre><code class="language-csharp">// before
+fixed (byte* p = data) {
+    return MemoryMarshal.ReadByte((IntPtr)p, 0);
+}
+
+// after——多一層 unsafe block，原語意不變
+fixed (byte* p = data) {
+    unsafe {
+        // SAFETY: p 在 fixed scope 內 pinned
+        return MemoryMarshal.ReadByte((IntPtr)p, 0);
+    }
+}</code></pre>
+
+  <p>
+    第二，`stackalloc Span&lt;byte&gt;` 已經是 safe wrapper，不會受影響。
+    但 `byte* p = stackalloc byte[N]` 這種 raw pointer 版本會。
+    後者建議全面換到 `Span&lt;byte&gt; s = stackalloc byte[N]`——Span overload 本來就是 .NET Core 之後的偏好寫法、Span 內部已經把 lifetime 收緊到 stack frame、unsafe 不會傳染。
+    runtime 端 #127394 的一大部分就是把 BCL 內部 `byte*` 形式的 stackalloc 改成 Span 形式。
+  </p>
+
+  <p>
+    第三，自己寫的 unsafe extension method 是最痛的。
+    如果一個內部 helper 過去寫成 `internal static unsafe byte ReadAt(this IntPtr ptr, int ofs) { return *(byte*)(ptr + ofs); }`——這個 method 在新模型下要嘛標 `&lt;safety&gt;` 塊把 obligation 寫清、要嘛全面改寫成接受 `Span&lt;byte&gt;` 的 safe 版本。
+    後者通常是對的選擇，因為這類 helper 99% 的呼叫端其實有 owning array、能 fix 出 Span。
+    `reduce-unsafe` label 追蹤的 PR 大量是這類「helper 改寫成 Span 版」的 mechanical 重構。
+  </p>
+
+  <p>
+    第四，跟 native code 互通的 P/Invoke wrapper：
+    建議直接用 `safe` 修飾——絕大多數 P/Invoke 函式對 caller 沒有 special obligation（例如 `getpid`、`gettimeofday`、各種純值 in/out 的 system call）。
+    少數真的需要 caller pass pointer 的，照新規範寫 `&lt;safety&gt;` 塊、callee 端維持 `unsafe`。
+    `safe` 修飾在 P/Invoke 上意外好用——以前必須記得 `[DllImport]` declaration 不要散播 unsafe 傳染，現在改成顯式 opt-in。
+  </p>
+
+  <p>
+    第五，遷移工具——roslyn PR #82547 帶來的 analyzer 會自動偵測「適合 opt-in 但還沒 opt-in 的 file」並提供 fix-it，自動把 method 上的 `unsafe` 修飾從 implementation 升級為 caller-contract 形式、自動在呼叫點補 `unsafe { }`。
+    這個 fix-it 不會生成 `&lt;safety&gt;` 塊——因為 obligation 是語意層級的東西、機器猜不出來。
+    analyzer 只能在缺失時發 warning 提醒作者補。
+    實務上的遷移節奏會是：
+    第一次 opt-in 整個 project，跑 fix-it 補機械層面的修改，然後逐個 method 補 `&lt;safety&gt;` 塊跟 `// SAFETY:` 註解——後者是人類工程師必須親手做的事。
+  </p>
+
+  <p>
+    整體看，遷移成本對 application code 是低的（多半是機械修改 + 一次心智轉換），對 library / framework 作者是中等（每個 unsafe API 都得補 `&lt;safety&gt;` 塊、每個 BCL function 都得重新審視 obligation 表達），對 .NET runtime 自己是高的（已知有上千個 unsafe API 要審視，`reduce-unsafe` label 的 PR 還在以每週數十個的速度推進）。
+    微軟把 runtime 自己當第一個白老鼠跑這個遷移，預計 .NET 12 進 production 時 BCL 的 unsafe 表面已經完成 opt-in，第三方 library 跟著用就行。
+  </p>
+
+  <h2>為什麼這在 AI 時代變得急迫</h2>
+
+  <p>
+    把以上拉到 motivation 層面：
+    為什麼 .NET 團隊在 2026 年要做這個？答案不在 C# 本身的演化壓力，而在 AI-assisted code generation 的爆炸性增長。
+    文件第一段給的理由直接：
+    要讓 obligation 對「正在生成 .NET 程式碼的 agent」可見——當 LLM 看到 `unsafe byte ReadByte(IntPtr ptr, int ofs)` 跟看到 `&lt;safety&gt;The sum of ptr and ofs must address a byte the caller is permitted to read&lt;/safety&gt;` 是不同的事。
+    前者是黑箱、後者是契約。
+    前者讓模型可以亂呼叫、後者讓編譯器有辦法拒絕。
+  </p>
+
+  <p>
+    這個觀察跟過去十年「memory safety 是給人類用的」思路反過來。
+    歷史上 C# 引入 nullable reference type、Rust 引入 ownership system、Swift 引入 ARC——這些工具都假設「作者是人、會讀 doc、會吸收 invariant」。
+    在這個假設下，把 obligation 寫進文件就夠了，因為人類會吸收。
+    LLM 完全不一樣：
+    模型不會主動讀外部 doc，模型讀的是 prompt window 裡有什麼。
+    如果一個 obligation 沒寫進函式簽名或附近的 doc comment，模型生成程式碼時就不會考慮它。
+    `unsafe void M()` 這種無資訊簽名對 LLM 等於「沒有 obligation」——模型會自由呼叫，bug 在 runtime 才出。
+  </p>
+
+  <p>
+    C# 16 的設計選擇是：
+    把 obligation 拉到「LLM 必然會讀到的位置」——函式簽名跟緊鄰的 doc block。
+    `/// &lt;safety&gt;` 塊出現在 IntelliSense tooltip 裡、出現在 LSP `textDocument/hover` 回應裡、出現在每個 source completion request 的 context window 裡。
+    模型在生成 caller code 時必然會看到這段 obligation 描述——它就有辦法判斷自己該不該呼叫、該不該往上 propagate、該不該在 boundary 寫 guard。
+    文件原話：
+    「Compiler rejection of undecorated unsafe calls narrows agent output search space.」——這句話翻譯成白話：
+    當編譯器 hard reject 違規的 unsafe 呼叫，LLM 在 train-time 跟 inference-time 看到的「正確 .NET 程式碼分佈」就會被收窄，模型自然會學到「呼叫 unsafe member 時必須 wrap unsafe block」。
+  </p>
+
+  <p>
+    這跟 Rust 的設計哲學收斂——`unsafe fn` 在 Rust 裡也是「呼叫端必須 wrap unsafe block」，沒有 implicit propagation。
+    Rust 從 1.0（2015 年）開始就是這樣，理由跟 C# 16 給的理由不完全一樣（Rust 當年主要是想避免 unsafe 隱式擴散導致 audit 範圍失控），但機制完全平行。
+    C# 16 算是補上這個對齊——遲了十年，但補上了。
+    對照 Swift 5.9 引入的 `~Copyable` 跟 `consume`、C++26 的 `[[nodiscard]]` 擴展、Zig 的 `allowzero`——整個 systems language 圈 2024-2026 年都在做同一件事：
+    把 caller-facing obligation 從 doc 提升到型別系統。
+    共同壓力來自 LLM，這不是巧合。
+    下方表把五個語言的 caller-facing 機制並排：
+  </p>
+
+  <figure class="vg-w-table-systems-langs-contract">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/>
+        <path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+      </svg>
+      <span>click column header to sort · 5 columns × 5 rows</span>
+    </p>
+    <style>
+      .vg-w-table-systems-langs-contract { overflow-x: auto; }
+      .vg-w-table-systems-langs-contract table { width: 100%; min-width: 520px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); font-variant-numeric: tabular-nums; }
+      .vg-w-table-systems-langs-contract thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; }
+      .vg-w-table-systems-langs-contract thead th[data-sort] { color: var(--accent-text); }
+      .vg-w-table-systems-langs-contract thead th[data-sort]::after { content: ' ▾'; font-size: 0.7em; }
+      .vg-w-table-systems-langs-contract thead th[data-sort="asc"]::after { content: ' ▴'; font-size: 0.7em; }
+      .vg-w-table-systems-langs-contract tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+      .vg-w-table-systems-langs-contract td.lang { font-family: var(--sans); font-weight: 600; color: var(--ink); }
+      .vg-w-table-systems-langs-contract td.year { font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); color: var(--muted); }
+      .vg-w-table-systems-langs-contract td.kw { font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); }
+      .vg-w-table-systems-langs-contract td.note { font-family: var(--scribed); font-style: italic; color: var(--accent-text); }
+      .vg-w-table-systems-langs-contract tbody tr:hover td { background: var(--bg-soft); }
+      .vg-w-table-systems-langs-contract caption { text-align: left; caption-side: top; font-family: var(--scribed); font-style: italic; color: var(--muted); font-size: var(--fs-sm); padding: var(--s-1) 0; }
+    </style>
+    <table>
+      <caption>五個 systems language 把 caller obligation 從 doc 升到型別系統的時程與機制——點欄位排序。</caption>
+      <thead>
+        <tr>
+          <th data-key="lang">語言</th>
+          <th data-key="year">首次落地</th>
+          <th data-key="kw">caller 關鍵字</th>
+          <th data-key="prop">傳染模型</th>
+          <th data-key="note">設計重心</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="lang">Rust</td>
+          <td class="year">2015</td>
+          <td class="kw">unsafe { }</td>
+          <td>呼叫端必須 wrap，無 implicit</td>
+          <td class="note">避免 audit 範圍失控</td>
+        </tr>
+        <tr>
+          <td class="lang">Swift</td>
+          <td class="year">2023</td>
+          <td class="kw">consume / ~Copyable</td>
+          <td>所有權轉移由簽名宣告</td>
+          <td class="note">move semantics 進型別</td>
+        </tr>
+        <tr>
+          <td class="lang">Zig</td>
+          <td class="year">2024</td>
+          <td class="kw">allowzero / @ptrCast</td>
+          <td>null/cast 從預設拒絕到 opt-in</td>
+          <td class="note">把舊習慣標出來</td>
+        </tr>
+        <tr>
+          <td class="lang">C++</td>
+          <td class="year">2026</td>
+          <td class="kw">[[nodiscard]] 擴展</td>
+          <td>呼叫端漏接 contract 即 warning</td>
+          <td class="note">attribute 漸進收網</td>
+        </tr>
+        <tr>
+          <td class="lang">C#</td>
+          <td class="year">2026</td>
+          <td class="kw">unsafe { } · &lt;safety&gt;</td>
+          <td>呼叫端必須 wrap（與 Rust 平行）</td>
+          <td class="note">給 LLM 可拒絕的契約</td>
+        </tr>
+      </tbody>
+    </table>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-table-systems-langs-contract');
+        const headers = root.querySelectorAll('thead th');
+        const tbody = root.querySelector('tbody');
+        let activeKey = null, asc = true;
+        headers.forEach((h, idx) => h.addEventListener('click', () => {
+          const key = h.dataset.key;
+          if (activeKey === key) asc = !asc; else { activeKey = key; asc = true; }
+          headers.forEach((x) => x.removeAttribute('data-sort'));
+          h.setAttribute('data-sort', asc ? 'asc' : 'desc');
+          const rows = Array.from(tbody.querySelectorAll('tr'));
+          rows.sort((a, b) => {
+            const av = a.children[idx].textContent.trim();
+            const bv = b.children[idx].textContent.trim();
+            const numA = parseFloat(av), numB = parseFloat(bv);
+            const cmp = (!isNaN(numA) && !isNaN(numB)) ? (numA - numB) : av.localeCompare(bv);
+            return asc ? cmp : -cmp;
+          });
+          rows.forEach((r) => tbody.appendChild(r));
+        }));
+      })();
+    </script>
+  </figure>
+
+  <p>
+    收斂點是 keyword-based「呼叫端必須親手表態」——Rust、C# 16 平行；分歧點在 C++26 選 attribute 而非 keyword，這對 LLM 訓練語料的可見度更弱。
+  </p>
+
+  <p>
+    還有一個容易被忽略的二次效應：
+    當 obligation 變成函式簽名的一部分，code review 跟靜態分析的能力也升級了。
+    過去 reviewer 看到一個 unsafe call site 必須去翻 callee source 才能判斷 caller 是否滿足了所有 invariant——`&lt;safety&gt;` 塊把這件事壓進兩三行 doc comment，hover 一下就能讀完。
+    SAST 工具現在可以對「unsafe block 內缺少對應 SAFETY 註解」、「`&lt;safety&gt;` 塊與實際 callee 文件不一致」、「opt-in caller 呼叫 legacy callee 卻沒包 unsafe」這類模式做精確 lint。
+    Memory safety violation 在 .NET 生態裡過去多半透過 runtime crash（AccessViolation、SegFault）發現，遷移後將更多在 review / lint 階段被攔下來。
+    對 security team 而言這是真正的 win——把 memory safety 失誤從 production incident 推回 PR-time 是降低風險的最大槓桿。
+  </p>
+
+  <p>
+    當然遷移期間會有摩擦：
+    opt-in 已經 opted 的 application 撞到 legacy NuGet 時必須包額外 unsafe block（compat 模式的保守處理），這會讓初期 opt-in 的開發者覺得「儀式變多了」。
+    文件提到這是 deliberate friction——它推動生態圈 collectively opt-in，因為「你升級了但你的 dependency 沒升級」的痛苦會傳遞到 dependency 作者那邊變成 issue。
+    這是 community-level 的 forcing function，類似 Rust 從 edition 2015 升到 2018 那段時間，crates.io 上的 package 被逐步催促升級。
+    .NET ecosystem 過去的 forcing function 多半是 framework version（.NET Framework → .NET Core → .NET 5+），這次的 unsafe opt-in 比較細，但邏輯一樣。
+  </p>
+
+  <p>
+    最後一個觀察：
+    當 .NET 把 obligation 顯式化之後，最受益的可能不是人類開發者，而是 .NET runtime 自己。
+    runtime team 在 `reduce-unsafe` PR 系列裡反覆遭遇的 case 是「這個 BCL method 三年前寫成 unsafe 的理由我們已經不記得了」——舊 code base 累積的 implicit knowledge 沒有人能 fully recover。
+    `&lt;safety&gt;` 塊強迫每個新 PR 都把 obligation 寫清，五年後新的 contributor 看 BCL source 不需要 archaeology 就能讀懂。
+    這也是為什麼微軟把自己當白老鼠先跑——他們已經感受到舊模型的工程債務。
+  </p>
+
+  <p class="vg-deep-closer"><strong>What this enables</strong>：把 caller obligation 從 doc comment 的散文升格到函式簽名與型別系統，C# 16 讓 LLM 生成的 .NET 程式碼第一次有東西可以被編譯器精確拒絕——memory safety 失誤從 runtime crash 移回 PR-time，AI-assisted code generation 跟 systems language 的安全邊界終於有一個可以相互握手的協議層。</p>
+</div>

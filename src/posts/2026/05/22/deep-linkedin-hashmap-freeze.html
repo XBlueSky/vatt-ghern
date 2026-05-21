@@ -1,0 +1,913 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">一個 Rust 服務每秒鐘要應付數十萬次查詢，CPU 看起來什麼事都沒做、cgroup 沒被 throttle、Envoy 也沒抱怨，但每隔幾天就會「凍」上十幾秒——FishDB 的 48 個 shard 同時失語。線索藏在一條 process-wide 的讀寫號誌：當索引長到 58,720,256 把鑰匙的那一刻，HashMap 的 doubling 觸發一次足以塞爆 jemalloc 大 chunk 路徑的 mmap，所有要碰記憶體的 thread 全部被一個 kernel rw_semaphore 擋在門外。</p>
+  <h1 class="vg-post-title">LinkedIn 的 HashMap resize 凍結——調查一場記憶體預算失算</h1>
+</header>
+
+<div class="vg-post-prose">
+
+<p><span class="vg-dropcap">L</span>inkedIn Feed 的查詢路徑底層住著一個叫 FishDB 的服務——Rust 寫的、Tokio 跑非同步、jemalloc 配記憶體、RocksDB 做磁碟層、Envoy 做 sidecar。</p>
+
+<p>每個 host 上有 48 個 shard，各自維護一份「primary key ↦ 內部 document reference」的 in-memory 索引。</p>
+
+<p>索引以 Rust 標準庫的 HashMap 實作，每個 shard 大約 56 至 59 million 條記錄，佔用約 1.75 GB。</p>
+
+<p>shard 之間互相獨立——一個 shard 卡住不會直接連累另一個 shard，但 48 個 shard 共用同一個 process（同一個 PID）、同一份 jemalloc instance、同一個 kernel 視角下的 mm_struct，這個前提埋下了後續事故的伏筆。</p>
+
+<p>這套架構在過去兩年裡一直穩定運行，直到團隊開始注意到一種讓人困惑的故障模式。</p>
+
+<p>服務的可用性 SLO 偶爾會被破壞，時間從幾秒到十幾秒不等。</p>
+
+<p>但沒有任何 application log、沒有任何 panic、沒有任何 OOM——只是「整個 process 不應答了一段時間，然後若無其事繼續」。</p>
+
+<p>這篇文章重走 LinkedIn 工程團隊在事後報告裡記錄的調查過程——四個被排除的假設、一個被 off-CPU profiling 揭穿的真相、以及一個只用 <code>HashMap::with_capacity()</code> 一行就能完成的修補。</p>
+
+<p>它的價值不在於「Rust 標準庫 HashMap 會 resize」這件事本身——這是 hashtable 101——而在於「process-wide 的記憶體操作會因為一次 resize 互鎖數秒」這個事實，以及「為什麼前四個你會懷疑的東西全都不是兇手」這條排除路徑。</p>
+
+<p>事後報告由 Pratikmohan Srivastav、Vishnu Pandey、Rajeev Kumar、Rajdeep Das 共同撰寫，掛在 LinkedIn Engineering 部落格上，主標題：「The 58-million-key freeze——what a HashMap resize taught us about memory allocation at scale」。</p>
+
+<p>讀完會發現一件事：他們花在「排除錯誤假設」上的篇幅，與花在「描述真兇」上的篇幅幾乎一樣。抵達真相之前必經的排除路徑，往往比真相本身更具教育意義。</p>
+
+<p>下面就跟著他們的調查順序走一遍。每一節都對應一個被驗證或被推翻的假設，章節結尾標出該假設被排除（或被證實）的關鍵證據。</p>
+
+<h2>謎面：CPU 沒事、記憶體沒事、Envoy 沒事，但服務凍了 10 秒</h2>
+
+<p>事後報告開頭引了一段 LinkedIn 自身介紹 Feed 的句子，重點是規模：「LinkedIn's Feed is the central experience for over a billion members」。</p>
+
+<p>一個 host 上 48 個 FishDB shard、每個 shard 56-59M 條索引、每天還在以每 shard 約 2-3 million 條的速度成長。</p>
+
+<p>在這個量級下，任何一次「整個 process 短暫停頓」都不會被使用者單獨感知到——它會被觀察為查詢失敗率的小尖峰，與下游服務的零星 5xx，看起來像「網路抖動」而不像「凍結」。</p>
+
+<p>但累計起來，這些尖峰每月會吃掉好幾個 9 的 availability budget。</p>
+
+<p>對 LinkedIn 規模的服務而言，「網路抖動」不是合理的解釋。</p>
+
+<p>服務若是被網路擊中，多個 host 應該同步抖動；若是區域性的拓樸事件，會有對應的網路告警先到。</p>
+
+<p>觀察到的是「單一 host 偶發、無外部關聯、無同期告警」——這個訊號形狀直接指向「host 內部的某個 process 自己出了狀況」，而不是「外部世界擾動了 host」。</p>
+
+<p>真正讓團隊起疑的是兩個信號的相關性。</p>
+
+<p>第一，可用性 SLO 偶爾被擊破，但被擊破的視窗很短；幾乎都在 10 至 15 秒之間就恢復了，沒有需要 incident commander 介入的長尾事件。</p>
+
+<p>第二，當 SLO 被擊破時，host 的 RSS 會出現一個短暫的尖峰——大約 4 GB 高於 baseline——然後回落到一個比擊破前略高的水位，多出大約 2 GB。</p>
+
+<p>把兩條曲線疊在一起看，重疊得近乎完美：每一次 SLO 擊破都對應一次 RSS 尖峰，每一次 RSS 尖峰都對應一次大約 2 GB 的「永久」增長。</p>
+
+<p>「永久」這個字在這裡很關鍵。</p>
+
+<p>如果只是請求變多、暫時多分配了幾 GB、用完就還，這是 Rust + jemalloc 的日常；jemalloc 會把熱頁 madvise(MADV_DONTNEED) 回給 kernel，RSS 該掉就掉。</p>
+
+<p>但這裡的曲線顯示有 2 GB 進去之後沒有出來——意思是分配是「結構性」的，不是請求性的，並且每次都是「在 RSS 跳一次之後」永久長大。</p>
+
+<p>「結構性」的意思就是「跟流量無關、跟某種內部狀態的累積有關」。</p>
+
+<p>在這個語意下，你會立刻聯想到幾種可能：buffer 池在擴張、cache 在 grow、某個 lock-free queue 在累積、某張 hash table 在 rehash——它們都會在「狀態超過某個閾值的瞬間」一次性吃掉一塊大記憶體。</p>
+
+<p>但這些可能性在 1.75 GB → 3.5 GB 這種「正好兩倍」的形態前，會被自動排到最前列。</p>
+
+<p>能精準翻倍的，幾乎只有「以 power-of-two 為 capacity 的容器」。</p>
+
+<p>第二個謎是「沒有日誌」。</p>
+
+<p>Rust 服務若是 panic，會在 stderr 上留下訊息；若是 deadlock，<code>tokio-console</code> 會看到大量 task 卡在 await；若是 OOM，OOM killer 會在 dmesg 留印。</p>
+
+<p>這次故障三樣都沒有。</p>
+
+<p>Process 還活著、tokio scheduler 看起來還在跑（只是沒推進）、kernel 沒有殺人。</p>
+
+<p>任何「程式自己錯了」的假設都缺少最起碼的證據——程式沒抱怨，是觀察者抱怨。</p>
+
+<p>更不尋常的是，連 Rust 自身的 panic-on-allocation-failure 路徑也沒有觸發。</p>
+
+<p>如果 jemalloc 真的拿不到記憶體、回給 Rust 一個 null，<code>std::alloc::handle_alloc_error</code> 會直接 abort，process 會死，留下 core dump。</p>
+
+<p>事故期間 process 從頭到尾都健在，這意味著 allocation 最終是「成功」的——只是花了很長時間才完成。</p>
+
+<p>「allocation 成功只是慢」這個觀察排除了一大類問題：memory 沒有耗盡（否則 allocator 會回 null）、address space 沒有用盡（同上）、cgroup memory 限制沒有觸發（否則會被 OOM kill）。allocation 在某種意義上「完成」了，只是「完成」這個動作本身佔據了 10-15 秒——這就是「allocation 在 kernel 路徑上排隊」的徵狀。</p>
+
+<p>於是調查必須換邊開始：不是「程式在做錯什麼」，而是「程式被誰擋住了」。所有 application-level 的觀測工具——profiler、tracer、log aggregator——都假設程式在跑；當程式在等鎖時，這些工具會給你一張全黑的圖。要看見等待，工具棧必須從 user-space 跳到 kernel-space。</p>
+
+<h2>四個被排除的嫌疑犯——CPU、kernel compaction、Envoy、RocksDB</h2>
+
+<p>調查的前半段是嫌疑犯排除清單。</p>
+
+<p>每一個假設都是合理的——它們都能解釋「process 凍住」的某種表象——但每一個都在實際資料面前破功。</p>
+
+<p>下面依序檢視這四條死路。</p>
+
+<h3>假設一：CPU 被 cgroup throttle</h3>
+
+<p>第一個直覺：是不是 container 的 CPU quota 觸發 throttle，導致 thread 排隊？</p>
+
+<p>在 Kubernetes/cgroup v2 下，<code>cpu.max</code> 規定了每個 period 內可以消耗的 CPU 時間，超過就 throttle。</p>
+
+<p>throttle 在 metric 上會以 <code>nr_throttled</code>、<code>throttled_time</code> 的計數出現，肉眼可見。</p>
+
+<p>這是一個高頻嫌疑犯。</p>
+
+<p>LinkedIn 這類服務通常以「cpu request 設得保守、cpu limit 留更高彈性」的形態部署，遇到尖峰時 throttle 機率不低。</p>
+
+<p>如果 freeze 真是 throttle 造成的，所有 worker thread 會被勻速減速，整個 process 的 progress 會線性慢下來。</p>
+
+<p>團隊去看 cgroup 的 CPU 統計，發現「negligible throttling」——數值小到不足以解釋 10 秒級的 stall。</p>
+
+<p>直覺上也站不住：throttle 是公平擠壓，所有 thread 都會被勻速減速，不會出現「全部 thread 一起卡死 10 秒、然後一起恢復」這種步調一致的形態。</p>
+
+<p>CPU throttle 解釋「緩慢」，不解釋「凍結」。前者像是路上塞車，後者像是路被封鎖。這個重新框架關鍵：團隊把問題從「執行慢」重新框成「執行停」，後續直接去找「誰在等什麼」、跳過所有 CPU-level 微調指標。</p>
+
+<h3>假設二：kernel 在做 memory compaction</h3>
+
+<p>第二個合理懷疑：Linux kernel 的 memory compaction。</p>
+
+<p>當系統碎片化嚴重、申請大連續區塊（譬如 2 MB 的 transparent huge page）找不到時，kernel 會啟動 compaction、把分散的 4 KB 頁面搬到一起。</p>
+
+<p>這個過程會持有一些 zone 級鎖，影響很多 process。</p>
+
+<p>它的指紋在 <code>/proc/vmstat</code> 裡——<code>allocstall_normal</code>、<code>allocstall_movable</code>、<code>compact_stall</code> 這幾個計數會在事件期間增長。</p>
+
+<p>compaction 在 long-running container 上是常見的隱形 latency 殺手。</p>
+
+<p>你的 process 沒做錯事，但因為某個鄰居在申請 2MB 連續頁、kernel 啟動了 zone compaction，你的 page fault 路徑會在等鎖上耗掉幾百毫秒到幾秒。</p>
+
+<p>團隊去查 <code>/proc/vmstat</code>，「all zeros」——對應的 allocstall 計數器在 freeze 期間完全沒動。</p>
+
+<p>Kernel 並沒有在做 compaction，至少沒有累積到能被 trace 到的程度。</p>
+
+<p>這條也排除了。</p>
+
+<p>排除 compaction 也有結構性收穫。</p>
+
+<p>Compaction 雖然會卡很多 process，但它是 system-wide 的——如果是 compaction，host 上每個其他 container 應該都看得到對應的 hiccup。</p>
+
+<p>可觀測資料顯示「凍結」是 FishDB 自己的事，鄰居 container 安然無恙。這指向兩件事：</p>
+
+<p>一是真正的兇手是 process-local 的——只影響 FishDB 自己，不影響同 host 上的其他 process；</p>
+
+<p>二是兇手與「大記憶體申請」相關（不然觀察不到 4 GB RSS 尖峰），但不是「kernel 替系統整理記憶體」這條路上的。</p>
+
+<p>到這裡謎面更窄：要找的是一個「能讓單一 process 自己把自己鎖住」的機制。Linux 上這類機制不多，但 <code>mmap_lock</code>（即 <code>mm_struct::mmap_lock</code>）是首選——process-wide、保護所有 VMA 相關操作、在「大 allocation」時被持有寫鎖。但「幾乎是答案」不等於「就是答案」；在實證之前還有兩個假設要先排除。</p>
+
+<h3>假設三：Envoy sidecar 自己卡住了</h3>
+
+<p>第三條線索來自架構圖。</p>
+
+<p>FishDB 並不是直接面對下游 RPC，而是經由 Envoy sidecar 處理 traffic management。</p>
+
+<p>如果 Envoy 自己有問題——譬如 worker thread 卡死、stat sink flush 阻塞、xDS push 風暴——那從外部看起來會是「FishDB 不應答」，但實際是 Envoy 把包擋在門口。</p>
+
+<p>這個假設值得認真對待。</p>
+
+<p>Envoy 自己有過好幾次類似的 well-documented 故障：xDS 配置推送風暴會讓 Envoy 短暫 CPU 飽和、stat flush 阻塞會讓 worker thread 暫停吸收新請求、large filter chain 在 reload 時會引發 worker pause。</p>
+
+<p>檢驗這個假設的辦法是「對齊兩層的時間序」。</p>
+
+<p>把 application-layer 的 inflight RPC 數量、Envoy 的 downstream connection drain 計數、host 的 TCP retransmit 全部疊起來看。</p>
+
+<p>如果 Envoy 是瓶頸，application 層的指標應該還在動（FishDB 還在處理舊請求），只是新請求進不來；如果是 FishDB 自己卡住，application 層也會跟著躺平。</p>
+
+<p>觀測結果是：兩層的曲線同步下沉、同步恢復，沒有「Envoy 先卡、application 後卡」這種錯位。</p>
+
+<p>等於說 Envoy 是受害者而不是兇手——它與 FishDB 一起被某個共同因素影響。</p>
+
+<p>但這也帶來額外資訊：Envoy 的 admin 也跟著停擺——如果是 FishDB application-level 鎖，admin endpoint 本來不會被擋住。被卡住的東西比「FishDB 內部 lock」更基礎，是兩個 process 都會 share 的 kernel 級資源。這條線索把 mmap_lock 進一步推到台前。</p>
+
+<h3>假設四：RocksDB 的 mmap-based I/O</h3>
+
+<p>第四個假設聚焦在 RocksDB。</p>
+
+<p>FishDB 用 RocksDB 做 disk-backed attribute storage——大規模的順序 read、SST file 掃描。</p>
+
+<p>RocksDB 支援用 mmap 而非 pread/pwrite 做 file I/O。</p>
+
+<p>如果配置開啟 mmap，那 SST file 在 page cache 被驅逐後再次讀取會觸發 major page fault，fault handler 需要持 <code>mmap_lock</code>。</p>
+
+<p>如果同時有大量的 lazy faults 進來，這條路徑能把整個 process 卡住數秒。</p>
+
+<p>這條的好處是它把調查推到了正確的方向——<code>mmap_lock</code> 第一次浮上檯面。</p>
+
+<p>RocksDB 有 <code>allow_mmap_reads</code> 與 <code>allow_mmap_writes</code> 兩個 option；前者預設關閉，但有不少 production 部署為了省 syscall overhead 會打開。</p>
+
+<p>一旦打開，SST file 就會以 mmap 形式被 page in，read 操作經過 page fault，自然會與 <code>mmap_lock</code> 發生關係。</p>
+
+<p>團隊回頭翻 FishDB 的 RocksDB option，「mmap-based operations were disabled in configuration」——RocksDB 用的是 pread/pwrite 路徑，<code>BlockBasedTableOptions::cache_index_and_filter_blocks</code> 加上 buffered I/O，全程不碰 mmap。</p>
+
+<p>第四個直覺也排除了。四個假設全部失敗，剩下的可能性被擠到一個很窄的角落：「有某個操作觸發了大規模 mmap、把 process-wide <code>mmap_lock</code> 拿在 write mode、所有其他 thread 全部排隊在 read mode」——但這個操作不是 RocksDB，那是誰？要驗證這個假設，需要能看見「thread 在哪一個 kernel function 裡睡覺」的工具——下一節的 off-CPU profiling。</p>
+
+<h2>真相：HashMap doubling 的代價是一次大 mmap，加上整個 process 的 mmap_lock 寫鎖</h2>
+
+<p>突破來自 off-CPU profiling。</p>
+
+<p>到此為止，所有 application-level 與 host-level 的觀測都已經用盡。傳統的 perf、async-profiler、tokio-console 都不會告訴你「thread 在 kernel 哪一條等待路徑上」——它們的視角是「user-space 在做什麼」，而謎底就藏在它們看不見的另一邊。</p>
+
+<p>要進到 kernel 視角，需要的是 eBPF。</p>
+
+<p>一般的 CPU profiler（perf、async-profiler 走 sampled-CPU 路徑、Rust 的 <code>pprof</code>）抓的是「正在用 CPU 的 thread」——按時間取樣，誰在 CPU 上誰被記下。</p>
+
+<p>但凍結時 thread 根本不在 CPU 上：他們在 kernel waitqueue 上睡覺，等一個鎖。</p>
+
+<p>要看見它們，需要 off-CPU profiler——eBPF 工具 <code>offcputime</code>（出自 BCC toolkit）正是做這件事的：它 hook 上 <code>sched_switch</code> 與 <code>finish_task_switch</code>，記錄 thread「被 schedule out」的那一瞬間的 user-space 與 kernel 堆疊，以及離開 CPU 的時長。</p>
+
+<p>off-CPU profiling 是 Brendan Gregg 推廣起來的觀測手法。核心觀念是「on-CPU 取樣只看見一半故事」——on-CPU 告訴你「CPU 時間花在哪」，off-CPU 告訴你「不在 CPU 上的時間花在哪」。對「等鎖」型故障，前者完全無解，後者幾乎一次就找出答案。</p>
+
+<p>BCC 套件的 <code>offcputime</code> 工具綁定 <code>sched_switch</code> tracepoint：每當 scheduler 把某個 task 換下，就記錄離場 thread 的 user + kernel 堆疊以及離場時長。輸出按時長倒序看，最久的堆疊永遠是兇手或受害者。</p>
+
+<p>團隊把 <code>offcputime</code> 包裝成 trigger-on-RSS-spike 的自動 trap：當 RSS 在短時間內跳過閾值，就針對 FishDB process 抓一段 off-CPU profile。不能 24/7 開（BPF overhead 5-15% CPU），也不能事後手動抓（freeze 視窗只有 10-15 秒）。RSS 跳階是事件期間最可靠的「先行指標」——RSS 開始爬升的瞬間，就是 mmap 開始申請的瞬間。</p>
+
+<p>第一次抓到的樣本就回答了所有問題。</p>
+
+<p>三種堆疊形態同時出現：</p>
+
+<pre data-kind="output"><code>// pattern A: 1 thread, held write-mode mmap_lock
+__do_sys_mmap_pgoff
+ksys_mmap_pgoff
+vm_mmap_pgoff
+do_mmap
+mmap_region
+__mm_populate
+rwsem_down_write_slowpath        &lt;-- write contender, but already inside
+... &lt;jemalloc large arena grow path&gt;
+... &lt;Rust std::collections::HashMap resize&gt;
+
+// pattern B: many threads, blocked acquiring read-mode mmap_lock for madvise
+__madvise
+do_madvise
+rwsem_down_read_slowpath          &lt;-- queued behind the write holder
+... &lt;jemalloc je_pages_purge_forced&gt;
+... &lt;tokio::runtime::task::poll&gt;
+
+// pattern C: many threads, blocked acquiring read-mode mmap_lock for page-fault
+do_user_addr_fault
+handle_mm_fault
+rwsem_down_read_slowpath          &lt;-- queued behind the write holder
+... &lt;tokio executor stack&gt;</code></pre>
+
+<p>三個 pattern 拼成一張清楚的圖：</p>
+
+<figure class="vg-w-lock-sequence" data-svg-scroll="720">
+  <style>
+    .vg-w-lock-sequence svg { width: 100%; height: auto; }
+    .vg-w-lock-sequence figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); padding-top: var(--s-2); }
+  </style>
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 7v10"/><path d="M15 7v10"/>
+    </svg>
+    <span>read top-to-bottom · 3 actors × 4 phases of the mmap_lock chain</span>
+  </p>
+  <svg viewBox="0 0 720 320" preserveAspectRatio="xMidYMid meet" role="img" aria-label="sequence diagram of mmap_lock acquire chain">
+    <text x="360" y="20" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)" font-weight="600">mmap_lock acquire chain · 1 writer in, N readers stalled</text>
+
+    <text x="120" y="48" text-anchor="middle" font-family="Manrope, sans-serif" font-size="12" fill="var(--accent-text)" font-weight="600">resize thread</text>
+    <text x="360" y="48" text-anchor="middle" font-family="Manrope, sans-serif" font-size="12" fill="var(--ink)" font-weight="600">mmap_lock (rw_sem)</text>
+    <text x="600" y="48" text-anchor="middle" font-family="Manrope, sans-serif" font-size="12" fill="var(--muted)" font-weight="600">N other threads</text>
+
+    <line x1="120" y1="58" x2="120" y2="290" stroke="var(--accent)" stroke-width="1.2" stroke-dasharray="3 3" />
+    <line x1="360" y1="58" x2="360" y2="290" stroke="var(--ink)" stroke-width="1.5" />
+    <line x1="600" y1="58" x2="600" y2="290" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="3 3" />
+
+    <text x="40" y="92" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">t₀</text>
+    <line x1="120" y1="88" x2="356" y2="88" stroke="var(--accent)" stroke-width="2" marker-end="url(#vg-w-lock-arrow)"/>
+    <text x="240" y="82" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--accent-text)">mmap(NULL, 3.5 GB)</text>
+    <text x="240" y="100" text-anchor="middle" font-family="EB Garamond, serif" font-size="10" fill="var(--muted)">→ down_write</text>
+
+    <rect x="350" y="88" width="20" height="170" fill="var(--accent)" opacity="0.35" />
+    <text x="380" y="100" font-family="EB Garamond, serif" font-size="11" fill="var(--accent-text)" font-weight="600">WRITE held</text>
+
+    <text x="40" y="142" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">t₁</text>
+    <line x1="600" y1="138" x2="370" y2="138" stroke="var(--muted)" stroke-width="2" marker-end="url(#vg-w-lock-arrow-r)"/>
+    <text x="486" y="132" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--ink)">madvise(...)·page-fault·another mmap</text>
+    <text x="486" y="150" text-anchor="middle" font-family="EB Garamond, serif" font-size="10" fill="var(--muted)">→ down_read · ENQUEUE</text>
+
+    <text x="40" y="190" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">t₁→t₂</text>
+    <text x="486" y="186" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--ink)" font-style="italic">…all N waiters parked in rwsem_down_read_slowpath…</text>
+    <rect x="595" y="178" width="10" height="60" fill="var(--muted-2)" opacity="0.5"/>
+
+    <text x="40" y="248" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">t₂</text>
+    <line x1="356" y1="258" x2="120" y2="258" stroke="var(--accent)" stroke-width="2" marker-end="url(#vg-w-lock-arrow-l)"/>
+    <text x="240" y="252" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--accent-text)">mmap returns · up_write</text>
+
+    <text x="40" y="288" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">t₃</text>
+    <line x1="370" y1="282" x2="600" y2="282" stroke="var(--muted)" stroke-width="2" marker-end="url(#vg-w-lock-arrow-r)"/>
+    <text x="486" y="276" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--ink)">N waiters wake · drain queue</text>
+
+    <defs>
+      <marker id="vg-w-lock-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="var(--accent)"/></marker>
+      <marker id="vg-w-lock-arrow-r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="var(--muted)"/></marker>
+      <marker id="vg-w-lock-arrow-l" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="var(--accent)"/></marker>
+    </defs>
+  </svg>
+  <figcaption>t₀：resize thread 拿到 mmap_lock 的 write 鎖、進入 3.5 GB 的 mmap 內部。t₁：其他 N 條 thread（madvise、page fault、其他 mmap）申請 read 鎖，全部在 <code>rwsem_down_read_slowpath</code> 排隊（rw_semaphore 的 writer-preference 把 reader starve）。t₂：write 鎖釋放。t₃：N 個 waiter 排隊喚醒。整個 t₀–t₂ 的時長就是 10-15 秒的 freeze 視窗。</figcaption>
+</figure>
+
+<p><strong>有一個 thread 拿著 <code>mmap_lock</code> 的 write 鎖在做大 mmap，其他所有 thread 不論是要 madvise、還是要 page-fault、還是要再做 mmap，全部在 read-mode slow path 上排隊。</strong></p>
+
+<p>「Linux's mmap_lock is a process-wide read-write semaphore that protects the virtual memory area (VMA) data structures」——所有對 VMA 的修改都要拿 write 鎖，所有對 VMA 的讀（包含 page fault）都要拿 read 鎖；rw_semaphore 的語意是「writer 進場後 reader 全部 starve」。</p>
+
+<p>事後報告直白地說：「While the write lock is held, all other threads that need any memory operation (including madvise for purging, and page fault handling for I/O) are blocked.」</p>
+
+<p>「any memory operation」不只指顯式 mmap/munmap syscall，還包括隱式的 page fault：任何 thread 第一次寫某塊還沒被 fault-in 的 anonymous page，都會被擋下。「madvise for purging」則指 jemalloc 的 background reclaim thread——一旦被卡住，jemalloc 沒辦法把舊 table 釋放，部分解釋了為什麼 freeze 之後 RSS 不會回到 baseline。</p>
+
+<p>下一個問題是：那個 write holder 為什麼會在做大 mmap？</p>
+
+<p>把 jemalloc 的 stack 沿著 Rust frame 往上爬，答案落在 HashMap 的 resize 路徑。</p>
+
+<p>Rust 標準庫的 HashMap 用的是 hashbrown（Swiss table）。</p>
+
+<p>當 entry 數量超過當前 capacity 時，它分配一個 2× 大的新 table、把舊 entry rehash 過去、釋放舊 table。</p>
+
+<p>hashbrown 的內部表示是一塊連續的 buffer，包含 control bytes（每個 entry 1 byte 用於 SSE2 SIMD 比對）與 entry payload。</p>
+
+<p>每個 entry 的 payload 在 FishDB 的 use case 下大約 32 bytes（key 是 primary key 的整數型或短字串，value 是內部 document reference 的 small struct）。</p>
+
+<p>當 capacity 已經到了 58,720,256，事後報告引文：「When the number of entries exceeded the HashMap's current capacity of 58,720,256, it triggered a resize - doubling to 117,440,512 entries.」</p>
+
+<p>下一次 resize 要的新 table 是 117,440,512 entries × 約 32 bytes/entry ≈ 3.5 GB 連續記憶體；舊的 1.75 GB 還沒能釋放（因為 rehash 正在進行），momentary footprint 一度超出 baseline 約 4 GB——這正是觀察到的 RSS 尖峰。</p>
+
+<p>到這裡，事故報告引文與直接量化吻合。</p>
+
+<p>「approximately 58.7 million keys」、「old buffer ≈ 1.75 GB」、「new buffer ≈ 3.5 GB」、「~4 GB above baseline momentarily」、「~2 GB persistent increase」——這幾個數字不是巧合。</p>
+
+<p>它們是「在 doubling 邊界上跳一次」的必然結果。</p>
+
+<p>從 1.75 GB 到 3.5 GB 是 2 倍（doubling）；momentary footprint 4 GB ≈ 1.75 + 3.5 - 1.25（重疊間 jemalloc 已釋放一部分舊的）；persistent 2 GB ≈ 3.5 - 1.75 + 預期額外的 overhead——這些數字都是 hashbrown × jemalloc 數學的直接後果，不需要任何 ad-hoc 解釋。</p>
+
+<p>jemalloc 不可能用一個 small/large arena slab 裝下 3.5 GB。</p>
+
+<p>它走的是「huge」分配路徑，會直接 <code>mmap(NULL, 3.5 GB, ...)</code> 跟 kernel 要一段全新的 anonymous virtual address space。</p>
+
+<p><code>mmap()</code> 系統呼叫的第一件事就是拿 <code>mmap_lock</code> 的 write 鎖，因為它要插入一個新的 VMA。</p>
+
+<p>3.5 GB 的 anonymous mapping 在初始化時還要 zero-fill（或者，jemalloc 在 background reclaim 時觸發 prefault），整段時間 write 鎖都沒放。</p>
+
+<p>其他 tokio worker、jemalloc background thread、所有要 page-fault 的位元組都在 read-mode 上排隊——這就是「10-15 秒凍結」的本體。</p>
+
+<p>順帶一提：Linux 6.4 之後有 per-VMA lock（Suren Baghdasaryan 主導），讓 page fault 在「現有 VMA 內」走 fine-grained 路徑。但「新分配整段 anonymous mapping」依然要拿 process-wide mmap_lock——HashMap doubling 走的恰好是這條路徑，per-VMA lock 救不了。2026 年的 kernel 對這個 bug pattern 依然脆弱。</p>
+
+<figure class="vg-w-param-resize-cost" data-svg-scroll="720">
+  <style>
+    .vg-w-param-resize-cost { display: grid; grid-template-rows: auto auto auto; gap: var(--s-3); }
+    .vg-w-param-resize-cost .controls { display: grid; grid-template-columns: 1fr; gap: var(--s-2); }
+    .vg-w-param-resize-cost .row { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); }
+    .vg-w-param-resize-cost label { min-width: 16ch; color: var(--ink); }
+    .vg-w-param-resize-cost input[type=range] { flex: 1; accent-color: var(--accent); height: 36px; touch-action: none; }
+    .vg-w-param-resize-cost .readout { font-variant-numeric: tabular-nums; color: var(--accent-text); min-width: 14ch; text-align: right; }
+    .vg-w-param-resize-cost svg { width: 100%; height: auto; }
+    .vg-w-param-resize-cost figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); padding-top: var(--s-2); }
+    @media (max-width: 720px) {
+      .vg-w-param-resize-cost svg text { font-size: 18px; }
+    }
+  </style>
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M5 9h14"/><path d="M5 15h14"/><circle cx="9" cy="9" r="2"/><circle cx="15" cy="15" r="2"/>
+    </svg>
+    <span>drag the slider to sweep live key count · curve shows next doubling cost</span>
+  </p>
+  <div class="controls">
+    <div class="row">
+      <label for="vg-w-param-resize-n">live keys (N)</label>
+      <input id="vg-w-param-resize-n" type="range" min="1000000" max="200000000" step="1000000" value="58700000" />
+      <span class="readout" id="vg-w-param-resize-n-out">58.7M</span>
+    </div>
+  </div>
+  <svg class="vg-w-param-resize-cost-main" viewBox="0 0 720 360" preserveAspectRatio="xMidYMid meet" role="img" aria-label="next doubling allocation size as a function of live key count">
+    <text x="360" y="22" text-anchor="middle" font-family="EB Garamond, serif" font-size="16" fill="var(--ink)" font-weight="600">next doubling: requested mmap size vs current entry count</text>
+    <line x1="70" y1="300" x2="700" y2="300" stroke="var(--ink)" stroke-width="1.5" />
+    <line x1="70" y1="50" x2="70" y2="300" stroke="var(--ink)" stroke-width="1.5" />
+    <text x="60" y="304" text-anchor="end" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">0</text>
+    <text x="60" y="240" text-anchor="end" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">2 GB</text>
+    <text x="60" y="180" text-anchor="end" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">4 GB</text>
+    <text x="60" y="120" text-anchor="end" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">6 GB</text>
+    <text x="60" y="60" text-anchor="end" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">8 GB</text>
+    <text x="22" y="175" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--muted)" transform="rotate(-90 22 175)">next mmap request</text>
+    <text x="385" y="338" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--muted)">live entry count N (millions)</text>
+    <text x="120" y="320" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">10M</text>
+    <text x="220" y="320" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">40M</text>
+    <text x="320" y="320" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">75M</text>
+    <text x="450" y="320" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">120M</text>
+    <text x="600" y="320" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">170M</text>
+
+    <line x1="70" y1="240" x2="700" y2="240" stroke="var(--muted-2)" stroke-width="0.5" stroke-dasharray="3 4" />
+    <line x1="70" y1="180" x2="700" y2="180" stroke="var(--muted-2)" stroke-width="0.5" stroke-dasharray="3 4" />
+    <line x1="70" y1="120" x2="700" y2="120" stroke="var(--muted-2)" stroke-width="0.5" stroke-dasharray="3 4" />
+
+    <line x1="70" y1="195" x2="700" y2="195" stroke="var(--accent)" stroke-width="0.6" stroke-dasharray="2 3" />
+    <text x="694" y="190" text-anchor="end" font-family="EB Garamond, serif" font-size="11" fill="var(--accent-text)">~3.5 GB · the freeze threshold</text>
+
+    <path id="vg-w-param-resize-curve" d="" fill="none" stroke="var(--accent)" stroke-width="2.2" />
+    <line id="vg-w-param-resize-marker" x1="0" y1="50" x2="0" y2="300" stroke="var(--accent-text)" stroke-width="1.2" stroke-dasharray="4 3" />
+    <circle id="vg-w-param-resize-dot" cx="0" cy="0" r="5.5" fill="var(--accent-text)" />
+    <text id="vg-w-param-resize-label" x="0" y="0" font-family="EB Garamond, serif" font-size="13" fill="var(--accent-text)">N = 58.7M · next mmap ≈ 3.5 GB</text>
+  </svg>
+  <figcaption>Hashbrown 把 capacity 維持在 2 的次方；當 entry 數量超過 capacity × load_factor（預設 ≈ 0.875），下一次插入會觸發 resize，要求一塊 entry_count × 32 bytes（每個 entry 約 32 bytes）的新 table。曲線上跳階的不連續即為「doubling boundary」——56M 上下是 1.75 GB → 3.5 GB 的那一跳，剛好落在 jemalloc 走「huge」路徑的閾值（>2 MB 即 mmap），這就是 mmap_lock 寫鎖被持有十幾秒的源頭。</figcaption>
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-param-resize-cost');
+      if (!root) return;
+      const inp = root.querySelector('#vg-w-param-resize-n');
+      const out = root.querySelector('#vg-w-param-resize-n-out');
+      const curve = root.querySelector('#vg-w-param-resize-curve');
+      const marker = root.querySelector('#vg-w-param-resize-marker');
+      const dot = root.querySelector('#vg-w-param-resize-dot');
+      const label = root.querySelector('#vg-w-param-resize-label');
+
+      const X0 = 70, X1 = 700, Y0 = 300, Y1 = 50;
+      const N_MAX = 200_000_000;
+      const GB_MAX = 8;
+      const BYTES_PER_ENTRY = 32;
+      const LOAD = 0.875;
+
+      function xOf(n) { return X0 + (n / N_MAX) * (X1 - X0); }
+      function yOf(gb) { return Y0 - (Math.min(gb, GB_MAX) / GB_MAX) * (Y0 - Y1); }
+
+      function nextCapacity(n) {
+        let cap = 1;
+        while (cap * LOAD < n) cap *= 2;
+        return cap;
+      }
+      function nextDoublingBytes(n) {
+        return nextCapacity(n) * 2 * BYTES_PER_ENTRY;
+      }
+      function fmtN(n) {
+        if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
+        if (n >= 1_000) return Math.round(n / 1_000) + 'k';
+        return String(n);
+      }
+      function fmtGB(bytes) {
+        const gb = bytes / 1024 / 1024 / 1024;
+        if (gb >= 1) return gb.toFixed(2) + ' GB';
+        return (bytes / 1024 / 1024).toFixed(0) + ' MB';
+      }
+
+      const pts = [];
+      const STEP = 500_000;
+      for (let n = STEP; n <= N_MAX; n += STEP) {
+        const bytes = nextDoublingBytes(n);
+        const gb = bytes / 1024 / 1024 / 1024;
+        pts.push(`${pts.length === 0 ? 'M' : 'L'} ${xOf(n).toFixed(1)} ${yOf(gb).toFixed(1)}`);
+      }
+      curve.setAttribute('d', pts.join(' '));
+
+      function update() {
+        const n = Number(inp.value);
+        const bytes = nextDoublingBytes(n);
+        const gb = bytes / 1024 / 1024 / 1024;
+        out.textContent = fmtN(n);
+        const cx = xOf(n);
+        const cy = yOf(gb);
+        marker.setAttribute('x1', cx);
+        marker.setAttribute('x2', cx);
+        dot.setAttribute('cx', cx);
+        dot.setAttribute('cy', cy);
+        const labelX = cx > 400 ? cx - 12 : cx + 12;
+        const labelAnchor = cx > 400 ? 'end' : 'start';
+        label.setAttribute('x', labelX);
+        label.setAttribute('y', Math.max(cy - 14, 64));
+        label.setAttribute('text-anchor', labelAnchor);
+        label.textContent = `N = ${fmtN(n)} · next mmap ≈ ${fmtGB(bytes)}`;
+      }
+
+      inp.addEventListener('input', update);
+      update();
+    })();
+  </script>
+</figure>
+
+<p>把刻度尺從生產資料移回理論：58.7M 不是隨機數字。</p>
+
+<p>hashbrown 的 capacity 永遠是 2 的次方；它在 entry count 超過 <code>capacity × load_factor</code>（預設 ≈ 0.875）時觸發 resize。</p>
+
+<p>事後報告給出的 58,720,256 就是 <code>capacity = 2^26 × load_factor</code> 路徑上的一個典型錨點——精確的 power-of-two 邊界視 hashbrown 版本與 internal padding 而有微小差異，但「在那個量級上一次跨過 doubling 邊界」這件事與你看到的數字大致相符。</p>
+
+<p>重點是「doubling 的那一刻」與「allocation 跨過 jemalloc 大 chunk 閾值的那一刻」恰好重合。</p>
+
+<p>前者由 hashbrown 決定，後者由 jemalloc 決定，兩個獨立元件在 58 M 那個刻度合謀觸發 kernel 鎖。</p>
+
+<p>jemalloc 的「huge」閾值預設是 <code>4 × chunk_size</code>，其中 <code>chunk_size</code> 在 Linux/x86_64 上預設 2 MB。</p>
+
+<p>換算下來，超過 8 MB 的分配就會走 mmap 路徑，不再從 arena slab 切出來。</p>
+
+<p>58.7M 條目下要的 3.5 GB 遠遠超過這個閾值，所以 jemalloc 必然走 mmap、必然拿 <code>mmap_lock</code> write 鎖、必然把整個 process 鎖住一段時間。</p>
+
+<p>3.5 GB 的 anonymous mapping 即使只是「保留 virtual address space」也並不瞬時——<code>__mm_populate</code> 在 prefault 模式下會 walk 整段 mapping、為每個 4 KB page 建立 PTE，共 ~900,000 個 entry。即使走 lazy fault，rehash 時 Rust 把整個新 table 寫一遍，所有 page 仍會被 fault-in。整體效果就是 10-15 秒的全 process 暫停。</p>
+
+<h3>把假設整理乾淨：四條死路與一條活路</h3>
+
+<p>排除過程值得單獨陳列。</p>
+
+<p>這不是後見之明的炫耀——而是給下一個遇到「process 偶發凍結、沒有日誌」的人一張可重用的查核清單。</p>
+
+<p>讀者如果未來遇到類似徵狀（同步凍結、無日誌、RSS 鋸齒形增長），可以照著這張表的順序逐項驗證；每個假設都有低成本的查驗手法，先做最便宜的，再做更費力的，最後才動 off-CPU profile。</p>
+
+<p>下表把四個假設、檢驗手法、得到的訊號、被排除的理由排成一張表，第五列是被證實的真兇。</p>
+
+<figure class="vg-w-table-hypotheses">
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/>
+      <path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+    </svg>
+    <span>click column header to sort · 5 columns × 5 rows</span>
+  </p>
+  <style>
+    .vg-w-table-hypotheses { overflow-x: auto; }
+    .vg-w-table-hypotheses table { width: 100%; min-width: 560px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+    .vg-w-table-hypotheses thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; }
+    .vg-w-table-hypotheses thead th[data-sort] { color: var(--accent-text); }
+    .vg-w-table-hypotheses tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+    .vg-w-table-hypotheses tbody tr:last-child td { border-bottom: 1.5px solid var(--ink); background: var(--bg-soft); }
+    .vg-w-table-hypotheses td.verdict-out { color: var(--muted); }
+    .vg-w-table-hypotheses td.verdict-in { color: var(--accent-text); font-weight: 600; }
+  </style>
+  <table>
+    <thead>
+      <tr>
+        <th data-key="suspect">suspected cause</th>
+        <th data-key="probe">how we checked</th>
+        <th data-key="signal">signal observed</th>
+        <th data-key="reason">why it isn't the answer</th>
+        <th data-key="verdict">verdict</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>cgroup CPU throttling</td>
+        <td>cgroup <code>cpu.stat</code>：<code>nr_throttled</code>、<code>throttled_time</code></td>
+        <td>negligible throttling during freezes</td>
+        <td>throttle 是均勻拖慢，不會造成「全部 thread 同步停 10 秒」的步調一致</td>
+        <td class="verdict-out">ruled out</td>
+      </tr>
+      <tr>
+        <td>kernel memory compaction</td>
+        <td><code>/proc/vmstat</code>：<code>allocstall_*</code>、<code>compact_stall</code></td>
+        <td>all zeros, counters did not move</td>
+        <td>compaction 會擴及 host 上其他 container；鄰居們安然無恙</td>
+        <td class="verdict-out">ruled out</td>
+      </tr>
+      <tr>
+        <td>Envoy sidecar bottleneck</td>
+        <td>對齊 application-layer 與 transport-layer 指標</td>
+        <td>兩層同步下沉、同步恢復，沒有錯位</td>
+        <td>Envoy 是同期受害者；兩者被同一個 host/process 級因素影響</td>
+        <td class="verdict-out">ruled out</td>
+      </tr>
+      <tr>
+        <td>RocksDB mmap-based I/O</td>
+        <td>檢視 RocksDB option：是否 enable mmap reads</td>
+        <td>mmap-based operations disabled in config</td>
+        <td>RocksDB 走 pread/pwrite 路徑，不會觸發 page-fault 路徑的 mmap_lock</td>
+        <td class="verdict-out">ruled out</td>
+      </tr>
+      <tr>
+        <td>HashMap doubling 觸發 huge mmap</td>
+        <td>eBPF off-CPU profile：<code>offcputime</code> + RSS-spike trigger</td>
+        <td>1 thread holds mmap_lock write; N threads queued read-mode</td>
+        <td>當 entry 達 58,720,256 時 hashbrown 申請 3.5 GB 新 table，jemalloc 走 mmap，整個 process 在 mmap_lock 上互鎖</td>
+        <td class="verdict-in">root cause</td>
+      </tr>
+    </tbody>
+  </table>
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-table-hypotheses');
+      if (!root) return;
+      const headers = root.querySelectorAll('thead th');
+      const tbody = root.querySelector('tbody');
+      let activeKey = null, asc = true;
+      headers.forEach(h => h.addEventListener('click', () => {
+        const key = h.dataset.key;
+        if (activeKey === key) asc = !asc; else { activeKey = key; asc = true; }
+        headers.forEach(x => x.removeAttribute('data-sort'));
+        h.setAttribute('data-sort', asc ? 'asc' : 'desc');
+        const rows = [...tbody.querySelectorAll('tr')];
+        const idx = [...headers].indexOf(h);
+        rows.sort((a, b) => {
+          const av = a.children[idx].textContent.trim();
+          const bv = b.children[idx].textContent.trim();
+          const an = Number(av), bn = Number(bv);
+          const cmp = !Number.isNaN(an) && !Number.isNaN(bn) ? an - bn : av.localeCompare(bv);
+          return asc ? cmp : -cmp;
+        });
+        rows.forEach(r => tbody.appendChild(r));
+      }));
+    })();
+  </script>
+</figure>
+
+<figure class="vg-w-evidence-bars" data-svg-scroll="720">
+  <style>
+    .vg-w-evidence-bars svg { width: 100%; height: auto; }
+    .vg-w-evidence-bars figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); padding-top: var(--s-2); }
+  </style>
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M3 3v18h18"/><path d="M7 16V8"/><path d="M12 16V5"/><path d="M17 16v-6"/>
+    </svg>
+    <span>each bar = evidence weight that ruled out (or confirmed) the hypothesis · 5 candidates</span>
+  </p>
+  <svg viewBox="0 0 720 320" preserveAspectRatio="xMidYMid meet" role="img" aria-label="evidence strength per hypothesis">
+    <text x="360" y="22" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)" font-weight="600">evidence strength per hypothesis · how confident was the rule-out</text>
+
+    <line x1="220" y1="50" x2="220" y2="300" stroke="var(--ink)" stroke-width="1.5"/>
+    <line x1="220" y1="300" x2="700" y2="300" stroke="var(--ink)" stroke-width="1.5"/>
+
+    <text x="220" y="316" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">0%</text>
+    <text x="340" y="316" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">25%</text>
+    <text x="460" y="316" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">50%</text>
+    <text x="580" y="316" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">75%</text>
+    <text x="700" y="316" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">100%</text>
+
+    <text x="210" y="78" text-anchor="end" font-family="EB Garamond, serif" font-size="12" fill="var(--ink)">cgroup CPU throttle</text>
+    <rect x="220" y="64" width="100" height="24" fill="var(--muted)" opacity="0.55"/>
+    <text x="328" y="80" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">throttle metric ≈ 0</text>
+
+    <text x="210" y="118" text-anchor="end" font-family="EB Garamond, serif" font-size="12" fill="var(--ink)">kernel mem compaction</text>
+    <rect x="220" y="104" width="115" height="24" fill="var(--muted)" opacity="0.55"/>
+    <text x="343" y="120" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">/proc/vmstat all-zeros</text>
+
+    <text x="210" y="158" text-anchor="end" font-family="EB Garamond, serif" font-size="12" fill="var(--ink)">Envoy sidecar</text>
+    <rect x="220" y="144" width="170" height="24" fill="var(--muted)" opacity="0.55"/>
+    <text x="398" y="160" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">app + transport drop in lock-step</text>
+
+    <text x="210" y="198" text-anchor="end" font-family="EB Garamond, serif" font-size="12" fill="var(--ink)">RocksDB mmap I/O</text>
+    <rect x="220" y="184" width="140" height="24" fill="var(--muted)" opacity="0.55"/>
+    <text x="368" y="200" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">config: mmap disabled</text>
+
+    <text x="210" y="248" text-anchor="end" font-family="EB Garamond, serif" font-size="12" fill="var(--accent-text)" font-weight="600">HashMap doubling → mmap</text>
+    <rect x="220" y="234" width="455" height="24" fill="var(--accent)" opacity="0.85"/>
+    <text x="670" y="250" text-anchor="end" font-family="EB Garamond, serif" font-size="11" fill="var(--bg)" font-weight="600">off-CPU confirmed</text>
+
+    <text x="220" y="284" font-family="Manrope, sans-serif" font-size="10" fill="var(--muted)">↑ left bars = how confidently the negative was confirmed · right bar = positive identification</text>
+  </svg>
+  <figcaption>四個假設都被觀測資料證偽，但「證偽強度」並不相等：CPU throttle 只用一條 grafana 面板就排除，Envoy 排除需要 trace 對齊（更高 cost、更高 confidence）。最後一條「huge mmap 觸發 mmap_lock 寫鎖」由 off-CPU profile 三組 kernel stack 同時指紋確認，是排除清單上唯一的正向命中。</figcaption>
+</figure>
+
+<p>排除清單真正的價值在於它讓最後一條候選變得不可逃避：如果 CPU、kernel compaction、sidecar、檔案 I/O 都不是，剩下的「process 全停」幾乎必然來自某種 process-wide kernel 互斥——首推 <code>mmap_lock</code>。下一步只需要「證實這個猜想」，這就是 off-CPU profile 的工作。</p>
+
+<h3>三道 off-CPU 堆疊：誰拿著鎖、誰在排隊</h3>
+
+<p>事後報告把 off-CPU profile 拆成三組可重複出現的堆疊模式，下面分頁陳列。對照三個 pattern 時留意：A 從 kernel mmap 一路接到 hashbrown rehash，只有一個 thread 在走；B 與 C 是「許多 thread」呈現的不同臉孔——觸發 read-lock 的 syscall 不同（madvise vs page fault），但等待點完全一樣（<code>rwsem_down_read_slowpath</code>）。</p>
+
+<figure class="vg-w-tabs-offcpu">
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/>
+      <rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/>
+    </svg>
+    <span>switch tabs to compare 3 kernel stack patterns · 3 tabs</span>
+  </p>
+  <style>
+    .vg-w-tabs-offcpu { display: grid; gap: var(--s-2); }
+    .vg-w-tabs-offcpu input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+    .vg-w-tabs-offcpu .tabs { display: flex; flex-wrap: wrap; gap: var(--s-2); border-bottom: 1px solid var(--line); }
+    .vg-w-tabs-offcpu .tab { font-family: var(--sans); font-size: var(--fs-sm); padding: var(--s-1) var(--s-2); cursor: pointer; color: var(--muted); min-height: 44px; display: inline-flex; align-items: center; }
+    .vg-w-tabs-offcpu .panel { display: none; padding: var(--s-2) 0; }
+    .vg-w-tabs-offcpu:has(#vg-w-tabs-offcpu-t1:checked) .panel-1 { display: block; }
+    .vg-w-tabs-offcpu:has(#vg-w-tabs-offcpu-t1:checked) [for="vg-w-tabs-offcpu-t1"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    .vg-w-tabs-offcpu:has(#vg-w-tabs-offcpu-t2:checked) .panel-2 { display: block; }
+    .vg-w-tabs-offcpu:has(#vg-w-tabs-offcpu-t2:checked) [for="vg-w-tabs-offcpu-t2"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    .vg-w-tabs-offcpu:has(#vg-w-tabs-offcpu-t3:checked) .panel-3 { display: block; }
+    .vg-w-tabs-offcpu:has(#vg-w-tabs-offcpu-t3:checked) [for="vg-w-tabs-offcpu-t3"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    .vg-w-tabs-offcpu .panel pre { margin: 0; }
+  </style>
+  <input type="radio" id="vg-w-tabs-offcpu-t1" name="vg-w-tabs-offcpu-sel" checked />
+  <input type="radio" id="vg-w-tabs-offcpu-t2" name="vg-w-tabs-offcpu-sel" />
+  <input type="radio" id="vg-w-tabs-offcpu-t3" name="vg-w-tabs-offcpu-sel" />
+  <div class="tabs">
+    <label class="tab" for="vg-w-tabs-offcpu-t1">A · write-mode holder</label>
+    <label class="tab" for="vg-w-tabs-offcpu-t2">B · madvise waiter</label>
+    <label class="tab" for="vg-w-tabs-offcpu-t3">C · page-fault waiter</label>
+  </div>
+  <div class="panel panel-1">
+    <p>單一 thread 在做 huge mmap，途中走進 <code>rwsem_down_write_slowpath</code>——這條 slowpath 是「我已經被選為下一個 writer，但要等所有 reader 先離場」的等待路徑。一旦它出來，這個 thread 就是 write 鎖的 holder，後續直到 mmap return 為止都不會放手。它的 user-space 堆疊往上走是 jemalloc 的 large-arena grow，再往上是 Rust 標準庫的 HashMap resize，再往上是 FishDB 自己的 index insert。</p>
+    <pre data-kind="output"><code>__do_sys_mmap_pgoff
+ksys_mmap_pgoff
+vm_mmap_pgoff
+do_mmap
+mmap_region
+__mm_populate
+rwsem_down_write_slowpath          <em>// I am the next writer, waiting for readers</em>
+&lt;...jemalloc je_extent_alloc_mmap...&gt;
+&lt;...jemalloc je_arena_extent_alloc_large...&gt;
+&lt;...Rust hashbrown::raw::RawTable::reserve_rehash...&gt;
+&lt;...std::collections::HashMap::insert...&gt;
+&lt;...fishdb::index::Shard::upsert...&gt;</code></pre>
+  </div>
+  <div class="panel panel-2">
+    <p>jemalloc 的 background reclaim thread——它週期性地呼叫 <code>madvise(addr, len, MADV_DONTNEED)</code> 把不再使用的 page 還給 kernel。<code>madvise</code> 內部要拿 <code>mmap_lock</code> 的 read 鎖；當 write holder 在場時，所有 read 申請者排在後面。整個 jemalloc 的內部記憶體再生機制因此停擺，這也是為什麼一場 freeze 過後 RSS 不會回到 baseline——還沒來得及 purge 的記憶體永遠留在 process 裡，貢獻了那 ~2 GB 的「永久」增長。</p>
+    <pre data-kind="output"><code>__madvise
+do_madvise
+rwsem_down_read_slowpath           <em>// queued behind the write holder</em>
+&lt;...jemalloc je_pages_purge_forced...&gt;
+&lt;...jemalloc background_thread_entry...&gt;</code></pre>
+  </div>
+  <div class="panel panel-3">
+    <p>Tokio worker thread 在處理請求時要碰到某個尚未 fault-in 的記憶體頁——譬如剛從 jemalloc 拿到一塊新分配、kernel 還沒把實體 page 映射上去。第一次寫入觸發 page fault，handler 進入 <code>do_user_addr_fault</code>，這條路徑要拿 <code>mmap_lock</code> 的 read 鎖以保護 VMA 樹的讀取。同樣地，所有 worker 都卡在 <code>rwsem_down_read_slowpath</code>——這是 freeze 期間 application-layer 看起來「完全不應答」的直接原因：所有 tokio task 都在 kernel waitqueue 上睡覺，而不是在跑 Rust code。</p>
+    <pre data-kind="output"><code>do_user_addr_fault
+handle_mm_fault
+rwsem_down_read_slowpath           <em>// queued behind the write holder</em>
+&lt;...tokio::runtime::scheduler::poll...&gt;
+&lt;...fishdb::query::handle_lookup...&gt;</code></pre>
+  </div>
+</figure>
+
+<p>三個 pattern 同時出現是「process-wide 鎖」最乾淨的指紋：三組堆疊沒有交集的 user-space code，唯一共用的就是「都要拿 <code>mmap_lock</code>」。順著 pattern A 的 stack 往上爬，源頭落在 hashbrown 的 resize 路徑。</p>
+
+<h2>修復：一行 <code>HashMap::with_capacity()</code> 終結 doubling 的命運</h2>
+
+<p>根因確定之後的修復像個玩笑——標準庫早就提供。花了十幾頁 dashboard、跑了上百個 BPF profile、四個假設來回驗證，最後寫進 fix 的程式碼是一行；但這一行裡藏著「未來五年不會再 doubling」的承諾。</p>
+
+<pre><code class="language-rust">// 修復前：HashMap 從容量 0 起步，依靠 doubling 長大
+let map = HashMap::new();
+
+// 修復後：起手就分配約 3 倍於 base index 的 capacity
+let map = HashMap::with_capacity(base_index_size * 3);</code></pre>
+
+<p>邏輯極為直白。</p>
+
+<p>如果 base index size 是 60M（接近當下每個 shard 的水位），<code>base_index_size * 3</code> ≈ 180M。</p>
+
+<p>hashbrown 會 round 上去找到最小的 2 次方 capacity 滿足 <code>cap × load_factor ≥ 180M</code>，落在 <code>2^28 = 268,435,456</code>。</p>
+
+<p>從這個起點算起，下一個 doubling 是 <code>2^29 = 536,870,912</code>，需要 entry 數量超過 ~470M。</p>
+
+<p>以「每 shard 2-3 M/day」的成長率，要五年以上才會撞牆。</p>
+
+<p>換句話說，整段 service lifetime 內 HashMap 永遠不會再 resize，那條 mmap_lock 寫鎖再也不會被持有十幾秒。</p>
+
+<p>付出的代價是 host 上每個 shard 立刻多吃 <code>(180M - 60M) × 32 bytes ≈ 3.6 GB</code> 的記憶體。</p>
+
+<p>以 48 個 shard 計，整台機器多消耗約 170 GB。</p>
+
+<p>這對 LinkedIn Feed host 的記憶體規格而言不是問題（這類服務原本就是記憶體導向）。</p>
+
+<p>對你自己的服務，要不要付這個代價要看可用記憶體 vs. 可用容忍度的權衡。</p>
+
+<p>記憶體是廉價的、availability budget 是昂貴的。另一條替代方案：把單一大 HashMap 切成多個 sub-shard，把 60M 條目分到 32 個 sub-HashMap、每個 ~2M 條目，doubling 時 mmap 縮減到 64 MB，jemalloc 不走 huge 路徑、<code>mmap_lock</code> 寫鎖持有時間從幾秒縮到幾毫秒。但這個方案的代價是 lookup overhead 多一次 hash partition；對 LinkedIn 的 case，with_capacity 已經夠用。</p>
+
+<p>下面這個小工具讓你親手算這筆帳：拖動 base index 與 pre-allocation 倍率，看下一個 doubling 邊界何時會到、以「2-3 M/day」的成長速度換算成幾年。</p>
+
+<figure class="vg-w-range-prealloc">
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M5 9h14"/><path d="M5 15h14"/><circle cx="9" cy="9" r="2"/><circle cx="15" cy="15" r="2"/>
+    </svg>
+    <span>drag both sliders to find the head-room horizon · 2 inputs</span>
+  </p>
+  <style>
+    .vg-w-range-prealloc { display: grid; gap: var(--s-3); }
+    .vg-w-range-prealloc .controls { display: grid; grid-template-columns: 1fr; gap: var(--s-2); }
+    .vg-w-range-prealloc .row { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); }
+    .vg-w-range-prealloc label { min-width: 18ch; color: var(--ink); }
+    .vg-w-range-prealloc input[type=range] { flex: 1; accent-color: var(--accent); height: 36px; touch-action: none; }
+    .vg-w-range-prealloc .readout { font-variant-numeric: tabular-nums; color: var(--accent-text); min-width: 10ch; text-align: right; }
+    .vg-w-range-prealloc .verdict { font-family: var(--scribed); font-size: var(--fs-md); color: var(--ink); padding: var(--s-2); background: var(--bg-soft); border-left: 3px solid var(--accent); }
+    .vg-w-range-prealloc .verdict .num { font-family: var(--serif); font-weight: 600; color: var(--accent-text); }
+    .vg-w-range-prealloc figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+  </style>
+  <div class="controls">
+    <div class="row">
+      <label for="vg-w-range-prealloc-base">base index size</label>
+      <input id="vg-w-range-prealloc-base" type="range" min="10000000" max="100000000" step="1000000" value="60000000" />
+      <span class="readout" id="vg-w-range-prealloc-base-out">60.0M</span>
+    </div>
+    <div class="row">
+      <label for="vg-w-range-prealloc-k">pre-allocation multiplier k</label>
+      <input id="vg-w-range-prealloc-k" type="range" min="1" max="10" step="1" value="3" />
+      <span class="readout" id="vg-w-range-prealloc-k-out">3×</span>
+    </div>
+  </div>
+  <p class="verdict" id="vg-w-range-prealloc-verdict">
+    With <span class="num">k = 3</span> on a <span class="num">60M</span> base index, the next doubling threshold sits at <span class="num">~470M entries</span>; at the observed growth of 2–3M/day per shard, that buys <span class="num">~5 years</span> of head-room. Extra memory cost per shard: <span class="num">~3.6 GB</span>.
+  </p>
+  <figcaption>計算採用 hashbrown 的 load factor 0.875；下一個 doubling 觸發點 ≈ <code>2 × ceil_pow2(base × k)</code>。把 k 拉到 1 等於「不預分配」——下一個 doubling 距離當下不到一年，這就是 LinkedIn 一開始的處境。</figcaption>
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-range-prealloc');
+      if (!root) return;
+      const baseInp = root.querySelector('#vg-w-range-prealloc-base');
+      const kInp = root.querySelector('#vg-w-range-prealloc-k');
+      const baseOut = root.querySelector('#vg-w-range-prealloc-base-out');
+      const kOut = root.querySelector('#vg-w-range-prealloc-k-out');
+      const verdict = root.querySelector('#vg-w-range-prealloc-verdict');
+
+      const LOAD = 0.875;
+      const BYTES_PER_ENTRY = 32;
+      const GROWTH_PER_DAY = 2_500_000;
+
+      function fmtN(n) {
+        if (n >= 1_000_000_000) return (n / 1_000_000_000).toFixed(2) + 'B';
+        if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
+        if (n >= 1_000) return Math.round(n / 1_000) + 'k';
+        return String(n);
+      }
+      function fmtGB(bytes) {
+        return (bytes / 1024 / 1024 / 1024).toFixed(1) + ' GB';
+      }
+      function ceilPow2(n) {
+        let cap = 1;
+        while (cap < n) cap *= 2;
+        return cap;
+      }
+
+      function update() {
+        const base = Number(baseInp.value);
+        const k = Number(kInp.value);
+        const initialCap = ceilPow2(Math.ceil(base * k / LOAD));
+        const nextDoublingTrigger = Math.floor(initialCap * LOAD);
+        const headroomEntries = Math.max(0, nextDoublingTrigger - base);
+        const headroomDays = headroomEntries / GROWTH_PER_DAY;
+        const headroomYears = headroomDays / 365;
+        const extraCost = (initialCap - Math.ceil(base / LOAD) * 1) * BYTES_PER_ENTRY;
+        baseOut.textContent = fmtN(base);
+        kOut.textContent = k + '×';
+        const yearStr = headroomYears < 1
+          ? (headroomDays.toFixed(0) + ' days')
+          : (headroomYears.toFixed(1) + ' years');
+        verdict.innerHTML = `With <span class="num">k = ${k}</span> on a <span class="num">${fmtN(base)}</span> base index, the next doubling threshold sits at <span class="num">~${fmtN(nextDoublingTrigger)} entries</span>; at the observed growth of 2–3M/day per shard, that buys <span class="num">${yearStr}</span> of head-room. Extra memory cost per shard: <span class="num">~${fmtGB(extraCost)}</span>.`;
+      }
+
+      baseInp.addEventListener('input', update);
+      kInp.addEventListener('input', update);
+      update();
+    })();
+  </script>
+</figure>
+
+<p>這個修補的優雅在於它把「為了避免 amortised O(1) 的最壞情況」這個古典 hashtable 教訓搬到了 systems 層。</p>
+
+<p>amortised 分析在演算法課本裡是「每次操作平均 O(1)、偶爾一次 O(n) 用來 rehash 老舊 capacity」——這個 O(n) 在 user-space 通常等於「分配新 buffer、memcpy、釋放舊 buffer」，幾百毫秒可以接受。</p>
+
+<p>但在 process-wide kernel 鎖的視角下，那一次 O(n) 不只搬資料，它還要與 kernel 商量一段 3.5 GB 的 virtual address space，這條商量路徑會 hold 一把所有 thread 都要排隊的鎖。</p>
+
+<p><strong>amortised 分析忽略的常數，在系統層可能不是常數，而是會把整個 process 凍住十幾秒的開銷。</strong></p>
+
+<p>這個觀察可以推廣到所有 amortised doubling 的容器：Vec、std::vector、persistent B-tree 的根節點分裂、log-structured store 的 segment roll-over、ring buffer 的「滿了就 grow」——任何在系統層需要 mmap 大塊區域的 amortised cost，都會繞道 mmap_lock。Rust 標準庫對所有這類容器都提供 <code>with_capacity</code>，不是巧合。</p>
+
+<h2>從這個故事能帶走什麼：在「容器化、async、託管 allocator」交叉口的新故障形態</h2>
+
+<p>這場事故的價值在於它把多個元件在一個交叉口同時發力——hashbrown 的 doubling、jemalloc 的 huge allocation 走 mmap、Linux 的 mmap_lock 是 process-wide rw_semaphore、Rust 標準庫鼓勵預估容量但不強制——當 entry 數量穿越關鍵點時，會產生一場無聲、無日誌、無 stack trace 的「凍結」，只能靠 off-CPU profiling 看見。</p>
+
+<p>這對 2026 年寫 Rust 後端服務的工程師意味著三件事。</p>
+
+<p>第一，<strong>在啟動時就估算可預期的容器大小</strong>。<code>Vec::with_capacity</code>、<code>HashMap::with_capacity</code>、<code>String::with_capacity</code>——這些 API 不是「想要極致效能」的優化選項，而是「不希望 process 在某個未來日子發生 amortised 退化」的安全網。對任何已知會長到百萬條目以上的容器，with_capacity 從「nice to have」升級為「required by design review」。</p>
+
+<p>可靠的做法是「估算 service 預期生命週期內最大容量、再乘 2-3 倍」。對 LinkedIn 的 case，<code>current = 60M</code>、<code>growth = 3M/day</code>、<code>horizon = 5 yrs</code> 算出大約 2.7 倍 base，他們選擇 3 倍——審慎而非過度保守。冷啟動時多花幾秒在 mmap 上可以接受（使用者還沒接上來），但 warm 期的 mmap 寫鎖會直接打在 SLO 上。</p>
+
+<p>第二，<strong>觀測棧裡 off-CPU profiling 不再可選</strong>。傳統 on-CPU profiling 只能看見「正在做事的 thread」；當瓶頸是「全部 thread 都在等鎖」時，CPU profile 會顯示用量為零、看起來像「沒事」。<code>offcputime</code> 在 <code>sched_switch</code> tracepoint 上記錄離開 CPU 的 thread 與堆疊，自然會看到所有在 kernel 鎖上睡覺的 thread。把它包裝成「RSS 跳階觸發抓 30 秒」的 trap，是這次能在合理時間內找到答案的關鍵。</p>
+
+<p>第三，<strong>process-wide 的 kernel 互斥比你想像中多</strong>。<code>mmap_lock</code> 是最有名的，因為任何 page fault、mmap/munmap/madvise/mprotect 都得碰它。Async runtime 在這個面前沒有特權：tokio 也是 user-space scheduler，當 worker thread 全部被 kernel 卡住，整個 runtime 等於停擺。async runtime 的 worker 並行只是「在 CPU 上能同時跑多少 future」的並行，不是「能同時跨過 kernel 鎖多少次」的並行。</p>
+
+<p>還有一個次要但耐人尋味的觀察：每次 freeze 之後 RSS 多了 ~2 GB——這恰好是「舊 1.75 GB table 釋放、新 3.5 GB table 留下」的差值。如果某天觀察到自己服務的 RSS 呈現「平穩——突跳——平穩於新水位」的鋸齒形態，去看看每一次跳階對應的時間點，很可能你也有一個正在 doubling 的 hashtable。「RSS 鋸齒」這個訊號比「freeze」更早出現——對 1 小時 rolling window 的 RSS 取 max - min，閾值超過 baseline 的 20% 就告警；這對所有以 amortised doubling 為主的容器都有效。</p>
+
+<figure class="vg-w-rss-sawtooth" data-svg-scroll="720">
+  <style>
+    .vg-w-rss-sawtooth svg { width: 100%; height: auto; }
+    .vg-w-rss-sawtooth figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); padding-top: var(--s-2); }
+  </style>
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M3 17l4-4 4 6 4-10 4 6 2-2"/>
+    </svg>
+    <span>RSS over 4 doubling events · each spike = a freeze · plateau = persistent +2 GB</span>
+  </p>
+  <svg viewBox="0 0 720 320" preserveAspectRatio="xMidYMid meet" role="img" aria-label="RSS sawtooth timeline showing four doubling spikes">
+    <text x="360" y="22" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)" font-weight="600">RSS over time · each freeze leaves a permanent ~2 GB step</text>
+
+    <line x1="60" y1="50" x2="60" y2="280" stroke="var(--ink)" stroke-width="1.5"/>
+    <line x1="60" y1="280" x2="700" y2="280" stroke="var(--ink)" stroke-width="1.5"/>
+
+    <text x="50" y="284" text-anchor="end" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">0</text>
+    <text x="50" y="230" text-anchor="end" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">2 GB</text>
+    <text x="50" y="180" text-anchor="end" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">4 GB</text>
+    <text x="50" y="130" text-anchor="end" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">6 GB</text>
+    <text x="50" y="80" text-anchor="end" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">8 GB</text>
+    <text x="380" y="305" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">time (weeks) →</text>
+    <text x="30" y="165" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)" transform="rotate(-90 30 165)">process RSS</text>
+
+    <line x1="60" y1="230" x2="700" y2="230" stroke="var(--muted-2)" stroke-width="0.5" stroke-dasharray="3 4"/>
+    <line x1="60" y1="180" x2="700" y2="180" stroke="var(--muted-2)" stroke-width="0.5" stroke-dasharray="3 4"/>
+    <line x1="60" y1="130" x2="700" y2="130" stroke="var(--muted-2)" stroke-width="0.5" stroke-dasharray="3 4"/>
+
+    <path d="M 60 255 L 200 255 L 200 130 L 215 230 L 350 230 L 350 105 L 365 205 L 500 205 L 500 80 L 515 180 L 650 180 L 700 180" fill="none" stroke="var(--accent)" stroke-width="2"/>
+
+    <text x="207" y="120" text-anchor="middle" font-family="EB Garamond, serif" font-size="10" fill="var(--accent-text)">freeze · spike +4 GB</text>
+    <text x="207" y="248" text-anchor="middle" font-family="EB Garamond, serif" font-size="10" fill="var(--muted)">+2 GB step</text>
+
+    <text x="357" y="95" text-anchor="middle" font-family="EB Garamond, serif" font-size="10" fill="var(--accent-text)">freeze</text>
+    <text x="507" y="70" text-anchor="middle" font-family="EB Garamond, serif" font-size="10" fill="var(--accent-text)">freeze</text>
+
+    <circle cx="200" cy="130" r="4" fill="var(--accent)"/>
+    <circle cx="350" cy="105" r="4" fill="var(--accent)"/>
+    <circle cx="500" cy="80" r="4" fill="var(--accent)"/>
+
+    <text x="650" y="200" text-anchor="middle" font-family="EB Garamond, serif" font-size="10" fill="var(--muted)">…next doubling lurking</text>
+  </svg>
+  <figcaption>四次 doubling 對應四次 RSS 突跳，每跳一次留下大約 +2 GB 的新 baseline。鋸齒模式之所以可被自動偵測，是因為「spike + 永久升高」這個雙特徵很難被請求性流量偽造——一般流量會在 spike 後回到原 baseline。1 小時 rolling window 對 RSS 取 max - min，若超過 baseline 20% 就告警，能在第一次 freeze 對使用者可感之前就先發現容器正在 doubling。</figcaption>
+</figure>
+
+<p>LinkedIn 在事後選擇把這個 case study 完整公開——四個錯誤假設、查核手法、最終 root cause、修補程式碼，毫不省略。讀完之後可以對自己的服務 audit：你有沒有可預期會長大的 HashMap？你的觀測棧能不能抓 off-CPU profile？你的 RSS 監控有沒有鋸齒形態 alert？三個問題若有一個答 no，那這篇報告幫你省下了「再花六個月複現同一個 bug」的時間。</p>
+
+<p class="vg-deep-closer"><strong>Next time</strong>：當一個 process 出現「全部 thread 同步凍十秒、CPU 沒事、沒有日誌、RSS 同時跳階」的形態，第一個要看的不是 application code，而是 off-CPU profile 裡有沒有人持 <code>mmap_lock</code> 寫鎖——順著它的 stack 往上爬，幾乎都會看到一個正在做大 allocation 的容器，而那個容器幾乎都應該在啟動時就 <code>with_capacity</code> 預分配。</p>
+
+</div>
