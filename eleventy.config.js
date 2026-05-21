@@ -94,6 +94,9 @@ export default function (eleventyConfig) {
   );
   eleventyConfig.addPassthroughCopy({ "src/static": "static" });
   eleventyConfig.addPassthroughCopy({ "src/robots.txt": "robots.txt" });
+  // Cloudflare Pages security headers. See src/_headers for the
+  // threat model and CSP rationale.
+  eleventyConfig.addPassthroughCopy({ "src/_headers": "_headers" });
 
   // Self-host fonts via fontsource. Mirror files/ (woff2 + woff) for each
   // family, plus the specific weight-CSS files we actually use.
