@@ -262,7 +262,43 @@ elements in a ≥32px hit area:
 
 See tier-3-principles §12.1.C and §12.1.F.
 
-## G. The summary test
+## G. Scroll-driven explanation (BANNED 2026-05-21)
+
+> The pattern: sticky figure on one side, list of stages on the other.
+> As the reader scrolls past each stage, an `IntersectionObserver`
+> (or `animation-timeline: scroll()`) toggles the matching SVG group
+> visible inside the sticky figure.
+
+**Why banned**: across PR #28-#30 this pattern produced visual failures
+on every viewport variant we tested:
+
+- **Sticky figure leaves viewport before stages change** — the sticky
+  top anchor calibration depends on `rootMargin` AND header height.
+  Get either wrong and the figure scrolls away while the prose is
+  still mid-stage.
+- **Mobile sticky covers the prose** — to keep the sticky figure
+  visible on a 667px-tall phone, you have to make it ≤50vh. That
+  collides with the user trying to read the prose stages, which are
+  ALSO on screen.
+- **Stages change at wrong moment** — IntersectionObserver fires on
+  ENTRY into a rootMargin band. The "right moment" to swap is when
+  the reader's *eye* is on the prose for that stage — these are not
+  the same. Stage 3 prose can come into view while the figure still
+  shows stage 2 (or vice versa).
+- **No good fallback** for browsers without scroll-timeline support.
+- **Screen readers**: the scroll-driven semantics don't translate.
+
+**Use instead**: `tab-switcher-pure-css`. Tabs map 1:1 to stages,
+work identically across viewports, need no observer calibration, and
+are accessible by default. Author each stage as a `<div class="stage-body" data-stage="N">`
+controlled by `:has(:checked)` on a hidden radio. See the Meta
+post `vg-w-tabs-meta-ingest-migration` for a reference implementation.
+
+The Tier-1 entry `scroll-driven-explanation.md` and the Tier-2
+`css-scroll-timeline.md` are kept for reference but Step 7c will
+REJECT any deep-story whose `widget_templates` includes either id.
+
+## H. The summary test
 
 Before shipping a widget, ask:
 

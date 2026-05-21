@@ -1,5 +1,19 @@
 # Tier 2 — CSS Scroll-Driven Animation
 
+> **BANNED — DO NOT PICK** (2026-05-21).
+>
+> Same ban as the Tier-1 scroll-driven-explanation entry. Banned because
+> scroll-tied animations make the widget unreliable across viewport
+> sizes — the trigger position depends on viewport height, the sticky
+> figure can leave the viewport before the animation completes, and
+> there is no good fallback on browsers without `animation-timeline`
+> support.
+>
+> **Replace with**: state changes triggered by `<input type="radio">`
+> or `<input type="range">`, or `intersection-observer-reveal` for a
+> one-shot "fade in when visible" reveal that does NOT depend on
+> sustained scroll position.
+
 > Use `animation-timeline: scroll()` to drive an animation by scroll
 > position. Pure CSS, no JS needed.
 

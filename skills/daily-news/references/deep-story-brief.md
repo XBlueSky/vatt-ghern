@@ -77,8 +77,14 @@ You are writing ONE deep-story for vatt'ghern's daily-news routine.
   removed.
 - **≥ 3 widgets total**. ≥ 1 must be a Tier-1 (interactive) hero
   widget — that is, the widget includes at least one of: `<script>`
-  (interactive logic), `<input>` (user input), `<canvas>` (loop), or
-  scroll-driven CSS (`animation-timeline: scroll()`).
+  (interactive logic), `<input>` (user input), `<canvas>` (loop).
+  **Scroll-driven CSS (`animation-timeline: scroll()`) and the
+  scroll-tied stage walkthrough pattern are BANNED 2026-05-21 — see
+  `widget-cookbook/anti-examples.md` §G.** Use tabs
+  (`tab-switcher-pure-css`) for staged narratives instead.
+- **Banned widget templates** (REJECT if any appears in sidecar's
+  `widget_templates`): `scroll-driven-explanation`,
+  `css-scroll-timeline`. These will fail Step 7c verification.
 - **Each widget carries a conceptual question** recorded in the
   sidecar's `widget_questions` array (one entry per widget).
 - Persona invariants: `——` (CJK double em-dash) not `—`; `：` (CJK
