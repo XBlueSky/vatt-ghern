@@ -1,0 +1,772 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">數 PB 的社交圖譜資料每天從 MySQL 流進 data warehouse，這條管子不能停——但底下控制面要整個被換掉。Meta 用兩年時間把幾萬個 ingestion job 從「team-owned 客戶程式碼」搬到「平台託管的 warehouse service」，工程交付的關鍵不是引擎，而是把「shadow → reverse shadow → cleanup」三段顯式化、把 row count 與 checksum 變成每小時自動跑的對帳機，並且讓 onboarding 流量一秒都不停。</p>
+  <h1 class="vg-post-title">Meta 換掉 data ingestion 控制面——PB/day 流量底下的 zero-downtime 換引擎</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p>
+    <span class="vg-dropcap">這</span>篇是 Meta 那篇「Migrating data ingestion systems at Meta scale」（2026.05.12）的工程整理——重點不是「他們換到什麼引擎」，而是在 PB/day 持續寫入的前提下，怎麼把整條 ingestion 控制面換掉、怎麼把「驗證／切讀／退役」三段顯式化、怎麼讓對 downstream consumer 來說整個遷移是 invisible 的。對任何在規劃跨年度資料層遷移的人，這套方法論比技術選型更值得記。
+  </p>
+
+  <p>
+    Meta 的描述把問題框得很清楚：legacy 是 customer-owned 的 ingestion pipeline——每個 product team 自己拼 Spark job、自己寫 CDC consumer、自己對齊 schema；這套架構在小規模時跑得動，data landing time 要求變嚴之後就撐不住。換到 self-managed warehouse service 等於是把這層 glue code 從千百個 team 那邊收回 platform 內，但這就意味著要把幾萬個既有 ingestion job、跨產品線、跨 schema 全部搬一遍——而且不能有任何一個 partition 在搬遷期間 silently 寫錯。下面這個 5-stage walkthrough 把整個 migration lifecycle 攤開，點上方 tab 切換 stage、下方的架構快照會同步換——重點不是「哪個方塊變色」，而是「這一段 control plane 在驗證什麼、bad data 從哪裡會跑出來」。
+  </p>
+
+  <p>
+    在進入細節之前先設一個 mental anchor：這篇 Meta 文章引用了三個明確的階段名稱——「shadow」「reverse shadow」「migration cleanup」。三個名稱對應三個不同的 invariant：shadow 階段的 invariant 是「shadow 出錯不會打到 consumer」、reverse-shadow 的 invariant 是「即使 cutover 後出錯仍能 instant rollback」、cleanup 的 invariant 是「legacy 路徑下線時沒有任何 reader 還在依賴」。把這三個 invariant 在心裡標清楚，後面所有設計細節都是為這三條服務的——這也是讀方法論文章時最容易迷失在實作層的地方：忘記「為什麼這樣設計」而停在「他們做了什麼」。
+  </p>
+
+  <figure class="vg-w-tabs-meta-ingest-migration" data-svg-scroll="560">
+    <p class="vg-w-affordance"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M3 9h18"/><path d="M9 21V9"/></svg><span>click a stage to see what control plane checks · 5 stages</span></p>
+    <style>
+      .vg-w-tabs-meta-ingest-migration { display: grid; grid-template-columns: 1fr; gap: var(--s-3); align-items: start; margin: var(--s-4) 0; }
+      .vg-w-tabs-meta-ingest-migration input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-tabs-meta-ingest-migration .tabs { display: flex; flex-wrap: wrap; gap: 2px; border-bottom: 1px solid var(--line); }
+      .vg-w-tabs-meta-ingest-migration .tab { flex: 1 1 auto; padding: var(--s-1) var(--s-2); font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); cursor: pointer; border-bottom: 2px solid transparent; text-align: center; min-width: 100px; white-space: nowrap; }
+      .vg-w-tabs-meta-ingest-migration .tab:hover { color: var(--ink); }
+      .vg-w-tabs-meta-ingest-migration .tab:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+      .vg-w-tabs-meta-ingest-migration .stage-body { display: none; padding: var(--s-2) var(--s-3); border-left: 2px solid var(--accent); }
+      .vg-w-tabs-meta-ingest-migration .stage-body h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--ink); }
+      .vg-w-tabs-meta-ingest-migration .stage-body .when { font-family: var(--display); font-size: var(--fs-md); color: var(--accent-text); margin-bottom: var(--s-1); }
+      .vg-w-tabs-meta-ingest-migration .stage-body p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-tabs-meta-ingest-migration .stage-body .verify { font-family: var(--scribed); color: var(--accent-text); }
+      .vg-w-tabs-meta-ingest-migration .figure-svg { background: var(--bg); padding: var(--s-2) 0; }
+      .vg-w-tabs-meta-ingest-migration svg { width: 100%; height: auto; }
+      .vg-w-tabs-meta-ingest-migration .stage-group { display: none; }
+      .vg-w-tabs-meta-ingest-migration .axis-text { font-family: EB Garamond, serif; font-size: 13px; }
+      .vg-w-tabs-meta-ingest-migration .axis-text.title { font-size: 15px; }
+      /* tab + stage-group visibility driven by :has(:checked) — pure CSS */
+      .vg-w-tabs-meta-ingest-migration:has(#vg-w-tabs-meta-ingest-migration-r1:checked) .tab[for="vg-w-tabs-meta-ingest-migration-r1"],
+      .vg-w-tabs-meta-ingest-migration:has(#vg-w-tabs-meta-ingest-migration-r2:checked) .tab[for="vg-w-tabs-meta-ingest-migration-r2"],
+      .vg-w-tabs-meta-ingest-migration:has(#vg-w-tabs-meta-ingest-migration-r3:checked) .tab[for="vg-w-tabs-meta-ingest-migration-r3"],
+      .vg-w-tabs-meta-ingest-migration:has(#vg-w-tabs-meta-ingest-migration-r4:checked) .tab[for="vg-w-tabs-meta-ingest-migration-r4"],
+      .vg-w-tabs-meta-ingest-migration:has(#vg-w-tabs-meta-ingest-migration-r5:checked) .tab[for="vg-w-tabs-meta-ingest-migration-r5"] { color: var(--accent-text); border-bottom-color: var(--accent); }
+      .vg-w-tabs-meta-ingest-migration:has(#vg-w-tabs-meta-ingest-migration-r1:checked) .stage-body[data-stage="1"],
+      .vg-w-tabs-meta-ingest-migration:has(#vg-w-tabs-meta-ingest-migration-r2:checked) .stage-body[data-stage="2"],
+      .vg-w-tabs-meta-ingest-migration:has(#vg-w-tabs-meta-ingest-migration-r3:checked) .stage-body[data-stage="3"],
+      .vg-w-tabs-meta-ingest-migration:has(#vg-w-tabs-meta-ingest-migration-r4:checked) .stage-body[data-stage="4"],
+      .vg-w-tabs-meta-ingest-migration:has(#vg-w-tabs-meta-ingest-migration-r5:checked) .stage-body[data-stage="5"] { display: block; }
+      .vg-w-tabs-meta-ingest-migration:has(#vg-w-tabs-meta-ingest-migration-r1:checked) #vg-w-tabs-meta-ingest-migration-stage-1,
+      .vg-w-tabs-meta-ingest-migration:has(#vg-w-tabs-meta-ingest-migration-r2:checked) #vg-w-tabs-meta-ingest-migration-stage-2,
+      .vg-w-tabs-meta-ingest-migration:has(#vg-w-tabs-meta-ingest-migration-r3:checked) #vg-w-tabs-meta-ingest-migration-stage-3,
+      .vg-w-tabs-meta-ingest-migration:has(#vg-w-tabs-meta-ingest-migration-r4:checked) #vg-w-tabs-meta-ingest-migration-stage-4,
+      .vg-w-tabs-meta-ingest-migration:has(#vg-w-tabs-meta-ingest-migration-r5:checked) #vg-w-tabs-meta-ingest-migration-stage-5 { display: inline; }
+    </style>
+
+    <input type="radio" name="vg-w-tabs-meta-ingest-migration-sel" id="vg-w-tabs-meta-ingest-migration-r1" checked aria-label="stage 0 customer-owned"/>
+    <input type="radio" name="vg-w-tabs-meta-ingest-migration-sel" id="vg-w-tabs-meta-ingest-migration-r2" aria-label="stage 1 batch curation"/>
+    <input type="radio" name="vg-w-tabs-meta-ingest-migration-sel" id="vg-w-tabs-meta-ingest-migration-r3" aria-label="stage 2 shadow"/>
+    <input type="radio" name="vg-w-tabs-meta-ingest-migration-sel" id="vg-w-tabs-meta-ingest-migration-r4" aria-label="stage 3 reverse shadow"/>
+    <input type="radio" name="vg-w-tabs-meta-ingest-migration-sel" id="vg-w-tabs-meta-ingest-migration-r5" aria-label="stage 4 cleanup"/>
+
+    <div class="tabs" role="tablist">
+      <label class="tab" for="vg-w-tabs-meta-ingest-migration-r1">stage 0 · 起點</label>
+      <label class="tab" for="vg-w-tabs-meta-ingest-migration-r2">stage 1 · batch</label>
+      <label class="tab" for="vg-w-tabs-meta-ingest-migration-r3">stage 2 · shadow</label>
+      <label class="tab" for="vg-w-tabs-meta-ingest-migration-r4">stage 3 · reverse</label>
+      <label class="tab" for="vg-w-tabs-meta-ingest-migration-r5">stage 4 · cleanup</label>
+    </div>
+
+    <div class="stage-body" data-stage="1">
+      <div class="when">stage 0 · 起點</div>
+      <h3>Customer-owned ingestion</h3>
+      <p>每個 product team 自己跑 Spark job、消 CDC log、寫 partition；landing time SLA 越收越緊時，這套架構的 reliability 開始撐不住——失誤散落在數百條 pipeline 裡，沒有單一 oncall 能看完。</p>
+      <p class="verify">這一段對齊的：「目標架構長什麼樣」——self-managed warehouse service，platform 收回 ingestion control plane。</p>
+    </div>
+    <div class="stage-body" data-stage="2">
+      <div class="when">stage 1 · batch curation</div>
+      <h3>把幾萬個 job 切成可控批次</h3>
+      <p>按 throughput、priority、special case 把待遷移 job 分類；known-issue 的 job 暫時排除——避免製造帶問題的 shadow，省下昂貴的 full-dump 操作；對 critical table 額外協商驗收標準。</p>
+      <p class="verify">這一段對齊的：批次間互相獨立、incident 不會跨批傳染。</p>
+    </div>
+    <div class="stage-body" data-stage="3">
+      <div class="when">stage 2 · shadow</div>
+      <h3>Pre-prod 雙跑、不對外輸出</h3>
+      <p>把每個 job 的 shadow 版跑在 pre-production；output 寫到 shadow table。Custom 工具每小時對 production 與 shadow 的對應 partition 做 row count + checksum 比對，mismatch 寫進 Scuba、附上 sample row 與 debug context。</p>
+      <p class="verify">這一段對齊的：data quality（row count、checksum）、landing latency 不退化、compute 與 storage quota 在預期範圍。</p>
+    </div>
+    <div class="stage-body" data-stage="4">
+      <div class="when">stage 3 · reverse shadow</div>
+      <h3>新版上 production、舊版降到 shadow</h3>
+      <p>同一份比對機制反向部署——新 job 寫 production table、原 job 降為 shadow 寫 shadow table。Cutover 後仍持續產生 data-quality signal，因為 downstream 已經在 query 新表，這層持續驗證是 rollback 的安全網。</p>
+      <p class="verify">這一段對齊的：post-cutover 仍有「對照組」，divergence 一出現就 trigger rollback。</p>
+    </div>
+    <div class="stage-body" data-stage="5">
+      <div class="when">stage 4 · cleanup</div>
+      <h3>確認穩定，撤掉 legacy shadow</h3>
+      <p>連續一段時間 zero divergence 後，原 job 從 shadow 池退役、相關 storage 與 compute 釋放。整個批次的 customer-owned pipeline 才算真正被收編進 platform service。</p>
+      <p class="verify">這一段對齊的：legacy 路徑沒有任何 reader 還在依賴、退役不會誤殺 downstream consumer。</p>
+    </div>
+
+    <div class="figure-svg">
+      <svg viewBox="0 0 480 360" role="img"
+           aria-label="Meta data ingestion migration 五階段架構快照——左邊 stage 切換時右邊架構同步變化">
+        <defs>
+          <marker id="vg-w-tabs-meta-ingest-migration-arr"
+                  markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
+            <path d="M0,0 L6,3 L0,6 Z" fill="var(--muted)"/>
+          </marker>
+        </defs>
+
+        <text x="240" y="22" text-anchor="middle" fill="var(--ink)" class="axis-text title">
+          每階段的 control-plane 快照
+        </text>
+
+        <!-- Stage 1: customer-owned -->
+        <g class="stage-group" id="vg-w-tabs-meta-ingest-migration-stage-1">
+          <rect x="40" y="60" width="120" height="36" rx="4" fill="none" stroke="var(--muted-2)" stroke-width="1.2"/>
+          <text x="100" y="82" text-anchor="middle" fill="var(--ink)" class="axis-text">MySQL CDC</text>
+
+          <line x1="160" y1="78" x2="200" y2="78" stroke="var(--muted)" stroke-width="1"
+                marker-end="url(#vg-w-tabs-meta-ingest-migration-arr)"/>
+
+          <rect x="200" y="48" width="240" height="100" rx="6" fill="var(--accent)" fill-opacity="0.06"
+                stroke="var(--accent)" stroke-width="1.5" stroke-dasharray="4,3"/>
+          <text x="320" y="68" text-anchor="middle" fill="var(--accent-text)" class="axis-text">customer-owned glue</text>
+
+          <rect x="216" y="80" width="64" height="32" rx="3" fill="none" stroke="var(--accent)" stroke-width="1"/>
+          <text x="248" y="100" text-anchor="middle" fill="var(--ink)" class="axis-text">team A</text>
+          <rect x="288" y="80" width="64" height="32" rx="3" fill="none" stroke="var(--accent)" stroke-width="1"/>
+          <text x="320" y="100" text-anchor="middle" fill="var(--ink)" class="axis-text">team B</text>
+          <rect x="360" y="80" width="64" height="32" rx="3" fill="none" stroke="var(--accent)" stroke-width="1"/>
+          <text x="392" y="100" text-anchor="middle" fill="var(--ink)" class="axis-text">team C</text>
+
+          <text x="320" y="130" text-anchor="middle" fill="var(--muted)" class="axis-text">每隊各自寫 Spark job</text>
+
+          <rect x="60" y="240" width="360" height="80" rx="6" fill="none" stroke="var(--accent)" stroke-width="1.2" stroke-dasharray="4,3"/>
+          <text x="240" y="262" text-anchor="middle" fill="var(--accent-text)" class="axis-text">控制面散在數百條 pipeline</text>
+          <text x="240" y="280" text-anchor="middle" fill="var(--muted)" class="axis-text">landing time SLA 越收越緊就撐不住</text>
+          <text x="240" y="300" text-anchor="middle" fill="var(--muted)" class="axis-text">data quality 沒有單一 oncall 可以看完</text>
+        </g>
+
+        <!-- Stage 2: batch curation -->
+        <g class="stage-group" id="vg-w-tabs-meta-ingest-migration-stage-2">
+          <rect x="40" y="60" width="120" height="36" rx="4" fill="none" stroke="var(--muted-2)" stroke-width="1.2"/>
+          <text x="100" y="82" text-anchor="middle" fill="var(--ink)" class="axis-text">job inventory</text>
+
+          <line x1="160" y1="78" x2="200" y2="78" stroke="var(--muted)" stroke-width="1"
+                marker-end="url(#vg-w-tabs-meta-ingest-migration-arr)"/>
+
+          <rect x="200" y="48" width="240" height="100" rx="6" fill="var(--ink-deep)" fill-opacity="0.06"
+                stroke="var(--ink-deep)" stroke-width="1.5"/>
+          <text x="320" y="68" text-anchor="middle" fill="var(--ink-deep)" class="axis-text">curated batches</text>
+
+          <rect x="216" y="80" width="64" height="32" rx="3" fill="none" stroke="var(--ink-deep)" stroke-width="1"/>
+          <text x="248" y="100" text-anchor="middle" fill="var(--ink-deep)" class="axis-text">high-thru</text>
+          <rect x="288" y="80" width="64" height="32" rx="3" fill="none" stroke="var(--ink-deep)" stroke-width="1"/>
+          <text x="320" y="100" text-anchor="middle" fill="var(--ink-deep)" class="axis-text">priority</text>
+          <rect x="360" y="80" width="64" height="32" rx="3" fill="none" stroke="var(--ink-deep)" stroke-width="1"/>
+          <text x="392" y="100" text-anchor="middle" fill="var(--ink-deep)" class="axis-text">special</text>
+
+          <text x="320" y="130" text-anchor="middle" fill="var(--muted)" class="axis-text">known-issue job 暫時排除</text>
+
+          <rect x="60" y="240" width="360" height="80" rx="6" fill="none" stroke="var(--ink-deep)" stroke-width="1.2" stroke-dasharray="4,3"/>
+          <text x="240" y="262" text-anchor="middle" fill="var(--ink-deep)" class="axis-text">批次互相獨立、可以排隊處理</text>
+          <text x="240" y="280" text-anchor="middle" fill="var(--muted)" class="axis-text">snapshot partition 從 legacy 拿來當初始</text>
+          <text x="240" y="300" text-anchor="middle" fill="var(--muted)" class="axis-text">省掉「slow and expensive」的 full dump</text>
+        </g>
+
+        <!-- Stage 3: shadow -->
+        <g class="stage-group" id="vg-w-tabs-meta-ingest-migration-stage-3">
+          <rect x="40" y="60" width="100" height="36" rx="4" fill="none" stroke="var(--muted-2)" stroke-width="1.2"/>
+          <text x="90" y="82" text-anchor="middle" fill="var(--ink)" class="axis-text">CDC log</text>
+
+          <line x1="140" y1="78" x2="180" y2="58" stroke="var(--muted)" stroke-width="1"
+                marker-end="url(#vg-w-tabs-meta-ingest-migration-arr)"/>
+          <line x1="140" y1="78" x2="180" y2="98" stroke="var(--accent)" stroke-width="1"
+                marker-end="url(#vg-w-tabs-meta-ingest-migration-arr)"/>
+
+          <rect x="180" y="40" width="120" height="36" rx="4" fill="none"
+                stroke="var(--muted-2)" stroke-width="1.2"/>
+          <text x="240" y="62" text-anchor="middle" fill="var(--ink)" class="axis-text">prod job</text>
+
+          <rect x="180" y="92" width="120" height="36" rx="4" fill="var(--accent)" fill-opacity="0.08"
+                stroke="var(--accent)" stroke-width="1.5"/>
+          <text x="240" y="114" text-anchor="middle" fill="var(--accent-text)" class="axis-text">shadow job</text>
+
+          <line x1="300" y1="58" x2="340" y2="58" stroke="var(--muted)" stroke-width="1"
+                marker-end="url(#vg-w-tabs-meta-ingest-migration-arr)"/>
+          <line x1="300" y1="110" x2="340" y2="110" stroke="var(--accent)" stroke-width="1"
+                marker-end="url(#vg-w-tabs-meta-ingest-migration-arr)"/>
+
+          <rect x="340" y="40" width="100" height="36" rx="4" fill="none" stroke="var(--muted-2)" stroke-width="1.2"/>
+          <text x="390" y="62" text-anchor="middle" fill="var(--ink)" class="axis-text">prod table</text>
+          <rect x="340" y="92" width="100" height="36" rx="4" fill="none" stroke="var(--accent)" stroke-width="1.5"/>
+          <text x="390" y="114" text-anchor="middle" fill="var(--accent-text)" class="axis-text">shadow table</text>
+
+          <line x1="390" y1="76" x2="390" y2="92" stroke="var(--ink-deep)" stroke-width="1.5"
+                stroke-dasharray="3,3" marker-end="url(#vg-w-tabs-meta-ingest-migration-arr)"/>
+          <text x="436" y="86" fill="var(--ink-deep)" class="axis-text">hourly diff</text>
+
+          <rect x="60" y="240" width="360" height="80" rx="6" fill="none" stroke="var(--accent)" stroke-width="1.2" stroke-dasharray="4,3"/>
+          <text x="240" y="262" text-anchor="middle" fill="var(--accent-text)" class="axis-text">row count + checksum 比對、mismatch 落 Scuba</text>
+          <text x="240" y="280" text-anchor="middle" fill="var(--muted)" class="axis-text">附 sample row 與 debug context、可定位到 span</text>
+          <text x="240" y="300" text-anchor="middle" fill="var(--muted)" class="axis-text">downstream 仍只讀 prod table、shadow 對外不見</text>
+        </g>
+
+        <!-- Stage 4: reverse shadow -->
+        <g class="stage-group" id="vg-w-tabs-meta-ingest-migration-stage-4">
+          <rect x="40" y="60" width="100" height="36" rx="4" fill="none" stroke="var(--muted-2)" stroke-width="1.2"/>
+          <text x="90" y="82" text-anchor="middle" fill="var(--ink)" class="axis-text">CDC log</text>
+
+          <line x1="140" y1="78" x2="180" y2="58" stroke="var(--sage)" stroke-width="1"
+                marker-end="url(#vg-w-tabs-meta-ingest-migration-arr)"/>
+          <line x1="140" y1="78" x2="180" y2="98" stroke="var(--muted)" stroke-width="1"
+                marker-end="url(#vg-w-tabs-meta-ingest-migration-arr)"/>
+
+          <rect x="180" y="40" width="120" height="36" rx="4" fill="var(--sage-deep)" fill-opacity="0.08"
+                stroke="var(--sage-deep)" stroke-width="1.5"/>
+          <text x="240" y="62" text-anchor="middle" fill="var(--sage-deep)" class="axis-text">new job (promoted)</text>
+
+          <rect x="180" y="92" width="120" height="36" rx="4" fill="none"
+                stroke="var(--muted-2)" stroke-width="1.2"/>
+          <text x="240" y="114" text-anchor="middle" fill="var(--muted)" class="axis-text">legacy job (shadow)</text>
+
+          <line x1="300" y1="58" x2="340" y2="58" stroke="var(--sage)" stroke-width="1"
+                marker-end="url(#vg-w-tabs-meta-ingest-migration-arr)"/>
+          <line x1="300" y1="110" x2="340" y2="110" stroke="var(--muted)" stroke-width="1"
+                marker-end="url(#vg-w-tabs-meta-ingest-migration-arr)"/>
+
+          <rect x="340" y="40" width="100" height="36" rx="4" fill="var(--sage-deep)" fill-opacity="0.08"
+                stroke="var(--sage-deep)" stroke-width="1.5"/>
+          <text x="390" y="62" text-anchor="middle" fill="var(--sage-deep)" class="axis-text">prod table</text>
+          <rect x="340" y="92" width="100" height="36" rx="4" fill="none" stroke="var(--muted-2)" stroke-width="1.2"/>
+          <text x="390" y="114" text-anchor="middle" fill="var(--muted)" class="axis-text">shadow table</text>
+
+          <line x1="390" y1="76" x2="390" y2="92" stroke="var(--ink-deep)" stroke-width="1.5"
+                stroke-dasharray="3,3" marker-end="url(#vg-w-tabs-meta-ingest-migration-arr)"/>
+          <text x="436" y="86" fill="var(--ink-deep)" class="axis-text">仍在比對</text>
+
+          <rect x="60" y="240" width="360" height="80" rx="6" fill="none" stroke="var(--sage-deep)" stroke-width="1.2" stroke-dasharray="4,3"/>
+          <text x="240" y="262" text-anchor="middle" fill="var(--sage-deep)" class="axis-text">backfill 同時在新舊兩邊跑、結果比對</text>
+          <text x="240" y="280" text-anchor="middle" fill="var(--muted)" class="axis-text">不一致就在 consumer 看到前 trigger rollback</text>
+          <text x="240" y="300" text-anchor="middle" fill="var(--muted)" class="axis-text">downstream 已切讀新表、legacy 是備胎</text>
+        </g>
+
+        <!-- Stage 5: cleanup -->
+        <g class="stage-group" id="vg-w-tabs-meta-ingest-migration-stage-5">
+          <rect x="40" y="60" width="100" height="36" rx="4" fill="none" stroke="var(--muted-2)" stroke-width="1.2"/>
+          <text x="90" y="82" text-anchor="middle" fill="var(--ink)" class="axis-text">CDC log</text>
+
+          <line x1="140" y1="78" x2="180" y2="78" stroke="var(--sage)" stroke-width="1"
+                marker-end="url(#vg-w-tabs-meta-ingest-migration-arr)"/>
+
+          <rect x="180" y="60" width="140" height="36" rx="4" fill="var(--sage-deep)" fill-opacity="0.08"
+                stroke="var(--sage-deep)" stroke-width="1.5"/>
+          <text x="250" y="82" text-anchor="middle" fill="var(--sage-deep)" class="axis-text">platform-managed job</text>
+
+          <line x1="320" y1="78" x2="360" y2="78" stroke="var(--sage)" stroke-width="1"
+                marker-end="url(#vg-w-tabs-meta-ingest-migration-arr)"/>
+
+          <rect x="360" y="60" width="100" height="36" rx="4" fill="var(--sage-deep)" fill-opacity="0.08"
+                stroke="var(--sage-deep)" stroke-width="1.5"/>
+          <text x="410" y="82" text-anchor="middle" fill="var(--sage-deep)" class="axis-text">prod table</text>
+
+          <rect x="180" y="110" width="140" height="36" rx="4" fill="none"
+                stroke="var(--muted-2)" stroke-width="1.2" stroke-dasharray="4,3"/>
+          <text x="250" y="132" text-anchor="middle" fill="var(--muted)" class="axis-text">legacy retired</text>
+
+          <rect x="360" y="110" width="100" height="36" rx="4" fill="none"
+                stroke="var(--muted-2)" stroke-width="1.2" stroke-dasharray="4,3"/>
+          <text x="410" y="132" text-anchor="middle" fill="var(--muted)" class="axis-text">shadow gone</text>
+
+          <rect x="60" y="240" width="360" height="80" rx="6" fill="none" stroke="var(--sage-deep)" stroke-width="1.2" stroke-dasharray="4,3"/>
+          <text x="240" y="262" text-anchor="middle" fill="var(--sage-deep)" class="axis-text">platform 收編完成、legacy 路徑釋放</text>
+          <text x="240" y="280" text-anchor="middle" fill="var(--muted)" class="axis-text">100% workload 在 self-managed 服務上跑</text>
+          <text x="240" y="300" text-anchor="middle" fill="var(--muted)" class="axis-text">control plane 統一到一條 oncall 線</text>
+        </g>
+      </svg>
+    </div>
+
+    <!-- No JS: tab + stage-group visibility driven entirely by CSS :has(:checked). -->
+    <figcaption>5 階段的 migration lifecycle——點上方 tab 切換，下方 SVG 同步顯示該階段的 control plane 快照。重點不是「方塊變色」而是「這一段在驗證什麼、bad data 從哪裡會跑出來」。</figcaption>
+  </figure>
+
+  <h2>為什麼不能用維護視窗——PB/day 寫入下的時序壓力</h2>
+
+  <p>
+    Meta 的數字：每天 several petabytes of social graph data 從 MySQL 走 CDC 進 warehouse；後面有 tens of thousands 的 ingestion job 加工成各 product table。這條 path 沒辦法「暫停半小時」——CDC 是 incremental、下游讀分鐘級 partition，停掉等於上游 backlog 撐爆 buffer + 下游 staleness 同時惡化。30 分鐘維護視窗就是 TB 級補追，catch-up 跟 live stream 競爭 IO 在某些壓力曲線下會發散——永遠追不上、最終 OOM。
+  </p>
+
+  <p>
+    這就是為什麼「dual-run + 對帳」是這類遷移的唯一可行解：新舊兩條 path 都跑、舊的負責出 production、新的在 shadow 跑——shadow 出錯不會打到 consumer，但能即時量出「新版跟舊版差多少」。把這個量出來，才有勇氣把讀切過去。MySQL 沒有原生「snapshot at T」接口，新舊兩邊只能靠 CDC binlog 當共同 ground truth、stateless consumer 各自累積 state——這個 invariant 決定了 dual-run 的設計形狀。
+  </p>
+
+  <pre data-kind="config"><code><em># PB/day 寫入下「不能用維護視窗」的算術</em>
+write_rate           ≈ several PB / day ≈ tens of GB / s 持續
+maintenance window   = 30 min hypothetical
+backlog_during_pause ≈ write_rate × 30 min ≈ 多個 TB
+catch_up_capacity    ≈ peak_throughput − live_rate  <em>// 小於 live_rate 自己</em>
+catch_up_time        ≈ backlog / catch_up_capacity  <em>// 數小時起跳</em>
+risk_during_catchup  = live stream 與 backlog 互搶資源 → cascade
+
+<em># 唯一可行的設計：新舊並行、永遠不停寫、用對帳取代「切換瞬間」</em>
+</code></pre>
+
+  <p>
+    這個限制規定了 batch curation——幾萬個 job 不可能同時上 shadow。三個 axis（throughput / priority / special-case）讓 oncall 排序時有可操作維度；Meta 的「avoided creating shadow jobs with unresolved issues」是把 full dump 資源花在會通過 verification 的 job 上。Snapshot reuse 進一步把新 job 從 legacy snapshot 起跑、只追 incremental，第一個 hour 就能產生有意義 diff。
+  </p>
+
+  <h2>Shadow phase 怎麼把「差異」變成可操作的訊號</h2>
+
+  <p>
+    Shadow phase 的核心是一個 custom analysis 工具：每小時對 prod / shadow 對應 partition 算 row count + checksum（row count 抓 drop / duplicate，checksum 抓 transform 錯誤），mismatch 寫進 Scuba 附 sample row。Oncall 直接從 alert 跳到 root cause，不必翻 log。
+  </p>
+
+  <p>
+    下面這個 timeline scrubber 把 shadow phase 裡「partition 出現 divergence → control plane 反應 → consumer 沒看到 bad data」這個 6 小時序列攤開——拖動 handle 看每個時點 system 在做什麼。重點在於：consumer 從頭到尾讀的都是 production table，shadow 在另一條 path 跑，這個分離讓 control plane 有時間 react 而不會把 bad data 推給下游。
+  </p>
+
+  <figure class="vg-w-scrub-meta-divergence-timeline" data-svg-scroll="720">
+    <p class="vg-w-affordance"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m18 8 4 4-4 4"/><path d="M2 12h20"/><path d="m6 8-4 4 4 4"/></svg><span>drag slider to scrub through 7 events over 6 hours</span></p>
+    <style>
+      .vg-w-scrub-meta-divergence-timeline { display: grid; gap: var(--s-2); margin: var(--s-4) 0; }
+      .vg-w-scrub-meta-divergence-timeline > svg.timeline-svg { width: 100%; height: auto; }
+      .vg-w-scrub-meta-divergence-timeline .scrub-control { display: flex; align-items: center; gap: var(--s-2); padding: 0 var(--s-2); }
+      .vg-w-scrub-meta-divergence-timeline .scrub-control label { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); flex: 0 0 auto; }
+      .vg-w-scrub-meta-divergence-timeline input[type="range"] { flex: 1 1 auto; height: 36px; accent-color: var(--accent); touch-action: none; cursor: ew-resize; }
+      .vg-w-scrub-meta-divergence-timeline .state { font-family: var(--serif); font-size: var(--fs-sm); padding: var(--s-2) var(--s-3); background: var(--bg-soft); border-left: 2px solid var(--accent); }
+      .vg-w-scrub-meta-divergence-timeline .state strong { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); display: block; margin-bottom: var(--s-1); }
+      .vg-w-scrub-meta-divergence-timeline figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+
+    <svg class="timeline-svg" viewBox="0 0 720 140" role="img"
+         aria-label="Shadow phase 一個 partition 出現 divergence 的 6 小時時序——拖動下方 slider 查看每個時點的系統狀態">
+      <!-- backdrop band: production vs shadow lanes -->
+      <rect x="40" y="36" width="640" height="20" fill="var(--muted-2)" fill-opacity="0.3" rx="2"/>
+      <text x="32" y="50" text-anchor="end" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">prod</text>
+      <rect x="40" y="64" width="640" height="20" fill="var(--accent)" fill-opacity="0.1" rx="2"/>
+      <text x="32" y="78" text-anchor="end" font-family="Manrope, sans-serif" font-size="11" fill="var(--accent-text)">shadow</text>
+
+      <line x1="40" y1="100" x2="680" y2="100" stroke="var(--muted-2)" stroke-width="1.5"/>
+
+      <g id="vg-w-scrub-meta-divergence-timeline-events"></g>
+
+      <line id="vg-w-scrub-meta-divergence-timeline-handle-line" x1="40" y1="28" x2="40" y2="116" stroke="var(--accent)" stroke-width="2"/>
+      <circle id="vg-w-scrub-meta-divergence-timeline-handle" cx="40" cy="100" r="6" fill="var(--accent)" pointer-events="none"/>
+      <text id="vg-w-scrub-meta-divergence-timeline-clock" x="40" y="22" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--ink)">t=0:00</text>
+    </svg>
+
+    <div class="scrub-control">
+      <label for="vg-w-scrub-meta-divergence-timeline-range">scrub</label>
+      <input type="range" id="vg-w-scrub-meta-divergence-timeline-range" min="0" max="360" value="0" step="1" aria-label="scrub timeline from t=0:00 to t=6:00"/>
+    </div>
+
+    <div class="state" id="vg-w-scrub-meta-divergence-timeline-state">
+      <strong>t=0:00 · CDC stream</strong>
+      Prod 與 shadow 同時消同一條 CDC log、各自寫 partition。整點剛跑完 diff job、row count 與 checksum 完全 match。
+    </div>
+
+    <figcaption>
+      Shadow phase 的一個 6 小時切片——上層 lane 是 production（consumer 一直在讀的）、下層是 shadow。
+      hourly diff job 每整點跑一次；divergence 出現後 control plane 的 quarantine、investigation、 fix
+      都在 shadow lane 處理，prod 完全不受影響。
+    </figcaption>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-scrub-meta-divergence-timeline');
+        if (!root) return;
+        const svg = root.querySelector('svg.timeline-svg');
+        const handle = root.querySelector('#vg-w-scrub-meta-divergence-timeline-handle');
+        const handleLine = root.querySelector('#vg-w-scrub-meta-divergence-timeline-handle-line');
+        const clock = root.querySelector('#vg-w-scrub-meta-divergence-timeline-clock');
+        const stateDiv = root.querySelector('#vg-w-scrub-meta-divergence-timeline-state');
+        const eventsG = root.querySelector('#vg-w-scrub-meta-divergence-timeline-events');
+        const range = root.querySelector('#vg-w-scrub-meta-divergence-timeline-range');
+
+        const events = [
+          [0,   'normal',     'CDC stream',
+            'Prod 與 shadow 同時消同一條 CDC log、各自寫 partition。整點剛跑完 diff job、row count 與 checksum 完全 match。'],
+          [60,  'normal',     '+1h diff ok',
+            '又一個整點 diff job 跑完——這個小時的兩條 partition 同樣 zero divergence。downstream consumer 一直在讀 prod，對 shadow 的存在毫無感知。'],
+          [120, 'div',        'quarantine',
+            't=2:00 的 diff job 報告：shadow partition 的 row count 比 prod 多了 1.3%、其中 12 個 sample row 的某欄位 checksum 不一致。系統幾秒內就在 shadow partition 上標 quality-issue metadata（受影響的是 shadow，不是 prod）；alert 寫到 Scuba、附 sample row 與 schema diff。Prod 路徑完全不受影響、consumer 持續讀 prod。'],
+          [160, 'investigate','root cause',
+            'Oncall 從 alert 跳到 sample row、發現是 shadow 端的 type cast 把 null 處理成 0 而 prod 端保留 null。判定為 shadow job 的 bug、不是 schema drift。'],
+          [240, 'fix',        'patch',
+            'Shadow job 部署修正、重新處理涵蓋這段時間的 input range。修正後寫到一個新的 delta partition；舊 partition 仍標著 quality-issue。'],
+          [300, 'merge',      'recover',
+            'Reconciliation 工具偵測到 fixed delta、把它跟舊 target partition 的 unaffected 部分合併出新 candidate。下個整點 diff 重跑，zero divergence——shadow partition 重新乾淨。'],
+          [360, 'green',      'back to normal',
+            '連續一個整點 zero divergence，shadow 進入「累積 cutover 信用」的計時段。Prod 從頭到尾沒有讀到任何 bad data。'],
+        ];
+        const T_MAX = 360;
+        const X0 = 40, X1 = 680;
+        const xOf = t => X0 + (t / T_MAX) * (X1 - X0);
+
+        const NS = 'http://www.w3.org/2000/svg';
+        const colorMap = {
+          normal: 'var(--muted)',
+          div: 'var(--accent)',
+          quarantine: 'var(--accent-text)',
+          investigate: 'var(--ink-deep)',
+          fix: 'var(--ink-deep)',
+          merge: 'var(--sage-deep)',
+          green: 'var(--sage-deep)',
+        };
+
+        for (const [t, kind, label] of events) {
+          const c = document.createElementNS(NS, 'circle');
+          c.setAttribute('cx', xOf(t)); c.setAttribute('cy', 100); c.setAttribute('r', 5);
+          c.setAttribute('fill', colorMap[kind] || 'var(--muted)');
+          eventsG.appendChild(c);
+          const tx = document.createElementNS(NS, 'text');
+          tx.setAttribute('x', xOf(t)); tx.setAttribute('y', 130);
+          tx.setAttribute('text-anchor', 'middle');
+          tx.setAttribute('font-family', 'Manrope, sans-serif');
+          tx.setAttribute('font-size', 11);
+          tx.setAttribute('fill', colorMap[kind] || 'var(--muted)');
+          tx.textContent = label;
+          eventsG.appendChild(tx);
+        }
+
+        function fmtTime(t) {
+          const m = Math.floor(t / 60), s = Math.floor(t % 60);
+          return `t=${m}:${String(s).padStart(2, '0')}`;
+        }
+        function update(t) {
+          const x = xOf(t);
+          handle.setAttribute('cx', x);
+          handleLine.setAttribute('x1', x); handleLine.setAttribute('x2', x);
+          clock.setAttribute('x', x);
+          clock.textContent = fmtTime(t);
+          let active = events[0];
+          for (const e of events) if (e[0] <= t) active = e;
+          stateDiv.innerHTML = `<strong>t=${Math.floor(active[0]/60)}:${String(active[0]%60).padStart(2,'0')} · ${active[2]}</strong>${active[3]}`;
+        }
+
+        range.addEventListener('input', () => update(Number(range.value)));
+        // initial sync
+        update(0);
+      })();
+    </script>
+  </figure>
+
+  <p>
+    這個 timeline 的關鍵不是「事件本身」，而是 prod 與 shadow 兩條 lane 始終是分開的：divergence 發生在 shadow lane、quarantine 與 fix 都在 shadow lane 處理、reconciliation 把 fixed delta merge 回 shadow 的 target，整個過程 prod lane 上沒有任何動作——consumer 從頭到尾讀的都是「validated 過、來自 legacy job」的 prod partition。把這個 invariant 守住，shadow job 出 bug 才不會變成 user-facing 事故。
+  </p>
+
+  <p>
+    再仔細看這 6 小時序列，有幾個 design choice 值得拆解。第一個是 t=125 那個 quarantine 動作——它是「shadow 自己標自己」，沒有任何人工介入。在 customer-owned ingestion 時代，「partition 有問題」通常是 downstream consumer 抱怨後 oncall 才發現；platform 化之後把這個發現提前到 reconciler 自動偵測，從「事後追溯」變成「事中標記」。這個轉變不只是 alert 來得更早，而是讓 quarantine 動作可以自動化——人不需要在 alert 觸發後再去手動標 partition、設 routing 規則，因為 quality metadata 本身就是 platform 認可的 routing input。
+  </p>
+
+  <p>
+    第二個是 t=240 那個 fix 動作的形狀。fix 不是「修改既有 partition 的內容」（那會破壞 immutability），而是「產出一個 delta partition 放在另一個 location、reconciler 把它跟 unaffected 舊資料合併出新 candidate」。這個 immutable + delta + merge 的 pattern 跟 LSM tree、Apache Iceberg / Delta Lake 的 time-travel 機制是同一套思想——把 quality 修正當成 append-only 操作，而不是 destructive update。這也意味著歷史上每個版本的 partition 都保留下來，後續做 forensic / audit / lineage 追蹤時不會卡在「上週的版本被覆蓋了」。
+  </p>
+
+  <p>
+    第三個是 t=300 的 reconciliation merge。Merge 不是 union——是 reconciler 拿 fixed delta 跟 older clean 的 partition unaffected 部分合併出 new candidate。這個 candidate 通過下一輪 hourly diff 才會被 promote 成 production-visible 的 partition。Merge 與 verification 是分開的兩步——這層 buffer 讓「修正本身可能有 bug」這種情境也有 rollback 視窗：如果合併出來的 candidate 在下一輪 diff 仍 fail，可以再退一步、不會直接污染 production。
+  </p>
+
+  <p>
+    Meta 文章裡花了相當篇幅描述一個機制——partition 級別的 quality metadata：當 diff 偵測到問題時，系統會在那個 partition 的 metadata 上標 quality-issue。但「partition 被標」不等於「partition 被刪除」，這個區分很關鍵：
+  </p>
+
+  <ul>
+    <li><strong>Delta partition（incremental 新寫入的）</strong>被標時，系統會 block 新資料寫進 target、同時 trigger alert。但已經在 target 裡的歷史資料不動。</li>
+    <li><strong>Target partition（accumulated state）</strong>被標時，系統會挑選一個 older clean partition、跟未受影響的 delta 們合併成新的 candidate target——讓「partition 有問題」這件事不會 cascade 成「整段歷史不可用」。</li>
+  </ul>
+
+  <p>
+    這個區分本質上是把 partition 看成 immutable snapshot：bad data 出現時不是 in-place 修改，而是另起一個 version、舊 version 保留以便 forensic。這跟 git 的 commit history 是同一個結構——壞掉的不刪，但 production 指針指到 known-good。
+  </p>
+
+  <p>
+    這也是為什麼「先 quarantine、再 fix」比「邊跑邊 patch」安全：quarantine 把 bad partition 從 query path 上移除（query 自動轉到 older clean），fix 在另一條 path 跑、產出 delta、reconciliation 再 merge——任何時刻 consumer 看到的都是 verified-clean 的視圖。
+  </p>
+
+  <p>
+    這套機制對下游 consumer 的契約有一個很關鍵但不顯眼的影響——consumer 看到的「partition X 的內容」是隨時間變化的。剛 commit 時 consumer 看到 version A；如果 reconciler 偵測到 divergence 並用 fixed delta merge，後續 query 同一個 partition X 看到的是 version B。對 idempotent 的下游（每次重跑都重新讀 partition）這沒問題；對 stateful 的下游（已經把 partition X 的 aggregate 算進 weekly metric）就需要對應的 invalidation 機制——partition 的 quality metadata 改變要 propagate 成「下游 cache invalidation 訊號」。Meta 沒詳細描述這層 propagation，但這是任何採用 partition-level quality 機制都必須處理的二階問題。
+  </p>
+
+  <p>
+    另一個 implicit 的設計選擇是 partition 粒度本身。如果 partition 太大（例如「整個產品 line 一天的所有 user event」），quarantine 一個 partition 就 freeze 掉一大塊 query；太小（例如「每個 user 每 5 分鐘」）的話 metadata overhead 與 reconciler 工作量都會爆炸。實際做法通常是「按 time window + 按 logical shard key」雙維度切——time window 提供「快速 quarantine」的能力，shard key 提供「diff range 不會跨太大語意邊界」的能力。Partition 粒度的選擇不在 Meta 文章中明說，但這個 axis 是 ingestion 系統設計中常被低估的關鍵變數。
+  </p>
+
+  <h2>四條驗收標準——哪一條訊號會先抓到哪一類退化</h2>
+
+  <p>
+    Shadow phase 與 reverse-shadow phase 都靠同一組「成功 criteria」來判斷一個 job 能不能 graduate 到下一段。Meta 列出四條，可以看成四個獨立的 quality gate——每條盯著一個獨立的失敗類別，少了哪一條就會漏抓對應的退化：
+  </p>
+
+  <figure class="vg-w-table-meta-success-criteria">
+    <p class="vg-w-affordance"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21 16-4 4-4-4"/><path d="M17 20V4"/><path d="m3 8 4-4 4 4"/><path d="M7 4v16"/></svg><span>click column header to sort · 4 columns × 4 rows</span></p>
+    <style>
+      .vg-w-table-meta-success-criteria { margin: var(--s-4) 0; overflow-x: auto; }
+      .vg-w-table-meta-success-criteria table { width: 100%; min-width: 560px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-meta-success-criteria thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; }
+      .vg-w-table-meta-success-criteria thead th[data-sort] { color: var(--accent-text); }
+      .vg-w-table-meta-success-criteria thead th[data-sort="asc"]::after { content: " ↑"; }
+      .vg-w-table-meta-success-criteria thead th[data-sort="desc"]::after { content: " ↓"; }
+      .vg-w-table-meta-success-criteria tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+      .vg-w-table-meta-success-criteria figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-2); }
+    </style>
+    <table>
+      <thead>
+        <tr>
+          <th data-key="criterion">criterion</th>
+          <th data-key="signal">主要訊號</th>
+          <th data-key="catches">抓到的退化類別</th>
+          <th data-key="cadence">cadence</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>data quality</td>
+          <td>row count + checksum diff</td>
+          <td>欄位算錯、join key 錯、type cast 漏轉、row drop / duplicate</td>
+          <td>hourly</td>
+        </tr>
+        <tr>
+          <td>landing latency</td>
+          <td>partition 寫入時間 vs 預期 SLA</td>
+          <td>新 job 的 scheduling 不如舊 job、batch size 不對、resource 配置不夠</td>
+          <td>per-partition</td>
+        </tr>
+        <tr>
+          <td>resource utilization</td>
+          <td>compute / storage quota usage</td>
+          <td>新 job 的 algorithm 退化、無謂的 shuffle、memory leak、 partition fan-out 失控</td>
+          <td>continuous</td>
+        </tr>
+        <tr>
+          <td>critical-table negotiated</td>
+          <td>per-table 額外協商的指標</td>
+          <td>關鍵 table 特有的 invariant（如 schema lineage、特定欄位的 freshness）</td>
+          <td>per-table</td>
+        </tr>
+      </tbody>
+    </table>
+    <figcaption>
+      四條 criterion 各自盯著不同失敗類別——少了 data quality 你會送出錯的數字、少了 latency 你會踩 SLA、
+      少了 resource usage 你會付雙倍帳單但跑同樣資料、少了 critical-table negotiation 你會在重要 table 上出 surprise。
+      點欄位 header 排序。
+    </figcaption>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-table-meta-success-criteria');
+        if (!root) return;
+        const headers = root.querySelectorAll('thead th');
+        const tbody = root.querySelector('tbody');
+        let activeKey = null, asc = true;
+        headers.forEach(h => h.addEventListener('click', () => {
+          const key = h.dataset.key;
+          if (activeKey === key) { asc = !asc; } else { activeKey = key; asc = true; }
+          headers.forEach(x => x.removeAttribute('data-sort'));
+          h.setAttribute('data-sort', asc ? 'asc' : 'desc');
+          const rows = [...tbody.querySelectorAll('tr')];
+          const idx = [...headers].indexOf(h);
+          rows.sort((a, b) => {
+            const av = a.children[idx].textContent.trim();
+            const bv = b.children[idx].textContent.trim();
+            return asc ? av.localeCompare(bv) : bv.localeCompare(av);
+          });
+          rows.forEach(r => tbody.appendChild(r));
+        }));
+      })();
+    </script>
+  </figure>
+
+  <p>
+    四條 criterion 不是「冗餘的安全網」，而是各自抓不同類別的退化——這也是為什麼 Meta 強調要全部過：data quality 是 correctness 的最後一道牆，latency 是 SLA 的 leading indicator，resource utilization 是成本與效率的訊號，critical-table negotiation 是針對特定 table 的 special-case invariant（例如 ads ranking feature 對 freshness 的特殊要求、ML feature pipeline 對 schema lineage 的精確期待）。
+  </p>
+
+  <p>
+    為什麼要把 critical-table 那條單獨拉出來而不靠前三條 cover？因為前三條是 generic 的指標——抓得到普遍類別的退化（row count diff、SLA miss、quota usage），但抓不到 table-specific 的語意 invariant。一張 ads ranking feature table 可能要求「partition 的 feature freshness 必須 ≤ 5 分鐘且 zero null in feature_X column」——這個是 row count 與 checksum 都看不出來的，只能跟那張 table 的 owner 協商出特定指標。Generic 機制做大方向、per-table negotiation 收尾巴。
+  </p>
+
+  <p>
+    四條 criterion 之間還有時序的順序：data quality 是 blocker（不過就直接 fail）、landing latency 是 alert-and-investigate（退化但仍 within tolerance 可以繼續，明確 regression 才 block）、resource utilization 是 trend signal（不單看絕對值，看是否朝壞方向漂）、critical-table negotiated 是 per-table 約定（owner 簽字才算過）。這個 stacked structure 讓 graduation 決策不是「全部達標就放行」的 binary——而是「先過 quality 硬指標、再看 latency 是否在容忍範圍、再看資源使用趨勢、最後跟 critical owner 確認」的階梯式 check。
+  </p>
+
+  <p>
+    這四條判準合起來界定了「一個 job 算搬完了沒」——不是「跑得通」，而是「在四個獨立 axis 上都不退化」。從 oncall 的角度看，這也意味著一個 job 可能在 data quality 通過但 latency 退化、或 latency 持平但 resource 翻倍，每種狀況都對應不同 root cause 與不同的 fix path。
+  </p>
+
+  <p>
+    舉個具體場景：shadow job 的 data quality 完美 match prod、但 landing latency 從 prod 的 12 分鐘變成 25 分鐘——這通常不是 algorithm bug，而是 batch size 或 scheduling 配置問題。可能要把 trigger 從「partition close」改成「rolling window」、可能要調整 executor 數量、可能要把 stage boundary 重新切。資源使用偏高（compute 翻倍但結果一樣）幾乎一定是 algorithm 退化——多了無謂的 shuffle 或重複的 scan。Quality 退化但 latency / resource 正常的場景最危險——可能是 schema 假設改變、可能是 type coercion 行為不同、可能是 NULL handling semantic 微妙差異。這類錯誤從 system metric 看不出來，只能靠 row-level diff 抓到。四條 criterion 對應的 root cause 區分，是 oncall 在收到 alert 時節省 debug 時間的關鍵。
+  </p>
+
+  <h2>Reverse shadow——為什麼要把舊 job 留下來、不一刀切</h2>
+
+  <p>
+    Reverse-shadow phase 是這套方法最容易被誤解的一段。直覺上「shadow 通過了 → 把新版升為 prod → 刪舊版」聽起來很乾脆，但 Meta 故意不這樣做——而是讓新 job 升為 prod 寫 production table、原本的 prod job 降級為 shadow 寫 shadow table，比對機制不下線。
+  </p>
+
+  <p>
+    這個選擇的關鍵不在「萬一新版有問題怎麼辦」這種一次性切換的考量，而是要持續產生 data-quality signal。Shadow phase 證明的是「過去這段時間，新版輸出跟舊版輸出夠接近」；但 production 環境的 input 分佈、容量壓力、edge case 隨時間飄移——昨天 match 的 job 不保證明天還 match。Reverse-shadow 把對照組保留下來，這樣 cutover 後仍能即時偵測「新版開始跟舊版分歧」——可能是上游 schema 變了、可能是某種罕見 edge case 第一次出現、可能是新版 job 在更大 input 下露出 latent bug。
+  </p>
+
+  <pre data-kind="pseudocode"><code><em>// Shadow 與 reverse-shadow 的對稱性</em>
+<em>// shadow phase：</em>
+prod_table   = legacy_job(CDC_stream)
+shadow_table = new_job(CDC_stream)
+hourly: assert diff(prod_table, shadow_table) == 0  <em>// reader 讀 prod</em>
+
+<em>// 通過 N 小時 zero divergence 後 → reverse shadow：</em>
+prod_table   = new_job(CDC_stream)                  <em>// promote</em>
+shadow_table = legacy_job(CDC_stream)               <em>// demote</em>
+hourly: assert diff(prod_table, shadow_table) == 0  <em>// reader 已切讀 new (prod)，但仍有對照</em>
+
+<em>// 再通過 M 小時 → cleanup：</em>
+del legacy_job, shadow_table                        <em>// 確認沒有任何 reader 還在讀 shadow</em>
+
+<em>// 為什麼不直接從 shadow → cleanup？</em>
+<em>// 因為 cutover 那一刻的 input 與 reader 行為改變</em>
+<em>// 是一個全新的測試條件、不能用過去的 shadow 通過記錄推論</em>
+</code></pre>
+
+  <p>
+    這個對稱結構讓 rollback 變成 trivial：在 reverse-shadow 階段，如果發現新版有 regression，把讀切回 shadow（舊 job）只是改一行 routing config——不需要 hot-swap engine、replay events 或重啟。Rollback 從「rebuild + replay 數小時」壓縮成「切讀路徑 + 等下一個 partition」。對 PB/day 這不是 nice-to-have、是 hard requirement——4 小時的 rollback window 等於 4 小時的 downstream bad data。
+  </p>
+
+  <p>
+    Cleanup 的時機靠「continued monitoring」決定，不是 hardcoded 的「N 天退役」。因為 production input 有 weekly / monthly seasonality 與特殊事件——shadow phase 可能還沒見過所有 pattern。Cutover 後負載條件改變（成為 main path、被 reader 直接打），測試條件就改了；reverse-shadow 是承認這個 epistemic 限制：唯一可靠的答案是「持續對照、等證據累積」，而不是「shadow 過了所以 OK」。
+  </p>
+
+  <p>
+    下面這張 before-after 圖把 customer-owned 與 self-managed warehouse service 並排——「同樣的 CDC 入口 + 同樣的 warehouse 終點」之間，platform 把整個中段抽象化了。
+  </p>
+
+  <figure class="vg-w-ba-meta-control-plane">
+    <style>
+      .vg-w-ba-meta-control-plane { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: var(--line); border: 1px solid var(--line); margin: var(--s-4) 0; }
+      .vg-w-ba-meta-control-plane .pane { background: var(--bg); padding: var(--s-2); min-width: 0; overflow-x: auto; }
+      .vg-w-ba-meta-control-plane .pane svg { display: block; width: 100%; height: auto; max-width: 100%; }
+      .vg-w-ba-meta-control-plane figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); grid-column: 1 / -1; padding: var(--s-2) var(--s-3); background: var(--bg-soft); }
+      @media (max-width: 720px) {
+        .vg-w-ba-meta-control-plane { grid-template-columns: 1fr; }
+      }
+    </style>
+
+    <div class="pane">
+    <svg viewBox="0 0 720 400" preserveAspectRatio="xMidYMid meet">
+      <rect width="720" height="400" fill="var(--bg-soft)"/>
+      <text x="360" y="32" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">舊：customer-owned ingestion</text>
+
+      <rect x="40" y="60" width="120" height="60" rx="4" fill="none" stroke="var(--muted-2)" stroke-width="1.5"/>
+      <text x="100" y="86" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--ink)">MySQL CDC</text>
+      <text x="100" y="102" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="11" fill="var(--muted)">incremental</text>
+
+      <rect x="200" y="60" width="320" height="220" rx="6" fill="none" stroke="var(--accent)" stroke-width="1.5" stroke-dasharray="4,3"/>
+      <text x="360" y="84" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--accent-text)">customer-owned glue (per team)</text>
+
+      <rect x="220" y="100" width="80" height="40" rx="3" fill="none" stroke="var(--accent)" stroke-width="1"/>
+      <text x="260" y="124" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--ink)">Spark job</text>
+      <rect x="320" y="100" width="80" height="40" rx="3" fill="none" stroke="var(--accent)" stroke-width="1"/>
+      <text x="360" y="124" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--ink)">Spark job</text>
+      <rect x="420" y="100" width="80" height="40" rx="3" fill="none" stroke="var(--accent)" stroke-width="1"/>
+      <text x="460" y="124" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--ink)">Spark job</text>
+
+      <rect x="220" y="160" width="80" height="40" rx="3" fill="none" stroke="var(--accent)" stroke-width="1"/>
+      <text x="260" y="184" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--ink)">schema</text>
+      <rect x="320" y="160" width="80" height="40" rx="3" fill="none" stroke="var(--accent)" stroke-width="1"/>
+      <text x="360" y="184" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--ink)">schema</text>
+      <rect x="420" y="160" width="80" height="40" rx="3" fill="none" stroke="var(--accent)" stroke-width="1"/>
+      <text x="460" y="184" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--ink)">schema</text>
+
+      <text x="360" y="226" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="11" fill="var(--muted)">每隊各自寫、各自 oncall</text>
+      <text x="360" y="244" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="11" fill="var(--muted)">data quality 監控散落各處</text>
+      <text x="360" y="262" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="11" fill="var(--muted)">landing time SLA 各自定義</text>
+
+      <rect x="560" y="60" width="120" height="220" rx="4" fill="none" stroke="var(--muted-2)" stroke-width="1.5"/>
+      <text x="620" y="160" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">data</text>
+      <text x="620" y="178" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">warehouse</text>
+
+      <line x1="160" y1="90" x2="220" y2="120" stroke="var(--muted)" stroke-width="1"/>
+      <line x1="500" y1="120" x2="560" y2="120" stroke="var(--muted)" stroke-width="1"/>
+      <line x1="500" y1="180" x2="560" y2="180" stroke="var(--muted)" stroke-width="1"/>
+
+      <text x="360" y="320" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="13" fill="var(--accent-text)">control plane = 各隊的 oncall + tribal knowledge</text>
+      <text x="360" y="340" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="12" fill="var(--muted)">在 PB/day + 收緊的 landing SLA 下撐不住</text>
+    </svg>
+    </div>
+
+    <div class="pane">
+    <svg viewBox="0 0 720 400" preserveAspectRatio="xMidYMid meet">
+      <rect width="720" height="400" fill="var(--accent)" fill-opacity="0.05"/>
+      <text x="360" y="32" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--sage-deep)">新：self-managed warehouse service</text>
+
+      <rect x="40" y="60" width="120" height="60" rx="4" fill="none" stroke="var(--sage-deep)" stroke-width="1.5"/>
+      <text x="100" y="86" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--ink)">MySQL CDC</text>
+      <text x="100" y="102" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="11" fill="var(--muted)">incremental</text>
+
+      <rect x="200" y="60" width="320" height="220" rx="6" fill="var(--sage-deep)" fill-opacity="0.05" stroke="var(--sage-deep)" stroke-width="1.5"/>
+      <text x="360" y="84" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--sage-deep)">platform-managed control plane</text>
+
+      <rect x="220" y="100" width="280" height="32" rx="3" fill="none" stroke="var(--sage-deep)" stroke-width="1"/>
+      <text x="360" y="120" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--ink)">unified ingestion runtime</text>
+
+      <rect x="220" y="142" width="280" height="32" rx="3" fill="none" stroke="var(--sage-deep)" stroke-width="1"/>
+      <text x="360" y="162" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--ink)">central schema registry</text>
+
+      <rect x="220" y="184" width="280" height="32" rx="3" fill="none" stroke="var(--sage-deep)" stroke-width="1"/>
+      <text x="360" y="204" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--ink)">row-count + checksum reconciler</text>
+
+      <rect x="220" y="226" width="280" height="32" rx="3" fill="none" stroke="var(--sage-deep)" stroke-width="1"/>
+      <text x="360" y="246" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--ink)">partition quality metadata</text>
+
+      <rect x="560" y="60" width="120" height="220" rx="4" fill="none" stroke="var(--sage-deep)" stroke-width="1.5"/>
+      <text x="620" y="160" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--sage-deep)">data</text>
+      <text x="620" y="178" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--sage-deep)">warehouse</text>
+
+      <line x1="160" y1="90" x2="220" y2="116" stroke="var(--sage)" stroke-width="1"/>
+      <line x1="500" y1="200" x2="560" y2="170" stroke="var(--sage)" stroke-width="1"/>
+
+      <text x="360" y="320" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="13" fill="var(--sage-deep)">control plane = platform-owned，oncall 統一</text>
+      <text x="360" y="340" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="12" fill="var(--muted)">data quality 監控收進中央、SLA 統一定義</text>
+    </svg>
+    </div>
+
+    <figcaption>左：customer-owned glue 散在數百個 team 的 codebase 裡，control plane 等於各隊的 oncall + tribal knowledge。右：platform-managed runtime + central schema registry + 統一 reconciler + partition quality metadata——cross-cutting 工作只需要 platform 升級一次。</figcaption>
+  </figure>
+
+  <p>
+    左半邊那塊 dashed-outline 的「customer-owned glue」是整個遷移要對付的真正債務——不是「Spark job 數量太多」，而是「ingestion 控制面散在數百個團隊的 codebase 裡」。每隊有自己的 schema 約定、自己的 oncall rotation、自己的 SLA 定義；當 landing time 要從「每天」收緊到「每小時」時，沒有單一團隊能跨所有 ingestion path 統一改善——因為他們不擁有彼此的程式碼，且彼此 schema 假設不一致。
+  </p>
+
+  <p>
+    這個 ownership distribution 還有一個更深層的問題：cross-cutting concern 沒地方落。當「需要在所有 ingestion job 加一條 GDPR-compliance audit log」這種需求出現，customer-owned model 下要去拜訪數百個團隊、跟每個 team 排優先序、各自 ship 各自的版本——可能要花一年才全 fleet 部署完。Platform-owned model 下這是一次 runtime 升級，所有跑在 platform 上的 job 立刻同時生效。同樣的對比也適用於：observability schema 升級、retention policy 變更、compute backend 從 X 換到 Y、安全事件的 emergency rollback。Cross-cutting 工作的可行性是平台價值的核心，這個價值在 customer-owned 架構下無法獲得。
+  </p>
+
+  <p>
+    右半邊的 platform-managed control plane 把這層 glue 收回去：unified runtime（一條 oncall 線、一份 deployment pipeline）、central schema registry（schema 變更走標準 review 而不是各自寫 ALTER）、row-count + checksum reconciler（dataset 層級的 ground truth、不依賴 team 自己回報）、partition quality metadata（quality 是 first-class 屬性、可以被 query layer 利用）。每一塊都不複雜，難的是這四塊全部收齊、而且舊路徑同時還在運行——這就是為什麼遷移過程裡 dual-run、reconciliation、quality-tagged partition 缺一不可。
+  </p>
+
+  <p>
+    Central schema registry 在這個架構裡的角色特別關鍵。在 customer-owned 時代，schema 變更通常是「team A 想加一個欄位 → 寫 ALTER TABLE → 通知下游 team B/C/D → 各自更新 consumer → 在某個時點 deploy」——這個流程的失敗模式是「某個 consumer 沒收到通知、deploy 之後讀爆」。Central registry 把 schema 變更變成一筆 versioned commit：寫入端 declare 新 schema、讀取端的 codegen 從 registry 拉、不相容變更自動 fail-fast。Schema 變成 platform 的 first-class object 而不是 team 之間的 verbal agreement。遷移到 self-managed warehouse 帶上 central schema registry，等於把 schema drift 這類經典 bug 從 production 直接消失。
+  </p>
+
+  <p>
+    Partition quality metadata 是更被低估的一塊——它把 data quality 從「另一個 monitoring dashboard 的指標」變成「partition 自身的屬性」。Query layer 可以在執行 query 時就知道某個 partition 是不是 quarantine 狀態、是否要走 fallback 到 older clean version；ETL 下游可以根據 partition quality flag 決定是否要重跑某個 aggregation。這層 metadata 是 quality 從「事後檢查」變成「事中決策依據」的關鍵——quality 不再是 reconciler 自己關起門來看的訊號，而是 platform 上所有 consumer 都能讀的契約。
+  </p>
+
+  <h2>對讀者下週工作的具體含義</h2>
+
+  <p>
+    這套方法從 GB/day 到 PB/day 都成立——差別只是規模。把 Meta 的做法翻譯成可直接拿來檢查自己 migration plan 的清單：
+  </p>
+
+  <ol>
+    <li>
+      <strong>遷移前：盤點批次邊界</strong>。按 throughput / priority / known-issue 切成獨立批次，known-issue 那批暫時不上 shadow——避免做「明知會 fail 的雙跑」浪費 capacity，也讓 shadow alert 的 signal-to-noise ratio 不被汙染。
+    </li>
+    <li>
+      <strong>shadow 階段：reconciliation 不能是事後</strong>。每小時級別的 row count + checksum 對帳要在 day 1 就存在——不要等「跑一週看看」才上對帳。Reconciliation 工具同時要能挑 example row 並附 debug context，光報「diff 1.3%」沒辦法 debug。
+    </li>
+    <li>
+      <strong>cutover 不是切換、是 promotion + demotion</strong>。Reverse-shadow 是核心——cutover 後舊版要繼續跑當對照，這樣 input drift 與 edge case 才能被即時偵測。砍舊版是 cleanup 階段做的事。
+    </li>
+    <li>
+      <strong>quality 是 partition 屬性、不是「整個系統 OK / 不 OK」</strong>。bad partition 可以被 quarantine 而不影響其他 partition、fixed delta 可以跟 older clean 合併。出問題不再等於資料不可用。
+    </li>
+    <li>
+      <strong>cleanup 依訊號決定、不是「跑滿 N 天」</strong>。退役 legacy 看「連續多久 zero divergence」，配合 critical-table owner 確認。Hardcoded 的「跑 14 天就刪」是把信號替換成日曆。
+    </li>
+  </ol>
+
+  <p class="vg-deep-closer">
+    <strong>The lesson</strong>：PB/day 等級的 ingestion migration 沒有「big-bang cutover」這條路——dual-run + 對帳 + 顯式三段（shadow / reverse-shadow / cleanup）是時序層面唯一可行的骨架；把 partition 級別的 quality metadata 設成 first-class、把 reconciliation 跑成每小時，是讓「rollback 仍便宜」的前提；把 known-issue job 排除在 shadow 外、用 legacy snapshot 當新 job 初始狀態，是讓「對帳訊號不被 noise 淹掉」與「capacity envelope 不爆」的工程紀律。
+  </p>
+</div>

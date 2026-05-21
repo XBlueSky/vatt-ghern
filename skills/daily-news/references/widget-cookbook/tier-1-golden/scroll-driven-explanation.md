@@ -1,5 +1,24 @@
 # Tier 1 — Scroll-Driven Explanation
 
+> **BANNED — DO NOT PICK** (2026-05-21).
+>
+> User explicitly banned this pattern after repeated failures on PR #30:
+> the sticky figure leaves the viewport before stage transitions
+> complete, IntersectionObserver `rootMargin` calibration is fragile
+> across viewport sizes, and on mobile the sticky figure either
+> covers the prose or scrolls away entirely. Three iterations of
+> tuning across May 2026 did not produce a reliable result.
+>
+> **Replace with**: `tier-2-snippets/tab-switcher-pure-css.md`. Tabs
+> map naturally to "5 stages of a process" without scroll dependency,
+> have no observer calibration, work identically on mobile + desktop,
+> and pass screen readers without ARIA gymnastics.
+>
+> The body below is kept for reference only. Authors picking this
+> template at Step 7b will have their dispatch rejected at Step 7c
+> verify (widget_templates field must not include
+> `scroll-driven-explanation`).
+
 > Hero template for posts that walk through a multi-stage process where
 > each stage builds on the previous.
 

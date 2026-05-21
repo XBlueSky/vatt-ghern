@@ -156,6 +156,27 @@ should not self-censor inside these allowances.
 - `element.classList.add` / `remove` / `toggle`
 - `element.style.setProperty('--name', value)` for CSS custom property writes
 
+**Selector gotcha — DO NOT use `root.querySelector('svg')` blindly**
+(added 2026-05-21 after PR #30 scrubber bug). Interactive figures now
+carry an inline `<p class="vg-w-affordance"><svg>` as the first child
+(see `design-system.md` § Interactive-affordance hint), so a bare
+`querySelector('svg')` will return the **14×14 lucide affordance
+icon** instead of the figure's main SVG. Always target the main SVG
+with an explicit class or id:
+
+```html
+<svg class="vg-w-foo-main" viewBox="0 0 720 360"> ... </svg>
+```
+
+```js
+const svg = root.querySelector('svg.vg-w-foo-main');
+// OR target a child you'll mutate by id instead, never the svg itself
+const axes = root.querySelector('#vg-w-foo-axes');
+```
+
+Same applies to `querySelector('p')`, `querySelector('img')` etc. for
+the same reason — the affordance hint always renders first.
+
 ### Rendering primitives
 
 - Canvas 2D context (`canvas.getContext('2d')`) and its drawing methods

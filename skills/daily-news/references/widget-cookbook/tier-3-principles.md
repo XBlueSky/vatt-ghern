@@ -282,6 +282,49 @@ mitigated three ways (least to most invasive):
    plus explicit `max-height: 50vh` to bound height growth
 3. Re-author with a taller viewBox (2:1 or 3:2 aspect)
 
+**D-bis. SVG `<text>` doesn't wrap — budget char count per labelled box**
+
+Unlike HTML, SVG `<text>` has no word-wrap behaviour by default; long
+strings render as a single line and overflow whatever rect / annotation
+container they were intended to label. PR #30 hit this in the
+`vg-w-annotated-fides-stack` widget: four side-by-side rects of width
+180 SVG units each held labels like
+`security_label{integrity, confidentiality}` (42 chars at 11 px
+JetBrains Mono ≈ 250 SVG units). The label from box 1 ran straight
+through into box 2, visually merging four boxes into one illegible
+strip.
+
+**Char-width budget**: for a labelled rect of width W SVG units with
+font-size F (px), a monospace label fits roughly
+`W / (F × 0.6)` chars before overflow. A proportional font is ~10-15%
+narrower per char.
+
+| rect width | font-size | safe chars (mono) | safe chars (proportional) |
+|---|---|---|---|
+| 120 | 11 | ~18 | ~22 |
+| 180 | 11 | ~27 | ~33 |
+| 180 | 13 | ~23 | ~28 |
+| 240 | 11 | ~36 | ~44 |
+| 320 | 11 | ~48 | ~58 |
+
+**Fix priorities** when a label exceeds the budget:
+
+1. Shorten the label (drop redundant qualifiers — `security_label{...}`
+   is fine; `security_label{integrity, confidentiality}` is too long).
+2. Drop font-size by 1–2 px IF the resulting effective px on mobile
+   stays ≥ 11 (see design-system § Mobile legibility floor).
+3. Move the label OUTSIDE the rect (above / below) where it has the
+   full SVG width to breathe.
+4. Wrap manually with multiple `<text>` elements stacked by y.
+
+**Do not** rely on `<foreignObject>` for wrapping — it works but is a
+heavy hammer for what is usually a labelling discipline issue.
+
+**Invariant** (caught by Step 8.5 mechanical check):
+`text.getBBox().right` MUST NOT exceed the bounding `<rect>`'s right
+edge by more than 2 SVG units. Same for siblings — label from box N
+must not cross into box N+1's bbox.
+
 **D. Canvas / SVG aspect-ratio adjusts at mobile**
 
 Desktop 16:9 canvas (e.g., queue simulation) crushes to ~211px tall

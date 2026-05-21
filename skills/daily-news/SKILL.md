@@ -296,6 +296,43 @@ fits the post's voice.
 - If candidates cannot satisfy domain + archetype diversity, write
   fewer (2 or 1). Do not force.
 
+**d. Pre-dispatch URL dedup (added 2026-05-21 after PR #30)**:
+
+Before finalising the deep-story picks for Step 7a, run the URL-dedup
+helper to catch any pick whose URL already appears in the past 7 days.
+This must happen *here*, not at Step 8 — otherwise a sub-agent will
+write an entire deep-story (DONE) only to have it dropped during the
+formal `check-dup.mjs` run, leaving an empty deep-story slot with no
+refill path.
+
+```bash
+echo '{"candidates":[{"news_id":"...","url":"...","title":"...",...}, ...],
+       "past_urls":[ ...from load-context.mjs... ]}' \
+  | node skills/daily-news/scripts/decisions/dedup-urls.mjs
+```
+
+The module returns `{ kept, dropped }`. Any candidate in `dropped`:
+
+1. Is NOT dispatched in Step 7b.
+2. MUST be replaced by the next-best deep-story candidate from Step 5b
+   that satisfies the same constraints (≥8 score, domain + archetype
+   diversity). If no qualifying replacement exists, reduce N by 1 and
+   note `Domains skipped today` accordingly. Do NOT leave deep-story
+   N silently below target without refilling first.
+3. The `roundup` separately must also drop or swap that URL — handle
+   the roundup-side dedup before writing roundup HTML in Step 6.
+
+Record any dedup-driven swap or refill in PR body under
+`### Advisory overrides`. Example: "`deep[01] = GitHub eBPF` dropped on
+URL collision with 2026-05-16 roundup; refilled with cluster #07 (Slack
+HTTP/3, score 8, infra domain)".
+
+**Invariant**: `N_deep_dispatched_in_step_7b == N_deep_final_in_PR`. If
+not, the routine has a bug in this step. Recording a "dropped, not
+refilled" deep-story in the PR body is acceptable ONLY when Step 5d
+truthfully reports `replacement_pool_exhausted: true` — never as a
+silent N reduction.
+
 After picking each archetype, read the corresponding detail file for the
 structure rules to follow when writing:
 
@@ -439,7 +476,46 @@ After all sub-agents return:
    - Body matches the picked archetype's H2 *count range* (phrasing free).
    - Sidecar contains `widget_count`, `widget_questions`,
      `widget_templates` arrays; lengths agree.
-3. The mechanical QA gate in Step 8 (`archetype-check`, `check-dup`,
+3. **Count-conservation invariant** (added 2026-05-21 after PR #30):
+   `N_deep_dispatched_in_step_7b == N_deep_written_files`. If a
+   sub-agent BLOCKED or its output got dropped, refer to Step 5d's
+   refill loop — do NOT silently let N drop. The PR body must
+   explicitly account for every dispatched brief (DONE,
+   DONE_WITH_CONCERNS, BLOCKED, or refilled-after-drop).
+4. **BA-slider pane invariant** (added 2026-05-21 after PR #30): if
+   any deep-story contains a before/after slider widget
+   (`.vg-w-ba-*`), inspect both `.before` and `.after` panes via
+   Playwright DevTools and confirm both contain visible, sensical
+   content at the default 50/50 position. The PR #30 Rust BA widget
+   inverted DOM order + clip-path; the right pane was authored
+   correctly but never painted. Spot-check via:
+
+   ```js
+   document.querySelectorAll('.vg-w-ba-* .before, .vg-w-ba-* .after')
+     .forEach(el => console.log({ cls: el.className, h: el.scrollHeight, text: el.textContent.slice(0,60) }));
+   ```
+
+   Both panes must report nonzero `scrollHeight` and non-empty
+   `textContent`. See `widget-cookbook/tier-2-snippets/before-after-slider.md`
+   for the canonical pattern.
+5. **Banned widget templates invariant** (added 2026-05-21 after PR #30):
+   the deep-story sidecar's `widget_templates` array MUST NOT include
+   any of the banned ids. Current ban list:
+   - `scroll-driven-explanation` (sticky figure leaves viewport
+     before stages change; fragile observer margins; mobile sticky
+     covers the prose)
+   - `css-scroll-timeline` (same scroll-position fragility, no
+     reliable fallback)
+
+   If a sub-agent returned a deep-story whose sidecar references a
+   banned id, REJECT the output and re-dispatch the brief with an
+   explicit instruction to pick a non-banned alternative
+   (typically `tab-switcher-pure-css` for staged narratives, or
+   `annotated-diagram-walkthrough` for architecture exposition).
+   The canonical reference implementation is the Meta migration
+   tabs widget `vg-w-tabs-meta-ingest-migration` in
+   `src/posts/2026/05/21/deep-meta-data-ingestion-migration.html`.
+6. The mechanical QA gate in Step 8 (`archetype-check`, `check-dup`,
    `html-validate`, `link-check`) is the formal validation. Step 7c is
    the first-pass sanity check before that.
 
@@ -450,6 +526,9 @@ PR body must list:
 - "Parallel dispatch summary": which N briefs were dispatched, how
   many returned DONE / DONE_WITH_CONCERNS / BLOCKED, and any
   re-dispatches needed.
+- Explicit `N_deep_dispatched == N_deep_final` reconciliation. Any
+  drop must point at a Step 5d refill attempt (success or "pool
+  exhausted").
 
 ### Step 7.5: Content quality gate
 
@@ -671,7 +750,49 @@ sleep 2 && curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/
       the active stage class actually changes as the reader scrolls
       (IntersectionObserver mobile rootMargin per §12.1.E).
 
-   e. Record findings for the post in the issue list (see severity
+   e. **Semantic invariants — mechanical** (added 2026-05-21 after PR #30):
+      run the two semantic-invariant scripts against every published
+      page. These catch classes of failure that visual screenshot
+      review systematically misses (because screenshots are
+      downsampled and human reviewers pattern-match on "looks roughly
+      right" rather than measuring).
+
+      **(i) SVG legibility floor**: smallest text inside every
+      `vg-w-*` SVG must render at ≥ 11 effective px on a 375 viewport.
+
+      ```bash
+      node ${CLAUDE_PLUGIN_ROOT}/skills/daily-news/scripts/measure-svg-legibility.mjs \
+        http://localhost:8080/YYYY/MM/DD/<roundup-slug>/ \
+        http://localhost:8080/YYYY/MM/DD/<deep-slug-1>/ \
+        http://localhost:8080/YYYY/MM/DD/<deep-slug-2>/ \
+        > /tmp/vg-legibility.json
+      # exit 1 = at least one figure below the 11 px hard floor
+      ```
+
+      The script emits one JSON line per figure on stderr and an
+      aggregate verdict on stdout. PASS = ≥ 11 effective px (target);
+      SOFT-PASS = 10.0–11.0 (acceptable for deliberate calibration);
+      FAIL = < 10 px. Fix by adding or bumping `data-svg-scroll="<min-px>"`
+      on the `<figure>` per `references/design-system.md` § Mobile
+      legibility floor. Treat any FAIL as a Blocking-tier issue.
+
+      **(ii) SVG text overflow**: no `<text>` inside a `vg-w-*` figure
+      may extend more than 2 SVG units past the right edge of the
+      `<rect>` that semantically contains it.
+
+      ```bash
+      node ${CLAUDE_PLUGIN_ROOT}/skills/daily-news/scripts/check-svg-text-overflow.mjs \
+        http://localhost:8080/YYYY/MM/DD/<deep-slug-1>/ \
+        http://localhost:8080/YYYY/MM/DD/<deep-slug-2>/ \
+        > /tmp/vg-overflow.json
+      # exit 1 = at least one text overflows its owning rect
+      ```
+
+      Fix per `widget-cookbook/tier-3-principles.md` §12.1.D-bis:
+      shorten the label, drop font-size (within legibility floor),
+      move outside the rect, or split into stacked `<text>` lines.
+
+   f. Record findings for the post in the issue list (see severity
       tiering below).
 
 6. **Roundup mobile check**: navigate to roundup at 375px, screenshot

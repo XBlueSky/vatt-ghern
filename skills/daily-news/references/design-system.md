@@ -147,6 +147,105 @@ Roundup items MUST have `id="item-NN"` (zero-padded) and the matching
 Always set `style="width: 100%; height: auto;"` or `style="max-width: NNNpx;"`
 on the `<svg>` element so it responds to layout.
 
+### Mobile legibility floor (added 2026-05-21 after PR #30)
+
+**Rule**: every SVG `<text>` inside a `vg-w-*` figure MUST render at
+**≥ 11 px** effective on a 375 px viewport. If the SVG would shrink
+text below this floor, the figure MUST opt into horizontal scroll via
+the `data-svg-scroll="<min-px>"` attribute on the `<figure>`.
+
+**Why this matters**: the global `figure svg { width: 100% !important }`
+rule in `site.css` forces the SVG to fit the figure container. On a
+375 px mobile viewport the figure container is ~343 px wide. A
+viewBox-880 SVG then scales to 0.39× — turning an authored 11 px label
+into 4.3 device px, which is fully unreadable. PR #30 had 7 figures
+where the smallest text rendered between 3.5 and 5.4 device px on
+mobile; visually they looked fine in screenshots, but no human could
+actually read them.
+
+**Sizing math**: effective px on mobile ≈
+`font_size_in_svg_units × (data-svg-scroll / viewBox_width)`. To pick
+a value, solve for `min_text_px ≥ 11`:
+`data-svg-scroll ≥ 11 × viewBox_width / smallest_font_size_in_svg`.
+
+**Allowed values** (site.css enumerates these): `560`, `640`, `720`,
+`800`, `880`. Pick the smallest one that gets every text ≥ 11 effective
+px. Examples from PR #30:
+
+| viewBox | smallest font | min scroll | resulting effective px |
+|---|---|---|---|
+| `880 × ...` | 11 | `880` | 11.0 |
+| `880 × ...` | 13 | `720` | 10.6 (acceptable) |
+| `720 × ...` | 10 | `720` | 10.0 |
+| `760 × ...` | 12 | `640` | 10.1 |
+| `360 × ...` | 11 | (none needed) | 11.4 at 343 px viewport |
+
+**Markup**:
+
+```html
+<figure class="vg-w-foo" data-svg-scroll="720">
+  <svg viewBox="0 0 720 360"> ... </svg>
+</figure>
+```
+
+On desktop (figure width ≥ 880 px) the rule is a no-op — `min-width`
+is met by the natural figure width and there's no overflow. On mobile
+the SVG holds at its `min-width` and the figure scrolls horizontally;
+a native scrollbar appears at the bottom of the figure as a clear
+affordance.
+
+**When NOT to use**: small `viewBox` widgets (≤ 480 wide) usually
+already render legibly on mobile because the natural scale is close to
+1×. Run the audit before adding the attribute. Adding it
+unnecessarily creates an unwanted scrollbar.
+
+### Interactive-affordance hint
+
+Mark interactive figures with an inline `<p class="vg-w-affordance">`
+as the FIRST child of the `<figure>`. Pattern (revised 2026-05-21
+after the corner-pill version collided with table captions and
+panel headers):
+
+```html
+<figure class="vg-w-table-foo">
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+         stroke="currentColor" stroke-width="1.8"
+         stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <!-- lucide arrow-up-down paths -->
+      <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/>
+      <path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+    </svg>
+    <span>click column header to sort · 5 columns × 7 rows</span>
+  </p>
+  <!-- ... figure body ... -->
+</figure>
+```
+
+Inline-flow benefits over the earlier `data-interactive` pseudo-element
+badge:
+
+- Real DOM element flows naturally; never collides with internal text.
+- The descriptive `<span>` carries widget-specific data ("4 layers",
+  "7 events over 6 hours") instead of a 4-letter genre tag.
+- No `position: absolute` / `z-index` / sticky-header overlap concerns.
+- Mobile reflow naturally.
+
+| Lucide icon | Use for | Typical phrasing |
+|---|---|---|
+| `move-horizontal` | drag sliders, range scrubbers | "drag handle along the timeline · 7 events over 6 hours" |
+| `mouse-pointer-click` | clickable layers, radios-as-cards | "click any layer to read its responsibility · 4 layers" |
+| `panels-top-left` | tab switchers | "switch tabs to compare 4 approaches · 4 tabs" |
+| `arrow-up-down` | sortable table headers | "click column header to sort · 5 columns × 7 rows" |
+
+Embed the lucide SVG paths inline (do NOT use the `{% lucide %}`
+shortcode in this position — it emits attributes the global
+`figure svg { width: 100% !important }` rule will fight). The
+`.vg-w-affordance svg` rule in `site.css` includes the required
+`width/height/min-width !important` overrides to keep the 14×14 icon
+from being stretched to figure width by the global rule and by any
+`data-svg-scroll` rule.
+
 ## Anti-patterns (don't ship)
 
 - `<style>` blocks at post body level (use existing classes; only

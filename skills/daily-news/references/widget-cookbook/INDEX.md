@@ -34,14 +34,17 @@ anti-patterns.
 | Template id | One-line purpose | Best fit |
 |---|---|---|
 | `interactive-param-demo` | Slider drives a real curve; reader sweeps a continuous variable. Answers "how sensitive is X to Y?" | investigation, explainer |
-| `scroll-driven-explanation` | Stages reveal as reader scrolls; SVG state tracks progress. Answers "what is each stage doing?" | narrative |
 | `mini-canvas-simulation` | Canvas + rAF loop showing dynamic behaviour over time. Answers "what does this look like over time?" | narrative, explainer |
 | `annotated-diagram-walkthrough` | Architecture diagram where each component reveals its responsibility on selection. Answers "which component owns what?" | technical-deep-dive |
 | `data-driven-chart` | Real numerical data plotted with programmatic axes, ticks, series. Answers "what's the shape of the data?" | comparison, investigation |
 
+> **BANNED**: `scroll-driven-explanation` was banned 2026-05-21 after repeated
+> failures (sticky figure leaving viewport, fragile observer margins).
+> Use a tab-driven walkthrough (`tab-switcher-pure-css`) for staged
+> narratives instead.
+
 Detailed pages:
 - `tier-1-golden/interactive-param-demo.md`
-- `tier-1-golden/scroll-driven-explanation.md`
 - `tier-1-golden/mini-canvas-simulation.md`
 - `tier-1-golden/annotated-diagram-walkthrough.md`
 - `tier-1-golden/data-driven-chart.md`
@@ -67,7 +70,6 @@ Snippets are smaller patterns. Some are zero parts of Tier-1 templates
 | Snippet id | One-line purpose |
 |---|---|
 | `draggable-svg-handle` | Pointer events + viewBox clamping inside an SVG |
-| `css-scroll-timeline` | Pure-CSS scroll-driven animation via `animation-timeline` |
 | `css-container-query` | `@container` for self-adapting widget layout |
 | `css-3d-transform` | `perspective` + `rotateX/Y` for layered structural diagrams |
 | `view-transition-api` | `document.startViewTransition()` for state-swap animations |
@@ -88,7 +90,7 @@ Detailed pages: all live under `tier-2-snippets/<id>.md`.
 
 | Archetype | Typical hero choice | Typical Tier-2 supports |
 |---|---|---|
-| `narrative` | scroll-driven-explanation | intersection-observer-reveal, web-animations-api |
+| `narrative` | annotated-diagram-walkthrough OR mini-canvas-simulation | tab-switcher-pure-css, timeline-scrubber, intersection-observer-reveal |
 | `technical-deep-dive` | annotated-diagram-walkthrough | css-3d-transform, tab-switcher-pure-css |
 | `investigation` | interactive-param-demo OR data-driven-chart | range-input-binding, matter-of-fact-table |
 | `comparison` | data-driven-chart | matter-of-fact-table, before-after-slider |

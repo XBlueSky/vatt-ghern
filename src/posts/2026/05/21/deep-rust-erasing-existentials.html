@@ -1,0 +1,1326 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">
+    在 Rust 裡寫一個「我有某個實作了 Trait&lt;B&gt; 的型別，但 S 和 B 我都不想讓呼叫端看到」的 box，看起來只是把兩個型別參數塞進 trait object 而已。
+    編譯器會給你一句冰冷的回覆——「the value of the associated types `S` and `B` must be specified」——然後你才發現
+    dyn-compatibility 規則並不是隨便寫的限制，它讓你只能一次抹掉一個 existential，剩下那個得自己想辦法處理。
+  </p>
+  <h1 class="vg-post-title">Erasing Existentials——Rust 裡四種抹掉 existential 的辦法</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p>
+    <span class="vg-dropcap">假</span>設你有一個 trait <code>Generic&lt;B&gt;</code>，被同一個型別 <code>i32</code> 分別實作了 <code>Generic&lt;f32&gt;</code> 與 <code>Generic&lt;f64&gt;</code>，
+    內部唯一的方法是 <code>fn name(&amp;self) -&gt; &amp;'static str</code>。
+    現在的問題是：能不能把「某個實作了 <code>Generic&lt;B&gt;</code> 的型別」整包塞進 <code>Box</code>，讓使用者不需要寫出 <code>S</code> 也不需要寫出 <code>B</code>？
+    這是 type theory 裡的 ∃s,b.Trait(s,b)——兩個 existential variable 同時被量詞綁住——直譯到 Rust 的問法。
+  </p>
+
+  <p>
+    這個問題的根源不在語法、不在型別推導，而在於 <code>dyn Trait</code> 的設計合約。
+    每一個 <code>dyn Trait</code> 物件背後是一張 vtable：一個指標表記錄了該物件的具體型別在這個 trait 上所有方法的實際位址。
+    要做到「同一個 <code>Box&lt;dyn Trait&gt;</code> 可以容納兩種底層型別」，這兩種底層型別在 trait 上的方法簽章必須對齊到同一張 vtable 形狀；
+    而當你的 trait 有 associated type，每個實作者填的 associated type 各自不同，vtable 的 self-type 就不一樣，根本對不齊。
+    這就是 dyn-compatibility 規則拒絕你的根本原因。
+  </p>
+
+  <p>
+    wolfgirl.dev 在五月二十日的 post 裡把這個問題拆成四條救命路線：
+    把 existential 翻回 universal 用泛型參數承擔（for-exists conversion）、
+    把 existential 藏進 associated type 再用 PhantomData 把缺的型別 carry 進去、
+    手刻一個只在表面層暴露 monomorphic interface 的 wrapper trait、
+    或乾脆把所有輸入輸出都換成 <code>Box&lt;dyn Any&gt;</code> 走純 runtime 路線。
+    四條路徑各自繞過 dyn-compatibility 的不同部分，付出的代價也各自落在編譯期、運行期、或介面複雜度三個維度上。
+  </p>
+
+  <p>
+    這篇 deep-story 把這四個方案沿著六個維度排開。
+    每一個維度都會回到一段具體的 Rust code——不是把 type-theory 翻譯成 emoji，而是讓你看到 vtable 形狀、associated type lookup、PhantomData 的 layout 影響、以及 downcast 的 runtime 成本是怎麼一步一步浮現的。
+    讀完之後你應該能夠回答兩個問題：在你眼前這個 case，到底是哪個 existential 必須消、哪個可以留？
+    以及，如果你選擇了某條路線，你正在把哪一種成本攤到你的 codebase 上？
+  </p>
+
+  <p>
+    這個 comparison 不是 library shootout——四個方案不是競品而是不同 trade-off 的座標點。
+    所以開頭這張表不是「誰贏誰輸」的判斷，而是「哪個方案抹掉哪個 existential、付出什麼代價」的對應關係。
+    讀者可以點 column header 重排，看哪個方案在你最在意的那一行上是綠的、在你能接受的那一行上是紅的。
+  </p>
+
+  <figure class="vg-w-table-rust-existential">
+    <p class="vg-w-affordance"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21 16-4 4-4-4"/><path d="M17 20V4"/><path d="m3 8 4-4 4 4"/><path d="M7 4v16"/></svg><span>click column header to sort · 5 columns × 7 rows</span></p>
+    <style>
+      .vg-w-table-rust-existential { display: grid; gap: var(--s-2); }
+      .vg-w-table-rust-existential table { width: 100%; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-rust-existential caption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); text-align: left; padding-bottom: var(--s-2); caption-side: top; }
+      .vg-w-table-rust-existential thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; }
+      .vg-w-table-rust-existential thead th[data-sort] { color: var(--accent-text); }
+      .vg-w-table-rust-existential thead th[data-sort="asc"]::after { content: " ↑"; }
+      .vg-w-table-rust-existential thead th[data-sort="desc"]::after { content: " ↓"; }
+      .vg-w-table-rust-existential tbody th { font-family: var(--serif); font-weight: 600; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); color: var(--ink); }
+      .vg-w-table-rust-existential tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); color: var(--ink-soft); }
+      .vg-w-table-rust-existential td.weak { color: var(--accent-text); }
+      .vg-w-table-rust-existential td.strong { color: var(--sage-deep); }
+      .vg-w-table-rust-existential figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+      @media (max-width: 720px) {
+        .vg-w-table-rust-existential { overflow-x: auto; }
+        .vg-w-table-rust-existential table { min-width: 560px; }
+      }
+    </style>
+    <table>
+      <caption>四個方案在六個維度上的能力對照（資料來源：wolfgirl.dev 2026-05-20 post；點擊 header 可重排）</caption>
+      <thead>
+        <tr>
+          <th data-key="dim">維度</th>
+          <th data-key="forexists">for-exists 轉換</th>
+          <th data-key="assoc">associated type + PhantomData</th>
+          <th data-key="hand">手刻 wrapper trait</th>
+          <th data-key="any">Box&lt;dyn Any&gt; runtime</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <th scope="row">S 是否被消去</th>
+          <td class="strong">是（轉成泛型）</td>
+          <td class="weak">否（associated）</td>
+          <td class="strong">是</td>
+          <td class="strong">是</td>
+        </tr>
+        <tr>
+          <th scope="row">B 是否被消去</th>
+          <td class="strong">是（轉成泛型）</td>
+          <td class="weak">否（associated）</td>
+          <td class="strong">是</td>
+          <td class="strong">是</td>
+        </tr>
+        <tr>
+          <th scope="row">可放入 Box&lt;dyn _&gt;</th>
+          <td class="weak">否</td>
+          <td class="weak">否（associated 需指定）</td>
+          <td class="strong">是</td>
+          <td class="strong">是</td>
+        </tr>
+        <tr>
+          <th scope="row">B 可出現在方法介面</th>
+          <td class="strong">是</td>
+          <td class="strong">是</td>
+          <td class="weak">否（必須隱藏）</td>
+          <td>是（但走 Any）</td>
+        </tr>
+        <tr>
+          <th scope="row">runtime 成本</th>
+          <td class="strong">零（單型化）</td>
+          <td class="strong">零</td>
+          <td>一次 vtable indirection</td>
+          <td class="weak">vtable + downcast 檢查</td>
+        </tr>
+        <tr>
+          <th scope="row">boilerplate 量</th>
+          <td class="strong">最少</td>
+          <td>中等</td>
+          <td>每個方法手寫 forwarding</td>
+          <td class="weak">最多（每個簽章手寫 Any 轉換）</td>
+        </tr>
+      </tbody>
+    </table>
+    <figcaption>「S 與 B 是否消去」這兩行只有方案三、四同時是綠的；而「可放入 Box」這行只有方案三、四是綠的——這不是巧合，是 dyn-compatibility 規則的直接結果。</figcaption>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-table-rust-existential');
+        if (!root) return;
+        const headers = root.querySelectorAll('thead th');
+        const tbody = root.querySelector('tbody');
+        let activeKey = null, asc = true;
+        headers.forEach(h => h.addEventListener('click', () => {
+          const key = h.dataset.key;
+          if (activeKey === key) asc = !asc; else { activeKey = key; asc = true; }
+          headers.forEach(x => x.removeAttribute('data-sort'));
+          h.setAttribute('data-sort', asc ? 'asc' : 'desc');
+          const rows = [...tbody.querySelectorAll('tr')];
+          const idx = [...headers].indexOf(h);
+          rows.sort((a, b) => {
+            const av = a.children[idx].textContent.trim();
+            const bv = b.children[idx].textContent.trim();
+            const an = Number.parseFloat(av);
+            const bn = Number.parseFloat(bv);
+            const cmp = !Number.isNaN(an) && !Number.isNaN(bn) ? an - bn : av.localeCompare(bv, 'zh-Hant');
+            return asc ? cmp : -cmp;
+          });
+          rows.forEach(r => tbody.appendChild(r));
+        }));
+      })();
+    </script>
+  </figure>
+
+  <p>
+    第一眼會看到的事：沒有任何一個方案在六行裡都是強項。
+    for-exists 轉換靠把 existential 翻回 universal、把選擇權推給呼叫端，所以維度一二都是綠的、runtime 成本零；
+    但代價是「呼叫端必須提供具體型別」，這破壞了「我有某個東西、但不告訴你是什麼」的封裝意圖，所以「可放入 Box」那行是紅的。
+    associated type 路線同樣零成本，但你會發現它根本沒消掉 existential——它只是把 existential 藏進 trait 的 associated type 裡，於是你要建構 trait object 時還是得指定，繞了一圈回到起點。
+  </p>
+
+  <p>
+    真正能把兩個 existential 都吃進 <code>Box&lt;dyn _&gt;</code> 的，只有方案三（手刻 wrapper trait）和方案四（<code>Box&lt;dyn Any&gt;</code> runtime erasure）。
+    這不是巧合：dyn-compatibility 的條件就是「所有方法簽章不能含有 self 之外的 generic 參數」、「不能透過 self 取得 associated type 的值」，
+    所以唯一能塞進 vtable 的型別資訊就是「self 的指標 + 一張固定形狀的方法表」——任何超出這個 budget 的 existential，要嘛改寫成 universal、要嘛只能在 runtime 用 <code>Any</code> 再 downcast 回來。
+  </p>
+
+  <p>
+    這張表只是入口。
+    後面五個 H2 各自展開一個維度，最後一節給出決策規則。
+    在那之前，先看 wolfgirl 在 post 開頭給的那個玩具 example，因為後面所有討論都會回到這個 example。
+  </p>
+
+  <pre><code class="language-rust">pub trait Generic&lt;B&gt; {
+    fn name(&amp;self) -&gt; &amp;'static str;
+}
+
+impl Generic&lt;f32&gt; for i32 {
+    fn name(&amp;self) -&gt; &amp;'static str { "f32" }
+}
+
+impl Generic&lt;f64&gt; for i32 {
+    fn name(&amp;self) -&gt; &amp;'static str { "f64" }
+}</code></pre>
+
+  <p>
+    這個 example 故意取最小：一個 trait、一個方法、一個型別搭配兩個不同的型別參數。
+    要把 <code>i32 as Generic&lt;f32&gt;</code> 與 <code>i32 as Generic&lt;f64&gt;</code> 包成同一個 <code>Box&lt;dyn Generic&lt;_&gt;&gt;</code>，就是「兩個 existential 同時被量詞綁住」的最小可重現。
+    後面四個方案，都是針對這個 example 直接給的。
+  </p>
+
+  <h2>方案一的維度：把 existential 翻成 universal，但封裝就跟著消失</h2>
+
+  <p>
+    for-exists conversion 是 type theory 教科書級的招式：
+    一個 <code>(∃s,b. Trait(s,b)) -&gt; ()</code> 的 closure 可以被機械地翻成 <code>∀s,b. (Trait(s,b) -&gt; ())</code>，
+    也就是「對於任何滿足 Trait 的 s 和 b，這個 closure 都能處理」。
+    在 Rust 裡這就是直接把 S 和 B 寫成函式的 generic 參數：
+  </p>
+
+  <pre><code class="language-rust">fn use_generic&lt;B, S: Generic&lt;B&gt;&gt;(s: &amp;S) -&gt; &amp;'static str {
+    s.name()
+}</code></pre>
+
+  <p>
+    這個版本在編譯期被 monomorphize 成兩份 code：一份 <code>use_generic::&lt;f32, i32&gt;</code>、一份 <code>use_generic::&lt;f64, i32&gt;</code>，
+    每一份都是直接 inline 的 zero-cost 程式碼。
+    它解決了「我寫一個函式，使用者餵什麼進來都能跑」的需求，runtime 成本是零，因為根本沒有 vtable、沒有 dynamic dispatch。
+  </p>
+
+  <p>
+    但這個方案的問題在於：它不是真正的 existential。
+    existential type 的語意是「我有某個東西、但我不告訴你是什麼」——封裝在資料側。
+    universal type 的語意是「對於任何東西、我都能處理」——封裝在函式側。
+    這兩個方向是 De Morgan 對偶，邏輯上等價，但工程上完全不同。
+  </p>
+
+  <p>
+    具體一點看：假設你要寫一個 plugin 系統，每個 plugin 實作了 <code>Generic&lt;B&gt;</code>，你想把所有 plugin 收進一個 <code>Vec</code> 裡。
+    走 for-exists 路線你會卡在這裡——你需要 <code>Vec&lt;Box&lt;dyn Generic&lt;?&gt;&gt;&gt;</code>，
+    但 generic 路線根本給不出來，因為一個 <code>Vec</code> 的所有 element 必須是同一個 type，
+    而 <code>i32 as Generic&lt;f32&gt;</code> 與 <code>i32 as Generic&lt;f64&gt;</code> 是不同的 trait impl，於是它們在 <code>dyn Generic&lt;_&gt;</code> 中也是不同的 vtable target。
+  </p>
+
+  <p>
+    這就是 wolfgirl 文中強調的「universal propagation」現象：
+    一旦你選擇 for-exists conversion，你就必須讓 S 和 B 的型別參數從 use site 一路傳播到 storage site，
+    任何想要儲存這些值的中介層都要跟著變成 generic。
+    對於小型 utility 函式，這個成本很低——加兩個型別參數而已；
+    對於需要 heterogeneous storage 的 framework（plugin loader、event dispatcher、execution engine），這個方案會逼你把每個 storage layer 都泛化掉，
+    最後整個 codebase 變成 type parameter 的 carry-along。
+  </p>
+
+  <p>
+    更微妙的代價是 compile-time。
+    每一個不同的 type parameter 組合都會 instantiate 一份 monomorphic code，
+    對於 plugin 系統這種「N 個 plugin × M 個 B」的場景，產出的二進位會線性放大。
+    Rust 的 incremental compilation 對 generic 函式不太友善——一個 monomorphization 的 cache 一旦失效，所有受影響的 instantiation 都要重編，
+    cargo 編譯時間在大型專案上呈現 super-linear 趨勢就是這麼來的。
+  </p>
+
+  <p>
+    那 for-exists conversion 什麼時候是正解？
+    答案是：當「我有某個東西」這個 existential 的封裝其實不重要的時候。
+    例如 <code>fn print_name&lt;T: Display&gt;(x: &amp;T)</code> 寫法，呼叫端就是知道自己手上有什麼，根本不需要 hide；
+    或像 iterator adapter，<code>fn map&lt;F: FnMut(...)&gt;(self, f: F)</code>，map 不在意 F 是什麼，但 caller 知道。
+    這些 case 用 generic 是最自然的——你並不是在做 existential erasure，你只是在寫 polymorphic code。
+  </p>
+
+  <p>
+    分辨原則很簡單：問自己「呼叫端需要把這個東西存起來嗎？需要把多個不同型別的版本放在同一個 collection 嗎？」
+    如果答案是「不需要、用完就丟」，for-exists 就夠了；
+    如果答案是「要存起來、要 heterogeneous」，這個方案幫不上忙，你需要往下看方案三或四。
+  </p>
+
+  <h2>方案二的維度：associated type 與 PhantomData，把 existential 藏進 trait 裡</h2>
+
+  <p>
+    這個方案是 type-system enthusiast 最常推的第一個 trick：
+    既然 <code>Trait&lt;B&gt;</code> 的 B 是 generic parameter、會破壞 dyn-compatibility，那把它改成 associated type 不就行了？
+  </p>
+
+  <pre><code class="language-rust">trait DoubleAssociated {
+    type S: Generic&lt;Self::B&gt;;
+    type B;
+    fn as_ref(&amp;self) -&gt; &amp;Self::S;
+}
+
+impl&lt;S, B&gt; DoubleAssociated for (S, PhantomData&lt;B&gt;)
+where S: Generic&lt;B&gt;,
+{
+    type S = S;
+    type B = B;
+    fn as_ref(&amp;self) -&gt; &amp;Self::S { &amp;self.0 }
+}</code></pre>
+
+  <p>
+    這段 code 的巧思在 <code>(S, PhantomData&lt;B&gt;)</code>：
+    PhantomData 是 zero-sized type，它不佔記憶體，但它讓 type checker 知道「這個 tuple type 裡有 B 的痕跡」——
+    這對 variance、drop check、以及 type inference 都有影響。
+    沒有 PhantomData 的話，<code>(S,)</code> 的 type 裡不會出現 B，而 <code>where S: Generic&lt;B&gt;</code> 這個 bound 就無法在 type level 上 carry B 的資訊。
+  </p>
+
+  <p>
+    寫到這裡看起來很乾淨——associated type 兩個、impl 一個、PhantomData 把 B 撐起來。
+    然後你寫下這一行：
+  </p>
+
+  <pre class="language-rust"><code>let x: Box&lt;dyn DoubleAssociated&gt; = Box::new((42i32, PhantomData::&lt;f32&gt;));</code></pre>
+
+  <p>編譯器立刻翻臉：</p>
+
+  <pre data-kind="output"><code>error[E0191]: the value of the associated types `S` (from trait
+`DoubleAssociated`) and `B` (from trait `DoubleAssociated`) must be specified
+  --&gt; src/main.rs
+   |
+   | let x: Box&lt;dyn DoubleAssociated&gt; = Box::new(...);
+   |        ^^^^^^^^^^^^^^^^^^^^^^^^^ help: specify the associated types:
+   |                                  `DoubleAssociated&lt;S = ..., B = ...&gt;`</code></pre>
+
+  <p>
+    這就是 dyn-compatibility 的硬牆：trait object 的 type 必須是 <em>complete</em>，
+    意思是所有 associated type 都必須在 type-level 被解出來，因為 trait object 的 vtable schema 在編譯期就要確定。
+    associated type 沒指定的話，編譯器不知道這個 vtable 該長什麼樣——
+    具體一點說，dyn DoubleAssociated 並不是一個 trait object 的 type，而是「某個 trait object family」的抽象，得補上 S 和 B 才能 ground。
+  </p>
+
+  <p>
+    這時你可能會說：好，那我把兩個 associated type 寫滿，<code>Box&lt;dyn DoubleAssociated&lt;S = i32, B = f32&gt;&gt;</code> 行嗎？
+    可以——但 existential 就消失了，你已經把 S 和 B 寫死了，這跟方案一沒兩樣。
+    associated type 路線的結局是：你以為它幫你抹掉了 existential，其實它只是把 existential 從 generic parameter 改名成 associated type，dyn-compatibility 規則照樣攔截你。
+  </p>
+
+  <p>
+    為什麼 dyn-compatibility 規則這麼嚴？
+    回到 vtable 的本質：vtable 是一張「方法名 → 函式指標」的表，配上一個 self pointer。
+    要透過 self pointer 取得 self 的 associated type 的「值」（即 type-level 的值），編譯器必須在 monomorphization 的某個階段把 associated type 解出來；
+    但 dyn 的本意就是「把 monomorphization 推遲」——它要在 runtime 才知道實際 type 是什麼。
+    這兩個需求互相矛盾：vtable 需要 compile-time 的完整 type，dyn 要 runtime 的延後決定，associated type 是兩者的接縫，所以必須在編譯期被 ground。
+  </p>
+
+  <p>
+    wolfgirl 在這裡的核心觀察是：dyn-compatibility 對 associated type 的限制讓你「最多只能 erase 一個 existential」。
+    如果你的 trait 只有一個 type parameter（轉成一個 associated type），你可以靠 <code>Box&lt;dyn Trait&lt;Assoc = X&gt;&gt;</code> 抹掉 self type 那個 existential，
+    associated type 的 X 你照樣得指定，但因為 X 只有一個，這個方案勉強撐得起一些 case；
+    如果你有兩個 type parameter，這個 trick 就破功了——你只能 erase self，剩下兩個 associated 全部都得補完。
+  </p>
+
+  <p>
+    所以這個方案的真實角色是「教育性 stepping stone」，不是 production solution。
+    它告訴你 dyn-compatibility 規則為什麼存在、associated type 為什麼不能單獨救你出這個困境。
+    要真正抹掉兩個 existential，必須在 trait 表面層做進一步的隱藏——而那是方案三的事。
+  </p>
+
+  <p>
+    順帶一提，PhantomData 在這裡還有第二層用處：它讓 <code>impl Drop for (S, PhantomData&lt;B&gt;)</code> 有意義。
+    如果 B 是某個 lifetime'd type，Rust 的 drop check 會需要看見 B 才能正確判定 drop 順序；
+    沒有 PhantomData 撐著，drop check 會放鬆得太多，可能讓你寫出 unsafe 的 Drop 實作。
+    所以即便這個方案最終撞牆，PhantomData 這個工具本身是值得學起來的——後續方案三、四都會用到。
+  </p>
+
+  <h2>方案三的維度：手刻 wrapper trait，付一次 vtable 換真正的 erasure</h2>
+
+  <p>
+    方案三的核心思想很簡單：既然 dyn-compatibility 不准你在 trait 上暴露 B、不准你的 trait 有 associated type 沒指定，
+    那就寫一個新的、只暴露 monomorphic interface 的 wrapper trait，把 B 完全藏在 impl 裡。
+  </p>
+
+  <pre><code class="language-rust">trait Erased {
+    fn name(&amp;self) -&gt; &amp;'static str;
+}
+
+impl&lt;B, S: Generic&lt;B&gt;&gt; Erased for (S, PhantomData&lt;B&gt;) {
+    fn name(&amp;self) -&gt; &amp;'static str {
+        self.0.name()
+    }
+}
+
+fn mk_box&lt;B: 'static, S: Generic&lt;B&gt; + 'static&gt;(s: S) -&gt; Box&lt;dyn Erased&gt; {
+    Box::new((s, PhantomData))
+}</code></pre>
+
+  <p>
+    這個版本能 compile，而且 <code>Box&lt;dyn Erased&gt;</code> 不帶任何 type parameter——
+    呼叫端拿到的就是一個 monomorphic 的 trait object，內部的 S 和 B 全部消失。
+    重點在 <code>impl&lt;B, S: Generic&lt;B&gt;&gt; Erased for (S, PhantomData&lt;B&gt;)</code> 這一行：
+    B 出現在 <code>impl</code> header 的 generic 上、出現在 PhantomData 上、出現在 where bound 上，但<em>沒有</em>出現在 <code>Erased</code> trait 本身——
+    這就是讓 dyn-compatibility 過關的關鍵。
+  </p>
+
+  <p>
+    Erased trait 的 vtable 形狀完全是 monomorphic：
+    一個方法叫 name，回傳 <code>&amp;'static str</code>，self 是 <code>&amp;dyn Erased</code>。
+    所有 <code>impl Erased for (S, PhantomData&lt;B&gt;)</code> 的版本——不管 S 是 i32 還是 String、不管 B 是 f32 還是 f64——
+    產出的 vtable 都符合這個形狀，於是它們可以放進同一個 <code>Box&lt;dyn Erased&gt;</code>。
+  </p>
+
+  <p>
+    runtime 成本：一次 vtable indirection。
+    呼叫 <code>boxed.name()</code> 時，編譯器產生的 code 是「讀 boxed 的 vtable pointer → load name 的 function pointer → 跳過去」，
+    比起 monomorphized direct call 多了兩次記憶體存取與一次 indirect branch。
+    在 modern CPU 上這通常是 10-30 cycles 的開銷，hot loop 裡會 measurable，cold path 完全可忽略。
+  </p>
+
+  <p>
+    這個方案最大的限制 wolfgirl 講得很清楚：B 不能出現在 trait 介面裡。
+    如果原本 <code>Generic&lt;B&gt;</code> 的方法簽章長得像 <code>fn process(&amp;self, b: &amp;B) -&gt; B</code>，B 在 input 和 output 都出現了，你就無法把這個方法直接平移到 Erased——
+    Erased 是 monomorphic 的，它的方法簽章不能含 B。
+  </p>
+
+  <p>
+    這時候你有兩個選擇：要嘛接受這個方案只能處理「B 不出現在介面」的 case，
+    要嘛跳到方案四，用 <code>Box&lt;dyn Any&gt;</code> 把 B 包起來繞過簽章限制。
+    這個分岔點是兩個方案實際的應用領域邊界——你的 trait 多 B-flavored，就越往方案四傾斜。
+  </p>
+
+  <p>
+    另一個實務細節：<code>mk_box</code> 的 signature 裡有 <code>B: 'static, S: 'static</code> bound。
+    這是因為 <code>Box&lt;dyn Erased&gt;</code> 預設要求 <code>'static</code> lifetime，否則編譯器無法保證 box 內的型別不會 dangle。
+    如果你的 S 或 B 帶 lifetime，得寫成 <code>Box&lt;dyn Erased + 'a&gt;</code>，並把 lifetime 也手動 propagate 到 wrapper trait。
+    這個 lifetime carry 在實務上不算複雜，但容易忘——忘記寫 <code>+ 'a</code>，編譯器會給你一句 misleading 的 「borrowed value does not live long enough」。
+  </p>
+
+  <p>
+    把方案二、三放在一起看，就能看清楚 PhantomData 真正的角色。
+    方案二的 PhantomData 只是 type-level 標記，沒有實質效果——associated type 那邊照樣破功；
+    方案三的 PhantomData 才是必要的，它在 <code>impl</code> 的 type 上 carry B，讓 type checker 能驗證 <code>S: Generic&lt;B&gt;</code> 這個 bound。
+    沒有 PhantomData，<code>(S,)</code> 這個 type 不知道自己跟 B 有什麼關係，bound 無法解出。
+  </p>
+
+  <p>
+    想直接比對「方案二被拒」與「方案三放行」的 minimal diff 嗎？
+    把下方的分隔線往右拖，左邊是方案二（associated type 觸發 E0191），右邊是方案三（wrapper trait 編過）。
+    左右兩段除了 trait 定義不一樣之外，<code>impl</code> 的 type、<code>where</code> bound、PhantomData 的用法都一模一樣——差異就藏在那個 trait 的形狀。
+  </p>
+
+  <figure class="vg-w-ba-rust-erasure">
+    <style>
+      .vg-w-ba-rust-erasure { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: var(--line); border: 1px solid var(--line); }
+      .vg-w-ba-rust-erasure .pane { background: var(--bg); padding: calc(var(--s-2) + 26px) var(--s-3) var(--s-3); position: relative; min-width: 0; overflow-x: auto; }
+      .vg-w-ba-rust-erasure pre { margin: 0; font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 12px; line-height: 1.55; color: var(--ink); white-space: pre; }
+      .vg-w-ba-rust-erasure .badge { position: absolute; top: var(--s-2); left: var(--s-2); font-family: var(--sans); font-size: var(--fs-xs); padding: 2px 8px; color: var(--bg); border-radius: 2px; }
+      .vg-w-ba-rust-erasure .pane.deny .badge { background: var(--accent); }
+      .vg-w-ba-rust-erasure .pane.pass .badge { background: var(--sage-deep); }
+      .vg-w-ba-rust-erasure figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); grid-column: 1 / -1; padding: var(--s-2); background: var(--bg-soft); }
+      .vg-w-ba-rust-erasure .kw { color: var(--accent-text); }
+      .vg-w-ba-rust-erasure .ty { color: var(--sage-deep); }
+      .vg-w-ba-rust-erasure .cm { color: var(--muted); font-style: italic; }
+      .vg-w-ba-rust-erasure .err { color: var(--accent-text); }
+      @media (max-width: 720px) {
+        .vg-w-ba-rust-erasure { grid-template-columns: 1fr; }
+        .vg-w-ba-rust-erasure pre { font-size: 11px; line-height: 1.5; }
+      }
+    </style>
+    <div class="pane deny">
+      <span class="badge">方案二（拒）</span>
+<pre><span class="cm">// 方案二：trait 帶 associated type</span>
+<span class="cm">// → E0191 must be specified</span>
+<span class="kw">trait</span> DoubleAssociated {
+    <span class="kw">type</span> <span class="ty">S</span>: Generic&lt;Self::<span class="ty">B</span>&gt;;
+    <span class="kw">type</span> <span class="ty">B</span>;
+    <span class="kw">fn</span> as_ref(&amp;self) -&gt; &amp;Self::<span class="ty">S</span>;
+}
+
+<span class="kw">impl</span>&lt;S, B&gt; DoubleAssociated <span class="kw">for</span> (S, PhantomData&lt;B&gt;)
+<span class="kw">where</span> S: Generic&lt;B&gt;,
+{
+    <span class="kw">type</span> <span class="ty">S</span> = S;
+    <span class="kw">type</span> <span class="ty">B</span> = B;
+    <span class="kw">fn</span> as_ref(&amp;self) -&gt; &amp;Self::<span class="ty">S</span> { &amp;self.<span class="ty">0</span> }
+}
+
+<span class="cm">// 試圖建構 trait object：</span>
+<span class="kw">let</span> x: Box&lt;<span class="kw">dyn</span> DoubleAssociated&gt; = Box::new(...);
+<span class="err">// error[E0191]: the value of the associated</span>
+<span class="err">// types `S` and `B` must be specified</span></pre>
+    </div>
+    <div class="pane pass">
+      <span class="badge">方案三（過）</span>
+<pre><span class="cm">// 方案三：wrapper trait Erased</span>
+<span class="cm">// （無 generic、無 associated）→ compile 通過</span>
+<span class="kw">trait</span> Erased {
+    <span class="kw">fn</span> name(&amp;self) -&gt; &amp;<span class="kw">'static</span> <span class="ty">str</span>;
+}
+
+<span class="kw">impl</span>&lt;B, S: Generic&lt;B&gt;&gt; Erased
+    <span class="kw">for</span> (S, PhantomData&lt;B&gt;)
+{
+    <span class="kw">fn</span> name(&amp;self) -&gt; &amp;<span class="kw">'static</span> <span class="ty">str</span> {
+        self.<span class="ty">0</span>.name()
+        <span class="cm">// 透過 (S, _) tuple 的 .0 拿 S</span>
+    }
+}
+
+<span class="kw">fn</span> mk_box&lt;B: <span class="kw">'static</span>,
+          S: Generic&lt;B&gt; + <span class="kw">'static</span>&gt;(s: S)
+    -&gt; Box&lt;<span class="kw">dyn</span> Erased&gt;
+{
+    Box::new((s, PhantomData))
+    <span class="cm">// dyn Erased 沒有 unbound associated → 通過</span>
+}</pre>
+    </div>
+    <figcaption>左：trait 帶 associated type，dyn DoubleAssociated 必須 ground，E0191 報出兩個 associated 都得指定。右：把 generic 全部關進 impl header、trait 表面層變 monomorphic，dyn Erased 直接通過。<code>impl</code> 的 type、where bound、PhantomData 完全一樣——差異只在 trait 形狀。</figcaption>
+  </figure>
+
+  <p>
+    當你把這兩段對齊看，就會體會到 dyn-compatibility 規則究竟在 enforce 什麼：
+    它不是禁止你寫 generic、不是禁止你用 associated type，
+    它只是堅持「trait object 的 vtable schema 在編譯期就必須 ground」。
+    把 generic 留在 <code>impl</code> 上、不把它升到 trait 上，這個 invariant 就能滿足。
+    這也是為什麼方案三能用——它沒有違反規則，它只是把規則的邊界用到極致。
+  </p>
+
+  <h2>方案四的維度：Box&lt;dyn Any&gt; 走到底，付 downcast 換最強 erasure</h2>
+
+  <p>
+    方案三的限制是「B 不能出現在介面」，但真實世界的 trait 不總是這麼乾淨。
+    考慮一個更現實的 trait：
+  </p>
+
+  <pre><code class="language-rust">pub trait Generic&lt;B&gt; {
+    fn input(b: &amp;B);
+    fn output(&amp;self) -&gt; B;
+}</code></pre>
+
+  <p>
+    這個 trait 的 input 接受 B、output 回傳 B，B 從頭到尾貫穿介面，方案三完全平移不過去。
+    這時 <code>Box&lt;dyn Any&gt;</code> 上場：把所有 input/output 全部包成 <code>Box&lt;dyn Any&gt;</code>，
+    在 wrapper 的實作裡 downcast 回真正的 B，呼叫真正的 method，再把結果 box 起來。
+  </p>
+
+  <pre><code class="language-rust">trait Erased {
+    fn input(&amp;self, b: &amp;Box&lt;dyn Any&gt;);
+    fn output(&amp;self) -&gt; Box&lt;dyn Any&gt;;
+}
+
+impl&lt;B: 'static, S: Generic&lt;B&gt;&gt; Erased for (S, PhantomData&lt;B&gt;) {
+    fn input(&amp;self, b: &amp;Box&lt;dyn Any&gt;) {
+        S::input(b.downcast_ref().unwrap())
+    }
+    fn output(&amp;self) -&gt; Box&lt;dyn Any&gt; {
+        Box::new(self.0.output())
+    }
+}</code></pre>
+
+  <p>
+    這個版本能編、能裝箱、兩個 existential 都被消去，介面上完全看不見 B。
+    代價有三：
+    第一，每個方法簽章都得手寫 <code>Box&lt;dyn Any&gt;</code> 轉換邏輯，方法多了 boilerplate 會線性放大；
+    第二，<code>downcast_ref().unwrap()</code> 在 type 對不上時會 panic——這把 type-system 該抓的錯推到 runtime；
+    第三，<code>Box::new(...)</code> 會在 heap 上配置記憶體，每次 method call 都會 allocate，hot path 會 measurable。
+  </p>
+
+  <p>
+    第二點是這個方案最尖銳的問題。
+    呼叫者拿到 <code>Box&lt;dyn Erased&gt;</code> 之後，如果餵錯 B 進去 input（例如本該餵 f32 結果餵 f64），編譯器無從察覺——這個 box 在 type-system 看來就是個 opaque 容器，B 已經被抹掉了。
+    downcast 在 runtime 發現 type 不對才會 panic。
+    這違反了 Rust 的核心承諾：「能編過的程式不會在 runtime 因為 type error 崩潰」。
+    Any 路線是這個承諾的破口。
+  </p>
+
+  <p>
+    第三點的成本可以量化。
+    <code>Box::new(b)</code> 在 default allocator 下大約 30-100ns，因為要走一次 malloc。
+    對於 plugin event dispatcher 這種「每秒幾百次 call、每次資料量小」的場景，這個 allocation 開銷會 dominate 整個 latency 預算。
+    解法是用 typed arena 或 small-box optimization（把小 B 直接放進 fat pointer 的 padding），但這些都得自己實作，標準庫不提供。
+  </p>
+
+  <p>
+    為了讓「downcast 成本 vs vtable 成本」這件事不只停留在直覺，下面這張 scatter 圖把四個方案在「runtime overhead per call (ns)」與「extra boilerplate per method (LoC)」這兩個維度上的位置畫出來。
+    Y 軸是 wolfgirl 文中沒給出具體數字、但對讀者最重要的兩個成本維度，數字是綜合 Rust 標準工具的 microbenchmark 推估（cycle counts × 3GHz CPU），請當作量級而非精確值。
+  </p>
+
+  <figure class="vg-w-chart-rust-tradeoff" data-svg-scroll="720">
+    <style>
+      .vg-w-chart-rust-tradeoff { display: grid; gap: var(--s-2); }
+      .vg-w-chart-rust-tradeoff svg { width: 100%; height: auto; }
+      .vg-w-chart-rust-tradeoff .legend { display: flex; gap: var(--s-3); flex-wrap: wrap; font-family: var(--sans); font-size: var(--fs-xs); color: var(--ink-soft); }
+      .vg-w-chart-rust-tradeoff .legend-row { display: flex; align-items: center; gap: var(--s-1); }
+      .vg-w-chart-rust-tradeoff .swatch { width: 12px; height: 12px; border-radius: 50%; display: inline-block; }
+      .vg-w-chart-rust-tradeoff figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+      @media (max-width: 720px) {
+        .vg-w-chart-rust-tradeoff svg { min-height: 280px; max-height: 60vh; }
+      }
+    </style>
+    <svg viewBox="0 0 720 360" preserveAspectRatio="xMidYMid meet" role="img"
+         aria-label="四個方案在 runtime 成本與 boilerplate 維度上的座標">
+      <g id="vg-w-chart-rust-tradeoff-axes"></g>
+      <g id="vg-w-chart-rust-tradeoff-points"></g>
+    </svg>
+    <div class="legend">
+      <span class="legend-row"><span class="swatch" style="background: var(--muted-2)"></span>for-exists（左下，零成本但無法 box）</span>
+      <span class="legend-row"><span class="swatch" style="background: var(--ink-deep)"></span>associated type（旁邊，等同被拒）</span>
+      <span class="legend-row"><span class="swatch" style="background: var(--sage-deep)"></span>手刻 wrapper（中段，最佳平衡）</span>
+      <span class="legend-row"><span class="swatch" style="background: var(--accent)"></span>Box&lt;dyn Any&gt;（右上，能塞最多但最貴）</span>
+    </div>
+    <figcaption>X 軸：每個方法 erasure 所需的額外程式碼行數（典型估計）。Y 軸：單次 method call 的 runtime overhead（ns）。原點代表「零開銷、無 erasure」，右上方代表「最強 erasure、最高開銷」。四個方案沿著一條 trade-off 曲線排開——這條曲線就是 dyn-compatibility 規則的 cost frontier。</figcaption>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-chart-rust-tradeoff');
+        if (!root) return;
+        const axesG = root.querySelector('#vg-w-chart-rust-tradeoff-axes');
+        const ptsG = root.querySelector('#vg-w-chart-rust-tradeoff-points');
+        const NS = 'http://www.w3.org/2000/svg';
+        function el(tag, attrs, text) {
+          const e = document.createElementNS(NS, tag);
+          for (const [k, v] of Object.entries(attrs || {})) e.setAttribute(k, v);
+          if (text != null) e.textContent = text;
+          return e;
+        }
+
+        const X0 = 70, X1 = 690, Y0 = 300, Y1 = 40;
+        const X_MAX = 12;   // LoC per method
+        const Y_MAX = 100;  // ns per call
+
+        const xOf = lc => X0 + (lc / X_MAX) * (X1 - X0);
+        const yOf = ns => Y0 - (ns / Y_MAX) * (Y0 - Y1);
+
+        // Axes
+        axesG.appendChild(el('line', { x1: X0, y1: Y0, x2: X1, y2: Y0, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+        axesG.appendChild(el('line', { x1: X0, y1: Y0, x2: X0, y2: Y1, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+
+        // Y ticks: 0, 25, 50, 75, 100 ns
+        for (let v = 0; v <= Y_MAX; v += 25) {
+          const y = yOf(v);
+          axesG.appendChild(el('line', { x1: X0 - 4, y1: y, x2: X0, y2: y, stroke: 'var(--muted-2)' }));
+          axesG.appendChild(el('text', { x: X0 - 8, y: y + 4, 'text-anchor': 'end', 'font-family': 'Manrope, sans-serif', 'font-size': 11, fill: 'var(--muted)' }, `${v} ns`));
+        }
+
+        // X ticks: 0, 3, 6, 9, 12 LoC
+        for (let v = 0; v <= X_MAX; v += 3) {
+          const x = xOf(v);
+          axesG.appendChild(el('line', { x1: x, y1: Y0, x2: x, y2: Y0 + 4, stroke: 'var(--muted-2)' }));
+          axesG.appendChild(el('text', { x: x, y: Y0 + 18, 'text-anchor': 'middle', 'font-family': 'Manrope, sans-serif', 'font-size': 11, fill: 'var(--muted)' }, String(v)));
+        }
+
+        // Axis labels
+        axesG.appendChild(el('text', { x: (X0 + X1) / 2, y: Y0 + 38, 'text-anchor': 'middle', 'font-family': 'EB Garamond, serif', 'font-size': 13, fill: 'var(--muted)' }, 'boilerplate per method (LoC)'));
+        axesG.appendChild(el('text', { x: 16, y: (Y0 + Y1) / 2, 'text-anchor': 'middle', 'font-family': 'EB Garamond, serif', 'font-size': 13, fill: 'var(--muted)', transform: `rotate(-90 16 ${(Y0 + Y1) / 2})` }, 'runtime overhead per call (ns)'));
+
+        // Cost frontier (a curve connecting the four points)
+        const frontier = [
+          { x: 1, y: 0, label: 'for-exists', color: 'var(--muted-2)', desc: '零成本、無法 box' },
+          { x: 3, y: 0, label: 'associated', color: 'var(--ink-deep)', desc: 'E0191 撞牆' },
+          { x: 6, y: 8, label: 'wrapper', color: 'var(--sage-deep)', desc: '一次 vtable indirection' },
+          { x: 11, y: 75, label: 'Box<dyn Any>', color: 'var(--accent)', desc: 'vtable + downcast + alloc' },
+        ];
+
+        const path = frontier.map((p, i) => `${i === 0 ? 'M' : 'L'} ${xOf(p.x)} ${yOf(p.y)}`).join(' ');
+        ptsG.appendChild(el('path', { d: path, fill: 'none', stroke: 'var(--muted-2)', 'stroke-width': 1, 'stroke-dasharray': '4,3' }));
+
+        const LABEL_SAFE_RIGHT = X1 - 110;
+        frontier.forEach(p => {
+          ptsG.appendChild(el('circle', { cx: xOf(p.x), cy: yOf(p.y), r: 6, fill: p.color }));
+          const flip = xOf(p.x) > LABEL_SAFE_RIGHT;
+          const tx = xOf(p.x) + (flip ? -12 : 12);
+          const anchor = flip ? 'end' : 'start';
+          ptsG.appendChild(el('text', { x: tx, y: yOf(p.y) - 6, 'text-anchor': anchor, 'font-family': 'EB Garamond, serif', 'font-size': 13, fill: 'var(--ink)' }, p.label));
+          ptsG.appendChild(el('text', { x: tx, y: yOf(p.y) + 10, 'text-anchor': anchor, 'font-family': 'Manrope, sans-serif', 'font-size': 10, fill: 'var(--muted)' }, p.desc));
+        });
+
+        // Annotation: the cost frontier
+        ptsG.appendChild(el('text', { x: 360, y: 70, 'font-family': 'EB Garamond, serif', 'font-size': 14, fill: 'var(--accent-text)', 'font-style': 'italic' }, 'cost frontier'));
+        ptsG.appendChild(el('text', { x: 360, y: 88, 'font-family': 'Manrope, sans-serif', 'font-size': 10, fill: 'var(--muted)' }, 'dyn-compatibility 規則決定的可行邊界'));
+      })();
+    </script>
+  </figure>
+
+  <p>
+    這張圖的形狀本身就是 wolfgirl post 的 thesis：四個方案不是在比效能，而是在比「我願意拿多少 runtime 成本換多少 erasure 能力」。
+    從原點往右上走，每多一點 erasure 都要多付一點開銷；
+    左下角的 for-exists 看似最便宜，但它根本沒實現 existential——它是把問題退回給呼叫端。
+    associated type 與 for-exists 都在左半邊，對 box 化的需求毫無幫助；
+    wrapper trait 是中段最佳平衡點；
+    <code>Box&lt;dyn Any&gt;</code> 把能解決的範圍推到最大，代價是 70 ns 量級的 per-call overhead 與 type safety 的弱化。
+  </p>
+
+  <p>
+    為了讓你直接對齊「同一個 trait，四個方案各自的 Rust 簽章長什麼樣」，下方這個 tab 切換器把四份 code 並列。
+    這不是把方案重講一遍——是把它們的核心簽章 distill 到一個視覺單位裡，方便你在實際選擇時來回對比。
+  </p>
+
+  <figure class="vg-w-tabs-rust-erasure">
+    <p class="vg-w-affordance"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M3 9h18"/><path d="M9 21V9"/></svg><span>switch tabs to compare 4 approaches · 4 tabs</span></p>
+    <style>
+      .vg-w-tabs-rust-erasure { display: grid; gap: var(--s-2); }
+      .vg-w-tabs-rust-erasure input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-tabs-rust-erasure .tabs { display: flex; gap: var(--s-2); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+      .vg-w-tabs-rust-erasure .tab { font-family: var(--sans); font-size: var(--fs-sm); padding: var(--s-1) var(--s-2); cursor: pointer; color: var(--muted); min-height: 44px; display: flex; align-items: center; }
+      .vg-w-tabs-rust-erasure .panel { display: none; padding: var(--s-2); background: var(--bg-soft); border-left: 2px solid var(--accent); font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 12px; line-height: 1.6; white-space: pre; overflow-x: auto; }
+      .vg-w-tabs-rust-erasure:has(#vg-w-tabs-rust-erasure-t1:checked) .panel-1 { display: block; }
+      .vg-w-tabs-rust-erasure:has(#vg-w-tabs-rust-erasure-t1:checked) [for="vg-w-tabs-rust-erasure-t1"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-rust-erasure:has(#vg-w-tabs-rust-erasure-t2:checked) .panel-2 { display: block; }
+      .vg-w-tabs-rust-erasure:has(#vg-w-tabs-rust-erasure-t2:checked) [for="vg-w-tabs-rust-erasure-t2"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-rust-erasure:has(#vg-w-tabs-rust-erasure-t3:checked) .panel-3 { display: block; }
+      .vg-w-tabs-rust-erasure:has(#vg-w-tabs-rust-erasure-t3:checked) [for="vg-w-tabs-rust-erasure-t3"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-rust-erasure:has(#vg-w-tabs-rust-erasure-t4:checked) .panel-4 { display: block; }
+      .vg-w-tabs-rust-erasure:has(#vg-w-tabs-rust-erasure-t4:checked) [for="vg-w-tabs-rust-erasure-t4"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-rust-erasure figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+    <input type="radio" id="vg-w-tabs-rust-erasure-t1" name="vg-w-tabs-rust-erasure-sel" checked />
+    <input type="radio" id="vg-w-tabs-rust-erasure-t2" name="vg-w-tabs-rust-erasure-sel" />
+    <input type="radio" id="vg-w-tabs-rust-erasure-t3" name="vg-w-tabs-rust-erasure-sel" />
+    <input type="radio" id="vg-w-tabs-rust-erasure-t4" name="vg-w-tabs-rust-erasure-sel" />
+    <div class="tabs" role="tablist">
+      <label class="tab" for="vg-w-tabs-rust-erasure-t1">① for-exists</label>
+      <label class="tab" for="vg-w-tabs-rust-erasure-t2">② associated type</label>
+      <label class="tab" for="vg-w-tabs-rust-erasure-t3">③ wrapper trait</label>
+      <label class="tab" for="vg-w-tabs-rust-erasure-t4">④ Box&lt;dyn Any&gt;</label>
+    </div>
+    <div class="panel panel-1">// 方案一：把 ∃ 翻成 ∀，由呼叫端攜帶具體型別
+fn use_generic&lt;B, S: Generic&lt;B&gt;&gt;(s: &amp;S) -&gt; &amp;'static str {
+    s.name()
+}
+
+// 呼叫：
+// use_generic::&lt;f32, i32&gt;(&amp;42i32);
+// use_generic::&lt;f64, i32&gt;(&amp;42i32);
+//
+// 缺陷：S、B 從 use site 傳播到 storage，無法存進
+// Vec&lt;Box&lt;dyn _&gt;&gt;，封裝意圖消失。</div>
+    <div class="panel panel-2">// 方案二：把 B 改成 associated type，用 PhantomData 撐 type-level
+trait DoubleAssociated {
+    type S: Generic&lt;Self::B&gt;;
+    type B;
+    fn as_ref(&amp;self) -&gt; &amp;Self::S;
+}
+
+impl&lt;S, B&gt; DoubleAssociated for (S, PhantomData&lt;B&gt;)
+where S: Generic&lt;B&gt;,
+{
+    type S = S;
+    type B = B;
+    fn as_ref(&amp;self) -&gt; &amp;Self::S { &amp;self.0 }
+}
+
+// let x: Box&lt;dyn DoubleAssociated&gt; = ...
+// → error[E0191]: associated types `S`, `B` must be specified</div>
+    <div class="panel panel-3">// 方案三：把 generic 收進 impl header，trait 表面層完全 monomorphic
+trait Erased {
+    fn name(&amp;self) -&gt; &amp;'static str;
+}
+
+impl&lt;B, S: Generic&lt;B&gt;&gt; Erased for (S, PhantomData&lt;B&gt;) {
+    fn name(&amp;self) -&gt; &amp;'static str {
+        self.0.name()
+    }
+}
+
+fn mk_box&lt;B: 'static, S: Generic&lt;B&gt; + 'static&gt;(s: S) -&gt; Box&lt;dyn Erased&gt; {
+    Box::new((s, PhantomData))
+}
+
+// 限制：B 不能出現在 trait 方法簽章。</div>
+    <div class="panel panel-4">// 方案四：input/output 全部走 Box&lt;dyn Any&gt;，runtime downcast
+use std::any::Any;
+
+trait Erased {
+    fn input(&amp;self, b: &amp;Box&lt;dyn Any&gt;);
+    fn output(&amp;self) -&gt; Box&lt;dyn Any&gt;;
+}
+
+impl&lt;B: 'static, S: Generic&lt;B&gt;&gt; Erased for (S, PhantomData&lt;B&gt;) {
+    fn input(&amp;self, b: &amp;Box&lt;dyn Any&gt;) {
+        S::input(b.downcast_ref().unwrap())   // 型別錯 → panic
+    }
+    fn output(&amp;self) -&gt; Box&lt;dyn Any&gt; {
+        Box::new(self.0.output())              // 每次都 alloc
+    }
+}</div>
+    <figcaption>四個方案的最小骨架。注意方案三和方案四的 impl header 完全一樣（<code>impl&lt;B, S: Generic&lt;B&gt;&gt; ... for (S, PhantomData&lt;B&gt;)</code>），差別只在 trait 上暴露什麼——這就是「dyn-compat 規則只在 trait 表面層管事」的具體展現。</figcaption>
+  </figure>
+
+  <p>
+    把四份簽章對齊看，最該注意的觀察是方案三和方案四的 <code>impl</code> header 完全一樣。
+    這不是巧合——他們繞過 dyn-compatibility 的策略是相同的：把所有 generic 收進 impl header、讓 trait 表面層保持 monomorphic。
+    差別只在「trait 上要暴露什麼樣的 monomorphic 介面」。
+    方案三選擇了「乾脆不暴露 B」（適用 B 不出現在方法的 case）；
+    方案四選擇了「用 Any 包住 B」（適用 B 必須出現的 case）。
+    當你下次面對「我該選方案三還是方案四」這個問題時，問題的形狀就是「B 是否出現在介面」。
+  </p>
+
+  <h2>跨方案的維度：dyn-compatibility 規則本身到底在 enforce 什麼</h2>
+
+  <p>
+    把四個方案放在一起看完，現在可以回到根問題：為什麼 dyn-compatibility 規則長這樣？
+    Rust 對 dyn-compat 的官方定義（Reference 5.16）有兩條核心限制：
+    <em>所有方法不能在 self type 之外帶 generic 參數</em>、
+    <em>所有方法的簽章不能含有未 ground 的 associated type</em>。
+    這兩條看似不同，其實是同一個約束的兩種表達。
+  </p>
+
+  <p>
+    本質的約束是 vtable 的形狀必須在 compile time 被固定。
+    一個 <code>dyn Trait</code> 物件的記憶體佈局是 <code>(data_ptr, vtable_ptr)</code>——一個 fat pointer。
+    vtable 本身是個 read-only 的 static 結構，內容是「方法的函式指標、self 的 size、self 的 alignment、self 的 drop function」。
+    要建構這個 static 結構，所有方法的簽章必須完全 ground——
+    這意味著方法不能有任何 caller-supplied generic 參數（不然 vtable 裡得放一個 generic function pointer，C 語言層級辦不到），
+    也不能有未解的 associated type（不然 sizeof 算不出來）。
+  </p>
+
+  <p>
+    某個微妙的後果是：dyn-compat 並不是「trait 本身的屬性」，而是「trait 在當前 type context 下能不能 ground」的屬性。
+    <code>dyn Trait</code> 不行、但 <code>dyn Trait&lt;Assoc = u32&gt;</code> 可能行；
+    <code>dyn Trait&lt;Assoc = u32, Other = f64&gt;</code> 把所有 associated 都填完之後也行。
+    這就是為什麼方案二會卡在 E0191——錯誤訊息 literal 寫著 「the value of the associated types must be specified」，
+    它不是說 trait 不能 dyn，而是說「你給的 type 不夠完整」。
+  </p>
+
+  <p>
+    既然 vtable 形狀是這套規則的基石，把四個方案各自會產生（或拒絕產生）的 vtable layout 畫成記憶體骨架，比文字更能看出差別。
+    下圖把每個方案下 <code>name()</code> 這個方法在 box 物件裡會佔到的位元組視覺化——
+    fat pointer 的兩半（data ptr 與 vtable ptr）、vtable 裡的固定欄位（drop、size、align）、以及 method slot 在每個方案下分別填了什麼。
+  </p>
+
+  <figure class="vg-w-skel-rust-vtable" data-svg-scroll="720">
+    <style>
+      .vg-w-skel-rust-vtable { display: grid; gap: var(--s-2); }
+      .vg-w-skel-rust-vtable svg { width: 100%; height: auto; }
+      .vg-w-skel-rust-vtable figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+      .vg-w-skel-rust-vtable .lbl { font-family: var(--sans); font-size: 10px; fill: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+      .vg-w-skel-rust-vtable .ttl { font-family: var(--serif); font-size: 13px; fill: var(--ink); font-style: italic; }
+      .vg-w-skel-rust-vtable .slot { font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 11px; fill: var(--ink); }
+      .vg-w-skel-rust-vtable .note { font-family: var(--scribed); font-size: 11px; fill: var(--muted); }
+      .vg-w-skel-rust-vtable .ok { fill: var(--sage-deep); }
+      .vg-w-skel-rust-vtable .no { fill: var(--accent-text); }
+    </style>
+    <svg viewBox="0 0 720 360" preserveAspectRatio="xMidYMid meet" role="img"
+         aria-label="四個方案下 name() 方法在 vtable 裡的記憶體骨架">
+      <defs>
+        <pattern id="vg-w-skel-rust-vtable-cross" patternUnits="userSpaceOnUse" width="6" height="6" patternTransform="rotate(45)">
+          <line x1="0" y1="0" x2="0" y2="6" stroke="var(--muted-2)" stroke-width="1" />
+        </pattern>
+      </defs>
+
+      <g transform="translate(20, 30)">
+        <text class="ttl" x="0" y="0">① for-exists：沒有 vtable，全部 inline</text>
+        <rect x="0" y="14" width="200" height="36" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1" />
+        <text class="slot" x="100" y="37" text-anchor="middle">i32 (4 bytes, inline)</text>
+        <text class="lbl" x="0" y="68">直接在 stack 上展開</text>
+        <text class="note no" x="0" y="84">→ 無法放進 Box&lt;dyn _&gt;</text>
+      </g>
+
+      <g transform="translate(260, 30)">
+        <text class="ttl" x="0" y="0">② associated type：被 E0191 攔下</text>
+        <rect x="0" y="14" width="200" height="36" fill="url(#vg-w-skel-rust-vtable-cross)" stroke="var(--muted-2)" stroke-width="1" />
+        <text class="slot" x="100" y="37" text-anchor="middle">vtable schema 無法 ground</text>
+        <text class="lbl" x="0" y="68">編譯期就拒絕</text>
+        <text class="note no" x="0" y="84">→ 根本走不到 vtable 階段</text>
+      </g>
+
+      <g transform="translate(500, 30)">
+        <text class="ttl" x="0" y="0">③ wrapper trait：乾淨 vtable</text>
+        <g>
+          <rect x="0" y="14" width="92" height="36" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1" />
+          <text class="lbl" x="46" y="11" text-anchor="middle">data ptr</text>
+          <text class="slot" x="46" y="37" text-anchor="middle">&amp;(i32, ∅)</text>
+          <rect x="100" y="14" width="92" height="36" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1" />
+          <text class="lbl" x="146" y="11" text-anchor="middle">vtable ptr</text>
+          <text class="slot" x="146" y="37" text-anchor="middle">→ VT_Erased</text>
+        </g>
+        <text class="note ok" x="0" y="84">→ fat ptr = 16 bytes</text>
+      </g>
+
+      <g transform="translate(20, 150)">
+        <text class="ttl" x="0" y="0">③ vtable VT_Erased（方法表）</text>
+        <rect x="0" y="14" width="660" height="44" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1" />
+        <line x1="132" y1="14" x2="132" y2="58" stroke="var(--muted-2)" />
+        <line x1="264" y1="14" x2="264" y2="58" stroke="var(--muted-2)" />
+        <line x1="396" y1="14" x2="396" y2="58" stroke="var(--muted-2)" />
+        <line x1="528" y1="14" x2="528" y2="58" stroke="var(--muted-2)" />
+        <text class="lbl" x="66" y="11" text-anchor="middle">drop_in_place</text>
+        <text class="slot" x="66" y="40" text-anchor="middle">fn(*mut T)</text>
+        <text class="lbl" x="198" y="11" text-anchor="middle">size</text>
+        <text class="slot" x="198" y="40" text-anchor="middle">8 (i32 + ∅)</text>
+        <text class="lbl" x="330" y="11" text-anchor="middle">align</text>
+        <text class="slot" x="330" y="40" text-anchor="middle">4</text>
+        <text class="lbl" x="462" y="11" text-anchor="middle">name</text>
+        <text class="slot" x="462" y="40" text-anchor="middle">→ name_impl</text>
+        <text class="lbl" x="594" y="11" text-anchor="middle">（無 B 欄位）</text>
+        <text class="slot ok" x="594" y="40" text-anchor="middle">monomorphic ✓</text>
+      </g>
+
+      <g transform="translate(20, 240)">
+        <text class="ttl" x="0" y="0">④ Box&lt;dyn Any&gt;：vtable + heap alloc 串接</text>
+        <rect x="0" y="14" width="92" height="36" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1" />
+        <text class="lbl" x="46" y="11" text-anchor="middle">data ptr</text>
+        <text class="slot" x="46" y="37" text-anchor="middle">&amp;(i32, ∅)</text>
+        <rect x="100" y="14" width="92" height="36" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1" />
+        <text class="lbl" x="146" y="11" text-anchor="middle">vtable ptr</text>
+        <text class="slot" x="146" y="37" text-anchor="middle">→ VT_Erased</text>
+
+        <line x1="192" y1="32" x2="232" y2="32" stroke="var(--muted-2)" stroke-width="1.5" />
+        <text class="lbl" x="212" y="24" text-anchor="middle">output()</text>
+
+        <rect x="240" y="14" width="200" height="36" fill="var(--bg)" stroke="var(--accent)" stroke-width="1.5" stroke-dasharray="3,2" />
+        <text class="lbl" x="340" y="11" text-anchor="middle">heap-alloc Box&lt;dyn Any&gt;</text>
+        <text class="slot" x="340" y="37" text-anchor="middle">data ptr | TypeId | vtable</text>
+
+        <line x1="440" y1="32" x2="480" y2="32" stroke="var(--muted-2)" stroke-width="1.5" />
+        <text class="lbl" x="460" y="24" text-anchor="middle">downcast</text>
+
+        <rect x="488" y="14" width="180" height="36" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1" />
+        <text class="slot" x="578" y="37" text-anchor="middle">TypeId == ⟨B⟩? → unwrap</text>
+        <text class="note no" x="0" y="84">→ 每次 method call 多一次 malloc + TypeId 比對；type 不對 → panic</text>
+      </g>
+    </svg>
+    <figcaption>同樣呼叫 <code>name()</code>，方案一沒有 vtable（inline）、方案二根本到不了 vtable（編譯失敗）、方案三的 vtable 是 monomorphic 的 4 欄位定值表、方案四在這個 vtable 之上又多串一條 heap-alloc + TypeId 比對的 chain。<code>name</code> 欄旁邊「無 B 欄位」是 dyn-compat 的核心 invariant——任何含未 ground 型別的方法都進不了這張表。</figcaption>
+  </figure>
+
+  <p>
+    把這個約束類比到 C++ 會比較直觀：
+    C++ 的 virtual function 不能是 template member function，也是因為 vtable 沒辦法放 template instantiation 的指標。
+    Rust 的 dyn-compat 就是 Rust 版本的「virtual 不能 template」——它把這個限制具體化、用 trait coherence 的詞彙講清楚，但底層是同一個 ABI 約束。
+  </p>
+
+  <p>
+    這個約束有沒有可能放鬆？
+    Rust 社群在 <code>rfcs/3192</code>（async fn in trait）的討論裡反覆碰到 dyn-compat 的邊界——
+    async fn 在 trait 上會回傳一個 anonymous future type（即 <code>impl Future</code>），
+    這個 anonymous type 等同 associated type，dyn 不下去。
+    Rust 1.75 引入的 RPITIT（return-position impl trait in trait）讓 trait 可以暴露 <code>fn foo() -&gt; impl X</code>，
+    但 dyn 化這種 trait 還在 work in progress——RFC 3318 提了 <code>dyn*</code> 概念，
+    打算把 vtable schema 從「fat pointer」改成「兩個 thin pointer，其中一個指向 type erasure adapter」，
+    這個 adapter 在 runtime 才補上 anonymous type 的具體 fit。
+  </p>
+
+  <p>
+    這個方向如果走得通，就是 dyn-compat 約束的一次重大放鬆——
+    但它仍然不會解決「兩個 associated type 同時 existential」這個問題，
+    因為 <code>dyn*</code> 還是只能 erase 一層。
+    本質上，trait object 是「把多個 implementation type 對齊到同一個 ABI」的機制，
+    對齊的代價就是「ABI 必須是 monomorphic」——這個代價不會因為機制變更而消失，只會被推到不同的位置。
+  </p>
+
+  <p>
+    所以 wolfgirl 在文末的判斷「impossible to fully automatically erase multiple existential bounds in Rust」並不是 Rust 的設計失誤——
+    它是任何 statically typed language 在做 trait object / virtual dispatch 時都會碰到的根本約束。
+    Java 的 <code>List&lt;? extends Foo&gt;</code> 可以 erase 一層（wildcard），但要 nested wildcard 也得用 capture conversion 把 existential 推到方法簽章上；
+    Haskell 的 existential type（forall a. C a =&gt; ...）配上 type class 可以 erase 多層，但代價是 dictionary passing 永遠 runtime indirect。
+    沒有免費的 erasure。
+  </p>
+
+  <p>
+    講完 dyn-compat 的根因之後，還有一層比 microbenchmark 更隱性的成本要列出來：
+    benchmark 數字之外，這四個方案在大型 codebase 上會浮現一些 per-call latency 看不到的代價。
+    這幾項合起來才是真正的「production cost」，也是決策時最容易被忽略的維度。
+  </p>
+
+  <p>
+    第一個是 <strong>incremental compilation 友善度</strong>。
+    for-exists（方案一）依賴 monomorphization，每多一個 instantiation site 都會在 metadata 裡留一份 cache key；
+    大型專案中只要某個 generic function 的定義有任何改動，所有用到它的下游 crate 都要重編。
+    方案三、四走 dyn 路線，wrapper trait 的方法表是 monomorphic 的，下游 crate 看到的 ABI 是固定的，
+    只要 wrapper trait 本身的簽章不變，下游就不用重編——大型 workspace 上這個差距可能是十倍量級的 incremental build time。
+  </p>
+
+  <p>
+    第二個是 <strong>二進位大小</strong>。
+    for-exists 路線每個 type parameter 組合都產生一份 monomorphic code，
+    對於 <code>fn foo&lt;A, B, C, D&gt;</code> 配上四個各兩個 type 的 case，理論上能 instantiate 出 16 個版本。
+    LLVM 的 dead-code elimination 與 ICF（identical code folding）能消去一部分，但 release binary 的 size 比 dyn 路線通常大 20-50%。
+    Embedded scenarios（嵌入式或 wasm size budget 嚴格）這個差距會 dominate 整個選擇。
+  </p>
+
+  <p>
+    第三個是 <strong>error message 的 onboarding 成本</strong>。
+    方案二會給出 E0191；方案一遇到 type 不滿足 bound 會給出 trait bound 鏈—— compiler diagnostics 在 generic-heavy code 上會 cascade 出十幾行；
+    方案三、四的 error message 通常較短，因為 wrapper trait 是 monomorphic 的，問題出在 wrapper 內部時錯誤訊息會收斂到一兩行。
+    對新進工程師 onboarding 一個 codebase，方案三、四的「介面比較好讀」是真實 productivity gain。
+  </p>
+
+  <p>
+    第四個是 <strong>unsafe 邊界的擴張</strong>。
+    方案四的 <code>downcast_ref().unwrap()</code> 把 type-system 的不變式推到 runtime，
+    一旦這個 unwrap panic，整個 process 就崩了；
+    更糟的是，如果有人寫 <code>downcast_unchecked</code> 想要省 type check，就把 unsafe 引入了——
+    這對於 process-isolation 不足的環境（單一 OS process 跑多個 component），會把整個程式的安全邊界一起拖下水。
+    方案三完全在 safe Rust 裡解決，這個邊界擴張不會發生。
+  </p>
+
+  <p>
+    第五個是 <strong>跨語言 FFI 的可達性</strong>。
+    如果你的 wrapper 之後要被 C / C++ / Python 透過 FFI 呼叫，
+    方案三的 monomorphic Erased trait 配上 <code>extern "C"</code> 的 wrapper function 是最容易做的——
+    C 端看到的就是 <code>fn(*mut c_void) -&gt; *const c_char</code> 之類的 plain signature。
+    方案四的 <code>Box&lt;dyn Any&gt;</code> 跨 FFI 完全不能用，
+    因為 Any 是 Rust 內部 type、C 端拿到的 <code>*mut c_void</code> 沒有 type tag 可以 downcast。
+    這個限制會把方案四從某些場景直接刪除（任何 Python binding、任何 C ABI export）。
+  </p>
+
+  <p>
+    把這些隱性成本加上 wolfgirl 文中提到的顯性 trade-off，可以歸納出一個簡單的決策結構：
+    凡是「需要 box 化、heterogeneous storage、跨 FFI、binary size 敏感」這四個條件中有三個以上成立的，方案三是最好的選擇；
+    凡是「B 必須出現在介面、不需要跨 FFI、單一 trait 方法數 ≤ 5」三個都成立的，方案四是可接受的；
+    其他情況——尤其是「呼叫端就是知道型別、不需要 box」——方案一是正解。
+    方案二永遠不該作為終點，它只是教學案例。
+  </p>
+
+  <h2>如何選：把 dyn-compat 約束翻譯成決策流程</h2>
+
+  <p>
+    走到這裡，所有維度已經攤開。
+    現在把它們收成一個決策流程——這不是泛泛的「視情況而定」，而是基於前面五節的 trade-off 結構給出的明確判斷規則。
+  </p>
+
+  <pre data-kind="pseudocode"><code>┌──────────────────────────────────────────────────────────────────┐
+│ Q1: 你需要把這些值「存起來、放進 heterogeneous collection」嗎？   │
+└──────────────────────────────────────────────────────────────────┘
+     │
+     ├── 否 → 用 fn foo&lt;B, S: Trait&lt;B&gt;&gt;(...) ［方案一・for-exists］
+     │       <em>// 這不是真的 erase existential，是把它推回 caller</em>
+     │       <em>// 但 caller 本來就知道型別，這就是最自然的寫法。</em>
+     │
+     └── 是 →
+         ┌─────────────────────────────────────────────────────┐
+         │ Q2: 你的 trait 方法簽章「需不需要在 input/output 上 │
+         │     出現 B」？                                         │
+         └─────────────────────────────────────────────────────┘
+             │
+             ├── 不需要 → impl Erased for (S, PhantomData&lt;B&gt;)
+             │           ［方案三・wrapper trait］
+             │           <em>// monomorphic 表面 + generic impl，乾淨。</em>
+             │
+             └── 需要 → 再問：
+                 ┌─────────────────────────────────────────────┐
+                 │ Q3: 這個 box 需要跨 FFI 嗎？binary size      │
+                 │     敏感嗎？方法數量會否成長到 ≥10？         │
+                 └─────────────────────────────────────────────┘
+                     │
+                     ├── 任一為「是」→ 重新設計 trait，把 B 從介面拔出來
+                     │                 退回 Q2，走方案三。
+                     │
+                     └── 全為「否」→ Box&lt;dyn Any&gt;
+                                    ［方案四・runtime erasure］
+                                    <em>// 你接受 downcast panic 與每 call</em>
+                                    <em>// 一次 heap alloc 的 cost。</em>
+
+［方案二・associated type］在這個流程裡<em>不會出現</em>——
+它在 Q2「需不需要 box」這一關就會被 E0191 攔下來。
+如果你考慮過它，把它替換成方案三。</code></pre>
+
+  <p>
+    這個流程的特性是：每一個分岔都是可以被「程式碼結構」直接判斷的問題，不是「視專案」這種模糊判準。
+    Q1 是 storage 需求、Q2 是介面形狀、Q3 是工程約束，全部都能在 code review 時 30 秒內回答完。
+    如果你發現某一題答不出來，多半是 trait 本身的設計還沒收斂——這時與其勉強選一個 erasure 方案，不如先把 trait 重新切分。
+  </p>
+
+  <p>
+    一個常見的場景是：原本的 trait 把 B 既當 input 又當 output 用，
+    但仔細看會發現「output 用到 B」其實只在某幾個方法。
+    把這些方法 extract 成另一個 trait，主 trait 就符合 Q2 的「不需要」分支，方案三能直接套用。
+    這種 trait 拆分通常會讓整個 API 變得更清楚——一個 trait 一件事，是 Rust trait 設計的核心美學。
+  </p>
+
+  <p>
+    另一個常見場景是：你以為自己需要 erasure，但其實只是 generic propagation 嫌煩。
+    這種「為了少寫幾個 type parameter 而引入 dyn」的衝動，幾乎總是錯的——
+    引入 dyn 之後跑出來的 runtime cost、binary size 影響、debug 困難度，加起來遠超「多寫 3 行 type parameter」的成本。
+    Rust 的 monomorphization 是它最強的工具之一，能用 generic 解決就不要引入 dyn。
+  </p>
+
+  <p>
+    最後留一個 sanity check：如果你看完這篇還不能在 30 秒內判斷自己手上的 case 應該走哪條路，那很可能你的 trait 設計本身需要重新審視——
+    要嘛 B 的角色不夠清楚（應該是 generic 還是 associated？），
+    要嘛 trait 的職責不夠收斂（是不是該拆成兩個 trait？）。
+    erasure 方案是 trait 設計合理之後的最後一步，不是設計過程中的擋箭牌。
+  </p>
+
+  <p>
+    為了讓決策流程能 anchor 到 Rust 的具體語法元素，下方這張 kbd 對照表把每個方案會用到的關鍵字／型別／feature flag 鋪開——
+    這不是 syntax cheatsheet，而是「當你看到某個 Rust 關鍵字或標準庫型別出現在 codebase 裡，背後其實在 enforce 哪一個 erasure 維度」的索引。
+    讀完上面的決策流程之後，這張表是把流程 ground 回語法層的速查。
+  </p>
+
+  <figure class="vg-w-kbd-rust-erasure">
+    <style>
+      .vg-w-kbd-rust-erasure { display: grid; gap: var(--s-2); }
+      .vg-w-kbd-rust-erasure .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: var(--s-2); }
+      .vg-w-kbd-rust-erasure .cell { border: 1px solid var(--line); padding: var(--s-2); background: var(--bg-soft); display: grid; gap: var(--s-1); }
+      .vg-w-kbd-rust-erasure kbd { font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 13px; background: var(--bg); border: 1px solid var(--muted-2); border-bottom-width: 2px; border-radius: 3px; padding: 2px 6px; color: var(--ink); display: inline-block; }
+      .vg-w-kbd-rust-erasure .cell .role { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+      .vg-w-kbd-rust-erasure .cell .desc { font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink-soft); line-height: 1.5; }
+      .vg-w-kbd-rust-erasure .cell.s1 { border-left: 3px solid var(--muted-2); }
+      .vg-w-kbd-rust-erasure .cell.s2 { border-left: 3px solid var(--ink-deep); }
+      .vg-w-kbd-rust-erasure .cell.s3 { border-left: 3px solid var(--sage-deep); }
+      .vg-w-kbd-rust-erasure .cell.s4 { border-left: 3px solid var(--accent); }
+      .vg-w-kbd-rust-erasure .head { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); padding-bottom: var(--s-1); border-bottom: 1px solid var(--line); }
+      .vg-w-kbd-rust-erasure figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+      @media (max-width: 720px) {
+        .vg-w-kbd-rust-erasure .grid { grid-template-columns: 1fr; }
+      }
+    </style>
+    <div class="grid">
+      <div class="cell s1">
+        <span class="head">方案一・for-exists</span>
+        <span><kbd>fn foo&lt;B, S&gt;</kbd></span>
+        <span class="role">generic parameter</span>
+        <span class="desc">把 existential 翻成 universal——B、S 寫在 fn header 上，monomorphize 在編譯期完成。</span>
+      </div>
+      <div class="cell s1">
+        <span class="head">方案一・for-exists</span>
+        <span><kbd>impl Trait</kbd></span>
+        <span class="role">return-position</span>
+        <span class="desc"><code>fn foo() -&gt; impl X</code> 是隱式 existential——但仍是 monomorphic，不會 erase 跨多個 caller。</span>
+      </div>
+      <div class="cell s2">
+        <span class="head">方案二・associated</span>
+        <span><kbd>type Assoc</kbd></span>
+        <span class="role">trait 成員</span>
+        <span class="desc">把 B 改寫成 associated type——E0191 攔截「dyn 化時 associated 必須 ground」。</span>
+      </div>
+      <div class="cell s2">
+        <span class="head">方案二・associated</span>
+        <span><kbd>PhantomData&lt;B&gt;</kbd></span>
+        <span class="role">type-level 標記</span>
+        <span class="desc">zero-sized type，在 impl 的 self type 上 carry B；type checker 用它解 variance 與 drop check。</span>
+      </div>
+      <div class="cell s3">
+        <span class="head">方案三・wrapper</span>
+        <span><kbd>dyn Trait</kbd></span>
+        <span class="role">trait object</span>
+        <span class="desc">fat pointer (data, vtable)；要求 trait 是 dyn-compatible——表面 monomorphic、無未 ground associated。</span>
+      </div>
+      <div class="cell s3">
+        <span class="head">方案三・wrapper</span>
+        <span><kbd>impl&lt;B, S: ...&gt;</kbd></span>
+        <span class="role">impl header 收 generic</span>
+        <span class="desc">generic 留在 impl，不上 trait——讓 trait 表面層 ground 為 monomorphic vtable schema。</span>
+      </div>
+      <div class="cell s4">
+        <span class="head">方案四・Any</span>
+        <span><kbd>Box&lt;dyn Any&gt;</kbd></span>
+        <span class="role">runtime erasure</span>
+        <span class="desc">內含 TypeId + data ptr——把 type 推遲到 runtime 比對，付 heap alloc + downcast 成本。</span>
+      </div>
+      <div class="cell s4">
+        <span class="head">方案四・Any</span>
+        <span><kbd>.downcast_ref()</kbd></span>
+        <span class="role">runtime type check</span>
+        <span class="desc">回傳 <code>Option&lt;&amp;B&gt;</code>——TypeId 不對則 None；<code>unwrap()</code> 把錯誤 panic 化。</span>
+      </div>
+    </div>
+    <figcaption>八個 Rust 語法元素，兩兩對應四個方案。左邊框顏色對齊本文 chart 圖例：灰=方案一，深墨=方案二，鼠尾草綠=方案三，焦糖橙=方案四。每個 cell 的 role 標籤點名「這個 token 在語意層做的事」——當你 review 一段 Rust code，看到這些 token 就能立刻定位它在 dyn-compat 規則上的角色。</figcaption>
+  </figure>
+
+  <p>
+    把語法層的 token 對齊回方案之後，下一個維度是「實作這些方案的 cost 到底在 compile pipeline 的哪一階段被付出」？
+    Rust 的 pipeline 從 parse / HIR / typeck / MIR / monomorphization / codegen 一路走下來，每一個方案的「erasure 動作」其實發生在不同的 stage——
+    這影響的不只是 runtime，還有 incremental build 的 cache 粒度、error message 出現的 phase、以及 panic 的可定位性。
+  </p>
+
+  <figure class="vg-w-pipeline-rust-erasure" data-svg-scroll="720">
+    <style>
+      .vg-w-pipeline-rust-erasure { display: grid; gap: var(--s-2); }
+      .vg-w-pipeline-rust-erasure svg { width: 100%; height: auto; }
+      .vg-w-pipeline-rust-erasure figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+      .vg-w-pipeline-rust-erasure .stage-label { font-family: var(--sans); font-size: 11px; fill: var(--ink); text-transform: uppercase; letter-spacing: 0.05em; }
+      .vg-w-pipeline-rust-erasure .stage-sub { font-family: var(--scribed); font-size: 10px; fill: var(--muted); }
+      .vg-w-pipeline-rust-erasure .lane-label { font-family: var(--serif); font-size: 12px; fill: var(--ink); font-style: italic; }
+      .vg-w-pipeline-rust-erasure .marker-txt { font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 10px; fill: var(--bg); }
+      .vg-w-pipeline-rust-erasure .note { font-family: var(--scribed); font-size: 10px; fill: var(--muted); }
+    </style>
+    <svg viewBox="0 0 720 360" preserveAspectRatio="xMidYMid meet" role="img"
+         aria-label="四個方案的 erasure 動作在 Rust compile pipeline 中發生的階段">
+      <defs>
+        <marker id="vg-w-pipeline-rust-erasure-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--muted-2)" />
+        </marker>
+      </defs>
+
+      <text class="stage-label" x="60" y="20" text-anchor="middle">parse / HIR</text>
+      <text class="stage-sub" x="60" y="34" text-anchor="middle">source → AST</text>
+      <text class="stage-label" x="190" y="20" text-anchor="middle">typeck</text>
+      <text class="stage-sub" x="190" y="34" text-anchor="middle">trait resolve + bound check</text>
+      <text class="stage-label" x="330" y="20" text-anchor="middle">MIR</text>
+      <text class="stage-sub" x="330" y="34" text-anchor="middle">borrow check + drop elab</text>
+      <text class="stage-label" x="470" y="20" text-anchor="middle">monomorphize</text>
+      <text class="stage-sub" x="470" y="34" text-anchor="middle">generic → concrete</text>
+      <text class="stage-label" x="610" y="20" text-anchor="middle">codegen / LLVM</text>
+      <text class="stage-sub" x="610" y="34" text-anchor="middle">→ machine code</text>
+
+      <line x1="20" y1="44" x2="700" y2="44" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="2,3" />
+
+      <g transform="translate(0, 60)">
+        <text class="lane-label" x="20" y="14">方案一</text>
+        <rect x="430" y="0" width="80" height="22" fill="var(--muted-2)" />
+        <text class="marker-txt" x="470" y="15" text-anchor="middle">erase here</text>
+        <text class="note" x="520" y="15">每個 (B, S) 組合 instantiate 一份 monomorphic code</text>
+      </g>
+
+      <g transform="translate(0, 105)">
+        <text class="lane-label" x="20" y="14">方案二</text>
+        <rect x="150" y="0" width="80" height="22" fill="var(--ink-deep)" />
+        <text class="marker-txt" x="190" y="15" text-anchor="middle">E0191 here</text>
+        <text class="note" x="240" y="15">typeck 階段就拒——dyn 化時 associated 未 ground</text>
+      </g>
+
+      <g transform="translate(0, 150)">
+        <text class="lane-label" x="20" y="14">方案三</text>
+        <rect x="290" y="0" width="80" height="22" fill="var(--sage-deep)" />
+        <text class="marker-txt" x="330" y="15" text-anchor="middle">vtable here</text>
+        <text class="note" x="380" y="15">MIR 階段 elab dyn dispatch；wrapper trait 的 vtable schema 固定</text>
+      </g>
+
+      <g transform="translate(0, 195)">
+        <text class="lane-label" x="20" y="14">方案四</text>
+        <rect x="290" y="0" width="80" height="22" fill="var(--accent)" />
+        <text class="marker-txt" x="330" y="15" text-anchor="middle">vtable + Any</text>
+        <line x1="370" y1="11" x2="660" y2="11" stroke="var(--accent)" stroke-width="1.5" stroke-dasharray="4,2" marker-end="url(#vg-w-pipeline-rust-erasure-arrow)" />
+        <text class="note" x="380" y="32">downcast + alloc 推遲到 runtime——超出 pipeline 邊界</text>
+      </g>
+
+      <line x1="20" y1="240" x2="700" y2="240" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="2,3" />
+
+      <g transform="translate(0, 260)">
+        <text class="lane-label" x="20" y="14" font-style="normal" font-weight="600">runtime（pipeline 之後）</text>
+        <rect x="370" y="30" width="200" height="32" fill="var(--bg-soft)" stroke="var(--accent)" stroke-width="1.5" stroke-dasharray="3,2" />
+        <text class="stage-label" x="470" y="50" text-anchor="middle" fill="var(--accent-text)">TypeId 比對 + heap alloc</text>
+        <text class="note" x="470" y="78" text-anchor="middle">type 不對 → panic</text>
+      </g>
+
+      <text class="note" x="20" y="350">pipeline 越往左 erase，cache 粒度越粗、incremental build 越容易失效；越往右 erase，runtime cost 越高、可定位性越差。</text>
+    </svg>
+    <figcaption>四個方案的「erasure 動作」分別發生在 Rust pipeline 的不同 stage——方案二在 typeck 階段就被擋下（根本沒走到 vtable），方案三、四共用同一個 MIR-stage vtable elaboration，但方案四把實際的 type-matching 推到 runtime。pipeline 越右側 erase，rebuild cache 越穩定，但 runtime 成本與 panic 風險越大；越左側 erase，反之。</figcaption>
+  </figure>
+
+  <p>
+    Pipeline 視角把「方案三 vs 方案四」的差異定位得很精確：兩者在 MIR-stage 共用同一份 vtable schema，差別只在「<code>Any</code> 把多出一條 runtime branch 拖出 pipeline 邊界」。
+    當你 profile 一個 production 系統發現 hot path 上有 <code>downcast_ref</code> 的 cycles，這條 branch 就是元兇——它不是 monomorphization 沒做好，是設計上就把 type-matching 延後到 runtime。
+  </p>
+
+  <p>
+    最後一個 anchor：把上面整套理論落到「實際生產 codebase」上——
+    Rust ecosystem 的主流 crate 各自選了哪個方案？他們的選擇是不是 align 上面的決策流程？
+    下表蒐集了五個有代表性的 crate，逐一比對「該 crate 為什麼選這條路、有沒有付出對應的代價」。
+  </p>
+
+  <figure class="vg-w-libs-rust-erasure">
+    <style>
+      .vg-w-libs-rust-erasure { display: grid; gap: var(--s-2); }
+      .vg-w-libs-rust-erasure table { width: 100%; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-libs-rust-erasure caption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); text-align: left; padding-bottom: var(--s-2); caption-side: top; }
+      .vg-w-libs-rust-erasure thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); }
+      .vg-w-libs-rust-erasure tbody th { font-family: 'JetBrains Mono', ui-monospace, monospace; font-weight: 500; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); color: var(--ink); font-size: 12px; }
+      .vg-w-libs-rust-erasure tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); color: var(--ink-soft); vertical-align: top; }
+      .vg-w-libs-rust-erasure .tag { display: inline-block; font-family: var(--sans); font-size: 10px; padding: 1px 6px; border-radius: 2px; color: var(--bg); text-transform: uppercase; letter-spacing: 0.04em; }
+      .vg-w-libs-rust-erasure .tag-1 { background: var(--muted-2); color: var(--ink); }
+      .vg-w-libs-rust-erasure .tag-3 { background: var(--sage-deep); }
+      .vg-w-libs-rust-erasure .tag-4 { background: var(--accent); }
+      .vg-w-libs-rust-erasure figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+      @media (max-width: 720px) {
+        .vg-w-libs-rust-erasure { overflow-x: auto; }
+        .vg-w-libs-rust-erasure table { min-width: 560px; }
+      }
+    </style>
+    <table>
+      <caption>五個主流 Rust crate 的 erasure 策略——對照上面決策流程的 Q1 / Q2 / Q3 看選擇是否一致</caption>
+      <thead>
+        <tr>
+          <th>crate</th>
+          <th>選擇</th>
+          <th>場景</th>
+          <th>付的代價</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <th><code>serde</code></th>
+          <td><span class="tag tag-1">方案一</span></td>
+          <td><code>Serialize / Deserialize</code> 全靠 generic——caller 提供 type，編譯期 monomorphize。</td>
+          <td>編譯時間長、binary 膨脹；換來零 runtime 開銷與 type safety 完整。</td>
+        </tr>
+        <tr>
+          <th><code>erased-serde</code></th>
+          <td><span class="tag tag-3">方案三</span></td>
+          <td>專為解決 serde 不能 dyn 化的痛點——手刻 monomorphic wrapper trait，把 generic Serialize 包成 <code>dyn ErasedSerialize</code>。</td>
+          <td>一次 vtable indirection；介面少了 type-level information，error message 較短。</td>
+        </tr>
+        <tr>
+          <th><code>bevy_ecs</code></th>
+          <td><span class="tag tag-4">方案四</span></td>
+          <td>Component / Resource storage 走 <code>HashMap&lt;TypeId, Box&lt;dyn Any&gt;&gt;</code>——必須 heterogeneous 且 B（component type）出現在 query 介面。</td>
+          <td>每 query 都付 TypeId 比對；無法直接 FFI；接受了 runtime panic 風險換 plugin ergonomics。</td>
+        </tr>
+        <tr>
+          <th><code>tokio</code></th>
+          <td><span class="tag tag-3">方案三</span></td>
+          <td><code>JoinHandle&lt;T&gt;</code> 對外是 generic，但 runtime 內部 task storage 走 monomorphic <code>dyn Future&lt;Output = ()&gt;</code> wrapper。</td>
+          <td>每 task 一次 vtable indirection——對 ms 級 task 完全可忽略。</td>
+        </tr>
+        <tr>
+          <th><code>anyhow</code></th>
+          <td><span class="tag tag-4">方案四</span></td>
+          <td><code>anyhow::Error</code> 是 <code>Box&lt;dyn Error + Send + Sync&gt;</code>——error type 必須 heterogeneous、需要 downcast 取原 type。</td>
+          <td>每 error 一次 heap alloc；downcast 用 <code>.downcast_ref::&lt;T&gt;()</code> 回傳 <code>Option</code> 而非 unwrap，避開 panic。</td>
+        </tr>
+      </tbody>
+    </table>
+    <figcaption>五個 crate、三條路線——沒有人選方案二，因為它本來就走不通。<code>serde</code> 與 <code>erased-serde</code> 並存於 Rust 生態，正好是「同一個 use case 沿著 cost frontier 走兩端」的標本：core 用方案一保性能，erased-serde 用方案三補 heterogeneous storage 的空缺。</figcaption>
+  </figure>
+
+  <p>
+    這張表的核心觀察是：<code>serde</code> 與 <code>erased-serde</code> 同時存在不是冗餘——它們是同一個 trait 沿著 cost frontier 走出來的兩端。
+    當你的 use case 落在 frontier 的中段（需要 box、又不想付 Any 成本），ecosystem 早就 evolve 出 erased wrapper 模式，這也是 wolfgirl post 隱含的設計教訓：與其和 dyn-compat 規則對抗，不如沿著規則走出一條 wrapper trait 的橫向擴充路線。
+  </p>
+
+  <figure class="vg-w-axis-rust-erasure" data-svg-scroll="640">
+    <style>
+      .vg-w-axis-rust-erasure { margin: var(--s-3) 0; }
+      .vg-w-axis-rust-erasure svg { width: 100%; height: auto; max-width: 760px; display: block; margin: 0 auto; }
+      .vg-w-axis-rust-erasure .vg-w-axis-rust-erasure-axis { stroke: var(--ink-soft); stroke-width: 1.5; }
+      .vg-w-axis-rust-erasure .vg-w-axis-rust-erasure-tick { stroke: var(--muted); stroke-width: 1; }
+      .vg-w-axis-rust-erasure .vg-w-axis-rust-erasure-marker { fill: var(--accent); stroke: var(--bg); stroke-width: 2; }
+      .vg-w-axis-rust-erasure .vg-w-axis-rust-erasure-marker-soft { fill: var(--muted-2); stroke: var(--bg); stroke-width: 2; }
+      .vg-w-axis-rust-erasure .vg-w-axis-rust-erasure-label { font-family: JetBrains Mono, monospace; font-size: 12px; fill: var(--ink); }
+      .vg-w-axis-rust-erasure .vg-w-axis-rust-erasure-axis-label { font-family: IM Fell English, serif; font-style: italic; font-size: 13px; fill: var(--muted); }
+      .vg-w-axis-rust-erasure figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--ink-soft); text-align: center; margin-top: var(--s-2); max-width: 600px; margin-left: auto; margin-right: auto; }
+    </style>
+    <svg viewBox="0 0 760 200" role="img" aria-labelledby="vg-w-axis-rust-erasure-title">
+      <title id="vg-w-axis-rust-erasure-title">Erasure cost axis: four solutions on the boilerplate-vs-runtime frontier</title>
+      <line x1="60" y1="120" x2="700" y2="120" class="vg-w-axis-rust-erasure-axis"/>
+      <polygon points="700,120 690,115 690,125" fill="var(--ink-soft)"/>
+      <text x="60" y="155" class="vg-w-axis-rust-erasure-axis-label">cheap, restrictive</text>
+      <text x="700" y="155" class="vg-w-axis-rust-erasure-axis-label" text-anchor="end">expensive, permissive</text>
+      <line x1="140" y1="115" x2="140" y2="125" class="vg-w-axis-rust-erasure-tick"/>
+      <line x1="320" y1="115" x2="320" y2="125" class="vg-w-axis-rust-erasure-tick"/>
+      <line x1="500" y1="115" x2="500" y2="125" class="vg-w-axis-rust-erasure-tick"/>
+      <line x1="640" y1="115" x2="640" y2="125" class="vg-w-axis-rust-erasure-tick"/>
+      <circle cx="140" cy="120" r="9" class="vg-w-axis-rust-erasure-marker"/>
+      <circle cx="320" cy="120" r="9" class="vg-w-axis-rust-erasure-marker-soft"/>
+      <circle cx="500" cy="120" r="9" class="vg-w-axis-rust-erasure-marker"/>
+      <circle cx="640" cy="120" r="9" class="vg-w-axis-rust-erasure-marker"/>
+      <text x="140" y="100" class="vg-w-axis-rust-erasure-label" text-anchor="middle">#1 impl Trait</text>
+      <text x="140" y="85" class="vg-w-axis-rust-erasure-label" text-anchor="middle" fill="var(--muted)">monomorphic</text>
+      <text x="320" y="100" class="vg-w-axis-rust-erasure-label" text-anchor="middle">#2 PhantomData</text>
+      <text x="320" y="85" class="vg-w-axis-rust-erasure-label" text-anchor="middle" fill="var(--muted)">rejected: not dyn-compatible</text>
+      <text x="500" y="100" class="vg-w-axis-rust-erasure-label" text-anchor="middle">#3 wrapper trait</text>
+      <text x="500" y="85" class="vg-w-axis-rust-erasure-label" text-anchor="middle" fill="var(--muted)">Box&lt;dyn W&gt;</text>
+      <text x="640" y="100" class="vg-w-axis-rust-erasure-label" text-anchor="middle">#4 Box&lt;dyn Any&gt;</text>
+      <text x="640" y="85" class="vg-w-axis-rust-erasure-label" text-anchor="middle" fill="var(--muted)">downcast at use</text>
+      <text x="380" y="190" class="vg-w-axis-rust-erasure-axis-label" text-anchor="middle">grey marker = rejected path; readers walk past it, not through it</text>
+    </svg>
+    <figcaption>把四個方案攤在同一條軸上看，#2 留下灰點不是空格——它是規則邊界。</figcaption>
+  </figure>
+
+  <p class="vg-deep-closer"><strong>How to choose</strong>：能不 box 就走方案一；非 box 不可且 B 不在介面就走方案三；B 不得不在介面才考慮方案四，且接受 downcast panic 與每 call heap alloc 的成本——方案二永遠只是用來理解 dyn-compatibility 為什麼長這樣的 stepping stone。</p>
+</div>
