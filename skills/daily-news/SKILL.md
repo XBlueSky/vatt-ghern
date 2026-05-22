@@ -540,6 +540,26 @@ looks at story arc, hook strength, or whether H2s are template-shaped.
 
 **Wallclock is NOT capped** in this step. Quality trumps speed.
 
+**No skip clause exists.** If wall-clock or Opus-budget anxiety makes
+the full dual-reviewer pass feel expensive, the only legal response is
+to **drop deep-stories (N → N-1) so the remaining gate fits**, never
+skip the gate to ship more posts. PR #32 (2026-05-22) shipped 3 deep
+stories with a self-declared "deviation: 7.5 skipped because parallel
+dispatch already consumed multiple Opus batches" — this is exactly the
+pattern this clause forbids. The cost arithmetic the routine performed
+("8 more Opus dispatches with retry potential") is irrelevant: if you
+cannot afford 8 reviewer dispatches, you cannot afford 3 deep stories
+in this run. Trim to 2 or 1.
+
+Step 7c sub-agent self-checks (the author reading the archetype
+reference + persona before drafting) are **not a substitute** for
+Step 7.5 — author self-check is biased and shallow by construction;
+the whole point of dispatching an independent Opus reviewer is to get
+a judgment the author cannot give itself. Wording like "the Step 7c
+sub-agent self-checks plus the Step 8 mechanical checks serve as the
+quality gate for this run" is a rationalization, not a substitution
+argument; reject it in your own routine output.
+
 #### Step 7.5a: Dispatch dual reviewers (parallel)
 
 For each post produced in Steps 6 + 7 (1 roundup + N deep-stories,
@@ -682,10 +702,21 @@ npx @11ty/eleventy
 npx html-validate "_site/**/*.html"
 node ${CLAUDE_PLUGIN_ROOT}/tests/archetype-check.mjs _site/
 node ${CLAUDE_PLUGIN_ROOT}/tests/link-check.mjs
+
+# Quality-gate evidence: enforces that Step 7.5 and Step 8.5 actually ran
+# (reviewer JSON + screenshot artifacts present on disk). Exits 1 if any
+# post lacks evidence. Run this AFTER Steps 7.5 and 8.5 have completed
+# and BEFORE the commit / PR step.
+node ${CLAUDE_PLUGIN_ROOT}/skills/daily-news/scripts/check-quality-gate-evidence.mjs src/posts/YYYY/MM/DD/
 ```
 
 If any step fails: fix the underlying content, re-run. Do not commit while
 checks fail.
+
+`check-quality-gate-evidence.mjs` failing means the routine skipped a
+quality pass. The fix is **never** "delete the gate" or "stub the
+artifacts"; the fix is to actually run Step 7.5 / 8.5, or to drop deep
+stories until what remains fits the budget the routine can pay.
 
 ### Step 8.5: Visual self-review (Playwright + multimodal)
 
@@ -694,6 +725,25 @@ do NOT catch visual regressions like SVG widgets invisible in dark mode,
 text overflow, layout collapse, or unreadable contrast. Step 8.5 closes
 that gap by having Claude open each rendered page in Playwright, take a
 screenshot, and look at it.
+
+**No skip clause exists.** Same enforcement rule as Step 7.5: if
+wall-clock is tight, drop deep-stories (N → N-1) so the audit fits,
+never skip the audit to ship more posts. PR #32 (2026-05-22) declared
+the visual audit as "(Minor) deferred" with the rationale "the
+mechanical semantic invariants cover the highest-risk visual failures"
+— this is false. The mechanical scripts cover SVG legibility floor +
+text overflow only; they do not catch grid-track conflicts, breakout
+overflow, dark-mode contrast, viewport-scroll regressions, or any
+class of layout bug that is visible at a glance in a screenshot but
+invisible to per-element DOM measurement. The 2026-05-22 C# widget
+shipped with desktop SVG squeezed to 409 px in a 1.3fr-1fr grid (vs
+intended 960 px full-width) — the post-merge screenshot revealed it
+in one second; the routine's mechanical PASS hid it completely.
+
+If you find yourself thinking "I already ran the mechanical scripts so
+the visual pass is lower priority" — that is the rationalization this
+clause forbids. **Mechanical and visual passes are not substitutes
+for each other**; they catch disjoint failure modes by construction.
 
 **Setup**:
 
@@ -791,6 +841,34 @@ sleep 2 && curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/
       Fix per `widget-cookbook/tier-3-principles.md` §12.1.D-bis:
       shorten the label, drop font-size (within legibility floor),
       move outside the rect, or split into stacked `<text>` lines.
+
+      **(iii) Desktop grid + `data-svg-scroll` mutual exclusion** (added
+      after the 2026-05-22 C# unsafe widget shipped a 1.3fr-1fr grid
+      with `data-svg-scroll="720"`; on a ~880 px desktop figure the
+      left track is only ~497 px, so the 720 px-min SVG overflowed and
+      triggered an unintended horizontal scrollbar). The
+      `data-svg-scroll="N"` rule sets `min-width: N px` on every
+      descendant `<svg>` — that floor is measured against the
+      containing grid track, not the figure. If the figure is itself a
+      multi-column grid on desktop, the SVG can't fit and either spills
+      or forces the figure's `overflow-x: auto` open. The
+      `widget-cookbook/anti-examples.md` "Two-column grid + scroll"
+      pattern documents the rule verbally; this script enforces it
+      mechanically.
+
+      ```bash
+      node ${CLAUDE_PLUGIN_ROOT}/skills/daily-news/scripts/check-grid-svgscroll-conflict.mjs \
+        http://localhost:8080/YYYY/MM/DD/<deep-slug-1>/ \
+        http://localhost:8080/YYYY/MM/DD/<deep-slug-2>/ \
+        > /tmp/vg-grid-scroll.json
+      # exit 1 = at least one figure combines desktop multi-column
+      # grid with data-svg-scroll
+      ```
+
+      Fix by either (a) dropping `data-svg-scroll` if the SVG is
+      readable in the desktop track at its natural width, or (b)
+      collapsing the desktop grid to a single column so the SVG spans
+      the full figure. Treat as Blocking.
 
    f. Record findings for the post in the issue list (see severity
       tiering below).
@@ -898,27 +976,71 @@ AI · 3 · SYSTEMS · 3 · INFRA · 2 · WEB · 1 · BACKEND · 1
 - ...
 - Failed: (none) or list of failed-fetch sources
 
-## Visual Concerns (from Step 8.5 self-review)
+## Step 8.5 Visual Audit Evidence (REQUIRED — no "deferred" allowed)
 
-- (none) — or list each issue found at Important/Minor tier with affected
-  page URL + brief description. Example:
-- `/2026/05/16/deep-quic-cubic/` (dark mode): timeline SVG legend label
-  "T2 incident" overlaps with arrowhead at 480px viewport. Important; 3
-  fix attempts in Step 8.5 (tried wider viewBox, label nudge, font shrink)
-  did not fully resolve.
-- `/2026/05/16/roundup/`: drop cap baseline 2px below following line. Minor.
+This section MUST list, for every published post, the screenshot
+artifacts produced in Step 8.5. Empty or "skipped" or "deferred" is an
+INVALID PR — the publish gate (`check-quality-gate-evidence.mjs`) will
+fail if the screenshot directory is empty.
 
-## Content Quality Review
+For each post:
+- `<output_path>` — desktop (1280×900) and mobile (375×812), light + dark,
+  plus one viewport screenshot per widget. Format:
+  ```
+  /2026/MM/DD/<slug>/
+    desktop-light.png · desktop-dark.png
+    mobile-light.png · mobile-dark.png
+    widget-<vg-w-name>-desktop.png · widget-<vg-w-name>-mobile.png  (× N widgets)
+  ```
+  Screenshots live under `/tmp/vg-audit-YYYY-MM-DD/<slug>/`. Full
+  path list goes here; do not summarize.
+
+### Visual issues found (and fixed during the audit)
+
+- (none) — or list each issue with affected page URL + screenshot path +
+  what was fixed. Example:
+- `/2026/05/22/deep-csharp-memory-safety-net11/` (desktop 1280): the
+  `.vg-w-annotated-csharp-unsafe-contracts` widget rendered SVG at
+  409 px in a 1.3fr-1fr grid track instead of full-width.
+  Fix: replaced desktop grid with `display: flex; flex-direction: column`
+  so the wide-aspect SVG spans the figure and the detail panel sits
+  beneath it. Re-screenshot in
+  `/tmp/vg-audit-2026-05-22/deep-csharp-memory-safety-net11/widget-annotated-csharp-unsafe-contracts-desktop.png`
+  confirms 960 px SVG, no horizontal scroll. Blocking-tier; 1 iteration.
+
+### Visual issues accepted (Important/Minor — NOT skipped)
+
+Issues here mean the visual audit DID run, found something, AND a
+decision was made to ship anyway with the issue documented. This is
+different from skipping the audit. List with severity + screenshot
+path + rationale for accepting.
+
+- (none) — or list each.
+
+## Step 7.5 Content Quality Review (REQUIRED — no "skipped" allowed)
+
+This section MUST contain dual-reviewer per-axis scores for every
+post. Empty or "skipped" or "deviation declared" is an INVALID PR —
+the publish gate (`check-quality-gate-evidence.mjs`) will fail if the
+reviewer JSON artifacts under `/tmp/vg-quality-YYYY-MM-DD/` are
+missing.
+
+Wall-clock or Opus-budget pressure is NOT a valid reason to omit this
+section. If the routine cannot afford full reviewer dispatches for N
+deep-stories, the routine MUST drop deep-stories until N fits the
+budget, per Step 7.5 "No skip clause exists" paragraph. Shipping more
+posts at lower quality-assurance is forbidden.
 
 For each post (roundup + deep-stories):
 - `<output_path>` — final status: PASS / PASS-with-notes / IMPORTANT-accepted / BLOCKED-dropped
-  - Axis 1 (Hook): <score> — "<short justification>"
-  - Axis 2 (Structural, <archetype>): <score> — "<short justification>"
-  - Axis 3 (Material): <score>
-  - Axis 4 (Depth): <score>
-  - Axis 5 (Relevance, <dimension>): <score>
-  - Axis 6 (Anti-template): <score>
+  - Axis 1 (Hook): <consensus-score> (A=<a>, B=<b>) — "<short justification>"
+  - Axis 2 (Structural, <archetype>): <consensus-score> (A=<a>, B=<b>) — "<short justification>"
+  - Axis 3 (Material): <consensus-score> (A=<a>, B=<b>)
+  - Axis 4 (Depth): <consensus-score> (A=<a>, B=<b>)
+  - Axis 5 (Relevance, <dimension>): <consensus-score> (A=<a>, B=<b>)
+  - Axis 6 (Anti-template): <consensus-score> (A=<a>, B=<b>)
   - (Axis 7 inter-post diversity: see § Inter-post diversity concerns below)
+  - Reviewer JSON artifacts: `/tmp/vg-quality-YYYY-MM-DD/<slug>-reviewer-A.json`, `<slug>-reviewer-B.json`
   - Retry rounds: <N>
 
 ## Step 7.5 Blocking drops
