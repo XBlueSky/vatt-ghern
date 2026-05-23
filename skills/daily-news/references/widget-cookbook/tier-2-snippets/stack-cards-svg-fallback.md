@@ -67,7 +67,7 @@ the same PR.
     .vg-w-stack-EXAMPLE .stack-cards label {
       display: block; padding: var(--s-2);
       border: 1px solid var(--muted-2); border-radius: 2px;
-      cursor: pointer; transition: border-color 200ms + background 200ms;
+      cursor: pointer; transition: border-color 200ms, background 200ms;
       min-height: 44px;
     }
     .vg-w-stack-EXAMPLE .stack-cards label:hover { border-color: var(--accent); }
@@ -88,7 +88,7 @@ the same PR.
     }
     .vg-w-stack-EXAMPLE:has(#vg-w-stack-EXAMPLE-r1:checked) .card-1 {
       border-color: var(--accent);
-      background: color-mix(in srgb + var(--accent) 8% + transparent);
+      background: color-mix(in srgb, var(--accent) 8%, transparent);
     }
     /* ... repeat for r2/card-2 + r3/card-3 + r4/card-4 ... */
 
