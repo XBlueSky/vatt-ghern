@@ -34,7 +34,7 @@
 //
 // Exit 0 = evidence found for every post. Exit 1 = missing evidence.
 
-import { readdirSync, existsSync, statSync } from "node:fs";
+import { readdirSync, existsSync, statSync, readFileSync } from "node:fs";
 import { join, basename } from "node:path";
 
 const targetDir = process.argv[2];
@@ -123,6 +123,88 @@ if (!existsSync(auditDir)) {
       const p = join(postDir, shot);
       if (!existsSync(p))
         violations.push(`Step 8.5: missing ${shot} for ${slug} (expected ${p})`);
+    }
+  }
+}
+
+// --- Step 5 evidence: deep-story count justification when N_deep < 3 ---
+// Added 2026-05-23 after PR #35. The default deep-story count is N = 3.
+// If N_final < 3, a Step 5 reason MUST be recorded in a sidecar file
+// `/tmp/vg-quality-${dateSlug}/deep-count-justification.json` with shape:
+//   { "target": 3, "actual": <N>, "reason": "<one of the legal reasons>" }
+// Legal reasons (substring match, case-insensitive):
+//   - "score" + "qualifying"          → fewer than 3 clusters scored ≥ 8
+//   - "diversity" + "unsatisfiable"   → can't satisfy domain + archetype
+//   - "url" + "refill" + "exhausted"  → Step 5d collision, no replacement
+//   - "step 7.5" + "blocking"          → Step 7.5 retry exhausted
+//   - "step 8.5" + "blocking"          → Step 8.5 visual unfixable
+// Banned reason substrings (case-insensitive): "budget", "wallclock",
+// "wall-clock", "dispatch cost", "opus quota".
+const deepSlugs = slugs.filter((s) => s.startsWith("deep-"));
+const deepCount = deepSlugs.length;
+if (deepCount < 3) {
+  const justificationPath = join(qualityDir, "deep-count-justification.json");
+  if (!existsSync(justificationPath)) {
+    violations.push(
+      `Step 5: deep-story count is ${deepCount} (below default N=3) ` +
+        `but ${justificationPath} is missing. SKILL.md Step 5c requires a ` +
+        `named structural reason when N_final < 3. "Budget" / "wallclock" ` +
+        `/ "dispatch cost" are NOT legal Step 5 reasons.`
+    );
+  } else {
+    let parsed = null;
+    try {
+      parsed = JSON.parse(readFileSync(justificationPath, "utf8"));
+    } catch (e) {
+      violations.push(
+        `Step 5: ${justificationPath} is not valid JSON (${e.message})`
+      );
+    }
+    if (parsed) {
+      const reason = String(parsed.reason || "").toLowerCase();
+      const bannedSubstrings = [
+        "budget",
+        "wallclock",
+        "wall-clock",
+        "dispatch cost",
+        "opus quota",
+      ];
+      const legalPatterns = [
+        ["score", "qualifying"],
+        ["diversity", "unsatisfiable"],
+        ["url", "refill", "exhausted"],
+        ["step 7.5", "blocking"],
+        ["step 8.5", "blocking"],
+      ];
+      const containsBanned = bannedSubstrings.find((s) => reason.includes(s));
+      if (containsBanned) {
+        violations.push(
+          `Step 5: deep-count justification cites "${containsBanned}" — ` +
+            `this is one of the banned reasons. SKILL.md Step 5c "Budget / ` +
+            `wallclock / dispatch cost is NEVER a Step 5 reason to trim". ` +
+            `If runtime evidence later showed Step 7.5 / 8.5 couldn't fit, ` +
+            `say so with the explicit "Step 7.5 blocking..." / "Step 8.5 ` +
+            `blocking..." pattern; do not paraphrase it as "budget".`
+        );
+      } else {
+        const matches = legalPatterns.some((pat) =>
+          pat.every((s) => reason.includes(s))
+        );
+        if (!matches) {
+          violations.push(
+            `Step 5: deep-count justification reason "${parsed.reason}" ` +
+              `does not match any of the 5 legal structural reasons. See ` +
+              `SKILL.md Step 5c "Trimming N below 3 is ONLY legitimate ` +
+              `when…" list.`
+          );
+        }
+      }
+      if (parsed.actual !== deepCount) {
+        violations.push(
+          `Step 5: justification says actual=${parsed.actual} but ` +
+            `${deepCount} deep-story sidecars found on disk`
+        );
+      }
     }
   }
 }

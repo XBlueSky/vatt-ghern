@@ -1,0 +1,582 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">過去四年裡，一個 Rust Worker 只要 panic 一次，就會整個 Wasm instance 都進棺材——所有 in-flight request 一起死、所有 Durable Object 的記憶體狀態一起清空。Cloudflare 沒有去寫 panic 處理框架，他們改的是 WebAssembly 規格本身：把 Exception Handling proposal 接到 wasm-bindgen 的 Walrus parser、教 Rust 用 <code>extern "C-unwind"</code> 跨進 JS、用 <code>Exception.Tag</code> 把「可救」跟「不可救」分開——一條 panic 從 Rust 代碼到 JS catch block 的完整通路被重新接起來。</p>
+  <h1 class="vg-post-title">{{ title }}</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p><span class="vg-dropcap">R</span>ust Workers 0.8.0 引入的 <code>--panic-unwind</code> flag 背後動的是四層相互依存的機制——Rust 編譯器要重建 <code>std</code> 走 unwind path、wasm-bindgen 的 Walrus parser 要學會 try/catch 指令、WebAssembly Exception Handling proposal 要在 target runtime 上可用、Workers runtime 要把 <code>PanicError</code> 翻譯成可 <code>.catch()</code> 的 promise rejection。原文一句話總結：「a panic rejects the JavaScript <code>Promise</code> with a <code>PanicError</code>」。對 Durable Object 作者來說，這代表 panic 不再會把 in-memory state 一起帶走；對 stateless handler 作者來說，是把 fault isolation 邊界從 instance-level 收緊到 request-level。</p>
+
+  <p>把這個 release 放到 wasm 生態的脈絡看：Exception Handling 是 wasm roadmap 上爭議最大、最久才達 phase 4 的之一，因為 EH 的設計涉及 throw semantics、unwind cost、跨語言互通——每一條都會 lock in 多年的工程選擇。Phase 4 在 2024-2025 達成意味著 wasm 從「native code 退化的 IR」往「真正可以承載多語言 runtime 的 portable VM」推進了一格。Rust + Workers 是這個推進最早的 production 應用之一。</p>
+
+  <p>對工程 leader 來說，這個 release 帶來一個具體可問的問題：我的 Rust Worker fleet 是否該升 0.8.0、啟用 panic recovery？回答取決於三件事——（一）binary size 是否還在 budget 內、（二）有沒有 Durable Object 或 long-lived state、（三）有沒有 unsafe / raw pointer 跨 closure 邊界需要逐個 audit 標記 <code>new_aborting</code>。三個答案都沒有 red flag 的話，升級是 net positive；任何一條 yes，就要先做 audit 跟 measurement 才升。</p>
+
+  <p>對讀者該記住的層次圖可以用一句話總結：Rust panic 在 source 沒變、在 LLVM IR 變成 unwind operation、在 wasm 變成 throw with tag、在 host 變成 PanicError、在 JS catch 變成可程式化處理的 Error 物件。四層轉換沒有 magic、每一層都是 mechanical transformation——但每一層都需要對應 toolchain 跟 runtime 的 sync 才能跑通。這也是為什麼 wasm EH 從 proposal 到 production 跑了這麼多年——不是因為設計困難，而是因為要對齊的 stakeholders 太多。</p>
+
+  <figure class="vg-w-arch-wasmbg-panic-stack">
+    <style>
+      .vg-w-arch-wasmbg-panic-stack { display: flex; flex-direction: column; gap: var(--s-3); align-items: stretch; }
+      .vg-w-arch-wasmbg-panic-stack svg.diagram { width: 100%; height: auto; max-width: 880px; }
+      .vg-w-arch-wasmbg-panic-stack input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-arch-wasmbg-panic-stack .layer { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; transition: fill 200ms, stroke 200ms; }
+      .vg-w-arch-wasmbg-panic-stack .layer:hover { stroke: var(--accent); }
+      .vg-w-arch-wasmbg-panic-stack .layer:focus { outline: none; }
+      .vg-w-arch-wasmbg-panic-stack .layer:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+      .vg-w-arch-wasmbg-panic-stack .layer-text { pointer-events: none; font-family: EB Garamond, serif; font-size: 14px; }
+      .vg-w-arch-wasmbg-panic-stack .layer-sub { pointer-events: none; font-family: IM Fell English, serif; font-style: italic; font-size: 11px; fill: var(--muted); }
+      .vg-w-arch-wasmbg-panic-stack .num { font-family: JetBrains Mono, monospace; font-size: 11px; pointer-events: none; }
+      .vg-w-arch-wasmbg-panic-stack .head { font-family: IM Fell English, serif; font-style: italic; font-size: 13px; }
+      .vg-w-arch-wasmbg-panic-stack .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+      .vg-w-arch-wasmbg-panic-stack .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-arch-wasmbg-panic-stack .detail p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-arch-wasmbg-panic-stack:has(#vg-w-arch-wasmbg-panic-stack-r1:checked) .layer-1 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+      .vg-w-arch-wasmbg-panic-stack:has(#vg-w-arch-wasmbg-panic-stack-r2:checked) .layer-2 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+      .vg-w-arch-wasmbg-panic-stack:has(#vg-w-arch-wasmbg-panic-stack-r3:checked) .layer-3 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+      .vg-w-arch-wasmbg-panic-stack:has(#vg-w-arch-wasmbg-panic-stack-r4:checked) .layer-4 { fill: var(--sage-deep); fill-opacity: 0.32; stroke: var(--sage-deep); }
+      .vg-w-arch-wasmbg-panic-stack:has(#vg-w-arch-wasmbg-panic-stack-r1:checked) .detail-1 { display: block; }
+      .vg-w-arch-wasmbg-panic-stack:has(#vg-w-arch-wasmbg-panic-stack-r2:checked) .detail-2 { display: block; }
+      .vg-w-arch-wasmbg-panic-stack:has(#vg-w-arch-wasmbg-panic-stack-r3:checked) .detail-3 { display: block; }
+      .vg-w-arch-wasmbg-panic-stack:has(#vg-w-arch-wasmbg-panic-stack-r4:checked) .detail-4 { display: block; }
+      .vg-w-arch-wasmbg-panic-stack .hint { font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin: 0 0 var(--s-1) 0; }
+
+      /* mobile cards (default-visible at narrow viewports) ──────── */
+      .vg-w-arch-wasmbg-panic-stack .stack-title { font-family: IM Fell English, serif; font-style: italic; font-size: var(--fs-md); margin: 0 0 var(--s-1) 0; color: var(--ink); line-height: 1.4; }
+      .vg-w-arch-wasmbg-panic-stack .stack-cards { display: flex; flex-direction: column; gap: var(--s-1); list-style: none; padding: 0; margin: 0; }
+      .vg-w-arch-wasmbg-panic-stack .stack-cards label { display: block; padding: var(--s-2); border: 1px solid var(--muted-2); border-radius: 2px; cursor: pointer; transition: border-color 200ms, background 200ms; min-height: 44px; }
+      .vg-w-arch-wasmbg-panic-stack .stack-cards label:hover { border-color: var(--accent); }
+      .vg-w-arch-wasmbg-panic-stack .stack-cards .card-head { font-family: EB Garamond, serif; font-size: var(--fs-md); margin: 0 0 4px 0; color: var(--ink); display: flex; align-items: baseline; justify-content: space-between; gap: var(--s-2); flex-wrap: wrap; }
+      .vg-w-arch-wasmbg-panic-stack .stack-cards .card-sub { font-family: IM Fell English, serif; font-style: italic; font-size: var(--fs-sm); color: var(--muted); margin: 0; line-height: 1.5; }
+      .vg-w-arch-wasmbg-panic-stack .stack-cards .card-tag { font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); color: var(--accent-text); font-style: normal; }
+      .vg-w-arch-wasmbg-panic-stack:has(#vg-w-arch-wasmbg-panic-stack-r1:checked) .card-1 { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+      .vg-w-arch-wasmbg-panic-stack:has(#vg-w-arch-wasmbg-panic-stack-r2:checked) .card-2 { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+      .vg-w-arch-wasmbg-panic-stack:has(#vg-w-arch-wasmbg-panic-stack-r3:checked) .card-3 { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+      .vg-w-arch-wasmbg-panic-stack:has(#vg-w-arch-wasmbg-panic-stack-r4:checked) .card-4 { border-color: var(--sage-deep); background: color-mix(in srgb, var(--sage-deep) 10%, transparent); }
+
+      /* desktop ≥ 720px ── show SVG diagram + hide HTML cards */
+      .vg-w-arch-wasmbg-panic-stack svg.diagram { display: none; }
+      @media (min-width: 720px) {
+        .vg-w-arch-wasmbg-panic-stack svg.diagram { display: block; }
+        .vg-w-arch-wasmbg-panic-stack .stack-title { display: none; }
+        .vg-w-arch-wasmbg-panic-stack .stack-cards { display: none; }
+      }
+    </style>
+
+    <input type="radio" id="vg-w-arch-wasmbg-panic-stack-r1" aria-label="select Rust compiler layer" name="vg-w-arch-wasmbg-panic-stack-sel" checked />
+    <input type="radio" id="vg-w-arch-wasmbg-panic-stack-r2" aria-label="select wasm-bindgen layer" name="vg-w-arch-wasmbg-panic-stack-sel" />
+    <input type="radio" id="vg-w-arch-wasmbg-panic-stack-r3" aria-label="select EH proposal layer" name="vg-w-arch-wasmbg-panic-stack-sel" />
+    <input type="radio" id="vg-w-arch-wasmbg-panic-stack-r4" aria-label="select Workers runtime layer" name="vg-w-arch-wasmbg-panic-stack-sel" />
+
+    <p class="stack-title" id="vg-w-arch-wasmbg-panic-stack-title">panic 由內向外的四個邊界——每層只負責自己那段翻譯</p>
+    <ul class="stack-cards" aria-labelledby="vg-w-arch-wasmbg-panic-stack-title">
+      <li class="card-1"><label for="vg-w-arch-wasmbg-panic-stack-r1">
+        <p class="card-head"><span>L1 · Rust compiler</span><code class="card-tag">panic=unwind</code></p>
+        <p class="card-sub">RUSTFLAGS='-Cpanic=unwind' cargo build -Zbuild-std · 重建 std 走 unwind path</p>
+      </label></li>
+      <li class="card-2"><label for="vg-w-arch-wasmbg-panic-stack-r2">
+        <p class="card-head"><span>L2 · wasm-bindgen tooling</span><code class="card-tag">--panic-unwind</code></p>
+        <p class="card-sub">Walrus parser 認得 try/catch · descriptor interpreter 跑進 EH block · 出口加 extern "C-unwind"</p>
+      </label></li>
+      <li class="card-3"><label for="vg-w-arch-wasmbg-panic-stack-r3">
+        <p class="card-head"><span>L3 · WebAssembly EH proposal</span><code class="card-tag">phase 4</code></p>
+        <p class="card-sub">try / catch / throw / rethrow / catch_all · Exception.Tag 區分 panic vs. abort</p>
+      </label></li>
+      <li class="card-4"><label for="vg-w-arch-wasmbg-panic-stack-r4">
+        <p class="card-head"><span>L4 · Cloudflare Workers runtime</span><code class="card-tag">JS visible</code></p>
+        <p class="card-sub">PanicError → Promise rejection · 單 request fault isolation · Durable Object in-memory state 保留</p>
+      </label></li>
+    </ul>
+
+    <svg class="diagram" viewBox="0 0 880 360" role="img"
+         aria-label="Rust Worker panic recovery 四層 stack——點擊任一層查看責任邊界">
+      <text x="80" y="22" text-anchor="start" fill="var(--ink)" class="head">panic 由內向外的四個邊界——每層只負責自己那段翻譯</text>
+
+      <!-- Layer 1: Rust compiler -->
+      <rect class="layer layer-1" data-target="vg-w-arch-wasmbg-panic-stack-r1" x="60" y="56" width="760" height="56" role="button" tabindex="0" />
+      <text x="80" y="80" fill="var(--ink)" class="layer-text">L1 · Rust compiler</text>
+      <text x="80" y="100" fill="var(--muted)" class="layer-sub">RUSTFLAGS='-Cpanic=unwind' cargo build -Zbuild-std · 重建 std 走 unwind path</text>
+      <text x="800" y="92" text-anchor="end" fill="var(--accent-text)" class="num">panic=unwind</text>
+
+      <!-- Arrow 1 -->
+      <line x1="440" y1="112" x2="440" y2="128" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-arch-wasmbg-panic-stack-arrow)"/>
+
+      <!-- Layer 2: wasm-bindgen -->
+      <rect class="layer layer-2" data-target="vg-w-arch-wasmbg-panic-stack-r2" x="60" y="132" width="760" height="56" role="button" tabindex="0" />
+      <text x="80" y="156" fill="var(--ink)" class="layer-text">L2 · wasm-bindgen tooling</text>
+      <text x="80" y="176" fill="var(--muted)" class="layer-sub">Walrus parser 認得 try/catch · descriptor interpreter 跑進 EH block · 出口加 extern "C-unwind"</text>
+      <text x="800" y="168" text-anchor="end" fill="var(--accent-text)" class="num">--panic-unwind</text>
+
+      <!-- Arrow 2 -->
+      <line x1="440" y1="188" x2="440" y2="204" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-arch-wasmbg-panic-stack-arrow)"/>
+
+      <!-- Layer 3: WebAssembly EH proposal -->
+      <rect class="layer layer-3" data-target="vg-w-arch-wasmbg-panic-stack-r3" x="60" y="208" width="760" height="56" role="button" tabindex="0" />
+      <text x="80" y="232" fill="var(--ink)" class="layer-text">L3 · WebAssembly Exception Handling proposal</text>
+      <text x="80" y="252" fill="var(--muted)" class="layer-sub">try / catch / throw / rethrow / catch_all · Exception.Tag 區分 panic vs. abort</text>
+      <text x="800" y="244" text-anchor="end" fill="var(--accent-text)" class="num">phase 4</text>
+
+      <!-- Arrow 3 -->
+      <line x1="440" y1="264" x2="440" y2="280" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-arch-wasmbg-panic-stack-arrow)"/>
+
+      <!-- Layer 4: Workers runtime -->
+      <rect class="layer layer-4" data-target="vg-w-arch-wasmbg-panic-stack-r4" x="60" y="284" width="760" height="56" role="button" tabindex="0" />
+      <text x="80" y="308" fill="var(--ink)" class="layer-text">L4 · Cloudflare Workers runtime · workerd</text>
+      <text x="80" y="328" fill="var(--muted)" class="layer-sub">PanicError → Promise rejection · 單 request fault isolation · Durable Object in-memory state 保留</text>
+      <text x="800" y="320" text-anchor="end" fill="var(--sage-deep)" class="num">JS visible</text>
+
+      <defs>
+        <marker id="vg-w-arch-wasmbg-panic-stack-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+        </marker>
+      </defs>
+    </svg>
+
+    <div>
+      <p class="hint">click any layer above</p>
+      <div class="detail detail-1">
+        <h3>Rust compiler · 責任邊界</h3>
+        <p>把 Rust source 編成包含 unwind metadata 的 wasm code。<code>panic=unwind</code> 是預設行為的反面——wasm32 target 過去固定走 <code>panic=abort</code>，因為當時 wasm 規格沒有 unwind 機制。要切到 unwind 必須用 <code>-Zbuild-std</code> 重建 <code>std</code> crate 本身，因為發佈版的 <code>libstd</code> 是 <code>panic=abort</code> 編出來的、不含 landing pad。</p>
+        <p><strong>不負責的事</strong>：Wasm 模組裡的 try/catch 指令長什麼樣、descriptor 怎麼描述 exception 形狀、JS 端看到什麼物件。Rust compiler 只保證「panic 不再展開成 trap」。</p>
+      </div>
+      <div class="detail detail-2">
+        <h3>wasm-bindgen · 責任邊界</h3>
+        <p>把 Rust 編出來的 wasm 模組 post-process 成「JS 跟 Rust 可以雙向呼叫」的 binary。Walrus 是 wasm-bindgen 用的 wasm parser／rewriter——原本完全不認得 EH proposal 的 try/catch 指令，看到就 panic。Cloudflare 加上的 patch 讓 Walrus 知道怎麼把這些指令保留、descriptor interpreter 知道遇到 try block 該怎麼遞迴下去評估。export function 出口要標 <code>extern "C-unwind"</code>，告訴 LLVM 「這個 ABI 邊界允許 unwind 跨過去」——沒這個標記，unwind 會在跨邊界時被 abort path 攔截。</p>
+        <p><strong>不負責的事</strong>：runtime 怎麼真的執行 try/catch、host 怎麼把 exception 物件 marshall 成 JS Error。wasm-bindgen 只保證「產出的 binary 在支援 EH 的 runtime 上會被正確 interpret」。</p>
+      </div>
+      <div class="detail detail-3">
+        <h3>WebAssembly EH proposal · 責任邊界</h3>
+        <p>規格層面定義 try、catch、throw、rethrow、catch_all 這幾個新指令，以及 <code>Exception.Tag</code> 物件——tag 是個輕量的 identity，用來判斷 catch block 該不該接這個 exception。Cloudflare 利用 tag 機制把「Rust panic（可救）」跟「Wasm abort / unreachable（不可救）」分到兩個不同的 tag——同一個 catch 點可以選擇只接 panic、把 abort 透傳出去。Phase 4 表示 proposal 已經被各家 engine 實作、進入 standardization 收尾階段。</p>
+        <p><strong>不負責的事</strong>：Rust panic 物件的記憶體布局、JS 端 catch 到的 Error 物件長相、host 把哪些 exception 視為 fatal。EH proposal 只規範了 instruction set 跟 tag 比較語意。</p>
+      </div>
+      <div class="detail detail-4">
+        <h3>Workers runtime · 責任邊界</h3>
+        <p>把 EH proposal 暴露給 isolate 內的 JS，並負責「panic 翻譯成 <code>PanicError</code> 並 reject 對應的 Promise」這個翻譯動作。最重要的承諾是 fault isolation 從 instance 收緊到 request——以前 panic 等於 <code>WebAssembly.RuntimeError</code> 把整個 instance 標記為 poisoned，所有 in-flight request 一起死、Durable Object 的 in-memory state 整個清空；現在 panic 只 reject 那一個 Promise，其他 request 跟所有 in-memory 物件原封不動。</p>
+        <p><strong>不負責的事</strong>：Rust 源碼層面的 unwind safety、Wasm 模組裡哪些 export 該 unwind、application 自己要 catch 哪些 panic。runtime 只保證「panic 變成可 catch 的 JS exception，並且不污染同 instance 的其他 work」。</p>
+      </div>
+    </div>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-arch-wasmbg-panic-stack');
+        root.querySelectorAll('.layer').forEach((rect) => {
+          rect.addEventListener('click', () => {
+            const targetId = rect.getAttribute('data-target');
+            const radio = root.querySelector('#' + targetId);
+            if (radio) radio.checked = true;
+          });
+          rect.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              rect.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            }
+          });
+        });
+      })();
+    </script>
+  </figure>
+
+  <p>四層從上到下對應 panic 由內向外傳遞的物理路徑。Rust 代碼 panic——L1 提供 unwind frame；L2 在跨 ABI 邊界處用 <code>extern "C-unwind"</code> 不攔截 unwind；L3 把 unwind 編碼成 throw 指令、配上 tag；L4 在 host 端把 throw 翻譯成 JS Promise rejection、夾帶 <code>PanicError</code> 物件。任何一層斷裂，整條 chain 都退回 <code>unreachable</code> trap 那條 fatal path。</p>
+
+  <p>四層的責任邊界是 pure functional pipeline 式——每一層只負責自己那段翻譯、不依賴下層的 implementation detail。L1 不需要知道 wasm-bindgen 怎麼生成 wrapper；L2 不需要知道 host runtime 如何接 exception；L3 spec 不需要知道 Rust 或 JS。Cloudflare 設計這個 chain 時刻意保留了這個 layering——任何一層的 implementation 換掉，其他層不需要動。這對長期 maintainability 是巨大紅利。</p>
+
+  <p>對比 native Rust 的對應 stack 可以看出 wasm 多了哪些工程量。Native Rust 的 panic recovery path：<code>panic=unwind</code> 是預設、走 SysV ABI 的 DWARF unwind table、跨 <code>extern "C"</code> 邊界被靜態 abort（除非 <code>extern "C-unwind"</code>）、整條 chain 都在 OS 層、用了二十年的 ABI。Wasm 對應的 chain 是全新的：wasm 沒有 stack frame 的 DWARF 概念、沒有 personality function、沒有 OS 級別的 unwinder。EH proposal 必須把這整套機制重做——這也是為什麼 EH proposal 花了七年才到 phase 4。</p>
+
+  <h2>L1：Rust compiler 跟 std 重建——panic=unwind 不是預設值</h2>
+
+  <p>Rust 對 <code>wasm32-unknown-unknown</code> target 多年來預設 <code>panic=abort</code>。理由很簡單：WebAssembly 在 EH proposal 進入 phase 4 之前根本沒有 unwind 機制。原文描述完全直白：「a panic inside a Rust Worker would abruptly trap with an <code>unreachable</code> instruction and exit Wasm back to JS with a <code>WebAssembly.RuntimeError</code>」。從 V8 角度看，這個 <code>unreachable</code> 跟 stack overflow、divide-by-zero 是一類東西：runtime invariant 被破壞、instance 進入 poisoned 狀態。</p>
+
+  <p>要切到 <code>panic=unwind</code>，光改 application 的 <code>Cargo.toml</code> 不夠——預編出來的 <code>libstd</code> 本身是 abort 的，<code>Vec::push</code> 觸發 <code>realloc</code> 失敗時的 panic path 都沒有 landing pad。唯一可行的解法是 <code>-Zbuild-std</code> 把整個 <code>std</code>、<code>core</code>、<code>alloc</code> 用使用者指定的 panic strategy 從原始碼重建一次：</p>
+
+  <pre data-kind="shell"><code><em># Rust Workers 0.8.0+ 啟用 panic unwinding 的最小 invocation</em>
+$ RUSTFLAGS='-Cpanic=unwind' \
+    cargo build \
+    --target wasm32-unknown-unknown \
+    -Zbuild-std=std,panic_unwind
+
+<em># 配合 wrangler.toml / Cargo metadata</em>
+[profile.release]
+panic = "unwind"
+lto = "thin"
+
+<em># wasm-pack / worker-build 透過新 flag 把上面這串塞進 cargo</em>
+$ worker-build --release --panic-unwind</code></pre>
+
+  <p>Unwind path 的代價有兩個。第一是 binary size：每個 panic-reachable 的 function 都需要 landing pad metadata，典型的 Rust Worker wasm binary 會比 <code>panic=abort</code> 版本大 8-15%。第二是 runtime overhead：normal-path 的 function call 多了 frame pointer 跟額外 instruction 來標記 try block 邊界。Workers 平台對 wasm binary size 有上限（免費方案 1 MiB 壓縮後、付費 10 MiB），8-15% 對接近上限的 binary 有感——這也是為什麼 <code>--panic-unwind</code> 是 opt-in 而非預設。</p>
+
+  <p>Cloudflare 的網路是 anycast——使用者 request 落到地理上最近的 PoP，所以每個 PoP 都得有完整 Worker fleet 鏡像。Wasm binary size 直接影響 deploy 的全球 propagation 時間——10% 成長等於每個 PoP 多 10% propagation 跟 storage 成本，乘以 300+ PoP 就有規模。對單一 customer 是 8-15%，對整個 platform 是 N×10% 的 capacity planning 變動。</p>
+
+  <p>Cloudflare 為此引入了一個新的 <code>MaybeUnwindSafe</code> trait——它「checks <code>UnwindSafe</code> only when built with <code>panic=unwind</code>」。在 abort 模式編譯時這個 check 退化成 no-op，避免在不會真的 unwind 的環境裡逼使用者標記一堆 <code>AssertUnwindSafe</code>。這個 trait 的設計告訴你一件事：Cloudflare 把 unwind 模式當成 opt-in、不強迫所有現存 Rust Worker 都升級。</p>
+
+  <p>另一個容易忽略的點：<code>panic=unwind</code> 在 wasm32 啟用後，「無限 recursion 觸發 stack overflow」這條 path 仍然是 unrecoverable abort、不是 panic。原因是 stack overflow 在 wasm 上會觸發 trap，trap 不是 throw、不會 unwind、也不會被 catch tag 接住。這個 distinction 對用 deep recursion 演算法的 application 是個重要 caveat——你不能假設啟用 panic=unwind 之後所有 fatal error 都會變 recoverable。可救 vs. 不可救的 boundary 在 spec 層面就劃分清楚了。</p>
+
+  <h2>L2：wasm-bindgen 的 Walrus parser 學會 try/catch</h2>
+
+  <p>Rust 編完的 wasm 模組要先過 wasm-bindgen 一輪 post-processing——它的職責是讓 Rust 跟 JavaScript 雙向呼叫。這個 post-processing 用 <strong>Walrus</strong>（wasm parser / IR / rewriter library）實作。Walrus 在 panic-unwind 改動之前完全不認得 EH proposal 的指令。原文寫得直白：「The WebAssembly parser Walrus did not know how to handle try/catch instructions, so we added support for them」。Cloudflare 加的 patch 把 EH proposal 定義的全部 instruction（<code>try</code>、<code>catch</code>、<code>throw</code>、<code>rethrow</code>、<code>catch_all</code>、<code>delegate</code>）都加進 Walrus 的 opcode table、各自對應一個 IR 節點型別。</p>
+
+  <p>跨邊界的另一個關鍵動作：export wrapper。wasm-bindgen 生成的 export function 必須允許 Rust 的 unwind 穿過去 JS。Rust 預設的 <code>extern "C"</code> ABI 在邊界處對 unwind 是 abort——要讓 unwind 真的能跨邊界，必須用較新的 <code>extern "C-unwind"</code> ABI。Cloudflare 在文中寫：「exports needed to be marked <code>extern "C-unwind"</code> to explicitly allow unwinding across the boundary」。下面對比舊 vs. 新的 export wrapper：</p>
+
+  <figure class="vg-w-tabs-wasmbg-before-after">
+    <style>
+      .vg-w-tabs-wasmbg-before-after { display: grid; gap: var(--s-2); min-width: 0; overflow-x: hidden; }
+      .vg-w-tabs-wasmbg-before-after .panel { min-width: 0; }
+      .vg-w-tabs-wasmbg-before-after .panel pre { overflow-x: auto; max-width: 100%; -webkit-overflow-scrolling: touch; }
+      .vg-w-tabs-wasmbg-before-after .panel pre code { white-space: pre; display: block; }
+      .vg-w-tabs-wasmbg-before-after input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-tabs-wasmbg-before-after .tabs { display: flex; gap: var(--s-2); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+      .vg-w-tabs-wasmbg-before-after .tab { font-family: var(--sans); font-size: var(--fs-sm); padding: var(--s-1) var(--s-2); cursor: pointer; color: var(--muted); min-height: 36px; display: inline-flex; align-items: center; }
+      .vg-w-tabs-wasmbg-before-after .panel { display: none; padding: var(--s-2) 0; }
+      .vg-w-tabs-wasmbg-before-after:has(#vg-w-tabs-wasmbg-before-after-t1:checked) .panel-1 { display: block; }
+      .vg-w-tabs-wasmbg-before-after:has(#vg-w-tabs-wasmbg-before-after-t1:checked) [for="vg-w-tabs-wasmbg-before-after-t1"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-wasmbg-before-after:has(#vg-w-tabs-wasmbg-before-after-t2:checked) .panel-2 { display: block; }
+      .vg-w-tabs-wasmbg-before-after:has(#vg-w-tabs-wasmbg-before-after-t2:checked) [for="vg-w-tabs-wasmbg-before-after-t2"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-wasmbg-before-after:has(#vg-w-tabs-wasmbg-before-after-t3:checked) .panel-3 { display: block; }
+      .vg-w-tabs-wasmbg-before-after:has(#vg-w-tabs-wasmbg-before-after-t3:checked) [for="vg-w-tabs-wasmbg-before-after-t3"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    </style>
+    <input type="radio" id="vg-w-tabs-wasmbg-before-after-t1" name="vg-w-tabs-wasmbg-before-after-sel" checked />
+    <input type="radio" id="vg-w-tabs-wasmbg-before-after-t2" name="vg-w-tabs-wasmbg-before-after-sel" />
+    <input type="radio" id="vg-w-tabs-wasmbg-before-after-t3" name="vg-w-tabs-wasmbg-before-after-sel" />
+    <div class="tabs" role="tablist">
+      <label class="tab" for="vg-w-tabs-wasmbg-before-after-t1">Rust source</label>
+      <label class="tab" for="vg-w-tabs-wasmbg-before-after-t2">wasm IR</label>
+      <label class="tab" for="vg-w-tabs-wasmbg-before-after-t3">JS catch path</label>
+    </div>
+    <div class="panel panel-1">
+      <pre><code class="language-rust">// 舊：panic=abort
+#[wasm_bindgen]
+pub fn parse_request(buf: &amp;[u8]) -&gt; Vec&lt;u8&gt; {
+    // 任一 panic（unwrap 失敗、index out of bounds、slice
+    // mismatch）——直接 abort，整個 Wasm instance poisoned
+    let header = parse_header(buf).unwrap();
+    process(header, &amp;buf[header.len()..])
+}
+
+// 新：panic=unwind
+#[wasm_bindgen]
+pub fn parse_request(buf: &amp;[u8]) -&gt; Vec&lt;u8&gt; {
+    // 同樣的代碼——panic 還是會發生，但展開為 unwind
+    // 通過 extern "C-unwind" wrapper 到 JS、變成 PanicError
+    let header = parse_header(buf).unwrap();
+    process(header, &amp;buf[header.len()..])
+}
+
+// 對 unsafe 的 callback，明確標記 abort：
+let cb = Closure::&lt;dyn Fn(JsValue)&gt;::new_aborting(|v| {
+    // 這個 closure 不會 unwind——unwind 進來就終結 instance
+    unsafe { process_fragile_thing(v) }
+});</code></pre>
+    </div>
+    <div class="panel panel-2">
+      <pre data-kind="pseudocode"><code><em>// 舊 wasm bytecode（panic=abort）</em>
+(func $parse_request (export "parse_request")
+  (param $buf i32) (param $len i32) (result i32)
+  call $parse_header
+  br_if $abort        <em>// unwrap 失敗 → unreachable</em>
+  call $process
+  return
+  unreachable)        <em>// trap: WebAssembly.RuntimeError</em>
+
+<em>// 新 wasm bytecode（panic=unwind, EH proposal）</em>
+(func $parse_request (export "parse_request")
+  (param $buf i32) (param $len i32) (result i32)
+  try $exn               <em>// 6 ── 進入 try block</em>
+    call $parse_header
+    call $process
+  catch $vg_panic_tag    <em>// 7 ── 接 Rust panic tag</em>
+    call $marshall_panic
+    throw $exn           <em>// 重新 throw 給 JS host</em>
+  end)
+
+<em>// Walrus 看 try (0x06) 跟 catch (0x07) 直到加 patch 前都報</em>
+<em>// "unknown opcode"——Cloudflare 把這六個指令塞進 Walrus</em>
+<em>// 的 IR table 並擴充 descriptor interpreter 跟著 evaluate。</em></code></pre>
+    </div>
+    <div class="panel panel-3">
+      <pre><code class="language-js">// JS 端的 wasm-bindgen 生成 wrapper
+export async function parse_request(buf) {
+  try {
+    const ret = wasm.__wbindgen_parse_request(buf);
+    return ret;
+  } catch (e) {
+    // PanicError 來自 Rust 端 panic 經 extern "C-unwind"
+    // 過 wasm EH 後 host 翻譯。Tag 用來區分：
+    //   - PanicError → 可救，request 失敗、instance 健康
+    //   - 其它 RuntimeError → instance poisoned，重啟
+    if (e instanceof PanicError) {
+      console.error('rust panic', e.message);
+      return new Response('500', { status: 500 });
+    }
+    throw e;
+  }
+}
+
+// Durable Object handler 等價：
+export class Counter {
+  async fetch(req) {
+    try {
+      return await wasm.handle_request(req);
+    } catch (e) {
+      if (e instanceof PanicError) {
+        // in-memory state（this.value, this.items）保留——
+        // 這在舊版會整個一起死
+        return new Response('panicked: ' + e.message, { status: 500 });
+      }
+      throw e;
+    }
+  }
+}</code></pre>
+    </div>
+  </figure>
+
+  <p>三個 view 對應同一個 panic 在三個高度的呈現。Rust source 幾乎沒變——這是有意的，作者不該因為 unwind 模式被迫改 source code。Wasm IR 從一個 <code>unreachable</code> trap 變成一對 <code>try / catch / throw</code> 包住整個 export body。JS 端從「instance 整個 poisoned」變成「<code>PanicError</code> 落到 <code>try / catch</code>」——這正是「a panic rejects the JavaScript <code>Promise</code> with a <code>PanicError</code>」這句承諾的兌現位置。</p>
+
+  <p>注意 IR 的 <code>try / catch / throw</code> 三明治不是 application code 寫的——是 wasm-bindgen 在 export wrapper 自動生成的。Application 端的 Rust source 完全不需要寫 try block；panic site 在源碼裡是 <code>.unwrap()</code> 或 <code>panic!()</code>、編譯器生成 unwind 指令、wasm-bindgen 在 export edge 包上 try block。這個 architectural separation 很重要：作者繼續用 idiomatic Rust 寫代碼，但所有 panic 都會在 export edge 被 catch 住、不會逸出到 host runtime。</p>
+
+  <p>wasm-bindgen 的 closure 包裝也得跟著動。有些 closure（含 <code>unsafe</code> 操作、跟 raw pointer 互動的 FFI）作者明知道不該 unwind——unwind 跨過去會留 dangling resource。Cloudflare 為此引入 <code>Closure::new_aborting</code> 系列 variant：「we added <code>Closure::new_aborting</code> variants」。對熟悉 C++ 的讀者來說，這就跟 <code>noexcept</code> 的角色一樣：標記「不會 throw、真 throw 就 terminate」。</p>
+
+  <p>實務上 <code>new_aborting</code> 跟 <code>new</code> 的選擇可以這樣 frame：default 用 <code>Closure::new</code> 走 unwind path；只有當 closure 滿足以下任一條件才切到 <code>new_aborting</code>——（一）closure body 含 <code>unsafe</code> block 而且操作的 invariant 跨 syscall / FFI 邊界；（二）closure 在跑的時候持有 raw pointer 對 wasm linear memory 的某個區段；（三）closure 是 <code>Drop</code> 的一部分。這三條基本對應「unwind 跨過去會破壞 invariant」的場景。</p>
+
+  <p>Walrus 改動還有個延伸影響：所有 downstream tool 也要跟著升級。Wasm ecosystem 裡有不少 tool 用 Walrus 作為 wasm 解析 library——例如 <code>wasm-opt</code>、各種 wasm linker。Cloudflare 修 Walrus 之後，這些 tool 在處理含 EH instruction 的模組時要嘛 fail 要嘛跳過 unknown opcode。對 Workers production 來說這條 chain 都受 Cloudflare 控制，他們可以一起 bump 版本；對社群 user 來說則要等所有 tool 升完才能完整使用 EH。</p>
+
+  <h2>L3：WebAssembly Exception Handling proposal 跟 Exception.Tag</h2>
+
+  <p>L2 改動依賴 L3 已經存在——EH proposal 必須先進 phase 4、各家 engine 必須先實作 <code>try</code> / <code>catch</code> / <code>throw</code> / <code>rethrow</code> / <code>catch_all</code> 這幾個指令以及 <code>Exception.Tag</code> 物件。原文列出的 runtime support：「Chrome 138（June 28, 2025）、Firefox 131（October 1, 2024）、Safari 18.4（March 31, 2025）、Node.js 25.0.0（October 15, 2025）」。Cloudflare 額外把 EH 支援「backported to Node.js 22 and 24 LTS releases」。</p>
+
+  <figure class="vg-w-table-wasmbg-runtime-matrix">
+    <style>
+      .vg-w-table-wasmbg-runtime-matrix table { width: 100%; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-wasmbg-runtime-matrix thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; }
+      .vg-w-table-wasmbg-runtime-matrix thead th[data-sort] { color: var(--accent-text); }
+      .vg-w-table-wasmbg-runtime-matrix thead th[data-sort="asc"]::after { content: ' ▴'; font-size: 0.7em; }
+      .vg-w-table-wasmbg-runtime-matrix thead th[data-sort="desc"]::after { content: ' ▾'; font-size: 0.7em; }
+      .vg-w-table-wasmbg-runtime-matrix tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); }
+      .vg-w-table-wasmbg-runtime-matrix td.num { font-variant-numeric: tabular-nums; text-align: right; }
+      .vg-w-table-wasmbg-runtime-matrix td.engine { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+      .vg-w-table-wasmbg-runtime-matrix td.status { font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); }
+      .vg-w-table-wasmbg-runtime-matrix tbody tr:hover td { background: var(--bg-soft); }
+      .vg-w-table-wasmbg-runtime-matrix p.vg-w-affordance { display: flex; align-items: center; gap: var(--s-1); margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
+      .vg-w-table-wasmbg-runtime-matrix caption { text-align: left; caption-side: top; font-family: var(--scribed); font-style: italic; color: var(--muted); font-size: var(--fs-sm); padding: var(--s-1) 0; }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/><path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+      </svg>
+      <span>click column header to sort · 5 columns × 6 rows</span>
+    </p>
+    <table>
+      <caption>WebAssembly Exception Handling 跨 runtime 支援表——Cloudflare 為了 production 多走了 backport 路線。所有版號跟釋出日期取自原文。</caption>
+      <thead>
+        <tr>
+          <th data-key="engine">runtime</th>
+          <th data-key="version" class="num">version</th>
+          <th data-key="released">released</th>
+          <th data-key="status">EH 狀態</th>
+          <th data-key="note">備註</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td class="engine">Chrome (V8)</td><td class="num">138</td><td>2025-06-28</td><td class="status">phase 4</td><td>包含 Edge / Chromium 衍生瀏覽器</td></tr>
+        <tr><td class="engine">Firefox (SpiderMonkey)</td><td class="num">131</td><td>2024-10-01</td><td class="status">phase 4</td><td>最早 ship 的主流瀏覽器</td></tr>
+        <tr><td class="engine">Safari (JSC)</td><td class="num">18.4</td><td>2025-03-31</td><td class="status">phase 4</td><td>iOS Safari 同版本同步</td></tr>
+        <tr><td class="engine">Node.js</td><td class="num">25</td><td>2025-10-15</td><td class="status">phase 4</td><td>current 線；LTS 仍是 24</td></tr>
+        <tr><td class="engine">Node.js (LTS 22)</td><td class="num">22.x</td><td>backported</td><td class="status">cloudflare</td><td>Cloudflare 自己 backport 進 LTS 線</td></tr>
+        <tr><td class="engine">Node.js (LTS 24)</td><td class="num">24.x</td><td>backported</td><td class="status">cloudflare</td><td>Workers production 跑這條</td></tr>
+      </tbody>
+    </table>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-table-wasmbg-runtime-matrix');
+        const headers = root.querySelectorAll('thead th');
+        const tbody = root.querySelector('tbody');
+        let activeKey = null, asc = true;
+        headers.forEach((h, idx) => h.addEventListener('click', () => {
+          const key = h.dataset.key;
+          if (activeKey === key) asc = !asc; else { activeKey = key; asc = true; }
+          headers.forEach((x) => x.removeAttribute('data-sort'));
+          h.setAttribute('data-sort', asc ? 'asc' : 'desc');
+          const rows = Array.from(tbody.querySelectorAll('tr'));
+          rows.sort((a, b) => {
+            let av = a.children[idx].textContent.trim();
+            let bv = b.children[idx].textContent.trim();
+            const an = Number(av), bn = Number(bv);
+            if (!Number.isNaN(an) && !Number.isNaN(bn)) { av = an; bv = bn; }
+            const cmp = av < bv ? -1 : av > bv ? 1 : 0;
+            return asc ? cmp : -cmp;
+          });
+          rows.forEach((r) => tbody.appendChild(r));
+        }));
+      })();
+    </script>
+  </figure>
+
+  <p>EH proposal 的核心新概念是 <strong>Exception.Tag</strong>。Tag 是個 first-class wasm 物件，用來給 exception 一個 nominal identity——同一個 module 可以宣告多個 tag、每個 tag 帶不同 type signature。<code>catch $tag</code> 指令只接「跟 $tag 完全相同」的 exception，其他 tag 的 exception 會被透傳到外層 frame。Cloudflare 利用這個機制：給 Rust panic 一個 tag、給 Wasm abort 另一個 tag、給 JS host 拋進來的 foreign exception 第三個 tag。原文的用語是「we found it easier to implement exception tags for foreign exceptions to distinguish them from aborting non-unwind-safe exceptions」。</p>
+
+  <pre data-kind="pseudocode"><code><em>// EH proposal 在 wasm module 裡宣告 tag</em>
+(tag $vg_panic_tag (param i32))         <em>// Rust panic, 攜帶 panic_info ptr</em>
+(tag $vg_abort_tag (param i32))         <em>// Wasm abort, unreachable, OOM</em>
+(tag $vg_foreign_tag (param externref)) <em>// JS-thrown exception 跨進來</em>
+
+<em>// catch chain: 只想接 panic, 其它透傳</em>
+(func $vg_panic_runner (export "run")
+  try
+    call $user_fn
+  catch $vg_panic_tag
+    <em>// 可救——marshall 成 PanicError 給 host</em>
+    call $marshall_panic
+    return
+  end)
+<em>// abort tag 不被 catch, 自動 propagate 到 host, host 看到後</em>
+<em>// 走 instance-poisoned path; panic tag 被 catch, 只 reject 對應 Promise</em></code></pre>
+
+  <p>Tag 不只是 catch 過濾——它在 host integration 也起作用。Workers runtime 把 wasm 拋出的 exception 接到時，可以 query exception 的 tag 比較看是 panic 還是其它——這個比較是常數時間、不需要解碼 exception payload。對比舊路徑：舊路徑 <code>unreachable</code> trap 只是一個 generic <code>WebAssembly.RuntimeError</code>，host 沒有任何 information 能區分「intentional Rust panic」跟「程式真的撞牆」。Tag 把語意從 runtime opaque 抬到 static identity——這是 Cloudflare 能對外承諾「panic 可救、abort 不可救」這條 fault boundary 的根本前提。</p>
+
+  <p>EH proposal 的設計有個值得展開的細節：它不像 Java 或 C++ 那樣有 rethrow 鏈或 caused-by 這種高階概念，wasm 只給最低限度的原始 primitive。<code>throw $tag</code> 把指定 tag 的 exception 拋出去；<code>catch $tag</code> 接同 tag；<code>catch_all</code> 接任何 tag；<code>rethrow $depth</code> 把 catch 到的 exception 再丟給更外層的 frame。沒有 exception type hierarchy、沒有 message field、沒有 stack trace——所有「友善」的東西都要 library 自己 layer 上去。</p>
+
+  <p>這個「最低限度 primitive」的設計選擇有它的好處——wasm engine 不需要在每個 exception 物件上掛 RTTI、不需要為 throw 做動態 type dispatch。代價是 language toolchain 必須各自實作一套 marshalling 規約，把語言層的 exception 型別 flatten 成 tag + raw data 組合。Rust 的選擇是「一個 tag 對應一類事件」——panic tag 攜帶一個 i32（panic info ptr）、abort tag 攜帶 cause code、foreign tag 攜帶 externref。</p>
+
+  <p>還有一個 subtle 跟 sandbox security 有關的設計考量：EH proposal 確保 exception 不能跨 instance 隨意 raise——只有 module 自己 import 的 tag 才能 throw、catch_all 接到的 exception 不能 forge tag。這個 guarantee 對多租戶 wasm runtime 很關鍵：tenant A 的 wasm module 不能用「假冒 tenant B 的 panic tag」這條 path 影響 tenant B 的 catch logic。Tag identity 是 host 管理的 capability、不能在 wasm 內 forge。</p>
+
+  <p>從 Web 標準制定流程的角度看，EH proposal 從 2018 年提出到 2025 年 phase 4 跑了七年。中間 Java/Kotlin/wasm 想要的 hierarchical exception type 一度被搶過 spec 注意力，wasm 社群最後做了取捨——維持 minimal primitive、把 hierarchy 留給 toolchain。這個取捨對 Rust 來說剛好——Rust panic 本來就沒有 hierarchical type。對 C++ exception 跟 Java exception 在 wasm 上的支援會比較吃力，他們需要在 wasm tag 之上自己 layer hierarchy。</p>
+
+  <h2>L4：Workers runtime 把 PanicError 翻譯到 JS，並守住 fault boundary</h2>
+
+  <p>到了 L4 才真正兌現使用者面看得到的承諾。Workers runtime（內部稱 workerd）負責三件事：把 wasm 拋出的 exception 接到 host、看 tag 決定如何 marshall 成 JS 物件、確保 fault isolation 在 request 邊界停下來。對 stateless Worker 的影響直觀：以前 panic 等於 5xx 整個 instance 重啟、所有 cohabiting request 都失敗；現在 panic 只 reject 那個 Promise、其他 request 不受影響。</p>
+
+  <p>對 stateful Worker——特別是 <strong>Durable Objects</strong>——影響更深。原文點明 stakes：「For stateless request handlers, this is fine. But for workloads that hold meaningful state in memory, such as Durable Objects, reinitialization means losing that state entirely」。一個 Durable Object instance 累積了幾分鐘的 WebSocket connection、in-memory edit buffer、cached query result——舊版任何一條 request 觸發 panic，這些全部清空；新版只有那條 request 失敗，其他全部健康。</p>
+
+  <p>另一個立即受惠的場景是 WebSocket 長連線 pool。Durable Object 可以掛幾百個 WebSocket 連線、根據 message routing 邏輯把 message 轉發到對應 client。舊版任何 message handler 裡的 bug 觸發 panic，整個 connection pool 一起斷——client 端會看到 close code 1011，需要重連。新版單一 message handler 的 panic 只 reject 那條 promise、其他連線繼續服務、in-flight message 路由不變。</p>
+
+  <p>「state 全保留」這個承諾的延伸後果之一：collaborative editing 的場景變得真的可行。想像一個 Google Docs-like 服務，每份文件對應一個 Durable Object、in-memory 維持 100 KB 的 operation log 跟 active collaborator 連線。舊版任何一條 incoming op 觸發 panic 就意味著整份文件的 in-memory 狀態消失、所有 collaborator 連線斷掉、需要從 persistent storage 重新 load 並 replay log。新版那條 invalid op 自己失敗、log 完整、其他 collaborator 完全無感。對 latency-sensitive 的 real-time 場景，這是定性的差別。</p>
+
+  <p>從可用性 SLA 的角度也可以看到差別。舊版 Rust Worker 的 panic 等於 instance reset、reset 之後第一個 request 經歷完整 cold start，通常落在 50-200 ms。如果 panic rate 是 1‰，每 1000 個 request 就會有一個經歷這個額外延遲——而且因為 instance 被重設，這個 request 之後的幾個 cohabiting request 也可能在 instance 重熱身時看到 cold cache。新版 panic rate 1‰ 變成「每 1000 個 request 有一個失敗」，instance 不被 reset、cohabiting request 完全不受影響。</p>
+
+  <p>下面這個小工具用 toggle 模擬「對應 build flag 跟 runtime 支援的不同組合，JS 端會看到什麼」——三個 toggle 分別控制 <code>panic=unwind</code>、Walrus 是否認得 EH、Workers runtime 是否支援 Exception.Tag。任一條缺，最終 fallback 都退回 <code>unreachable</code> trap。</p>
+
+  <figure class="vg-w-toggles-wasmbg-flags">
+    <style>
+      .vg-w-toggles-wasmbg-flags { display: grid; gap: var(--s-3); }
+      .vg-w-toggles-wasmbg-flags .controls { display: grid; grid-template-columns: 1fr; gap: var(--s-2); }
+      @media (min-width: 720px) { .vg-w-toggles-wasmbg-flags .controls { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+      .vg-w-toggles-wasmbg-flags .toggle { display: flex; flex-direction: column; gap: var(--s-1); padding: var(--s-2); border: 1px solid var(--line); cursor: pointer; user-select: none; transition: border-color 200ms; min-height: 44px; }
+      .vg-w-toggles-wasmbg-flags .toggle:hover { border-color: var(--accent); }
+      .vg-w-toggles-wasmbg-flags .toggle input { display: none; }
+      .vg-w-toggles-wasmbg-flags .toggle-head { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); display: flex; align-items: center; gap: var(--s-1); }
+      .vg-w-toggles-wasmbg-flags .toggle-dot { width: 10px; height: 10px; border-radius: 50%; border: 1.5px solid var(--muted-2); background: var(--bg-soft); transition: background 150ms, border-color 150ms; }
+      .vg-w-toggles-wasmbg-flags .toggle:has(input:checked) .toggle-dot { background: var(--sage-deep); border-color: var(--sage-deep); }
+      .vg-w-toggles-wasmbg-flags .toggle:has(input:checked) .toggle-head { color: var(--accent-text); }
+      .vg-w-toggles-wasmbg-flags .toggle-name { font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink); }
+      .vg-w-toggles-wasmbg-flags .toggle-cost { font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); color: var(--muted); }
+      .vg-w-toggles-wasmbg-flags .readout { display: grid; grid-template-columns: 1fr; gap: var(--s-2); padding: var(--s-3); background: var(--bg-soft); border-left: 2px solid var(--accent); }
+      @media (min-width: 720px) { .vg-w-toggles-wasmbg-flags .readout { grid-template-columns: 200px 1fr; align-items: center; } }
+      .vg-w-toggles-wasmbg-flags .verdict { font-family: EB Garamond, serif; font-size: 1.4rem; color: var(--ink); }
+      .vg-w-toggles-wasmbg-flags .verdict.bad { color: var(--accent-text); }
+      .vg-w-toggles-wasmbg-flags .verdict.good { color: var(--sage-deep); }
+      .vg-w-toggles-wasmbg-flags .breakdown { font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink-soft); }
+      .vg-w-toggles-wasmbg-flags .breakdown em { color: var(--accent-text); font-style: italic; }
+    </style>
+    <div class="controls" role="group" aria-label="三層 build/runtime 開關">
+      <label class="toggle">
+        <input type="checkbox" data-flag="compiler" checked />
+        <span class="toggle-head"><span class="toggle-dot"></span>L1 · compiler</span>
+        <span class="toggle-name">panic = unwind</span>
+        <span class="toggle-cost">-Zbuild-std=std,panic_unwind</span>
+      </label>
+      <label class="toggle">
+        <input type="checkbox" data-flag="bindgen" checked />
+        <span class="toggle-head"><span class="toggle-dot"></span>L2 · wasm-bindgen</span>
+        <span class="toggle-name">Walrus + C-unwind</span>
+        <span class="toggle-cost">--panic-unwind flag</span>
+      </label>
+      <label class="toggle">
+        <input type="checkbox" data-flag="runtime" checked />
+        <span class="toggle-head"><span class="toggle-dot"></span>L4 · runtime</span>
+        <span class="toggle-name">EH 支援 + Tag</span>
+        <span class="toggle-cost">Chrome 138 / FF 131 / Safari 18.4 / Node 25</span>
+      </label>
+    </div>
+
+    <div class="readout">
+      <div class="verdict" data-verdict>——</div>
+      <div class="breakdown" data-breakdown>——</div>
+    </div>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-toggles-wasmbg-flags');
+        const inputs = root.querySelectorAll('input[data-flag]');
+        const verdict = root.querySelector('[data-verdict]');
+        const breakdown = root.querySelector('[data-breakdown]');
+        function recompute() {
+          const state = {};
+          inputs.forEach((i) => { state[i.dataset.flag] = i.checked; });
+          const all = state.compiler && state.bindgen && state.runtime;
+          if (all) {
+            verdict.textContent = 'PanicError → Promise.reject';
+            verdict.className = 'verdict good';
+            breakdown.innerHTML = '三層全到位——panic 在 Rust 端 unwind, 跨 <em>extern "C-unwind"</em> wrapper, 經 EH throw 到 host, runtime 看 tag marshall 成 PanicError, reject 對應的 Promise。Durable Object 的 in-memory state 完好。其他 in-flight request 不受影響。';
+          } else if (!state.compiler) {
+            verdict.textContent = 'unreachable trap';
+            verdict.className = 'verdict bad';
+            breakdown.innerHTML = 'compiler 仍是 <em>panic=abort</em>——panic 直接展開成 <code>core::intrinsics::abort()</code>, 變 wasm <code>unreachable</code> 指令, host 看到 <em>WebAssembly.RuntimeError</em>, instance 整個 poisoned, 所有 cohabiting request 一起死。L2/L4 開了也救不回來。';
+          } else if (!state.bindgen) {
+            verdict.textContent = 'wasm-bindgen rebuild 失敗';
+            verdict.className = 'verdict bad';
+            breakdown.innerHTML = '舊 wasm-bindgen 的 Walrus 解到 <em>try (0x06)</em> 直接 panic「unknown opcode」——build 階段就失敗。就算硬把 module 拼出來, export wrapper 仍是 <em>extern "C"</em>, unwind 跨邊界時被攔截變 abort。';
+          } else {
+            verdict.textContent = 'runtime LinkError';
+            verdict.className = 'verdict bad';
+            breakdown.innerHTML = '舊 runtime 不認得 try/catch 跟 Tag——instantiation 就拋 <em>LinkError</em>, 整個 Wasm 都載不起來。這也是為什麼 Cloudflare 要 backport EH 到 Node.js 22/24 LTS, 不等到 Node 25 在 production 大規模上線。';
+          }
+        }
+        inputs.forEach((i) => i.addEventListener('change', recompute));
+        recompute();
+      })();
+    </script>
+    <figcaption>三個 toggle 模擬 build flag / wasm-bindgen / runtime 三層的開關。每個組合都對應一個 JS 端看得到的觀察結果。任何單一層缺席，全 stack 都 fallback 到舊行為——這也是為什麼這個 release 涉及這麼多層的同步動作。</figcaption>
+  </figure>
+
+  <p>除了 panic recovery 這條主軸，Workers runtime 還引入了兩個 abort-side 鉤子：第一個是 <code>set_on_abort</code>——「A new abort hook, <code>set_on_abort</code>, can be used at initialization time」，讓 wasm library 註冊 callback、在 instance 已 abort 時呼叫。第二個是 experimental flag <code>--reset-state-function</code>，host 觸發 abort 後不重新 fetch + compile 整個 binary，而是 call reset function 把 linear memory 跟 global 倒回初始化狀態——對 Durable Object 是 last resort，提供了「lose state 而不需要全套 cold start」的中間檔。</p>
+
+  <pre><code class="language-rust">use wasm_bindgen::prelude::*;
+
+// 在 init hook 設定 abort handler
+#[wasm_bindgen(start)]
+pub fn init() {
+    wasm_bindgen::set_on_abort(|reason| {
+        // host 已經判定 instance 不可救
+        // 這個 callback 是最後一次 log / metric / cleanup
+        eprintln!("worker aborted: {}", reason);
+        // 不能在這 panic / 不能 alloc——其它 invariant 都不保證
+    });
+}
+
+// 對 unsafe closure 用 new_aborting variant
+let cb = Closure::&lt;dyn Fn(JsValue)&gt;::new_aborting(|v| {
+    // unwind 進來這條 closure → abort instance
+    // 明確標記「我不接受被 unwind 跨過」
+    unsafe { fragile_ffi_call(v) }
+});
+
+// experimental: --reset-state-function 啟用後，wasm 多 export
+// 一個 vg_reset 函式；host 收到 abort 後不重 fetch binary, 改 call
+// vg_reset 把 linear memory 跟 global 重置——比完整 cold start 快
+#[wasm_bindgen]
+#[allow(non_snake_case)]
+pub fn vg_reset() {
+    // 重置 application 自己的 global state
+    APP_STATE.with(|s| s.borrow_mut().clear());
+}</code></pre>
+
+  <p>四層拼起來，使用者面的 contract 從「panic = lose everything」變成三檔：（一）正常 panic——只 reject 對應 Promise、in-memory state 保留；（二）unwind-unsafe closure 觸發的 panic 經 <code>new_aborting</code> path——instance abort、走 <code>set_on_abort</code> 做最後 cleanup；（三）真正的不可救事件（unreachable、OOM）——一樣經 abort hook、<code>--reset-state-function</code>（如有）做 best-effort state reset。對 Durable Object 作者來說最有感的是第一檔——這條 path 是過去四年完全沒有的。</p>
+
+  <p>但要享受這條 path 也需要 application 自己做事——具體就是給 fetch handler 加 try/catch。否則 PanicError throw 出來沒人接、會 propagate 到 Workers runtime 變成 default 500 response。正確 pattern 是：在 fetch handler 最外層接所有 PanicError、log 後回 500；application-level error 用 Rust idiomatic 的 ? operator 處理、不要 catch；JS-thrown exception 維持原樣 propagate。</p>
+
+  <p>另一個值得展開的點是 shared state 的 invariant。Durable Object 在 panic 後 state 雖然保留，但「panic 發生時這個 state 是否在 inconsistent 中間狀態」這件事仍由 application 負責。舉例：DO 內部維持一個 <code>HashMap</code>，request handler 先 insert 新 session、再 send notification、再 return。如果 panic 發生在 insert 之後、send 之前——按舊版邏輯 instance 重啟、HashMap 重置、不一致狀態消失；新版 HashMap 保留了「沒發 notification 的 session」這個 inconsistent 狀態。這不是 Cloudflare 的 bug、是 application 自己的責任邊界往內收了一格。</p>
+
+  <p>Rust 的型別系統本來就提供了工具來處理這件事——<code>RefCell</code> 的 poison flag、<code>Mutex</code> 的 poison API、<code>UnwindSafe</code> 的 type-level marker——這些都在告訴 Rust 程式員「panic 中段可能留下 inconsistent state」。過去因為 wasm32 是 <code>panic=abort</code>，這些工具在 Workers 裡的意義被淡化。新模式下這些工具回到第一線——作者需要重新 take seriously 哪些 type 是 <code>UnwindSafe</code>、哪些操作需要在 catch 之後做 cleanup 或 rollback。</p>
+
+  <p>整理一下這個 release 對不同角色的 takeaway：（一）Rust Worker 作者——升級到 0.8.0、過一次 audit 把 unsafe closure 標 <code>new_aborting</code>、給 fetch handler 加 try/catch wrapper；（二）Durable Object 作者——重新審視 in-memory state 的 invariant，確認 panic 中段不會留下不一致的 state，如果有，加 explicit rollback path；（三）SRE / on-call——更新 runbook，panic alert 從「instance crash, 需要 cold start」改成「single request fault, 觀察是否 systemic」；（四）平台選型者——如果 application 屬於「state 跟 fault isolation 重要、但寫 Rust」這條 sweet spot，Workers 的 attractiveness 顯著提升。</p>
+
+  <p>從 distributed system 設計的長期視角看，這個 release 是個 case study：一個 spec 層面的 capability 出現（wasm EH proposal phase 4），需要工具鏈跟 runtime 對齊（rustc + wasm-bindgen + workerd），才能變成 user-facing primitive（PanicError）。這條 chain 上每一個 stakeholder 都做了「跟我自己無關但對整體有用」的工作——LLVM 早就 emit EH instruction、即使當時跑不起來；Walrus 維護者接受 Cloudflare 的 patch；EH proposal authors 在 phase 3 拒絕了複雜的 hierarchical exception 設計、堅持 minimal tag-based。任何一塊缺席，這個 release 就出不了。</p>
+
+  <p>這個 release 的設計呼應了 Joe Armstrong 的 thesis「Making reliable distributed systems in the presence of software errors」——關鍵不是「不出錯」而是「錯了之後 fault domain 多大」。Erlang 把 fault domain 設在 process；Cloudflare Workers 過去把 fault domain 設在 isolate；現在透過 wasm EH 收緊到 single request。從 abstraction stack 的角度看，這是 fault containment 顆粒度的又一次細分——對讀者來說最值得帶走的是這個 sense：一個看起來很小的 user-facing 改動（panic 不再 take down instance），底下是一個由四個 layer、若干 stakeholder、多年協作共同推進的工程系統。</p>
+
+  <p class="vg-deep-closer"><strong>What this enables</strong>：把 Rust panic 從「instance-level fatal event」收到「request-level recoverable error」，需要 Rust compiler、wasm-bindgen、WebAssembly Exception Handling proposal、Workers runtime 四層同時就位——任何一層缺席就 fallback 回 <code>unreachable</code> trap；四層都到位後，Durable Object 的 in-memory state 第一次能夠在單一 panic 後存活，stateful Worker 的 fault boundary 從整個 isolate 收緊到單一 Promise——這也是 wasm-bindgen + EH proposal phase 4 帶給整個 Rust + wasm 生態的最大紅利，不只 Cloudflare 一家。</p>
+</div>

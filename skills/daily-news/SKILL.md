@@ -287,14 +287,48 @@ an archetype feel like the same post. The test suite checks H2
 *counts*, not strings. Closer labels are also free; pick one that
 fits the post's voice.
 
-**c. Selection constraints when writing up to 3**:
+**c. Selection constraints — default is N = 3**:
 
-- All 3 must score ≥8
-- ≥2 distinct domains required if writing 3 (≥1 if writing 2)
-- ≥2 distinct archetypes required if writing 3 (avoid "3 narratives in
-  a row"); `freeform` counts as its own archetype for diversity
-- If candidates cannot satisfy domain + archetype diversity, write
-  fewer (2 or 1). Do not force.
+The deep-story count default is **N = 3**. Aim for 3 every run unless a
+named structural constraint blocks it. The constraints when writing 3:
+
+- All 3 must score ≥ 8
+- ≥ 2 distinct domains required if writing 3 (≥ 1 if writing 2)
+- ≥ 2 distinct archetypes required if writing 3 (avoid "3 narratives
+  in a row"); `freeform` counts as its own archetype for diversity
+- If genuine candidate scarcity makes domain + archetype diversity
+  unsatisfiable at N = 3, fall back to N = 2 or N = 1. Do not force a
+  3rd pick that violates the diversity rule.
+
+**Trimming N below 3 is ONLY legitimate when one of these structural
+reasons applies**:
+
+1. Fewer than 3 clusters scored ≥ 8 in Step 5.0 (record cluster
+   scores in PR body)
+2. Cannot find 3 clusters satisfying ≥ 2 domain + ≥ 2 archetype
+   diversity (record the domain × archetype matrix in PR body)
+3. Step 5d URL dedup dropped a pick AND replacement pool is exhausted
+   (record refill attempt in PR body)
+4. Step 7.5 blocking exhausted on a draft after 5 retries (Step 7.5c)
+5. Step 8.5 blocking exhausted on a draft after 5 iterations
+
+**"Budget / wallclock / dispatch cost" is NEVER a Step 5 reason to
+trim.** Steps 7.5 and 8.5 have their own runtime trim mechanisms
+(documented in "No skip clause exists" paragraphs). Those clauses
+authorize trimming when *runtime evidence* shows the gate cannot fit
+— they do NOT authorize preemptive trimming in Step 5 on imagined
+cost. If you find yourself reasoning "Step 7.5 will be expensive with
+3 posts so I'll do 2", STOP — that reasoning is the anti-pattern this
+clause forbids.
+
+**PR #35 (2026-05-23)** shipped 2 deep stories on a self-declared
+"dispatch budget" rationalization. Step 5 had 9 qualifying ≥ 8 clusters
+and domain + archetype diversity was trivially achievable for N = 3.
+A third deep story (weirdgloop AI scrapers, web/narrative) was added
+in the same PR after the user caught the trim in review. The PR body
+now requires an explicit "Deep-story count justification" section
+when N_final < 3, and `check-quality-gate-evidence.mjs` enforces it
+mechanically.
 
 **d. Pre-dispatch URL dedup (added 2026-05-21 after PR #30)**:
 
@@ -551,6 +585,19 @@ pattern this clause forbids. The cost arithmetic the routine performed
 cannot afford 8 reviewer dispatches, you cannot afford 3 deep stories
 in this run. Trim to 2 or 1.
 
+**Scope clarification (added 2026-05-23 after PR #35)**: this clause
+authorizes trimming N when *runtime evidence* shows the gate cannot
+fit — e.g. a reviewer crashed and won't re-dispatch, a per-post retry
+loop legitimately exhausts, or an inter-post reviewer keeps failing.
+It does NOT authorize **Step 5 preemptive trimming** on imagined
+cost. The "if you cannot afford 8 reviewer dispatches" sentence above
+is a post-hoc rule that kicks in when you have evidence the budget
+won't hold; it is not an invitation to do the math in Step 5 and
+trim N preemptively. If you cite "Step 7.5 will be expensive" in
+Step 5b, you've inverted the clause — see Step 5c's "Trimming N
+below 3 is ONLY legitimate when…" list for the legal Step 5
+reasons.
+
 Step 7c sub-agent self-checks (the author reading the archetype
 reference + persona before drafting) are **not a substitute** for
 Step 7.5 — author self-check is biased and shallow by construction;
@@ -744,6 +791,14 @@ If you find yourself thinking "I already ran the mechanical scripts so
 the visual pass is lower priority" — that is the rationalization this
 clause forbids. **Mechanical and visual passes are not substitutes
 for each other**; they catch disjoint failure modes by construction.
+
+**Scope clarification (added 2026-05-23 after PR #35)**: same scope
+rule as Step 7.5. This clause authorizes trimming N when *runtime
+evidence* shows a Blocking visual issue genuinely can't be fixed in 5
+iterations. It does NOT authorize Step 5 preemptive trimming on
+"Step 8.5 will be expensive with N posts" reasoning. Step 5c's
+"Trimming N below 3 is ONLY legitimate when…" list is the only
+authorization for sub-3 in Step 5.
 
 **Setup**:
 
@@ -1064,6 +1119,28 @@ For each post (roundup + deep-stories):
 - {{deep_title_1}} — `narrative`
 - {{deep_title_2}} — `technical-deep-dive`
 - {{deep_title_3}} — `freeform` (hybrid topic, no structured archetype fit cleanly)
+
+## Deep-story count justification (REQUIRED when N_final < 3)
+
+The default deep-story count is N = 3. If N_final < 3, this section
+MUST contain exactly one of the named structural reasons below.
+`check-quality-gate-evidence.mjs` enforces this mechanically: a sub-3
+run with no listed reason (or with a "budget/wallclock/dispatch cost"
+reason) fails the publish gate.
+
+- Target: N = 3
+- Actual: N = <number>
+- Reason (only if Actual < Target; pick exactly one):
+  - `<3 score-qualifying clusters: <list cluster IDs + their scores>`
+  - `domain/archetype diversity unsatisfiable: <enumerate combinations tried>`
+  - `Step 5d URL collision with refill pool exhausted: <details>`
+  - `Step 7.5 BLOCKING retry exhausted on <slug> after 5 rounds`
+  - `Step 8.5 Blocking visual issue unfixable after 5 iterations on <slug>`
+
+"Budget" / "wallclock" / "dispatch cost" / "Opus quota" is NOT a
+valid Step 5 reason — see SKILL.md Step 5c. If you wrote one of those
+phrases here, the routine has a bug in Step 5 and you should re-pick
+deep stories at N = 3.
 
 ## Advisory overrides
 

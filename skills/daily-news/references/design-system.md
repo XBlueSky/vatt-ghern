@@ -199,6 +199,26 @@ already render legibly on mobile because the natural scale is close to
 1×. Run the audit before adding the attribute. Adding it
 unnecessarily creates an unwanted scrollbar.
 
+**Stack/list widgets — do NOT use `data-svg-scroll`** (added 2026-05-23
+after PR #35). If the widget renders N discrete items (4 layers, 3
+stages, N hypotheses) each with a long subtitle, the
+`data-svg-scroll` pattern bisects item identifiers in the initial
+mobile view ("L2 · L..." with the rest hidden until horizontal swipe).
+Even with the swipe affordance, the initial render looks visually
+broken. Use the dual-rendering pattern at
+`widget-cookbook/tier-2-snippets/stack-cards-svg-fallback.md` instead:
+HTML cards on mobile (wrap naturally, full text visible), SVG diagram
+on desktop. Both layouts share the same radio + `:has(input:checked)`
+selectors so detail-panel mechanics are identical.
+
+Pattern decision:
+| Widget kind | Use |
+|---|---|
+| Charts, timelines, axis plots, param sweeps, continuous SVG content | `data-svg-scroll` (partial view still conveys meaning) |
+| Stacks, lists, N-item architecture diagrams, step pipelines | `stack-cards-svg-fallback` (each item readable in full) |
+| Single annotated illustration | `data-svg-scroll` (one visual unit, swipe to read it) |
+| Tabs with wide content per panel | depends on panel content; trim panel width to fit if possible |
+
 ### Interactive-affordance hint
 
 Mark interactive figures with an inline `<p class="vg-w-affordance">`

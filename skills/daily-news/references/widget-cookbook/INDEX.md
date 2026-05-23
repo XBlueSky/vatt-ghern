@@ -83,6 +83,7 @@ Snippets are smaller patterns. Some are zero parts of Tier-1 templates
 | `tooltip-popover-anchor` | Hover-detail using CSS anchor positioning |
 | `before-after-slider` | Two figures overlaid; drag divider to reveal diff |
 | `timeline-scrubber` | Horizontal time axis with draggable scrub handle |
+| `stack-cards-svg-fallback` | N-item stack with HTML cards (mobile) + SVG diagram (desktop) — RWD-safe alternative to `data-svg-scroll` for discrete-item widgets |
 
 Detailed pages: all live under `tier-2-snippets/<id>.md`.
 

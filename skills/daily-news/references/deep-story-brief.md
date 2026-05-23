@@ -64,7 +64,13 @@ You are writing ONE deep-story for vatt'ghern's daily-news routine.
 11. Write the sidecar to {{sidecar_path}} per the schema in
     references/archetypes.md § Sidecar spec. `sources[]` MUST include
     EVERY variant_url. Sidecar MUST include `widget_count`,
-    `widget_questions`, and `widget_templates` fields.
+    `widget_questions`, and `widget_templates` fields. The sidecar
+    `summary` field MUST be Traditional Chinese (繁體中文), matching
+    the post body's language — it surfaces in the homepage "Today's
+    deep reads" cards and the RSS feed alongside the Chinese title.
+    Mixing an English `summary` with a Chinese title produces a
+    visibly inconsistent index card (PR #35, 2026-05-23 shipped one
+    English sidecar summary and had to patch it post-merge).
 12. Report back: path written, character count, archetype deviations
     (if any) with reasoning, widget count, and widget templates used.
 
