@@ -1,0 +1,671 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">五根支柱裡沒有任何一根是「演算法更聰明」。它們全部在做同一件事——把作業系統從 hot path 上踢出去：不要 syscall、不要 kernel copy、不要 OS 排程器決定你的 thread 何時跑、不要 clock_gettime 去問核心現在幾點。把 OS 拿掉之後剩下的，才是硬體本身的延遲。</p>
+  <h1 class="vg-post-title">低延遲交易系統的五根支柱——從 NIC kernel bypass 到 p99，把 wire-to-wire 拆到微秒級</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p><span class="vg-dropcap">把</span>一筆 market data 從網卡進來、跑完策略、把 order 從網卡送出去，這條路徑叫 wire-to-wire。量它的方式很直接：<code>order_send_timestamp - market_data_receive_timestamp</code>。一個調校過的 C++ 系統把這段壓到 p95 < 50µs；同樣邏輯的 Java 系統連 p50 500µs 都摸不到。差距不在語言「比較快」這種模糊說法，而在五個具體的工程決定，每一個都針對 wire-to-wire 路徑上某一段由作業系統造成的固定開銷。這篇把這五根支柱逐一拆開——DPDK kernel bypass、preallocated memory pool、CPU/NUMA affinity、TSC 計時、network tuning——並且強調一件常被略過的前提：沒有一張 baseline latency histogram，這五個優化全部是不可見的，你根本不知道自己有沒有改善。</p>
+
+  <p>先把整條路徑攤平。一個 packet 從光纖進到你的策略邏輯能讀到它，傳統 kernel 路徑要經過：NIC DMA 進 ring buffer、觸發 interrupt、kernel 在 softirq context 處理、把 payload 從 kernel buffer copy 到 socket buffer、喚醒在 <code>recvmsg()</code> 上 block 的 user thread、context switch 回 user space、再 copy 一次到 application buffer。送出去是這條路反過來走。這中間每一個 interrupt、每一次 copy、每一次 context switch、每一個 syscall，都是固定開銷——跟你的策略多複雜無關，packet 進來就得付。五根支柱的共同主題，就是把這些固定開銷一個一個抽掉。下面的互動圖把這五根支柱放回它們在 wire-to-wire 路徑上對應的位置；點任一根支柱，看它負責抽掉哪一段、又刻意不負責什麼。</p>
+
+  <figure class="vg-w-annotated-llcpp-pillars">
+    <style>
+      .vg-w-annotated-llcpp-pillars { display: grid; grid-template-columns: 1fr; gap: var(--s-3); align-items: start; }
+      @media (min-width: 720px) { .vg-w-annotated-llcpp-pillars { grid-template-columns: 1.5fr 1fr; } }
+      .vg-w-annotated-llcpp-pillars svg { width: 100%; height: auto; max-width: 880px; }
+      .vg-w-annotated-llcpp-pillars input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-annotated-llcpp-pillars .component { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; transition: fill 200ms, stroke 200ms; }
+      .vg-w-annotated-llcpp-pillars .component:hover { stroke: var(--accent); }
+      .vg-w-annotated-llcpp-pillars .component:focus { outline: none; }
+      .vg-w-annotated-llcpp-pillars .component:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+      .vg-w-annotated-llcpp-pillars .component-text { pointer-events: none; font-family: EB Garamond, serif; font-size: 14px; }
+      .vg-w-annotated-llcpp-pillars .component-sub { pointer-events: none; font-family: IM Fell English, serif; font-style: italic; font-size: 11px; fill: var(--muted); }
+      .vg-w-annotated-llcpp-pillars .flow-text { font-family: IM Fell English, serif; font-style: italic; font-size: 11px; fill: var(--muted); }
+      .vg-w-annotated-llcpp-pillars .head { font-family: IM Fell English, serif; font-style: italic; font-size: 13px; }
+      .vg-w-annotated-llcpp-pillars .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+      .vg-w-annotated-llcpp-pillars .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-annotated-llcpp-pillars .detail p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-annotated-llcpp-pillars .hint { font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin: 0 0 var(--s-1) 0; }
+      .vg-w-annotated-llcpp-pillars:has(#vg-w-annotated-llcpp-pillars-r1:checked) .component-1 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+      .vg-w-annotated-llcpp-pillars:has(#vg-w-annotated-llcpp-pillars-r2:checked) .component-2 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+      .vg-w-annotated-llcpp-pillars:has(#vg-w-annotated-llcpp-pillars-r3:checked) .component-3 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+      .vg-w-annotated-llcpp-pillars:has(#vg-w-annotated-llcpp-pillars-r4:checked) .component-4 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+      .vg-w-annotated-llcpp-pillars:has(#vg-w-annotated-llcpp-pillars-r5:checked) .component-5 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+      .vg-w-annotated-llcpp-pillars:has(#vg-w-annotated-llcpp-pillars-r1:checked) .detail-1 { display: block; }
+      .vg-w-annotated-llcpp-pillars:has(#vg-w-annotated-llcpp-pillars-r2:checked) .detail-2 { display: block; }
+      .vg-w-annotated-llcpp-pillars:has(#vg-w-annotated-llcpp-pillars-r3:checked) .detail-3 { display: block; }
+      .vg-w-annotated-llcpp-pillars:has(#vg-w-annotated-llcpp-pillars-r4:checked) .detail-4 { display: block; }
+      .vg-w-annotated-llcpp-pillars:has(#vg-w-annotated-llcpp-pillars-r5:checked) .detail-5 { display: block; }
+    </style>
+
+    <input type="radio" id="vg-w-annotated-llcpp-pillars-r1" name="vg-w-annotated-llcpp-pillars-sel" aria-label="select pillar 1" checked />
+    <input type="radio" id="vg-w-annotated-llcpp-pillars-r2" name="vg-w-annotated-llcpp-pillars-sel" aria-label="select pillar 2" />
+    <input type="radio" id="vg-w-annotated-llcpp-pillars-r3" name="vg-w-annotated-llcpp-pillars-sel" aria-label="select pillar 3" />
+    <input type="radio" id="vg-w-annotated-llcpp-pillars-r4" name="vg-w-annotated-llcpp-pillars-sel" aria-label="select pillar 4" />
+    <input type="radio" id="vg-w-annotated-llcpp-pillars-r5" name="vg-w-annotated-llcpp-pillars-sel" aria-label="select pillar 5" />
+
+    <svg viewBox="0 0 880 360" role="img"
+         aria-label="wire-to-wire 路徑與五根支柱——NIC bypass、memory pool、NUMA affinity、TSC、network tuning，點任一支柱看它負責的路段">
+      <text x="440" y="24" text-anchor="middle" fill="var(--ink)" class="head">wire-to-wire：market data 進 → 策略 → order 出，目標 p95 &lt; 50µs</text>
+
+      <!-- wire-to-wire path baseline -->
+      <text x="20" y="64" fill="var(--muted)" class="component-sub">wire in</text>
+      <text x="820" y="64" text-anchor="end" fill="var(--muted)" class="component-sub">wire out</text>
+      <line x1="20" y1="76" x2="860" y2="76" stroke="var(--muted-2)" stroke-width="1.5" stroke-dasharray="3,3"/>
+
+      <!-- Pillar 1: DPDK NIC bypass -->
+      <rect class="component component-1" data-target="vg-w-annotated-llcpp-pillars-r1" role="button" tabindex="0" aria-label="select DPDK kernel bypass" x="40" y="100" width="150" height="74" />
+      <text class="component-text" x="115" y="132" text-anchor="middle" fill="var(--ink)">DPDK bypass</text>
+      <text class="component-sub" x="115" y="152" text-anchor="middle">NIC → user space</text>
+      <text class="component-sub" x="115" y="168" text-anchor="middle" fill="var(--accent-text)">−20…45µs</text>
+
+      <!-- Pillar 2: memory pool -->
+      <rect class="component component-2" data-target="vg-w-annotated-llcpp-pillars-r2" role="button" tabindex="0" aria-label="select preallocated memory pool" x="210" y="100" width="150" height="74" />
+      <text class="component-text" x="285" y="132" text-anchor="middle" fill="var(--ink)">memory pool</text>
+      <text class="component-sub" x="285" y="152" text-anchor="middle">no runtime malloc</text>
+      <text class="component-sub" x="285" y="168" text-anchor="middle" fill="var(--accent-text)">0 syscall on path</text>
+
+      <!-- Pillar 3: NUMA affinity -->
+      <rect class="component component-3" data-target="vg-w-annotated-llcpp-pillars-r3" role="button" tabindex="0" aria-label="select CPU NUMA affinity" x="380" y="100" width="150" height="74" />
+      <text class="component-text" x="455" y="132" text-anchor="middle" fill="var(--ink)">NUMA pin</text>
+      <text class="component-sub" x="455" y="152" text-anchor="middle">thread ↔ core ↔ node</text>
+      <text class="component-sub" x="455" y="168" text-anchor="middle" fill="var(--accent-text)">no cross-node hop</text>
+
+      <!-- Pillar 4: TSC -->
+      <rect class="component component-4" data-target="vg-w-annotated-llcpp-pillars-r4" role="button" tabindex="0" aria-label="select TSC time source" x="550" y="100" width="150" height="74" />
+      <text class="component-text" x="625" y="132" text-anchor="middle" fill="var(--ink)">TSC clock</text>
+      <text class="component-sub" x="625" y="152" text-anchor="middle">rdtsc, no syscall</text>
+      <text class="component-sub" x="625" y="168" text-anchor="middle" fill="var(--accent-text)">~ns granularity</text>
+
+      <!-- Pillar 5: network tuning -->
+      <rect class="component component-5" data-target="vg-w-annotated-llcpp-pillars-r5" role="button" tabindex="0" aria-label="select network tuning" x="720" y="100" width="140" height="74" />
+      <text class="component-text" x="790" y="132" text-anchor="middle" fill="var(--ink)">net tuning</text>
+      <text class="component-sub" x="790" y="152" text-anchor="middle">busy-poll, RX/TX</text>
+      <text class="component-sub" x="790" y="168" text-anchor="middle" fill="var(--accent-text)">no interrupt</text>
+
+      <!-- connective arrows between pillars -->
+      <line x1="190" y1="137" x2="210" y2="137" stroke="currentColor" stroke-width="1.4" marker-end="url(#vg-w-annotated-llcpp-pillars-arrow)"/>
+      <line x1="360" y1="137" x2="380" y2="137" stroke="currentColor" stroke-width="1.4" marker-end="url(#vg-w-annotated-llcpp-pillars-arrow)"/>
+      <line x1="530" y1="137" x2="550" y2="137" stroke="currentColor" stroke-width="1.4" marker-end="url(#vg-w-annotated-llcpp-pillars-arrow)"/>
+      <line x1="700" y1="137" x2="720" y2="137" stroke="currentColor" stroke-width="1.4" marker-end="url(#vg-w-annotated-llcpp-pillars-arrow)"/>
+
+      <!-- baseline-histogram annotation -->
+      <text x="440" y="226" text-anchor="middle" fill="var(--accent-text)" class="head">前提：baseline latency histogram</text>
+      <rect x="160" y="240" width="560" height="50" fill="none" stroke="var(--accent)" stroke-width="1.2" stroke-dasharray="4,3"/>
+      <text x="440" y="262" text-anchor="middle" fill="var(--ink)" class="component-sub">沒有 p50 / p95 / p99 / p99.9 的 baseline，上面五根支柱全部是不可量測的</text>
+      <text x="440" y="280" text-anchor="middle" fill="var(--muted)" class="component-sub">「look like real latency spikes」——量測誤差會偽裝成真的延遲尖峰</text>
+
+      <text x="440" y="332" text-anchor="middle" fill="var(--muted)" class="component-sub">點任一根支柱方塊查看它的責任邊界與它刻意不負責的事</text>
+
+      <defs>
+        <marker id="vg-w-annotated-llcpp-pillars-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+        </marker>
+      </defs>
+    </svg>
+
+    <div>
+      <p class="hint">click a pillar above</p>
+      <div class="detail detail-1">
+        <h3>DPDK bypass · 責任邊界</h3>
+        <p>用 polling mode driver 直接跟 NIC 對話，繞過 kernel network stack——packet 直接 DMA 進 user-space 管理的 ring，不經 interrupt、不經 kernel-to-user copy、不經 socket syscall。調校得當時 market data 處理可省 <strong>20 到 45µs</strong>。</p>
+        <p><strong>不負責的事</strong>：packet 進到 user space 之後怎麼配記憶體（memory pool 的事）、跑在哪個 core（NUMA 的事）。DPDK 只保證「byte 從 NIC 到你手上沒繞 kernel」。</p>
+      </div>
+      <div class="detail detail-2">
+        <h3>memory pool · 責任邊界</h3>
+        <p>啟動時一次性 pre-allocate 大塊記憶體，在其上自建 allocator，runtime 從 pool 切配，<strong>把所有 syscall 從 hot path 上完全消除</strong>。critical path 上沒有 <code>malloc</code>、沒有 page fault、沒有 <code>brk</code>/<code>mmap</code>。</p>
+        <p><strong>不負責的事</strong>：byte 怎麼進來（DPDK 的事）。pool 只回答「這段記憶體不會在 hot path 觸發 kernel」。</p>
+      </div>
+      <div class="detail detail-3">
+        <h3>NUMA pin · 責任邊界</h3>
+        <p>把 critical thread pin 到同一個 NUMA node 內的 core，記憶體也配在同一 node 的本地 DRAM。範例的 2-node × 8-core 機器，可以「跑兩組獨立策略、各佔一個 NUMA node，同時把 logging 與 observability 隔離在 critical path 之外」。</p>
+        <p><strong>不負責的事</strong>：thread 內部做什麼。affinity 只保證「你的 thread 不會被 OS 排到別的 core、記憶體存取不會跨 node」。</p>
+      </div>
+      <div class="detail detail-4">
+        <h3>TSC clock · 責任邊界</h3>
+        <p>用 CPU 的 Time Stamp Counter 當時間源，<code>rdtsc</code> 是一條指令、不進 kernel；取代 <code>clock_gettime</code> 這類 syscall。HFT 在 nanosecond granularity 量測，所以時間源本身的開銷必須接近零。</p>
+        <p><strong>不負責的事</strong>：correctness of skew。TSC 會在同一顆 CPU 的不同 core 之間 drift，這個 skew 必須另外校正——否則它會偽裝成真的延遲尖峰。</p>
+      </div>
+      <div class="detail detail-5">
+        <h3>net tuning · 責任邊界</h3>
+        <p>關掉 interrupt 改用 polling 避免打斷 application flow、加大 RX buffer 降低 packet loss、加大 TX backlog queue。這是 DPDK 之上的細部旋鈕——bypass 把 kernel 拿掉，tuning 把剩下的 NIC 行為對齊「永遠在跑、永遠不被打斷」。</p>
+        <p><strong>不負責的事</strong>：packet 內容語意。tuning 只調「NIC 與 driver 的節奏」。</p>
+      </div>
+    </div>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-annotated-llcpp-pillars');
+        root.querySelectorAll('.component').forEach((rect) => {
+          rect.addEventListener('click', () => {
+            const targetId = rect.getAttribute('data-target');
+            const radio = root.querySelector('#' + targetId);
+            if (radio) radio.checked = true;
+          });
+          rect.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              rect.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            }
+          });
+        });
+      })();
+    </script>
+  </figure>
+
+  <p>注意這五根支柱不是「依序執行的步驟」，而是同一條 hot path 上五個不同位置的固定開銷被五種手段各自移除。它們是 compose 而非 sequence：DPDK 把 packet 帶進 user space，但如果你接著在 hot path 上 <code>malloc</code> 一個 buffer，剛剛省下的 20µs 又被一次 page fault 吃回去。NUMA affinity 把 thread pin 好了，但如果你還在用 <code>clock_gettime</code> 打時間戳，每次量測都進一次 kernel。五根支柱要全部到位，wire-to-wire 才會真的落在 sub-50µs；少一根，那一根對應的開銷就整段回來。下面的互動小工具讓你逐根加上支柱，看 wire-to-wire 預算如何從 syscall 主導的數百微秒收斂——拉動 slider，每多開一根支柱，預算就往 sub-50µs 靠近一步。</p>
+
+  <figure class="vg-w-range-llcpp-budget">
+    <style>
+      .vg-w-range-llcpp-budget { display: grid; gap: var(--s-3); }
+      .vg-w-range-llcpp-budget .slider-row { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); }
+      .vg-w-range-llcpp-budget .slider-row label { color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; font-size: var(--fs-xs); white-space: nowrap; }
+      .vg-w-range-llcpp-budget input[type="range"] { flex: 1; accent-color: var(--accent); height: 36px; }
+      .vg-w-range-llcpp-budget .readout { font-variant-numeric: tabular-nums; color: var(--accent-text); min-width: 7ch; text-align: right; font-family: JetBrains Mono, monospace; }
+      .vg-w-range-llcpp-budget svg { width: 100%; height: auto; }
+      .vg-w-range-llcpp-budget .stage-name { font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink); }
+      .vg-w-range-llcpp-budget .total-line { font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink-soft); padding: var(--s-2) var(--s-3); background: var(--bg-soft); border-left: 2px solid var(--accent); }
+      .vg-w-range-llcpp-budget .total-line em { color: var(--accent-text); font-style: italic; }
+      .vg-w-range-llcpp-budget .total-line strong { font-family: JetBrains Mono, monospace; }
+      .vg-w-range-llcpp-budget .bar { transition: width 220ms ease-out, fill 220ms; }
+      @media (max-width: 720px) {
+        .vg-w-range-llcpp-budget svg { aspect-ratio: 4 / 3; min-height: 200px; }
+      }
+    </style>
+
+    <div class="slider-row">
+      <label for="vg-w-range-llcpp-budget-x">pillars enabled</label>
+      <input id="vg-w-range-llcpp-budget-x" type="range" min="0" max="5" step="1" value="0" aria-label="number of pillars enabled" />
+      <span class="readout" data-count>0 / 5</span>
+    </div>
+
+    <svg viewBox="0 0 720 150" role="img" aria-label="逐根加上支柱後的 wire-to-wire 延遲預算 (對數軸)">
+      <line x1="60" y1="104" x2="690" y2="104" stroke="var(--muted-2)" stroke-width="1"/>
+      <text x="60" y="122" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="11">50µs</text>
+      <text x="270" y="122" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="11">100µs</text>
+      <text x="480" y="122" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="11">250µs</text>
+      <text x="688" y="122" text-anchor="end" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="11">500µs+</text>
+      <text x="375" y="142" text-anchor="middle" fill="var(--muted)" font-family="IM Fell English, serif" font-style="italic" font-size="12">estimated wire-to-wire p95 (log scale)</text>
+      <text x="20" y="60" fill="var(--muted)" font-family="IM Fell English, serif" font-style="italic" font-size="12">p95</text>
+      <rect class="bar" data-bar x="60" y="44" width="630" height="44" fill="var(--accent)" opacity="0.7"/>
+      <text data-label x="666" y="72" text-anchor="end" fill="var(--bg)" font-family="JetBrains Mono, monospace" font-size="14">~500µs</text>
+    </svg>
+
+    <div class="total-line" data-breakdown>0 根支柱——<em>~500µs+</em>，這就是「Java/C# 連 p50 500µs 都摸不到」那條線：每個 packet 都付 interrupt、kernel copy、syscall、runtime allocation。拉動 slider 逐根加上支柱。</div>
+    <figcaption>說明性估算，非單一 benchmark：以 source 的 p95 < 50µs 目標、DPDK −20…45µs、與各支柱移除的固定開銷量級換算成對數軸上的累積位置。對數軸刻意讓 50µs ↔ 500µs 的視覺差距等於十倍而非百分之幾。</figcaption>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-range-llcpp-budget');
+        const inp = root.querySelector('input');
+        const count = root.querySelector('[data-count]');
+        const bar = root.querySelector('[data-bar]');
+        const label = root.querySelector('[data-label]');
+        const breakdown = root.querySelector('[data-breakdown]');
+        // each pillar enabled lowers the budget toward 50µs
+        const budgets = [520, 300, 180, 110, 70, 48];
+        const names = ['DPDK kernel bypass', 'memory pool', 'NUMA affinity', 'TSC 計時', 'network tuning'];
+        // log scale: x = 60 + (log10(us) - log10(50)) / (log10(520) - log10(50)) * 630
+        function xForUs(us) {
+          const lo = Math.log10(50), hi = Math.log10(520);
+          const v = Math.log10(Math.max(50, Math.min(520, us)));
+          return 60 + (v - lo) / (hi - lo) * 630;
+        }
+        function recompute() {
+          const n = Number(inp.value);
+          count.textContent = n + ' / 5';
+          const us = budgets[n];
+          const x = xForUs(us);
+          const w = Math.max(10, x - 60);
+          bar.setAttribute('width', String(w));
+          bar.setAttribute('fill', n >= 5 ? 'var(--sage-deep)' : 'var(--accent)');
+          label.setAttribute('x', String(60 + w - 8));
+          label.textContent = '~' + us + 'µs';
+          if (n === 0) {
+            breakdown.innerHTML = '0 根支柱——<em>~520µs</em>，這就是「Java/C# 連 p50 500µs 都摸不到」那條線：每個 packet 都付 interrupt、kernel copy、syscall、runtime allocation。拉動 slider 逐根加上支柱。';
+          } else if (n === 5) {
+            breakdown.innerHTML = '五根支柱全到位——<em>~48µs</em>，落進 source 的 <strong>p95 &lt; 50µs</strong> 目標。OS 已經被踢出 hot path，剩下的就是硬體本身的延遲。';
+          } else {
+            breakdown.innerHTML = '加上 <em>' + names.slice(0, n).join('、') + '</em>——預算降到 <strong>~' + us + 'µs</strong>。還差 ' + (5 - n) + ' 根；下一根（' + names[n] + '）會抽掉下一段固定開銷。';
+          }
+        }
+        inp.addEventListener('input', recompute);
+        recompute();
+      })();
+    </script>
+  </figure>
+
+  <h2>DPDK kernel bypass：直接對著 NIC 講話</h2>
+
+  <p>第一根支柱拿掉的是整條路徑上最大的一塊固定開銷——kernel network stack。傳統路徑下，packet 進到你能讀它，要付 interrupt、softirq、kernel-to-socket copy、wake-up、context switch、再一次 socket-to-application copy。DPDK（Data Plane Development Kit）的做法是繞過這整套：NIC 用 poll mode driver，packet 直接 DMA 進一塊 user space 管理的 ring buffer，application 在 user space 直接 polling 這個 ring。沒有 interrupt（你主動去問 NIC「有沒有新 packet」而不是等它敲你），沒有 kernel-to-user 的 double copy（packet 落地的那塊記憶體就是你要讀的記憶體），沒有 <code>recvmsg()</code> syscall。source 給的數字很具體：調校得當時，market data 處理可以省下 <strong>roughly 20 to 45 microseconds</strong>。</p>
+
+  <p>要理解這 20–45µs 從哪裡來，得把傳統路徑上每一筆開銷攤開。一次 hardware interrupt 從觸發到 handler 開始跑大約是 single-digit microsecond；softirq 排程與處理又是幾微秒；kernel buffer 到 socket buffer 的 copy、socket buffer 到 application buffer 的 copy，每一次都是 memory bandwidth 與 cache pollution 的代價；最貴的是把 block 在 <code>recvmsg()</code> 上的 thread 喚醒並 context switch 回來——這一下 scheduler 介入、TLB 可能被刷、L1/L2 cache 被換掉，動輒就是十幾微秒的尾巴。DPDK 把這些全部換成一個 tight polling loop：CPU 100% 燒在「問 NIC ring 有沒有新 descriptor」上，一旦有就立刻處理，packet-to-application 的延遲塌縮成幾次記憶體存取。</p>
+
+  <p>代價也得講清楚。Poll mode driver 意味著那顆 core 永遠在 100% 跑——它不睡、不讓出、不省電。對一台桌機這是荒謬的浪費，對 HFT 這正是要的：你寧可一顆 core 永遠燒著，也不要任何一個 packet 因為 CPU 剛好在 idle 而多等一次 wake-up。另一個代價是 DPDK 接管了 NIC，這張卡 kernel 就看不到了——你不能再用 <code>tcpdump</code>、不能用一般的 socket API，network stack（如果你需要 TCP）得自己在 user space 重建或用 DPDK 生態的實作。對只收 UDP multicast market data、送 order 走簡單協定的交易系統，這個 trade 划算；對需要完整 TCP 語意的一般後端，門檻就高了。</p>
+
+  <pre data-kind="pseudocode"><code><em>// 傳統 kernel 路徑（每個 packet 都付這些固定開銷）</em>
+NIC → interrupt → softirq → kernel buffer
+    → copy to socket buffer
+    → wake recvmsg() thread → context switch
+    → copy to application buffer        <em>// double copy + syscall + wakeup</em>
+
+<em>// DPDK poll mode（hot path 上一條 syscall 都沒有）</em>
+loop forever:                            <em>// 一顆 core 100% 燒在這</em>
+    n = rte_eth_rx_burst(port, queue, bufs, BURST)
+    if n &gt; 0:
+        for pkt in bufs[0..n]:
+            handle(pkt)                  <em>// pkt 落地的記憶體就是你讀的記憶體</em>
+<em>// 省下：interrupt + softirq + 2× copy + wakeup + context switch ≈ 20–45µs</em></code></pre>
+
+  <p>這根支柱是其他四根的前提。沒有 bypass，packet 還在 kernel 裡繞，後面 memory pool 省下的那點 allocation 時間、TSC 省下的那點計時開銷，相對於 kernel stack 的幾十微秒都是零頭。先把最大的固定開銷拿掉，剩下四根才有意義——這也是為什麼上面的 slider 第一格（0→1 根）掉得最猛：DPDK 一上，預算就從 ~520µs 砍到 ~300µs。</p>
+
+  <h2>preallocated memory pool：hot path 上不准 malloc</h2>
+
+  <p>第二根支柱對付的是一個在一般後端被視為理所當然、在 hot path 上卻是災難的東西——runtime heap allocation。一次 <code>malloc</code> 看起來只是拿一塊記憶體，但它背後可能觸發 <code>brk</code> 或 <code>mmap</code> syscall（進 kernel）、可能觸發 page fault（第一次 touch 那頁時 kernel 要配實體頁）、可能在 allocator 內部走 free-list 搜尋或 lock contention。這些開銷不固定、不可預測——大部分時候 <code>malloc</code> 很快，但偶爾一次就是幾十微秒的尾巴，而 p99/p99.9 量的就是這些「偶爾一次」。source 的描述很直接：做法是「在啟動時 pre-allocate 記憶體段、在其上自建 custom allocator 來 runtime 分配，首要目標是把所有 syscall 從 hot path 上完全消除」。</p>
+
+  <p>具體做法是啟動時一次大的 heap allocation 涵蓋最大記憶體需求，之後交易期間由 custom allocator 在這塊預配好的記憶體裡切配，不再呼叫 OS。常見的形態是 object pool 與 ring buffer：每種 hot-path 物件（order、market data tick、message）預先配好固定數量，用完歸還、不釋放回 OS。配與還都退化成指標運算或 free-list push/pop，O(1)、不進 kernel、不觸發 page fault（因為那些頁在啟動時就 touch 過、甚至用 <code>mlock</code> 鎖在 RAM 裡，不會被換出）。</p>
+
+  <pre data-kind="pseudocode"><code><em>// 啟動時：一次性 pre-allocate，touch 每一頁讓 kernel 真的配實體頁</em>
+pool = mmap(MAX_BYTES, MAP_POPULATE)     <em>// 一次 syscall，啟動時付</em>
+mlock(pool, MAX_BYTES)                    <em>// 鎖在 RAM，不准換出</em>
+for page in pool: page[0] = 0             <em>// 預先 fault-in，避免 hot path page fault</em>
+
+<em>// hot path：配與還都不進 kernel、O(1)</em>
+Order* acquire():   return free_list.pop()        <em>// 指標運算</em>
+void   release(o):  free_list.push(o)             <em>// 指標運算</em>
+<em>// 沒有 malloc、沒有 brk/mmap、沒有 page fault、沒有 lock</em></code></pre>
+
+  <p>這根支柱跟前一根是互補的：DPDK 把 byte 帶進 user space，memory pool 確保你處理這些 byte 時不會因為一次 allocation 把剛省下的時間吐回去。一個典型的失誤是 hot path 上某條罕見分支（例如錯誤處理、罕見的訂單型別）裡藏了一個 <code>std::string</code> 或 <code>std::vector</code> 的隱式 allocation——平常 90% 的 packet 走不到那條分支，所以 p50、p95 都漂亮，但那 1% 走到的 packet 就吃一次 malloc 尾巴，p99.9 直接爆掉。這也是為什麼第六節要講 baseline histogram：如果你只看 p50，這種尾巴你永遠看不到。</p>
+
+  <p>C++ 在這裡的優勢不是「跑得快」，而是「allocation 是顯式的、可控的」。你可以 placement new 進 pool、可以 override <code>operator new</code>、可以用 PMR（polymorphic memory resource）把整個 subsystem 綁到一個 monotonic buffer。Java / C# 的問題正相反：GC 的存在意味著 allocation 永遠在背景發生，而 GC pause——即便是 concurrent collector——也會在不可預測的時刻插進來，造成幾百微秒甚至毫秒級的 stop-the-world 尾巴。這就是為什麼 source 說 Java 系統連 p50 500µs 都摸不到：不是 Java 的 throughput 差，是它的 tail latency 被 GC 與 runtime allocation 釘死在那個量級。</p>
+
+  <h2>CPU / NUMA affinity：把 thread 釘在一個 NUMA node 上</h2>
+
+  <p>第三根支柱對付的是兩個不可預測來源：OS scheduler 與 cross-NUMA 記憶體存取。預設情況下 Linux scheduler 會為了「公平」把你的 thread 在 core 之間搬來搬去——每搬一次，那顆 core 上辛苦 warm 起來的 L1/L2 cache 全部作廢，新 core 上要重新 warm，這中間就是 cache miss 的延遲。更糟的是 cross-NUMA：現代多 socket 機器的記憶體是分 node 的，core 存取本地 node 的 DRAM 快，存取另一個 node 的 DRAM 要走 inter-socket interconnect（QPI/UPI），latency 高出可觀的一截。如果你的 thread 在 node 0 的 core 上跑，但資料配在 node 1 的記憶體，每次存取都付這個 cross-node tax。</p>
+
+  <p>解法是把 critical thread pin 死在特定 core 上（<code>pthread_setaffinity_np</code> 或 <code>taskset</code>），並確保它用的記憶體配在同一個 NUMA node 的本地 DRAM（<code>numactl --membind</code> 或 <code>libnuma</code>）。source 給的範例是一台 8-core-per-node、2-node 的機器：可以「跑兩組獨立策略、各佔一個 NUMA node，同時把 logging 與 observability 隔離在 critical path 之外」。這個 layout 的關鍵在「隔離」——hot path 的 thread 各自獨佔 core，永遠不被排程器打斷；而 logging、metrics 收集、observability 這些不在 hot path、但又必須跑的東西，被推到別的 core（甚至別的 node），不准碰 critical thread 的 core。</p>
+
+  <pre data-kind="shell"><code><em># 把 hot-path thread pin 到 node 0 的 core 2，記憶體綁 node 0 本地 DRAM</em>
+$ numactl --cpunodebind=0 --membind=0 ./strategy_engine
+
+<em># 進一步：把該 core 從 kernel scheduler 手上整顆隔離出來</em>
+<em># （boot cmdline）讓 scheduler 永遠不會把別的 task 排到它上面</em>
+isolcpus=2,3,10,11 nohz_full=2,3,10,11 rcu_nocbs=2,3,10,11
+
+<em># 結果：core 2 上只有你的 thread 在跑，沒有 timer tick、沒有 RCU callback、</em>
+<em># 沒有別的 task——cache 永遠 warm，沒有 context switch 尾巴</em></code></pre>
+
+  <p>這裡有一個常被忽略的細節：DPDK 的 polling thread、策略 thread、與資料所在的記憶體，三者最好都在同一個 NUMA node。如果 NIC 接在 node 0 的 PCIe lane 上，packet DMA 落在 node 0 的記憶體，但你的策略 thread 跑在 node 1，那 DPDK 省下的 kernel bypass 又被 cross-node 存取吃掉一截。所以這三根支柱（bypass、pool、affinity）在實務上是綁在一起設計的：NIC、ring buffer、memory pool、策略 thread，全部對齊到同一個 node。affinity 不負責 thread 內部做什麼，它只保證「你選的 core 永遠是你的、你存取的記憶體永遠是本地的」——把 OS scheduler 與 interconnect 這兩個不可預測來源從 tail latency 裡拿掉。</p>
+
+  <h2>TSC 計時：用一條指令取代一個 syscall</h2>
+
+  <p>第四根支柱很容易被當成細節略過，但它同時是「優化」也是「量測前提」。要算 wire-to-wire latency，你得在 packet 進來時打一個時間戳、在 order 送出時打另一個，相減。問題是「打時間戳」這個動作本身有開銷——如果你用 <code>clock_gettime(CLOCK_MONOTONIC)</code>，在最好的情況（vDSO）它不進 kernel，但仍有函式呼叫與計算開銷；在最差情況它就是一個 syscall，幾百 nanosecond 起跳。當你的整條 wire-to-wire 才幾十微秒、而你又想在路徑上的多個點打時間戳做 profiling，計時開銷本身就會污染你要量的東西。</p>
+
+  <p>解法是用 TSC（Time Stamp Counter）。TSC 是 CPU 內建的一個 64-bit counter，每個 clock cycle 遞增，用 <code>rdtsc</code>（或 <code>rdtscp</code>）一條指令就能讀出來，不進 kernel、不需要 syscall。source 的部署建議直接寫「Use TSC for all timing on the critical path」。讀一次 TSC 是個位數 nanosecond 等級，比任何 clock syscall 都低一兩個數量級——這讓你可以在 hot path 上密集打點而不擾動量測。</p>
+
+  <p>但 TSC 有一個會咬人的陷阱，而且 source 特別點名這個陷阱「specifically bites HFT systems」，因為只有在 nanosecond granularity 量測時它才會浮現。原文講得很清楚：「TSC can drift across cores on the same CPU. Left uncorrected, that skew introduces measurement errors that look like real latency spikes and can obscure genuine performance bugs.」——同一顆 CPU 的不同 core 上的 TSC 可能有偏移；若不校正，這個 skew 造成的量測誤差會「看起來像真的延遲尖峰」,把真正的 performance bug 蓋掉。想像你在 core 2 上 packet 進來時讀 TSC、在 core 3 上 order 送出時讀 TSC，兩個 counter 之間有 200ns 的 skew——你算出來的 wire-to-wire 就憑空多（或少）200ns，而這個誤差會以 spike 的形態出現在你的 histogram 上，讓你以為系統有間歇性問題，其實是計時本身在說謊。</p>
+
+  <p>下面這個 tab 把第四、第五兩根支柱裡「為什麼換掉預設行為」的對照攤開：時間源從 syscall clock 換成 TSC、網路從 interrupt 換成 busy-poll，並把 TSC 的 skew 陷阱單獨列一格——因為它是這篇唯一一個「優化本身會製造假資料」的地方。</p>
+
+  <figure class="vg-w-tabs-llcpp-clock">
+    <style>
+      .vg-w-tabs-llcpp-clock { display: grid; gap: var(--s-2); }
+      .vg-w-tabs-llcpp-clock input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-tabs-llcpp-clock .tabs { display: flex; flex-wrap: wrap; gap: var(--s-2); border-bottom: 1px solid var(--line); }
+      .vg-w-tabs-llcpp-clock .tab { font-family: var(--sans); font-size: var(--fs-sm); padding: var(--s-1) var(--s-2); cursor: pointer; color: var(--muted); border-bottom: 2px solid transparent; }
+      .vg-w-tabs-llcpp-clock .tab:hover { color: var(--accent-text); }
+      .vg-w-tabs-llcpp-clock .panel { display: none; padding: var(--s-2) 0; }
+      .vg-w-tabs-llcpp-clock .panel p { font-family: var(--serif); font-size: var(--fs-sm); margin: 0 0 var(--s-2) 0; }
+      .vg-w-tabs-llcpp-clock .panel .col2 { display: grid; grid-template-columns: 1fr; gap: var(--s-2); }
+      @media (min-width: 720px) { .vg-w-tabs-llcpp-clock .panel .col2 { grid-template-columns: 1fr 1fr; } }
+      .vg-w-tabs-llcpp-clock .card { padding: var(--s-2); border-left: 2px solid var(--muted-2); }
+      .vg-w-tabs-llcpp-clock .card.good { border-left-color: var(--sage-deep); }
+      .vg-w-tabs-llcpp-clock .card.bad { border-left-color: var(--accent); }
+      .vg-w-tabs-llcpp-clock .card h4 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+      .vg-w-tabs-llcpp-clock .card.good h4 { color: var(--sage-deep); }
+      .vg-w-tabs-llcpp-clock .card.bad h4 { color: var(--accent-text); }
+      .vg-w-tabs-llcpp-clock .card code { font-size: 0.85em; }
+      .vg-w-tabs-llcpp-clock:has(#vg-w-tabs-llcpp-clock-t1:checked) .panel-1 { display: block; }
+      .vg-w-tabs-llcpp-clock:has(#vg-w-tabs-llcpp-clock-t1:checked) [for="vg-w-tabs-llcpp-clock-t1"] { color: var(--accent-text); border-bottom-color: var(--accent); }
+      .vg-w-tabs-llcpp-clock:has(#vg-w-tabs-llcpp-clock-t2:checked) .panel-2 { display: block; }
+      .vg-w-tabs-llcpp-clock:has(#vg-w-tabs-llcpp-clock-t2:checked) [for="vg-w-tabs-llcpp-clock-t2"] { color: var(--accent-text); border-bottom-color: var(--accent); }
+      .vg-w-tabs-llcpp-clock:has(#vg-w-tabs-llcpp-clock-t3:checked) .panel-3 { display: block; }
+      .vg-w-tabs-llcpp-clock:has(#vg-w-tabs-llcpp-clock-t3:checked) [for="vg-w-tabs-llcpp-clock-t3"] { color: var(--accent-text); border-bottom-color: var(--accent); }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect width="18" height="18" x="3" y="3" rx="2"/><path d="M3 9h18"/><path d="M9 21V9"/>
+      </svg>
+      <span>switch tabs to compare 3 framings · 3 tabs</span>
+    </p>
+    <input type="radio" id="vg-w-tabs-llcpp-clock-t1" name="vg-w-tabs-llcpp-clock-sel" aria-label="time source tab" checked />
+    <input type="radio" id="vg-w-tabs-llcpp-clock-t2" name="vg-w-tabs-llcpp-clock-sel" aria-label="network tuning tab" />
+    <input type="radio" id="vg-w-tabs-llcpp-clock-t3" name="vg-w-tabs-llcpp-clock-sel" aria-label="TSC skew tab" />
+    <div class="tabs">
+      <label class="tab" for="vg-w-tabs-llcpp-clock-t1">time source</label>
+      <label class="tab" for="vg-w-tabs-llcpp-clock-t2">network tuning</label>
+      <label class="tab" for="vg-w-tabs-llcpp-clock-t3">TSC skew 陷阱</label>
+    </div>
+    <div class="panel panel-1">
+      <p>計時這件事在 wire-to-wire 量測裡是元操作——你要量的東西的精度，受限於量它的工具的開銷。</p>
+      <div class="col2">
+        <div class="card bad">
+          <h4>syscall clock（預設）</h4>
+          <p><code>clock_gettime()</code> 最好情況走 vDSO 不進 kernel，最差情況是一次 syscall，幾百 ns 起跳。在 hot path 上多點打時間戳時，計時開銷本身污染量測。</p>
+        </div>
+        <div class="card good">
+          <h4>TSC（critical path 用這個）</h4>
+          <p><code>rdtsc</code> / <code>rdtscp</code> 一條指令、不進 kernel，個位數 ns 等級。source：「Use TSC for all timing on the critical path」。讓你能密集打點而不擾動。</p>
+        </div>
+      </div>
+    </div>
+    <div class="panel panel-2">
+      <p>DPDK 把 kernel 拿掉之後，NIC 與 driver 的行為還有三個旋鈕要對齊「永遠在跑、永遠不被打斷」。</p>
+      <div class="col2">
+        <div class="card bad">
+          <h4>interrupt 模式（預設）</h4>
+          <p>NIC 收到 packet 敲 interrupt 打斷 application flow——每次打斷都是 context switch 與 cache pollution 的代價。</p>
+        </div>
+        <div class="card good">
+          <h4>busy-poll + 加大 buffer</h4>
+          <p>關掉 interrupt、改 polling 避免打斷 application flow；加大 RX buffer 降 packet loss；加大 TX backlog queue。三者都是「用 CPU 換確定性」。</p>
+        </div>
+      </div>
+    </div>
+    <div class="panel panel-3">
+      <p>這是全篇唯一一個「優化本身會製造假資料」的地方，也是 source 特別點名 TSC「specifically bites HFT systems」的原因。</p>
+      <div class="col2">
+        <div class="card bad">
+          <h4>未校正的 cross-core skew</h4>
+          <p>「TSC can drift across cores on the same CPU.」在 core 2 讀進入時間、core 3 讀送出時間，兩個 counter 間若有 200ns 偏移，算出的 wire-to-wire 就憑空多或少 200ns。</p>
+        </div>
+        <div class="card good">
+          <h4>校正後</h4>
+          <p>確認 <code>constant_tsc</code> / <code>nonstop_tsc</code>、量測 per-core offset 並補償，或把進入與送出的計時固定在同一 core。否則 skew「look like real latency spikes」，把真 bug 蓋掉。</p>
+        </div>
+      </div>
+    </div>
+  </figure>
+
+  <p>把 panel 三單獨拉出來講，是因為它違反了一般優化的直覺：通常你加一個優化，最壞情況是它沒效果；但未校正的 TSC 是「加了之後它會主動騙你」。一個團隊如果在沒校正的 TSC 上看到 histogram 出現週期性 spike，很可能花幾天去追一個根本不存在的 GC-like pause 或 lock contention，結果只是兩顆 core 的 counter 沒對齊。這把我們帶到最後、也是貫穿全篇的前提——所有這些優化，沒有一張可信的 baseline histogram 就全部不可量測。</p>
+
+  <h2>baseline histogram：沒有它，前五根支柱全部不可見</h2>
+
+  <p>前面五根支柱每一根都宣稱「省下 X 微秒」或「移除 Y 開銷」。問題是：你怎麼知道？延遲不是一個數字，是一個分布。一個系統的 p50 可能漂亮到 20µs，但 p99.9 是 800µs——對交易來說那條尾巴可能就是你被別人吃掉的價差。只看平均、只看 p50，等於閉著眼睛優化：你做了一個改動，p50 沒動，你以為沒效果，其實你砍掉了 p99.9 的一個尾巴；或者反過來，你「優化」了某段邏輯，p50 好看了 2µs，但引入了一個罕見的 allocation,把 p99.9 拉高了 300µs，而你完全沒看到。</p>
+
+  <p>所以第一步、在碰任何一根支柱之前，要先建一張 baseline latency histogram，量 wire-to-wire 以及路徑上每一段的 p50、p95、p99、p99.9。source 列的觀測項很完整：「track p50, p95, p99, and p99.9 latencies at both levels」（wire-to-wire 與路徑分段兩個層級），外加 syscall latency、CPU utilization、NIC metrics，工具用 <code>bcc</code> / <code>bpftrace</code>。有了這張 baseline，每一根支柱的效果才變成可驗證的命題：上 DPDK 前後,wire-to-wire 的 p95 應該掉 20–45µs;若沒掉，要嘛沒調對、要嘛瓶頸不在那裡。下面這張表把「為什麼要看整條分布而不是平均」量化出來——同一套邏輯,C++ tuned、C++ untuned、Java 三種配置在四個 percentile 上的差距。點欄位標題可以排序，你會發現按 p50 排跟按 p99.9 排，名次完全不同。</p>
+
+  <figure class="vg-w-table-llcpp-percentiles">
+    <style>
+      .vg-w-table-llcpp-percentiles { overflow-x: auto; }
+      .vg-w-table-llcpp-percentiles table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-llcpp-percentiles caption { text-align: left; caption-side: top; font-family: var(--scribed); font-style: italic; color: var(--muted); font-size: var(--fs-sm); padding: var(--s-1) 0; }
+      .vg-w-table-llcpp-percentiles thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; }
+      .vg-w-table-llcpp-percentiles thead th[data-sort] { color: var(--accent-text); }
+      .vg-w-table-llcpp-percentiles thead th[data-sort="asc"]::after { content: ' ▴'; font-size: 0.7em; }
+      .vg-w-table-llcpp-percentiles thead th[data-sort="desc"]::after { content: ' ▾'; font-size: 0.7em; }
+      .vg-w-table-llcpp-percentiles tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); }
+      .vg-w-table-llcpp-percentiles td.num { font-variant-numeric: tabular-nums; text-align: right; font-family: JetBrains Mono, monospace; }
+      .vg-w-table-llcpp-percentiles td.cfg { font-family: var(--sans); font-size: var(--fs-xs); }
+      .vg-w-table-llcpp-percentiles tbody tr:hover td { background: var(--bg-soft); }
+      .vg-w-table-llcpp-percentiles .tail { color: var(--accent-text); }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/><path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+      </svg>
+      <span>click column header to sort · 5 columns × 3 rows</span>
+    </p>
+    <table>
+      <caption>說明性的 wire-to-wire 延遲分布對照（µs）——以 source 的 C++ tuned 目標 p95 < 50µs 與 Java「連 p50 500µs 都摸不到」為錨點，凸顯為何只看 p50 會看不見尾巴。點欄位標題排序。</caption>
+      <thead>
+        <tr>
+          <th data-key="cfg">配置</th>
+          <th data-key="p50" class="num">p50</th>
+          <th data-key="p95" class="num">p95</th>
+          <th data-key="p99" class="num">p99</th>
+          <th data-key="p999" class="num">p99.9</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td class="cfg">C++ 五根支柱全到位</td><td class="num">28</td><td class="num">48</td><td class="num">72</td><td class="num tail">140</td></tr>
+        <tr><td class="cfg">C++ 未調校（kernel path）</td><td class="num">95</td><td class="num">210</td><td class="num">380</td><td class="num tail">720</td></tr>
+        <tr><td class="cfg">Java（GC + runtime alloc）</td><td class="num">520</td><td class="num">1,100</td><td class="num">2,400</td><td class="num tail">6,800</td></tr>
+      </tbody>
+    </table>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-table-llcpp-percentiles');
+        const headers = root.querySelectorAll('thead th');
+        const tbody = root.querySelector('tbody');
+        let activeKey = null, asc = true;
+        headers.forEach((h, idx) => h.addEventListener('click', () => {
+          const key = h.dataset.key;
+          if (activeKey === key) asc = !asc; else { activeKey = key; asc = true; }
+          headers.forEach((x) => x.removeAttribute('data-sort'));
+          h.setAttribute('data-sort', asc ? 'asc' : 'desc');
+          const rows = Array.from(tbody.querySelectorAll('tr'));
+          rows.sort((a, b) => {
+            let av = a.children[idx].textContent.trim().replace(/,/g, '');
+            let bv = b.children[idx].textContent.trim().replace(/,/g, '');
+            const an = Number(av), bn = Number(bv);
+            if (!Number.isNaN(an) && !Number.isNaN(bn)) { av = an; bv = bn; }
+            const cmp = av < bv ? -1 : av > bv ? 1 : 0;
+            return asc ? cmp : -cmp;
+          });
+          rows.forEach((r) => tbody.appendChild(r));
+        }));
+      })();
+    </script>
+  </figure>
+
+  <p>表把四個 percentile 並排，但它沒給你「分布長什麼形狀」。延遲的右尾不是線性的——它通常是一條長到離譜的細尾。下面這張 CDF(累積分布)把同一組數字畫成曲線:X 軸是延遲(對數),Y 軸是「有多少比例的 packet 在這個延遲以內完成」。看曲線右端怎麼翹，比看四個離散數字更直觀——C++ tuned 的曲線在 ~140µs 處就貼到 100%,Java 的曲線拖到 6,800µs 還沒收。</p>
+
+  <figure class="vg-w-chart-llcpp-cdf">
+    <style>
+      .vg-w-chart-llcpp-cdf { display: grid; gap: var(--s-2); }
+      .vg-w-chart-llcpp-cdf svg { width: 100%; height: auto; }
+      .vg-w-chart-llcpp-cdf figcaption { font-family: var(--scribed); font-style: italic; font-size: var(--fs-sm); color: var(--muted); }
+      @media (max-width: 720px) { .vg-w-chart-llcpp-cdf svg { min-height: 240px; } }
+    </style>
+    <svg viewBox="0 0 720 340" preserveAspectRatio="xMidYMid meet" role="img"
+         aria-label="wire-to-wire 延遲的累積分布(CDF)——C++ tuned vs Java,對數 X 軸">
+      <g id="vg-w-chart-llcpp-cdf-axes"></g>
+      <g id="vg-w-chart-llcpp-cdf-series"></g>
+    </svg>
+    <figcaption>說明性 CDF:Y = 完成比例,X = wire-to-wire 延遲(對數,µs)。錨點取自 source 的 C++ p95 < 50µs 目標與 Java「連 p50 500µs 都摸不到」。曲線越早貼到頂、右尾越短，代表分布越緊。</figcaption>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-chart-llcpp-cdf');
+        const axesG = root.querySelector('#vg-w-chart-llcpp-cdf-axes');
+        const seriesG = root.querySelector('#vg-w-chart-llcpp-cdf-series');
+        const NS = 'http://www.w3.org/2000/svg';
+        function el(tag, attrs) { const e = document.createElementNS(NS, tag); for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v); return e; }
+        // (percentile, latency µs) anchor points → interpolated CDF, same numbers as the table
+        const series = [
+          { name: 'C++ 五根支柱', color: 'var(--sage-deep)', pts: [[0.50, 28], [0.95, 48], [0.99, 72], [0.999, 140]] },
+          { name: 'C++ 未調校', color: 'var(--ink-deep)', pts: [[0.50, 95], [0.95, 210], [0.99, 380], [0.999, 720]] },
+          { name: 'Java', color: 'var(--accent)', pts: [[0.50, 520], [0.95, 1100], [0.99, 2400], [0.999, 6800]] },
+        ];
+        const X0 = 64, X1 = 690, Y0 = 270, Y1 = 36;
+        const loX = Math.log10(20), hiX = Math.log10(8000);
+        const xOf = us => X0 + (Math.log10(Math.max(20, Math.min(8000, us))) - loX) / (hiX - loX) * (X1 - X0);
+        const yOf = p => Y0 - p * (Y0 - Y1); // p in 0..1
+        // axes
+        axesG.appendChild(el('line', { x1: X0, y1: Y0, x2: X1, y2: Y0, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+        axesG.appendChild(el('line', { x1: X0, y1: Y0, x2: X0, y2: Y1, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+        // X log ticks
+        [20, 50, 100, 250, 500, 1000, 2500, 5000].forEach(v => {
+          const x = xOf(v);
+          axesG.appendChild(el('line', { x1: x, y1: Y0, x2: x, y2: Y0 + 4, stroke: 'var(--muted-2)' }));
+          const t = el('text', { x: x, y: Y0 + 18, 'text-anchor': 'middle', 'font-family': 'JetBrains Mono, monospace', 'font-size': 11, fill: 'var(--muted)' });
+          t.textContent = v >= 1000 ? (v / 1000) + 'k' : String(v); axesG.appendChild(t);
+        });
+        // Y ticks (percentiles)
+        [[0.5, 'p50'], [0.95, 'p95'], [0.99, 'p99'], [1, '100%']].forEach(([p, lab]) => {
+          const y = yOf(p);
+          axesG.appendChild(el('line', { x1: X0 - 4, y1: y, x2: X0, y2: y, stroke: 'var(--muted-2)' }));
+          const t = el('text', { x: X0 - 8, y: y + 4, 'text-anchor': 'end', 'font-family': 'Manrope, sans-serif', 'font-size': 11, fill: 'var(--muted)' });
+          t.textContent = lab; axesG.appendChild(t);
+        });
+        const xl = el('text', { x: (X0 + X1) / 2, y: Y0 + 38, 'text-anchor': 'middle', 'font-family': 'IM Fell English, serif', 'font-style': 'italic', 'font-size': 12, fill: 'var(--muted)' });
+        xl.textContent = 'wire-to-wire latency (µs, log)'; axesG.appendChild(xl);
+        const yl = el('text', { x: 16, y: (Y0 + Y1) / 2, 'text-anchor': 'middle', 'font-family': 'IM Fell English, serif', 'font-style': 'italic', 'font-size': 12, fill: 'var(--muted)', transform: `rotate(-90 16 ${(Y0 + Y1) / 2})` });
+        yl.textContent = 'cumulative fraction'; axesG.appendChild(yl);
+        // series as step-ish CDF curves
+        series.forEach((s, si) => {
+          const pts = [[0, 20], ...s.pts, [1, s.pts[s.pts.length - 1][1] * 1.05]];
+          let d = '';
+          pts.forEach((pt, i) => { d += (i === 0 ? 'M' : 'L') + ' ' + xOf(pt[1]).toFixed(1) + ' ' + yOf(pt[0]).toFixed(1) + ' '; });
+          seriesG.appendChild(el('path', { d: d, fill: 'none', stroke: s.color, 'stroke-width': 2, 'stroke-dasharray': si === 1 ? '5,3' : 'none' }));
+          s.pts.forEach(pt => seriesG.appendChild(el('circle', { cx: xOf(pt[1]), cy: yOf(pt[0]), r: 3, fill: s.color })));
+          // legend
+          const ly = 44 + si * 20;
+          seriesG.appendChild(el('rect', { x: 470, y: ly, width: 14, height: 2.5, fill: s.color }));
+          const lt = el('text', { x: 490, y: ly + 5, 'font-family': 'Manrope, sans-serif', 'font-size': 12, fill: 'var(--ink)' });
+          lt.textContent = s.name; seriesG.appendChild(lt);
+        });
+      })();
+    </script>
+  </figure>
+
+  <p>表裡最值得盯著看的是最右那欄 p99.9。C++ tuned 的 p50 是 28µs、p99.9 是 140µs——尾巴只比中位數高五倍，因為 OS 已經被踢出 hot path,沒有 GC、沒有 page fault、沒有 context switch 來製造長尾。Java 的 p50 已經 520µs,p99.9 直接衝到 6,800µs——十三倍的尾巴，而那一條尾巴的來源正是 GC pause 與 runtime allocation 的不可預測性。這就是 source 那句「Java 系統連 p50 500µs 都摸不到」的全貌：不是 Java 平均慢，是它的分布右尾被 runtime 釘死在毫秒量級，而交易系統被尾巴決定生死。</p>
+
+  <p>histogram 還回答一個更實際的問題：你的瓶頸在哪一段。把 wire-to-wire 拆成「NIC→user space」「parse + 策略」「order encode→NIC」三段各自打 TSC 時間戳、各自畫 histogram,你會立刻看到哪一段的尾巴最肥。下面這個小工具把這三段攤開，各自標上典型 p50/p99 與「這段的尾巴通常由誰製造」——點任一段看它對應到哪一根支柱。</p>
+
+  <figure class="vg-w-stack-llcpp-segments">
+    <style>
+      .vg-w-stack-llcpp-segments { display: flex; flex-direction: column; gap: var(--s-3); align-items: stretch; }
+      .vg-w-stack-llcpp-segments input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-stack-llcpp-segments .stack-title { font-family: IM Fell English, serif; font-style: italic; font-size: var(--fs-md); margin: 0 0 var(--s-1) 0; color: var(--ink); line-height: 1.4; }
+      .vg-w-stack-llcpp-segments .stack-cards { display: flex; flex-direction: column; gap: var(--s-1); list-style: none; padding: 0; margin: 0; }
+      .vg-w-stack-llcpp-segments .stack-cards label { display: block; padding: var(--s-2); border: 1px solid var(--muted-2); border-radius: 2px; cursor: pointer; transition: border-color 200ms, background 200ms; min-height: 44px; }
+      .vg-w-stack-llcpp-segments .stack-cards label:hover { border-color: var(--accent); }
+      .vg-w-stack-llcpp-segments .stack-cards .card-head { font-family: EB Garamond, serif; font-size: var(--fs-md); margin: 0 0 4px 0; color: var(--ink); display: flex; align-items: baseline; justify-content: space-between; gap: var(--s-2); flex-wrap: wrap; }
+      .vg-w-stack-llcpp-segments .stack-cards .card-sub { font-family: IM Fell English, serif; font-style: italic; font-size: var(--fs-sm); color: var(--muted); margin: 0; line-height: 1.5; }
+      .vg-w-stack-llcpp-segments .stack-cards .card-tag { font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); color: var(--accent-text); font-style: normal; }
+      .vg-w-stack-llcpp-segments:has(#vg-w-stack-llcpp-segments-r1:checked) .card-1 { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+      .vg-w-stack-llcpp-segments:has(#vg-w-stack-llcpp-segments-r2:checked) .card-2 { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+      .vg-w-stack-llcpp-segments:has(#vg-w-stack-llcpp-segments-r3:checked) .card-3 { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+      .vg-w-stack-llcpp-segments svg.diagram { display: none; }
+      @media (min-width: 720px) {
+        .vg-w-stack-llcpp-segments svg.diagram { display: block; width: 100%; height: auto; max-width: 880px; }
+        .vg-w-stack-llcpp-segments .stack-title { display: none; }
+        .vg-w-stack-llcpp-segments .stack-cards { display: none; }
+      }
+      .vg-w-stack-llcpp-segments .seg { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; transition: fill 200ms, stroke 200ms; }
+      .vg-w-stack-llcpp-segments .seg:hover { stroke: var(--accent); }
+      .vg-w-stack-llcpp-segments .seg:focus { outline: none; }
+      .vg-w-stack-llcpp-segments .seg:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+      .vg-w-stack-llcpp-segments .seg-text { pointer-events: none; font-family: EB Garamond, serif; font-size: 14px; }
+      .vg-w-stack-llcpp-segments .seg-sub { pointer-events: none; font-family: IM Fell English, serif; font-style: italic; font-size: 12px; fill: var(--muted); }
+      .vg-w-stack-llcpp-segments .seg-num { pointer-events: none; font-family: JetBrains Mono, monospace; font-size: 12px; fill: var(--accent-text); }
+      .vg-w-stack-llcpp-segments .head { font-family: IM Fell English, serif; font-style: italic; font-size: 13px; }
+      .vg-w-stack-llcpp-segments:has(#vg-w-stack-llcpp-segments-r1:checked) .seg-1 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+      .vg-w-stack-llcpp-segments:has(#vg-w-stack-llcpp-segments-r2:checked) .seg-2 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+      .vg-w-stack-llcpp-segments:has(#vg-w-stack-llcpp-segments-r3:checked) .seg-3 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+      .vg-w-stack-llcpp-segments .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+      .vg-w-stack-llcpp-segments .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-stack-llcpp-segments .detail p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-stack-llcpp-segments .hint { font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin: 0 0 var(--s-1) 0; }
+      .vg-w-stack-llcpp-segments:has(#vg-w-stack-llcpp-segments-r1:checked) .detail-1 { display: block; }
+      .vg-w-stack-llcpp-segments:has(#vg-w-stack-llcpp-segments-r2:checked) .detail-2 { display: block; }
+      .vg-w-stack-llcpp-segments:has(#vg-w-stack-llcpp-segments-r3:checked) .detail-3 { display: block; }
+    </style>
+
+    <input type="radio" id="vg-w-stack-llcpp-segments-r1" name="vg-w-stack-llcpp-segments-sel" checked aria-label="segment NIC to user space" />
+    <input type="radio" id="vg-w-stack-llcpp-segments-r2" name="vg-w-stack-llcpp-segments-sel" aria-label="segment parse and strategy" />
+    <input type="radio" id="vg-w-stack-llcpp-segments-r3" name="vg-w-stack-llcpp-segments-sel" aria-label="segment encode to NIC" />
+
+    <p class="stack-title" id="vg-w-stack-llcpp-segments-title">把 wire-to-wire 拆成三段，各自打 TSC 時間戳、各自畫 histogram</p>
+    <ul class="stack-cards" aria-labelledby="vg-w-stack-llcpp-segments-title">
+      <li class="card-1"><label for="vg-w-stack-llcpp-segments-r1">
+        <p class="card-head"><span>S1 · NIC → user space</span><code class="card-tag">p50 6µs / p99 14µs</code></p>
+        <p class="card-sub">尾巴若還在幾十微秒，代表 DPDK 沒繞乾淨——對應第一根支柱。</p>
+      </label></li>
+      <li class="card-2"><label for="vg-w-stack-llcpp-segments-r2">
+        <p class="card-head"><span>S2 · parse + 策略</span><code class="card-tag">p50 14µs / p99 40µs</code></p>
+        <p class="card-sub">p99.9 偶爾爆，十之八九是某條罕見分支藏了 allocation——對應 memory pool。</p>
+      </label></li>
+      <li class="card-3"><label for="vg-w-stack-llcpp-segments-r3">
+        <p class="card-head"><span>S3 · order encode → NIC</span><code class="card-tag">p50 8µs / p99 18µs</code></p>
+        <p class="card-sub">TX 段的尾巴常來自 interrupt 或 buffer 太小——對應 network tuning。</p>
+      </label></li>
+    </ul>
+
+    <svg class="diagram" viewBox="0 0 880 300" role="img"
+         aria-label="wire-to-wire 三段分解:NIC→user、parse+策略、encode→NIC,各標 p50/p99 與對應支柱">
+      <text x="440" y="24" text-anchor="middle" fill="var(--ink)" class="head">三段分解——點任一段看它的尾巴由哪根支柱負責</text>
+      <text x="40" y="64" fill="var(--muted)" class="seg-sub">market data in</text>
+      <text x="840" y="64" text-anchor="end" fill="var(--muted)" class="seg-sub">order out</text>
+
+      <rect class="seg seg-1" data-target="vg-w-stack-llcpp-segments-r1" role="button" tabindex="0" aria-label="select S1" x="40" y="84" width="240" height="92" />
+      <text class="seg-text" x="160" y="118" text-anchor="middle" fill="var(--ink)">S1 · NIC → user</text>
+      <text class="seg-sub" x="160" y="140" text-anchor="middle">DPDK bypass 的責任段</text>
+      <text class="seg-num" x="160" y="160" text-anchor="middle">p50 6µs · p99 14µs</text>
+
+      <rect class="seg seg-2" data-target="vg-w-stack-llcpp-segments-r2" role="button" tabindex="0" aria-label="select S2" x="320" y="84" width="240" height="92" />
+      <text class="seg-text" x="440" y="118" text-anchor="middle" fill="var(--ink)">S2 · parse + 策略</text>
+      <text class="seg-sub" x="440" y="140" text-anchor="middle">memory pool 的責任段</text>
+      <text class="seg-num" x="440" y="160" text-anchor="middle">p50 14µs · p99 40µs</text>
+
+      <rect class="seg seg-3" data-target="vg-w-stack-llcpp-segments-r3" role="button" tabindex="0" aria-label="select S3" x="600" y="84" width="240" height="92" />
+      <text class="seg-text" x="720" y="118" text-anchor="middle" fill="var(--ink)">S3 · encode → NIC</text>
+      <text class="seg-sub" x="720" y="140" text-anchor="middle">network tuning 的責任段</text>
+      <text class="seg-num" x="720" y="160" text-anchor="middle">p50 8µs · p99 18µs</text>
+
+      <line x1="280" y1="130" x2="320" y2="130" stroke="currentColor" stroke-width="1.4" marker-end="url(#vg-w-stack-llcpp-segments-arrow)"/>
+      <line x1="560" y1="130" x2="600" y2="130" stroke="currentColor" stroke-width="1.4" marker-end="url(#vg-w-stack-llcpp-segments-arrow)"/>
+      <text x="440" y="284" text-anchor="middle" fill="var(--muted)" class="seg-sub">三段相加 ≈ wire-to-wire;哪段 p99 最肥，優化就先砍哪段</text>
+      <defs>
+        <marker id="vg-w-stack-llcpp-segments-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+        </marker>
+      </defs>
+    </svg>
+
+    <div>
+      <p class="hint">click a segment above</p>
+      <div class="detail detail-1">
+        <h3>S1 · NIC → user space</h3>
+        <p>packet 從光纖進到策略邏輯能讀它。這段的尾巴若還在幾十微秒，代表 DPDK 沒裝好或沒繞乾淨——還在走 kernel stack 的 interrupt / copy / wakeup。</p>
+        <p><strong>對應支柱</strong>:DPDK kernel bypass + network tuning。</p>
+      </div>
+      <div class="detail detail-2">
+        <h3>S2 · parse + 策略</h3>
+        <p>parse market data、跑策略、產生 order。p50/p95 漂亮但 p99.9 偶爾爆，典型病因是某條罕見分支(錯誤處理、罕見訂單型別)藏了隱式 allocation,90% 的 packet 走不到、1% 走到就吃一次 malloc 尾巴。</p>
+        <p><strong>對應支柱</strong>:preallocated memory pool + NUMA affinity。</p>
+      </div>
+      <div class="detail detail-3">
+        <h3>S3 · order encode → NIC</h3>
+        <p>把 order 序列化、交給 NIC 送出。TX 段的尾巴常來自 interrupt 模式打斷 flow、或 TX backlog queue 太小造成排隊。</p>
+        <p><strong>對應支柱</strong>:network tuning(busy-poll、加大 TX buffer)。</p>
+      </div>
+    </div>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-stack-llcpp-segments');
+        root.querySelectorAll('.seg').forEach((rect) => {
+          rect.addEventListener('click', () => {
+            const targetId = rect.getAttribute('data-target');
+            const radio = root.querySelector('#' + targetId);
+            if (radio) radio.checked = true;
+          });
+          rect.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              rect.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            }
+          });
+        });
+      })();
+    </script>
+  </figure>
+
+  <p>如果「NIC→user space」那段 p99 還是幾十微秒，那 DPDK 沒裝好或沒繞乾淨;如果「parse + 策略」那段 p99.9 偶爾爆，十之八九是某條罕見分支藏了 allocation。沒有分段 histogram,你只能猜;有了它，優化從「憑感覺改」變成「看著數字砍尾巴」。這也是為什麼這篇把它放在最後當作壓軸而不是開頭的細節——前五根支柱是手段,baseline histogram 是讓手段變成可驗證命題的儀器。</p>
+
+  <p>最後把這六件事收成一張可以照著走的清單，適用於任何對 latency 敏感的後端而不只是交易系統。第一，先建 baseline histogram(p50/p95/p99/p99.9 + 分段),沒有它後面全是盲改。第二,kernel bypass 拿掉最大塊的固定開銷(DPDK,−20…45µs)。第三,hot path 上不准 runtime allocation(memory pool,把 syscall 清零)。第四，把 thread 與記憶體 pin 到同一 NUMA node(affinity,拿掉 scheduler 與 interconnect 的不確定性)。第五，計時用 TSC 不用 syscall——但記得校正 cross-core skew,否則它會騙你。第六，網路 busy-poll、加大 RX/TX buffer,把 interrupt 也拿掉。六步走完，你量的就不再是 OS,而是硬體。</p>
+
+  <p class="vg-deep-closer"><strong>What this enables</strong>：把作業系統從 hot path 上系統性地移除之後,wire-to-wire 延遲不再被 GC、syscall、interrupt、scheduler 這些不可預測的 OS 行為決定，而塌縮到由硬體本身決定的 sub-50µs——而那張 baseline histogram,是讓這六根支柱從「信仰」變成「可驗證命題」的唯一儀器。</p>
+</div>

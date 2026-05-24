@@ -25,7 +25,7 @@
 // Output (stdout, JSON):
 //   {
 //     "kept":    [{ ...candidate, "dedup_reason": null }, ...],
-//     "dropped": [{ ...candidate, "dedup_reason": "url-match-2026-05-16" }, ...]
+//     "dropped": [{ ...candidate, "dedup_reason": "url-match-archive" }, ...]
 //   }
 //
 // Drop rule: canonical URL match (strip utm_*, #fragment, trailing /).
@@ -74,7 +74,7 @@ const dropped = [];
 for (const c of candidates) {
   const canon = canonicalizeUrl(c.url || "");
   if (canon && pastSet.has(canon)) {
-    dropped.push({ ...c, dedup_reason: `url-match-past-7d` });
+    dropped.push({ ...c, dedup_reason: `url-match-archive` });
   } else {
     kept.push({ ...c, dedup_reason: null });
   }
