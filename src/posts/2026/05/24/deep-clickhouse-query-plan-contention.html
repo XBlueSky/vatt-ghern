@@ -1,0 +1,508 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">每天凌晨跑的帳務聚合作業愈來愈慢，但每一塊儀表板都是綠的——I/O 正常、記憶體正常、每筆查詢掃過的 row 數一筆不多、讀到的 data part 數也沒變。唯一跟延遲一起爬升的，是一個跟查詢本身毫無關係的數字：整張表在叢集裡累積的 part 總數。</p>
+  <h1 class="vg-post-title">帳務管線為什麼突然變慢——從 partition key 追到 ClickHouse query planner mutex</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p><span class="vg-dropcap">這</span>是一個典型的「改了一個看起來無害的 schema、半年後被它咬一口」的故事。Cloudflare 的 Ready-Analytics ClickHouse 表為了支援 per-namespace 的 retention，把 partition key 從 <code>(day)</code> 改成 <code>(namespace, day)</code>——讓每個 namespace 可以各自設定保留天數。改動本身合情合理、上線時毫無異狀。問題是在那之後幾個月才慢慢浮現：負責產生發票的 daily aggregation job 開始變慢，而且是那種「沒有任何單一指標能解釋」的慢。原文的描述很精準：team 把 query duration 對著叢集裡的 total part count 畫出來，「The correlation was undeniable」。查詢延遲跟它根本不該讀到的那些 part 強相關。</p>
+
+  <p>這篇要拆的不是「ClickHouse 很慢」這種空泛結論，而是一條具體的因果鏈：一個 partition key 的改動，怎麼讓 data part 的數量結構性地膨脹；膨脹的 part 數又怎麼透過 query planner 裡一個 EXCLUSIVE 的 mutex，把原本可以併發的查詢排成一列單行道。最後落在三個 patch 上——每個 patch 各自解掉這條鏈的一段，全部進了 ClickHouse 25.11（PR #85535）。對任何在跑大型 ClickHouse、或任何在改 partition key 的人來說，這條鏈的每一環都值得記下來。</p>
+
+  <p>先把規模感建立起來。這張表到 2024 年 12 月已經超過 2 PiB，ingest 速率是每秒數百萬 row。改 partition key 之前，每個 replica 上大約 3 萬個 part；一年後，這個數字爬到約 16 萬。ClickHouse 的 MergeTree 引擎本來就會在背景持續做 merge 把小 part 合併成大 part，但當 partition key 多了一個高 cardinality 的 namespace 維度，part 被切得更碎、merge 追不上 ingest，part 總數就只升不降。這裡要記住的關鍵不是「part 多了會慢」這種直覺——而是「慢的是 planner，不是 I/O」這個反直覺。</p>
+
+  <p>要理解 part 為什麼跟 partition key 綁這麼死，得先講清楚 ClickHouse 的 data part 是什麼。MergeTree 的每一次 insert 不是寫進某個既有檔案、而是落地成一個全新的、不可變的 data part——一個目錄，裡面是這批 row 按 sorting key 排好序的 column 檔。背景的 merge thread 持續把同一個 partition 內的小 part 兩兩（或多個）合併成更大的 part，舊 part 標記成 inactive 等待清理。這個 LSM-tree 式的設計讓 write 永遠是 append、不需要 in-place update，代價是讀的時候要面對一堆散落的 part、靠 merge 把數量壓回可控範圍。整個機制的健康指標就是一個：active part 的數量能不能被 merge 壓住。</p>
+
+  <p>關鍵限制在於 <strong>merge 只在同一個 partition 內進行</strong>。兩個不同 partition 的 part，無論多小、無論多老，永遠不會被合併成一個。partition key 是 <code>(day)</code> 的時候，一天的全部資料屬於同一個 partition，merge 可以把它收斂成少數幾個大 part——一天可能就幾個 part。改成 <code>(namespace, day)</code> 之後，一天的資料按 namespace 被劈成成千上萬個獨立 partition，每個 partition 各自維護自己那一小撮 part，而且彼此之間的 merge 機會歸零。partition 數量是 part 數量的硬下限——partition 一暴增，就算每個 partition 只剩一個 part，total part 數也被結構性地抬到一個全新的量級。3 萬到 16 萬這個五倍多的成長，根源就在這裡。</p>
+
+  <p>這就帶出一個微妙但要命的點：part 數的成長跟「資料量」其實脫鉤了。2 PiB 的資料無論用哪個 partition key 都是 2 PiB，但攤成 16 萬個 part 跟攤成 3 萬個 part，是兩種完全不同的 metadata 規模。part 是 ClickHouse 在 read path 跟 plan path 都要逐一處理的 unit——它的數量，而非總位元組數，決定了很多操作的成本。一個資料量沒變、但 part 數翻五倍的系統，在「按 byte 計」的指標上看起來毫無變化，在「按 part 計」的隱藏成本上卻翻了五倍。team 監控的全是前者。</p>
+
+  <p>下面這張圖把 part 總數隨時間的成長畫出來，並標出 partition key 改動的那一刻——這是整個 investigation 唯一一條「跟延遲一起爬」的曲線。注意 y 軸是每 replica 的 part 數，不是資料量；資料量是平滑成長的，part 數卻在改 key 之後出現結構性的斜率跳變。</p>
+
+  <figure class="vg-w-chart-clickhouse-partgrowth" data-svg-scroll="800">
+    <style>
+      .vg-w-chart-clickhouse-partgrowth { display: grid; gap: var(--s-2); }
+      .vg-w-chart-clickhouse-partgrowth svg.vg-w-chart-clickhouse-partgrowth-main { width: 100%; height: auto; }
+      .vg-w-chart-clickhouse-partgrowth figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+    <svg class="vg-w-chart-clickhouse-partgrowth-main" viewBox="0 0 720 300" preserveAspectRatio="xMidYMid meet" role="img"
+         aria-label="每 replica 的 active part 數隨時間成長——partition key 改動後從約 3 萬爬到約 16 萬">
+      <g id="vg-w-chart-clickhouse-partgrowth-axes"></g>
+      <g id="vg-w-chart-clickhouse-partgrowth-series"></g>
+    </svg>
+    <figcaption>每 replica active part 數的成長軌跡。改 partition key 前約 3 萬，一年後約 16 萬——五倍多。資料點為原文給出的兩個錨點（3 萬／16 萬），中間段為示意的單調成長，標記出 <code>(day)</code> → <code>(namespace, day)</code> 切換點。</figcaption>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-chart-clickhouse-partgrowth');
+        const svg = root.querySelector('svg.vg-w-chart-clickhouse-partgrowth-main');
+        const axesG = root.querySelector('#vg-w-chart-clickhouse-partgrowth-axes');
+        const seriesG = root.querySelector('#vg-w-chart-clickhouse-partgrowth-series');
+        const NS = 'http://www.w3.org/2000/svg';
+        function el(tag, attrs) {
+          const e = document.createElementNS(NS, tag);
+          for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+          return e;
+        }
+        const X0 = 70, X1 = 690, Y0 = 250, Y1 = 30;
+        const T0 = 0, T1 = 12;          // months
+        const Y_MAX = 170000;
+        // anchors: month 0 → 30k (just before key change), month 12 → 160k.
+        // key change happens at month 1; before it the slope is gentle, after it steep.
+        const data = [];
+        for (let m = T0; m <= T1; m++) {
+          let parts;
+          if (m <= 1) parts = 30000 + m * 1000;
+          else parts = 31000 + (m - 1) * ((160000 - 31000) / (T1 - 1));
+          data.push([m, Math.round(parts)]);
+        }
+        function xOf(m) { return X0 + (m - T0) / (T1 - T0) * (X1 - X0); }
+        function yOf(v) { return Y0 - (v / Y_MAX) * (Y0 - Y1); }
+
+        axesG.appendChild(el('line', { x1: X0, y1: Y0, x2: X1, y2: Y0, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+        axesG.appendChild(el('line', { x1: X0, y1: Y0, x2: X0, y2: Y1, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+        [0, 3, 6, 9, 12].forEach((m) => {
+          const x = xOf(m);
+          axesG.appendChild(el('line', { x1: x, y1: Y0, x2: x, y2: Y0 + 4, stroke: 'var(--muted-2)' }));
+          const t = el('text', { x: x, y: Y0 + 18, 'text-anchor': 'middle', 'font-family': 'Manrope, sans-serif', 'font-size': 11, fill: 'var(--muted)' });
+          t.textContent = '+' + m + 'mo';
+          axesG.appendChild(t);
+        });
+        [0, 40000, 80000, 120000, 160000].forEach((v) => {
+          const y = yOf(v);
+          axesG.appendChild(el('line', { x1: X0 - 4, y1: y, x2: X0, y2: y, stroke: 'var(--muted-2)' }));
+          const t = el('text', { x: X0 - 8, y: y + 4, 'text-anchor': 'end', 'font-family': 'Manrope, sans-serif', 'font-size': 11, fill: 'var(--muted)' });
+          t.textContent = (v / 1000) + 'k';
+          axesG.appendChild(t);
+        });
+        const yl = el('text', { x: 18, y: (Y0 + Y1) / 2, 'text-anchor': 'middle', 'font-family': 'EB Garamond, serif', 'font-size': 13, fill: 'var(--muted)', transform: `rotate(-90 18 ${(Y0 + Y1) / 2})` });
+        yl.textContent = 'active parts / replica';
+        axesG.appendChild(yl);
+
+        // key-change marker at month 1
+        const kx = xOf(1);
+        seriesG.appendChild(el('line', { x1: kx, y1: Y0, x2: kx, y2: Y1, stroke: 'var(--ink-deep)', 'stroke-width': 1, 'stroke-dasharray': '4 3' }));
+        const kt = el('text', { x: kx + 6, y: Y1 + 14, 'text-anchor': 'start', 'font-family': 'JetBrains Mono, monospace', 'font-size': 11, fill: 'var(--ink-deep)' });
+        kt.textContent = '(day) → (namespace, day)';
+        seriesG.appendChild(kt);
+
+        const path = data.map((d, i) => `${i === 0 ? 'M' : 'L'} ${xOf(d[0]).toFixed(1)} ${yOf(d[1]).toFixed(1)}`).join(' ');
+        seriesG.appendChild(el('path', { d: path, fill: 'none', stroke: 'var(--accent)', 'stroke-width': 2 }));
+        data.forEach((d) => seriesG.appendChild(el('circle', { cx: xOf(d[0]), cy: yOf(d[1]), r: 2.5, fill: 'var(--accent)' })));
+        // annotate the two real anchors
+        [[0, '≈30k'], [12, '≈160k']].forEach(([m, lbl]) => {
+          const d = data.find((x) => x[0] === m);
+          const t = el('text', { x: xOf(m), y: yOf(d[1]) - 10, 'text-anchor': m === 0 ? 'start' : 'end', 'font-family': 'JetBrains Mono, monospace', 'font-size': 12, fill: 'var(--accent-text)' });
+          t.textContent = lbl;
+          seriesG.appendChild(t);
+        });
+      })();
+    </script>
+  </figure>
+
+  <p>investigation 的價值在於它排除了什麼，而不只是它找到了什麼。下面這張表是 team 一個一個劃掉的 hypothesis——每一個都是合理的第一猜測，每一個都被資料否決。看完這張表，你會理解為什麼這個 bug 這麼難抓：它把所有「正常該看的指標」都騙過去了。</p>
+
+  <figure class="vg-w-table-clickhouse-ruledout">
+    <style>
+      .vg-w-table-clickhouse-ruledout { overflow-x: auto; }
+      .vg-w-table-clickhouse-ruledout table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-clickhouse-ruledout caption { text-align: left; caption-side: top; font-family: var(--scribed); font-style: italic; color: var(--muted); font-size: var(--fs-sm); padding: var(--s-1) 0; }
+      .vg-w-table-clickhouse-ruledout thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; }
+      .vg-w-table-clickhouse-ruledout thead th[data-sort] { color: var(--accent-text); }
+      .vg-w-table-clickhouse-ruledout thead th[data-sort="asc"]::after { content: ' ▴'; font-size: 0.7em; }
+      .vg-w-table-clickhouse-ruledout thead th[data-sort="desc"]::after { content: ' ▾'; font-size: 0.7em; }
+      .vg-w-table-clickhouse-ruledout tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+      .vg-w-table-clickhouse-ruledout td.verdict { font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); }
+      .vg-w-table-clickhouse-ruledout td.verdict[data-v="out"] { color: var(--muted); }
+      .vg-w-table-clickhouse-ruledout td.verdict[data-v="hit"] { color: var(--accent-text); }
+      .vg-w-table-clickhouse-ruledout tbody tr:hover td { background: var(--bg-soft); }
+      .vg-w-table-clickhouse-ruledout p.vg-w-affordance { display: flex; align-items: center; gap: var(--s-1); margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/><path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+      </svg>
+      <span>click column header to sort · 4 columns × 6 rows</span>
+    </p>
+    <table>
+      <caption>investigation 過程中被逐一否決的 hypothesis——前五個全是綠燈，唯一爬升的是第六行的 total part count。資料取自原文敘述。</caption>
+      <thead>
+        <tr>
+          <th data-key="hyp">hypothesis</th>
+          <th data-key="metric">看的指標</th>
+          <th data-key="result">觀察結果</th>
+          <th data-key="verdict">判定</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>磁碟 I/O 變成瓶頸</td><td>disk read throughput / iowait</td><td>正常，沒有飽和跡象</td><td class="verdict" data-v="out">ruled out</td></tr>
+        <tr><td>記憶體壓力觸發 swap</td><td>memory utilization</td><td>正常，遠低於上限</td><td class="verdict" data-v="out">ruled out</td></tr>
+        <tr><td>查詢掃過更多 row</td><td>rows scanned / query</td><td>沒變，跟改 key 前一致</td><td class="verdict" data-v="out">ruled out</td></tr>
+        <tr><td>查詢讀到更多 part</td><td>parts read / query</td><td>沒變，pruning 仍然有效</td><td class="verdict" data-v="out">ruled out</td></tr>
+        <tr><td>查詢 selectivity 變差</td><td>query plan / predicate</td><td>plan 相同，predicate 沒退化</td><td class="verdict" data-v="out">ruled out</td></tr>
+        <tr><td>延遲跟「叢集 total part 數」相關</td><td>query duration vs total parts</td><td>強相關，且跟單查詢讀到的 part 無關</td><td class="verdict" data-v="hit">the lead</td></tr>
+      </tbody>
+    </table>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-table-clickhouse-ruledout');
+        const headers = root.querySelectorAll('thead th');
+        const tbody = root.querySelector('tbody');
+        let activeKey = null, asc = true;
+        headers.forEach((h, idx) => h.addEventListener('click', () => {
+          const key = h.dataset.key;
+          if (activeKey === key) asc = !asc; else { activeKey = key; asc = true; }
+          headers.forEach((x) => x.removeAttribute('data-sort'));
+          h.setAttribute('data-sort', asc ? 'asc' : 'desc');
+          const rows = Array.from(tbody.querySelectorAll('tr'));
+          rows.sort((a, b) => {
+            const av = a.children[idx].textContent.trim();
+            const bv = b.children[idx].textContent.trim();
+            return asc ? av.localeCompare(bv, 'zh-Hant') : bv.localeCompare(av, 'zh-Hant');
+          });
+          rows.forEach((r) => tbody.appendChild(r));
+        }));
+      })();
+    </script>
+  </figure>
+
+  <p>第六行那個相關性是整個故事的轉折點。它告訴你的事情很奇怪：一筆查詢的延遲，跟它自己讀了多少 part 無關，反而跟「整張表此刻一共有多少 part」有關。換句話說，叢集裡別人 ingest 出來的、跟你這筆查詢 partition 完全不重疊的那些 part，也會拖慢你。這種「全域狀態拖累局部操作」的形狀，幾乎只可能有一個來源——某個保護全域狀態的 lock。下面的章節就照著 team 的 inquiry 順序走：先看 partition key 怎麼把 part 數推上去，再看 profiling 怎麼指向 <code>filterPartsByPartition</code>，最後拆 mutex 跟三個 patch。</p>
+
+  <h2>假設一：是 partition key 改動讓 data part 結構性膨脹嗎？</h2>
+
+  <p>這是第一個、也是最直接的懷疑對象——因為時間點對得上。partition key 從 <code>(day)</code> 改成 <code>(namespace, day)</code> 之後，ClickHouse 對每一個 <code>(namespace, day)</code> 組合各開一個 partition。原本一天的資料是一個 partition、被 merge 成少數幾個大 part；現在一天的資料按 namespace 切成成千上萬個 partition，每個 partition 都有自己的一組 part。ClickHouse 的 merge 只在同一個 partition 內進行——不同 partition 的 part 永遠不會被合併——所以 partition 數量一暴增，part 總數的下限就被抬高了。</p>
+
+  <p>這個機制本身是對的：part 數確實因為 partition key 而膨脹，從每 replica 約 3 萬爬到約 16 萬。但這只回答了「part 為什麼變多」，沒回答「part 變多為什麼讓查詢變慢」。畢竟 ClickHouse 的 partition pruning 還是有效的——表裡的指標清清楚楚寫著：每筆查詢讀到的 part 數沒變。pruning 把不相關的 partition 擋在門外，查詢實際碰到的資料量跟以前一樣。所以「part 膨脹」是 root cause 的上游，但它不是讓查詢變慢的那個直接機制。真正的問題藏在 part 數被用在哪裡——而那個地方，不是 read path，是 planning path。</p>
+
+  <p>partition pruning 為什麼仍然有效，是這個 bug 偽裝術的核心。帳務查詢幾乎都帶著明確的 namespace 跟 day 條件，planner 拿著 predicate 比對每個 partition 的 value，把不符合的整個 partition 連同底下的 part 一起跳過。所以最後真正被選中要讀的 part 數可能只有數十個——這個數字確實沒變，因為一個 namespace 一天能產生多少 part 跟「叢集裡一共有幾個 namespace」無關。pruning 的「結果」是對的、是省的；但 pruning 的「過程」要付出多少成本，卻是另一回事。指標只記錄了結果。</p>
+
+  <p>這裡要建立一個重要的區分：part 數會在兩個完全不同的階段被觸及。第一個階段是 query planning——planner 需要看過所有 part 才能決定哪些要讀、哪些要 prune。第二個階段是 query execution——真正去讀被選中的那些 part。execution 階段的成本跟「讀到的 part 數」成正比，而那個數字沒變；planning 階段的成本，卻可能跟「總 part 數」成正比。team 看的所有指標都是 execution 階段的指標，所以全部綠燈。問題在 planning 階段，而那裡當時沒有好的可觀測性。下面這個互動圖把這兩條曲線擺在一起，讓你親手把 part 數從 3 萬拉到 16 萬，看 planning 成本怎麼跟 execution 成本分道揚鑣。</p>
+
+  <figure class="vg-w-param-demo-clickhouse-contention" data-svg-scroll="800">
+    <style>
+      .vg-w-param-demo-clickhouse-contention { display: grid; grid-template-rows: auto auto 1fr auto; gap: var(--s-2); }
+      .vg-w-param-demo-clickhouse-contention .controls { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); flex-wrap: wrap; }
+      .vg-w-param-demo-clickhouse-contention .controls label { white-space: nowrap; }
+      .vg-w-param-demo-clickhouse-contention .controls input[type="range"] { flex: 1; min-width: 140px; height: 36px; accent-color: var(--accent); touch-action: none; }
+      .vg-w-param-demo-clickhouse-contention .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 10ch; text-align: right; font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); }
+      .vg-w-param-demo-clickhouse-contention .modes { display: flex; gap: var(--s-2); flex-wrap: wrap; font-family: var(--sans); font-size: var(--fs-xs); }
+      .vg-w-param-demo-clickhouse-contention .modes label { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; border: 1px solid var(--line); cursor: pointer; min-height: 36px; }
+      .vg-w-param-demo-clickhouse-contention .modes label:has(input:checked) { border-color: var(--accent); color: var(--accent-text); }
+      .vg-w-param-demo-clickhouse-contention .modes input { accent-color: var(--accent); }
+      .vg-w-param-demo-clickhouse-contention svg.vg-w-param-demo-clickhouse-contention-main { width: 100%; height: auto; }
+      .vg-w-param-demo-clickhouse-contention figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+
+    <div class="controls">
+      <label for="vg-w-param-demo-clickhouse-contention-x">total parts / replica =</label>
+      <input id="vg-w-param-demo-clickhouse-contention-x" type="range" min="30000" max="160000" step="1000" value="30000" />
+      <span class="readout" id="vg-w-param-demo-clickhouse-contention-x-readout">30,000</span>
+    </div>
+
+    <div class="modes" role="group" aria-label="planner locking mode">
+      <label><input type="radio" name="vg-w-param-demo-clickhouse-contention-mode" value="excl" checked /> EXCLUSIVE lock + copy（修復前）</label>
+      <label><input type="radio" name="vg-w-param-demo-clickhouse-contention-mode" value="fixed" /> shared_lock + 共享 copy + binary search（25.11）</label>
+    </div>
+
+    <svg class="vg-w-param-demo-clickhouse-contention-main" viewBox="0 0 720 320" preserveAspectRatio="xMidYMid meet" role="img" aria-label="query duration 對 total part count 的曲線——修復前 planning 成本隨總 part 數線性爬升，修復後維持平坦">
+      <g id="vg-w-param-demo-clickhouse-contention-axes"></g>
+      <g id="vg-w-param-demo-clickhouse-contention-series"></g>
+      <g id="vg-w-param-demo-clickhouse-contention-marker"></g>
+    </svg>
+
+    <figcaption>execution 成本（讀到的 part）幾乎是常數；planning 成本在 EXCLUSIVE 模式下隨 total part 數線性爬升。切到 25.11 模式，planning 曲線被壓平——這正是「breaks correlation of query duration with the number of parts」那句話的形狀。曲線為示意模型，錨點用原文的 3 萬／16 萬 part 與「約 50% 延遲下降」。</figcaption>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-param-demo-clickhouse-contention');
+        const svg = root.querySelector('svg.vg-w-param-demo-clickhouse-contention-main');
+        const axesG = root.querySelector('#vg-w-param-demo-clickhouse-contention-axes');
+        const seriesG = root.querySelector('#vg-w-param-demo-clickhouse-contention-series');
+        const markerG = root.querySelector('#vg-w-param-demo-clickhouse-contention-marker');
+        const input = root.querySelector('input[type="range"]');
+        const readout = root.querySelector('.readout');
+        const modeInputs = root.querySelectorAll('input[name="vg-w-param-demo-clickhouse-contention-mode"]');
+
+        const NS = 'http://www.w3.org/2000/svg';
+        function el(tag, attrs) {
+          const e = document.createElementNS(NS, tag);
+          for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+          return e;
+        }
+
+        const X0 = 70, X1 = 690, Y0 = 280, Y1 = 30;
+        const P_MIN = 30000, P_MAX = 160000;
+        const Y_MAX = 100; // relative query duration, normalised to 100 at the worst case
+
+        // execution cost: roughly constant (parts read per query unchanged)
+        const EXEC = 18;
+        // planning cost grows linearly with total parts (exclusive lock + full vector copy
+        // serialised across concurrent queries). normalised so 160k → ~82 on top of EXEC.
+        function planExcl(p) { return ((p - P_MIN) / (P_MAX - P_MIN)) * 82; }
+        // fixed mode: shared_lock removes serialisation, cached copy removes the copy,
+        // binary search makes pruning sub-linear → planning cost essentially flat.
+        function planFixed(p) { return ((p - P_MIN) / (P_MAX - P_MIN)) * 6; }
+
+        function xOf(p) { return X0 + (p - P_MIN) / (P_MAX - P_MIN) * (X1 - X0); }
+        function yOf(v) { return Y0 - (v / Y_MAX) * (Y0 - Y1); }
+
+        // static axes
+        axesG.appendChild(el('line', { x1: X0, y1: Y0, x2: X1, y2: Y0, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+        axesG.appendChild(el('line', { x1: X0, y1: Y0, x2: X0, y2: Y1, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+        // x ticks
+        [30000, 60000, 90000, 120000, 160000].forEach((p) => {
+          const x = xOf(p);
+          axesG.appendChild(el('line', { x1: x, y1: Y0, x2: x, y2: Y0 + 4, stroke: 'var(--muted-2)' }));
+          const t = el('text', { x: x, y: Y0 + 18, 'text-anchor': 'middle', 'font-family': 'Manrope, sans-serif', 'font-size': 11, fill: 'var(--muted)' });
+          t.textContent = (p / 1000) + 'k';
+          axesG.appendChild(t);
+        });
+        // y ticks
+        [0, 25, 50, 75, 100].forEach((v) => {
+          const y = yOf(v);
+          axesG.appendChild(el('line', { x1: X0 - 4, y1: y, x2: X0, y2: y, stroke: 'var(--muted-2)' }));
+          const t = el('text', { x: X0 - 8, y: y + 4, 'text-anchor': 'end', 'font-family': 'Manrope, sans-serif', 'font-size': 11, fill: 'var(--muted)' });
+          t.textContent = String(v);
+          axesG.appendChild(t);
+        });
+        const xl = el('text', { x: (X0 + X1) / 2, y: Y0 + 38, 'text-anchor': 'middle', 'font-family': 'EB Garamond, serif', 'font-size': 13, fill: 'var(--muted)' });
+        xl.textContent = 'total parts / replica';
+        axesG.appendChild(xl);
+        const yl = el('text', { x: 18, y: (Y0 + Y1) / 2, 'text-anchor': 'middle', 'font-family': 'EB Garamond, serif', 'font-size': 13, fill: 'var(--muted)', transform: `rotate(-90 18 ${(Y0 + Y1) / 2})` });
+        yl.textContent = 'query duration (relative)';
+        axesG.appendChild(yl);
+
+        // legend
+        const lg = el('g', { 'font-family': 'Manrope, sans-serif', 'font-size': 12 });
+        lg.appendChild(el('rect', { x: 470, y: 40, width: 12, height: 3, fill: 'var(--sage-deep)' }));
+        const lA = el('text', { x: 490, y: 44, fill: 'var(--ink)' }); lA.textContent = 'execution（讀到的 part）'; lg.appendChild(lA);
+        lg.appendChild(el('rect', { x: 470, y: 60, width: 12, height: 3, fill: 'var(--accent)' }));
+        const lB = el('text', { x: 490, y: 64, fill: 'var(--ink)' }); lB.textContent = 'planning（mutex + copy）'; lg.appendChild(lB);
+        axesG.appendChild(lg);
+
+        function currentMode() {
+          for (const m of modeInputs) if (m.checked) return m.value;
+          return 'excl';
+        }
+
+        function planOf(p, mode) { return mode === 'fixed' ? planFixed(p) : planExcl(p); }
+
+        function redraw() {
+          const mode = currentMode();
+          while (seriesG.firstChild) seriesG.removeChild(seriesG.firstChild);
+
+          // execution curve (flat)
+          const execPts = [];
+          for (let p = P_MIN; p <= P_MAX; p += 2000) {
+            execPts.push(`${p === P_MIN ? 'M' : 'L'} ${xOf(p).toFixed(1)} ${yOf(EXEC).toFixed(1)}`);
+          }
+          seriesG.appendChild(el('path', { d: execPts.join(' '), fill: 'none', stroke: 'var(--sage-deep)', 'stroke-width': 2 }));
+
+          // total (execution + planning) curve
+          const totPts = [];
+          for (let p = P_MIN; p <= P_MAX; p += 2000) {
+            totPts.push(`${p === P_MIN ? 'M' : 'L'} ${xOf(p).toFixed(1)} ${yOf(EXEC + planOf(p, mode)).toFixed(1)}`);
+          }
+          seriesG.appendChild(el('path', { d: totPts.join(' '), fill: 'none', stroke: 'var(--accent)', 'stroke-width': 2 }));
+
+          // marker at current slider position
+          while (markerG.firstChild) markerG.removeChild(markerG.firstChild);
+          const p = Number(input.value);
+          const total = EXEC + planOf(p, mode);
+          markerG.appendChild(el('line', { x1: xOf(p), y1: Y0, x2: xOf(p), y2: yOf(total), stroke: 'var(--muted-2)', 'stroke-width': 1, 'stroke-dasharray': '3 3' }));
+          markerG.appendChild(el('circle', { cx: xOf(p), cy: yOf(total), r: 4.5, fill: 'var(--accent)' }));
+          markerG.appendChild(el('circle', { cx: xOf(p), cy: yOf(EXEC), r: 3.5, fill: 'var(--sage-deep)' }));
+          const tag = el('text', { x: xOf(p), y: yOf(total) - 12, 'text-anchor': 'middle', 'font-family': 'JetBrains Mono, monospace', 'font-size': 12, fill: 'var(--accent-text)' });
+          tag.textContent = total.toFixed(0);
+          markerG.appendChild(tag);
+        }
+
+        function onInput() {
+          readout.textContent = Number(input.value).toLocaleString('en-US');
+          redraw();
+        }
+        input.addEventListener('input', onInput);
+        modeInputs.forEach((m) => m.addEventListener('change', redraw));
+        onInput();
+      })();
+    </script>
+  </figure>
+
+  <p>把 mode 切到 25.11 那條，再把 slider 拉到底——你會看到紅色那條 planning 曲線幾乎貼著綠色的 execution 曲線走、不再隨 part 數抬升。這就是 fix 的本質：不是讓 planning 更快，而是讓 planning 成本不再跟 total part 數綁在一起。但要做到這件事，得先知道 planning 慢在哪。partition key 假設到此為止——它解釋了 part 為什麼變多，但 part 變多之後傷害在哪、為什麼，要靠 profiling 才看得到。</p>
+
+  <h2>假設二：CPU profiling 指向 filterPartsByPartition，但 CPU 不是真相</h2>
+
+  <p>下一步是 profiling。ClickHouse 內建 <code>trace_log</code> 這套 sampling profiler，可以產生 flame graph。team 先跑了 CPU-based 的 trace——也就是「CPU 在忙的時候，正在執行哪個 function」的取樣。結果很尖銳：「45% of the sampled CPU time was being spent in a single function called <code>filterPartsByPartition</code>」。將近一半的 CPU 時間花在一個函式上，這通常是 root cause 的強烈訊號。<code>filterPartsByPartition</code> 顧名思義就是「按 partition 過濾 part」——也就是 planner 在做 partition pruning 的地方。part 多了、要過濾的東西多了，這個函式吃掉更多 CPU，看起來完全說得通。</p>
+
+  <p>但這裡有個陷阱，而它正是這個 investigation 最值得學的一課。CPU profiling 只取樣「正在跑」的 thread——它看不到「正在等」的 thread。如果 thread 大半時間卡在一個 mutex 上動彈不得，CPU profiler 根本不會把它算進去，因為那個 thread 此刻沒有消耗 CPU。換句話說，CPU flame graph 告訴你的是「CPU 忙的時候在忙什麼」，不是「query 的時間都花到哪去了」。當瓶頸是 lock contention 而非 compute 時，這兩者天差地遠。</p>
+
+  <p>所以 team 換了取樣方式——切到 ClickHouse 的 "Real" trace，這種取樣會把所有 thread 都算進去、包含正在 sleep／等 lock 的 thread。換了視角之後，真相浮現：「more than half of leaf query duration is spent waiting for a mutex that protects the list of active parts」。超過一半的 leaf query 時間，根本不是在算東西，是在排隊等一個保護 active parts 清單的 mutex——具體說是 <code>MergeTreeData</code> 上的那個 mutex。<code>filterPartsByPartition</code> 吃 45% CPU 是真的，但那是「拿到 lock 之後」的工作；真正的時間黑洞在「拿到 lock 之前」的等待。下面這張對照圖把同一筆查詢在兩種 profiler 視角下的樣子擺在一起。</p>
+
+  <figure class="vg-w-flame-clickhouse-profiler" data-svg-scroll="720">
+    <style>
+      .vg-w-flame-clickhouse-profiler { display: flex; flex-direction: column; gap: var(--s-2); }
+      .vg-w-flame-clickhouse-profiler svg.vg-w-flame-clickhouse-profiler-main { width: 100%; height: auto; }
+      .vg-w-flame-clickhouse-profiler .box-cpu { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); stroke-width: 1.2; }
+      .vg-w-flame-clickhouse-profiler .box-wait { fill: var(--muted-2); fill-opacity: 0.18; stroke: var(--muted); stroke-width: 1.2; stroke-dasharray: 4 3; }
+      .vg-w-flame-clickhouse-profiler .box-work { fill: var(--sage-deep); fill-opacity: 0.2; stroke: var(--sage-deep); stroke-width: 1.2; }
+      .vg-w-flame-clickhouse-profiler .lbl { font-family: JetBrains Mono, monospace; font-size: 12px; fill: var(--ink); }
+      .vg-w-flame-clickhouse-profiler .sub { font-family: IM Fell English, serif; font-style: italic; font-size: 12px; fill: var(--muted); }
+      .vg-w-flame-clickhouse-profiler .head { font-family: IM Fell English, serif; font-style: italic; font-size: 14px; fill: var(--ink); }
+      .vg-w-flame-clickhouse-profiler figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+    <svg class="vg-w-flame-clickhouse-profiler-main" viewBox="0 0 720 300" preserveAspectRatio="xMidYMid meet" role="img"
+         aria-label="同一筆 leaf query 在 CPU profiler 與 Real profiler 兩種視角下的時間分布對照">
+      <text x="20" y="26" class="head">同一筆 leaf query · 兩種 profiler 視角</text>
+
+      <!-- CPU view -->
+      <text x="20" y="58" class="sub">CPU trace（只算正在跑的 thread）</text>
+      <rect class="box-cpu" x="20" y="70" width="305" height="40" />
+      <text x="32" y="88" class="lbl">filterPartsByPartition</text>
+      <text x="32" y="103" class="sub">≈ 45% of sampled CPU</text>
+      <rect class="box-work" x="333" y="70" width="367" height="40" />
+      <text x="345" y="88" class="lbl">其餘 planning + execution</text>
+      <text x="345" y="103" class="sub">剩下的 CPU 取樣</text>
+
+      <!-- Real view -->
+      <text x="20" y="156" class="sub">Real trace（含正在等 lock 的 thread）</text>
+      <rect class="box-wait" x="20" y="168" width="378" height="40" />
+      <text x="32" y="186" class="lbl">waiting on MergeTreeData mutex</text>
+      <text x="32" y="201" class="sub">&gt; 50% of leaf query duration · 不消耗 CPU</text>
+      <rect class="box-cpu" x="406" y="168" width="150" height="40" />
+      <text x="416" y="186" class="lbl">filterParts…</text>
+      <text x="416" y="201" class="sub">lock 後</text>
+      <rect class="box-work" x="564" y="168" width="136" height="40" />
+      <text x="574" y="186" class="lbl">execution</text>
+
+      <!-- annotation -->
+      <line x1="209" y1="208" x2="209" y2="240" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="3 3" />
+      <text x="20" y="262" class="sub">CPU profiler 看不到等待時間——這段在 CPU 視角是隱形的，</text>
+      <text x="20" y="280" class="sub">這就是為什麼 45% CPU 的 filterPartsByPartition 不是真正的瓶頸。</text>
+    </svg>
+    <figcaption>上排是 CPU trace 的歸因，下排是 Real trace 的歸因。同一筆查詢、同一段時間，差別只在「等 lock」算不算進來。lock 等待不耗 CPU，所以在上排完全隱形——這是 lock-contention bug 在 CPU profile 下集體裝死的原因。</figcaption>
+  </figure>
+
+  <p>這個對照是整篇最該記住的方法論。當你看到一個 function 吃掉大量 CPU，很容易直接把它當成兇手、開始優化它。但如果真正的瓶頸是等待——等 lock、等 I/O、等 RPC——CPU profiler 會系統性地把它藏起來，而你會花時間優化一個其實沒那麼重要的熱點。判斷的關鍵問題是：「我的 query latency 跟 CPU 使用率對得上嗎？」如果 latency 高但 CPU 沒滿，幾乎可以確定有東西在等。這時候要換 wall-clock／off-CPU profiling，把睡著的 thread 也算進來。</p>
+
+  <p>稍微展開兩種 profiler 的取樣機制，差異的來源就更清楚了。CPU profiler（perf 的 default、ClickHouse 的 CPU trace）靠的是 CPU cycle 或 timer interrupt——只有當某個 thread 真的在 CPU 上跑、被 interrupt 打中，它的 stack 才會被記一筆。一個 blocked 在 <code>futex</code>／mutex 上的 thread 已經被 OS scheduler 移出 run queue、不佔 CPU，自然永遠不會被這種取樣打中。它在 CPU flame graph 上的貢獻是嚴格的零。Real／wall-clock profiler 反過來，是按掛鐘時間對「所有 thread」取樣——不管它在跑還是在睡，都記一筆它當下的 stack。於是一個卡在 mutex acquire 的 thread，會在 Real trace 裡留下大量「停在 lock 那一行」的取樣。兩種 profiler 量的根本是兩個不同的東西：一個量 CPU 怎麼分配，一個量時間怎麼流逝。</p>
+
+  <p>這也解釋了 45% 跟「過半」這兩個數字為什麼不矛盾、而是同一件事的兩面。<code>filterPartsByPartition</code> 確實是 CPU 上最重的 function——拿到 lock 之後，複製 vector 跟線性掃描都發生在這裡，所以它吃掉 CPU 的 45% 是真的。但 leaf query 的牆鐘時間裡，超過一半根本沒在跑任何 code、是停在 mutex acquire 前面排隊。把這兩個數字放一起看，畫面就完整了：少數搶到 lock 的 thread 在 <code>filterPartsByPartition</code> 裡燒 CPU，而大多數 thread 在門外等它放手。CPU 視角只看得到門內那幾個忙碌的身影，看不到門外排成長龍的隊伍。</p>
+
+  <h2>真因：planner 拿 EXCLUSIVE lock、複製整個 parts vector、把併發查詢排成單行道</h2>
+
+  <p>找到 mutex 之後，機制就清楚了。ClickHouse 的 <code>MergeTreeData</code> 維護一份 active parts 的清單——這份清單會被 ingest（新增 part）跟 merge（合併 part）持續修改，所以需要一個 mutex 保護。問題出在 query planner 怎麼用這個 mutex。每一筆查詢在 planning 階段，為了知道有哪些 part 可以 prune，會做三件事：先拿 mutex 的 <strong>EXCLUSIVE lock</strong>，然後把<strong>整個 parts vector 完整複製一份</strong>（幾萬個 element），放掉 lock，最後對這份 copy 做過濾。</p>
+
+  <p>這裡有兩個各自獨立的問題疊在一起。第一個是 EXCLUSIVE lock。query planning 其實只是「讀」這份清單、不改它——讀操作之間本來可以併發。但因為用的是 exclusive lock，任兩筆查詢的 planning 都互斥：A 在 plan 的時候 B 只能等。原文的比喻是「single-file line」——幾百筆併發查詢被排成一條單行道，一次只能過一個。part 愈多，每筆查詢持有 lock 的時間愈長（因為複製跟過濾都變久），後面排隊的人等愈久。這就是為什麼延遲會跟 total part 數相關——它相關的不是你讀的 part，是別人讓這條隊伍變慢的 part。</p>
+
+  <p>第二個問題是那個完整複製。就算 lock 換成可併發的，每筆查詢還是要把幾萬個 element 的 vector 複製一遍——這個動作本身在大表上一秒會發生好幾百次，純粹是 CPU 跟 memory bandwidth 的浪費。下面用 pseudocode 把修復前的 planning path 寫出來，三行註解標出三個各自獨立的成本來源。</p>
+
+  <pre data-kind="pseudocode"><code><em>// 修復前：每一筆查詢的 planning 都這樣跑一遍</em>
+plan_query(query):
+  lock = parts_mutex.acquire_exclusive()   <em>// ① 互斥——併發查詢排成單行道</em>
+  all_parts = copy(data.parts_vector)       <em>// ② 複製整個 vector（幾萬個 element）</em>
+  lock.release()
+  relevant = []
+  for part in all_parts:                    <em>// ③ 線性掃過全部 part 做 partition pruning</em>
+    if part.partition matches query.predicate:
+      relevant.append(part)
+  return relevant
+
+<em>// 成本結構：</em>
+<em>//   ① 隨「併發查詢數」放大——但放大倍率又跟 ② ③ 的耗時成正比</em>
+<em>//   ② ③ 隨「total part 數」放大——跟這筆查詢實際要讀的 part 無關</em>
+<em>// 三者相乘，total part 一升，整條隊伍的等待時間爆炸。</em></code></pre>
+
+  <p>把這三個成本來源擺在一起，就能解釋為什麼這個 bug 這麼隱蔽、又這麼致命。execution 階段的指標（rows scanned、parts read）全綠，因為 pruning 本身仍然正確——它最後只回傳了該讀的那幾個 part。但 pruning 為了得到那個正確答案，付出的 planning 成本是「拿 exclusive lock × 複製全部 part × 線性掃全部 part」，而這個成本完全長在 total part 數上，且被併發放大。schema 改動把 total part 數從 3 萬推到 16 萬，等於把這條隊伍的單人通過時間乘了五倍以上，再乘上幾百個併發查詢——延遲就這樣爆出來。</p>
+
+  <p>值得停下來想一層：這是一個「合理的設計在規模變化下失效」的經典案例，而不是誰寫錯了 code。在 part 數只有幾千、partition key 只有 <code>(day)</code> 的年代，「planning 時複製整個 parts vector」是完全可以接受的——複製幾千個 pointer 是微不足道的成本，exclusive lock 的持有時間短到 contention 可以忽略。是 partition key 改動同時推高了 part 數，才讓這個一直存在、一直沒事的設計突然變成主要瓶頸。原本可以忽略的常數，乘上五倍規模跟幾百倍併發，就不再可以忽略。</p>
+
+  <p>為什麼一開始會用 exclusive lock？這不是疏忽，而是一個保守的預設。用 <code>std::mutex</code> 這種純互斥鎖是最簡單、最不容易出錯的選擇——它不需要區分讀者寫者、不需要擔心 reader 拿著 reference 的時候 vector 被 writer 改掉導致 iterator invalidation。「先複製一份再放手」這個 pattern 更是教科書級的防禦：在 lock 內把需要的東西完整 copy 出來，出了 lock 就只碰自己手上的 copy，徹底隔絕 concurrent mutation。這套組合在正確性上無懈可擊，在低 part 數下也夠快。它唯一的問題是：兩個假設——「lock 持有時間短」跟「複製成本低」——都默默綁在 part 數上，而沒有人在改 partition key 的時候重新檢查這兩個假設還成不成立。</p>
+
+  <p>把這個 contention 放到 Little's law 的框架看會更觸目。當 planning 階段被 exclusive lock 序列化，它實際上變成一個 capacity 為 1 的 service station——一次只服務一筆查詢。每筆查詢的服務時間 ∝ total part 數（複製 + 線性掃描），到達率是幾百筆併發查詢。當服務時間隨 part 數線性拉長、到達率不變，這個單 server 佇列的等待時間不是線性、而是往非線性的方向衝——一旦平均服務時間逼近平均到達間隔，佇列長度跟等待時間就會急遽發散。3 萬到 16 萬這一步，很可能就是把這個系統從「佇列穩定」推過了「佇列爆炸」的臨界點，這也解釋了為什麼劣化是「逐漸」然後「突然」感受到的。</p>
+
+  <h2>三個修復：shared_lock、共享 cached copy、binary search——各自解掉一段</h2>
+
+  <p>真因清楚之後，修復不是一個 patch，而是三個——因為前面的成本結構有三個獨立的來源，得分別處理。三個 fix 是疊加的：每一個解掉鏈條的一段，合起來才把 query duration 跟 part 數的相關性徹底打斷。下面的 tab 把三個 fix 各自「解了什麼、為什麼能解」拆開講。</p>
+
+  <figure class="vg-w-tabs-clickhouse-fixes">
+    <style>
+      .vg-w-tabs-clickhouse-fixes { display: grid; gap: var(--s-2); min-width: 0; overflow-x: hidden; }
+      .vg-w-tabs-clickhouse-fixes .panel { min-width: 0; }
+      .vg-w-tabs-clickhouse-fixes .panel pre { overflow-x: auto; max-width: 100%; -webkit-overflow-scrolling: touch; }
+      .vg-w-tabs-clickhouse-fixes .panel pre code { white-space: pre; display: block; }
+      .vg-w-tabs-clickhouse-fixes .panel p { font-family: var(--serif); font-size: var(--fs-sm); margin: 0 0 var(--s-2) 0; }
+      .vg-w-tabs-clickhouse-fixes input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-tabs-clickhouse-fixes .tabs { display: flex; gap: var(--s-2); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+      .vg-w-tabs-clickhouse-fixes .tab { font-family: var(--sans); font-size: var(--fs-sm); padding: var(--s-1) var(--s-2); cursor: pointer; color: var(--muted); min-height: 36px; display: inline-flex; align-items: center; }
+      .vg-w-tabs-clickhouse-fixes .panel { display: none; padding: var(--s-2) 0; }
+      .vg-w-tabs-clickhouse-fixes:has(#vg-w-tabs-clickhouse-fixes-t1:checked) .panel-1 { display: block; }
+      .vg-w-tabs-clickhouse-fixes:has(#vg-w-tabs-clickhouse-fixes-t1:checked) [for="vg-w-tabs-clickhouse-fixes-t1"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-clickhouse-fixes:has(#vg-w-tabs-clickhouse-fixes-t2:checked) .panel-2 { display: block; }
+      .vg-w-tabs-clickhouse-fixes:has(#vg-w-tabs-clickhouse-fixes-t2:checked) [for="vg-w-tabs-clickhouse-fixes-t2"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-clickhouse-fixes:has(#vg-w-tabs-clickhouse-fixes-t3:checked) .panel-3 { display: block; }
+      .vg-w-tabs-clickhouse-fixes:has(#vg-w-tabs-clickhouse-fixes-t3:checked) [for="vg-w-tabs-clickhouse-fixes-t3"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    </style>
+    <input type="radio" id="vg-w-tabs-clickhouse-fixes-t1" name="vg-w-tabs-clickhouse-fixes-sel" checked />
+    <input type="radio" id="vg-w-tabs-clickhouse-fixes-t2" name="vg-w-tabs-clickhouse-fixes-sel" />
+    <input type="radio" id="vg-w-tabs-clickhouse-fixes-t3" name="vg-w-tabs-clickhouse-fixes-sel" />
+    <div class="tabs" role="tablist">
+      <label class="tab" for="vg-w-tabs-clickhouse-fixes-t1">① shared_lock</label>
+      <label class="tab" for="vg-w-tabs-clickhouse-fixes-t2">② 共享 cached copy</label>
+      <label class="tab" for="vg-w-tabs-clickhouse-fixes-t3">③ binary search</label>
+    </div>
+    <div class="panel panel-1">
+      <p>解掉成本來源 ①：把 EXCLUSIVE lock 換成 <code>std::shared_lock</code>。planning 只讀 parts 清單、不改它，所以多筆查詢可以同時持有 shared lock 併發 plan；只有真正修改清單的 ingest／merge 才需要 exclusive。單行道變成多線道，序列化消失。</p>
+      <pre data-kind="pseudocode"><code>plan_query(query):
+  <em>// 修復前：exclusive——任兩筆查詢的 planning 互斥</em>
+  <em>// lock = parts_mutex.acquire_exclusive()</em>
+
+  <em>// 修復後：shared——讀者之間併發，只跟 writer 互斥</em>
+  lock = parts_mutex.acquire_shared()   <em>// std::shared_lock</em>
+  all_parts = copy(data.parts_vector)   <em>// ← ② 還沒解，仍在複製</em>
+  lock.release()
+  ...</code></pre>
+    </div>
+    <div class="panel panel-2">
+      <p>解掉成本來源 ②：消除每筆查詢的整個 vector 複製。改成維護一份 <strong>共享的 cached copy</strong>——讀操作直接引用這份共享 copy，只有 ingest／merge 修改清單時才重新產生它。planner 不再複製全部幾萬個 element，只複製過濾後的結果。原本一秒發生好幾百次的全 vector 複製，被一份共享指標取代。</p>
+      <pre data-kind="pseudocode"><code>plan_query(query):
+  lock = parts_mutex.acquire_shared()
+  <em>// 修復前：copy 整個 vector（幾萬個 element）</em>
+  <em>// all_parts = copy(data.parts_vector)</em>
+
+  <em>// 修復後：引用共享 cached snapshot，零複製</em>
+  snapshot = data.cached_parts_snapshot   <em>// 只在 ingest/merge 時重建</em>
+  lock.release()
+  relevant = filter(snapshot, query)       <em>// 只複製過濾後的結果</em>
+  return relevant</code></pre>
+    </div>
+    <div class="panel panel-3">
+      <p>解掉成本來源 ③：把線性掃描換成 binary search。partition key 的第一欄是 namespace，而 parts vector 是按 partition key 排序的——所以同一個 namespace 的 part 在 vector 裡是連續的一段。大多數查詢都帶 namespace predicate，於是可以用 binary search 直接定位到那一段、跳過其餘全部，不必線性掃過所有 part。這一刀「finally breaks correlation of query duration with the number of parts」——planning 成本不再隨 total part 數線性成長。</p>
+      <pre data-kind="pseudocode"><code><em>// parts vector 按 (namespace, day) 排序 → 同 namespace 連續</em>
+plan_query(query):
+  snapshot = data.cached_parts_snapshot
+  <em>// 修復前：線性掃過全部 part</em>
+  <em>// for part in snapshot: if matches(part): ...</em>
+
+  <em>// 修復後：binary search 定位 namespace 區段</em>
+  lo = lower_bound(snapshot, query.namespace)
+  hi = upper_bound(snapshot, query.namespace)
+  relevant = filter(snapshot[lo:hi], query.day)  <em>// 只看這一段</em>
+  return relevant
+  <em>// 掃描範圍 ∝ 該 namespace 的 part 數，不再 ∝ total part 數</em></code></pre>
+    </div>
+  </figure>
+
+  <p>三個 fix 的順序對應它們各自的數量級貢獻。第一個 shared_lock 是最戲劇性的——原文說它帶來「immediate dramatic reduction in query duration」，因為它直接消滅了序列化，幾百個併發查詢從排隊變成併行。第二個共享 cached copy 在 shared lock 之上再砍掉那個一秒好幾百次的全 vector 複製，原文形容是「another significant performance improvement」。第三個 binary search 是最後一刀、也是質變的一刀：前兩個 fix 讓 planning 更便宜，但 planning 成本仍然隱隱跟 total part 數有關（複製過濾結果、掃描範圍）；binary search 把掃描範圍從「全部 part」收到「該 namespace 的 part」，徹底切斷了那個相關性。三者合起來，最終 query duration 下降約 50%。</p>
+
+  <p>第一個 fix 的正確性值得單獨確認一下，因為「把 exclusive 換成 shared」聽起來太便宜、容易讓人懷疑是不是漏了什麼。<code>std::shared_lock</code> 配上 <code>std::shared_mutex</code> 的語意是：任意多個 reader 可以同時持有 shared lock，但 writer 要拿 exclusive lock 時必須等所有 reader 放手、且期間擋住新的 reader。這個切換之所以安全，前提是 planning 真的只讀不寫——它讀 parts 清單來做 pruning 決策，不會去動清單本身。修改清單的只有 ingest（append 新 part）跟 merge（換掉一批 part），這些操作繼續拿 exclusive。所以這個 fix 的本質是：把一個「明明是 reader 卻被迫用 writer 鎖」的錯誤分類修正回來。它便宜，是因為原本就不該貴。</p>
+
+  <p>第二個 fix 的精髓在「誰付複製的代價」這個重新分配。修復前是每個 reader 各自複製一份完整 vector——複製次數 ∝ 查詢頻率（一秒幾百次），每次 ∝ part 總數。改成共享 cached copy 之後，這份 snapshot 只在「清單真的被改動時」由 writer 重建一次——重建頻率 ∝ ingest／merge 頻率，遠低於查詢頻率。reader 端從「複製整個 vector」降級成「複製一個指向 snapshot 的 shared pointer」，幾乎零成本。這是一個典型的 read-mostly 結構優化：當讀遠多於寫，就把成本從每次讀挪到每次寫，因為寫少得多。代價是一點點 memory（多持有一份 snapshot 直到舊 reader 全部放手）跟 reference counting 的開銷，相對於省下的複製，微不足道。</p>
+
+  <p>第三個 fix 是唯一改變漸進複雜度的那個，也是唯一真正「打斷相關性」的那個。前兩個 fix 把 planning 的常數係數砍小了，但 planning 仍然要 <code>O(total parts)</code> 線性掃過 snapshot 才能挑出該讀的 part——這條 <code>O(n)</code> 跟 total part 數的線性關係還在。binary search 利用了一個結構事實：parts vector 是按 partition key 排序的，而 partition key 的第一欄就是 namespace，所以同一個 namespace 的 part 在 vector 裡天然連續。<code>lower_bound</code>／<code>upper_bound</code> 兩次 <code>O(log n)</code> 定位出該 namespace 的區段邊界，之後只在這個區段內過濾。掃描量從「total part 數」降成「該 namespace 的 part 數」——這才是把曲線壓平的那一刀，因為它讓 planning 成本只跟「你自己 namespace 的 part」有關，跟「叢集裡其他人的 part」徹底脫鉤。這正是 hero 圖裡切到 25.11 模式時、紅線貼著綠線走的數學原因。</p>
+
+  <p>這三個 patch 全進了 ClickHouse 上游、收在 PR #85535、隨 25.11 釋出。最有說服力的驗證來自時間：修復之後的幾個月，這個叢集的 part 數從 16 萬繼續往上爬，但 query duration 維持穩定——「stable thanks to the optimizations we made」。這正是「打斷相關性」這句話的實證：part 還在長，延遲卻不再跟著長。一個原本會隨規模惡化的系統，被改成了規模無感。</p>
+
+  <p>值得補一句誠實的 footnote：part 數繼續膨脹並非全無代價。原文提到 part 數的成長在 ZooKeeper 的 metadata tracking 上製造了次級問題——per-namespace partitioning 這個 schema 選擇在更大規模下仍可能撞牆，目前的優化只是換來「significant breathing room」。換句話說，這三個 patch 治好了 planner 這一段，但 partition key 把 part 數推高的根本壓力還在，只是被推到了下一個 bottleneck。這也是大型系統 debugging 的常態：你解掉的往往不是最終形態的問題，而是當下擋路的那一個。</p>
+
+  <p>把這個 fix 放回工程 leader 的決策視角，它帶來兩個可以馬上拿去用的判斷。第一，如果你在跑大型 ClickHouse 且考慮在 partition key 加一個高 cardinality 的維度（namespace、tenant、user bucket），先確認你的版本 ≥ 25.11——否則 part 膨脹會透過 planner mutex 反咬，而且症狀會偽裝成「莫名其妙的全域變慢」、所有單查詢指標都正常。第二，更通用的一條：任何「全域共享狀態 + 每次操作都複製它」的設計，在低基數時是免費的、在高基數時是炸彈。複製成本跟 lock 持有時間都長在那個全域狀態的大小上，而那個大小往往不在你這條 code path 的控制範圍內。</p>
+
+  <p class="vg-deep-closer"><strong>Take-away</strong>：當 latency 高但 CPU 沒滿、所有單查詢指標都正常、唯一跟延遲相關的是某個全域 counter（這裡是 total part 數），別再盯著 CPU flame graph 上最高的那根——換 off-CPU／wall-clock profiling 把「正在等」的 thread 算進來，瓶頸十之八九是一把你沒注意到的 lock。stress-test 要測的是 realistic concurrency 下的 locking 行為，不只是單查詢的 selectivity。</p>
+</div>
