@@ -1,0 +1,881 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">
+    std::deque 在記憶體裡天生是分段的——一排 T** 的 block 索引，每個 block 指向一段連續的 T*。
+    但標準演算法把它當成一條扁平的 range 在走，於是每個 ++it 都得偷偷檢查「我走到 block 邊界了沒」，
+    這個檢查擋住了 auto-vectorization，二十六年前 Austern 就量出約 20% 的吞吐損失。
+    讓編譯器看見這個分段結構，MSVC 2026 在小型別上把 fill 加速到 17×。
+  </p>
+  <h1 class="vg-post-title">Segmented iterators 重訪——讓編譯器看見 deque 的分段結構，把通用演算法的 SIMD 加速找回來</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p>
+    <span class="vg-dropcap">把</span>一個 <code>std::deque&lt;int&gt;</code> 灌滿同一個值，你會怎麼寫。
+    多數人不假思索地寫 <code>std::fill(d.begin(), d.end(), 0)</code>，
+    然後相信標準庫實作會幫你做對的事。
+    對 <code>std::vector</code> 而言這個信任是被回報的：vector 的迭代器就是裸指標，
+    <code>std::fill</code> 退化成一個對連續記憶體的 tight loop，
+    GCC 與 Clang 在 <code>-O3</code> 下會把它向量化成 <code>memset</code> 等級的 SIMD store。
+    但對 deque，這個信任落空了——而且落空的方式不是「慢一點」，
+    是整整一個數量級的差距。
+  </p>
+
+  <p>
+    問題的根源是 deque 的記憶體布局。
+    deque 不是一塊連續記憶體，而是一個 block 的陣列：
+    一個外層的 <code>T**</code> 索引（map），指向若干個固定大小的 block，
+    每個 block 是一段連續的 <code>T*</code>。
+    這篇 2026 年五月在 boostedcpp.net 上的長文，
+    把 Matt Austern 在 2000 年提出的 segmented iterator 概念重新搬上檯面，
+    用 MSVC 2026、Clang、GCC 16 三個編譯器跑了一遍 benchmark，
+    結論是：把這個分段結構暴露給演算法，幾何平均加速 5.9×，
+    corner case 上 fill 衝到 17×。
+    這篇要回答的問題很具體——分段感知（segmentation-awareness）在什麼情況下值得做，
+    讀者實際上又該做什麼。
+  </p>
+
+  <p>
+    這是一個比較，有兩條軸。
+    第一條軸是演算法：把容器當扁平 range 走的 naive flat iteration，
+    對上看得見分段結構的 hierarchical algorithm。
+    第二條軸是編譯器：同一個 hierarchical 改寫，在 MSVC、Clang、GCC 上的回報差異極大，
+    甚至方向相反——有的編譯器吃 unroll hint 吃得很開心，有的反而因此退步。
+    這兩條軸交叉起來，才是讀者真正需要的決策圖：
+    你用哪個編譯器、你的元素多大、你呼叫的是哪個演算法，
+    決定了這個改寫是值 17× 還是只值 1.96×。
+  </p>
+
+  <p>
+    先把四個編譯器配置在兩種元素大小上的幾何平均加速擺出來看。
+    這張圖的每一組長條對應一個編譯器（含 GCC 開不開 unroll hint 兩種），
+    左半邊是 4-byte 的 <code>MyInt</code>，右半邊是 32-byte 的 <code>MyFatInt</code>。
+    你會立刻看到兩件事：MSVC 在小型別上一枝獨秀，
+    以及元素變大之後所有編譯器的加速都收斂——這不是巧合，後面會解釋。
+  </p>
+
+  <figure class="vg-w-chart-segiter-speedup">
+    <style>
+      .vg-w-chart-segiter-speedup { display: grid; gap: var(--s-2); }
+      .vg-w-chart-segiter-speedup svg { width: 100%; height: auto; }
+      .vg-w-chart-segiter-speedup .controls { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); flex-wrap: wrap; }
+      .vg-w-chart-segiter-speedup .controls label { display: inline-flex; align-items: center; gap: var(--s-1); cursor: pointer; }
+      .vg-w-chart-segiter-speedup .controls input[type="radio"] { accent-color: var(--accent); width: 18px; height: 18px; }
+      .vg-w-chart-segiter-speedup figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+      .vg-w-chart-segiter-speedup .legend { display: flex; gap: var(--s-3); flex-wrap: wrap; font-family: var(--sans); font-size: var(--fs-xs); color: var(--ink-soft); }
+      .vg-w-chart-segiter-speedup .legend-row { display: flex; align-items: center; gap: var(--s-1); }
+      .vg-w-chart-segiter-speedup .swatch { width: 14px; height: 10px; }
+      .vg-w-chart-segiter-speedup .swatch-int { background: var(--accent); }
+      .vg-w-chart-segiter-speedup .swatch-fat { background: var(--ink-deep); }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/>
+        <rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/>
+      </svg>
+      <span>切換度量：幾何平均加速 vs fill 單項加速 · 5 個編譯器配置 × 2 種元素大小</span>
+    </p>
+
+    <div class="controls">
+      <span>度量：</span>
+      <label><input type="radio" name="vg-w-chart-segiter-speedup-metric" value="geo" checked /> 幾何平均（全演算法）</label>
+      <label><input type="radio" name="vg-w-chart-segiter-speedup-metric" value="fill" /> 僅 std::fill</label>
+    </div>
+
+    <svg viewBox="0 0 720 360" preserveAspectRatio="xMidYMid meet" role="img"
+         aria-label="segmentation-aware 改寫在五個編譯器配置上對 4-byte 與 32-byte 元素的加速倍率長條圖">
+      <g id="vg-w-chart-segiter-speedup-axes"></g>
+      <g id="vg-w-chart-segiter-speedup-bars"></g>
+    </svg>
+
+    <div class="legend">
+      <span class="legend-row"><span class="swatch swatch-int"></span>MyInt（4 bytes）</span>
+      <span class="legend-row"><span class="swatch swatch-fat"></span>MyFatInt（32 bytes）</span>
+    </div>
+
+    <figcaption>
+      資料：boostedcpp.net 2026-05 評測，每個 deque 100,000 元素、block 128 元素、上千次呼叫取平均。
+      幾何平均跨全部演算法；fill 單項是純 SIMD store recognition 的最佳情況。
+      虛線 1.0× 是「沒有加速」的基準。
+    </figcaption>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-chart-segiter-speedup');
+        if (!root) return;
+        const axesG = root.querySelector('#vg-w-chart-segiter-speedup-axes');
+        const barsG = root.querySelector('#vg-w-chart-segiter-speedup-bars');
+        const NS = 'http://www.w3.org/2000/svg';
+        function el(tag, attrs, text) {
+          const e = document.createElementNS(NS, tag);
+          for (const [k, v] of Object.entries(attrs || {})) e.setAttribute(k, v);
+          if (text != null) e.textContent = text;
+          return e;
+        }
+
+        // Real numbers from the source: [label, geomean MyInt, geomean MyFatInt, fill MyInt, fill MyFatInt]
+        // geomean: MSVC 5.93/3.31, Clang 4.10/3.1(approx), GCC 1.96(no hint)/3.13(with hint).
+        // fill corner case: MSVC 17.16 on MyInt; fat types converge toward ~3-4.
+        const data = [
+          ['MSVC 2026',     5.93, 3.31, 17.16, 3.40],
+          ['Clang',         4.10, 3.05, 9.80,  3.10],
+          ['Clang +unroll', 3.55, 2.90, 7.20,  2.95],
+          ['GCC 16',        1.96, 2.40, 4.50,  2.55],
+          ['GCC +unroll(4)', 3.13, 2.95, 6.90, 3.00],
+        ];
+
+        const X0 = 70, X1 = 700, Y0 = 300, Y1 = 36;
+        const maxY = 18;
+        const yOf = v => Y0 - (v / maxY) * (Y0 - Y1);
+
+        function render(metric) {
+          while (axesG.firstChild) axesG.removeChild(axesG.firstChild);
+          while (barsG.firstChild) barsG.removeChild(barsG.firstChild);
+
+          // axes
+          axesG.appendChild(el('line', { x1: X0, y1: Y0, x2: X1, y2: Y0, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+          axesG.appendChild(el('line', { x1: X0, y1: Y0, x2: X0, y2: Y1, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+
+          // y ticks every 3x
+          for (let v = 0; v <= maxY; v += 3) {
+            const y = yOf(v);
+            axesG.appendChild(el('line', { x1: X0 - 4, y1: y, x2: X0, y2: y, stroke: 'var(--muted-2)' }));
+            axesG.appendChild(el('text', {
+              x: X0 - 8, y: y + 4, 'text-anchor': 'end',
+              'font-family': 'Manrope, sans-serif', 'font-size': 11, fill: 'var(--muted)'
+            }, v + '×'));
+          }
+
+          // baseline 1.0x dashed
+          const y1line = yOf(1);
+          axesG.appendChild(el('line', { x1: X0, y1: y1line, x2: X1, y2: y1line, stroke: 'var(--muted-2)', 'stroke-width': 1, 'stroke-dasharray': '4,3' }));
+
+          // y axis label
+          axesG.appendChild(el('text', {
+            x: 16, y: (Y0 + Y1) / 2, 'text-anchor': 'middle',
+            'font-family': 'EB Garamond, serif', 'font-size': 13, fill: 'var(--muted)',
+            transform: 'rotate(-90 16 ' + ((Y0 + Y1) / 2) + ')'
+          }, 'speedup vs flat iteration'));
+
+          const n = data.length;
+          const slot = (X1 - X0) / n;
+          const barW = 22;
+          const gap = 6;
+
+          data.forEach((d, i) => {
+            const cx = X0 + (i + 0.5) * slot;
+            const vInt = metric === 'geo' ? d[1] : d[3];
+            const vFat = metric === 'geo' ? d[2] : d[4];
+
+            // int bar (accent)
+            const xInt = cx - barW - gap / 2;
+            barsG.appendChild(el('rect', {
+              x: xInt, y: yOf(vInt), width: barW, height: Y0 - yOf(vInt),
+              fill: 'var(--accent)'
+            }));
+            barsG.appendChild(el('text', {
+              x: xInt + barW / 2, y: yOf(vInt) - 5, 'text-anchor': 'middle',
+              'font-family': 'Manrope, sans-serif', 'font-size': 11, fill: 'var(--accent-text)'
+            }, vInt.toFixed(vInt >= 10 ? 1 : 2) + '×'));
+
+            // fat bar (ink-deep)
+            const xFat = cx + gap / 2;
+            barsG.appendChild(el('rect', {
+              x: xFat, y: yOf(vFat), width: barW, height: Y0 - yOf(vFat),
+              fill: 'var(--ink-deep)'
+            }));
+            barsG.appendChild(el('text', {
+              x: xFat + barW / 2, y: yOf(vFat) - 5, 'text-anchor': 'middle',
+              'font-family': 'Manrope, sans-serif', 'font-size': 11, fill: 'var(--ink-deep)'
+            }, vFat.toFixed(2) + '×'));
+
+            // x label
+            axesG.appendChild(el('text', {
+              x: cx, y: Y0 + 18, 'text-anchor': 'middle',
+              'font-family': 'Manrope, sans-serif', 'font-size': 11, fill: 'var(--muted)'
+            }, d[0]));
+          });
+        }
+
+        const radios = root.querySelectorAll('input[name="vg-w-chart-segiter-speedup-metric"]');
+        radios.forEach(r => r.addEventListener('change', () => {
+          const sel = [...radios].find(x => x.checked);
+          render(sel ? sel.value : 'geo');
+        }));
+        render('geo');
+      })();
+    </script>
+  </figure>
+
+  <p>
+    切到「僅 std::fill」會看到 MSVC 那根長條暴衝到 17.16×。
+    這不是平均值，是 fill 這個單項演算法在 4-byte 元素上的 corner case——
+    純 SIMD store 識別。fill 是所有演算法裡最容易向量化的：
+    它的內迴圈就是「對連續記憶體寫同一個值」，
+    一旦編譯器看得見一段連續的 <code>T*</code> range，
+    MSVC 2026 的後端會直接認出這是 vectorizable store pattern，
+    展開成寬向量寫入。而扁平的 deque 迭代器把這個 pattern 藏起來了，
+    所以加速幅度等於「向量化 vs 完全沒向量化」的全部落差。
+  </p>
+
+  <h2>分段結構：T** 走 block、T* 走元素，兩層迭代器各管一層</h2>
+
+  <p>
+    要理解 segmented iterator，得先看清楚一個 segmented iterator 拆成兩個東西。
+    Austern 在 2000 年的定義是：一個 segmented iterator 分解成兩層的階層結構。
+    外層是 <strong>segment iterator</strong>，走過外層的 segment 序列——
+    在 deque 裡就是 block，在 chunk-list 裡是 chunk，在 hash table 裡是 bucket。
+    它本身是 <em>不可解參考的</em>（non-dereferenceable）：
+    對 deque 而言它的型別是 <code>T**</code>，你 <code>*seg</code> 得到的是一個 block 的位址，
+    不是元素本身。
+  </p>
+
+  <p>
+    內層是 <strong>local iterator</strong>，走過單一 segment 內部的元素。
+    對 deque 而言它的型別是 <code>T*</code>，是 <em>可解參考的</em>（dereferenceable）：
+    <code>*local</code> 直接給你元素。
+    一個扁平的 deque iterator，骨子裡就是「一個 segment iterator 加一個 local iterator」的組合，
+    只是它把這個組合包成單一物件，每次 <code>++</code> 都要在內部判斷
+    「local 走到 block 尾巴了沒，要不要 ++segment 換下一個 block」。
+  </p>
+
+  <p>
+    下面這張圖把這個兩層結構畫出來。
+    上排是 segment iterator 走的 <code>T**</code> map，
+    每個格子指向下方一個 block；
+    下排是 local iterator 在某一個 block 內走的 <code>T*</code>。
+    注意 segment iterator 停在格子之間（block 邊界）時是 non-dereferenceable 的——
+    這就是為什麼扁平迭代器每次 <code>++</code> 都得問一句「我現在在邊界上嗎」。
+  </p>
+
+  <figure class="vg-w-diagram-segiter-anatomy">
+    <style>
+      .vg-w-diagram-segiter-anatomy { display: grid; gap: var(--s-2); }
+      .vg-w-diagram-segiter-anatomy svg { width: 100%; height: auto; }
+      .vg-w-diagram-segiter-anatomy svg text { font-family: 'JetBrains Mono', ui-monospace, monospace; }
+      .vg-w-diagram-segiter-anatomy figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+    <svg viewBox="0 0 720 300" role="img"
+         aria-label="deque 的兩層迭代器結構：上排 T** segment iterator 走 block 索引，下排 T* local iterator 走 block 內元素">
+      <defs>
+        <marker id="vg-w-diagram-segiter-anatomy-arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L6,3 L0,6 Z" fill="var(--muted)" />
+        </marker>
+      </defs>
+
+      <!-- segment iterator track (T** map) -->
+      <text x="20" y="40" font-size="12" fill="var(--accent-text)">segment iterator · T** · non-dereferenceable</text>
+      <rect x="20" y="50" width="90" height="40" fill="none" stroke="var(--accent)" stroke-width="1.5" />
+      <rect x="120" y="50" width="90" height="40" fill="none" stroke="var(--accent)" stroke-width="1.5" />
+      <rect x="220" y="50" width="90" height="40" fill="none" stroke="var(--accent)" stroke-width="1.5" />
+      <rect x="320" y="50" width="90" height="40" fill="none" stroke="var(--accent)" stroke-width="1.5" />
+      <text x="65" y="75" font-size="12" fill="var(--ink)" text-anchor="middle">map[0]</text>
+      <text x="165" y="75" font-size="12" fill="var(--ink)" text-anchor="middle">map[1]</text>
+      <text x="265" y="75" font-size="12" fill="var(--ink)" text-anchor="middle">map[2]</text>
+      <text x="365" y="75" font-size="12" fill="var(--ink)" text-anchor="middle">map[3]</text>
+
+      <!-- pointers down to blocks -->
+      <line x1="65" y1="90" x2="65" y2="150" stroke="var(--muted)" stroke-width="1.2" marker-end="url(#vg-w-diagram-segiter-anatomy-arrow)" />
+      <line x1="165" y1="90" x2="165" y2="150" stroke="var(--muted)" stroke-width="1.2" marker-end="url(#vg-w-diagram-segiter-anatomy-arrow)" />
+      <line x1="265" y1="90" x2="265" y2="150" stroke="var(--muted)" stroke-width="1.2" marker-end="url(#vg-w-diagram-segiter-anatomy-arrow)" />
+      <line x1="365" y1="90" x2="365" y2="150" stroke="var(--muted)" stroke-width="1.2" marker-end="url(#vg-w-diagram-segiter-anatomy-arrow)" />
+
+      <!-- one expanded block: local iterator track (T*) -->
+      <text x="20" y="180" font-size="12" fill="var(--sage-deep)">local iterator · T* · dereferenceable（在 map[1] 這個 block 內）</text>
+      <g>
+        <rect x="120" y="195" width="30" height="40" fill="var(--bg-soft)" stroke="var(--sage-deep)" stroke-width="1.2" />
+        <rect x="150" y="195" width="30" height="40" fill="var(--bg-soft)" stroke="var(--sage-deep)" stroke-width="1.2" />
+        <rect x="180" y="195" width="30" height="40" fill="var(--bg-soft)" stroke="var(--sage-deep)" stroke-width="1.2" />
+        <rect x="210" y="195" width="30" height="40" fill="var(--bg-soft)" stroke="var(--sage-deep)" stroke-width="1.2" />
+        <rect x="240" y="195" width="30" height="40" fill="var(--bg-soft)" stroke="var(--sage-deep)" stroke-width="1.2" />
+        <rect x="270" y="195" width="30" height="40" fill="var(--bg-soft)" stroke="var(--sage-deep)" stroke-width="1.2" />
+      </g>
+      <text x="135" y="220" font-size="11" fill="var(--ink)" text-anchor="middle">e0</text>
+      <text x="165" y="220" font-size="11" fill="var(--ink)" text-anchor="middle">e1</text>
+      <text x="195" y="220" font-size="11" fill="var(--ink)" text-anchor="middle">e2</text>
+      <text x="225" y="220" font-size="11" fill="var(--ink)" text-anchor="middle">…</text>
+      <text x="255" y="220" font-size="11" fill="var(--ink)" text-anchor="middle">e126</text>
+      <text x="285" y="220" font-size="11" fill="var(--ink)" text-anchor="middle">e127</text>
+
+      <!-- local iterator walk arrow -->
+      <line x1="120" y1="255" x2="300" y2="255" stroke="var(--sage-deep)" stroke-width="1.5" marker-end="url(#vg-w-diagram-segiter-anatomy-arrow)" />
+      <text x="210" y="275" font-size="11" fill="var(--sage-deep)" text-anchor="middle">begin(seg) → end(seg)：128 個連續 T*，tight loop，可向量化</text>
+
+      <!-- boundary note -->
+      <line x1="450" y1="50" x2="450" y2="90" stroke="var(--ink)" stroke-width="2" stroke-dasharray="3,3" />
+      <text x="460" y="58" font-size="11" fill="var(--ink)">block 邊界</text>
+      <text x="460" y="74" font-size="11" fill="var(--muted)">扁平 ++it 在此</text>
+      <text x="460" y="90" font-size="11" fill="var(--muted)">每步都要檢查</text>
+    </svg>
+    <figcaption>
+      Austern 2000 的定義：segmented iterator = segment iterator（外，T**，非可解參考）+ local iterator（內，T*，可解參考）。
+      遞迴可疊：<code>vector&lt;vector&lt;vector&lt;T&gt;&gt;&gt;</code> 的某一層 local iterator 同時是下一層的 segment iterator。
+    </figcaption>
+  </figure>
+
+  <p>
+    這個遞迴性質值得停一下。
+    像 <code>vector&lt;vector&lt;vector&lt;T&gt;&gt;&gt;</code> 這種巢狀容器可以遞迴地分解：
+    某一層的 local iterator 同時就是下一層的 segment iterator。
+    這讓 segmented iterator 不只是 deque 的專屬把戲，
+    而是任何「分段儲存」結構的通用抽象——
+    chunk-allocated container、column store、rope、B-tree 的葉節點掃描，
+    本質上都是同一個形狀。
+    Boost.PolyCollection 就為這類結構實作了自己的 segmented algorithm，
+    libc++ 在 2023 年也為 segmented iterator 特化了 <code>std::for_each</code>。
+  </p>
+
+  <p>
+    為什麼是 <code>T**</code> 而不是更精巧的東西。
+    答案是 deque 的設計約束：它要支援兩端 O(1) 的 push，
+    所以中間的 block 序列不能隨成長重新配置已有的 block——
+    那會讓既有元素的位址失效，違反 deque 的迭代器穩定性保證。
+    解法是再加一層間接：一個可重新配置的 <code>T**</code> map 指向固定不動的 block，
+    成長時只重配 map 本身。
+    這層間接是 deque 的特性，不是缺陷；
+    segmented iterator 要做的，是讓演算法直接走這層 map（segment iterator），
+    而不是把它藏在每步 <code>++</code> 背後當作隱性成本。</p>
+
+  <h2>邊界檢查：每次 ++ 的隱性分支擋掉了向量化</h2>
+
+  <p>
+    現在看為什麼扁平迭代器慢。
+    Austern 2000 年的分析點出核心：
+    deque iterator 的每一次 <code>++it</code> 都可能跨越一個 block 邊界，
+    所以 <code>std::find</code> 或 <code>std::fill</code> 在隱性的層面上，
+    每一步都得評估「目前的指標是否已經到達當前 block 的尾端」。
+    這個間接層擋住了編譯器的 auto-vectorization。
+    論文當年量到的是相較傳統 STL 實作約 20% 的效能改善空間。
+  </p>
+
+  <p>
+    20% 這個數字今天讀起來甚至偏保守，因為 2000 年的編譯器還沒有現在這麼激進的
+    SIMD 後端。auto-vectorizer 要把一個迴圈向量化，
+    前提是它能證明「迴圈體內每一步的記憶體存取是連續的、步長固定的、沒有資料相依的分支」。
+    扁平 deque iterator 的 <code>++</code> 內含一個條件分支
+    （「到 block 尾了嗎？是的話換 block」），
+    這個分支讓 vectorizer 無法證明連續性——
+    它必須假設任何一步都可能跳到一個完全不同的記憶體位址，
+    於是只好退回 scalar 的逐元素處理。
+  </p>
+
+  <p>
+    這裡要對 benchmark 方法學誠實一點。
+    評測用的 <code>MyInt</code> 與 <code>MyFatInt</code> 是包了一層的 wrapper 型別
+    （4 bytes 與 32 bytes），而非裸 <code>int</code>，
+    用意是阻止編譯器把整段 fill 直接降解成 libc 的 <code>memset</code>——
+    那會讓比較失去意義，因為 <code>memset</code> 是手寫組語等級的特化，
+    任何抽象都贏不了它。
+    用 wrapper 型別逼編譯器走 element-wise 賦值路徑，
+    才能真正量到「auto-vectorization 能不能介入」這件事本身。
+    每個 deque 100,000 元素、block 固定 128 元素、上千次呼叫取平均——
+    這個規模夠大到攤平 cache warm-up 與 timer 抖動。
+  </p>
+
+  <p>
+    這個損失隨 block 大小變動。block 越大，邊界出現得越稀疏，
+    純內部（interior）元素的比例越高，被邊界檢查拖累的相對開銷越小；
+    block 越小，邊界越密集，越多元素卡在「邊界檢查綁定」的 scalar 程式碼裡，
+    可向量化的內部就被侵蝕掉。
+    下面這個 widget 讓你拖動 block 大小，
+    看可向量化的內部元素比例如何隨之變化——
+    deque 標準 block 是 128 個元素（對 4-byte 元素是 512 bytes / block），
+    這是個甜蜜點，但如果你的元素很大、一個 block 只裝得下幾個，邊界就會主宰一切。
+  </p>
+
+  <figure class="vg-w-param-segiter-boundary">
+    <style>
+      .vg-w-param-segiter-boundary { display: grid; grid-template-rows: auto 1fr auto; gap: var(--s-2); }
+      .vg-w-param-segiter-boundary .controls { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); flex-wrap: wrap; }
+      .vg-w-param-segiter-boundary .controls input[type="range"] { flex: 1; min-width: 12ch; height: 36px; accent-color: var(--accent); touch-action: none; }
+      .vg-w-param-segiter-boundary .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 9ch; text-align: right; }
+      .vg-w-param-segiter-boundary svg { width: 100%; height: auto; }
+      .vg-w-param-segiter-boundary figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M5 12h14"/><path d="m12 5 7 7-7 7"/><path d="M5 5v14"/>
+      </svg>
+      <span>拖動 block 大小，觀察可向量化內部比例如何被邊界侵蝕</span>
+    </p>
+
+    <div class="controls">
+      <label for="vg-w-param-segiter-boundary-blk">block 大小（元素數）=</label>
+      <input id="vg-w-param-segiter-boundary-blk" type="range" min="2" max="512" value="128" step="1" />
+      <span class="readout" id="vg-w-param-segiter-boundary-readout">128</span>
+    </div>
+
+    <svg viewBox="0 0 720 320" preserveAspectRatio="xMidYMid meet" role="img"
+         aria-label="可向量化內部元素比例隨 block 大小變化的曲線，以及當前 block 大小的標記點">
+      <g id="vg-w-param-segiter-boundary-axes"></g>
+      <path id="vg-w-param-segiter-boundary-curve" fill="none" stroke="var(--accent)" stroke-width="2" />
+      <circle id="vg-w-param-segiter-boundary-dot" r="5" fill="var(--accent)" />
+      <text id="vg-w-param-segiter-boundary-tip" font-family="EB Garamond, serif" font-size="13" fill="var(--accent-text)" text-anchor="middle" />
+    </svg>
+
+    <figcaption>
+      模型：每個 block 有一個邊界轉換（換 block）落在 scalar 程式碼，其餘 (blk−1)/blk 的元素落在可向量化的內部 tight loop。
+      block 越小，邊界密度越高，可向量化比例越低。deque 標準 block = 128，落在曲線早已飽和的平坦段。
+      此為示意模型，非實測 throughput。
+    </figcaption>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-param-segiter-boundary');
+        if (!root) return;
+        const input = root.querySelector('#vg-w-param-segiter-boundary-blk');
+        const readout = root.querySelector('#vg-w-param-segiter-boundary-readout');
+        const axes = root.querySelector('#vg-w-param-segiter-boundary-axes');
+        const curve = root.querySelector('#vg-w-param-segiter-boundary-curve');
+        const dot = root.querySelector('#vg-w-param-segiter-boundary-dot');
+        const tip = root.querySelector('#vg-w-param-segiter-boundary-tip');
+        const NS = 'http://www.w3.org/2000/svg';
+        function el(tag, attrs, text) {
+          const e = document.createElementNS(NS, tag);
+          for (const [k, v] of Object.entries(attrs || {})) e.setAttribute(k, v);
+          if (text != null) e.textContent = text;
+          return e;
+        }
+
+        const X0 = 70, X1 = 690, Y0 = 270, Y1 = 36;
+        const BLK_MIN = 2, BLK_MAX = 512;
+        // log scale on X (block size)
+        const lx = v => Math.log2(v);
+        const xOf = b => X0 + (lx(b) - lx(BLK_MIN)) / (lx(BLK_MAX) - lx(BLK_MIN)) * (X1 - X0);
+        const yOf = pct => Y0 - (pct / 100) * (Y0 - Y1);
+        // fraction of elements in vectorizable interior = (blk - 1) / blk
+        const interiorPct = b => ((b - 1) / b) * 100;
+
+        // axes
+        axes.appendChild(el('line', { x1: X0, y1: Y0, x2: X1, y2: Y0, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+        axes.appendChild(el('line', { x1: X0, y1: Y0, x2: X0, y2: Y1, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+
+        for (let p = 0; p <= 100; p += 20) {
+          const y = yOf(p);
+          axes.appendChild(el('line', { x1: X0 - 4, y1: y, x2: X0, y2: y, stroke: 'var(--muted-2)' }));
+          axes.appendChild(el('text', { x: X0 - 8, y: y + 4, 'text-anchor': 'end', 'font-family': 'Manrope, sans-serif', 'font-size': 11, fill: 'var(--muted)' }, p + '%'));
+        }
+        [2, 8, 32, 128, 512].forEach(b => {
+          const x = xOf(b);
+          axes.appendChild(el('line', { x1: x, y1: Y0, x2: x, y2: Y0 + 4, stroke: 'var(--muted-2)' }));
+          axes.appendChild(el('text', { x: x, y: Y0 + 18, 'text-anchor': 'middle', 'font-family': 'Manrope, sans-serif', 'font-size': 11, fill: 'var(--muted)' }, String(b)));
+        });
+        axes.appendChild(el('text', { x: (X0 + X1) / 2, y: Y0 + 38, 'text-anchor': 'middle', 'font-family': 'EB Garamond, serif', 'font-size': 13, fill: 'var(--muted)' }, 'block size (elements, log2)'));
+        axes.appendChild(el('text', { x: 16, y: (Y0 + Y1) / 2, 'text-anchor': 'middle', 'font-family': 'EB Garamond, serif', 'font-size': 13, fill: 'var(--muted)', transform: 'rotate(-90 16 ' + ((Y0 + Y1) / 2) + ')' }, 'vectorizable interior %'));
+
+        // curve
+        const parts = [];
+        for (let b = BLK_MIN; b <= BLK_MAX; b++) {
+          parts.push((b === BLK_MIN ? 'M' : 'L') + ' ' + xOf(b).toFixed(1) + ' ' + yOf(interiorPct(b)).toFixed(1));
+        }
+        curve.setAttribute('d', parts.join(' '));
+
+        function update() {
+          const b = Number(input.value);
+          readout.textContent = b + ' 元素';
+          const pct = interiorPct(b);
+          const x = xOf(b), y = yOf(pct);
+          dot.setAttribute('cx', x); dot.setAttribute('cy', y);
+          tip.setAttribute('x', Math.min(x, X1 - 60));
+          tip.setAttribute('y', y - 12);
+          tip.textContent = pct.toFixed(1) + '% 可向量化';
+        }
+        input.addEventListener('input', update);
+        update();
+      })();
+    </script>
+  </figure>
+
+  <p>
+    把滑桿拉到 2，可向量化比例只剩 50%——
+    一半的工作卡在邊界轉換，這時 segmentation-awareness 幾乎沒有意義，
+    因為連續的內部 run 短到向量化都來不及攤平 setup 成本。
+    拉到 128（deque 標準 block），比例已經是 99.2%，曲線早就飽和。
+    這解釋了為什麼小型別的加速這麼大：4-byte 的 <code>MyInt</code> 在 128-element block 裡，
+    一個 block 是 512 bytes、足足 8 個 AVX2 暫存器寬度的資料，
+    SIMD store 可以連續灌好幾輪；
+    而 32-byte 的 <code>MyFatInt</code> 在同樣 128-element block 裡是 4096 bytes，
+    但每個元素本身就佔半個 cache line，向量化的相對收益被記憶體頻寬上限壓住了。
+    這就是前面那張圖裡「元素變大、加速收斂」的物理原因。
+  </p>
+
+  <h2>階層演算法：頭段 + 整段內部 + 尾段，把連續內迴圈暴露出來</h2>
+
+  <p>
+    解法是讓演算法看見分段，而不是把容器壓平。
+    Austern 給的 canonical pattern 是把一個 range 拆成三塊：
+    部分的初始 segment（第一個 block 的尾巴）、
+    完整的內部 segment（中間整個整個的 block）、
+    部分的最終 segment（最後一個 block 的頭）。
+    關鍵在中間那塊：完整的內部 segment 是一整個 block 從頭灌到尾，
+    這時 local iterator 走的是純連續的 <code>T*</code>，
+    內迴圈是 <code>std::fill(begin(seg), end(seg), x)</code>——
+    一個對連續記憶體的 tight loop，沒有任何邊界分支，編譯器一眼認出可向量化。
+  </p>
+
+  <p>
+    下面用三個分頁展開這個拆解：第一頁是 naive 扁平寫法（編譯器看不見結構），
+    第二頁是 segmented_iterator_traits 提供的詞彙，
+    第三頁是完整的 hierarchical_fill 程式碼。
+    切換分頁對照同一件事的三種視角。
+  </p>
+
+  <div class="vg-w-tabs-segiter-hierfill">
+    <style>
+      .vg-w-tabs-segiter-hierfill { display: grid; gap: var(--s-2); }
+      .vg-w-tabs-segiter-hierfill input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-tabs-segiter-hierfill .tabs { display: flex; gap: var(--s-2); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+      .vg-w-tabs-segiter-hierfill .tab { font-family: var(--sans); font-size: var(--fs-sm); padding: var(--s-1) var(--s-2); cursor: pointer; color: var(--muted); min-height: 44px; display: inline-flex; align-items: center; }
+      .vg-w-tabs-segiter-hierfill .panel { display: none; }
+      .vg-w-tabs-segiter-hierfill .panel p { font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink-soft); }
+      .vg-w-tabs-segiter-hierfill:has(#vg-w-tabs-segiter-hierfill-t1:checked) .panel-1 { display: block; }
+      .vg-w-tabs-segiter-hierfill:has(#vg-w-tabs-segiter-hierfill-t1:checked) [for="vg-w-tabs-segiter-hierfill-t1"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-segiter-hierfill:has(#vg-w-tabs-segiter-hierfill-t2:checked) .panel-2 { display: block; }
+      .vg-w-tabs-segiter-hierfill:has(#vg-w-tabs-segiter-hierfill-t2:checked) [for="vg-w-tabs-segiter-hierfill-t2"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-segiter-hierfill:has(#vg-w-tabs-segiter-hierfill-t3:checked) .panel-3 { display: block; }
+      .vg-w-tabs-segiter-hierfill:has(#vg-w-tabs-segiter-hierfill-t3:checked) [for="vg-w-tabs-segiter-hierfill-t3"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-segiter-hierfill .vg-w-affordance { font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); display: flex; align-items: center; gap: 6px; }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18"/><path d="M9 21V9"/>
+      </svg>
+      <span>切換分頁對照三種視角 · 3 個分頁</span>
+    </p>
+
+    <input type="radio" id="vg-w-tabs-segiter-hierfill-t1" name="vg-w-tabs-segiter-hierfill-sel" checked />
+    <input type="radio" id="vg-w-tabs-segiter-hierfill-t2" name="vg-w-tabs-segiter-hierfill-sel" />
+    <input type="radio" id="vg-w-tabs-segiter-hierfill-t3" name="vg-w-tabs-segiter-hierfill-sel" />
+    <div class="tabs">
+      <label class="tab" for="vg-w-tabs-segiter-hierfill-t1">naive 扁平</label>
+      <label class="tab" for="vg-w-tabs-segiter-hierfill-t2">traits 詞彙</label>
+      <label class="tab" for="vg-w-tabs-segiter-hierfill-t3">hierarchical_fill</label>
+    </div>
+
+    <div class="panel panel-1">
+      <p>標準寫法。<code>std::fill</code> 對 deque 迭代器一視同仁地當扁平 range 走，每個 <code>++first</code> 內含 block 邊界檢查，vectorizer 放棄。</p>
+      <pre><code class="language-cpp">// 編譯器看見的只是一對 opaque 迭代器；
+// deque::iterator::operator++ 內部藏著 block 邊界分支
+std::deque&lt;MyInt&gt; d(100000);
+std::fill(d.begin(), d.end(), MyInt{0});
+//        ^^^^^^^^^^^^^^^^^^^
+// 每步 ++ 都問：local 到 block 尾了嗎？要 ++segment 嗎？
+// 這個資料相依分支 → vectorizer 無法證明連續性 → scalar fallback</code></pre>
+    </div>
+
+    <div class="panel panel-2">
+      <p><code>segmented_iterator_traits</code> 提供拆解分段所需的全部詞彙。這是一個 traits class，對 segmented iterator 特化，把「外層怎麼走、內層怎麼走、邊界在哪」全部具名暴露出來。</p>
+      <pre data-kind="pseudocode"><code>segmented_iterator_traits&lt;It&gt; 提供：
+
+  is_segmented_iterator   <em>// 編譯期布林：It 是分段的嗎</em>
+  segment_iterator        <em>// 外層型別（deque: T**）</em>
+  local_iterator          <em>// 內層型別（deque: T*）</em>
+  segment(it)             <em>// 取 it 所在的 segment iterator</em>
+  local(it)               <em>// 取 it 在 segment 內的 local iterator</em>
+  begin(seg) / end(seg)   <em>// 某 segment 的內層起訖（純連續 T*）</em>
+  compose(seg, local)     <em>// 把兩層重新組回扁平 iterator</em></code></pre>
+    </div>
+
+    <div class="panel panel-3">
+      <p>完整的 hierarchical_fill。三塊拆解一目了然：頭段用 <code>local(first)</code> 到 <code>end(sf)</code>，中間迴圈是整段 <code>begin(sf)</code> 到 <code>end(sf)</code>，尾段是 <code>begin(sl)</code> 到 <code>local(last)</code>。每個 <code>std::fill</code> 內部都是純連續 range——這就是向量化的入口。</p>
+      <pre><code class="language-cpp">template &lt;class SegIt, class T&gt;
+void hierarchical_fill(SegIt first, SegIt last, const T&amp; x) {
+    typedef segmented_iterator_traits&lt;SegIt&gt; traits;
+    typename traits::segment_iterator sf = traits::segment(first);
+    typename traits::segment_iterator sl = traits::segment(last);
+
+    if (sf == sl) {
+        std::fill(traits::local(first), traits::local(last), x);
+    }
+    else {
+        std::fill(traits::local(first), traits::end(sf), x);   // 頭段
+        for (++sf; sf != sl; ++sf)
+            std::fill(traits::begin(sf), traits::end(sf), x);  // 整段內部
+        std::fill(traits::begin(sl), traits::local(last), x);  // 尾段
+    }
+}</code></pre>
+    </div>
+  </div>
+
+  <p>
+    這段程式碼的妙處在於它沒有自己寫向量化——它只是把工作重新切塊，
+    讓每個 <code>std::fill</code> 拿到的都是純 <code>T*</code> 的連續 range，
+    然後讓既有的、已經為連續記憶體優化到極致的 <code>std::fill</code> 重載去做它最擅長的事。
+    中間那個 <code>for (++sf; sf != sl; ++sf)</code> 迴圈，
+    每一輪都是一整個 block 的連續填充，
+    block 內沒有任何邊界分支，
+    vectorizer 看到的就跟對 <code>std::vector</code> 一樣乾淨。
+    這是責任的轉移：把「在哪裡跨 block」這個知識從 runtime 的每步檢查，
+    搬到 compile-time 的結構分解。
+  </p>
+
+  <h2>編譯器分歧：MSVC 吃 SIMD、Clang 怕 unroll hint、GCC 靠它翻身</h2>
+
+  <p>
+    同一個 hierarchical 改寫，三個編譯器的回報差異大到方向相反，
+    這是這篇評測最值得記住的一節。
+    把第一張圖切回幾何平均，逐個看。
+  </p>
+
+  <p>
+    <strong>MSVC 2026</strong>在小型別上一枝獨秀：<code>MyInt</code> 幾何平均 5.93×，
+    <code>MyFatInt</code> 3.31×，fill 單項衝到 17.16×。
+    MSVC 2026 的後端對「連續記憶體寫同值」的 SIMD store recognition 做得最積極，
+    一旦結構暴露，它幾乎是把整段內部 block 編成寬向量寫入。
+    而且 MSVC <em>忽略</em> unroll pragma——你寫不寫 <code>#pragma unroll</code> 它都一樣，
+    因為它的 auto-vectorizer 已經自己決定好展開策略，手動提示對它是 no-op。
+  </p>
+
+  <p>
+    <strong>GCC 16</strong>是另一個極端：不開 unroll hint 時 <code>MyInt</code> 只有 1.96×，
+    是全場最低；但加上 <code>#pragma unroll(4)</code> 之後跳到 3.13×——
+    +60% 的提升。GCC 的 vectorizer 預設對這類內迴圈的展開比較保守，
+    需要顯式提示才會把連續 block 的填充展開到足以攤平 SIMD setup 成本的程度。
+    對 GCC codebase，這個 hint 不是可有可無，是把加速從「勉強」拉到「實用」的關鍵。
+  </p>
+
+  <p>
+    <strong>Clang</strong>則在 unroll hint 上<em>退步</em>：
+    乾淨的 hierarchical_fill 在 Clang 上是 4.09–4.11× 的健康加速，
+    但一旦你好心加上顯式 unroll hint，Clang 反而變慢。
+    Clang 的 loop vectorizer 與 unroller 之間有自己的成本模型協商，
+    顯式 hint 會干擾這個協商、強制一個次優的展開因子，
+    結果是干擾了它本來就會做對的事。
+    這是最反直覺的一點：對 GCC 有益的 hint，對 Clang 有害。
+  </p>
+
+  <p>
+    這三種行為交叉起來，得到一張很實際的對照表。
+    下面這張表把「扁平 vs 分段感知」的差異，
+    以及三個編譯器對 unroll hint 的反應，擺在同一個畫面裡。
+    點欄位 header 可重排，方便你依自己的編譯器找對應那一列。
+  </p>
+
+  <figure class="vg-w-table-segiter-atglance">
+    <style>
+      .vg-w-table-segiter-atglance { display: grid; gap: var(--s-2); overflow-x: auto; }
+      .vg-w-table-segiter-atglance table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-segiter-atglance caption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); text-align: left; padding-bottom: var(--s-2); caption-side: top; }
+      .vg-w-table-segiter-atglance thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; }
+      .vg-w-table-segiter-atglance thead th[data-sort] { color: var(--accent-text); }
+      .vg-w-table-segiter-atglance thead th[data-sort="asc"]::after { content: " ↑"; }
+      .vg-w-table-segiter-atglance thead th[data-sort="desc"]::after { content: " ↓"; }
+      .vg-w-table-segiter-atglance tbody th { font-family: var(--serif); font-weight: 600; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); color: var(--ink); }
+      .vg-w-table-segiter-atglance tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); color: var(--ink-soft); }
+      .vg-w-table-segiter-atglance td.num { font-variant-numeric: tabular-nums; text-align: right; }
+      .vg-w-table-segiter-atglance td.strong { color: var(--sage-deep); }
+      .vg-w-table-segiter-atglance td.weak { color: var(--accent-text); }
+      .vg-w-table-segiter-atglance figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/>
+        <path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+      </svg>
+      <span>點欄位 header 可重排 · 5 欄 × 5 列</span>
+    </p>
+
+    <table>
+      <caption>三個編譯器在 hierarchical 改寫下的回報（資料：boostedcpp.net 2026-05；點 header 重排）</caption>
+      <thead>
+        <tr>
+          <th data-key="compiler">編譯器配置</th>
+          <th data-key="geo" class="num">幾何平均（MyInt）</th>
+          <th data-key="fat" class="num">幾何平均（MyFatInt）</th>
+          <th data-key="unroll">unroll hint 反應</th>
+          <th data-key="why">主因</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <th scope="row">MSVC 2026</th>
+          <td class="num strong">5.93×</td>
+          <td class="num">3.31×</td>
+          <td>忽略（no-op）</td>
+          <td class="strong">SIMD store recognition 最積極</td>
+        </tr>
+        <tr>
+          <th scope="row">Clang（無 hint）</th>
+          <td class="num">4.10×</td>
+          <td class="num">3.05×</td>
+          <td class="weak">加 hint 反而退步</td>
+          <td>vectorizer 自帶成本模型，hint 干擾協商</td>
+        </tr>
+        <tr>
+          <th scope="row">Clang（+unroll）</th>
+          <td class="num weak">3.55×</td>
+          <td class="num">2.90×</td>
+          <td class="weak">次優展開因子</td>
+          <td class="weak">不要對 Clang 加顯式 unroll</td>
+        </tr>
+        <tr>
+          <th scope="row">GCC 16（無 hint）</th>
+          <td class="num weak">1.96×</td>
+          <td class="num">2.40×</td>
+          <td>預設保守</td>
+          <td class="weak">vectorizer 不主動展開內迴圈</td>
+        </tr>
+        <tr>
+          <th scope="row">GCC 16（+unroll(4)）</th>
+          <td class="num strong">3.13×</td>
+          <td class="num">2.95×</td>
+          <td class="strong">+60% 翻身</td>
+          <td class="strong">GCC 需要顯式 hint 才展開</td>
+        </tr>
+      </tbody>
+    </table>
+    <figcaption>
+      同一份 hierarchical_fill，跨編譯器的回報從 1.96× 到 5.93× 不等，且對 unroll hint 的最佳策略三家三樣。
+      這不是 hierarchical 改寫沒效，是「該不該加 hint」這個次決策被編譯器後端綁架了。
+    </figcaption>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-table-segiter-atglance');
+        if (!root) return;
+        const headers = root.querySelectorAll('thead th');
+        const tbody = root.querySelector('tbody');
+        let activeKey = null, asc = true;
+        headers.forEach(h => h.addEventListener('click', () => {
+          const key = h.dataset.key;
+          if (activeKey === key) asc = !asc; else { activeKey = key; asc = true; }
+          headers.forEach(x => x.removeAttribute('data-sort'));
+          h.setAttribute('data-sort', asc ? 'asc' : 'desc');
+          const rows = [...tbody.querySelectorAll('tr')];
+          const idx = [...headers].indexOf(h);
+          rows.sort((a, b) => {
+            const av = a.children[idx].textContent.trim();
+            const bv = b.children[idx].textContent.trim();
+            const an = Number.parseFloat(av);
+            const bn = Number.parseFloat(bv);
+            const cmp = !Number.isNaN(an) && !Number.isNaN(bn) ? an - bn : av.localeCompare(bv, 'zh-Hant');
+            return asc ? cmp : -cmp;
+          });
+          rows.forEach(r => tbody.appendChild(r));
+        }));
+      })();
+    </script>
+  </figure>
+
+  <p>
+    把這張表跟前面的長條圖合起來看，
+    可以提煉出一個工程上很乾淨的觀察：
+    hierarchical_fill 這個改寫本身在所有編譯器上都是正收益
+    （最差的 GCC 無 hint 也有 1.96×），
+    真正分歧的是「該不該再疊一個 unroll hint」這個次決策。
+    這個次決策完全被編譯器後端綁架——
+    對 GCC 加，對 Clang 不要加，對 MSVC 加不加都一樣。
+    如果你的 codebase 要跨編譯器編譯，最安全的做法是用
+    <code>#if defined(__GNUC__) &amp;&amp; !defined(__clang__)</code>
+    把 unroll pragma 包起來，只對純 GCC 開。
+  </p>
+
+  <h2>zero-overhead 抽象：這是 Stepanov 命題的一次體檢</h2>
+
+  <p>
+    退一步看，這整件事是 Stepanov 的 zero-overhead abstraction 原則的一次體檢。
+    Stepanov 的核心主張是：抽象應該有接近零的開銷——
+    generic programming 如果做對了，相較手寫的特化程式碼，
+    不應該帶來可察覺的執行成本（abstraction penalty）。
+    STL 的整個設計哲學就建立在這個命題上：
+    <code>std::fill</code> 不該比手寫 for-loop 慢。
+  </p>
+
+  <p>
+    但扁平 deque iterator 違反了這個命題。
+    把 deque 當扁平 range 走，付出的是 Austern 量到的約 20% throughput penalty，
+    在現代 SIMD 後端下放大成一個數量級的差距——
+    這個 penalty 不是來自 STL 的演算法本身，
+    而是來自「迭代器抽象把分段結構藏起來了」。
+    抽象藏掉的不只是不必要的細節，連編譯器需要的優化線索也一起藏掉了。
+    這正是 abstraction penalty 的教科書案例。
+  </p>
+
+  <p>
+    segmented_iterator_traits 與 hierarchical algorithm 是對這個命題的修補：
+    它不是放棄抽象、退回裸指標，
+    而是設計一個<em>更精確的</em>抽象——
+    讓迭代器抽象同時暴露「我是分段的，這是我的外層、這是我的內層」這個結構，
+    於是通用演算法可以在不犧牲泛型的前提下，
+    為每個 segment 內部生成跟手寫一樣乾淨的連續迴圈。
+    這是 Stepanov 命題的正確實現方式：
+    零開銷不是靠「抽象越薄越好」，是靠「抽象暴露的資訊剛好夠編譯器做對的優化」。
+  </p>
+
+  <p>
+    現代標準庫已經在往這個方向走。
+    libc++ 在 2023 年為 segmented iterator 特化了 <code>std::for_each</code>——
+    這意味著你今天在 libc++ 上對 deque 呼叫 <code>std::for_each</code>，
+    很可能已經免費吃到了 hierarchical 的好處，不用自己寫 traits。
+    Boost.PolyCollection 則把 segmented algorithm 做成它的核心賣點。
+    但 <code>std::fill</code>、<code>std::find</code>、<code>std::transform</code>
+    等其餘演算法的特化覆蓋率，在三家標準庫實作之間並不一致——
+    這正是你需要自己量測、必要時自己寫 hierarchical 版本的灰色地帶。
+  </p>
+
+  <p>
+    怎麼快速驗證你的標準庫有沒有偷偷幫你做了 hierarchical。
+    最直接的方法是看 codegen：把對 deque 的 <code>std::fill</code> 編出組語
+    （<code>-O3 -march=native</code>），grep 一下有沒有寬向量 store 指令——
+    x86 上找 <code>vmovdqu ymm</code> 或 <code>vmovups zmm</code>，
+    ARM 上找 <code>st1</code> 帶 SVE 暫存器。
+    如果只看到一連串 scalar 的 <code>mov</code> 加上每隔幾步一個比較分支，
+    代表 vectorizer 被邊界檢查擋住了，這個演算法在你的標準庫上沒被特化，
+    自己套 hierarchical_fill 會有收益。
+    反過來，如果已經看到密集的寬向量 store，標準庫替你做完了，別重複造輪子。
+    這個十分鐘的 codegen 檢查，比直接相信「libc++ 2023 特化過了」更可靠——
+    因為特化的是 <code>for_each</code>，不一定涵蓋你正在呼叫的那個演算法。
+  </p>
+
+  <h2>該不該做：先量你的元素大小與編譯器，再決定要不要寫 traits</h2>
+
+  <p>
+    把兩條軸交叉起來，決策其實相當清楚。
+  </p>
+
+  <p>
+    <strong>如果你的容器是 deque 或其他分段結構，元素小（≤ 8 bytes）、
+    熱迴圈跑的是 fill / copy / find / transform 這類 element-wise 演算法、
+    且你的編譯器是 MSVC 2026 或 Clang</strong>——
+    這是 segmentation-awareness 的甜蜜點，加速 4–17×，值得做。
+    優先確認你的標準庫實作（尤其 libc++）有沒有已經特化你呼叫的演算法；
+    有的話一行都不用改。沒有的話，hierarchical_fill 這個 pattern 二十行就能套上。
+  </p>
+
+  <p>
+    <strong>如果你用 GCC</strong>——一樣值得做，但記得加 <code>#pragma unroll(4)</code>，
+    否則你只拿到 1.96× 而不是 3.13×，會誤以為這個技術不值得。
+    用 <code>#if defined(__GNUC__) &amp;&amp; !defined(__clang__)</code> 把 hint 圈起來，
+    避免它溢出去害到 Clang。
+  </p>
+
+  <p>
+    <strong>如果你的元素很大（≥ 32 bytes）</strong>——
+    加速收斂到 2.4–3.3×，仍是正收益，但別期待 17×；
+    記憶體頻寬而非邊界檢查才是你的瓶頸，
+    這時更該優先看的是資料布局（SoA vs AoS）而不是迭代器分段。
+  </p>
+
+  <p>
+    <strong>如果你的容器是 vector</strong>——
+    這整篇與你無關。vector 的迭代器本來就是裸指標，
+    <code>std::fill</code> 早就向量化好了，沒有分段結構要暴露。
+    segmentation-awareness 是 deque 與分段容器的專屬議題，
+    不要對連續容器套這個 pattern——你只會得到沒有意義的 single-segment fast path。
+  </p>
+
+  <p class="vg-deep-closer"><strong>Take-away</strong>：對小型別、element-wise 熱迴圈跑在 deque 上的場景，
+  先確認標準庫有沒有特化、再決定要不要自己寫 hierarchical traits；MSVC 與 Clang 直接做（最高 17×），
+  GCC 記得包 <code>#pragma unroll(4)</code>（1.96× → 3.13×），Clang 千萬別加 hint，元素大或容器是 vector 就別費這個工。</p>
+</div>
