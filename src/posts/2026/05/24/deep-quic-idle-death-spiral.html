@@ -1,0 +1,977 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">在 6.7 秒裡，
+  一條 QUIC 連線的 CUBIC 狀態機翻轉了 999 次——平均每 14 毫秒一次，
+  剛好是一個 RTT 的時間。
+  封包早就不再遺失了，
+  網路一片平靜，
+  但 congestion window 死死卡在兩個封包大小的最小值上，
+  再也長不起來。
+  把這個 bug 追到底，
+  會走到一行 2017 年的 Linux 核心最佳化——一段為了讓 TCP 在閒置後不要重置成長曲線而寫的程式碼，
+  被原封不動搬進 userspace 之後，
+  反而成了讓連線餓死自己的引擎。</p>
+  <h1 class="vg-post-title">當 idle 不是 idle——一個 Linux 核心最佳化如何把 QUIC 推進死亡螺旋</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p><span class="vg-dropcap">C</span>loudflare 的 <code>quiche</code>——他們開源的 QUIC / HTTP3 函式庫——在一組壓力測試裡出現了一個極不直觀的失敗模式：
+  大約 61% 的下載在 timeout 之前根本跑不完。
+  測試本身並不殘酷：10ms RTT、
+  一個 10 MB 的 HTTP/3 下載、
+  前兩秒注入 30% 的隨機封包遺失，
+  兩秒之後網路完全恢復、
+  零遺失，
+  整體 10 秒 timeout。
+  照理說，
+  前兩秒的丟包會把 cwnd 打下去，
+  但兩秒一過，CUBIC 應該迅速爬回正常吞吐、
+  把剩下的位元組灌完。
+  實際發生的卻是：cwnd 卡在 2,700 bytes——剛好兩個 full-size 封包——再也不動。
+  連線沒有 crash、
+  沒有報錯、
+  吞吐曲線上只是一條貼著地板的平線，
+  然後 timeout。</p>
+
+  <p>這類 bug 是工程上最難抓的一種：
+  它在正常 dashboard 上完全隱形。
+  你的 throughput panel、
+  你的 p50 / p99 latency、
+  你的 error rate，
+  在沒有 congestion 的日子裡全都漂亮得很。
+  只有當網路真的進入嚴重遺失、CUBIC 真的要做 recovery 的時候，
+  這個 bug 才會引爆——而那恰恰是你最需要 congestion control 正常運作的時刻。
+  對一個跑在全球 anycast 網路上、
+  每天要面對各種劣質 last-mile 連線的 edge 平台來說，
+  「只在 recovery 期爆炸」
+  幾乎等於「在最該穩的時候最不穩」
+  。</p>
+
+  <p>更值得一個工程 leader 停下來想的是它的來歷。
+  這不是一個 CUBIC 演算法本身的設計缺陷——RFC 9438 把 CUBIC 寫得清清楚楚。
+  這也不是一個 quiche 團隊憑空寫錯的 off-by-one。
+  它是一段在 Linux 核心裡跑了八年、
+  被千萬台機器驗證過、
+  完全正確的最佳化程式碼，
+  在被移植進 userspace 的 QUIC stack 時，
+  因為兩邊的 timing 語意不同，
+  而從「正確」
+  退化成「災難」
+  。
+  這篇要拆的就是這條因果鏈：
+  從 2017 年那個 kernel commit，
+  到 quiche 裡的不完整移植，
+  到死亡螺旋的物理機制，
+  最後到那個只加一個 timestamp 就解決的修正。</p>
+
+  <h2>螺旋的形狀——cwnd 為什麼回不去</h2>
+
+  <p>先把現象本身看清楚。CUBIC 的設計目標是：
+  在遺失發生後，congestion window 沿著一條三次曲線重新成長，
+  前期快、
+  接近上次的 cwnd 上限時放緩、
+  越過上限後再加速探測更高頻寬。
+  這條曲線的數學形狀正是 CUBIC 名字的由來。
+  正常情況下，
+  前兩秒的 30% 遺失會把 cwnd 反覆砍半、
+  最終壓到最小值，
+  但只要遺失停止，CUBIC 的三次曲線就會接管，
+  把 cwnd 在幾百毫秒內拉回可用的吞吐區間。</p>
+
+  <p>出 bug 的連線完全不是這樣。
+  它的 cwnd 在遺失停止之後，
+  依然死死貼在 2,700 bytes 的地板上。CUBIC 不是「成長得慢」
+  ，
+  而是「完全不成長」
+  。
+  下面這個模擬把兩種行為並排放在同一個時間軸上——你可以親手切換 broken 跟 fixed、
+  按 play 看 cwnd 隨時間怎麼走。
+  注意 broken 模式下那條貼地的平線，
+  以及右下角那個瘋狂跳動的 recovery 狀態計數器：
+  它就是那 999 次翻轉的來源。</p>
+
+  <figure class="vg-w-canvas-quic-cwnd-spiral">
+    <style>
+      .vg-w-canvas-quic-cwnd-spiral { display: grid; grid-template-rows: auto auto 1fr auto; gap: var(--s-2); margin: var(--s-4) 0; }
+      .vg-w-canvas-quic-cwnd-spiral .toolbar { display: flex; align-items: center; gap: var(--s-2); flex-wrap: wrap; font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+      .vg-w-canvas-quic-cwnd-spiral button { font-family: var(--sans); font-size: var(--fs-sm); padding: 6px 14px; min-height: 44px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); cursor: pointer; }
+      .vg-w-canvas-quic-cwnd-spiral button:hover { border-color: var(--accent); color: var(--accent-text); }
+      .vg-w-canvas-quic-cwnd-spiral .mode { display: inline-flex; border: 1px solid var(--line); }
+      .vg-w-canvas-quic-cwnd-spiral .mode button { border: none; border-right: 1px solid var(--line); min-height: 44px; }
+      .vg-w-canvas-quic-cwnd-spiral .mode button:last-child { border-right: none; }
+      .vg-w-canvas-quic-cwnd-spiral .mode button.active { background: var(--accent); color: var(--bg); }
+      .vg-w-canvas-quic-cwnd-spiral .mode button.active:hover { color: var(--bg); }
+      .vg-w-canvas-quic-cwnd-spiral .clock { font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); color: var(--muted); }
+      .vg-w-canvas-quic-cwnd-spiral canvas { width: 100%; height: auto; aspect-ratio: 16 / 9; display: block; }
+      .vg-w-canvas-quic-cwnd-spiral figcaption { font-family: var(--scribed); font-style: italic; font-size: var(--fs-sm); color: var(--muted); }
+      @media (max-width: 720px) {
+        .vg-w-canvas-quic-cwnd-spiral canvas { aspect-ratio: 4 / 3; }
+        .vg-w-canvas-quic-cwnd-spiral .clock { width: 100%; }
+      }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m18 16 4-4-4-4"/><path d="m6 8-4 4 4 4"/><path d="m14.5 4-5 16"/>
+      </svg>
+      <span>play the simulation · switch broken / fixed to compare the cwnd trajectory</span>
+    </p>
+
+    <div class="toolbar">
+      <button id="vg-w-canvas-quic-cwnd-spiral-toggle" aria-label="play or pause simulation">&#9655; play</button>
+      <button id="vg-w-canvas-quic-cwnd-spiral-reset" aria-label="reset simulation">&#8635; reset</button>
+      <span class="mode" role="group" aria-label="select congestion control mode">
+        <button id="vg-w-canvas-quic-cwnd-spiral-broken" class="active">broken</button>
+        <button id="vg-w-canvas-quic-cwnd-spiral-fixed">fixed</button>
+      </span>
+      <span class="clock" id="vg-w-canvas-quic-cwnd-spiral-clock">t = 0.00s</span>
+    </div>
+
+    <canvas id="vg-w-canvas-quic-cwnd-spiral-canvas" role="img" aria-label="congestion window over time, comparing the broken death-spiral trajectory against the fixed CUBIC recovery curve"></canvas>
+
+    <figcaption>10ms RTT，前 2 秒 30% 隨機遺失，之後零遺失。broken 模式下 cwnd 卡在 2,700 bytes 的地板上、recovery 狀態以約每 14ms 一次的頻率翻轉；fixed 模式下遺失一停，CUBIC 三次曲線就接管把 cwnd 拉回。</figcaption>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-canvas-quic-cwnd-spiral');
+        const canvas = root.querySelector('#vg-w-canvas-quic-cwnd-spiral-canvas');
+        const toggle = root.querySelector('#vg-w-canvas-quic-cwnd-spiral-toggle');
+        const reset = root.querySelector('#vg-w-canvas-quic-cwnd-spiral-reset');
+        const clock = root.querySelector('#vg-w-canvas-quic-cwnd-spiral-clock');
+        const btnBroken = root.querySelector('#vg-w-canvas-quic-cwnd-spiral-broken');
+        const btnFixed = root.querySelector('#vg-w-canvas-quic-cwnd-spiral-fixed');
+        const ctx = canvas.getContext('2d');
+
+        function cssVar(name) {
+          return getComputedStyle(root).getPropertyValue(name).trim() || '#888';
+        }
+
+        function resize() {
+          const dpr = window.devicePixelRatio || 1;
+          const rect = canvas.getBoundingClientRect();
+          if (rect.width === 0) return;
+          canvas.width = rect.width * dpr;
+          canvas.height = rect.height * dpr;
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+          draw();
+        }
+        new ResizeObserver(resize).observe(canvas);
+
+        // --- model constants ---
+        const RTT = 0.010;          // 10ms
+        const MIN_CWND = 2700;      // bytes, two full packets
+        const LOSS_END = 2.0;       // loss stops at t=2s
+        const T_MAX = 8.0;          // simulate 8 seconds
+        const MSS = 1350;
+
+        let running = false;
+        let mode = 'broken';
+        let t = 0;
+        let cwnd = 14000;           // start near initial window
+        let wMax = 14000;           // CUBIC W_max (cwnd before last reduction)
+        let epoch = 0;              // CUBIC epoch start time
+        let lastAck = 0;            // last_ack_time
+        let lastSent = 0;           // last_sent_time
+        let transitions = 0;        // recovery state toggles
+        let lastLossT = -1;
+        const history = [];         // [t, cwnd]
+
+        function reseed() {
+          t = 0; cwnd = 14000; wMax = 14000; epoch = 0;
+          lastAck = 0; lastSent = 0; transitions = 0; lastLossT = -1;
+          history.length = 0;
+        }
+
+        // CUBIC growth target (bytes) given time since epoch
+        function cubicTarget(dtEpoch) {
+          const C = 0.4;
+          const beta = 0.7;
+          const K = Math.cbrt((wMax * (1 - beta)) / C);
+          const w = C * Math.pow(dtEpoch - K, 3) + wMax;
+          return Math.max(MIN_CWND, w);
+        }
+
+        function step(dt) {
+          t += dt;
+          // emulate per-RTT progress
+          lastSent = t;
+
+          // loss phase: random drops push cwnd toward the floor
+          const inLoss = t < LOSS_END;
+          if (inLoss && t - lastLossT > RTT && Math.random() < 0.30) {
+            lastLossT = t;
+            wMax = Math.max(cwnd, MIN_CWND);
+            cwnd = Math.max(MIN_CWND, cwnd * 0.7);
+            epoch = t;
+            transitions++;
+          }
+
+          if (!inLoss) {
+            // measure idle delta — THIS is the bug surface
+            let idleRef;
+            if (mode === 'broken') {
+              idleRef = lastSent;             // measures a whole RTT at min cwnd
+            } else {
+              idleRef = Math.max(lastAck, lastSent); // true app idle ~ 0
+            }
+            const idleDelta = t - idleRef;
+
+            if (mode === 'broken' && cwnd <= MIN_CWND * 1.05) {
+              // inflated delta pushes the recovery boundary forward every RTT:
+              // epoch keeps advancing, dtEpoch stays ~0, cwnd never grows.
+              epoch += RTT;          // boundary shoved forward
+              transitions++;          // false recovery transition
+              cwnd = MIN_CWND;        // pinned at floor
+            } else {
+              // healthy CUBIC growth
+              lastAck = t;
+              const dtEpoch = t - epoch;
+              const target = cubicTarget(dtEpoch);
+              cwnd += (target - cwnd) * Math.min(1, dt / RTT) * 0.5;
+              cwnd = Math.max(MIN_CWND, Math.min(cwnd, 60000));
+            }
+          }
+
+          history.push([t, cwnd]);
+          if (t >= T_MAX) { running = false; toggle.innerHTML = '&#9655; play'; }
+        }
+
+        function draw() {
+          const W = canvas.getBoundingClientRect().width;
+          const H = canvas.getBoundingClientRect().height;
+          if (W === 0) return;
+          ctx.clearRect(0, 0, W, H);
+
+          const padL = 56, padR = 16, padT = 18, padB = 34;
+          const plotW = W - padL - padR;
+          const plotH = H - padT - padB;
+          const yMaxBytes = 64000;
+          const xOf = (tt) => padL + (tt / T_MAX) * plotW;
+          const yOf = (b) => padT + plotH - (b / yMaxBytes) * plotH;
+
+          // axes
+          ctx.strokeStyle = cssVar('--line');
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.moveTo(padL, padT); ctx.lineTo(padL, padT + plotH); ctx.lineTo(padL + plotW, padT + plotH);
+          ctx.stroke();
+
+          ctx.font = '11px "JetBrains Mono", monospace';
+          ctx.fillStyle = cssVar('--muted');
+          ctx.textAlign = 'right';
+          for (let b = 0; b <= yMaxBytes; b += 16000) {
+            const y = yOf(b);
+            ctx.fillText((b / 1000) + 'k', padL - 6, y + 3);
+            ctx.strokeStyle = cssVar('--line');
+            ctx.globalAlpha = 0.35;
+            ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(padL + plotW, y); ctx.stroke();
+            ctx.globalAlpha = 1;
+          }
+          ctx.textAlign = 'center';
+          for (let s = 0; s <= T_MAX; s += 2) {
+            ctx.fillText(s + 's', xOf(s), padT + plotH + 18);
+          }
+
+          // floor line at MIN_CWND
+          ctx.strokeStyle = cssVar('--muted-2');
+          ctx.setLineDash([4, 4]);
+          ctx.beginPath();
+          ctx.moveTo(padL, yOf(MIN_CWND)); ctx.lineTo(padL + plotW, yOf(MIN_CWND));
+          ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.textAlign = 'left';
+          ctx.fillStyle = cssVar('--muted-2');
+          ctx.fillText('min cwnd 2,700B', padL + 6, yOf(MIN_CWND) - 4);
+
+          // loss-phase shading
+          ctx.fillStyle = cssVar('--accent');
+          ctx.globalAlpha = 0.07;
+          ctx.fillRect(padL, padT, (LOSS_END / T_MAX) * plotW, plotH);
+          ctx.globalAlpha = 1;
+          ctx.fillStyle = cssVar('--muted');
+          ctx.textAlign = 'left';
+          ctx.fillText('30% loss', padL + 4, padT + 12);
+
+          // cwnd trajectory
+          if (history.length > 1) {
+            ctx.strokeStyle = mode === 'broken' ? cssVar('--accent') : cssVar('--sage-deep');
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            history.forEach(([tt, cc], i) => {
+              const x = xOf(tt), y = yOf(cc);
+              if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+            });
+            ctx.stroke();
+          }
+
+          // current cwnd dot
+          if (history.length) {
+            const [tt, cc] = history[history.length - 1];
+            ctx.fillStyle = mode === 'broken' ? cssVar('--accent') : cssVar('--sage-deep');
+            ctx.beginPath(); ctx.arc(xOf(tt), yOf(cc), 4, 0, Math.PI * 2); ctx.fill();
+          }
+        }
+
+        let last = performance.now();
+        function frame(now) {
+          const dt = Math.min(0.05, (now - last) / 1000);
+          last = now;
+          if (running) {
+            // run a few model sub-steps per frame so 8s sim takes ~10s wall
+            for (let k = 0; k < 3 && running; k++) step(dt / 3 * 1.0);
+          }
+          draw();
+          const cur = history.length ? history[history.length - 1][1] : cwnd;
+          clock.textContent = 't = ' + t.toFixed(2) + 's · cwnd ' + Math.round(cur).toLocaleString() + 'B · recovery flips ' + transitions;
+          requestAnimationFrame(frame);
+        }
+        requestAnimationFrame(frame);
+
+        toggle.addEventListener('click', () => {
+          if (t >= T_MAX) { reseed(); }
+          running = !running;
+          toggle.innerHTML = running ? '&#10073;&#10073; pause' : '&#9655; play';
+          last = performance.now();
+        });
+        reset.addEventListener('click', () => {
+          running = false;
+          toggle.innerHTML = '&#9655; play';
+          reseed();
+          draw();
+        });
+        function setMode(m) {
+          mode = m;
+          btnBroken.classList.toggle('active', m === 'broken');
+          btnFixed.classList.toggle('active', m === 'fixed');
+          running = false;
+          toggle.innerHTML = '&#9655; play';
+          reseed();
+          draw();
+        }
+        btnBroken.addEventListener('click', () => setMode('broken'));
+        btnFixed.addEventListener('click', () => setMode('fixed'));
+
+        resize();
+      })();
+    </script>
+  </figure>
+
+  <p>「999 次狀態翻轉、6.7 秒、
+  約 14ms 一次」
+  這組數字本身就是診斷的關鍵線索。14ms 不是隨便一個數——它約等於一個 RTT（10ms）
+  加上一點點處理時間。
+  當一個本該是「事件驅動」
+  的狀態機，
+  開始以「每個 RTT 翻一次」
+  的節奏抽搐，
+  那幾乎可以斷定：
+  有某個量原本應該反映「應用層真正閒置了多久」
+  ，
+  卻意外被綁上了「一個 RTT 的長度」
+  。
+  把這個直覺記住，
+  它就是整條因果鏈的扣環。</p>
+
+  <p>這裡值得強調 CUBIC 的最小 cwnd 為什麼是兩個封包而不是一個。
+  兩個封包是為了讓 ACK clocking 能持續運轉——接收端的 delayed ACK 機制通常等到收到兩個 segment 才回一個 ACK，
+  如果 cwnd 只剩一個封包，
+  發送端送完就沒有 in-flight 資料、
+  收不到能觸發後續傳送的 ACK，
+  連線會直接 stall。
+  所以 2,700 bytes（兩個 1,350 byte 封包）
+  是 CUBIC 刻意設的地板。bug 的殘酷之處在於：
+  連線確實停在這個「理論上還能動」
+  的地板上，ACK clocking 也確實在跑，
+  但每一次 ACK 回來該觸發的成長，
+  都被那個錯誤的 idle 判斷吃掉了。</p>
+
+  <h2>2017 年那行核心程式碼——idle 最佳化的血統</h2>
+
+  <p>要理解 quiche 裡的 bug，
+  得先理解它移植的那段 Linux 核心程式碼解決的是什麼問題。CUBIC 的成長曲線是「自上次進入 congestion avoidance 的時間原點（epoch）
+  算起的三次函數」
+  。
+  這帶來一個微妙的問題：
+  如果一條連線送完一波資料後閒置了一段時間（例如 HTTP keep-alive 連線在兩個 request 之間沒有流量）
+  ，
+  等到下次又有資料要送時，
+  那個三次函數的時間原點已經被閒置期推得很遠——dtEpoch 很大，cubic 曲線會算出一個高得離譜的 cwnd 目標，
+  等於讓連線在對網路一無所知的情況下突然爆量送出。</p>
+
+  <p>RFC 9438 §4.2 對這種「應用受限（application-limited）
+  」
+  的情況有明確規範：
+  閒置期間不該讓 CUBIC 的曲線繼續往前跑。2017 年 Eric Dumazet、Yuchung Cheng、Neal Cardwell 提交的核心 commit <code>30927520dbae</code> 就是這個規範的實作——它的做法是在偵測到閒置時，
+  把 epoch 時間原點往前推，
+  等於「凍結」CUBIC 曲線的形狀，
+  讓連線恢復活動時從凍結點繼續、
+  而不是從一個被閒置期推遠的虛假高點爆發。
+  這是一個正確、
+  優雅、
+  被廣泛驗證的最佳化。</p>
+
+  <p>但這個 commit 落地大約一週後，
+  核心團隊自己又提交了一個 follow-up <code>c2e7204d180f</code>，
+  承認原版有個 imprecision：
+  在某些情況下，
+  量測閒置時間用的是「送出時間（send time）
+  」
+  ，
+  這可能把 recovery 的邊界推到未來去，
+  導致行為不正確。
+  換句話說，
+  核心團隊在原版上線一週內就發現「用 send time 當閒置基準」
+  這個量測點本身有問題、
+  並修掉了它。
+  這個一週的時間差，
+  後面會變成整個故事的關鍵——因為移植進 quiche 的，
+  是還沒被這個 follow-up 修正觀念滲透透徹的那套量測邏輯。</p>
+
+  <figure class="vg-w-scrub-quic-kernel-lineage" data-svg-scroll="880">
+    <style>
+      .vg-w-scrub-quic-kernel-lineage { display: grid; gap: var(--s-2); margin: var(--s-4) 0; }
+      .vg-w-scrub-quic-kernel-lineage svg.lineage { width: 100%; height: auto; touch-action: none; }
+      .vg-w-scrub-quic-kernel-lineage #vg-w-scrub-quic-kernel-lineage-handle { touch-action: none; }
+      .vg-w-scrub-quic-kernel-lineage .state { font-family: var(--serif); font-size: var(--fs-sm); padding: var(--s-2) var(--s-3); background: var(--bg-soft); border-left: 2px solid var(--accent); line-height: 1.65; }
+      .vg-w-scrub-quic-kernel-lineage .state .yr { font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); color: var(--accent-text); }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M5 12h14"/><path d="m12 5 7 7-7 7"/>
+      </svg>
+      <span>drag the handle along the lineage · 5 events from 2017 kernel to the quiche fix</span>
+    </p>
+
+    <svg class="lineage" viewBox="0 0 880 120" role="img" aria-label="time axis tracing the bug's lineage from the 2017 Linux kernel commit to the quiche fix; drag to inspect each step">
+      <line x1="48" y1="58" x2="832" y2="58" stroke="var(--muted-2)" stroke-width="1.5" />
+      <g id="vg-w-scrub-quic-kernel-lineage-events"></g>
+      <line id="vg-w-scrub-quic-kernel-lineage-handle-line" x1="48" y1="34" x2="48" y2="82" stroke="var(--accent)" stroke-width="2" />
+      <circle id="vg-w-scrub-quic-kernel-lineage-handle" cx="48" cy="58" r="9" fill="var(--accent)" cursor="grab" role="slider" tabindex="0" aria-label="lineage scrubber" aria-valuemin="0" aria-valuemax="4" aria-valuenow="0" />
+      <text id="vg-w-scrub-quic-kernel-lineage-clock" x="48" y="26" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--ink)">2017</text>
+    </svg>
+
+    <div class="state" id="vg-w-scrub-quic-kernel-lineage-state">把握把拖到任一節點，看 bug 的血統如何從 2017 年的 Linux 核心一路傳到 quiche。</div>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-scrub-quic-kernel-lineage');
+        const svg = root.querySelector('svg.lineage');
+        const handle = root.querySelector('#vg-w-scrub-quic-kernel-lineage-handle');
+        const handleLine = root.querySelector('#vg-w-scrub-quic-kernel-lineage-handle-line');
+        const clock = root.querySelector('#vg-w-scrub-quic-kernel-lineage-clock');
+        const stateDiv = root.querySelector('#vg-w-scrub-quic-kernel-lineage-state');
+        const eventsG = root.querySelector('#vg-w-scrub-quic-kernel-lineage-events');
+
+        // [position 0..4, short label, full state html]
+        const events = [
+          ['2017', 'kernel idle opt', '<span class="yr">commit 30927520dbae · 2017</span><br>Dumazet / Cheng / Cardwell 提交核心 idle 最佳化：閒置時把 CUBIC 的 epoch 時間原點往前推，凍結三次曲線的形狀，避免連線恢復活動時從虛假高點爆量。RFC 9438 §4.2 規範的 application-limited 行為。'],
+          ['+1wk', 'kernel follow-up', '<span class="yr">commit c2e7204d180f · 約一週後</span><br>核心團隊自己修正原版的 imprecision：用「送出時間」當閒置基準會把 recovery 邊界推到未來。這個量測點的觀念修正，是後面那條移植路徑沒有完整吸收的關鍵。'],
+          ['port', 'ported to quiche', '<span class="yr">quiche CUBIC 模組</span><br>2017 的 idle 最佳化被移植進 quiche 的 userspace CUBIC。但 timing 語意不同：核心的「last_sent_time」反映核心送封包的時刻；userspace 量到的卻可能把一整個 RTT 都算進閒置——移植不完整。'],
+          ['bug', 'death spiral', '<span class="yr">~61% 測試失敗</span><br>在最小 cwnd（2,700B）下，idle delta 量到的不是真實 app idle（~0ms）而是一整個 RTT（~14ms）。膨脹的 delta 每個 RTT 把 recovery 邊界往前推一次，觸發連續的 FALSE recovery 狀態，cwnd 永遠長不起來。6.7 秒翻轉 999 次。'],
+          ['fix', 'last_ack_time', '<span class="yr">quiche 修正</span><br>新增一個 last_ack_time timestamp，把閒置量測改成 max(last_ack_time, last_sent_time)。這捕捉到真正的 app idle，recovery 邊界不再被人為推進。測試通過率回到 100%，cwnd 在 4-5 秒內沿預期 CUBIC 曲線恢復成長。'],
+        ];
+        const N = events.length;
+        const X0 = 48, X1 = 832;
+        const xOf = i => X0 + (i / (N - 1)) * (X1 - X0);
+        const NS = 'http://www.w3.org/2000/svg';
+
+        events.forEach(([lbl], i) => {
+          const c = document.createElementNS(NS, 'circle');
+          c.setAttribute('cx', xOf(i)); c.setAttribute('cy', 58); c.setAttribute('r', 5);
+          c.setAttribute('fill', i === N - 1 ? 'var(--sage-deep)' : 'var(--muted)');
+          eventsG.appendChild(c);
+          const tx = document.createElementNS(NS, 'text');
+          tx.setAttribute('x', xOf(i)); tx.setAttribute('y', 100);
+          tx.setAttribute('text-anchor', 'middle');
+          tx.setAttribute('font-family', 'Manrope, sans-serif');
+          tx.setAttribute('font-size', 12);
+          tx.setAttribute('fill', 'var(--muted)');
+          tx.textContent = lbl;
+          eventsG.appendChild(tx);
+        });
+
+        function clamp(x) { return Math.max(X0, Math.min(X1, x)); }
+        function clientToSvgX(clientX) {
+          const pt = svg.createSVGPoint();
+          pt.x = clientX; pt.y = 0;
+          const p = pt.matrixTransform(svg.getScreenCTM().inverse());
+          return clamp(p.x);
+        }
+        function nearestIndex(x) {
+          let best = 0, bestD = Infinity;
+          for (let i = 0; i < N; i++) { const d = Math.abs(x - xOf(i)); if (d < bestD) { bestD = d; best = i; } }
+          return best;
+        }
+        function snap(i) {
+          const x = xOf(i);
+          handle.setAttribute('cx', x);
+          handleLine.setAttribute('x1', x); handleLine.setAttribute('x2', x);
+          clock.setAttribute('x', x);
+          clock.textContent = events[i][0];
+          handle.setAttribute('aria-valuenow', i);
+          stateDiv.innerHTML = events[i][2];
+        }
+
+        let dragging = false;
+        handle.addEventListener('pointerdown', (e) => { dragging = true; handle.setPointerCapture(e.pointerId); handle.style.cursor = 'grabbing'; });
+        handle.addEventListener('pointermove', (e) => { if (!dragging) return; snap(nearestIndex(clientToSvgX(e.clientX))); });
+        handle.addEventListener('pointerup', (e) => { dragging = false; handle.style.cursor = 'grab'; });
+        svg.addEventListener('pointerdown', (e) => { if (e.target === handle) return; snap(nearestIndex(clientToSvgX(e.clientX))); });
+        handle.addEventListener('keydown', (e) => {
+          const cur = Number(handle.getAttribute('aria-valuenow'));
+          if (e.key === 'ArrowRight' || e.key === 'ArrowUp') { e.preventDefault(); snap(Math.min(N - 1, cur + 1)); }
+          if (e.key === 'ArrowLeft' || e.key === 'ArrowDown') { e.preventDefault(); snap(Math.max(0, cur - 1)); }
+        });
+
+        snap(0);
+      })();
+    </script>
+  </figure>
+
+  <p>把這條血統攤開來看，
+  每一步都沒有人犯下「愚蠢」
+  的錯誤。Dumazet 那群人寫的核心程式碼是對的；
+  核心 follow-up 的修正也是對的；quiche 團隊把一個經過實戰驗證的核心最佳化拿來用，
+  這個判斷在工程上完全合理——別人花了八年驗證過的東西，
+  重新發明只會引入更多風險。
+  錯誤發生在最不起眼的接縫處：
+  核心的時間語意和 userspace 的時間語意，
+  在「last_sent_time 到底代表什麼」
+  這一點上，
+  悄悄地不一樣了。</p>
+
+  <h2>idle 量錯了——last_sent_time 與 last_ack_time 的差異</h2>
+
+  <p>現在拆機制本身。quiche 的 CUBIC 在 <code>on_packet_sent()</code> 裡用 <code>bytes_in_flight == 0</code> 判斷「現在是不是閒置狀態」——這個判斷本身是對的，
+  沒有 in-flight 資料確實意味著連線當下沒在傳東西。
+  問題出在下一步：
+  它量「閒置了多久」
+  用的是 <code>now - last_sent_time</code>。
+  在一般情況下這沒問題，
+  但在 cwnd 卡在最小值（兩個封包）
+  的特殊情況下，
+  這個量測會出大事。</p>
+
+  <p>想清楚最小 cwnd 下的封包時序：cwnd 只允許兩個封包在路上。
+  發送端送出這兩個封包後，<code>bytes_in_flight</code> 達到 cwnd 上限，
+  必須停下來等 ACK。ACK 要等多久？
+  一個 RTT。
+  所以從「送出最後一個封包」
+  到「收到第一個 ACK、bytes_in_flight 歸零、
+  可以再送」
+  之間，
+  必然隔著一整個 RTT。
+  此時 <code>now - last_sent_time</code> 量到的是這一整個 RTT（~14ms）——但這段時間應用層根本沒有閒置，
+  它是被 congestion control 卡住在等 ACK。
+  真正的 app idle 是 ~0ms：
+  應用早就準備好下一批資料了。</p>
+
+  <figure class="vg-w-tabs-quic-idle-measure">
+    <style>
+      .vg-w-tabs-quic-idle-measure { display: grid; gap: var(--s-2); margin: var(--s-4) 0; min-width: 0; overflow-x: hidden; }
+      .vg-w-tabs-quic-idle-measure input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-tabs-quic-idle-measure .tabs { display: flex; gap: var(--s-2); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+      .vg-w-tabs-quic-idle-measure .tab { font-family: var(--sans); font-size: var(--fs-sm); padding: var(--s-1) var(--s-2); cursor: pointer; color: var(--muted); min-height: 36px; display: inline-flex; align-items: center; }
+      .vg-w-tabs-quic-idle-measure .panel { display: none; padding: var(--s-2) 0; min-width: 0; }
+      .vg-w-tabs-quic-idle-measure .panel pre { overflow-x: auto; max-width: 100%; -webkit-overflow-scrolling: touch; }
+      .vg-w-tabs-quic-idle-measure .panel pre code { white-space: pre; display: block; }
+      .vg-w-tabs-quic-idle-measure svg.diag { width: 100%; height: auto; }
+      .vg-w-tabs-quic-idle-measure:has(#vg-w-tabs-quic-idle-measure-t1:checked) .panel-1 { display: block; }
+      .vg-w-tabs-quic-idle-measure:has(#vg-w-tabs-quic-idle-measure-t1:checked) [for="vg-w-tabs-quic-idle-measure-t1"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-quic-idle-measure:has(#vg-w-tabs-quic-idle-measure-t2:checked) .panel-2 { display: block; }
+      .vg-w-tabs-quic-idle-measure:has(#vg-w-tabs-quic-idle-measure-t2:checked) [for="vg-w-tabs-quic-idle-measure-t2"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-quic-idle-measure:has(#vg-w-tabs-quic-idle-measure-t3:checked) .panel-3 { display: block; }
+      .vg-w-tabs-quic-idle-measure:has(#vg-w-tabs-quic-idle-measure-t3:checked) [for="vg-w-tabs-quic-idle-measure-t3"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/>
+      </svg>
+      <span>switch tabs · broken measurement / fixed measurement / packet timeline · 3 views</span>
+    </p>
+
+    <input type="radio" id="vg-w-tabs-quic-idle-measure-t1" name="vg-w-tabs-quic-idle-measure-sel" checked />
+    <input type="radio" id="vg-w-tabs-quic-idle-measure-t2" name="vg-w-tabs-quic-idle-measure-sel" />
+    <input type="radio" id="vg-w-tabs-quic-idle-measure-t3" name="vg-w-tabs-quic-idle-measure-sel" />
+    <div class="tabs" role="tablist">
+      <label class="tab" for="vg-w-tabs-quic-idle-measure-t1">broken</label>
+      <label class="tab" for="vg-w-tabs-quic-idle-measure-t2">fixed</label>
+      <label class="tab" for="vg-w-tabs-quic-idle-measure-t3">packet timeline</label>
+    </div>
+
+    <div class="panel panel-1">
+      <pre data-kind="pseudocode"><code><em>// 移植進 quiche 的版本——閒置基準只看 last_sent_time</em>
+fn on_packet_sent(now) {
+    if bytes_in_flight == 0 {              <em>// 判斷「閒置」</em>
+        idle_delta = now - last_sent_time  <em>// ← 量錯了</em>
+
+        <em>// 在最小 cwnd 下，last_sent_time 是「上一輪送出的時刻」，</em>
+        <em>// 距離現在恰好隔了一整個 RTT（送完兩個封包後等 ACK）。</em>
+        <em>// idle_delta ≈ 14ms，但 app 根本沒閒置。</em>
+
+        epoch_start += idle_delta          <em>// 把 recovery 邊界往前推</em>
+        <em>// → dtEpoch 永遠 ≈ 0 → CUBIC target 永遠 ≈ min cwnd</em>
+        <em>// → 下個 RTT 再推一次 → FALSE recovery 連環觸發</em>
+    }
+    last_sent_time = now
+}</code></pre>
+    </div>
+
+    <div class="panel panel-2">
+      <pre data-kind="pseudocode"><code><em>// 修正版——多一個 last_ack_time，閒置取兩者較晚的</em>
+fn on_packet_sent(now) {
+    if bytes_in_flight == 0 {
+        <em>// last_ack_time 在每次收到 ACK 時更新。</em>
+        <em>// 最小 cwnd 下，剛收到 ACK → last_ack_time ≈ now，</em>
+        <em>// 所以 max(...) 取到 last_ack_time，idle_delta ≈ 0。</em>
+        idle_ref  = max(last_ack_time, last_sent_time)
+        idle_delta = now - idle_ref         <em>// ← 真實 app idle ≈ 0</em>
+
+        epoch_start += idle_delta           <em>// 推進量 ≈ 0，邊界不動</em>
+        <em>// → dtEpoch 正常累積 → CUBIC 三次曲線正常接管</em>
+    }
+    last_sent_time = now
+}
+
+fn on_ack_received(now) {
+    last_ack_time = now                     <em>// 新增的 timestamp</em>
+    // ... 既有的 ACK 處理 ...
+}</code></pre>
+    </div>
+
+    <div class="panel panel-3">
+      <svg class="diag" viewBox="0 0 880 280" role="img" aria-label="封包時序圖：最小 cwnd 下，從送出到收到 ACK 之間隔著一整個 RTT，broken 量測把這段算成 idle">
+        <text x="24" y="26" font-family="IM Fell English, serif" font-style="italic" font-size="14" fill="var(--ink)">最小 cwnd 下的一個 RTT——broken 量測把這段「等 ACK」誤判為 idle</text>
+
+        <text x="24" y="70" font-family="Manrope, sans-serif" font-size="12" fill="var(--muted)">sender</text>
+        <line x1="100" y1="64" x2="820" y2="64" stroke="var(--muted-2)" stroke-width="1.2" />
+        <text x="24" y="200" font-family="Manrope, sans-serif" font-size="12" fill="var(--muted)">receiver</text>
+        <line x1="100" y1="194" x2="820" y2="194" stroke="var(--muted-2)" stroke-width="1.2" />
+
+        <line x1="160" y1="64" x2="320" y2="194" stroke="var(--accent)" stroke-width="1.8" />
+        <line x1="200" y1="64" x2="360" y2="194" stroke="var(--accent)" stroke-width="1.8" />
+        <text x="150" y="56" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--accent-text)">pkt 1,2</text>
+
+        <line x1="420" y1="194" x2="600" y2="64" stroke="var(--sage-deep)" stroke-width="1.8" />
+        <text x="540" y="186" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--sage-deep)">ACK</text>
+
+        <line x1="200" y1="44" x2="200" y2="240" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="3 3" />
+        <line x1="600" y1="44" x2="600" y2="240" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="3 3" />
+        <text x="200" y="262" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">last_sent_time</text>
+        <text x="600" y="262" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">ACK 回來 / 可再送</text>
+
+        <line x1="200" y1="226" x2="600" y2="226" stroke="var(--accent)" stroke-width="1.5" marker-end="url(#vg-w-tabs-quic-idle-measure-arr)" marker-start="url(#vg-w-tabs-quic-idle-measure-arrs)" />
+        <text x="400" y="220" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--accent-text)">~14ms (一個 RTT)——broken 算成 idle</text>
+
+        <text x="640" y="110" font-family="EB Garamond, serif" font-size="13" fill="var(--sage-deep)">fixed: last_ack_time ≈ 此刻</text>
+        <text x="640" y="130" font-family="EB Garamond, serif" font-size="13" fill="var(--sage-deep)">→ idle_delta ≈ 0</text>
+
+        <defs>
+          <marker id="vg-w-tabs-quic-idle-measure-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="var(--accent)" /></marker>
+          <marker id="vg-w-tabs-quic-idle-measure-arrs" viewBox="0 0 10 10" refX="1" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M10 0 L0 5 L10 10 z" fill="var(--accent)" /></marker>
+        </defs>
+      </svg>
+    </div>
+  </figure>
+
+  <p>看懂了量測點的差異，
+  整個死亡螺旋的機制就清楚了。
+  在 broken 版本下，
+  每當 bytes_in_flight 歸零（也就是每個 RTT、
+  每次剛把那兩個封包送完等到 ACK）
+  ，<code>on_packet_sent()</code> 就會把那 ~14ms 的虛假 idle_delta 拿去推進 epoch_start。epoch 被往前推之後，CUBIC 計算 dtEpoch（自 epoch 起算的時間）
+  時得到一個接近 0 的值——而 dtEpoch ≈ 0 代入三次曲線，
+  算出的 cwnd 目標就是最小值附近。
+  於是 cwnd 不成長。
+  下一個 RTT，
+  同樣的事情再發生一次：epoch 又被推前、dtEpoch 又被歸零、cwnd 又不長。
+  這就是那 999 次翻轉的物理本質——每一次都是一個被人為製造出來的、
+  不該存在的 FALSE recovery 狀態。</p>
+
+  <p>這個機制有一個值得親手感受的性質：broken 版每個 round 把 epoch 往前推的量，
+  恰好等於一個 RTT——RTT 越大，epoch 被推得越遠、dtEpoch 被壓得越死。
+  下面這個滑桿讓你掃 RTT，
+  看 broken 與 fixed 兩種量測下，
+  每個 round 推進 epoch 的量怎麼隨 RTT 變化。
+  注意 fixed 版那條恆為 ~0 的線——不管 RTT 多大，
+  只要量測基準取對了，epoch 就不會被虛假地往前推。</p>
+
+  <figure class="vg-w-range-quic-rtt-push" data-svg-scroll="800">
+    <style>
+      .vg-w-range-quic-rtt-push { display: grid; gap: var(--s-3); margin: var(--s-4) 0; }
+      .vg-w-range-quic-rtt-push .control { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); flex-wrap: wrap; }
+      .vg-w-range-quic-rtt-push input[type="range"] { flex: 1; min-width: 140px; height: 36px; accent-color: var(--accent); touch-action: none; }
+      .vg-w-range-quic-rtt-push .readout { font-family: JetBrains Mono, monospace; font-variant-numeric: tabular-nums; color: var(--ink); min-width: 7ch; text-align: right; }
+      .vg-w-range-quic-rtt-push svg.bars { width: 100%; height: auto; }
+      .vg-w-range-quic-rtt-push .legend { display: flex; gap: var(--s-3); font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); flex-wrap: wrap; }
+      .vg-w-range-quic-rtt-push .legend span { display: inline-flex; align-items: center; gap: 6px; }
+      .vg-w-range-quic-rtt-push .sw { width: 14px; height: 4px; display: inline-block; }
+      .vg-w-range-quic-rtt-push .sw-broken { background: var(--accent); }
+      .vg-w-range-quic-rtt-push .sw-fixed { background: var(--sage-deep); }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M16 3h3a2 2 0 0 1 2 2v3"/><path d="M8 21H5a2 2 0 0 1-2-2v-3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/><path d="M12 7v10"/>
+      </svg>
+      <span>drag the slider to sweep RTT · watch the per-round epoch push scale</span>
+    </p>
+
+    <div class="control">
+      <label for="vg-w-range-quic-rtt-push-x">RTT =</label>
+      <input id="vg-w-range-quic-rtt-push-x" type="range" min="2" max="60" step="1" value="10" aria-label="round-trip time in milliseconds" />
+      <span class="readout" id="vg-w-range-quic-rtt-push-out">10 ms</span>
+    </div>
+
+    <svg class="bars" viewBox="0 0 720 240" role="img" aria-label="兩條長條：broken 版每 round 推進 epoch 的量隨 RTT 線性成長，fixed 版恆為約 0">
+      <line x1="200" y1="40" x2="200" y2="200" stroke="var(--line)" stroke-width="1" />
+      <line x1="200" y1="200" x2="700" y2="200" stroke="var(--line)" stroke-width="1" />
+      <text x="200" y="226" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--muted)">0</text>
+      <text x="450" y="226" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--muted)">30ms</text>
+      <text x="700" y="226" text-anchor="end" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--muted)">60ms</text>
+      <text x="700" y="236" text-anchor="end" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">per-round epoch push (ms)</text>
+
+      <text x="20" y="80" font-family="EB Garamond, serif" font-size="14" fill="var(--accent-text)">broken</text>
+      <text x="20" y="96" font-family="IM Fell English, serif" font-style="italic" font-size="11" fill="var(--muted)">≈ 一個 RTT</text>
+      <rect id="vg-w-range-quic-rtt-push-bar-broken" x="200" y="62" width="80" height="28" fill="var(--accent)" fill-opacity="0.7" />
+      <text id="vg-w-range-quic-rtt-push-lbl-broken" x="288" y="82" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--accent-text)">10.0 ms</text>
+
+      <text x="20" y="150" font-family="EB Garamond, serif" font-size="14" fill="var(--sage-deep)">fixed</text>
+      <text x="20" y="166" font-family="IM Fell English, serif" font-style="italic" font-size="11" fill="var(--muted)">≈ 0</text>
+      <rect id="vg-w-range-quic-rtt-push-bar-fixed" x="200" y="132" width="3" height="28" fill="var(--sage-deep)" />
+      <text id="vg-w-range-quic-rtt-push-lbl-fixed" x="212" y="152" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--sage-deep)">~0.0 ms</text>
+    </svg>
+
+    <div class="legend">
+      <span><i class="sw sw-broken"></i>broken：idle_delta = now − last_sent_time ≈ RTT</span>
+      <span><i class="sw sw-fixed"></i>fixed：idle_delta = now − max(last_ack_time, last_sent_time) ≈ 0</span>
+    </div>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-range-quic-rtt-push');
+        const inp = root.querySelector('#vg-w-range-quic-rtt-push-x');
+        const out = root.querySelector('#vg-w-range-quic-rtt-push-out');
+        const barBroken = root.querySelector('#vg-w-range-quic-rtt-push-bar-broken');
+        const lblBroken = root.querySelector('#vg-w-range-quic-rtt-push-lbl-broken');
+        const lblFixed = root.querySelector('#vg-w-range-quic-rtt-push-lbl-fixed');
+        const X0 = 200, X1 = 700, RTT_MAX = 60;
+        function onInput() {
+          const rtt = Number(inp.value);
+          out.textContent = rtt + ' ms';
+          // broken: per-round epoch push ≈ one RTT
+          const w = (rtt / RTT_MAX) * (X1 - X0);
+          barBroken.setAttribute('width', Math.max(2, w));
+          lblBroken.setAttribute('x', X0 + Math.max(2, w) + 8);
+          lblBroken.textContent = rtt.toFixed(1) + ' ms';
+          // fixed: ~0 regardless of RTT (tiny residual scheduling jitter)
+          lblFixed.textContent = '~0.0 ms';
+        }
+        inp.addEventListener('input', onInput);
+        onInput();
+      })();
+    </script>
+  </figure>
+
+  <p>這張圖把「為什麼 broken 版會無限循環」攤成一句話：
+  只要 idle_delta 跟 RTT 綁在一起，
+  每個 round 推進 epoch 的量就永遠 ≥ 一個 RTT，
+  而連線每個 RTT 都會進一次 <code>on_packet_sent()</code>——推進的速率剛好追平甚至超過時間流逝的速率，dtEpoch 因此永遠回不到正值。fixed 版把這條線壓回 0，
+  時間流逝才終於能累積成 dtEpoch，CUBIC 曲線才能重新接管。</p>
+
+  <p>修正之所以只需要「加一個 timestamp」
+  就足夠，
+  是因為問題的本質是「量測的參考點選錯了」
+  ，
+  而不是「演算法邏輯錯了」
+  。<code>last_ack_time</code> 在每次收到 ACK 時更新。
+  在最小 cwnd 的場景裡，
+  連線剛收到 ACK 才會去送下一批、
+  才會進到 <code>on_packet_sent()</code>，
+  所以此刻 <code>last_ack_time</code> 幾乎就是 <code>now</code>。
+  把閒置基準從 <code>last_sent_time</code> 改成 <code>max(last_ack_time, last_sent_time)</code> 之後，max 會取到那個剛更新的 <code>last_ack_time</code>，idle_delta 算出來 ≈ 0，epoch 不再被推進，CUBIC 的三次曲線正常接管。
+  為什麼是 max 而不是直接用 last_ack_time？
+  因為在真正的應用閒置場景（連線送完資料後沒有新資料、
+  也沒有新 ACK）
+  ，last_sent_time 才是較晚的那個、
+  才反映真實閒置的起點——max 同時涵蓋兩種場景。</p>
+
+  <p>這裡有一個容易被當成「實作細節」
+  一筆帶過、
+  但其實是整個 bug 核心的觀念：
+  在核心裡，
+  封包真的是核心自己送出去的，last_sent_time 反映的是「核心 NIC 隊列裡這個 socket 上一次有封包出去的時刻」
+  ，
+  而核心對 ACK 的處理跟對 send 的處理在同一個 timing domain 裡，
+  兩者的時間語意是對齊的。
+  搬到 userspace 之後，quiche 拿到的 timestamp 來自 userspace 的時鐘讀取，send 與 ack 之間的關係不再有核心那套隱含的對齊保證。
+  原本在核心裡「last_sent_time 已經足夠近似」
+  的前提，
+  在 userspace 的 timing 模型下不再成立——而那個一週後的核心 follow-up，
+  正是在核心自己的世界裡就已經發現「光用 send time 不夠精確」
+  。
+  移植的人沒有把那個一週後的觀念修正也一起帶過來。</p>
+
+  <h2>數字的形狀——把螺旋量化</h2>
+
+  <p>把這個案例的關鍵數字放在一起看，
+  能感受到它的隱蔽性與爆炸性各有多強。
+  下面這張表整理了測試條件、
+  失敗特徵、
+  與修正後的結果。
+  值得注意的是「失敗率 61%」
+  這個數字——它不是「偶爾」
+  ，
+  而是「多數」
+  ；
+  只要進入那組 congestion 條件，
+  連線更可能餓死自己而不是恢復。
+  但同樣這套程式碼在沒有遺失的日常流量下，
+  吞吐 dashboard 永遠是綠的。</p>
+
+  <figure class="vg-w-table-quic-spiral-numbers">
+    <style>
+      .vg-w-table-quic-spiral-numbers { margin: var(--s-4) 0; overflow-x: auto; }
+      .vg-w-table-quic-spiral-numbers table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-quic-spiral-numbers thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); }
+      .vg-w-table-quic-spiral-numbers tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+      .vg-w-table-quic-spiral-numbers td.num { font-variant-numeric: tabular-nums; font-family: JetBrains Mono, monospace; }
+      .vg-w-table-quic-spiral-numbers td.metric { color: var(--ink); }
+      .vg-w-table-quic-spiral-numbers tbody tr:hover td { background: var(--bg-soft); }
+      .vg-w-table-quic-spiral-numbers caption { text-align: left; caption-side: top; font-family: var(--scribed); font-style: italic; color: var(--muted); font-size: var(--fs-sm); padding: var(--s-1) 0; }
+    </style>
+    <table>
+      <caption>quiche CUBIC 死亡螺旋的關鍵量值——測試條件、失敗特徵、修正結果。數字取自 Cloudflare 部落格的復現實驗。</caption>
+      <thead>
+        <tr><th>量值</th><th>數字</th><th>意義</th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="metric">下載失敗率</td><td class="num">~61%</td><td>多數連線在 10 秒 timeout 內跑不完 10 MB 下載</td></tr>
+        <tr><td class="metric">recovery 狀態翻轉</td><td class="num">999</td><td>6.7 秒內，CUBIC 狀態機抽搐次數</td></tr>
+        <tr><td class="metric">翻轉間隔</td><td class="num">~14ms</td><td>約等於一個 RTT＋處理時間——這就是診斷線索</td></tr>
+        <tr><td class="metric">卡死的 cwnd</td><td class="num">2,700B</td><td>兩個 full-size 封包，CUBIC 的理論地板</td></tr>
+        <tr><td class="metric">RTT</td><td class="num">10ms</td><td>測試設定的往返時間</td></tr>
+        <tr><td class="metric">遺失注入</td><td class="num">30% / 2s</td><td>前兩秒隨機丟包，之後零遺失</td></tr>
+        <tr><td class="metric">修正後通過率</td><td class="num">100%</td><td>加上 last_ack_time 後</td></tr>
+        <tr><td class="metric">修正後恢復時間</td><td class="num">4-5s</td><td>cwnd 沿預期 CUBIC 曲線爬回</td></tr>
+      </tbody>
+    </table>
+  </figure>
+
+  <p>14ms 那一行值得單獨再強調。
+  在 incident 排查裡，
+  「某個本該是事件驅動的東西，
+  開始以一個固定的、
+  約等於某個系統常數的週期抽搐」
+  ，
+  幾乎永遠是「有個量被錯誤地綁上了那個常數」
+  的訊號。
+  這裡的常數是 RTT。
+  當你看到狀態翻轉的週期 ≈ RTT，
+  下一個問題就該是「哪個量本來不該跟 RTT 有關，
+  卻變成了一個 RTT 長？
+  」——答案就是那個被誤量成一整個 RTT 的 idle_delta。
+  這種「週期匹配某個系統常數」
+  的模式辨識，
+  是讀 timing-related bug 時最值得內化的直覺之一。</p>
+
+  <p>另一個值得 leader 記住的點是失敗的「形狀」
+  ：
+  它不是常態的 5% 降速，
+  而是條件性的 61% 全滅。
+  許多 congestion control 的 regression 是「在某些路徑上慢了 10%」
+  這種漸進式劣化，
+  可以靠 A/B 與長期 metric 慢慢發現。
+  這個 bug 不是——它平時完全不存在，
+  只在遺失夠嚴重、cwnd 被打到地板的那一刻突然出現，
+  而且一出現就是接近全滅。
+  這類「平時隱形、
+  極端條件下災難」
+  的失敗模式，
+  恰恰是最需要靠 fault injection 測試（像這次的 30% 隨機丟包）
+  而非生產 metric 才能抓到的——因為生產環境的 metric 是被「平時一切正常」
+  的多數樣本稀釋掉的。
+  把這點翻成排查語言：
+  當一個失敗只在某個狀態子空間（這裡是 cwnd 觸地）才出現，
+  聚合 metric 幾乎一定看不見它，
+  你需要的是能主動把系統逼進那個子空間的測試，
+  而不是被動等它在生產裡自己發生。</p>
+
+  <h2>移植核心程式碼這件事——該帶走的不只是程式碼</h2>
+
+  <p>這個案例真正的 leverage 不在 QUIC、
+  也不在 CUBIC，
+  而在「跨環境移植經過驗證的程式碼」
+  這個普遍動作裡。
+  把核心的最佳化搬進 userspace、
+  把 C 的演算法搬進 Rust、
+  把單執行緒的假設搬進並行環境——每一次這種移植，
+  工程師都在隱含地假設「原環境成立的前提，
+  在新環境也成立」
+  。
+  這個 bug 的教訓是：
+  那些前提經常是隱含的、
+  沒寫在程式碼裡的，
+  而它們恰恰是最危險的部分。</p>
+
+  <p>核心的 CUBIC 程式碼裡，
+  「last_sent_time 足以近似 idle 起點」
+  這個前提從來沒被明寫成一行註解或一個 assert——它是核心 timing model 的一個 emergent property，
+  是「send 與 ack 在同一個 timing domain、
+  且核心對 NIC 隊列有直接控制」
+  這些底層事實的副產品。
+  當你只 port 程式碼、
+  不 port 這些底層事實時，
+  前提就靜悄悄地失效了。
+  更諷刺的是，
+  核心團隊自己在一週後的 follow-up 裡，
+  等於已經把「光用 send time 不夠」
+  這個觀念寫下來了——移植時若連 commit 歷史一起讀，
+  這個坑本可以避開。</p>
+
+  <p>對一個帶團隊的人，
+  這裡有三條可以直接落地的做法。
+  第一，
+  移植任何「跨了 N 年、
+  被廣泛驗證」
+  的程式碼時，
+  把它的完整 commit 歷史也讀一遍——尤其是緊跟在原始 commit 之後的 follow-up 與 bugfix，
+  那些往往是原作者自己踩過、
+  又修掉的坑，
+  是不寫在最終程式碼裡的隱性知識。
+  第二，
+  凡是移植涉及 timing、ordering、memory model 的程式碼，
+  明確寫下原環境的隱含前提，
+  再逐條檢查新環境是否成立——把 emergent property 顯式化成 assert 或註解。
+  第三，
+  為「平時隱形、
+  極端條件下災難」
+  這類失敗模式建立 fault injection 測試，
+  不要只依賴生產 metric——這次若不是有人特地跑 30% 丟包，
+  這個 bug 可能還躲在 dashboard 的綠色背後很久。</p>
+
+  <p>還值得補一句關於「為什麼選擇移植而不是重寫」
+  的辯護：quiche 團隊拿核心驗證過的 idle 最佳化來用，
+  這個決定本身是對的。
+  重新發明一套 application-limited 處理邏輯，
+  引入新 bug 的機率只會更高。
+  問題從來不是「不該移植」
+  ，
+  而是「移植時對隱含前提的盡職調查不夠」
+  。
+  把這個案例讀成「不要抄核心程式碼」
+  是讀錯了；
+  正確的讀法是「抄的時候要連同它成立的條件一起抄，
+  並驗證新環境裡這些條件還在」
+  。</p>
+
+  <p class="vg-deep-closer"><strong>The lesson</strong>：
+  跨環境移植經過驗證的程式碼時，
+  真正要帶走的不是那幾行邏輯，
+  而是讓它成立的隱含前提——當 last_sent_time 在核心裡「足夠近似 idle」
+  、
+  到了 userspace 卻量成一整個 RTT，
+  那條沒被一起搬過來的 timing 語意，
+  就足以把一個正確的最佳化變成一台讓連線餓死自己的引擎。</p>
+</div>
