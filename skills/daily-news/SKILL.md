@@ -1,6 +1,6 @@
 ---
 name: daily-news
-description: This skill should be used when the user asks to "run daily news", "publish today's news", "draft today's vatt-ghern roundup", "do the daily-news routine", invokes `/vatt-ghern:daily-news`, or asks Claude to author tech-news posts for the vatt-ghern blog. The skill produces one daily-roundup HTML (10 items) plus up to three daily-deep-story HTML posts under `src/posts/YYYY/MM/DD/`, runs anti-duplication checks against the past 7 days, and opens a PR to `main`. Always use this skill (instead of authoring news posts ad-hoc) so output stays consistent with the archetype rules, design system, and dedup conventions.
+description: This skill should be used when the user asks to "run daily news", "publish today's news", "draft today's vatt-ghern roundup", "do the daily-news routine", invokes `/vatt-ghern:daily-news`, or asks Claude to author tech-news posts for the vatt-ghern blog. The skill produces one daily-roundup HTML (10 items) plus up to three daily-deep-story HTML posts under `src/posts/YYYY/MM/DD/`, runs anti-duplication checks (exact source-URL/news_id against the full archive, fuzzy title similarity against the past 7 days), and opens a PR to `main`. Always use this skill (instead of authoring news posts ad-hoc) so output stays consistent with the archetype rules, design system, and dedup conventions.
 version: 0.1.0
 ---
 
@@ -8,8 +8,9 @@ version: 0.1.0
 
 Curate today's tech news for the vatt-ghern blog and publish it as bespoke
 HTML posts. Adopt a senior-tech-lead persona, fetch from a priority source
-list, score and de-duplicate against the past 7 days, write one roundup and
-up to three deep-stories, and open a pull request for human review.
+list, score and de-duplicate (exact source URL / news_id against the full
+archive, fuzzy title similarity against the past 7 days), write one roundup
+and up to three deep-stories, and open a pull request for human review.
 
 ## When this skill runs
 
@@ -50,8 +51,9 @@ truth — do not re-derive their contents:
   priority order. HackerNoon is the primary signal.
 - **`references/archetypes.md`** — Required HTML structure for roundup and
   deep-story, sidecar JSON schema, content rules, scoring rubric.
-- **`references/anti-duplication.md`** — Rules for the 7-day window check
-  and how to handle near-duplicates.
+- **`references/anti-duplication.md`** — Dedup rules: exact source-URL /
+  news_id against the full archive, fuzzy title similarity against the past
+  7 days, and how to handle near-duplicates.
 - **`references/design-system.md`** — Color tokens, font stacks, component
   classes, read-tracking attribute conventions, SVG patterns.
 - **`references/widget-isolation.md`** — CSS / ID / JS scoping contract for
@@ -120,10 +122,11 @@ mechanical +2 domain-coverage bonus is added by the score module below.
 
 Drop candidates that:
 
-- Have a canonical URL already in `past_urls`
+- Have a canonical URL already in `past_urls` (full archive — a source
+  covered once stays a duplicate forever)
 - Have a title whose Jaccard char-bigram similarity > 0.85 against any
-  `past_roundup_titles` (compute this manually — the formal check runs in
-  step 8 via `check-dup.mjs`)
+  `past_roundup_titles` (recent 7-day window; compute this manually — the
+  formal check runs in step 8 via `check-dup.mjs`)
 - Violate the "what does NOT earn a place" rules in `persona.md`
 
 **Advisory check**: write the surviving candidates (each carrying
@@ -333,8 +336,9 @@ mechanically.
 **d. Pre-dispatch URL dedup (added 2026-05-21 after PR #30)**:
 
 Before finalising the deep-story picks for Step 7a, run the URL-dedup
-helper to catch any pick whose URL already appears in the past 7 days.
-This must happen *here*, not at Step 8 — otherwise a sub-agent will
+helper to catch any pick whose canonical URL already appears anywhere in
+the archive (`past_urls` from Step 1 spans the full history, not just 7
+days). This must happen *here*, not at Step 8 — otherwise a sub-agent will
 write an entire deep-story (DONE) only to have it dropped during the
 formal `check-dup.mjs` run, leaving an empty deep-story slot with no
 refill path.
