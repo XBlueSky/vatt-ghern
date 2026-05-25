@@ -14,10 +14,17 @@ test("isoWeekKey: next Monday starts new week", () => {
   assert.equal(isoWeekKey("2026-05-25"), "2026-W22"); // Mon
 });
 
-test("isoWeekKey: year boundary (Jan 1 2027 is W53 of 2026)", () => {
-  // 2026-01-01 is Thursday, so Jan 1 2027 (Fri) belongs to W53 of 2026 by ISO rule
-  // Sanity-check against a well-known case instead of trusting our own math:
-  assert.match(isoWeekKey("2027-01-01"), /^\d{4}-W\d{2}$/);
+test("isoWeekKey: year boundary — 2027-01-01 belongs to ISO 2026-W53", () => {
+  // 2026 starts Thu, so 2026 has 53 ISO weeks; Jan 1 2027 (Fri) still belongs
+  // to the last week of 2026.
+  assert.equal(isoWeekKey("2027-01-01"), "2026-W53");
+});
+
+test("isoWeekRange: W01 of 2026 crosses year boundary back to Dec 2025", () => {
+  // 2026 starts Thu, so ISO W01 of 2026 is Mon 2025-12-29 .. Sun 2026-01-04.
+  const { start, end } = isoWeekRange("2026-W01");
+  assert.equal(start, "2025-12-29");
+  assert.equal(end, "2026-01-04");
 });
 
 test("isoWeekRange: returns Mon..Sun for given key", () => {
