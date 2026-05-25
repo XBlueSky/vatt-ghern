@@ -11,6 +11,31 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const LUCIDE_DIR = join(__dirname, "node_modules", "lucide-static", "icons");
 const LUCIDE_CACHE = new Map();
 
+// Build the per-day post buckets used by both daysWithPosts and weeksWithPosts.
+// Skips drafts and weekly-rollup posts (weeklies live on weeks, not days).
+// Within each day: daily-roundup first, then deep-stories.
+function buildDayBuckets(api) {
+  const byDay = new Map();
+  for (const post of api.getFilteredByGlob("src/posts/**/*.html")) {
+    if (post.data.status === "draft") continue;
+    if (post.data.archetype === "weekly-rollup") continue;
+    const d = new Date(post.data.date);
+    const key = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
+    if (!byDay.has(key)) byDay.set(key, []);
+    byDay.get(key).push(post);
+  }
+  return [...byDay.entries()]
+    .sort(([a], [b]) => b.localeCompare(a)) // newest day first
+    .map(([date, posts]) => ({
+      date,
+      posts: posts.sort((a, b) => {
+        if (a.data.archetype === "daily-roundup") return -1;
+        if (b.data.archetype === "daily-roundup") return 1;
+        return 0;
+      }),
+    }));
+}
+
 function lucideIcon(name, extraClass = "", ariaLabel = "") {
   const cacheKey = `${name}|${extraClass}|${ariaLabel}`;
   if (LUCIDE_CACHE.has(cacheKey)) return LUCIDE_CACHE.get(cacheKey);
@@ -168,52 +193,14 @@ export default function (eleventyConfig) {
 
   // Collection: posts grouped by date for daily timeline homepage.
   // Returns [{ date: "2026-05-16", posts: [...] }, ...] newest day first.
-  eleventyConfig.addCollection("daysWithPosts", (api) => {
-    const byDay = new Map();
-    for (const post of api.getFilteredByGlob("src/posts/**/*.html")) {
-      if (post.data.status === "draft") continue;
-      if (post.data.archetype === "weekly-rollup") continue;
-      const d = new Date(post.data.date);
-      const key = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
-      if (!byDay.has(key)) byDay.set(key, []);
-      byDay.get(key).push(post);
-    }
-    return [...byDay.entries()]
-      .sort(([a], [b]) => b.localeCompare(a))
-      .map(([date, posts]) => ({
-        date,
-        posts: posts.sort((a, b) => {
-          // roundup first, then deep-stories
-          if (a.data.archetype === "daily-roundup") return -1;
-          if (b.data.archetype === "daily-roundup") return 1;
-          return 0;
-        }),
-      }));
-  });
+  eleventyConfig.addCollection("daysWithPosts", (api) => buildDayBuckets(api));
 
   // Collection: posts grouped by ISO week (Mon–Sun) for past-weeks rendering
   // on the homepage. Weekly-rollup posts attach to the week they summarise,
   // identified by data.range.start (since publish date is the Monday *after*
   // the covered week and would otherwise bucket to the next week).
   eleventyConfig.addCollection("weeksWithPosts", (api) => {
-    // Gather day buckets, mirroring daysWithPosts so we don't duplicate logic.
-    const byDay = new Map();
-    for (const post of api.getFilteredByGlob("src/posts/**/*.html")) {
-      if (post.data.status === "draft") continue;
-      if (post.data.archetype === "weekly-rollup") continue;
-      const d = new Date(post.data.date);
-      const key = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
-      if (!byDay.has(key)) byDay.set(key, []);
-      byDay.get(key).push(post);
-    }
-    const dayBuckets = [...byDay.entries()].map(([date, posts]) => ({
-      date,
-      posts: posts.sort((a, b) => {
-        if (a.data.archetype === "daily-roundup") return -1;
-        if (b.data.archetype === "daily-roundup") return 1;
-        return 0;
-      }),
-    }));
+    const dayBuckets = buildDayBuckets(api);
 
     // Gather weekly-rollup posts and bucket by the ISO week they cover.
     const weeklies = new Map(); // weekKey -> weekly post
