@@ -61,7 +61,7 @@ test("weekly-delta: domain_shift emits all 5 priority domains in fixed order", (
   assert.deepEqual(order, ["ai", "systems", "infra", "web", "backend"]);
 });
 
-test("weekly-delta: legacy topics counted as 'legacy' pseudo-domain", () => {
+test("weekly-delta: storage/industry topics counted as 'other' pseudo-domain", () => {
   const r = computeWeeklyDelta({
     end: "2026-05-25",
     loader: () => ({
@@ -74,10 +74,10 @@ test("weekly-delta: legacy topics counted as 'legacy' pseudo-domain", () => {
       deep_stories: [],
     }),
   });
-  const legacy = r.domain_shift.find((d) => d.domain === "legacy");
-  assert.ok(legacy, "expected legacy pseudo-domain in domain_shift");
-  assert.equal(legacy.last_week_pct, 100);
-  assert.equal(legacy.this_week_pct, 0);
+  const other = r.domain_shift.find((d) => d.domain === "other");
+  assert.ok(other, "expected 'other' pseudo-domain in domain_shift");
+  assert.equal(other.last_week_pct, 100);
+  assert.equal(other.this_week_pct, 0);
 });
 
 test("weekly-delta: throws on bad end format", () => {

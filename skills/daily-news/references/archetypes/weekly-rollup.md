@@ -84,9 +84,9 @@ this-week (days 1-7) and last-week (days 8-14), and emits:
 - `domain_shift[]` — 5 priority domains in fixed order
   (`ai → systems → infra → web → backend`), each with
   `{this_week_count, last_week_count, this_week_pct, last_week_pct,
-  delta_pp}`. Legacy `storage`/`industry` topics roll into a `legacy`
-  pseudo-domain appended after the 5; prose ignores it unless it's
-  > 20% of either week.
+  delta_pp}`. Non-priority `storage`/`industry` topics roll into an
+  `other` pseudo-domain appended after the 5; prose ignores it unless
+  it's > 20% of either week.
 - `tag_movement.new_this_week[]` — tags new this week with ≥2 mentions
 - `tag_movement.surge[]` — tags up ≥2 vs last week and ≥3 this week
 - `tag_movement.faded[]` — tags down ≥2 vs last week and ≥3 last week
