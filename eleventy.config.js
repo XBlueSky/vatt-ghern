@@ -5,6 +5,7 @@ import loadLanguages from "prismjs/components/index.js";
 import { readFileSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { isoWeekKey, isoWeekRange, isoWeekLabel } from "./scripts/iso-week.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const LUCIDE_DIR = join(__dirname, "node_modules", "lucide-static", "icons");
@@ -190,6 +191,68 @@ export default function (eleventyConfig) {
       }));
   });
 
+  // Collection: posts grouped by ISO week (Mon–Sun) for past-weeks rendering
+  // on the homepage. Weekly-rollup posts attach to the week they summarise,
+  // identified by data.range.start (since publish date is the Monday *after*
+  // the covered week and would otherwise bucket to the next week).
+  eleventyConfig.addCollection("weeksWithPosts", (api) => {
+    // Gather day buckets, mirroring daysWithPosts so we don't duplicate logic.
+    const byDay = new Map();
+    for (const post of api.getFilteredByGlob("src/posts/**/*.html")) {
+      if (post.data.status === "draft") continue;
+      if (post.data.archetype === "weekly-rollup") continue;
+      const d = new Date(post.data.date);
+      const key = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
+      if (!byDay.has(key)) byDay.set(key, []);
+      byDay.get(key).push(post);
+    }
+    const dayBuckets = [...byDay.entries()].map(([date, posts]) => ({
+      date,
+      posts: posts.sort((a, b) => {
+        if (a.data.archetype === "daily-roundup") return -1;
+        if (b.data.archetype === "daily-roundup") return 1;
+        return 0;
+      }),
+    }));
+
+    // Gather weekly-rollup posts and bucket by the ISO week they cover.
+    const weeklies = new Map(); // weekKey -> weekly post
+    for (const post of api.getFilteredByGlob("src/posts/**/*.html")) {
+      if (post.data.status === "draft") continue;
+      if (post.data.archetype !== "weekly-rollup") continue;
+      const start = post.data.range && post.data.range.start;
+      if (!start) continue; // malformed weekly — skip rather than crash build
+      weeklies.set(isoWeekKey(start), post);
+    }
+
+    // Merge into week buckets keyed by ISO week.
+    const byWeek = new Map();
+    for (const day of dayBuckets) {
+      const wk = isoWeekKey(day.date);
+      if (!byWeek.has(wk)) byWeek.set(wk, []);
+      byWeek.get(wk).push(day);
+    }
+    // Also seed weeks that have a weekly but no days (defensive — shouldn't
+    // happen in practice).
+    for (const wk of weeklies.keys()) {
+      if (!byWeek.has(wk)) byWeek.set(wk, []);
+    }
+
+    return [...byWeek.entries()]
+      .sort(([a], [b]) => b.localeCompare(a)) // newest week first
+      .map(([weekKey, days]) => {
+        const { start, end } = isoWeekRange(weekKey);
+        return {
+          weekKey,
+          weekLabel: isoWeekLabel(weekKey),
+          weekStart: start,
+          weekEnd: end,
+          weekly: weeklies.get(weekKey) || null,
+          days: days.sort((a, b) => b.date.localeCompare(a.date)),
+        };
+      });
+  });
+
   // Filters
   eleventyConfig.addFilter("dateISO", (d) => {
     const dt = d ? new Date(d) : new Date();
@@ -210,6 +273,8 @@ export default function (eleventyConfig) {
     if (isNaN(dt)) return "";
     return String(dt.getUTCDate()).padStart(2, "0");
   });
+  eleventyConfig.addFilter("isoWeekKey", isoWeekKey);
+  eleventyConfig.addFilter("isoWeekLabel", isoWeekLabel);
 
   // Reading-time estimator for bilingual zh-Hant + English prose.
   // CJK chars at 350/min, Latin words at 250/min, then sum; ceil to int.
