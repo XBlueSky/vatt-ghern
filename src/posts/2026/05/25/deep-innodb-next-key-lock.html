@@ -1,0 +1,590 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">在一張空表上，session A 跑了一句 <code>SELECT * FROM t WHERE id &gt; 100 FOR UPDATE</code>，沒鎖到任何 row——因為根本沒有 row。session B 接著 INSERT 一筆 id = 101，卻被擋住等鎖。一句鎖不到任何資料的查詢，憑什麼擋住一筆全新的寫入？</p>
+  <h1 class="vg-post-title">InnoDB 的 next-key lock，從零講起——REPEATABLE READ 怎麼用 gap lock 擋掉 phantom read</h1>
+</header>
+
+<div class="vg-post-prose">
+
+<p><span class="vg-dropcap">這</span>篇文章的目標，是把 InnoDB 在 REPEATABLE READ 下擋 phantom read 的那套機制，從你已經知道的東西一路推到你大概沒仔細想過的東西。讀完之後你會知道：四個 isolation level 各自擋掉哪幾種 read anomaly、phantom read 為什麼比 dirty read 跟 non-repeatable read 更難防、record lock 與 gap lock 與 next-key lock 到底差在哪、為什麼 SQL 標準說要 SERIALIZABLE 才能防 phantom 而 InnoDB 在 REPEATABLE READ 就做到了，以及開頭那個「鎖空氣也能擋住別人 INSERT」的反直覺場景到底發生了什麼事。所有鎖的定義會直接對齊 MySQL 8.4 Reference Manual 的「InnoDB Locking」章節——這是本文唯一的權威依據，gslin 那篇分析文則是把這個被很多人忘記的細節重新拎出來的觸發點。</p>
+
+<p>觸發這篇的，是 gslin 一篇短文。他翻出 SQL-92 標準對 phantom read（標準裡編號 P3）的定義，再把它跟 InnoDB 手冊那句「<em>InnoDB uses next-key locks for searches and index scans, which prevents phantom rows</em>」並排，得出一個他自己都承認「忘記過」的結論：InnoDB 的 REPEATABLE READ 提供了比 SQL 標準要求更強的保證。標準說 REPEATABLE READ 允許 phantom read、要擋 phantom 得升到 SERIALIZABLE；InnoDB 卻在預設的 REPEATABLE READ 就把 phantom 擋掉了。這個落差不是 bug，是 InnoDB 刻意的設計，而它的核心工具就是 gap lock 與 next-key lock。本文把這個落差拆開來講。</p>
+
+<h2>三種 read anomaly——先把「讀到不該讀的東西」分成三類</h2>
+
+<p>所有 isolation level 的討論，最後都會落到一個問題上：在我這個 transaction 還沒結束之前，別人的修改會不會「漏」進我的視野？SQL 標準把這種「漏進來」的現象分成三類，由弱到強。先把這三類分清楚，後面所有東西才有座標系。</p>
+
+<p>第一類是 <strong>dirty read（髒讀）</strong>。你讀到了另一個 transaction <em>還沒 commit</em> 的修改。對方改了一筆資料，你讀到了新值，然後對方 rollback——你手上那個值從來沒有真正存在過。這是最嚴重也最容易理解的一類，因為它違反的是最基本的直覺：你讀到的東西，至少應該是某個真的發生過的狀態。</p>
+
+<p>第二類是 <strong>non-repeatable read（不可重複讀）</strong>。你在同一個 transaction 裡，對<em>同一筆 row</em> 讀了兩次，兩次值不一樣——因為中間別人 commit 了一個 UPDATE。注意這裡的關鍵詞是「同一筆 row」：那筆 row 從頭到尾都存在，只是它的值在你兩次讀取之間被改掉了。對方的修改是已經 commit 的，所以這不是 dirty read；但它破壞了「我這個 transaction 裡，同一筆資料應該長得一樣」這個期待。</p>
+
+<p>第三類，也是本文的主角，是 <strong>phantom read（幻讀）</strong>。你用<em>同一個 search condition</em> 查了兩次，第二次跑出來的 row 集合多了（或少了）幾筆——因為中間別人 INSERT（或 DELETE）了符合你條件的 row。SQL-92 標準對它的定義是這樣的：</p>
+
+<blockquote>
+  <p>SQL-transaction T1 reads the set of rows N that satisfy some &lt;search condition&gt;. SQL-transaction T2 then executes SQL-statements that generate one or more rows that satisfy the &lt;search condition&gt; used by SQL-transaction T1.</p>
+</blockquote>
+
+<p>翻成白話：T1 讀了一組符合某條件的 row，T2 接著生出一筆（或多筆）也符合那個條件的 row。當 T1 再查一次，那筆「幻影」row 就冒出來了。注意 phantom 跟 non-repeatable 的本質差別——non-repeatable 動的是「既有 row 的值」，phantom 動的是「符合條件的 row 集合的成員資格」。前者是改 existing row 的內容，後者是讓一筆 row 進入或離開你的查詢結果。這個差別，等一下會直接決定它們各自需要什麼鎖才能擋住。</p>
+
+<p>三類的嚴重度從 dirty 到 phantom 遞增，而四個 isolation level 就是「我願意容忍其中哪幾類」的階梯。先把這張階梯放進腦子裡，下一節我們會看到為什麼 phantom 是這三類裡最難擋的一個。下面這個 tab widget 把四個 level 各自的容忍度攤開，順便標出 SQL 標準與 InnoDB 在 REPEATABLE READ 這一格上的分歧。</p>
+
+<figure class="vg-w-tabs-isolation-anomalies">
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/><path d="M3 9h6"/>
+    </svg>
+    <span>切換 4 個 isolation level，對照三種 anomaly · 4 tabs</span>
+  </p>
+  <style>
+    .vg-w-tabs-isolation-anomalies { display: grid; gap: var(--s-2); }
+    .vg-w-tabs-isolation-anomalies input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+    .vg-w-tabs-isolation-anomalies .tabs { display: flex; flex-wrap: wrap; gap: var(--s-1); border-bottom: 1px solid var(--line); }
+    .vg-w-tabs-isolation-anomalies .tab { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.04em; padding: var(--s-1) var(--s-2); cursor: pointer; color: var(--muted); min-height: 44px; display: flex; align-items: center; }
+    .vg-w-tabs-isolation-anomalies .panel { display: none; padding: var(--s-2) 0; }
+    .vg-w-tabs-isolation-anomalies .panel table { width: 100%; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+    .vg-w-tabs-isolation-anomalies .panel th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.04em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); }
+    .vg-w-tabs-isolation-anomalies .panel td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); }
+    .vg-w-tabs-isolation-anomalies .yes { color: var(--accent-text); font-family: var(--sans); font-size: var(--fs-xs); letter-spacing: 0.04em; }
+    .vg-w-tabs-isolation-anomalies .no { color: var(--sage-deep); font-family: var(--sans); font-size: var(--fs-xs); letter-spacing: 0.04em; }
+    .vg-w-tabs-isolation-anomalies .note { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-2); border-left: 2px solid var(--accent); padding-left: var(--s-2); }
+    .vg-w-tabs-isolation-anomalies:has(#vg-w-tabs-isolation-anomalies-t1:checked) .panel-1 { display: block; }
+    .vg-w-tabs-isolation-anomalies:has(#vg-w-tabs-isolation-anomalies-t1:checked) [for="vg-w-tabs-isolation-anomalies-t1"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    .vg-w-tabs-isolation-anomalies:has(#vg-w-tabs-isolation-anomalies-t2:checked) .panel-2 { display: block; }
+    .vg-w-tabs-isolation-anomalies:has(#vg-w-tabs-isolation-anomalies-t2:checked) [for="vg-w-tabs-isolation-anomalies-t2"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    .vg-w-tabs-isolation-anomalies:has(#vg-w-tabs-isolation-anomalies-t3:checked) .panel-3 { display: block; }
+    .vg-w-tabs-isolation-anomalies:has(#vg-w-tabs-isolation-anomalies-t3:checked) [for="vg-w-tabs-isolation-anomalies-t3"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    .vg-w-tabs-isolation-anomalies:has(#vg-w-tabs-isolation-anomalies-t4:checked) .panel-4 { display: block; }
+    .vg-w-tabs-isolation-anomalies:has(#vg-w-tabs-isolation-anomalies-t4:checked) [for="vg-w-tabs-isolation-anomalies-t4"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+  </style>
+  <input type="radio" id="vg-w-tabs-isolation-anomalies-t1" name="vg-w-tabs-isolation-anomalies-sel" />
+  <input type="radio" id="vg-w-tabs-isolation-anomalies-t2" name="vg-w-tabs-isolation-anomalies-sel" />
+  <input type="radio" id="vg-w-tabs-isolation-anomalies-t3" name="vg-w-tabs-isolation-anomalies-sel" checked />
+  <input type="radio" id="vg-w-tabs-isolation-anomalies-t4" name="vg-w-tabs-isolation-anomalies-sel" />
+  <div class="tabs">
+    <label class="tab" for="vg-w-tabs-isolation-anomalies-t1">READ UNCOMMITTED</label>
+    <label class="tab" for="vg-w-tabs-isolation-anomalies-t2">READ COMMITTED</label>
+    <label class="tab" for="vg-w-tabs-isolation-anomalies-t3">REPEATABLE READ</label>
+    <label class="tab" for="vg-w-tabs-isolation-anomalies-t4">SERIALIZABLE</label>
+  </div>
+  <div class="panel panel-1">
+    <table>
+      <thead><tr><th>anomaly</th><th>SQL 標準</th><th>InnoDB</th></tr></thead>
+      <tbody>
+        <tr><td>dirty read</td><td class="yes">允許</td><td class="yes">允許</td></tr>
+        <tr><td>non-repeatable read</td><td class="yes">允許</td><td class="yes">允許</td></tr>
+        <tr><td>phantom read</td><td class="yes">允許</td><td class="yes">允許</td></tr>
+      </tbody>
+    </table>
+    <p class="note">最弱的一級。讀取不加任何 share lock，直接讀最新的 row 版本——包含別人還沒 commit 的。三種 anomaly 全開。實務上幾乎沒人用。</p>
+  </div>
+  <div class="panel panel-2">
+    <table>
+      <thead><tr><th>anomaly</th><th>SQL 標準</th><th>InnoDB</th></tr></thead>
+      <tbody>
+        <tr><td>dirty read</td><td class="no">擋掉</td><td class="no">擋掉</td></tr>
+        <tr><td>non-repeatable read</td><td class="yes">允許</td><td class="yes">允許</td></tr>
+        <tr><td>phantom read</td><td class="yes">允許</td><td class="yes">允許</td></tr>
+      </tbody>
+    </table>
+    <p class="note">每句 SELECT 都看到一個「該句執行那一刻」的 snapshot，所以擋掉 dirty read。但同一 transaction 內兩句 SELECT 看到不同 snapshot，non-repeatable 與 phantom 都還在。在這級 InnoDB 會關掉 gap locking——這是手冊明說的：「Gap locking can be disabled explicitly. This occurs if you change the transaction isolation level to READ COMMITTED.」</p>
+  </div>
+  <div class="panel panel-3">
+    <table>
+      <thead><tr><th>anomaly</th><th>SQL 標準</th><th>InnoDB</th></tr></thead>
+      <tbody>
+        <tr><td>dirty read</td><td class="no">擋掉</td><td class="no">擋掉</td></tr>
+        <tr><td>non-repeatable read</td><td class="no">擋掉</td><td class="no">擋掉</td></tr>
+        <tr><td>phantom read</td><td class="yes">允許</td><td class="no">擋掉</td></tr>
+      </tbody>
+    </table>
+    <p class="note">分歧就在這一格。SQL-92 說 REPEATABLE READ 仍允許 phantom；InnoDB 的預設 level 卻把 phantom 也擋掉了。手冊原文：「By default, InnoDB operates in REPEATABLE READ transaction isolation level. In this case, InnoDB uses next-key locks for searches and index scans, which prevents phantom rows.」這個「超出標準」的保證，靠的就是下面要講的 gap lock 與 next-key lock。</p>
+  </div>
+  <div class="panel panel-4">
+    <table>
+      <thead><tr><th>anomaly</th><th>SQL 標準</th><th>InnoDB</th></tr></thead>
+      <tbody>
+        <tr><td>dirty read</td><td class="no">擋掉</td><td class="no">擋掉</td></tr>
+        <tr><td>non-repeatable read</td><td class="no">擋掉</td><td class="no">擋掉</td></tr>
+        <tr><td>phantom read</td><td class="no">擋掉</td><td class="no">擋掉</td></tr>
+      </tbody>
+    </table>
+    <p class="note">標準裡唯一保證擋掉全部三類的 level。在 InnoDB，SERIALIZABLE 會把所有 plain SELECT 隱式轉成 SELECT ... LOCK IN SHARE MODE，全程加鎖。代價是並發度大幅下降。標準要你付這個代價才能換 phantom protection——InnoDB 在 REPEATABLE READ 就免費給你了。</p>
+  </div>
+</figure>
+
+<p>把上面這張表讀通，你就抓到了本文的核心張力：在 SQL 標準裡，REPEATABLE READ 這一行的 phantom 欄是「允許」，SERIALIZABLE 才是「擋掉」。但 InnoDB 把 REPEATABLE READ 的 phantom 欄改成了「擋掉」。這不是兩家對標準的不同詮釋——而是 InnoDB 主動加碼。接下來要回答的就是：它憑什麼能在不升到 SERIALIZABLE 的情況下做到這件事？</p>
+
+<h2>為什麼 phantom 比另外兩個難擋——你沒辦法鎖一筆還不存在的 row</h2>
+
+<p>要看出 InnoDB 的巧思在哪，得先理解為什麼 phantom 用傳統的鎖擋不住。這一節我們把「naive 的鎖」拿來試試，看它在哪裡破功。</p>
+
+<p>先看 dirty read 跟 non-repeatable read 怎麼擋。傳統的悲觀鎖做法是 <strong>two-phase locking（2PL）</strong>：讀的時候加 share lock（S lock），寫的時候加 exclusive lock（X lock），鎖一直持有到 transaction 結束。MySQL 手冊定義得很乾淨：</p>
+
+<blockquote>
+  <p>A shared (S) lock permits the transaction that holds the lock to read a row. An exclusive (X) lock permits the transaction that holds the lock to update or delete a row.</p>
+</blockquote>
+
+<p>S lock 之間相容（兩個 transaction 可以同時讀同一筆），但 S 跟 X 互斥、X 跟任何鎖都互斥。有了這組規則，dirty read 自然消失：你想讀一筆別人正在改的 row，對方持有 X lock，你的 S lock 請求會被擋住，等到對方 commit 或 rollback 才放行——你永遠讀不到未 commit 的中間值。non-repeatable read 也擋掉了：你第一次讀就對那筆 row 加了 S lock 並持有到 transaction 結束，別人想 UPDATE 它得拿 X lock，被你的 S lock 擋住，所以你在 transaction 內再讀一次，那筆 row 的值不會變。</p>
+
+<p>關鍵來了：dirty read 跟 non-repeatable read 都是針對「<em>已經存在的 row</em>」。一筆 row 存在，它就有一個可以被鎖住的對象——你鎖住那筆 row 的 index record，就鎖住了問題。這種鎖叫 <strong>record lock</strong>，手冊定義：</p>
+
+<blockquote>
+  <p>A record lock is a lock on an index record. For example, <code>SELECT c1 FROM t WHERE c1 = 10 FOR UPDATE;</code> prevents any other transaction from inserting, updating, or deleting rows where the value of <code>t.c1</code> is 10.</p>
+</blockquote>
+
+<p>注意這句話最後一個動詞 <code>inserting</code>——record lock 能擋住「更新或刪除那筆 id=10」，但它要擋住「insert 一筆 id=10」靠的其實是 unique index 上「id=10 這個位置只能有一筆」的約束，而不是 record lock 本身能鎖住一個不存在的 row。這個區別馬上要變成重點。</p>
+
+<p>現在試著用同樣的招數擋 phantom。場景：你跑 <code>SELECT * FROM t WHERE age &gt; 30 FOR UPDATE</code>，回來三筆 row（age = 35、40、50）。你對這三筆都加了 X lock。然後別人 INSERT 一筆 age = 45。問題是——你對 age = 45 這筆 row 加得了鎖嗎？<strong>加不了，因為它還不存在。</strong>你只能鎖「掃描時遇到的 index record」，而 age = 45 那筆在你掃描的當下根本不在 index 裡，沒有 record 可以鎖。等對方 INSERT 完、你再查一次，age = 45 就冒出來了——這就是 phantom read，而 record lock 對它無能為力。</p>
+
+<p>把這件事說死：<strong>record lock 鎖的是「存在的東西」，phantom 來自「還不存在、之後才被生出來的東西」。</strong>你沒辦法對著一個空位置加 record lock，因為那裡沒有 record。non-repeatable read 動的是 existing row 的值（有對象可鎖），phantom read 動的是「符合條件的集合的成員資格」（新成員還沒被生出來，無從鎖起）。這就是為什麼 phantom 在三類 anomaly 裡是最難的一個——它要求你鎖住一個「未來可能出現 row 的位置」，而不是一筆現有的 row。</p>
+
+<p>那 SERIALIZABLE 是怎麼在標準框架內擋住 phantom 的？答案是用更粗的力氣：它讓整個查詢範圍變成一個不可並發的臨界區，要嘛靠 table-level lock，要嘛靠 predicate lock（鎖住「條件」本身而非具體 row）。代價是並發度崩塌。InnoDB 不想付這個代價，於是它發明了一個介於「鎖一筆 row」與「鎖整張表」之間的東西——鎖住 row 與 row 之間的「縫隙」。下一節就講這個縫隙。</p>
+
+<p>這裡還要先釐清一個很多人混淆的點，否則後面會卡住：InnoDB 在 REPEATABLE READ 下其實有<strong>兩套</strong>對抗 anomaly 的機制，它們作用在不同的讀取型態上。第一套是 MVCC 的 consistent snapshot read——普通的 <code>SELECT</code>（不帶 <code>FOR UPDATE</code> 或 <code>LOCK IN SHARE MODE</code>）走的是這條路，它讀的是 transaction 第一次讀取那一刻建立的快照，完全不加鎖。對這種 plain SELECT 而言，phantom 根本不會發生，因為它看到的永遠是同一份凍結的快照，別人 insert 的新 row 不在那份快照裡。第二套才是本文的主角——鎖定讀取（locking read，亦即 <code>SELECT ... FOR UPDATE</code> / <code>LOCK IN SHARE MODE</code>，以及 <code>UPDATE</code> / <code>DELETE</code> 內部的掃描）會看到「當下最新」的資料而非快照，這時候 MVCC 救不了它，必須靠 next-key lock 來擋 phantom。手冊那句「prevents phantom rows」講的正是這第二套。</p>
+
+<p>所以精確地說，InnoDB 的 phantom protection 是「快照讀靠 MVCC、鎖定讀靠 next-key lock」兩條腿走路。本文集中講後者，因為它才是 gslin 那篇文章的重點，也是「為什麼鎖空氣也能擋 INSERT」這個反直覺現象的來源。記住這個分工——後面所有的鎖討論，都默認是在 locking read 的脈絡下發生的。一句 plain SELECT 不會跟你搶 gap lock，但一句 <code>SELECT ... FOR UPDATE</code> 會。</p>
+
+<h2>gap lock 與 next-key lock——把鎖加在 row 之間的縫隙上</h2>
+
+<p>InnoDB 的核心洞見是：既然你沒辦法鎖一筆還不存在的 row，那就鎖「它將來會被插進去的那個位置」。row 在 index 上是有序排列的，任兩筆相鄰 row 之間有一段「空隙」——一個新的 row 只能插進某個空隙裡。鎖住空隙，就等於鎖住「在這個範圍內 insert 新 row」這個動作。這個鎖叫 <strong>gap lock</strong>，手冊定義：</p>
+
+<blockquote>
+  <p>A gap lock is a lock on a gap between index records, or a lock on the gap before the first or after the last index record.</p>
+</blockquote>
+
+<p>手冊給的例子很直接：<code>SELECT c1 FROM t WHERE c1 BETWEEN 10 and 20 FOR UPDATE;</code>「<em>prevents other transactions from inserting a value of 15 into column t.c1, whether or not there was already any such value in the column.</em>」注意最後那句「不管原本有沒有這個值」——這正是 gap lock 跟 record lock 的根本差別。record lock 鎖一筆存在的 row；gap lock 鎖一段範圍，不管那段範圍裡現在有沒有 row，都禁止別人往裡面 insert。</p>
+
+<p>gap lock 有三個性質很反直覺，但弄懂了整套機制就通了：</p>
+
+<ul>
+<li><strong>純粹是抑制性的（purely inhibitive）。</strong>手冊原文：「Gap locks in InnoDB are 'purely inhibitive', which means that their only purpose is to prevent other transactions from inserting to the gap.」它不保護任何 row 的值——它只做一件事：禁止往這段縫隙裡 insert。</li>
+<li><strong>gap lock 之間可以共存。</strong>手冊：「Gap locks can co-exist. A gap lock taken by one transaction does not prevent another transaction from taking a gap lock on the same gap. There is no difference between shared and exclusive gap locks.」兩個 transaction 可以同時對同一段 gap 持有 gap lock，互不衝突。因為它們都只是「禁止別人 insert」，而「兩個人都禁止別人 insert」並不矛盾。</li>
+<li><strong>用 unique index 查唯一一筆 row 時不需要 gap lock。</strong>手冊：「Gap locking is not needed for statements that lock rows using a unique index to search for a unique row.」因為 unique index 上一個值最多一筆 row，查 <code>WHERE id = 10</code>（id 是 primary key）不可能有 phantom——那個位置塞不進第二筆，所以只要 record lock，不必鎖 gap。這個例外是很多人 debug 鎖問題時的盲點。</li>
+</ul>
+
+<p>把 record lock 跟 gap lock 黏在一起，就得到 <strong>next-key lock</strong>。這是 InnoDB 掃 index 時實際上加的鎖。手冊定義：</p>
+
+<blockquote>
+  <p>A next-key lock is a combination of a record lock on the index record and a gap lock on the gap before the index record.</p>
+</blockquote>
+
+<p>「the gap before the index record」這幾個字要記牢——next-key lock 鎖住的是「這筆 index record 本身」加上「它<em>前面</em>那段 gap」。所以它鎖的是一個<strong>左開右閉</strong>的區間 <code>(前一筆, 這一筆]</code>。手冊舉的例子是：一個 index 裡有 10、11、13、20 四個值，InnoDB 會把整個 key space 切成這幾段 next-key 區間：</p>
+
+<pre data-kind="output"><code>(負無窮, 10]
+(10, 11]
+(11, 13]
+(13, 20]
+(20, 正無窮)</code></pre>
+
+<p>最後那段 <code>(20, 正無窮)</code> 特別重要，因為它牽涉到一個叫 <strong>supremum pseudo-record</strong> 的東西。index 最大值之上沒有真正的 row，所以 InnoDB 在那裡放了一個假想的「上確界」記錄——一個比 index 裡任何真實值都大的 pseudo-record。手冊原文：</p>
+
+<blockquote>
+  <p>For the last interval, the next-key lock locks the gap above the largest value in the index and the "supremum" pseudo-record having a value higher than any value actually in the index. The supremum is not a real index record, so, in effect, this next-key lock locks only the gap following the largest index value.</p>
+</blockquote>
+
+<p>換句話說，<code>WHERE c1 &gt; 20 FOR UPDATE</code> 會在 supremum 上加 next-key lock，效果是鎖住「20 以上的整段開放區間」——任何想 insert 一筆 c1 = 21、c1 = 1000 的 transaction 都會被擋。這就是為什麼開頭那個「在空表上 <code>WHERE id &gt; 100 FOR UPDATE</code> 卻擋住 INSERT」的場景成立：查詢沒鎖到任何 record（沒有 row 滿足條件），但它在 supremum 那段 gap 上加了鎖，於是別人想往那段 gap 裡 insert 就得等。</p>
+
+<p>下面這個 widget 把這條 index line 畫出來。點不同的查詢按鈕，看 InnoDB 對那句 predicate 到底鎖了哪些 record（實心點）、哪些 gap（區間條），以及合起來構成哪幾段 next-key 區間。特別注意 <code>c1 &gt; 13</code> 那一條——它會一路鎖到 supremum。</p>
+
+<figure class="vg-w-locklines-innodb" data-svg-scroll="560">
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>
+    </svg>
+    <span>點選查詢，看它在 index line 上鎖住哪些 record 與 gap · 4 種 predicate</span>
+  </p>
+  <style>
+    .vg-w-locklines-innodb { display: grid; grid-template-columns: 1fr; gap: var(--s-3); align-items: start; }
+    .vg-w-locklines-innodb svg { width: 100%; height: auto; }
+    .vg-w-locklines-innodb input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+    .vg-w-locklines-innodb .qbtn { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; transition: fill 150ms, stroke 150ms; }
+    .vg-w-locklines-innodb .qbtn:hover { stroke: var(--accent); }
+    .vg-w-locklines-innodb .qbtn:focus { outline: none; }
+    .vg-w-locklines-innodb .qbtn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .vg-w-locklines-innodb .qbtn-text { pointer-events: none; }
+    .vg-w-locklines-innodb .lockseg, .vg-w-locklines-innodb .lockrec { opacity: 0; transition: opacity 150ms; }
+    .vg-w-locklines-innodb .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+    .vg-w-locklines-innodb .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+    .vg-w-locklines-innodb .detail p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+    .vg-w-locklines-innodb .detail code { font-size: 0.92em; }
+    .vg-w-locklines-innodb:has(#vg-w-locklines-innodb-r1:checked) [data-q="1"] { fill: var(--accent); fill-opacity: 0.18; stroke: var(--accent); }
+    .vg-w-locklines-innodb:has(#vg-w-locklines-innodb-r2:checked) [data-q="2"] { fill: var(--accent); fill-opacity: 0.18; stroke: var(--accent); }
+    .vg-w-locklines-innodb:has(#vg-w-locklines-innodb-r3:checked) [data-q="3"] { fill: var(--accent); fill-opacity: 0.18; stroke: var(--accent); }
+    .vg-w-locklines-innodb:has(#vg-w-locklines-innodb-r4:checked) [data-q="4"] { fill: var(--accent); fill-opacity: 0.18; stroke: var(--accent); }
+    .vg-w-locklines-innodb:has(#vg-w-locklines-innodb-r1:checked) [data-locks~="1"] { opacity: 1; }
+    .vg-w-locklines-innodb:has(#vg-w-locklines-innodb-r2:checked) [data-locks~="2"] { opacity: 1; }
+    .vg-w-locklines-innodb:has(#vg-w-locklines-innodb-r3:checked) [data-locks~="3"] { opacity: 1; }
+    .vg-w-locklines-innodb:has(#vg-w-locklines-innodb-r4:checked) [data-locks~="4"] { opacity: 1; }
+    .vg-w-locklines-innodb:has(#vg-w-locklines-innodb-r1:checked) .detail-1 { display: block; }
+    .vg-w-locklines-innodb:has(#vg-w-locklines-innodb-r2:checked) .detail-2 { display: block; }
+    .vg-w-locklines-innodb:has(#vg-w-locklines-innodb-r3:checked) .detail-3 { display: block; }
+    .vg-w-locklines-innodb:has(#vg-w-locklines-innodb-r4:checked) .detail-4 { display: block; }
+    @media (max-width: 720px) { .vg-w-locklines-innodb { grid-template-columns: 1fr; } }
+  </style>
+
+  <input type="radio" id="vg-w-locklines-innodb-r1" name="vg-w-locklines-innodb-sel" checked />
+  <input type="radio" id="vg-w-locklines-innodb-r2" name="vg-w-locklines-innodb-sel" />
+  <input type="radio" id="vg-w-locklines-innodb-r3" name="vg-w-locklines-innodb-sel" />
+  <input type="radio" id="vg-w-locklines-innodb-r4" name="vg-w-locklines-innodb-sel" />
+
+  <svg class="vg-w-locklines-innodb-main" viewBox="0 0 480 360" role="img" aria-label="InnoDB index line lock visualization">
+    <!-- query buttons -->
+    <g font-family="JetBrains Mono, monospace" font-size="11">
+      <rect class="qbtn" data-q="1" data-target="vg-w-locklines-innodb-r1" role="button" tabindex="0" aria-label="select query c1 = 13" x="16" y="16" width="448" height="30" rx="4" />
+      <text class="qbtn-text" x="28" y="35" fill="var(--ink)">WHERE c1 = 13 FOR UPDATE</text>
+      <rect class="qbtn" data-q="2" data-target="vg-w-locklines-innodb-r2" role="button" tabindex="0" aria-label="select query c1 between 11 and 13" x="16" y="52" width="448" height="30" rx="4" />
+      <text class="qbtn-text" x="28" y="71" fill="var(--ink)">WHERE c1 BETWEEN 11 AND 13 FOR UPDATE</text>
+      <rect class="qbtn" data-q="3" data-target="vg-w-locklines-innodb-r3" role="button" tabindex="0" aria-label="select query c1 greater than 13" x="16" y="88" width="448" height="30" rx="4" />
+      <text class="qbtn-text" x="28" y="107" fill="var(--ink)">WHERE c1 &gt; 13 FOR UPDATE</text>
+      <rect class="qbtn" data-q="4" data-target="vg-w-locklines-innodb-r4" role="button" tabindex="0" aria-label="select query c1 = 12 non existent" x="16" y="124" width="448" height="30" rx="4" />
+      <text class="qbtn-text" x="28" y="143" fill="var(--ink)">WHERE c1 = 12 FOR UPDATE （不存在）</text>
+    </g>
+
+    <!-- index axis -->
+    <line x1="40" y1="230" x2="456" y2="230" stroke="var(--muted-2)" stroke-width="1.5" />
+
+    <!-- gap-lock segments (drawn under records); x positions:
+         10@70  11@150  13@230  20@310  supremum@420 -->
+    <rect class="lockseg" data-locks="2 3" x="70" y="222" width="80" height="16" rx="3" fill="var(--accent)" fill-opacity="0.16" stroke="var(--accent)" stroke-width="1" />
+    <rect class="lockseg" data-locks="1 2 3" x="150" y="222" width="80" height="16" rx="3" fill="var(--accent)" fill-opacity="0.16" stroke="var(--accent)" stroke-width="1" />
+    <rect class="lockseg" data-locks="3" x="230" y="222" width="80" height="16" rx="3" fill="var(--accent)" fill-opacity="0.16" stroke="var(--accent)" stroke-width="1" />
+    <rect class="lockseg" data-locks="3" x="310" y="222" width="110" height="16" rx="3" fill="var(--accent)" fill-opacity="0.16" stroke="var(--accent)" stroke-width="1" />
+    <rect class="lockseg" data-locks="4" x="150" y="222" width="80" height="16" rx="3" fill="var(--accent)" fill-opacity="0.16" stroke="var(--accent)" stroke-width="1" />
+
+    <!-- index record dots -->
+    <g font-family="JetBrains Mono, monospace" font-size="12">
+      <circle cx="70"  cy="230" r="6" fill="var(--bg)" stroke="var(--ink)" stroke-width="1.5" />
+      <circle cx="150" cy="230" r="6" fill="var(--bg)" stroke="var(--ink)" stroke-width="1.5" />
+      <circle cx="230" cy="230" r="6" fill="var(--bg)" stroke="var(--ink)" stroke-width="1.5" />
+      <circle cx="310" cy="230" r="6" fill="var(--bg)" stroke="var(--ink)" stroke-width="1.5" />
+      <circle cx="420" cy="230" r="6" fill="var(--bg)" stroke="var(--muted-2)" stroke-width="1.5" stroke-dasharray="2 2" />
+      <text x="70"  y="258" text-anchor="middle" fill="var(--ink)">10</text>
+      <text x="150" y="258" text-anchor="middle" fill="var(--ink)">11</text>
+      <text x="230" y="258" text-anchor="middle" fill="var(--ink)">13</text>
+      <text x="310" y="258" text-anchor="middle" fill="var(--ink)">20</text>
+      <text x="420" y="258" text-anchor="middle" fill="var(--muted)" font-size="10">+∞ sup</text>
+    </g>
+
+    <!-- record-lock highlight rings -->
+    <circle class="lockrec" data-locks="1 2 3" cx="230" cy="230" r="9" fill="none" stroke="var(--accent)" stroke-width="2" />
+    <circle class="lockrec" data-locks="2 3" cx="150" cy="230" r="9" fill="none" stroke="var(--accent)" stroke-width="2" />
+    <circle class="lockrec" data-locks="3" cx="310" cy="230" r="9" fill="none" stroke="var(--accent)" stroke-width="2" />
+    <circle class="lockrec" data-locks="3" cx="420" cy="230" r="9" fill="none" stroke="var(--accent)" stroke-width="2" stroke-dasharray="2 2" />
+
+    <!-- legend -->
+    <g font-family="Manrope, sans-serif" font-size="11">
+      <circle cx="56" cy="300" r="6" fill="none" stroke="var(--accent)" stroke-width="2" />
+      <text x="70" y="304" fill="var(--ink)">record lock</text>
+      <rect x="180" y="294" width="20" height="12" rx="2" fill="var(--accent)" fill-opacity="0.16" stroke="var(--accent)" stroke-width="1" />
+      <text x="206" y="304" fill="var(--ink)">gap lock</text>
+      <text x="50" y="332" fill="var(--muted)" font-style="italic" font-family="EB Garamond, serif" font-size="12">record + gap = next-key lock，鎖區間 (前一筆, 這一筆]</text>
+    </g>
+  </svg>
+
+  <div>
+    <div class="detail detail-1">
+      <h3>c1 = 13 · 等值查詢（非 unique index）</h3>
+      <p>c1 是 secondary index（非唯一）。InnoDB 對 c1 = 13 這筆加 record lock，並對它前面的 gap <code>(11, 13)</code> 加 gap lock——合起來是 next-key lock <code>(11, 13]</code>。為什麼連 gap 也鎖？因為若 c1 不是 unique，理論上可以再 insert 一筆 c1 = 13；鎖住前 gap 才能擋住「在 13 之前插入另一筆 13」。</p>
+      <p><strong>擋住</strong>：往 (11, 13] 之間 insert 任何值，例如 c1 = 12。</p>
+    </div>
+    <div class="detail detail-2">
+      <h3>c1 BETWEEN 11 AND 13 · 範圍查詢</h3>
+      <p>掃描遇到 11 與 13 兩筆 record，各加 record lock；同時鎖住它們前面的 gap，構成 next-key 區間 <code>(10, 11]</code> 與 <code>(11, 13]</code>。整段範圍被封死。</p>
+      <p><strong>擋住</strong>：insert c1 = 12（落在 (11, 13)），也擋住 update / delete 既有的 11 與 13。</p>
+    </div>
+    <div class="detail detail-3">
+      <h3>c1 &gt; 13 · 開放範圍，鎖到 supremum</h3>
+      <p>掃描從 13 之後開始，遇到 20，加 record lock 與 next-key <code>(13, 20]</code>；接著繼續到 supremum pseudo-record，加 next-key <code>(20, +∞)</code>。整個 13 以上的開放區間全被鎖住。</p>
+      <p><strong>擋住</strong>：insert c1 = 21、c1 = 999——任何大於 13 的新值。這正是開頭「鎖空氣擋 INSERT」的機制來源。</p>
+    </div>
+    <div class="detail detail-4">
+      <h3>c1 = 12 · 查一個不存在的值</h3>
+      <p>index 裡沒有 12。掃描定位到 12「應該在的位置」——落在 11 與 13 之間。沒有 record 可鎖，但 InnoDB 對 gap <code>(11, 13)</code> 加 gap lock，禁止別人把 12 insert 進來。沒鎖到任何 row，卻鎖住了一段空隙。</p>
+      <p><strong>擋住</strong>：insert c1 = 12（甚至 c1 = 12.5 概念上的任何中間值）。</p>
+    </div>
+  </div>
+
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-locklines-innodb');
+      root.querySelectorAll('.qbtn').forEach((rect) => {
+        rect.addEventListener('click', () => {
+          const targetId = rect.getAttribute('data-target');
+          const radio = root.querySelector('#' + targetId);
+          if (radio) radio.checked = true;
+        });
+        rect.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            rect.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+          }
+        });
+      });
+    })();
+  </script>
+</figure>
+
+<p>玩過上面那個 widget，你會發現整套機制其實只有一句話：<strong>InnoDB 掃 index 時，把掃描範圍對應的每一段 <code>(前一筆, 這一筆]</code> next-key 區間都鎖起來。</strong>等值查詢鎖一兩段，範圍查詢鎖好幾段，開放範圍一路鎖到 supremum。鎖住這些區間，等於宣告「在我這個 transaction 結束前，這些範圍內不准多出任何 row」——phantom read 於是被擋在門外，因為新的 row 根本插不進來。這就是 InnoDB 在 REPEATABLE READ 下「超出 SQL 標準」的 phantom protection 的全貌。</p>
+
+<p>順帶補一個性質：next-key lock 鎖的是「掃描遇到的 index record + 其前 gap」，而它鎖的是 <em>index</em> 不是 row。手冊強調 record lock「always lock index records, even if a table is defined with no indexes」——若一張表沒有任何索引，InnoDB 會用它內建的隱藏 clustered index 來鎖。所以你的 <code>WHERE</code> 條件走哪個 index，next-key lock 就鎖在哪個 index 上；同一句查詢走不同 index，鎖的範圍會差很多。這也是實務上鎖範圍「比預期大」最常見的根因——查詢沒走到你以為的那個 index，掃描範圍一大，鎖的 gap 也跟著一大片。</p>
+
+<h2>一個真實的兩 session 交錯——FOR UPDATE 鎖空隙，INSERT 撞上 insert intention lock</h2>
+
+<p>把前面的理論收束成一個可以親手重現的場景。這是 MySQL 手冊在「Insert Intention Locks」一節給的範例，原封不動：一張只有一個 primary key 的 child 表，裡面有 90 與 102 兩筆。Session A 開 transaction，鎖住 id &gt; 100 的範圍；Session B 想 insert 一筆 id = 101，結果被擋。</p>
+
+<pre><code class="language-sql">-- Session A
+CREATE TABLE child (id int NOT NULL, PRIMARY KEY(id)) ENGINE=InnoDB;
+INSERT INTO child (id) VALUES (90), (102);
+
+START TRANSACTION;
+SELECT * FROM child WHERE id &gt; 100 FOR UPDATE;
+-- 回傳 id = 102 一筆
+-- 但鎖住的是 next-key 區間 (100, 102] 與 (102, +∞)
+-- 包含 102 之上一路到 supremum 的整段 gap
+
+-- Session B（另一條連線，A 還沒 commit）
+START TRANSACTION;
+INSERT INTO child (id) VALUES (101);
+-- 101 落在 (100, 102) 這段被 A 鎖住的 gap 裡
+-- B 取得 insert intention lock 後，必須等 A 釋放 gap lock
+-- ==> BLOCKED，直到 A commit / rollback</code></pre>
+
+<p>這裡發生了什麼？Session A 的 <code>id &gt; 100 FOR UPDATE</code> 雖然只回傳一筆（id = 102），但它鎖住的是 100 以上的整段 next-key 區間，包含 <code>(100, 102)</code> 這段 gap。Session B 想 insert 的 101 正好落在這段 gap 裡。B 在真正寫入前，會先取得一種特殊的鎖——<strong>insert intention lock</strong>。手冊定義：</p>
+
+<blockquote>
+  <p>An insert intention lock is a type of gap lock set by INSERT operations prior to row insertion. This lock signals the intent to insert in such a way that multiple transactions inserting into the same index gap need not wait for each other if they are not inserting at the same position within the gap.</p>
+</blockquote>
+
+<p>insert intention lock 是一種「插入意圖」的 gap lock。它的設計很巧：兩個 transaction 想往<em>同一段 gap 但不同位置</em> insert，彼此不必互等。手冊舉例：「Suppose that there are index records with values of 4 and 7. Separate transactions that attempt to insert values of 5 and 6, respectively, each lock the gap between 4 and 7 with insert intention locks ... but do not block each other because the rows are nonconflicting.」5 跟 6 都落在 (4, 7) 裡，但位置不同，所以兩個 insert 可以同時進行——這是 insert intention lock 相對於普通 gap lock 的並發優化。</p>
+
+<p>但 insert intention lock 跟「別人已經持有的 gap lock / next-key lock」是<strong>衝突</strong>的。Session A 對 <code>(100, 102)</code> 持有 gap lock；Session B 的 insert intention lock 想進這段 gap，就得等 A 放手。InnoDB 的 monitor 輸出會明白寫著這個等待狀態：</p>
+
+<pre data-kind="output"><code>RECORD LOCKS space id 31 page no 3 n_bits 72 index `PRIMARY`
+of table `test`.`child`
+trx id 8731 lock_mode X locks gap before rec insert intention waiting</code></pre>
+
+<p>那句 <code>insert intention waiting</code> 就是鐵證——B 正卡在 insert intention lock 上等待。把這個交錯逐步攤開：拖動下面的 scrubber，看兩個 session 的動作怎麼交織，以及 B 在哪一步撞上 A 的 gap lock。</p>
+
+<figure class="vg-w-scrub-forupdate-insert" data-svg-scroll="800">
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M18 8L22 12L18 16"/><path d="M6 8L2 12L6 16"/><line x1="2" y1="12" x2="22" y2="12"/>
+    </svg>
+    <span>拖動把手，逐步看兩 session 的鎖交錯 · 6 個步驟</span>
+  </p>
+  <style>
+    .vg-w-scrub-forupdate-insert { display: grid; gap: var(--s-2); }
+    .vg-w-scrub-forupdate-insert .scrub { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+    .vg-w-scrub-forupdate-insert .scrub input { flex: 1; height: 36px; accent-color: var(--accent); touch-action: none; }
+    .vg-w-scrub-forupdate-insert .step-label { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 6ch; text-align: right; }
+    .vg-w-scrub-forupdate-insert svg { width: 100%; height: auto; }
+    .vg-w-scrub-forupdate-insert .state { font-family: var(--serif); font-size: var(--fs-sm); padding: var(--s-2); background: var(--bg-soft); border-left: 2px solid var(--accent); }
+    .vg-w-scrub-forupdate-insert .state strong { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+    .vg-w-scrub-forupdate-insert figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+  </style>
+  <div class="scrub">
+    <label for="vg-w-scrub-forupdate-insert-x">step =</label>
+    <input id="vg-w-scrub-forupdate-insert-x" type="range" min="0" max="5" value="0" step="1" />
+    <span class="step-label" id="vg-w-scrub-forupdate-insert-readout">0 / 5</span>
+  </div>
+  <svg class="vg-w-scrub-forupdate-insert-main" viewBox="0 0 720 240" preserveAspectRatio="xMidYMid meet" role="img" aria-label="two session lock interleaving">
+    <!-- session lanes -->
+    <text x="20" y="44" font-family="Manrope, sans-serif" font-size="12" letter-spacing="0.06em" fill="var(--accent-text)">SESSION A</text>
+    <text x="20" y="148" font-family="Manrope, sans-serif" font-size="12" letter-spacing="0.06em" fill="var(--sage-deep)">SESSION B</text>
+    <line x1="20" y1="56" x2="700" y2="56" stroke="var(--muted-2)" stroke-width="1" />
+    <line x1="20" y1="160" x2="700" y2="160" stroke="var(--muted-2)" stroke-width="1" />
+
+    <!-- step columns -->
+    <g id="vg-w-scrub-forupdate-insert-marks"></g>
+
+    <!-- scrub handle -->
+    <line id="vg-w-scrub-forupdate-insert-handle-line" x1="80" y1="30" x2="80" y2="190" stroke="var(--accent)" stroke-width="2" stroke-dasharray="3 3" />
+    <circle id="vg-w-scrub-forupdate-insert-handle" cx="80" cy="200" r="9" fill="var(--accent)" cursor="grab" />
+
+    <!-- gap lock state bar -->
+    <text x="20" y="214" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">gap (100, 102):</text>
+    <rect id="vg-w-scrub-forupdate-insert-gapbar" x="150" y="204" width="200" height="14" rx="3" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1" />
+    <text id="vg-w-scrub-forupdate-insert-gaptext" x="360" y="214" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">unlocked</text>
+  </svg>
+  <div class="state" id="vg-w-scrub-forupdate-insert-state"><strong>step 0</strong><br/>兩個 session 都還沒開始。child 表內有 id = 90 與 102。</div>
+  <figcaption>step 4 是關鍵：B 的 INSERT 取得 insert intention lock 後撞上 A 持有的 gap lock，進入等待。直到 step 5（A commit）gap 才釋放，B 才能完成。</figcaption>
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-scrub-forupdate-insert');
+      const svg = root.querySelector('svg.vg-w-scrub-forupdate-insert-main');
+      const input = root.querySelector('input');
+      const readout = root.querySelector('#vg-w-scrub-forupdate-insert-readout');
+      const handle = root.querySelector('#vg-w-scrub-forupdate-insert-handle');
+      const handleLine = root.querySelector('#vg-w-scrub-forupdate-insert-handle-line');
+      const stateDiv = root.querySelector('#vg-w-scrub-forupdate-insert-state');
+      const marksG = root.querySelector('#vg-w-scrub-forupdate-insert-marks');
+      const gapBar = root.querySelector('#vg-w-scrub-forupdate-insert-gapbar');
+      const gapText = root.querySelector('#vg-w-scrub-forupdate-insert-gaptext');
+      const NS = 'http://www.w3.org/2000/svg';
+
+      const X0 = 80, X1 = 660, N = 5;
+      const xOf = i => X0 + (i / N) * (X1 - X0);
+
+      // [lane: 'A'|'B', short label, full state, gapState: 0 unlocked / 1 A-locked / 2 B-waiting / 3 released]
+      const steps = [
+        ['', 'idle',       '兩個 session 都還沒開始。child 表內有 id = 90 與 102。', 0],
+        ['A', 'BEGIN',     'Session A 開 transaction。尚未下任何鎖。', 0],
+        ['A', 'FOR UPDATE','A 執行 SELECT ... WHERE id > 100 FOR UPDATE。回傳 102 一筆，但對 next-key 區間 (100, 102] 與 (102, +∞) 加鎖——gap (100, 102) 現在被 A 持有。', 1],
+        ['B', 'BEGIN',     'Session B 開 transaction。準備 insert 101。', 1],
+        ['B', 'INSERT…',   'B 執行 INSERT id = 101。101 落在 A 鎖住的 gap (100, 102) 裡。B 取得 insert intention lock 後，撞上 A 的 gap lock —— BLOCKED，進入等待。', 2],
+        ['A', 'COMMIT',    'A commit，釋放所有鎖。gap (100, 102) 解鎖。B 的 insert intention lock 立刻被授予，101 寫入成功。', 3],
+      ];
+
+      const gapStyles = {
+        0: ['var(--bg-soft)', 'var(--muted-2)', 'var(--muted)', 'unlocked'],
+        1: ['color-mix(in srgb, var(--accent) 18%, var(--bg))', 'var(--accent)', 'var(--accent-text)', 'A holds gap lock'],
+        2: ['color-mix(in srgb, var(--accent) 18%, var(--bg))', 'var(--accent)', 'var(--accent-text)', 'B waiting on gap'],
+        3: ['color-mix(in srgb, var(--sage) 22%, var(--bg))', 'var(--sage-deep)', 'var(--sage-deep)', 'released → B inserts'],
+      };
+
+      // place step marks
+      for (let i = 0; i <= N; i++) {
+        const x = xOf(i);
+        const lane = steps[i][0];
+        const y = lane === 'A' ? 56 : lane === 'B' ? 160 : 108;
+        if (lane) {
+          const c = document.createElementNS(NS, 'circle');
+          c.setAttribute('cx', x); c.setAttribute('cy', y); c.setAttribute('r', 5);
+          c.setAttribute('fill', lane === 'A' ? 'var(--accent)' : 'var(--sage-deep)');
+          marksG.appendChild(c);
+          const tx = document.createElementNS(NS, 'text');
+          tx.setAttribute('x', x); tx.setAttribute('y', lane === 'A' ? 40 : 144);
+          tx.setAttribute('text-anchor', 'middle');
+          tx.setAttribute('font-family', 'JetBrains Mono, monospace');
+          tx.setAttribute('font-size', 10);
+          tx.setAttribute('fill', lane === 'A' ? 'var(--accent-text)' : 'var(--sage-deep)');
+          tx.textContent = steps[i][1];
+          marksG.appendChild(tx);
+        }
+        const sx = document.createElementNS(NS, 'text');
+        sx.setAttribute('x', x); sx.setAttribute('y', 184);
+        sx.setAttribute('text-anchor', 'middle');
+        sx.setAttribute('font-family', 'Manrope, sans-serif');
+        sx.setAttribute('font-size', 10);
+        sx.setAttribute('fill', 'var(--muted)');
+        sx.textContent = 'S' + i;
+        marksG.appendChild(sx);
+      }
+
+      function clamp(x) { return Math.max(X0, Math.min(X1, x)); }
+      function clientToSvgX(clientX) {
+        const pt = svg.createSVGPoint();
+        pt.x = clientX; pt.y = 0;
+        const p = pt.matrixTransform(svg.getScreenCTM().inverse());
+        return clamp(p.x);
+      }
+      function nearestStep(x) { return Math.round(((x - X0) / (X1 - X0)) * N); }
+
+      function render(i) {
+        const x = xOf(i);
+        handle.setAttribute('cx', x);
+        handleLine.setAttribute('x1', x); handleLine.setAttribute('x2', x);
+        readout.textContent = i + ' / ' + N;
+        stateDiv.innerHTML = '<strong>step ' + i + '</strong><br/>' + steps[i][2];
+        const g = gapStyles[steps[i][3]];
+        gapBar.setAttribute('fill', g[0]);
+        gapBar.setAttribute('stroke', g[1]);
+        gapText.setAttribute('fill', g[2]);
+        gapText.textContent = g[3];
+      }
+
+      let dragging = false;
+      function setFromX(clientX) {
+        const x = clientToSvgX(clientX);
+        const i = Math.max(0, Math.min(N, nearestStep(x)));
+        input.value = i;
+        render(i);
+      }
+      handle.addEventListener('pointerdown', (e) => { dragging = true; handle.setPointerCapture(e.pointerId); });
+      handle.addEventListener('pointermove', (e) => { if (dragging) setFromX(e.clientX); });
+      handle.addEventListener('pointerup', () => { dragging = false; });
+      svg.addEventListener('pointerdown', (e) => { if (e.target !== handle) setFromX(e.clientX); });
+      input.addEventListener('input', () => render(Number(input.value)));
+
+      render(0);
+    })();
+  </script>
+</figure>
+
+<p>這個場景之所以反直覺，是因為大多數人對「鎖」的心智模型停在 record lock——「我鎖一筆資料，別人不能動那筆」。但 gap lock 鎖的不是資料，是「資料之間的空位」。Session A 的查詢回傳「零筆 row」或「一筆 row」都不重要——重要的是它掃過的範圍對應到哪些 gap。只要 B 想 insert 的值落在那些 gap 裡，B 就得等。理解這點，你就能解釋一大類「明明沒鎖到同一筆 row，為什麼 INSERT 還是卡住」的 production 鎖等待事件。</p>
+
+<p>最後把四種鎖的關係用一張可排序的表收尾——它鎖什麼、彼此相不相容、由什麼語句觸發。把它當成 debug 鎖問題時的 cheat sheet。</p>
+
+<figure class="vg-w-table-lock-compat">
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/><path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+    </svg>
+    <span>點欄位標題排序 · 4 種鎖 × 4 欄</span>
+  </p>
+  <style>
+    .vg-w-table-lock-compat { overflow-x: auto; }
+    .vg-w-table-lock-compat table { width: 100%; min-width: 520px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+    .vg-w-table-lock-compat thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; }
+    .vg-w-table-lock-compat thead th[data-sort] { color: var(--accent-text); }
+    .vg-w-table-lock-compat tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+    .vg-w-table-lock-compat tbody td:first-child { font-family: var(--mono); font-size: 0.9em; color: var(--accent-text); }
+    .vg-w-table-lock-compat figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-2); }
+  </style>
+  <table>
+    <thead>
+      <tr>
+        <th data-key="name">lock 類型</th>
+        <th data-key="locks">鎖住什麼</th>
+        <th data-key="coexist">彼此可共存？</th>
+        <th data-key="trigger">由什麼觸發</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td>record lock</td><td>單一 index record</td><td>S 與 S 可；S 與 X 互斥</td><td>WHERE 命中既有 row 並加鎖</td></tr>
+      <tr><td>gap lock</td><td>兩筆 record 之間的空隙</td><td>可（不分 S / X，互不衝突）</td><td>範圍 / 不存在值的鎖定查詢</td></tr>
+      <tr><td>next-key lock</td><td>record + 其前 gap，左開右閉區間</td><td>record 部分互斥；gap 部分共存</td><td>RR 下掃 index 的預設鎖</td></tr>
+      <tr><td>insert intention</td><td>插入位置所在的 gap（意圖）</td><td>同 gap 不同位置可共存；與他人 gap lock 衝突</td><td>INSERT 寫入前</td></tr>
+    </tbody>
+  </table>
+  <figcaption>四種鎖的關係表。注意 next-key lock 不是第四種獨立鎖，而是 record lock 與 gap lock 的組合；insert intention 則是專屬 INSERT 的一種 gap lock 變體。表格資料對齊 MySQL 8.4 Reference Manual「InnoDB Locking」章節。</figcaption>
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-table-lock-compat');
+      const headers = root.querySelectorAll('thead th');
+      const tbody = root.querySelector('tbody');
+      let activeKey = null, asc = true;
+      headers.forEach(h => h.addEventListener('click', () => {
+        const key = h.dataset.key;
+        if (activeKey === key) asc = !asc; else { activeKey = key; asc = true; }
+        headers.forEach(x => x.removeAttribute('data-sort'));
+        h.setAttribute('data-sort', asc ? 'asc' : 'desc');
+        const rows = [...tbody.querySelectorAll('tr')];
+        const idx = [...headers].indexOf(h);
+        rows.sort((a, b) => {
+          const av = a.children[idx].textContent.trim();
+          const bv = b.children[idx].textContent.trim();
+          return asc ? av.localeCompare(bv) : bv.localeCompare(av);
+        });
+        rows.forEach(r => tbody.appendChild(r));
+      }));
+    })();
+  </script>
+</figure>
+
+<h2>這套機制的代價——deadlock、insert 等待，與一個你該記住的取捨</h2>
+
+<p>gap lock 不是免費的。它買來了 phantom protection，但同時也擴大了鎖的「打擊面」——你鎖住的不再是幾筆 row，而是一整段範圍。這帶來兩類實務上很常踩到的問題。</p>
+
+<p>第一類是 <strong>insert 被意外擋住</strong>。前面那個 FOR UPDATE / INSERT 場景就是典型。在高並發寫入的系統裡，一個範圍查詢加 <code>FOR UPDATE</code>（或一句 <code>UPDATE ... WHERE range</code>）會鎖住整段 gap，所有想往那段範圍 insert 的 transaction 都得排隊。最隱蔽的版本是查一個「不存在的值」——例如先 <code>SELECT ... WHERE id = X FOR UPDATE</code> 確認沒有，再決定 INSERT，這種「check-then-insert」的 pattern 在 RR 下會對 X 所在的 gap 加 gap lock，於是兩個 transaction 同時對<em>同一個不存在的 X</em> 做 check-then-insert 時，雙方都拿到 gap lock（gap lock 可共存），但雙方的 insert intention lock 又都要等對方的 gap lock——典型的 deadlock。</p>
+
+<p>第二類就是 <strong>deadlock 機率上升</strong>。範圍鎖天生比點鎖更容易交叉等待。兩個 transaction 只要鎖的範圍有重疊、且取得鎖的順序相反，就可能互相等待成環。InnoDB 有 deadlock detection 會挑一個 victim rollback，但被 rollback 的那個 transaction 的工作就白做了，應用層得處理 retry。gap lock 把「範圍」變成可鎖對象，等於把 deadlock 的觸發面從「同一筆 row」擴大到「同一段範圍」。</p>
+
+<p>實務上 debug 這類 deadlock，你會去看 <code>SHOW ENGINE INNODB STATUS</code> 的 LATEST DETECTED DEADLOCK 區塊。最能洩漏「這是 gap 引起的」的線索，就是前面那行 <code>lock_mode X locks gap before rec insert intention waiting</code>——只要看到 <code>insert intention</code> 跟 <code>gap</code> 同時出現，你大概就知道凶手是某個範圍查詢或 check-then-insert 在 RR 下下的 gap lock，而不是兩筆 row 互鎖。相對地，若你看到的是 <code>lock_mode X locks rec but not gap</code>，那才是純 record lock 的衝突，gap 不在其中。這兩個字串的差別，是判斷「要不要動 isolation level」的第一個分水嶺。</p>
+
+<p>那什麼時候該調整？兩個方向。一是<strong>把 isolation level 降到 READ COMMITTED</strong>——前面表格提過，RC 會關掉 gap locking（手冊明說「Gap locking can be disabled explicitly. This occurs if you change the transaction isolation level to READ COMMITTED」）。RC 下只有 record lock，沒有 gap lock，insert 等待與範圍 deadlock 大幅減少，代價是你重新接受了 phantom read。很多以 row-by-row OLTP 為主、不依賴「同一 transaction 內範圍查詢結果穩定」的系統，在 RC 下反而更順——這也是 PostgreSQL 預設 RC、不少大型 MySQL 部署也改成 RC 的原因。二是<strong>確保查詢走 unique index 命中單筆</strong>——手冊那條「unique index 查唯一 row 不需要 gap lock」的例外，是你想保留 RR 又想避開 gap lock 的最佳路徑：用 primary key / unique key 精確命中，InnoDB 就只下 record lock，不鎖 gap。</p>
+
+<p>最後回到 gslin 那篇文章的觸發點，把整件事的取捨講清楚。SQL 標準把 isolation level 設計成一條單調的階梯：要更強的保證，就接受更低的並發。InnoDB 在 REPEATABLE READ 這一級「偷渡」了一個本來該在 SERIALIZABLE 才有的保證（phantom protection），靠的不是降併發、而是發明了一種更細粒度的鎖（gap / next-key）。這是 InnoDB 設計上的聰明，但它的副作用——insert 等待、範圍 deadlock、鎖範圍隨 index 選擇暴漲——也正是因為這個「免費的保證」其實有它的隱性帳單。你不是不用付，只是帳單從「並發度」這一欄，挪到了「鎖等待與 deadlock retry」那一欄。</p>
+
+<p class="vg-deep-closer"><strong>Take-away</strong>：record lock 鎖住「存在的 row」，gap lock 鎖住「row 之間的空位」；InnoDB 在 REPEATABLE READ 下用 next-key lock（兩者相加）鎖住整段掃描範圍，等於宣告「這個範圍內不准再多出 row」——這就是它擋掉 phantom read、超出 SQL 標準的全部祕密，而帳單寫在 insert 等待與 deadlock 上。</p>
+
+</div>

@@ -1,0 +1,1103 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">把一個 64-bit 整數印成十進位字串，
+看起來只是一句 <code>std::to_chars</code>。但它藏著兩個 CPU 最討厭的東西——
+一個「這個數字有幾位數」的資料相依分支，
+加上一連串相依的除以十。Champagne Gareau 與 Lemire 的做法不是把除法做快，
+而是把它整段刪掉：
+用 SIMD 的整數 multiply-add 在一個暫存器裡平行算出所有商與餘數，
+連查表都不要，
+把單次轉換壓到兩奈秒以下。</p>
+  <h1 class="vg-post-title">{{ title }}</h1>
+</header>
+
+<div class="vg-post-prose">
+<p><span class="vg-dropcap">整</span>數轉十進位字串是每個程式每天跑幾百萬次的操作。
+log line 把時間戳與計數器寫成文字、JSON serialize 把 id 與數量攤平、CSV export 把整列數字輸出、metrics agent 每秒把成千上萬個 counter 上報——全都要把記憶體裡的二進位整數，
+變成人看得懂的 ASCII 數字序列。
+</p>
+
+<p>它慢得不明顯，
+因為單次只花幾奈秒。
+但放進 hot path、乘以呼叫次數，
+itoa 就會悄悄吃掉一個可觀的百分比。
+一個每秒輸出百萬筆紀錄、每筆十來個整數欄位的服務，
+光是整數格式化就可能佔掉個位數的 CPU——這種「分散在各處、單點看不出來」的成本，
+正是最難用 profiler 抓、也最值得一次性解掉的那種。
+</p>
+
+<p>Daniel Lemire 的部落格與同主題的 arXiv 論文〈Converting an Integer to a Decimal String in Under Two Nanoseconds〉（作者 Jaël Champagne Gareau 與 Daniel Lemire）一起拆解這個「看起來很平凡」的操作。
+結論是把單次轉換壓到 2 奈秒以下，
+比最接近的競爭者快 1.4 到 2 倍、比 C++ 標準庫的 <code>std::to_chars</code> 快 2 到 4 倍。
+</p>
+
+<p>重點不在「寫一個更快的迴圈」。
+整段故事的核心是 HOW——那個藏在最裡面的「這個數字有幾位數」的資料相依分支，
+以及一連串相依的除以十，
+怎麼被一步步改寫成 branch-free、可向量化的算術。
+本文照「為什麼慢 → 怎麼搬掉慢的來源」的順序，
+把這條演化線拆成五個機制來看。
+</p>
+
+<p>先用一張圖建立量級感。
+下面把四條路擺在同一個 ns 軸上：naive 的逐位除十、C++ 標準庫的 <code>std::to_chars</code>、傳統查表 / SWAR 路線（jeaiii、Muła 這些既有實作落在這一帶），
+以及論文的 AVX-512 IFMA 變體。
+倍數差距用相對 <code>std::to_chars</code> 的 speedup 標示——這是論文與 benchmark suite 直接報的數字。
+2 ns 門檻用一條虛線標出，
+論文標題說的「under two nanoseconds」就是要跨過它。
+</p>
+
+  <figure class="vg-w-chart-itoa-bench" data-svg-scroll="720">
+    <style>
+      .vg-w-chart-itoa-bench { display: grid; gap: var(--s-2); }
+      .vg-w-chart-itoa-bench svg { width: 100%; height: auto; }
+      .vg-w-chart-itoa-bench figcaption { font-family: var(--scribed); font-style: italic; font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+    <svg viewBox="0 0 720 340" preserveAspectRatio="xMidYMid meet" role="img"
+         aria-label="整數轉字串各策略每次轉換 ns 長條圖：naive、std::to_chars、SWAR/查表、AVX-512 IFMA">
+      <g id="vg-w-chart-itoa-bench-axes"></g>
+      <g id="vg-w-chart-itoa-bench-series"></g>
+    </svg>
+    <figcaption>每次轉換的近似 ns，與相對 <code>std::to_chars</code> 的 speedup。speedup 區間（1.4–2x vs 最接近競爭者、2–4x vs std）取自論文與 fastfloat/int_serialization_benchmark；ns 值為對應 ~3–4 GHz 桌機等級的換算示意，用來呈現量級對比而非單機絕對值。</figcaption>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-chart-itoa-bench');
+        const axesG = root.querySelector('#vg-w-chart-itoa-bench-axes');
+        const seriesG = root.querySelector('#vg-w-chart-itoa-bench-series');
+        const NS = 'http://www.w3.org/2000/svg';
+        function el(tag, attrs) {
+          const e = document.createElementNS(NS, tag);
+          for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+          return e;
+        }
+        // [label, approx ns/n, speedup-vs-std label, color token]
+        // ns 以 std≈6ns 為錨換算 speedup 倍數，呈現相對量級。
+        const data = [
+          ['naive ÷10', 8.4, '0.7x', 'var(--muted)'],
+          ['std::to_chars', 6.0, '1.0x (基準)', 'var(--ink-deep)'],
+          ['查表 / SWAR\n(jeaiii、Muła)', 3.4, '~1.8x', 'var(--sage-deep)'],
+          ['AVX-512 IFMA\n(Champagne-Lemire)', 1.7, '~2–4x · <2ns', 'var(--accent)'],
+        ];
+        const X0 = 150, X1 = 690, Y0 = 290, Y1 = 36;
+        const maxY = 10;
+        const yOf = v => Y0 - (v / maxY) * (Y0 - Y1);
+        const band = (Y0 - Y1);
+        const rowH = (Y0 - Y1) / data.length;
+        // X axis (ns) + ticks
+        axesG.appendChild(el('line', { x1: X0, y1: Y0, x2: X1, y2: Y0, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+        const xOfNs = ns => X0 + (ns / maxY) * (X1 - X0);
+        for (let v = 0; v <= maxY; v += 2) {
+          const x = xOfNs(v);
+          axesG.appendChild(el('line', { x1: x, y1: Y0, x2: x, y2: Y0 + 4, stroke: 'var(--muted-2)' }));
+          const t = el('text', { x, y: Y0 + 18, 'text-anchor': 'middle', 'font-family': 'JetBrains Mono, monospace', 'font-size': 12, fill: 'var(--muted)' });
+          t.textContent = v + (v === maxY ? '' : '');
+          axesG.appendChild(t);
+        }
+        const xl = el('text', { x: (X0 + X1) / 2, y: Y0 + 40, 'text-anchor': 'middle', 'font-family': 'IM Fell English, serif', 'font-style': 'italic', 'font-size': 14, fill: 'var(--muted)' });
+        xl.textContent = 'ns / 每次轉換（越短越快）';
+        axesG.appendChild(xl);
+        // 2ns marker line
+        const m2 = xOfNs(2);
+        seriesG.appendChild(el('line', { x1: m2, y1: Y1 - 6, x2: m2, y2: Y0, stroke: 'var(--accent)', 'stroke-width': 1, 'stroke-dasharray': '3,3', opacity: 0.7 }));
+        const m2t = el('text', { x: m2, y: Y1 - 12, 'text-anchor': 'middle', 'font-family': 'JetBrains Mono, monospace', 'font-size': 11, fill: 'var(--accent-text)' });
+        m2t.textContent = '2 ns 門檻';
+        seriesG.appendChild(m2t);
+        // bars
+        data.forEach((d, i) => {
+          const yTop = Y1 + i * rowH + rowH * 0.18;
+          const h = rowH * 0.5;
+          const w = xOfNs(d[1]) - X0;
+          seriesG.appendChild(el('rect', { x: X0, y: yTop, width: Math.max(2, w), height: h, fill: d[3], opacity: 0.82 }));
+          // label (left, may be 2 lines)
+          const lines = d[0].split('\n');
+          lines.forEach((ln, li) => {
+            const t = el('text', { x: X0 - 12, y: yTop + h * 0.5 + (li - (lines.length - 1) / 2) * 14 + 4, 'text-anchor': 'end', 'font-family': li === 0 ? 'EB Garamond, serif' : 'JetBrains Mono, monospace', 'font-size': li === 0 ? 14 : 11, fill: li === 0 ? 'var(--ink)' : 'var(--muted)' });
+            t.textContent = ln;
+            axesG.appendChild(t);
+          });
+          // speedup tag at bar end
+          const st = el('text', { x: X0 + Math.max(2, w) + 10, y: yTop + h * 0.5 + 5, 'text-anchor': 'start', 'font-family': 'JetBrains Mono, monospace', 'font-size': 12, fill: d[3] });
+          st.textContent = d[2];
+          seriesG.appendChild(st);
+        });
+      })();
+    </script>
+  </figure>
+
+<p>底下五個小節各自處理一個機制，
+順序對應「為什麼慢 → 怎麼一步步搬掉慢的來源」。
+先看資料相依分支為什麼是 itoa 的根，
+再看 branch-free 的位數計算如何消掉迴圈邊界、兩位數查表把工作量減半、SWAR 把多個 byte 塞進一個暫存器平行處理，
+最後看論文真正的新東西——AVX-512 與 IFMA 怎麼把查表整個刪掉。
+每一節都附一個可操作的小工具，
+讓你直接把數字餵進去看它在暫存器裡變成什麼。
+</p>
+
+  <h2>為什麼 itoa 慢在資料相依分支</h2>
+
+<p>教科書版的 itoa 長這樣：
+反覆 <code>n % 10</code> 取最低位、<code>n /= 10</code> 砍掉它，
+把數字從尾巴往前一位一位刮出來，
+最後再把緩衝區 reverse 過來。
+一看就懂，
+問題也正是在這個「一看就懂」的結構裡。
+</p>
+
+<p>問題的第一層是相依鏈。
+每一步的 <code>n /= 10</code> 都依賴上一步的結果——這是一條 dependency chain。
+現代 CPU 的亂序執行引擎之所以能跑得快，
+靠的是同時把好幾個獨立指令丟給多個執行單元；但相依鏈把這條路堵死了，
+因為下一步要的輸入正是上一步的輸出。
+十位數的數字就是一條長度十的鏈，
+每個環節都要等前一個做完，
+亂序引擎再寬也攤不平。
+</p>
+
+<p>問題的第二層是資料相依的迴圈邊界。
+迴圈要跑幾次，
+取決於數字有幾位數：<code>7</code> 跑一次、<code>4294967295</code> 跑十次、20 位的 <code>uint64_t</code> 跑二十次。
+這個「跑幾次」是在執行期才知道的，
+意味著迴圈出口是一個資料相依分支。
+分支預測器面對「位數分布不規則」的輸入會頻繁 mispredict，
+每次 misprediction 在現代深 pipeline 上是十幾到二十個 cycle 的氣泡——而 itoa 本身可能總共也才幾十個 cycle，
+一次 mispredict 就足以讓單次轉換的成本翻倍。
+</p>
+
+<p>第三層、也是最要命的，
+是整數除法本身。
+<code>div</code> 指令在 x86 上是少數沒被流水線化得很好的算術指令，64-bit 除法的 latency 動輒二三十個 cycle，而且通常不能跟下一個除法重疊。
+一條十位數的逐位除十迴圈，
+光除法就可能吃掉一兩百個 cycle。
+</p>
+
+<p>這裡有個常見的誤解要先澄清：
+編譯器其實不會真的發出 <code>div</code> 去除以常數 10。
+它會把「除以常數」優化成「乘以一個 magic reciprocal 再右移」——這是 Granlund–Montgomery 的經典手法，
+把 <code>n / 10</code> 換成形如 <code>(n * 0xCCCCCCCCCCCCCCCD) &gt;&gt; 67</code> 的乘法加位移。
+<code>0xCCCC...CCCD</code> 是 1/10 在定點數下的近似（0.1 的二進位循環是 0.000110011...，<code>0xC</code> 正是那個 1100 的循環節），乘完右移就得到商。
+乘法的 latency 只有三四個 cycle，
+比除法快一個數量級。
+</p>
+
+<p>但這沒解決根本問題。
+即使除法被換成乘法，
+那條相依鏈仍在（每步的乘法仍要等上一步的結果）、那個資料相依的位數分支也仍在。
+所有後續的技巧，
+本質上都在攻擊這兩件事：把相依鏈打斷成可平行的算術，
+把位數分支改寫成 branch-free 的查表或位元運算。
+把這兩個敵人辨認清楚，
+後面四節就只是「用越來越寬的硬體去鋪平它們」的不同手段。
+</p>
+
+<p>值得對照的是浮點數轉字串。
+那是個難得多的問題——Ryu、Grisu、Dragon 這些演算法要處理「最短可往返表示」「正確捨入」這類語意正確性的硬骨頭，
+因為一個浮點數對應無窮多個十進位字串，
+得選出那個唯一最短又能 round-trip 的。
+整數轉字串沒有這些語意陷阱：每個整數只有一個十進位表示，
+不存在捨入、不存在「最短」的選擇問題。
+正因為語意這麼乾淨，
+整數 itoa 的全部難度才純粹落在「微架構效率」上——沒有正確性的灰色地帶要協調，
+剩下的就是怎麼把 CPU 餵飽。
+這也是為什麼這個「看起來平凡」的問題，
+反而是把 SIMD 算術技巧推到極限的好題目。
+</p>
+
+  <pre><code class="language-cpp">// naive：相依鏈 + 資料相依迴圈邊界
+char* itoa_naive(uint64_t n, char* out) {
+    char buf[20];
+    int i = 0;
+    do {
+        buf[i++] = '0' + (n % 10);   // 取最低位
+        n /= 10;                      // ← 依賴上一步，迴圈次數 = 位數
+    } while (n != 0);
+    while (i--) *out++ = buf[i];     // reverse
+    return out;
+}
+
+// 第一步優化：先算出「有幾位數」，把分支從迴圈移到一次性計算
+int digit_count(uint64_t n);          // branch-free，下節展開
+char* itoa_counted(uint64_t n, char* out) {
+    int len = digit_count(n);         // 一次算完，不再每步判斷
+    char* p = out + len;
+    do { *--p = '0' + (n % 10); n /= 10; } while (n);
+    return out + len;
+}</code></pre>
+
+<p>把「有幾位數」這個問題單獨拉出來算，
+是第一個關鍵的重構。
+它把「每次迭代都要判斷要不要繼續」的分支，
+換成「一次性算出 len、然後從固定位置往回填」。
+</p>
+
+<p>位數一旦先知道，
+輸出緩衝區的寫入位置就固定了：
+要寫 <code>len</code> 個 byte，
+就從 <code>out + len</code> 往回填。
+後面的逐位填寫不再需要每步問「還有沒有下一位」，
+迴圈次數變成一個事先算好的常數。
+資料相依的迴圈邊界就此消失——只要這個 <code>digit_count</code> 本身也是 branch-free 的。
+下節就來看它怎麼做到。
+</p>
+
+  <h2>digit-count：用前導零與 magic 常數算位數</h2>
+
+<p>「一個 64-bit 整數有幾位十進位數字」這個問題，
+naive 解法是一連串 <code>if (n &lt; 10) return 1; else if (n &lt; 100) return 2; ...</code>——
+最多九個分支，
+而且這些分支是純粹資料相依的，
+分支預測器的惡夢。
+我們要的是完全沒有分支瀑布的版本。
+</p>
+
+<p>branch-free 的解法分兩步走。
+第一步，
+用 <code>lzcnt</code>（count leading zeros）算出這個數的二進位位元寬度，
+也就是 floor(log2(n)) + 1。
+lzcnt 是單指令、固定 latency、跟輸入內容無關，
+完全沒有分支。
+第二步，
+把 log2 換算成 log10 的近似——因為 log10(n) ≈ log2(n) × log10(2) ≈ log2(n) × 0.301，
+一個十進位數字大約值 3.32 個二進位位元，
+所以從位元寬度乘上 0.301 就能估出十進位位數。
+</p>
+
+<p>0.301 是浮點數，
+不能直接在整數路徑上用。
+實作把它定點化成 <code>1233 / 4096</code>（1233 / 4096 ≈ 0.30103，
+誤差小到對 64-bit 範圍內所有輸入都夠用），
+於是「乘以 0.301」變成「乘以 1233、再右移 12 位」，
+兩個整數指令。
+</p>
+
+<p>但這個估計會差一格——
+因為 log10 的近似在某些數量級邊界上會把位數估高一位（例如 100 與 99 的位元寬度相同，
+但位數差一）。
+修正方法是 Lemire 在先前作品裡反覆用過的版本：預先建一張十的次方表 <code>POW10[]</code>，
+拿估出的位數 <code>est</code> 去查 <code>POW10[est-1]</code>，
+若 <code>n</code> 比它小就把 <code>est</code> 減一。
+這是<strong>一次比較</strong>，
+不是分支瀑布——CPU 可以用 conditional move（<code>cmov</code>）實現，
+完全沒有可被 mispredict 的分支。
+</p>
+
+<p>整段位數計算因此只有：
+一次 lzcnt、一次乘以 1233、一次右移、一次查表、一次比較。
+固定指令數、固定 latency、零資料相依分支。
+下面的小工具讓你輸入任意整數，
+看它的 lzcnt 位元寬度、推得的位數、以及最終要寫進緩衝區的長度——拖動滑桿掃描數量級，
+或直接打數字，
+三個欄位即時更新，
+最底下還展開了那一行修正比較。
+</p>
+
+  <figure class="vg-w-scrub-itoa-digits">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M18 8L22 12L18 16"/><path d="M6 8L2 12L6 16"/><path d="M2 12H22"/>
+      </svg>
+      <span>輸入整數或拖動滑桿 · 看 lzcnt 與 branch-free 位數計算逐欄更新</span>
+    </p>
+    <style>
+      .vg-w-scrub-itoa-digits { display: grid; gap: var(--s-3); }
+      .vg-w-scrub-itoa-digits .ctl { display: grid; gap: var(--s-2); }
+      @media (min-width: 720px) { .vg-w-scrub-itoa-digits .ctl { grid-template-columns: auto 1fr auto; align-items: center; } }
+      .vg-w-scrub-itoa-digits label { font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+      .vg-w-scrub-itoa-digits input[type="range"] { width: 100%; height: 36px; accent-color: var(--accent); touch-action: none; }
+      .vg-w-scrub-itoa-digits input[type="number"] { font-family: JetBrains Mono, monospace; font-size: var(--fs-md); padding: var(--s-1) var(--s-2); border: 1px solid var(--line); background: var(--bg-soft); color: var(--ink); width: 100%; max-width: 22ch; min-height: 36px; }
+      .vg-w-scrub-itoa-digits .grid { display: grid; grid-template-columns: 1fr; gap: var(--s-2); }
+      @media (min-width: 720px) { .vg-w-scrub-itoa-digits .grid { grid-template-columns: repeat(3, 1fr); } }
+      .vg-w-scrub-itoa-digits .cell { padding: var(--s-2); border-left: 2px solid var(--accent); background: var(--bg-soft); }
+      .vg-w-scrub-itoa-digits .cell .k { font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+      .vg-w-scrub-itoa-digits .cell .v { font-family: EB Garamond, serif; font-size: 1.8rem; color: var(--ink); font-variant-numeric: tabular-nums; }
+      .vg-w-scrub-itoa-digits .cell .sub { font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); color: var(--muted); }
+      .vg-w-scrub-itoa-digits .bits { font-family: JetBrains Mono, monospace; font-size: var(--fs-sm); color: var(--ink-soft); word-break: break-all; padding: var(--s-2); background: var(--bg-soft); border-left: 2px solid var(--muted-2); }
+      .vg-w-scrub-itoa-digits .bits b { color: var(--accent-text); }
+      .vg-w-scrub-itoa-digits .bits i { color: var(--muted); font-style: normal; }
+    </style>
+    <div class="ctl">
+      <label for="vg-w-scrub-itoa-digits-num">整數 n =</label>
+      <input id="vg-w-scrub-itoa-digits-num" type="number" min="0" max="18446744073709551615" step="1" value="4294967295" inputmode="numeric" />
+      <input id="vg-w-scrub-itoa-digits-rng" type="range" min="0" max="63" step="1" value="32" aria-label="以 2 的次方掃描數量級" />
+    </div>
+    <div class="grid">
+      <div class="cell">
+        <div class="k">二進位位元寬度（64 − lzcnt）</div>
+        <div class="v" data-bits>32</div>
+        <div class="sub">floor(log2 n) + 1</div>
+      </div>
+      <div class="cell">
+        <div class="k">推得的十進位位數</div>
+        <div class="v" data-digits>10</div>
+        <div class="sub">≈ bitwidth × log10(2)，查表修正</div>
+      </div>
+      <div class="cell">
+        <div class="k">緩衝區寫入長度</div>
+        <div class="v" data-len>10</div>
+        <div class="sub">輸出 byte 數，無資料相依迴圈</div>
+      </div>
+    </div>
+    <div class="bits" data-explain></div>
+    <figcaption>lzcnt 把二進位位元寬度一個指令算出，乘上 log10(2) 的近似後查一次十的次方表修正——branch-free，沒有 9 個 <code>if</code> 的分支瀑布。</figcaption>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-scrub-itoa-digits');
+        const num = root.querySelector('#vg-w-scrub-itoa-digits-num');
+        const rng = root.querySelector('#vg-w-scrub-itoa-digits-rng');
+        const outBits = root.querySelector('[data-bits]');
+        const outDigits = root.querySelector('[data-digits]');
+        const outLen = root.querySelector('[data-len]');
+        const explain = root.querySelector('[data-explain]');
+        const POW10 = [1n,10n,100n,1000n,10000n,100000n,1000000n,10000000n,100000000n,1000000000n,
+          10000000000n,100000000000n,1000000000000n,10000000000000n,100000000000000n,1000000000000000n,
+          10000000000000000n,100000000000000000n,1000000000000000000n,10000000000000000000n];
+        function bitWidth(n) { // n: BigInt >= 0
+          if (n === 0n) return 1;
+          let w = 0; let x = n;
+          while (x > 0n) { x >>= 1n; w++; }
+          return w;
+        }
+        function digitCountBranchFree(n) {
+          // 模擬論文/Lemire 的 branch-free 路徑：先估再用 POW10 修一次
+          if (n === 0n) return 1;
+          const bw = bitWidth(n);
+          // estimate = floor((bw) * 1233 / 4096) 是常見的 log10(2)≈1233/4096 整數近似
+          let est = Math.floor((bw * 1233) / 4096) + 1;
+          if (est < 1) est = 1; if (est > 20) est = 20;
+          // 修正：若 n < 10^(est-1) 則 est--（一次比較，無分支瀑布）
+          if (est >= 1 && n < POW10[est - 1]) est -= 1;
+          if (est < 1) est = 1;
+          return est;
+        }
+        function clampBig(v) {
+          if (v < 0n) return 0n;
+          const MAX = 18446744073709551615n;
+          if (v > MAX) return MAX;
+          return v;
+        }
+        function render(n) {
+          n = clampBig(n);
+          const bw = bitWidth(n);
+          const dc = digitCountBranchFree(n);
+          outBits.textContent = String(bw);
+          outDigits.textContent = String(dc);
+          outLen.textContent = String(dc);
+          const binStr = n.toString(2);
+          const decStr = n.toString(10);
+          explain.innerHTML =
+            '二進位 <b>' + binStr + '</b><br>' +
+            '<i>lzcnt → 位元寬度 ' + bw + '；' + bw + ' × 1233 / 4096 + 1 ≈ ' + (Math.floor((bw*1233)/4096)+1) +
+            '，跟 10^' + (dc-1) + ' 比一次修正 → 位數 ' + dc + '</i><br>' +
+            '十進位 <b>' + decStr + '</b>（' + decStr.length + ' 位，與計算結果' + (decStr.length===dc?'一致':'需再修正') + '）';
+        }
+        function fromNum() {
+          let v;
+          try { v = BigInt(num.value.split('.')[0] || '0'); } catch { v = 0n; }
+          v = clampBig(v);
+          // 同步 range 到最接近的 2 的次方
+          const bw = bitWidth(v);
+          rng.value = String(Math.max(0, Math.min(63, bw - 1)));
+          render(v);
+        }
+        function fromRng() {
+          const p = Number(rng.value);
+          // 取 2^p 到 2^(p+1)-1 區間的代表值：2^(p+1)-1（該數量級最大值）
+          let v = (p >= 63) ? 18446744073709551615n : ((1n << BigInt(p + 1)) - 1n);
+          num.value = v.toString(10);
+          render(v);
+        }
+        num.addEventListener('input', fromNum);
+        rng.addEventListener('input', fromRng);
+        fromNum();
+      })();
+    </script>
+  </figure>
+
+<p>這裡再強調一次那個常數的來歷，
+因為它是整個 branch-free 路徑的關鍵：
+<code>1233 / 4096</code> 就是 log10(2) ≈ 0.30103 的定點化版本，分母取 4096 是為了讓除法退化成「右移 12 位」這個零成本操作。
+先用它從位元寬度估一個位數，
+再跟預先算好的十的次方表 <code>POW10[]</code> 比一次決定要不要 −1。
+</p>
+
+<p>這裡有個值得記的正確性邊界：
+那個修正比較<strong>最多只需要一次</strong>，
+不會出現「估高兩位」的情況。
+原因是 <code>1233 / 4096</code> 對 log10(2) 的近似誤差，
+在 64-bit 的整個輸入範圍（位元寬度 1 到 64）內被嚴格界定住，
+乘出來的位數要嘛精確、要嘛恰好高一位，
+永遠不會高兩位。
+這不是巧合而是被驗證過的：分母選 4096、分子選 1233，
+部分就是為了讓「最多差一」這個性質在全範圍成立。
+如果換一個更粗的近似，
+可能就得多一次比較來修，
+branch-free 的成本也跟著上去。
+</p>
+
+<p>下面把兩條路的成本畫成輸入位數的函數。
+naive 的 <code>if</code> 瀑布是斜線（虛線疊上分支誤判懲罰的上界）；branch-free 的 lzcnt 加 magic 常數是一條<strong>水平線</strong>，
+與位數無關。
+那條平線就是賣點——成本從「輸入的函數」變成常數，
+正是後面所有向量化的地基。
+</p>
+
+  <figure class="vg-w-chart-digitcount-cost" data-svg-scroll="720">
+    <style>
+      .vg-w-chart-digitcount-cost { display: grid; gap: var(--s-2); }
+      .vg-w-chart-digitcount-cost svg.vg-w-chart-digitcount-cost-main { width: 100%; height: auto; }
+      .vg-w-chart-digitcount-cost figcaption { font-family: var(--scribed); font-style: italic; font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+    <svg class="vg-w-chart-digitcount-cost-main" viewBox="0 0 720 340" preserveAspectRatio="xMidYMid meet" role="img"
+         aria-label="位數計算成本對輸入數量級折線圖：naive if 瀑布隨位數攀升、含誤判上界，branch-free lzcnt 為水平固定成本">
+      <g id="vg-w-chart-digitcount-cost-axes"></g>
+      <g id="vg-w-chart-digitcount-cost-series"></g>
+    </svg>
+    <figcaption>「算 n 有幾位數」的近似 cycle 對輸入位數：naive <code>if</code> 瀑布隨位數攀升（虛線含誤判上界），branch-free 是固定五指令的水平線。cycle 為量級示意。</figcaption>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-chart-digitcount-cost');
+        const axesG = root.querySelector('#vg-w-chart-digitcount-cost-axes');
+        const seriesG = root.querySelector('#vg-w-chart-digitcount-cost-series');
+        const NS = 'http://www.w3.org/2000/svg';
+        function el(tag, attrs) {
+          const e = document.createElementNS(NS, tag);
+          for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+          return e;
+        }
+        // x: 十進位位數 1..20。y: 近似 cycle。
+        const digits = [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20];
+        // naive if 瀑布：平均要落空約 (位數-1) 個比較才命中，每個比較 ~1 cycle。
+        const naiveHit = d => 2 + (d - 1) * 1.0;
+        // 加上資料相依分支的誤判上界：最後一個決定性分支若 mispredict，疊一個 ~16 cycle 氣泡。
+        const naiveWorst = d => naiveHit(d) + 16;
+        // branch-free：lzcnt + mul + shift + load + cmov，固定五指令、相依但短，約 9 cycle，與位數無關。
+        const branchFree = 9;
+        const X0 = 70, X1 = 690, Y0 = 290, Y1 = 36;
+        const maxY = 40;
+        const yOf = v => Y0 - (v / maxY) * (Y0 - Y1);
+        const xOf = d => X0 + ((d - 1) / (digits.length - 1)) * (X1 - X0);
+        // axes
+        axesG.appendChild(el('line', { x1: X0, y1: Y0, x2: X1, y2: Y0, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+        axesG.appendChild(el('line', { x1: X0, y1: Y0, x2: X0, y2: Y1, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+        for (let v = 0; v <= maxY; v += 10) {
+          const y = yOf(v);
+          axesG.appendChild(el('line', { x1: X0 - 4, y1: y, x2: X0, y2: y, stroke: 'var(--muted-2)' }));
+          const t = el('text', { x: X0 - 8, y: y + 4, 'text-anchor': 'end', 'font-family': 'JetBrains Mono, monospace', 'font-size': 12, fill: 'var(--muted)' });
+          t.textContent = String(v);
+          axesG.appendChild(t);
+        }
+        [1,5,10,15,20].forEach(d => {
+          const t = el('text', { x: xOf(d), y: Y0 + 18, 'text-anchor': 'middle', 'font-family': 'JetBrains Mono, monospace', 'font-size': 12, fill: 'var(--muted)' });
+          t.textContent = String(d);
+          axesG.appendChild(t);
+        });
+        const xl = el('text', { x: (X0 + X1) / 2, y: Y0 + 38, 'text-anchor': 'middle', 'font-family': 'IM Fell English, serif', 'font-style': 'italic', 'font-size': 14, fill: 'var(--muted)' });
+        xl.textContent = '輸入 n 的十進位位數';
+        axesG.appendChild(xl);
+        const yl = el('text', { x: 18, y: (Y0 + Y1) / 2, 'text-anchor': 'middle', 'font-family': 'IM Fell English, serif', 'font-style': 'italic', 'font-size': 14, fill: 'var(--muted)', transform: `rotate(-90 18 ${(Y0 + Y1) / 2})` });
+        yl.textContent = '近似 cycle（越低越好）';
+        axesG.appendChild(yl);
+        function pathFor(fn, attrs) {
+          const d = digits.map((dg, i) => `${i === 0 ? 'M' : 'L'} ${xOf(dg)} ${yOf(fn(dg))}`).join(' ');
+          seriesG.appendChild(el('path', Object.assign({ d, fill: 'none' }, attrs)));
+        }
+        // naive worst (上界，虛線)
+        pathFor(naiveWorst, { stroke: 'var(--muted)', 'stroke-width': 1.5, 'stroke-dasharray': '4,3', opacity: 0.85 });
+        // naive hit (實線)
+        pathFor(naiveHit, { stroke: 'var(--ink-deep)', 'stroke-width': 1.5 });
+        // branch-free 水平線
+        seriesG.appendChild(el('line', { x1: xOf(1), y1: yOf(branchFree), x2: xOf(20), y2: yOf(branchFree), stroke: 'var(--accent)', 'stroke-width': 2 }));
+        digits.forEach(dg => seriesG.appendChild(el('circle', { cx: xOf(dg), cy: yOf(branchFree), r: 2, fill: 'var(--accent)' })));
+        // legend
+        const lg = el('g', { 'font-family': 'JetBrains Mono, monospace', 'font-size': 12 });
+        const rows = [
+          [yOf(branchFree) - 20, 'var(--accent)', 'branch-free（lzcnt + magic）固定', false],
+          [Y1 + 6, 'var(--ink-deep)', 'naive if 瀑布（命中）', false],
+          [Y1 + 24, 'var(--muted)', 'naive if 瀑布（含誤判上界）', true],
+        ];
+        rows.forEach(([y, color, label, dashed]) => {
+          lg.appendChild(el('line', Object.assign({ x1: 330, y1: y, x2: 354, y2: y, stroke: color, 'stroke-width': 2 }, dashed ? { 'stroke-dasharray': '4,3' } : {})));
+          const t = el('text', { x: 362, y: y + 4, fill: 'var(--ink)' });
+          t.textContent = label;
+          lg.appendChild(t);
+        });
+        seriesG.appendChild(lg);
+      })();
+    </script>
+  </figure>
+
+<p>位數知道了，
+輸出緩衝區的寫入位置就定了，
+剩下的問題退化成「把這幾位數字依序填進去」。
+下一節的查表技巧，
+就是把「填數字」這步的迭代次數與相依鏈長度同時減半。
+</p>
+
+  <h2>查表：兩位數一組</h2>
+
+<p>逐位填數字，
+每位要做一次 <code>n % 10</code> 與一次 <code>n /= 10</code>——
+十位數就是十次取模、十次除法，
+外加十次相依。
+最廣為人知的加速是「兩位數一組」。
+</p>
+
+<p>做法是預先建一張 100 entry 的查找表，
+索引 00 到 99，
+每個 entry 是對應的兩個 ASCII byte：
+索引 0 存 <code>'0','0'</code>、索引 42 存 <code>'4','2'</code>、索引 99 存 <code>'9','9'</code>。
+轉換時改成每步 <code>n % 100</code> 取最低兩位、查表一次直接寫出兩個 byte、<code>n /= 100</code> 砍掉它們。
+</p>
+
+<p>這一改有兩個收穫疊在一起。
+其一，
+迭代次數砍半——十位數從十次變五次。
+其二，
+更隱性但更重要：除法/取模從「除以 10」變成「除以 100」，
+相依鏈的環節數也跟著減半。
+對相依鏈瓶頸的 workload 來說，
+後者往往才是真正的勝因。
+這就是 jeaiii、Muła、Abseil 的 <code>FastIntToBuffer</code> 等既有高效實作的共同底盤。
+</p>
+
+<p>這張表的成本是 200 byte（100 entry × 2 byte），
+小到常駐在 L1 cache 裡、幾乎永遠命中。
+查表的本質是「用空間換掉算術」——把「商與餘數再各自加 <code>'0'</code> 轉 ASCII」這串運算，
+換成一次記憶體讀取。
+在 L1 命中的前提下，
+一次 load 比那串算術便宜。
+</p>
+
+<p>有些更激進的實作把表擴到 200 entry 甚至用 SIMD 一次查多組，
+但基本的空間/算術權衡是一樣的。
+值得注意的是，
+<code>std::to_chars</code> 在多數標準庫實作裡其實已經用了兩位數表——所以圖裡它不是最慢的 naive，
+而是一個「已經做了基本優化」的基準；論文要超越的是這個基準，
+不是教科書版。
+</p>
+
+<p>點下面圖裡任一個方塊，
+讀它在 <code>n % 100</code> → load → store 這條鏈裡各管什麼。
+三者解耦：查表這步不知道「這兩位數排第幾」，
+正因無狀態才能被向量化成一次查很多組。
+</p>
+
+  <figure class="vg-w-annotated-2digit-table" data-svg-scroll="560">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M9 9h.01"/><path d="M15 15h.01"/><path d="M9 15h.01"/><path d="M15 9h.01"/>
+        <rect width="18" height="18" x="3" y="3" rx="2"/>
+      </svg>
+      <span>點任一方塊讀它在查表鏈裡負責什麼 · 3 個部件</span>
+    </p>
+    <style>
+      .vg-w-annotated-2digit-table { display: grid; grid-template-columns: 1fr; gap: var(--s-3); align-items: start; }
+      .vg-w-annotated-2digit-table svg.vg-w-annotated-2digit-table-main { width: 100%; height: auto; }
+      .vg-w-annotated-2digit-table input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-annotated-2digit-table .part { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; transition: fill 200ms, stroke 200ms; }
+      .vg-w-annotated-2digit-table .part:hover { stroke: var(--accent); }
+      .vg-w-annotated-2digit-table .part:focus { outline: none; }
+      .vg-w-annotated-2digit-table .part:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+      .vg-w-annotated-2digit-table .part-text { pointer-events: none; }
+      .vg-w-annotated-2digit-table-panel { display: grid; gap: var(--s-2); align-content: start; }
+      .vg-w-annotated-2digit-table .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+      .vg-w-annotated-2digit-table .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-annotated-2digit-table .detail p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-annotated-2digit-table:has(#vg-w-annotated-2digit-table-r1:checked) .part-1 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-annotated-2digit-table:has(#vg-w-annotated-2digit-table-r2:checked) .part-2 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-annotated-2digit-table:has(#vg-w-annotated-2digit-table-r3:checked) .part-3 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-annotated-2digit-table:has(#vg-w-annotated-2digit-table-r1:checked) .detail-1 { display: block; }
+      .vg-w-annotated-2digit-table:has(#vg-w-annotated-2digit-table-r2:checked) .detail-2 { display: block; }
+      .vg-w-annotated-2digit-table:has(#vg-w-annotated-2digit-table-r3:checked) .detail-3 { display: block; }
+      @media (max-width: 720px) {
+        .vg-w-annotated-2digit-table { grid-template-columns: 1fr; }
+      }
+    </style>
+
+    <input type="radio" id="vg-w-annotated-2digit-table-r1" name="vg-w-annotated-2digit-table-sel" checked />
+    <input type="radio" id="vg-w-annotated-2digit-table-r2" name="vg-w-annotated-2digit-table-sel" />
+    <input type="radio" id="vg-w-annotated-2digit-table-r3" name="vg-w-annotated-2digit-table-sel" />
+
+    <svg class="vg-w-annotated-2digit-table-main" viewBox="0 0 480 240" role="img" aria-label="兩位數查表的三個部件：索引算術、200 byte 表、兩個輸出 byte">
+      <!-- part 1: index arithmetic -->
+      <rect class="part part-1" data-target="vg-w-annotated-2digit-table-r1" role="button" tabindex="0" aria-label="選擇索引算術部件" x="20" y="40" width="130" height="70" rx="3" />
+      <text class="part-text" x="85" y="68" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">r = n % 100</text>
+      <text class="part-text" x="85" y="90" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">索引算術</text>
+
+      <!-- part 2: the 200-byte table -->
+      <rect class="part part-2" data-target="vg-w-annotated-2digit-table-r2" role="button" tabindex="0" aria-label="選擇 200 byte 表部件" x="175" y="40" width="130" height="160" rx="3" />
+      <text class="part-text" x="240" y="64" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">TWO[200]</text>
+      <text class="part-text" x="240" y="84" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">100 entry × 2 byte</text>
+      <text class="part-text" x="240" y="118" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--ink-soft)">[42] → '4','2'</text>
+      <text class="part-text" x="240" y="138" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--ink-soft)">[99] → '9','9'</text>
+      <text class="part-text" x="240" y="172" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">常駐 L1</text>
+
+      <!-- part 3: two output bytes -->
+      <rect class="part part-3" data-target="vg-w-annotated-2digit-table-r3" role="button" tabindex="0" aria-label="選擇輸出 byte 部件" x="330" y="40" width="130" height="70" rx="3" />
+      <text class="part-text" x="395" y="68" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">p[0], p[1]</text>
+      <text class="part-text" x="395" y="90" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">兩個 ASCII byte</text>
+
+      <line x1="150" y1="75" x2="175" y2="90" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-annotated-2digit-table-arrow)" />
+      <line x1="305" y1="90" x2="330" y2="75" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-annotated-2digit-table-arrow)" />
+      <text x="162" y="135" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--muted)">index</text>
+      <text x="318" y="135" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--muted)">load</text>
+      <defs>
+        <marker id="vg-w-annotated-2digit-table-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+        </marker>
+      </defs>
+    </svg>
+
+    <div class="vg-w-annotated-2digit-table-panel">
+      <div class="detail detail-1">
+        <h3>索引算術 · 職責</h3>
+        <p><code>n % 100</code> 取最低兩位得 0 到 99 的索引，乘 2 即 byte 偏移。</p>
+        <p><strong>刻意不碰</strong>：不知道 <code>n</code> 還剩幾位、這組排在輸出哪裡。</p>
+      </div>
+      <div class="detail detail-2">
+        <h3>200 byte 表 · 職責</h3>
+        <p>100 entry × 2 byte，永遠命中 L1，把「商餘各加 <code>'0'</code>」的算術換成一次 load。</p>
+        <p><strong>刻意不碰</strong>：純常數、唯讀、無狀態，故能被 SIMD gather 一次查多組。</p>
+      </div>
+      <div class="detail detail-3">
+        <h3>輸出 byte · 職責</h3>
+        <p>把兩個 byte 寫進緩衝區的固定位置，指標前移 2 換下一組。</p>
+        <p><strong>刻意不碰</strong>：不做 ASCII 轉換——那在建表時一次做完，hot path 只剩 store。</p>
+      </div>
+    </div>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-annotated-2digit-table');
+        root.querySelectorAll('.part').forEach((rect) => {
+          rect.addEventListener('click', () => {
+            const targetId = rect.getAttribute('data-target');
+            const radio = root.querySelector('#' + targetId);
+            if (radio) radio.checked = true;
+          });
+          rect.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              rect.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            }
+          });
+        });
+      })();
+    </script>
+  </figure>
+
+<p>下面的小工具用 tab 切換三種策略，
+讓你直接對照同一個輸入在「逐位」「兩位數查表」「SWAR」三條路上，
+暫存器裡分別發生什麼。
+注意這是純 CSS tab、點標籤切換，
+不是捲動觸發。
+</p>
+
+  <figure class="vg-w-tabs-itoa-stages">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/>
+      </svg>
+      <span>切換分頁比較三種策略在暫存器裡做什麼 · 3 個分頁</span>
+    </p>
+    <style>
+      .vg-w-tabs-itoa-stages { display: grid; gap: var(--s-2); }
+      .vg-w-tabs-itoa-stages input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-tabs-itoa-stages .tabs { display: flex; flex-wrap: wrap; gap: var(--s-2); border-bottom: 1px solid var(--line); }
+      .vg-w-tabs-itoa-stages .tab { font-family: var(--sans); font-size: var(--fs-sm); padding: var(--s-1) var(--s-2); cursor: pointer; color: var(--muted); min-height: 44px; display: flex; align-items: center; }
+      .vg-w-tabs-itoa-stages .panel { display: none; padding: var(--s-2) 0; }
+      .vg-w-tabs-itoa-stages .panel p { font-family: var(--serif); font-size: var(--fs-sm); margin: 0 0 var(--s-2) 0; }
+      .vg-w-tabs-itoa-stages:has(#vg-w-tabs-itoa-stages-t1:checked) .panel-1 { display: block; }
+      .vg-w-tabs-itoa-stages:has(#vg-w-tabs-itoa-stages-t1:checked) [for="vg-w-tabs-itoa-stages-t1"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-itoa-stages:has(#vg-w-tabs-itoa-stages-t2:checked) .panel-2 { display: block; }
+      .vg-w-tabs-itoa-stages:has(#vg-w-tabs-itoa-stages-t2:checked) [for="vg-w-tabs-itoa-stages-t2"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-itoa-stages:has(#vg-w-tabs-itoa-stages-t3:checked) .panel-3 { display: block; }
+      .vg-w-tabs-itoa-stages:has(#vg-w-tabs-itoa-stages-t3:checked) [for="vg-w-tabs-itoa-stages-t3"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    </style>
+    <input type="radio" id="vg-w-tabs-itoa-stages-t1" name="vg-w-tabs-itoa-stages-sel" checked />
+    <input type="radio" id="vg-w-tabs-itoa-stages-t2" name="vg-w-tabs-itoa-stages-sel" />
+    <input type="radio" id="vg-w-tabs-itoa-stages-t3" name="vg-w-tabs-itoa-stages-sel" />
+    <div class="tabs" role="tablist">
+      <label class="tab" for="vg-w-tabs-itoa-stages-t1">逐位 ÷10</label>
+      <label class="tab" for="vg-w-tabs-itoa-stages-t2">兩位數查表</label>
+      <label class="tab" for="vg-w-tabs-itoa-stages-t3">SWAR</label>
+    </div>
+    <div class="panel panel-1">
+      <p>每步取一位。相依鏈長 = 位數，每步一次乘法（除以 10 的 magic reciprocal）加一次位移。對 <code>12345</code>：取 5、取 4、取 3、取 2、取 1，五步序列化、再 reverse。</p>
+      <pre data-kind="pseudocode"><code><em>// 一次一位，相依鏈 = 位數</em>
+do {
+  d = n % 10            <em>// (n * magic) >> shift 取餘</em>
+  *--p = '0' + d
+  n = n / 10            <em>// ← 下一步等這步</em>
+} while (n)</code></pre>
+    </div>
+    <div class="panel panel-2">
+      <p>每步取兩位，查 100 entry 的 ASCII pair 表寫出兩 byte。迭代次數與相依鏈長都砍半。表佔 200 byte，常駐 L1。這是 jeaiii / Abseil <code>FastIntToBuffer</code> 等實作的底盤。</p>
+      <pre><code class="language-cpp">// 預建表：索引 00..99 → 兩個 ASCII byte
+static const char TWO[200] =
+  "0001020304...96979899";  // 100 對
+
+do {
+  unsigned r = n % 100;          // 取兩位
+  p -= 2;
+  p[0] = TWO[r*2];               // 查表寫兩 byte
+  p[1] = TWO[r*2 + 1];
+  n /= 100;                      // 相依鏈長度減半
+} while (n >= 100);</code></pre>
+    </div>
+    <div class="panel panel-3">
+      <p>SWAR（SIMD Within A Register）：把多個十進位數字塞進一個 64-bit 暫存器的不同 byte，用一連串乘法、遮罩、位移在<strong>一個純量暫存器</strong>裡平行處理八個 byte，完全不碰 SIMD 指令。代價是常數要為固定位數寬度精心調過。</p>
+      <pre><code class="language-cpp">// 把 8 位數一次攤進 64-bit 的 8 個 byte（概念式）
+uint64_t fl = n;
+fl = (fl * 0x0000000005F5E100ULL) &gt;&gt; ...; // 拆高低段
+// 一連串 mul / mask / shift 把每位移到自己的 byte
+// 最後每個 byte + '0' 一口氣轉 ASCII，store 一次寫 8 byte</code></pre>
+    </div>
+    <figcaption>同一個輸入在三條路上的暫存器活動：逐位（相依鏈 = 位數）、兩位數查表（砍半 + 200 byte 表）、SWAR（一個暫存器塞八位、純量平行）。</figcaption>
+  </figure>
+
+<p>兩位數查表把「除以 10」換成「除以 100 + 一次記憶體讀」，
+是過去十年大多數高效 itoa 的共同底層。
+但它有個天花板。
+表仍佔 L1 的一塊；查表這步在極端 hot path 上是一次 load 延遲，
+而 load 即使命中 L1 也有四到五個 cycle 的 latency；而且相依鏈雖然減半，
+仍然存在。
+要再往前，
+得換掉「逐組往前算」這個結構本身。
+SWAR 就是這一步——連表都不要了，
+改用純算術在一個暫存器裡平行處理多個 byte。
+</p>
+
+  <h2>SWAR：一個暫存器裡平行</h2>
+
+<p>SWAR 是 SIMD Within A Register 的縮寫。
+它不用任何向量指令，
+純粹把一個 64-bit 通用暫存器當成「八個並排的 byte」來操作，
+用精心構造的乘法、加法、遮罩、位移，
+讓一個算術指令同時影響八個 byte。
+名字裡有 SIMD，
+但跑的全是 scalar 整數指令——好處是不需要任何特殊指令集，
+連 SSE 都不必，
+任何 64-bit CPU 都能跑。
+</p>
+
+<p>對 itoa 來說，
+目標很明確：
+把（最多）八位十進位數字，
+各自落到 64-bit 暫存器的八個 byte 位置上，
+最後一口氣每個 byte 加 <code>'0'</code> 轉成 ASCII、一次 store 寫出八個 byte。
+難點在「怎麼讓八個數字各就各位」，
+而且全程不准分支、不准查表。
+</p>
+
+<p>核心招式是「乘以 reciprocal 一次抽出整段商與餘數，
+再用位移把各位數對齊到 byte 邊界」。
+要把一個 8 位數拆成八個個位，
+做法像二分法：先乘一個常數把高四位與低四位分離成兩段，
+再對每一段平行地乘常數分成兩位+兩位，
+最後再分成個位。
+每一層把「並排的 N 段」變成「並排的 2N 段」，
+三層之後八個 byte 各持一位。
+</p>
+
+<p>這個二分結構是 SWAR 勝過逐位的關鍵。
+逐位是線性相依鏈（長度等於位數）；二分把相依鏈壓到 log 量級——八位數只要三層、十六位數只要四層。
+而且每一層內部「並排的多段」彼此獨立，
+亂序引擎可以重疊執行。
+相依鏈短、平行度高，
+這正是現代 CPU 喜歡的形狀。
+</p>
+
+<p>SWAR 也有它的代價，
+而這個代價恰好埋下了論文後面的伏筆：
+常數要為「特定位數寬度」精心調校。
+八位數一組的乘法常數與位移量，
+跟十六位數一組的不一樣；段數一變，
+整套定點數的精度分析就得重做一遍，
+否則某個輸入會在某一層的乘法裡進位錯誤、算出錯的數字。
+所以實作通常會按位數分段——不同位數走不同的固定路徑。
+</p>
+
+<p>這就是論文裡 branch-heavy 變體的來源之一：
+對「位數分布很集中」的輸入（例如你知道大多是 9 到 10 位），
+分段的固定路徑因為分支幾乎永遠命中，
+反而比 branch-free 還快。
+記住這個張力，
+下一節會看到 IFMA 怎麼用更寬的乘法把分段的需求一併壓低。
+</p>
+
+  <pre><code class="language-cpp">// SWAR 概念骨架：把低 8 位數攤進 64-bit 的 8 個 byte
+// （常數依固定位寬調校，這裡示意分離高/低段的二分結構）
+uint64_t to_bytes_8digits(uint32_t n) {        // n &lt; 100000000
+    uint64_t x = n;
+    // 1. 先分離成兩個 4 位段（高 4 位、低 4 位）
+    uint64_t hi = (x * 0x68DB8BACULL) &gt;&gt; 40;     // ≈ x / 10000
+    uint64_t lo = x - hi * 10000;
+    uint64_t packed = (hi &lt;&lt; 32) | lo;           // 兩段並排
+    // 2. 對每個 4 位段再二分成 2 位 + 2 位
+    uint64_t a = (packed * 0x29ULL) &gt;&gt; 11;        // ≈ /100（並行兩段）
+    uint64_t b = packed - a * 100;
+    uint64_t d2 = (a &lt;&lt; 16) | b;                  // 四個 2 位段並排
+    // 3. 再二分成個位，最後每 byte + '0'
+    uint64_t c = (d2 * 0x67ULL) &gt;&gt; 10;            // ≈ /10
+    uint64_t e = d2 - c * 10;
+    uint64_t digits = (c &lt;&lt; 8) | e;               // 八個 byte 各一位
+    return digits | 0x3030303030303030ULL;       // 一口氣 + '0' 轉 ASCII
+}</code></pre>
+
+<p>上面的常數與位移是示意性的二分結構（精確值依目標位寬與正確性證明調校），
+重點是看出 SWAR 的形狀：
+每一層把「並排的 N 個段」二分成「並排的 2N 個段」，
+全程在一個暫存器、全程純算術。
+</p>
+
+<p>最後那句 <code>| 0x3030303030303030</code> 是 SWAR 的招牌。
+<code>0x30</code> 是 ASCII <code>'0'</code>，八個 byte 各 OR 一個 <code>0x30</code>，一個指令就把八位二進位數字同時轉成 ASCII——這正是「把 byte 對齊好之後一次處理」帶來的紅利。
+</p>
+
+<p>SWAR 已經把表刪掉、把相依鏈壓到對數，
+看起來很完美。
+但它撞到一個物理上限：一個 64-bit 暫存器只能裝八個 byte。
+要處理 20 位的 <code>uint64_t</code>，
+得把數字拆成多段、分多次跑 SWAR，
+分段邏輯又把分支帶回來。
+真正的下一步是把暫存器加寬到 512-bit，
+並換一條更適合的乘法指令。
+</p>
+
+  <h2>AVX-512 與 IFMA：把查表整個刪掉</h2>
+
+<p>論文的核心貢獻就在這一節。
+SWAR 用一個 64-bit 暫存器平行八個 byte；AVX-512 把暫存器加寬到 512-bit，
+理論上一次能擺 64 個 byte。
+但純把 SWAR 搬上 512-bit 並不會自動變快——AVX-512 缺少高效的整數除法，
+逐位除十在向量裡反而更尷尬。
+關鍵是換一條指令：IFMA。
+</p>
+
+<p>IFMA 是 Integer Fused Multiply-Add 的縮寫，
+提供 <code>vpmadd52luq</code> 與 <code>vpmadd52huq</code> 兩條指令，
+能對 52-bit 整數做 fused multiply-add，
+分別取乘積的低 52 位或高 52 位。
+為什麼偏偏是 52 位這個怪數字？因為它復用了浮點 FMA 的 53-bit 尾數乘法器硬體——CPU 設計者不想為整數再蓋一套寬乘法器，
+就讓 IFMA 借用既有的浮點乘法電路。
+結果是這條指令路徑在現代 AMD（Zen 4 起）與 Intel 上吞吐量很高，
+每 cycle 能發出多條。
+</p>
+
+<p>有了寬乘法，
+「乘以 reciprocal 抽商餘」這個 SWAR 的核心動作就能搬進向量並且做得更乾淨：
+52 位的中間精度足夠一次處理更多位數，
+不必像 64-bit SWAR 那樣為避免進位錯誤而頻繁分段。
+論文摘要把成果講得很直接——他們的 SIMD 演算法「利用近代 AMD 與 Intel 處理器上的整數 multiply-add 指令」，
+並且「完全消除查表、平行計算多個商與餘數」。
+</p>
+
+<p>這裡的精度帳要算清楚才知道 52 位為什麼夠用。
+SWAR 的逐層二分之所以容易進位錯誤，
+是因為 64 位裡同時塞了八個 byte，
+每個乘法的中間結果只剩很窄的空間、稍不留意高位就溢進鄰格。
+IFMA 的 multiply-add 把乘積保持在 52 位寬度、又能單獨取高半或低半，
+等於給了每個中間商餘一個夠寬的「工作格」，
+定點數的精度分析一次就能涵蓋更多位數而不必切段。
+切段少了，
+需要分支去選「這是幾位數該走哪條路」的次數也跟著少——這就是為什麼 IFMA 不只是「SWAR 變寬」，
+而是讓 branch-free 路徑第一次在寬度上站得住腳。
+</p>
+
+<p>「完全消除查表」是跟 SWAR / 兩位數查表路線最大的分野。
+前面的技巧，
+或留著 200 byte 的兩位數表、或用純量乘法逐層二分；AVX-512 IFMA 則是把「乘以 reciprocal 抽商與餘數」這件事，
+用一條 52-bit multiply-add 對一整個 512-bit 向量裡的多組數字同時做掉，
+連那張表都不必存在。
+</p>
+
+<p>沒有表，
+就沒有 load 延遲、沒有 L1 佔用、沒有相依的記憶體存取。
+在一個本來就被 load latency 與相依鏈卡住的微操作裡，
+把記憶體完全踢出 hot path，
+是質變而不是量變。
+這也是為什麼論文能跨過 2 ns 門檻、而不只是再快個百分之幾。
+</p>
+
+<p>論文還報了一個架構決策值得記：
+dual-variant 設計加上動態選擇，
+正好回應前面 SWAR 那個「分段把分支帶回來」的張力。
+一個 branch-heavy 變體針對「位數長度分布很均勻」的工作負載——當你知道大部分數字都是 9 到 10 位，
+固定路徑的分支幾乎永遠預測正確，
+branch 反而比 branch-free 快，
+因為它省掉了 branch-free 為了「兼容所有位數」而付的額外算術。
+</p>
+
+<p>另一個 branch-light 變體針對「位數長度分布雜亂」的資料集——
+這時 misprediction 成本高，
+那個被均勻分布偏好的固定路徑會頻繁猜錯，
+branch-free 的向量路徑反而勝出。
+執行期根據輸入特徵動態選哪個變體，
+benchmark suite 裡叫 Champagne-Lemire auto，
+論文報的 2 到 4 倍上界主要來自它。
+這是個務實的設計：承認「沒有單一最快路徑」，
+乾脆量測輸入特徵再分派。
+</p>
+
+<p>這個 dual-variant 的取捨值得多想一層，
+因為它顛覆了「branch-free 永遠比較好」的直覺。
+branch-free 的代價是它得用一套統一的算術同時兼容所有位數，
+這套算術對任何單一位數來說都不是最省的；branch-heavy 則為每種位數量身打造最短路徑，
+只是要賭分支預測會猜對。
+當輸入位數高度集中（例如全是時間戳那種固定寬度的數字），
+預測器幾乎零失誤，
+branch-heavy 那條更短的算術直接勝出；當輸入位數雜亂，
+預測失誤的 cycle 氣泡又把那點算術優勢吃光。
+所以「哪個快」不是演算法的固有屬性，
+而是輸入分布的函數——auto 變體只是把這個判斷自動化。
+這也是給移植者的一個提醒：先量你自己資料的位數分布，
+再決定要不要 auto，
+甚至可能直接釘死在 branch-heavy 上更快。
+</p>
+
+<p>下面這張表把整個 int-serialization 領域的演算法擺在一起，
+標明各自靠哪一代指令集與暫存器寬度，
+點欄位標題可排序——
+按暫存器寬度排，
+那條 64 → 128 → 512 的演化線會直接浮出來。
+</p>
+
+  <figure class="vg-w-table-itoa-field">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/>
+        <path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+      </svg>
+      <span>點欄位標題排序 · 4 欄 × 9 列</span>
+    </p>
+    <style>
+      .vg-w-table-itoa-field { overflow-x: auto; }
+      .vg-w-table-itoa-field table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-itoa-field thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; }
+      .vg-w-table-itoa-field thead th[data-sort] { color: var(--accent-text); }
+      .vg-w-table-itoa-field thead th[data-sort]::after { content: ' ▾'; font-size: 0.7em; }
+      .vg-w-table-itoa-field thead th[data-sort="asc"]::after { content: ' ▴'; font-size: 0.7em; }
+      .vg-w-table-itoa-field tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); }
+      .vg-w-table-itoa-field td.num { font-variant-numeric: tabular-nums; text-align: right; }
+      .vg-w-table-itoa-field td.tech { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+      .vg-w-table-itoa-field tbody tr:hover td { background: var(--bg-soft); }
+      .vg-w-table-itoa-field caption { text-align: left; caption-side: top; font-family: var(--scribed); font-style: italic; color: var(--muted); font-size: var(--fs-sm); padding: var(--s-1) 0; }
+    </style>
+    <table>
+      <caption>int-serialization 領域的代表演算法與其依賴指令集（取自 fastfloat/int_serialization_benchmark 的 method 清單）。speedup 相對 <code>std::to_chars</code> 為量級示意，auto 變體為論文報的 2–4x 上界。</caption>
+      <thead>
+        <tr>
+          <th data-key="name">演算法</th>
+          <th data-key="tech">主要技巧 / 指令集</th>
+          <th data-key="width" class="num">暫存器寬度</th>
+          <th data-key="speedup" class="num">vs std（示意）</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>naive one-pass</td><td class="tech">逐位 ÷10</td><td class="num">64</td><td class="num" data-speedup="0.7">0.7×</td></tr>
+        <tr><td>std::to_chars</td><td class="tech">標準庫（含兩位數表）</td><td class="num">64</td><td class="num" data-speedup="1.0">1.0×</td></tr>
+        <tr><td>Abseil FastIntToBuffer</td><td class="tech">兩位數查表</td><td class="num">64</td><td class="num" data-speedup="1.5">~1.5×</td></tr>
+        <tr><td>jeaiii</td><td class="tech">乘法 + 兩位數表</td><td class="num">64</td><td class="num" data-speedup="1.8">~1.8×</td></tr>
+        <tr><td>Muła</td><td class="tech">SSE 向量</td><td class="num">128</td><td class="num" data-speedup="1.7">~1.7×</td></tr>
+        <tr><td>Mathisen</td><td class="tech">SSE4.1 算術</td><td class="num">128</td><td class="num" data-speedup="1.6">~1.6×</td></tr>
+        <tr><td>Champagne-Lemire（homogeneous）</td><td class="tech">AVX-512 IFMA · branch-heavy</td><td class="num">512</td><td class="num" data-speedup="3.2">~2–4×</td></tr>
+        <tr><td>Champagne-Lemire（heterogeneous）</td><td class="tech">AVX-512 IFMA · branch-light</td><td class="num">512</td><td class="num" data-speedup="3.0">~2–4×</td></tr>
+        <tr><td>Champagne-Lemire（auto）</td><td class="tech">AVX-512 IFMA · 動態選擇</td><td class="num">512</td><td class="num" data-speedup="3.4">~2–4×</td></tr>
+      </tbody>
+    </table>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-table-itoa-field');
+        const headers = root.querySelectorAll('thead th');
+        const tbody = root.querySelector('tbody');
+        let activeKey = null, asc = true;
+        headers.forEach((h, idx) => h.addEventListener('click', () => {
+          const key = h.dataset.key;
+          if (activeKey === key) asc = !asc; else { activeKey = key; asc = true; }
+          headers.forEach((x) => x.removeAttribute('data-sort'));
+          h.setAttribute('data-sort', asc ? 'asc' : 'desc');
+          const rows = Array.from(tbody.querySelectorAll('tr'));
+          rows.sort((a, b) => {
+            let av, bv;
+            if (key === 'speedup') {
+              av = Number(a.children[idx].getAttribute('data-speedup'));
+              bv = Number(b.children[idx].getAttribute('data-speedup'));
+            } else {
+              av = a.children[idx].textContent.trim().replace(/[×,]/g, '');
+              bv = b.children[idx].textContent.trim().replace(/[×,]/g, '');
+              const an = Number(av), bn = Number(bv);
+              if (!Number.isNaN(an) && !Number.isNaN(bn)) { av = an; bv = bn; }
+            }
+            const cmp = av < bv ? -1 : av > bv ? 1 : 0;
+            return asc ? cmp : -cmp;
+          });
+          rows.forEach((r) => tbody.appendChild(r));
+        }));
+      })();
+    </script>
+  </figure>
+
+<p>表裡看得出一條清楚的演化線：
+暫存器從 64-bit（純量、SWAR）走到 128-bit（SSE 的 Muła、Mathisen）再到 512-bit（AVX-512 IFMA），
+技巧從「逐位除十」走到「兩位數查表」再到「乘法-加法直接平行抽商餘、把表刪掉」。
+每一代都在用更寬的硬體攤平同一條相依鏈。
+</p>
+
+<p>論文報的 benchmark suite（fastfloat/int_serialization_benchmark）量的不只一個 throughput 數字，
+而是每個數字的 ns/n、cycles/n、instructions/n 與 IPC 四項。
+把指令數與 IPC 拆開很有意思：它讓你分辨 IFMA 路徑的勝出，
+究竟來自「發出更少的指令」（演算法本身更省）還是「更高的 IPC」（同樣指令數但平行度更好）。
+對想移植這套技巧的人，
+這個拆解比單一倍數有用得多——你的瓶頸如果是指令數，
+換寬乘法才有意義；如果是 IPC，
+可能先得處理 front-end。
+</p>
+
+<p>務實面要記三件事。
+第一，
+需要 AVX-512 支援才能跑 Champagne-Lemire 變體，
+這把它目前綁定在較新的 x86 桌機/伺服器 CPU 上；ARM、舊 x86、以及為了 AVX-512 降頻而保守的環境，
+仍得退回 SWAR / 查表路線。
+第二，
+AVX-512 的批次本質意味著它最甜的場景是「成批轉很多整數」——column-store export、批次序列化——而不是零星轉一兩個。
+第三，
+<code>auto</code> 變體要先掃一眼輸入的位數分布才分派，
+這個前置成本在很短的批次上可能吃掉收益。
+</p>
+
+<p>有一點要誠實標註：
+本文圖表裡的絕對 ns 值是把論文與 benchmark suite 報的相對倍數，
+錨定在一個 3 到 4 GHz 桌機等級的假想基準上換算出來的，
+用意是給「兩奈秒以下」一個直觀的量級，
+而不是宣稱某台特定機器上的精確讀數。
+真正可信的是相對關係——1.4 到 2 倍 vs 最接近競爭者、2 到 4 倍 vs <code>std::to_chars</code>——這些倍數才是論文直接量到、且附了可重現程式碼（GitHub 上的 int_serialization_benchmark）的部分。
+要對自己的硬體與資料下結論，
+最穩的做法是把那套 benchmark 在你的 CPU 上跑一遍，
+看 ns/n 與 IPC 落在哪。
+</p>
+
+<p>把這幾層組起來看：
+digit-count 先 branch-free 算出位數、消掉資料相依的迴圈邊界；
+兩位數查表把迭代與相依鏈砍半；
+SWAR 把表也刪掉、用一個暫存器平行八位、相依鏈壓到對數；
+AVX-512 IFMA 再把暫存器加寬到 512-bit、用 52-bit multiply-add 對多組數字同時抽商與餘數，
+連那張兩位數表都不再需要。
+每一層攻擊的都是同一個敵人——資料相依的控制流與相依鏈——只是用越來越寬的硬體去鋪平它。
+</p>
+
+<p class="vg-deep-closer"><strong>What this enables</strong>：
+當單次 itoa 跌破兩奈秒、且相對 <code>std::to_chars</code> 穩定 2 到 4 倍，
+整數序列化就從「不值得碰的微優化」變成「值得換實作的 hot-path 元件」——
+JSON encoder、log/metrics pipeline、column-store 的 export 路徑，
+凡是把整數成批攤成 ASCII 的地方，
+換上 AVX-512 IFMA 版本就能在不改演算法、只改一個轉換函式的前提下，
+把一段過去被當成常數成本的開銷直接砍掉一半以上。
+</p>
+</div>
