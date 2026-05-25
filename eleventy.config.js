@@ -171,6 +171,7 @@ export default function (eleventyConfig) {
     const byDay = new Map();
     for (const post of api.getFilteredByGlob("src/posts/**/*.html")) {
       if (post.data.status === "draft") continue;
+      if (post.data.archetype === "weekly-rollup") continue;
       const d = new Date(post.data.date);
       const key = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
       if (!byDay.has(key)) byDay.set(key, []);
