@@ -64,6 +64,8 @@ const dateSlug = `${parts[0]}-${parts[1]}-${parts[2]}`;
 const qualityDir = `/tmp/vg-quality-${dateSlug}`;
 const auditDir = `/tmp/vg-audit-${dateSlug}`;
 
+const ROLLUP_ARCHETYPES = new Set(["weekly-rollup", "monthly-rollup"]);
+
 const slugs = readdirSync(targetDir)
   .filter((f) => f.endsWith(".11tydata.json"))
   .map((f) => f.replace(/\.11tydata\.json$/, ""));
@@ -73,10 +75,26 @@ if (slugs.length === 0) {
   process.exit(1);
 }
 
+// Detect whether every post in this dir is a rollup archetype.
+// Weekly/monthly rollups don't produce deep stories or dual-reviewer passes
+// (the fallback workflow for those skips Steps 2-7; only 8, 8.5, 9 run).
+const isRollupDir = slugs.every((slug) => {
+  try {
+    const data = JSON.parse(
+      readFileSync(join(targetDir, `${slug}.11tydata.json`), "utf8")
+    );
+    return ROLLUP_ARCHETYPES.has(data.archetype);
+  } catch {
+    return false;
+  }
+});
+
 const violations = [];
 
 // --- Step 7.5 evidence: dual-reviewer JSON per post ---
-if (!existsSync(qualityDir)) {
+// Rollup posts skip Step 7.5 (no deep stories to review); this block is
+// only required for daily-roundup / daily-deep-story batches.
+if (!isRollupDir && !existsSync(qualityDir)) {
   violations.push(
     `Step 7.5 evidence missing: ${qualityDir}/ does not exist. ` +
       `The dual-reviewer pass must run for every post and write ` +
@@ -85,7 +103,7 @@ if (!existsSync(qualityDir)) {
       `deep-stories (N → N-1) instead. See SKILL.md Step 7.5 "No ` +
       `skip clause exists".`
   );
-} else {
+} else if (!isRollupDir) {
   for (const slug of slugs) {
     const a = join(qualityDir, `${slug}-reviewer-A.json`);
     const b = join(qualityDir, `${slug}-reviewer-B.json`);
@@ -128,21 +146,10 @@ if (!existsSync(auditDir)) {
 }
 
 // --- Step 5 evidence: deep-story count justification when N_deep < 3 ---
-// Added 2026-05-23 after PR #35. The default deep-story count is N = 3.
-// If N_final < 3, a Step 5 reason MUST be recorded in a sidecar file
-// `/tmp/vg-quality-${dateSlug}/deep-count-justification.json` with shape:
-//   { "target": 3, "actual": <N>, "reason": "<one of the legal reasons>" }
-// Legal reasons (substring match, case-insensitive):
-//   - "score" + "qualifying"          → fewer than 3 clusters scored ≥ 8
-//   - "diversity" + "unsatisfiable"   → can't satisfy domain + archetype
-//   - "url" + "refill" + "exhausted"  → Step 5d collision, no replacement
-//   - "step 7.5" + "blocking"          → Step 7.5 retry exhausted
-//   - "step 8.5" + "blocking"          → Step 8.5 visual unfixable
-// Banned reason substrings (case-insensitive): "budget", "wallclock",
-// "wall-clock", "dispatch cost", "opus quota".
+// Rollup posts (weekly/monthly) never produce deep stories — skip this gate.
 const deepSlugs = slugs.filter((s) => s.startsWith("deep-"));
 const deepCount = deepSlugs.length;
-if (deepCount < 3) {
+if (!isRollupDir && deepCount < 3) {
   const justificationPath = join(qualityDir, "deep-count-justification.json");
   if (!existsSync(justificationPath)) {
     violations.push(

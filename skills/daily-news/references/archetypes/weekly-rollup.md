@@ -57,7 +57,7 @@ The H2 count is flexible (4-6 sections), but the *arc* is fixed:
 2. **沒被合稱的個別亮點** (1 H2) — 3-5 items, one short paragraph each,
    surfacing posts that didn't fit the main theme but earn mention.
    Link each to its original deep-story or roundup item.
-3. **本週劢頭** (1 H2, optional — skipped if last week was empty) — the
+3. **本週動向** (1 H2, optional — skipped if last week was empty) — the
    week-over-week comparison H2. See "Delta computation" below.
 4. **一週的形狀** (1 H2) — the visualization H2. Contains the inline
    SVG (tag distribution, deep-archetype mix, or domain breakdown).
@@ -68,7 +68,7 @@ The H2 count is flexible (4-6 sections), but the *arc* is fixed:
 
 Closer (free phrasing — any label that signals "this is the wrap").
 
-## Delta computation (for 本週劢頭)
+## Delta computation (for 本週動向)
 
 Before writing the H2, call the weekly-delta module:
 
@@ -92,13 +92,13 @@ this-week (days 1-7) and last-week (days 8-14), and emits:
 - `tag_movement.faded[]` — tags down ≥2 vs last week and ≥3 last week
 - `totals`, optional `note` (`"this_week_empty"` or `"last_week_empty"`)
 
-If `note` is non-null, **skip the 本週劢頭 H2 entirely** for that week.
+If `note` is non-null, **skip the 本週動向 H2 entirely** for that week.
 
-## 本週劢頭 H2 shape
+## 本週動向 H2 shape
 
 When the delta JSON is non-empty:
 
-- Heading: `<h2>本週劢頭</h2>`. CJK heading, no English chrome label.
+- Heading: `<h2>本週動向</h2>`. CJK heading, no English chrome label.
 - 1-2 short paragraphs of prose:
   - First sentence: anchor on the most significant domain shift
     (`|delta_pp| ≥ 10`). Cite at least one specific number:

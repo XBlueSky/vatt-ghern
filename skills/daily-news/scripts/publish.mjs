@@ -37,6 +37,19 @@ const REQUIRED_FIELDS = [
   "estimated_read_min",
 ];
 
+const ROLLUP_REQUIRED_FIELDS = [
+  "title",
+  "date",
+  "archetype",
+  "summary",
+  "tags",
+  "topics",
+  "range",
+  "referenced_posts",
+];
+
+const ROLLUP_ARCHETYPES = ["weekly-rollup", "monthly-rollup"];
+
 const violations = [];
 const sidecars = readdirSync(targetDir).filter((f) => f.endsWith(".11tydata.json"));
 
@@ -66,14 +79,17 @@ for (const sidecarFile of sidecars) {
     continue;
   }
 
-  for (const field of REQUIRED_FIELDS) {
+  const isRollup = ROLLUP_ARCHETYPES.includes(data.archetype);
+  const fieldList = isRollup ? ROLLUP_REQUIRED_FIELDS : REQUIRED_FIELDS;
+  for (const field of fieldList) {
     if (!(field in data)) {
       violations.push(`${sidecarPath}: missing required field "${field}"`);
     }
   }
-  if (!["daily-roundup", "daily-deep-story"].includes(data.archetype)) {
-    violations.push(`${sidecarPath}: archetype must be "daily-roundup" or "daily-deep-story"`);
+  if (!["daily-roundup", "daily-deep-story", ...ROLLUP_ARCHETYPES].includes(data.archetype)) {
+    violations.push(`${sidecarPath}: archetype must be "daily-roundup", "daily-deep-story", "weekly-rollup", or "monthly-rollup"`);
   }
+  if (isRollup) continue; // rollup sidecars skip the daily-specific checks below
   if (data.archetype === "daily-roundup") {
     roundupCount++;
     if (stem !== "roundup") {
