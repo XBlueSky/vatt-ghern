@@ -21,7 +21,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const LOAD_PATH = join(here, "..", "load-past-roundups.mjs");
 
 const PRIORITY_DOMAINS = ["ai", "systems", "infra", "web", "backend"];
-const LEGACY_DOMAINS = new Set(["storage", "industry"]);
+const OTHER_DOMAINS = new Set(["storage", "industry"]);
 
 const TAG_NEW_MIN = 2;
 const TAG_NEW_CAP = 8;
@@ -112,8 +112,8 @@ function countItems(window) {
     total += itemCount;
     const domains = (r.topics || [])
       .filter((t) => t !== "roundup")
-      .map((t) => LEGACY_DOMAINS.has(t) ? "legacy" : t)
-      .filter((t) => PRIORITY_DOMAINS.includes(t) || t === "legacy");
+      .map((t) => OTHER_DOMAINS.has(t) ? "other" : t)
+      .filter((t) => PRIORITY_DOMAINS.includes(t) || t === "other");
     if (domains.length === 0) continue;
     const share = itemCount / domains.length;
     for (const d of domains) {
@@ -128,8 +128,8 @@ function countItems(window) {
     total += 1;
     const dom = (d.topics || [])[0];
     if (dom) {
-      const norm = LEGACY_DOMAINS.has(dom) ? "legacy" : dom;
-      if (PRIORITY_DOMAINS.includes(norm) || norm === "legacy") {
+      const norm = OTHER_DOMAINS.has(dom) ? "other" : dom;
+      if (PRIORITY_DOMAINS.includes(norm) || norm === "other") {
         by_domain.set(norm, (by_domain.get(norm) ?? 0) + 1);
       }
     }
@@ -148,8 +148,8 @@ function countItems(window) {
 function computeDomainShift(thisItems, lastItems) {
   const out = [];
   const order = [...PRIORITY_DOMAINS];
-  if (thisItems.by_domain.has("legacy") || lastItems.by_domain.has("legacy")) {
-    order.push("legacy");
+  if (thisItems.by_domain.has("other") || lastItems.by_domain.has("other")) {
+    order.push("other");
   }
   for (const domain of order) {
     const thisCount = thisItems.by_domain.get(domain) ?? 0;
