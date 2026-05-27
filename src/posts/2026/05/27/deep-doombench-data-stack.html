@@ -1,0 +1,562 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">同一份 DOOMQL——一個完全用 SQL 寫成的多人 DOOM——丟給 PostgreSQL，畫面跑 0.3 FPS；丟給接了 ETL 的 DuckDB，畫面流暢到 10 FPS，但你看到的是一秒前的世界。一個玩具，意外地把資料庫最古老的那道取捨逼到了螢幕上。</p>
+  <h1 class="vg-post-title">DoomBench——把 DOOM 塞進 SQL，逼出資料庫的真實取捨</h1>
+</header>
+
+<div class="vg-post-prose">
+<p><span class="vg-dropcap">D</span>OOMQL 是一個惡作劇式的工程作品：一個多人 DOOM-like shooter，整個遊戲邏輯——地圖、怪物、玩家、射擊、甚至畫面渲染——全部用 SQL 寫成。沒有遊戲引擎，沒有 C 寫的 render loop，只有 tables、views、跟一串 recursive CTE。玩家按 W／A／S／D 移動、按 X 開槍，每一次按鍵變成 <code>inputs</code> table 裡的一個 row；伺服器以 35 ticks per second 處理這些 input；客戶端則查一個 view，那個 view 用 recursive CTE 在查詢當下做 raycasting，把整個 3D 世界投影成 ASCII art。</p>
+
+<p>這原本可以只是一個 Hacker News 上博君一笑的 demo。CedarDB 這篇 DoomBench 的聰明之處，是把這個玩具轉成一把尺：既然整個遊戲就是一串 SQL，那就把它丟給不同的資料庫引擎跑，看誰撐得住。結果不是某個引擎「比較快」這麼簡單——而是同一份工作負載，在不同引擎上會以完全不同的方式失敗。PostgreSQL 失敗在畫面更新（0.3 FPS），DuckDB 失敗在資料新鮮度（畫面流暢但落後一秒）。這兩種失敗模式不是 bug，是兩種架構在面對「既要寫得快、又要讀得快」這個需求時，各自被迫做出的犧牲。</p>
+
+<p>換句話說，DOOMQL 把 transactional-vs-analytical——也就是 HTAP（Hybrid Transactional/Analytical Processing）這個老問題——變成了一件你能用眼睛看見的事。遊戲的 input 寫入是純 OLTP：高頻、小筆、低延遲；遊戲的畫面渲染是純 OLAP：一次掃過整個世界狀態、做大量計算。傳統引擎為其中一邊優化，另一邊就垮。這篇文章想講清楚的，就是這道取捨的形狀，以及為什麼一個從現代硬體重新設計的引擎，可以不必在兩者之間二選一。</p>
+
+<h2>三個引擎，三種失敗形狀</h2>
+
+<p>先把數字攤開。CedarDB 在三個引擎上跑同一份 DOOMQL 工作負載，量了三件事：遊戲邏輯每秒能推進幾個 tick（OLTP 吞吐）、畫面每秒能重畫幾次（OLAP 吞吐）、以及從按下按鍵到那個動作反映在畫面上的中位延遲（端到端 lag）。下面這張圖把三個引擎在這三條軸線上的位置畫在一起——重點不在誰的單一數字大，而在每個引擎是怎麼「贏一條軸、輸另一條」。</p>
+
+<figure class="vg-w-chart-doombench-engines" data-svg-scroll="720">
+  <style>
+    .vg-w-chart-doombench-engines { display: grid; gap: var(--s-2); margin: var(--s-4) 0; }
+    .vg-w-chart-doombench-engines svg.vg-w-chart-doombench-engines-main { width: 100%; height: auto; }
+    .vg-w-chart-doombench-engines figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    .vg-w-chart-doombench-engines .legend { display: flex; gap: var(--s-3); flex-wrap: wrap; font-family: var(--sans); font-size: var(--fs-xs); }
+    .vg-w-chart-doombench-engines .legend span { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); }
+    .vg-w-chart-doombench-engines .legend i { width: 14px; height: 14px; display: inline-block; border-radius: 2px; }
+  </style>
+
+  <div class="legend">
+    <span><i style="background: var(--muted-2);"></i> PostgreSQL</span>
+    <span><i style="background: var(--sage-deep);"></i> DuckDB + ETL</span>
+    <span><i style="background: var(--accent);"></i> CedarDB</span>
+  </div>
+
+  <svg class="vg-w-chart-doombench-engines-main" viewBox="0 0 720 360" preserveAspectRatio="xMidYMid meet" role="img" aria-label="三個引擎在 tick rate、FPS、median lag 三組指標上的長條圖">
+    <g id="vg-w-chart-doombench-engines-axes"></g>
+    <g id="vg-w-chart-doombench-engines-series"></g>
+  </svg>
+
+  <figcaption>三組指標、三個引擎。tick rate 與 FPS 越高越好；median lag 越低越好（注意 lag 軸已換算成「100 − lag/10」的同向尺度，讓三組都「越高越好」）。資料來源：<a href="https://cedardb.com/blog/doombench/">CedarDB DoomBench</a>。DuckDB 的 FPS 旁標 staleness。</figcaption>
+
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-chart-doombench-engines');
+      const axesG = root.querySelector('#vg-w-chart-doombench-engines-axes');
+      const seriesG = root.querySelector('#vg-w-chart-doombench-engines-series');
+      const NS = 'http://www.w3.org/2000/svg';
+      function el(tag, attrs) {
+        const e = document.createElementNS(NS, tag);
+        for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+        return e;
+      }
+      function txt(attrs, s) { const t = el('text', attrs); t.textContent = s; return t; }
+
+      // Three metric groups; each holds the three engines' real figures.
+      // value: the raw measured number; bar: 0..100 normalised height for the chart.
+      // colour fixed per engine.
+      const engines = [
+        { name: 'PostgreSQL', colour: 'var(--muted-2)' },
+        { name: 'DuckDB',     colour: 'var(--sage-deep)' },
+        { name: 'CedarDB',    colour: 'var(--accent)' },
+      ];
+      // metric: label, unit, then per-engine [displayValue, normalised 0..100, note]
+      const metrics = [
+        { label: 'tick rate', unit: 'ticks/s', vals: [['~10', 28, ''], ['—', 0, '無 tick'], ['30', 86, '']] },
+        { label: 'render FPS', unit: 'FPS', vals: [['0.3', 1, ''], ['~10', 33, '差一秒'], ['~30', 100, '']] },
+        { label: 'freshness', unit: '↑好', vals: [['fresh', 92, ''], ['1 s 舊', 8, 'stale'], ['44 ms', 96, '']] },
+      ];
+
+      const X0 = 70, X1 = 700, Y0 = 290, Y1 = 40;
+      const groupW = (X1 - X0) / metrics.length;
+      const barW = 38, gap = 8;
+
+      // axes
+      axesG.appendChild(el('line', { x1: X0, y1: Y0, x2: X1, y2: Y0, stroke: 'var(--ink)', 'stroke-width': 1 }));
+      axesG.appendChild(el('line', { x1: X0, y1: Y0, x2: X0, y2: Y1, stroke: 'var(--ink)', 'stroke-width': 1 }));
+      // y gridlines 0..100 every 25
+      for (let v = 0; v <= 100; v += 25) {
+        const y = Y0 - (v / 100) * (Y0 - Y1);
+        axesG.appendChild(el('line', { x1: X0, y1: y, x2: X1, y2: y, stroke: 'var(--line)', 'stroke-width': 1 }));
+        axesG.appendChild(txt({ x: X0 - 8, y: y + 4, 'text-anchor': 'end', 'font-family': 'EB Garamond, serif', 'font-size': 12, fill: 'var(--muted)' }, String(v)));
+      }
+      axesG.appendChild(txt({ x: 22, y: (Y0 + Y1) / 2, 'text-anchor': 'middle', 'font-family': 'EB Garamond, serif', 'font-size': 13, fill: 'var(--muted)', 'font-style': 'italic', transform: 'rotate(-90 22 ' + ((Y0 + Y1) / 2) + ')' }, '正規化分數（越高越好）'));
+
+      metrics.forEach((m, gi) => {
+        const gx0 = X0 + gi * groupW;
+        const groupCentre = gx0 + groupW / 2;
+        // group label
+        axesG.appendChild(txt({ x: groupCentre, y: Y0 + 22, 'text-anchor': 'middle', 'font-family': 'Manrope, sans-serif', 'font-size': 13, fill: 'var(--ink)' }, m.label));
+        axesG.appendChild(txt({ x: groupCentre, y: Y0 + 38, 'text-anchor': 'middle', 'font-family': 'EB Garamond, serif', 'font-size': 11, fill: 'var(--muted)', 'font-style': 'italic' }, m.unit));
+        const totalW = engines.length * barW + (engines.length - 1) * gap;
+        const startX = groupCentre - totalW / 2;
+        engines.forEach((eng, ei) => {
+          const [disp, norm, note] = m.vals[ei];
+          const x = startX + ei * (barW + gap);
+          const h = (norm / 100) * (Y0 - Y1);
+          const y = Y0 - h;
+          seriesG.appendChild(el('rect', { x, y, width: barW, height: Math.max(h, 1), fill: eng.colour, 'fill-opacity': 0.85, stroke: eng.colour, 'stroke-width': 1 }));
+          // value label above bar
+          seriesG.appendChild(txt({ x: x + barW / 2, y: y - 6, 'text-anchor': 'middle', 'font-family': 'EB Garamond, serif', 'font-size': 12, fill: 'var(--ink)' }, disp));
+          if (note) {
+            seriesG.appendChild(txt({ x: x + barW / 2, y: y - 20, 'text-anchor': 'middle', 'font-family': 'EB Garamond, serif', 'font-size': 11, fill: 'var(--accent-text)', 'font-style': 'italic' }, note));
+          }
+        });
+      });
+    })();
+  </script>
+</figure>
+
+<p>讀法是這樣。PostgreSQL 的 tick rate 勉強有 ~10，但 render FPS 只有 0.3——你按一次 W，世界確實前進了，但畫面三秒才重畫一次，根本不能玩。它沒有對「一次掃過全世界做 raycasting」這種分析型查詢做任何優化：每個 frame 都是一次 full scan，逐筆解析的 row-oriented 執行引擎在這種查詢上慢得令人絕望。更糟的是兩件事疊在一起：那個 raycasting 是 recursive CTE，文章形容它「as number-crunchy as SQL gets」，Postgres 對遞迴查詢沒有向量化執行，只能一個 row 一個 row 地把遞迴展開；同時遊戲的 tick 又在不停地 <code>UPDATE players</code>，MVCC 為每次更新留下一個舊版本，render 那次 full scan 得連同這些尚未被 vacuum 清掉的死 tuple 一起掃過去。寫入的代謝物，全變成讀取的負擔。它能寫，但讀不動。</p>
+
+<p>DuckDB 反過來。它是 column-oriented 的分析型引擎，render 那個吃重的 raycasting view 跑得飛快——~10 FPS，畫面流暢。但 DuckDB 不是為高頻小筆寫入設計的，直接拿它跑 input 寫入會很慘。DoomBench 的做法是給它接一條 CDC（Change-Data-Capture）loop：input 跟世界狀態留在 Postgres，每秒一次把所有 table 整批複製進 DuckDB 再渲染。代價直接寫在臉上——文章講得很白：因為同步一秒才一次、而客戶端以 ~10 FPS 在查，所以「9 out of 10 frames just render the same view」，十張畫面有九張畫的是同一個凍結的瞬間。你的畫面流暢，但顯示的是一秒前的世界。一秒，在一個射擊遊戲裡，是「你已經死了但畫面還沒告訴你」的延遲。它讀得動，但讀的是舊資料——而且那個「舊」不是均勻地舊，是一秒內凍住、然後瞬間跳一格的舊。</p>
+
+<p>這兩個失敗模式不是巧合，是同一道牆的兩面。下面這張表把 DoomBench 量的四個指標攤開，每個指標刻意只隔離一種純工作負載——這正是 benchmark 的設計意圖。</p>
+
+<figure class="vg-w-table-doombench-metrics">
+  <style>
+    .vg-w-table-doombench-metrics { margin: var(--s-4) 0; overflow-x: auto; }
+    .vg-w-table-doombench-metrics table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+    .vg-w-table-doombench-metrics thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; }
+    .vg-w-table-doombench-metrics thead th[data-sort] { color: var(--accent-text); }
+    .vg-w-table-doombench-metrics tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+    .vg-w-table-doombench-metrics td.num { font-variant-numeric: tabular-nums; text-align: right; }
+    .vg-w-table-doombench-metrics caption { font-family: var(--scribed); color: var(--muted); font-size: var(--fs-xs); text-align: left; padding: 0 0 var(--s-2) 0; }
+    .vg-w-table-doombench-metrics .vg-w-affordance { display: flex; align-items: center; gap: 6px; font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); margin: 0 0 var(--s-2) 0; }
+    .vg-w-table-doombench-metrics .vg-w-affordance svg { width: 14px !important; height: 14px !important; min-width: 14px !important; }
+  </style>
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/><path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+    </svg>
+    <span>點欄位標題可排序 · 4 個指標 × 4 欄</span>
+  </p>
+  <table>
+    <caption>DoomBench 的四個指標各自隔離一種純工作負載，DOOMscore 才把它們合成成 HTAP 分數。</caption>
+    <thead>
+      <tr>
+        <th data-key="metric">指標</th>
+        <th data-key="kind">隔離哪一種負載</th>
+        <th data-key="meaning">量的是什麼</th>
+        <th data-key="penalty">失守時的懲罰</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Tickrate</td>
+        <td>純 OLTP</td>
+        <td>只跑 game loop，不渲染——每秒能 commit 幾個 tick</td>
+        <td>低於 35 Hz 玩家就感覺得到卡頓</td>
+      </tr>
+      <tr>
+        <td>Static FPS</td>
+        <td>純 OLAP</td>
+        <td>只渲染、不推進世界——raycasting view 每秒能跑幾次</td>
+        <td>低於 ~24 FPS 畫面不流暢</td>
+      </tr>
+      <tr>
+        <td>Median Lag</td>
+        <td>端到端 HTAP</td>
+        <td>從按鍵到那個動作反映在 rendered view 的中位時間</td>
+        <td>越高代表寫入與讀取的耦合越鬆</td>
+      </tr>
+      <tr>
+        <td>DOOMscore</td>
+        <td>合成 HTAP</td>
+        <td>同時開 tick 與 render 的綜合分數</td>
+        <td>tick rate 掉到 35 Hz 以下時被罰分</td>
+      </tr>
+    </tbody>
+  </table>
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-table-doombench-metrics');
+      const headers = root.querySelectorAll('thead th');
+      const tbody = root.querySelector('tbody');
+      let activeKey = null, asc = true;
+      headers.forEach(h => h.addEventListener('click', () => {
+        const key = h.dataset.key;
+        if (activeKey === key) asc = !asc; else { activeKey = key; asc = true; }
+        headers.forEach(x => x.removeAttribute('data-sort'));
+        h.setAttribute('data-sort', asc ? 'asc' : 'desc');
+        const rows = [...tbody.querySelectorAll('tr')];
+        const idx = [...headers].indexOf(h);
+        rows.sort((a, b) => {
+          const av = a.children[idx].textContent.trim();
+          const bv = b.children[idx].textContent.trim();
+          const an = Number.parseFloat(av), bn = Number.parseFloat(bv);
+          const cmp = !Number.isNaN(an) && !Number.isNaN(bn) ? an - bn : av.localeCompare(bv);
+          return asc ? cmp : -cmp;
+        });
+        rows.forEach(r => tbody.appendChild(r));
+      }));
+    })();
+  </script>
+</figure>
+
+<p>關鍵設計是 DOOMscore 那條罰則：tick rate 一旦掉到 35 Hz 以下就扣分。這逼著引擎不能靠「犧牲世界推進來換渲染速度」作弊——DuckDB 那種「畫面流暢但世界落後一秒」的取巧，在 DOOMscore 這裡是不及格的，因為它的 effective tick rate 在 render 期間實質為零。把這四個指標放在一起看，benchmark 真正問的不是「誰渲染快」或「誰寫入快」，而是「誰能同時做這兩件事而不偷工」。這正是 HTAP 的定義。</p>
+
+<h2>game loop 的三段，剛好是資料庫的三種壓力</h2>
+
+<p>要理解為什麼這個玩具能逼出 HTAP，得先看清楚 DOOMQL 的 game loop 在資料庫眼裡長什麼樣。它有三段，而這三段剛好對應到資料庫面對的三種截然不同的壓力。下面這張圖把三段拆開——每一段我標了它丟給引擎的是哪一類工作負載。</p>
+
+<figure class="vg-w-stack-doomql-loop">
+  <style>
+    .vg-w-stack-doomql-loop { display: flex; flex-direction: column; gap: var(--s-3); align-items: stretch; margin: var(--s-4) 0; }
+    .vg-w-stack-doomql-loop input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+    .vg-w-stack-doomql-loop .vg-w-affordance { display: flex; align-items: center; gap: 6px; font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); margin: 0; }
+    .vg-w-stack-doomql-loop .vg-w-affordance svg { width: 14px !important; height: 14px !important; min-width: 14px !important; }
+    .vg-w-stack-doomql-loop .stack-title { font-family: IM Fell English, serif; font-style: italic; font-size: var(--fs-md); margin: 0; color: var(--ink); line-height: 1.4; }
+    .vg-w-stack-doomql-loop .stack-cards { display: flex; flex-direction: column; gap: var(--s-1); list-style: none; padding: 0; margin: 0; }
+    .vg-w-stack-doomql-loop .stack-cards label { display: block; padding: var(--s-2); border: 1px solid var(--muted-2); border-radius: 2px; cursor: pointer; transition: border-color 200ms, background 200ms; min-height: 44px; }
+    .vg-w-stack-doomql-loop .stack-cards label:hover { border-color: var(--accent); }
+    .vg-w-stack-doomql-loop .stack-cards .card-head { font-family: EB Garamond, serif; font-size: var(--fs-md); margin: 0 0 4px 0; color: var(--ink); display: flex; align-items: baseline; justify-content: space-between; gap: var(--s-2); flex-wrap: wrap; }
+    .vg-w-stack-doomql-loop .stack-cards .card-sub { font-family: IM Fell English, serif; font-style: italic; font-size: var(--fs-sm); color: var(--muted); margin: 0; line-height: 1.5; }
+    .vg-w-stack-doomql-loop .stack-cards .card-tag { font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); color: var(--accent-text); font-style: normal; }
+    .vg-w-stack-doomql-loop:has(#vg-w-stack-doomql-loop-r1:checked) .card-1 { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+    .vg-w-stack-doomql-loop:has(#vg-w-stack-doomql-loop-r2:checked) .card-2 { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+    .vg-w-stack-doomql-loop:has(#vg-w-stack-doomql-loop-r3:checked) .card-3 { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+    .vg-w-stack-doomql-loop svg.diagram { display: none; }
+    @media (min-width: 720px) {
+      .vg-w-stack-doomql-loop svg.diagram { display: block; width: 100%; height: auto; max-width: 880px; }
+      .vg-w-stack-doomql-loop .stack-title { display: none; }
+      .vg-w-stack-doomql-loop .stack-cards { display: none; }
+    }
+    .vg-w-stack-doomql-loop .layer { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; }
+    .vg-w-stack-doomql-loop:has(#vg-w-stack-doomql-loop-r1:checked) .layer-1 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+    .vg-w-stack-doomql-loop:has(#vg-w-stack-doomql-loop-r2:checked) .layer-2 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+    .vg-w-stack-doomql-loop:has(#vg-w-stack-doomql-loop-r3:checked) .layer-3 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+    .vg-w-stack-doomql-loop .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+    .vg-w-stack-doomql-loop .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+    .vg-w-stack-doomql-loop .detail p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+    .vg-w-stack-doomql-loop:has(#vg-w-stack-doomql-loop-r1:checked) .detail-1 { display: block; }
+    .vg-w-stack-doomql-loop:has(#vg-w-stack-doomql-loop-r2:checked) .detail-2 { display: block; }
+    .vg-w-stack-doomql-loop:has(#vg-w-stack-doomql-loop-r3:checked) .detail-3 { display: block; }
+  </style>
+
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M9 18l6-6-6-6"/>
+    </svg>
+    <span>點任一段看它對引擎施的壓力 · 3 段 game loop</span>
+  </p>
+
+  <input type="radio" id="vg-w-stack-doomql-loop-r1" name="vg-w-stack-doomql-loop-sel" checked aria-label="inputs 階段" />
+  <input type="radio" id="vg-w-stack-doomql-loop-r2" name="vg-w-stack-doomql-loop-sel" aria-label="game tick 階段" />
+  <input type="radio" id="vg-w-stack-doomql-loop-r3" name="vg-w-stack-doomql-loop-sel" aria-label="render 階段" />
+
+  <p class="stack-title" id="vg-w-stack-doomql-loop-title">DOOMQL game loop 的三段，與各自的資料庫壓力</p>
+  <ul class="stack-cards" aria-labelledby="vg-w-stack-doomql-loop-title">
+    <li class="card-1"><label for="vg-w-stack-doomql-loop-r1">
+      <p class="card-head"><span>① inputs · 寫入</span><code class="card-tag">OLTP</code></p>
+      <p class="card-sub">按鍵 append 一個 row 進 inputs table；高頻、小筆、要低延遲 commit。</p>
+    </label></li>
+    <li class="card-2"><label for="vg-w-stack-doomql-loop-r2">
+      <p class="card-head"><span>② game tick · 更新</span><code class="card-tag">OLTP</code></p>
+      <p class="card-sub">35 Hz 處理玩家位置、碰撞、世界狀態；連續的小型 read-modify-write。</p>
+    </label></li>
+    <li class="card-3"><label for="vg-w-stack-doomql-loop-r3">
+      <p class="card-head"><span>③ render · 讀取</span><code class="card-tag">OLAP</code></p>
+      <p class="card-sub">查 frames_by_row view，recursive CTE 做 raycasting，一次掃過全世界。</p>
+    </label></li>
+  </ul>
+
+  <svg class="diagram" viewBox="0 0 880 300" role="img" aria-label="DOOMQL game loop 三段：inputs 寫入、game tick 更新、render 讀取">
+    <defs>
+      <marker id="vg-w-stack-doomql-loop-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+      </marker>
+    </defs>
+    <text x="440" y="28" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--muted)" font-style="italic">同一個資料庫，同一秒，要同時扛這三段</text>
+
+    <rect class="layer layer-1" x="40" y="60" width="240" height="120" rx="4" role="button" tabindex="0" aria-label="inputs 寫入" />
+    <text x="160" y="98" text-anchor="middle" font-family="EB Garamond, serif" font-size="16" fill="var(--ink)">① inputs · 寫入</text>
+    <text x="160" y="124" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--accent-text)">OLTP</text>
+    <text x="160" y="148" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">按鍵 → append row</text>
+    <text x="160" y="166" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">高頻小筆，低延遲</text>
+
+    <rect class="layer layer-2" x="320" y="60" width="240" height="120" rx="4" role="button" tabindex="0" aria-label="game tick 更新" />
+    <text x="440" y="98" text-anchor="middle" font-family="EB Garamond, serif" font-size="16" fill="var(--ink)">② game tick · 更新</text>
+    <text x="440" y="124" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--accent-text)">OLTP · 35 Hz</text>
+    <text x="440" y="148" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">位置 / 碰撞 / 世界</text>
+    <text x="440" y="166" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">read-modify-write</text>
+
+    <rect class="layer layer-3" x="600" y="60" width="240" height="120" rx="4" role="button" tabindex="0" aria-label="render 讀取" />
+    <text x="720" y="98" text-anchor="middle" font-family="EB Garamond, serif" font-size="16" fill="var(--ink)">③ render · 讀取</text>
+    <text x="720" y="124" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--accent-text)">OLAP</text>
+    <text x="720" y="148" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">recursive CTE raycast</text>
+    <text x="720" y="166" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">一次掃全世界</text>
+
+    <line x1="280" y1="120" x2="320" y2="120" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-stack-doomql-loop-arrow)" />
+    <line x1="560" y1="120" x2="600" y2="120" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-stack-doomql-loop-arrow)" />
+    <path d="M 720 180 Q 720 250 440 250 Q 160 250 160 180" stroke="currentColor" stroke-width="1" stroke-dasharray="3 3" fill="none" marker-end="url(#vg-w-stack-doomql-loop-arrow)" />
+    <text x="440" y="268" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)" font-style="italic">每秒 30–35 圈</text>
+  </svg>
+
+  <div>
+    <div class="detail detail-1">
+      <h3>① inputs · 純 OLTP 寫入</h3>
+      <p>玩家每按一次 W／A／S／D／X，就往 <code>inputs</code> table 塞一個 row——文章給的形狀大致是 <code>insert into inputs(player_id, action, timestamp) values (47, 'W', now())</code>。10 個玩家每 200 ms 各送一個 input，就是約 50 transactions per second。</p>
+      <p>這是典型的 OLTP：筆數小、頻率高、每筆都要快速 commit。對 row-oriented 引擎這是強項；對 column-oriented 引擎這是地獄——每筆寫入都得攤平到一堆 column segment。</p>
+    </div>
+    <div class="detail detail-2">
+      <h3>② game tick · 35 Hz 的世界推進</h3>
+      <p>伺服器以 35 ticks per second（DOOM 原版的節奏）消化 input：算玩家新位置、做碰撞偵測、更新世界狀態。每個 tick 是一串 read-modify-write，量不大但要準時、要連續。</p>
+      <p>重點是 throughput 不是這裡的瓶頸——10 玩家也才 50 tps。瓶頸是 latency：tick 必須在 1/35 秒內完成，不然世界就卡。這條和 render 共享同一份世界狀態，正是衝突的起點。</p>
+    </div>
+    <div class="detail detail-3">
+      <h3>③ render · 純 OLAP 讀取</h3>
+      <p>客戶端查 <code>frames_by_row</code> view，像 <code>select full_row from frames_by_row where player_id = 47 order by row asc</code>。view 內部用 recursive CTE 做 raycasting——對每一條視線遞迴前進、判斷撞到哪面牆，再投影成 ASCII 字元。</p>
+      <p>這是徹頭徹尾的 OLAP：一次查詢掃過整個世界狀態、做大量計算、產出一個聚合結果。它要的是 column-oriented、向量化執行——和 ① ② 要的東西恰好相反。render 跟 tick 同時要碰世界狀態，就是 HTAP 衝突在這個玩具裡最尖銳的點。</p>
+    </div>
+  </div>
+
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-stack-doomql-loop');
+      root.querySelectorAll('.layer').forEach((rect) => {
+        rect.addEventListener('click', () => {
+          const n = rect.getAttribute('aria-label');
+          // map by index instead — find which layer class
+          const cls = [...rect.classList].find(c => /^layer-\d$/.test(c));
+          if (!cls) return;
+          const i = cls.split('-')[1];
+          const radio = root.querySelector('#vg-w-stack-doomql-loop-r' + i);
+          if (radio) radio.checked = true;
+        });
+        rect.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); rect.dispatchEvent(new MouseEvent('click', { bubbles: true })); } });
+      });
+    })();
+  </script>
+</figure>
+
+<p>把這三段對齊看，整個衝突的形狀就清楚了。① 跟 ② 是 OLTP——它們要的是「快速地改一小塊世界狀態」。③ 是 OLAP——它要的是「快速地掃過整個世界狀態」。傳統上這兩種需求對應到兩種完全相反的儲存與執行設計：row-oriented vs column-oriented、point lookup 優化 vs full scan 優化、低延遲 commit vs 高吞吐 scan。一個引擎為其中一邊調校，另一邊就慢。DOOMQL 的殘酷之處在於，它把這兩種需求綁在同一個 1/35 秒的時間窗裡——你不能說「白天跑 OLTP、晚上跑 OLAP」，因為 render 跟 tick 必須在同一個 frame 內都發生。</p>
+
+<h2>那三段 SQL，各自怎麼壓引擎</h2>
+
+<p>把三段 SQL 並排放，最能看出為什麼同一份程式碼會在不同引擎上以不同方式失敗。下面三個分頁是 DOOMQL 三段的 SQL 形狀（依文章與專案結構重建，非逐字 schema），每一段下面標了它對引擎施的壓力類型。</p>
+
+<figure class="vg-w-tabs-doomql-sql">
+  <style>
+    .vg-w-tabs-doomql-sql { display: grid; gap: var(--s-2); margin: var(--s-4) 0; }
+    .vg-w-tabs-doomql-sql input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+    .vg-w-tabs-doomql-sql .tabs { display: flex; gap: var(--s-2); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+    .vg-w-tabs-doomql-sql .tab { font-family: var(--sans); font-size: var(--fs-sm); padding: var(--s-1) var(--s-2); cursor: pointer; color: var(--muted); min-height: 44px; display: inline-flex; align-items: center; }
+    .vg-w-tabs-doomql-sql .panel { display: none; padding: var(--s-2) 0; }
+    .vg-w-tabs-doomql-sql .panel p { font-family: var(--serif); font-size: var(--fs-sm); margin: var(--s-2) 0 0 0; }
+    .vg-w-tabs-doomql-sql .panel .stress { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+    .vg-w-tabs-doomql-sql:has(#vg-w-tabs-doomql-sql-t1:checked) .panel-1 { display: block; }
+    .vg-w-tabs-doomql-sql:has(#vg-w-tabs-doomql-sql-t1:checked) [for="vg-w-tabs-doomql-sql-t1"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    .vg-w-tabs-doomql-sql:has(#vg-w-tabs-doomql-sql-t2:checked) .panel-2 { display: block; }
+    .vg-w-tabs-doomql-sql:has(#vg-w-tabs-doomql-sql-t2:checked) [for="vg-w-tabs-doomql-sql-t2"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    .vg-w-tabs-doomql-sql:has(#vg-w-tabs-doomql-sql-t3:checked) .panel-3 { display: block; }
+    .vg-w-tabs-doomql-sql:has(#vg-w-tabs-doomql-sql-t3:checked) [for="vg-w-tabs-doomql-sql-t3"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+  </style>
+  <input type="radio" id="vg-w-tabs-doomql-sql-t1" name="vg-w-tabs-doomql-sql-sel" checked aria-label="inputs SQL" />
+  <input type="radio" id="vg-w-tabs-doomql-sql-t2" name="vg-w-tabs-doomql-sql-sel" aria-label="tick SQL" />
+  <input type="radio" id="vg-w-tabs-doomql-sql-t3" name="vg-w-tabs-doomql-sql-sel" aria-label="raycast SQL" />
+  <div class="tabs">
+    <label class="tab" for="vg-w-tabs-doomql-sql-t1">① inputs INSERT</label>
+    <label class="tab" for="vg-w-tabs-doomql-sql-t2">② tick UPDATE</label>
+    <label class="tab" for="vg-w-tabs-doomql-sql-t3">③ raycast VIEW</label>
+  </div>
+  <div class="panel panel-1">
+    <pre><code class="language-sql">-- 玩家按一次 W，append 一個 input row
+INSERT INTO inputs (player_id, action, timestamp)
+VALUES (47, 'W', now());</code></pre>
+    <p><span class="stress">壓力：高頻小筆 commit</span>。一筆三欄、毫無計算。難的不是單筆，是頻率與 commit 延遲——每筆都要在玩家無感的時間內落地。row-oriented 引擎輕鬆；column-oriented 引擎得為每筆攤平到多個 column，痛。</p>
+  </div>
+  <div class="panel panel-2">
+    <pre><code class="language-sql">-- 35 Hz：把尚未處理的 input 套用到玩家狀態
+UPDATE players p
+SET x = p.x + d.dx,
+    y = p.y + d.dy,
+    facing = d.new_facing
+FROM (
+  SELECT player_id,
+         sum(move_dx(action)) AS dx,
+         sum(move_dy(action)) AS dy,
+         last_facing(action)  AS new_facing
+  FROM inputs
+  WHERE processed = false
+  GROUP BY player_id
+) d
+WHERE p.id = d.player_id
+  AND no_wall_collision(p.x + d.dx, p.y + d.dy);</code></pre>
+    <p><span class="stress">壓力：連續低延遲 read-modify-write</span>。每 tick 讀未處理 input、聚合位移、檢查碰撞、寫回位置。量小（~50 tps），但必須在 1/35 秒內準時完成，且和 render 共用同一份 <code>players</code> 狀態——衝突的起點。</p>
+  </div>
+  <div class="panel panel-3">
+    <pre><code class="language-sql">-- raycasting：每條視線遞迴前進直到撞牆，投影成 ASCII
+CREATE VIEW frames_by_row AS
+WITH RECURSIVE ray (player_id, col, dist, hit) AS (
+  SELECT p.id, c.col, 0.0, false
+  FROM players p CROSS JOIN screen_cols c
+  UNION ALL
+  SELECT r.player_id, r.col, r.dist + step_size, wall_at(r.dist + step_size)
+  FROM ray r
+  WHERE NOT r.hit AND r.dist &lt; max_depth
+)
+SELECT player_id, render_row(col, dist) AS full_row
+FROM ray
+WHERE hit
+ORDER BY col;</code></pre>
+    <p><span class="stress">壓力：一次掃全世界的分析查詢</span>。recursive CTE 對每條螢幕視線遞迴前進，撞牆才停，再投影成 ASCII。這是純 OLAP——要 column-oriented、向量化執行。和 ② 想要的東西恰好相反，卻得在同一 frame 內完成。</p>
+  </div>
+</figure>
+
+<p>值得把 ③ 那個 recursive CTE 的機制再拆細一點，因為它正是壓力的來源。raycasting 的想法是：螢幕每一直行（column）對應一條從玩家眼睛射出去的視線，你沿著這條視線一步一步往前走，每走一步就查當下這格 tile 是不是牆，撞到牆就停，用「走了多遠」換算成那一行牆該畫多高。寫成 recursive CTE，base case 是每條視線從 <code>dist = 0</code> 出發，recursive case 就是 <code>dist + step_size</code> 往前推一格、用 <code>wall_at()</code> 判斷有沒有撞牆，沒撞且還沒超過 <code>max_depth</code> 就繼續遞迴。這等於用一條 SQL 把「沿著射線在 tile grid 上行軍」這個迴圈攤平成一棵遞迴展開的關係。</p>
+
+<p>遞迴的每一輪（iteration）對應的是「所有還沒撞牆的視線同時往前踏一格」：第一輪是全部視線在距離 0 的那一格，第二輪是全部視線在距離 <code>step_size</code> 的那一格，依此類推。換句話說 recursive CTE 在水平方向（一條視線往遠處延伸）展開步數、在垂直方向（同一格的所有視線）展開寬度，最後 <code>WHERE hit</code> 把每條視線收斂成「它撞到的那一格」。這個結構之所以折磨人，是它既不是單純的 point lookup、也不是單純的一次性 full scan，而是一連串「掃一遍、過濾掉撞牆的、剩下的再往前掃一遍」的迭代——掃描次數等於最深那條視線走了幾步，每一步都要重新碰一次地圖與 <code>players</code> 狀態。文章把這種查詢形容成「as number-crunchy as SQL gets」，正是這個意思：它不是在搬資料，它是在用關係代數做密集算術。</p>
+
+<p>它之所以是純 OLAP，是因為每一個 frame 都要對螢幕上每一條 column、每一步行軍各算一次——這就是 per-pixel 等級的計算量，數十條視線乘上每條數十步，全靠引擎一次掃過整個 <code>players</code> 與地圖狀態算出來。向量化的 column-oriented 引擎能把這堆同構的算術打包成批次跑得飛快：同一輪裡幾十條視線的 <code>dist + step_size</code> 跟 <code>wall_at()</code> 是完全一樣的運算套在不同資料上，正好是 SIMD 跟 vectorized execution 最拿手的形狀。逐筆解析、沒有向量化遞迴的引擎，就只能一條視線、一步、一個 row 地把遞迴展開，每一格都付一次 interpreter 的開銷，於是慢到 0.3 FPS——瓶頸不在讀資料的頻寬，而在 executor 本身一次只能處理一個 tuple 的吞吐。</p>
+
+<p>三段並排，HTAP 的衝突就不再是抽象名詞。① 的 <code>INSERT</code> 跟 ② 的 <code>UPDATE</code> 要 row-oriented 的快速寫入；③ 那個 recursive CTE 要 column-oriented 的快速掃描。PostgreSQL 把 ① ② 做得不錯，但 ③ 那個遞迴查詢逐筆解析慢到 0.3 FPS。DuckDB 把 ③ 跑得飛快，但 ① ② 的高頻寫入它扛不住，只能靠 CDC 每秒同步一次——於是 ③ 讀到的 <code>players</code> 永遠落後一秒。同一份 SQL，沒有任何一行改變，卻在兩個引擎上撞到完全相反的牆。</p>
+
+<h2>取捨曲線，與把它推開的那一下</h2>
+
+<p>傳統引擎面對 HTAP，本質上是在一條取捨曲線上選一個點：你願意接受多舊的資料，換多高的渲染吞吐。PostgreSQL 選了「資料最新、但渲染極慢」那一端；DuckDB 加 ETL 選了「渲染很快、但資料舊一秒」那一端。下面這個 widget 讓你拖動「能容忍的 staleness 預算」，看在傳統架構下 render FPS 怎麼隨之爬升——以及 CedarDB 那條線為什麼不在這條取捨曲線上。</p>
+
+<figure class="vg-w-htap-tradeoff" data-svg-scroll="640">
+  <style>
+    .vg-w-htap-tradeoff { margin: var(--s-4) 0; padding: var(--s-3); border: 1px solid var(--line); background: var(--bg-soft); }
+    .vg-w-htap-tradeoff .vg-w-affordance { display: flex; align-items: center; gap: 6px; font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); margin: 0 0 var(--s-2) 0; }
+    .vg-w-htap-tradeoff .vg-w-affordance svg { width: 14px !important; height: 14px !important; min-width: 14px !important; }
+    .vg-w-htap-tradeoff svg.vg-w-htap-tradeoff-main { width: 100%; height: auto; display: block; }
+    .vg-w-htap-tradeoff .controls { display: grid; grid-template-columns: 200px 1fr 90px; gap: var(--s-2); align-items: center; margin-top: var(--s-3); font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); }
+    @media (max-width: 520px) { .vg-w-htap-tradeoff .controls { grid-template-columns: 1fr; } }
+    .vg-w-htap-tradeoff input[type=range] { width: 100%; accent-color: var(--accent); height: 36px; touch-action: none; }
+    .vg-w-htap-tradeoff .readout { font-variant-numeric: tabular-nums; text-align: right; color: var(--accent-text); font-size: var(--fs-md); }
+    .vg-w-htap-tradeoff .reading { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s-2); margin-top: var(--s-2); font-family: var(--serif); font-size: var(--fs-sm); }
+    @media (max-width: 520px) { .vg-w-htap-tradeoff .reading { grid-template-columns: 1fr; } }
+    .vg-w-htap-tradeoff .reading .cell { padding: var(--s-1) var(--s-2); border-left: 2px solid var(--muted-2); }
+    .vg-w-htap-tradeoff .reading .cell strong { display: block; font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin-bottom: 2px; }
+    .vg-w-htap-tradeoff .reading .cell.accent { border-left-color: var(--accent); }
+    .vg-w-htap-tradeoff caption { font-family: var(--scribed); color: var(--muted); font-size: var(--fs-xs); display: block; margin-bottom: var(--s-2); }
+  </style>
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M21 8V5a2 2 0 0 0-2-2h-3"/><path d="M3 16v3a2 2 0 0 0 2 2h3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/>
+    </svg>
+    <span>拖 staleness 預算，看傳統架構在取捨曲線上滑動 · 1 個連續變數</span>
+  </p>
+  <span class="caption">x 軸：你願意容忍的資料 staleness（ms，log scale）。y 軸：在該 staleness 預算下傳統 ETL 架構能達到的 render FPS。曲線是「越敢用舊資料、渲染越快」的取捨前緣。CedarDB 不在曲線上——它直接落在左上角的 44 ms／30 FPS。</span>
+  <svg class="vg-w-htap-tradeoff-main" viewBox="0 0 640 360" preserveAspectRatio="xMidYMid meet" role="img" aria-label="staleness 對 render FPS 的取捨曲線，CedarDB 落在曲線之外的左上角">
+    <g id="vg-w-htap-tradeoff-static"></g>
+    <g id="vg-w-htap-tradeoff-dynamic"></g>
+  </svg>
+  <div class="controls">
+    <label for="vg-w-htap-tradeoff-stale">可容忍 staleness</label>
+    <input type="range" id="vg-w-htap-tradeoff-stale" min="10" max="3000" step="10" value="1000" />
+    <span class="readout" id="vg-w-htap-tradeoff-stale-val">1000 ms</span>
+  </div>
+  <div class="reading">
+    <div class="cell"><strong>傳統 ETL 架構此預算下的 FPS</strong><span id="vg-w-htap-tradeoff-trad">~10 FPS</span></div>
+    <div class="cell accent"><strong>CedarDB（不在曲線上）</strong><span>44 ms 已 fresh · ~30 FPS</span></div>
+  </div>
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-htap-tradeoff');
+      const svg = root.querySelector('svg.vg-w-htap-tradeoff-main');
+      const staticG = root.querySelector('#vg-w-htap-tradeoff-static');
+      const dynG = root.querySelector('#vg-w-htap-tradeoff-dynamic');
+      const slider = root.querySelector('#vg-w-htap-tradeoff-stale');
+      const sVal = root.querySelector('#vg-w-htap-tradeoff-stale-val');
+      const tradOut = root.querySelector('#vg-w-htap-tradeoff-trad');
+      const NS = 'http://www.w3.org/2000/svg';
+      function el(tag, attrs) { const e = document.createElementNS(NS, tag); for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v); return e; }
+      function txt(attrs, s) { const t = el('text', attrs); t.textContent = s; return t; }
+
+      const X0 = 70, X1 = 600, Y0 = 300, Y1 = 40;
+      // x: log staleness 10ms..3000ms  → X0..X1
+      const lo = Math.log10(10), hi = Math.log10(3000);
+      const xOf = ms => X0 + (Math.log10(ms) - lo) / (hi - lo) * (X1 - X0);
+      // y: FPS 0..35 → Y0..Y1
+      const maxF = 35;
+      const yOf = f => Y0 - (f / maxF) * (Y0 - Y1);
+      // model: traditional ETL render FPS as function of allowable staleness.
+      // more staleness budget → can batch more, fewer fresh reads → higher FPS,
+      // saturating near 12 FPS (the column-store render ceiling here).
+      function tradFps(ms) { return 12 * (1 - Math.exp(-ms / 600)); }
+
+      // static layer: axes, gridlines, curve, CedarDB point
+      // axes
+      staticG.appendChild(el('line', { x1: X0, y1: Y0, x2: X1, y2: Y0, stroke: 'var(--ink)', 'stroke-width': 1 }));
+      staticG.appendChild(el('line', { x1: X0, y1: Y0, x2: X0, y2: Y1, stroke: 'var(--ink)', 'stroke-width': 1 }));
+      // y ticks
+      for (let f = 0; f <= maxF; f += 5) {
+        const y = yOf(f);
+        staticG.appendChild(el('line', { x1: X0 - 4, y1: y, x2: X0, y2: y, stroke: 'var(--muted-2)' }));
+        staticG.appendChild(txt({ x: X0 - 8, y: y + 4, 'text-anchor': 'end', 'font-family': 'EB Garamond, serif', 'font-size': 11, fill: 'var(--muted)' }, String(f)));
+      }
+      // x ticks at decades
+      [10, 100, 1000, 3000].forEach(ms => {
+        const x = xOf(ms);
+        staticG.appendChild(el('line', { x1: x, y1: Y0, x2: x, y2: Y0 + 4, stroke: 'var(--muted-2)' }));
+        staticG.appendChild(txt({ x, y: Y0 + 18, 'text-anchor': 'middle', 'font-family': 'EB Garamond, serif', 'font-size': 11, fill: 'var(--muted)' }, ms >= 1000 ? (ms/1000) + ' s' : ms + ' ms'));
+      });
+      staticG.appendChild(txt({ x: (X0 + X1) / 2, y: Y0 + 38, 'text-anchor': 'middle', 'font-family': 'EB Garamond, serif', 'font-size': 12, fill: 'var(--muted)', 'font-style': 'italic' }, '可容忍的資料 staleness（log）'));
+      staticG.appendChild(txt({ x: 22, y: (Y0 + Y1) / 2, 'text-anchor': 'middle', 'font-family': 'EB Garamond, serif', 'font-size': 12, fill: 'var(--muted)', 'font-style': 'italic', transform: 'rotate(-90 22 ' + ((Y0 + Y1) / 2) + ')' }, 'render FPS'));
+
+      // tradeoff curve
+      let d = '';
+      for (let i = 0; i <= 100; i++) {
+        const ms = Math.pow(10, lo + (hi - lo) * i / 100);
+        const x = xOf(ms), y = yOf(tradFps(ms));
+        d += (i === 0 ? 'M' : 'L') + ' ' + x.toFixed(1) + ' ' + y.toFixed(1) + ' ';
+      }
+      staticG.appendChild(el('path', { d, fill: 'none', stroke: 'var(--muted-2)', 'stroke-width': 2 }));
+      staticG.appendChild(txt({ x: X1, y: yOf(tradFps(3000)) - 10, 'text-anchor': 'end', 'font-family': 'EB Garamond, serif', 'font-size': 11, fill: 'var(--muted)', 'font-style': 'italic' }, '傳統 ETL 取捨前緣'));
+
+      // engine markers on / off the curve
+      // PostgreSQL: tiny staleness (fresh) but ~0.3 FPS → far left, near floor
+      staticG.appendChild(el('circle', { cx: xOf(20), cy: yOf(0.3), r: 4, fill: 'var(--muted-2)' }));
+      staticG.appendChild(txt({ x: xOf(20) + 8, y: yOf(0.3) + 4, 'font-family': 'EB Garamond, serif', 'font-size': 11, fill: 'var(--muted)' }, 'PostgreSQL · fresh 但 0.3 FPS'));
+      // DuckDB: 1s staleness, ~10 FPS → on the curve
+      staticG.appendChild(el('circle', { cx: xOf(1000), cy: yOf(10), r: 4, fill: 'var(--sage-deep)' }));
+      staticG.appendChild(txt({ x: xOf(1000) - 8, y: yOf(10) - 8, 'text-anchor': 'end', 'font-family': 'EB Garamond, serif', 'font-size': 11, fill: 'var(--sage-deep)' }, 'DuckDB+ETL · 1 s 舊'));
+      // CedarDB: off the curve, top-left (fresh AND fast)
+      staticG.appendChild(el('circle', { cx: xOf(44), cy: yOf(30), r: 6, fill: 'var(--accent)', stroke: 'var(--bg)', 'stroke-width': 1.5 }));
+      staticG.appendChild(txt({ x: xOf(44) + 10, y: yOf(30) + 4, 'font-family': 'EB Garamond, serif', 'font-size': 12, fill: 'var(--accent-text)', 'font-style': 'italic' }, 'CedarDB · 44 ms 且 30 FPS'));
+
+      // dynamic: vertical staleness-budget line + the point it picks on the curve
+      const vline = el('line', { id: 'vg-w-htap-tradeoff-vline', y1: Y1, y2: Y0, stroke: 'var(--accent)', 'stroke-width': 1, 'stroke-dasharray': '4 3' });
+      const dot = el('circle', { id: 'vg-w-htap-tradeoff-dot', r: 5, fill: 'none', stroke: 'var(--accent)', 'stroke-width': 2 });
+      dynG.appendChild(vline);
+      dynG.appendChild(dot);
+
+      function update() {
+        const ms = Number(slider.value);
+        sVal.textContent = ms >= 1000 ? (ms / 1000).toFixed(2) + ' s' : ms + ' ms';
+        const x = xOf(ms), f = tradFps(ms);
+        vline.setAttribute('x1', x); vline.setAttribute('x2', x);
+        dot.setAttribute('cx', x); dot.setAttribute('cy', yOf(f));
+        tradOut.textContent = '~' + f.toFixed(1) + ' FPS';
+      }
+      slider.addEventListener('input', update);
+      update();
+    })();
+  </script>
+</figure>
+
+<p>這個 widget 的重點不是那條曲線的精確形狀（它是用一個 saturating 模型把 staleness 換算成傳統架構可達 FPS 的示意，不是 benchmark 報的逐點數字），而是 CedarDB 那個點落在哪裡：左上角，曲線之外。它的 lag 是 44 ms——比一個 frame 還短，意味著資料是 fresh 的；同時它的 render 維持 ~30 FPS。在傳統取捨曲線的語言裡，這個點是「不存在的」：你不能既不付 staleness 又拿到高 FPS。CedarDB 落在這裡，等於宣稱它不在這條曲線上，因為它從一開始就不是用「為某一端優化、犧牲另一端」的方式蓋的。</p>
+
+<p>為什麼能跳出曲線？CedarDB 的論點是：那條取捨曲線本身是被舊硬體假設綁出來的。OLTP 系統當年是繞著旋轉磁碟設計的——row-oriented、把一筆 row 的所有欄位放在一起，因為磁碟 seek 很貴，你想一次 I/O 拿到一整筆。OLAP 系統則是繞著「盡量少讀」設計的——column-oriented、大量壓縮，因為掃描 TB 級資料時，少讀一個 column 就省一大段頻寬。這兩套設計在旋轉磁碟的年代是真的不相容。</p>
+
+<p>但現代硬體把前提抽掉了：NVMe 的隨機讀寫快到 seek 不再主導、DRAM 大到熱資料幾乎都在記憶體、CPU 核心多到向量化掃描跟高並發寫入可以共存。CedarDB 的主張是，它的 storage layer、query optimizer、execution engine 三者都是從這個現代硬體前提重新設計的，原生同時處理兩種工作負載——不靠 ETL pipeline 在兩個系統間搬資料，也沒有 replication lag。於是 input 寫入跟 raycasting 讀取可以打在同一份、同一刻的世界狀態上，render 出來的就是當下，而不是一秒前。44 ms 的 median lag 就是這個架構選擇的直接後果。</p>
+
+<p>把三條路徑對著「資料什麼時候新、什麼時候舊」這個軸再走一遍，差異就具體了。PostgreSQL 的資料永遠是 fresh 的——render 那次查詢直接讀 tick 剛寫完的 <code>players</code>，沒有中間層，所以它的 lag 短在「資料」這一端；它輸在 render 那次掃描本身慢，加上 MVCC 為每個 tick 的 <code>UPDATE</code> 留下舊版本，full scan 還得連同尚未 vacuum 的死 tuple 一起掃，於是「最新」變成「最新但三秒才畫得出來」。DuckDB 的問題正好對偶：它的 render 查詢飛快，但讀的是 CDC loop 一秒前那一次批次複製進來的快照——在兩次同步之間，無論你查幾次，看到的都是同一個凍結的世界，所以才有「十張畫面九張一樣」。它的新鮮度不是連續地衰減，而是一秒內完全凍住、然後瞬間跳一格，這種「批次刷新」的舊比均勻的舊更難用。</p>
+
+<p>CedarDB 之所以能同時拿掉這兩種病，關鍵在於它只有一個引擎、一份狀態。沒有第二套系統，就沒有「把資料從 OLTP 端搬到 OLAP 端」這個動作，自然也沒有那條搬運管線帶來的 staleness；render 讀的就是 tick 剛寫的那份記憶體裡的世界，新鮮度跟 PostgreSQL 一樣是 fresh 的。同時它的 execution engine 是向量化的，那個 recursive CTE 的密集算術跑得跟 column-store 一樣快，所以它又拿到了 DuckDB 那一端的 render 速度。30 ticks/s 的世界推進、~30 FPS 的渲染、44 ms 的端到端 lag——這三個數字能同時成立，正是因為「新鮮」跟「快」在這個架構裡不再分屬兩個系統，而是同一份資料在同一個 executor 裡的兩種讀法。</p>
+
+<p>這裡藏著一個值得拎出來的系統性教訓：很多我們以為是物理定律的取捨，其實只是某一代硬體的設計遺留物。OLTP 跟 OLAP 之所以長成兩套截然不同的系統，不是因為「快速寫入」跟「快速掃描」在數學上互斥，而是因為旋轉磁碟那個時代，一套儲存佈局沒辦法同時討好兩種存取模式，於是業界乾脆切成兩個系統、中間架一條 ETL 管線把資料從一邊搬到另一邊。久了，這個切法就被當成了世界的基本結構——人人都假設「線上系統」跟「分析系統」天經地義該分開。DOOMQL 的價值，是它用一個荒謬到無法忽視的方式逼問：如果讓 seek 變貴的那塊旋轉磁碟早就不在機房裡了，那道牆還剩多少是物理、多少只是慣性？當一道取捨的根據被抽掉，繼續沿著那條取捨曲線選點，就只是在為一個已經消失的限制繳費。判斷一個架構約束是真的物理還是過期的遺留，正是這類玩具 benchmark 最不玩具的那一面。</p>
+
+<p>當然，要對這個論點保持應有的懷疑。這是 CedarDB 自家 benchmark、跑自家最擅長的工作負載；PostgreSQL 那 0.3 FPS 多少反映了「拿一個沒人會這樣用的引擎跑一個沒人會這樣寫的程式」，遞迴 CTE 在 Postgres 上沒有向量化執行本就是已知短板。把它讀成「CedarDB 屌打 PostgreSQL」是誤讀。正確的讀法是：DOOMQL 提供了一個極端但誠實的 HTAP 壓力測試，因為它把 OLTP 跟 OLAP 強行綁進同一個 1/35 秒的窗口，而大多數真實 HTAP 場景沒這麼緊。在這個放大鏡下，三種架構的取捨被照得清清楚楚——這比那個絕對 FPS 數字有價值得多。</p>
+
+<h2>把玩具讀成一個更大的問句</h2>
+
+<p>退一步看，DoomBench 真正有趣的地方不是「資料庫能不能跑 DOOM」，而是它順手把資料庫推到了一個你不常放它的位置：互動式運算的底層 substrate。我們習慣把資料庫當成被動的儲存層——應用程式算邏輯，資料庫存結果。DOOMQL 把這個關係翻過來：邏輯本身就是 SQL，資料庫不只是存，而是在每個 frame 裡同時當 OLTP 寫入端、世界模擬器、跟 OLAP 渲染器。</p>
+
+<p>這個翻轉之所以以前不可行，正是因為那道 transactional-vs-analytical 的牆：一個需要 fresh state 又需要 low-latency analytical read 的互動式工作負載，落在兩種傳統引擎都不擅長的中間地帶。你要嘛接受 PostgreSQL 那種 fresh 但讀不動的窘境，要嘛接受 DuckDB 那種讀得快但看的是舊資料的妥協。HTAP 引擎如果真能在現代硬體上把這道牆拆掉，那它解鎖的就不只是「跑得動 DOOM」，而是一整類「需要在同一份 fresh state 上同時高頻寫入跟低延遲分析讀取」的應用——即時儀表板、線上特徵計算、互動式模擬、遊戲後端狀態，這些原本都得靠「主庫 + 唯讀副本 + ETL」這套有 lag 的拼裝來勉強應付。</p>
+
+<p>對下週要做技術選型的人，這篇文章的實用結論不是「去用 CedarDB」，而是兩件更具體的事。第一，當你發現自己正在搭「OLTP 主庫 → CDC/ETL → OLAP 副本 → 應用讀」這條管線，先問清楚你能容忍多少 staleness——如果答案是「幾乎不能」，那條管線就是你架構裡的根本性 lag 來源，HTAP 引擎值得評估，因為它可能把這條管線整段拿掉。第二，benchmark 要看它隔離了什麼。DoomBench 把 Tickrate、Static FPS、Median Lag 拆開量、再用 DOOMscore 合起來，這個「先隔離純負載、再看綜合、且對作弊設罰則」的設計，比任何單一 throughput 數字都更能反映一個引擎在 HTAP 場景下的真實行為。</p>
+
+<p class="vg-deep-closer"><strong>The model</strong>：DOOMQL 把 transactional-vs-analytical 這道抽象的牆，壓縮成「按下 W 之後，畫面多久才告訴你你動了」這個你能用眼睛量的問題。PostgreSQL 答 3 秒、DuckDB 答 1 秒、CedarDB 答 44 毫秒——同一份 SQL，三種架構，三種對「資料庫到底是儲存層還是運算 substrate」的回答。</p>
+</div>

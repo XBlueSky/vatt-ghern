@@ -1,0 +1,981 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">一次 virtual call 在組合語言裡只有兩條指令——<code>movq (%rdi), %rax</code> 把 vptr 讀進來，<code>jmp *(%rax)</code> 跳過去。問題不在那兩條指令，而在於它們踩著的那張表，是 ABI 用負偏移、多個 vptr、runtime 讀出來的偏移量、還有兩種建構子三種解構子，硬生生在編譯期攤平出來的。</p>
+  <h1 class="vg-post-title">{{ title }}</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p><span class="vg-dropcap">v</span>irtual dispatch 在 C++ 程式設計師的腦中通常只是一句「透過 vtable 找到正確的 override」。但 Itanium C++ ABI——Linux、macOS、幾乎所有非 MSVC 平台採用的那份規範——把這句話拆成一組相當講究的記憶體佈局約定：vtable 不是從頭開始讀的陣列，vptr 指向的是表中間的 address point，typeinfo 與 offset-to-top 躺在負偏移；多重繼承讓一個物件帶上不只一個 vptr，呼叫非主要 base 的虛擬函式得先把 <code>this</code> 調回去；虛擬繼承更狠，連「base 在哪裡」都得在 runtime 讀一個 vcall offset 算出來。本文沿著這些元件走一遍，最後回到那兩條 dispatch 指令——理解了佈局，那兩條指令踩著的整座機器才看得清楚。</p>
+
+  <p>為什麼值得花力氣讀懂這套佈局？因為它是一條「規則退化成事實」的捷徑。C++ 有一長串關於多型的規則需要背：建構子裡呼叫虛擬函式不會分派到 derived、純虛擬函式不能在建構期間被呼叫、虛擬繼承的菱形 base 只有一份、移除或重排虛擬函式會 break ABI、<code>dynamic_cast</code> 的成本遠高於虛擬呼叫。這些規則彼此看似無關，但一旦你看清 vtable 與 vptr 在記憶體裡的實際形狀，它們全部變成可以從佈局直接推導出來的必然結果——不再需要背，只需要想「此刻 vptr 物理上指向哪張表」。本文的目標不是教你寫 ABI，而是把這層心智模型建起來；所有的偏移、register、指令都用 x86-64 System V（LP64，指標 8 bytes）的實際產物來談。</p>
+
+  <p>先把最基本的形狀立起來。一個有兩個虛擬函式的 <code>Base</code>，它的 vtable 是一塊放在 <code>.rodata</code> 的靜態資料，符號名是 <code>_ZTV4Base</code>。但物件裡的 vptr 不指向這塊資料的開頭——它指向所謂的 address point，也就是第一個函式指標所在的位置。在這個 +16 的位置之前，藏著兩個（虛擬繼承下是三個）負偏移欄位。下面的互動圖把每個 slot 攤開：點任何一格看它的責任，特別注意 vptr 那支箭頭落在哪裡。</p>
+
+  <figure class="vg-w-vtable-itanium-layout" data-svg-scroll="880">
+    <style>
+      .vg-w-vtable-itanium-layout { display: flex; flex-direction: column; gap: var(--s-3); align-items: stretch; }
+      .vg-w-vtable-itanium-layout svg.vg-w-vtable-itanium-layout-main { width: 100%; height: auto; max-width: 880px; }
+      .vg-w-vtable-itanium-layout input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-vtable-itanium-layout .slot { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; transition: fill 200ms, stroke 200ms; }
+      .vg-w-vtable-itanium-layout .slot:hover { stroke: var(--accent); }
+      .vg-w-vtable-itanium-layout .slot:focus { outline: none; }
+      .vg-w-vtable-itanium-layout .slot:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+      .vg-w-vtable-itanium-layout .slot-text { pointer-events: none; font-family: JetBrains Mono, monospace; font-size: 13px; }
+      .vg-w-vtable-itanium-layout .slot-off { pointer-events: none; font-family: JetBrains Mono, monospace; font-size: 12px; fill: var(--muted); }
+      .vg-w-vtable-itanium-layout .annot { font-family: IM Fell English, serif; font-style: italic; font-size: 12px; fill: var(--muted); }
+      .vg-w-vtable-itanium-layout .head { font-family: IM Fell English, serif; font-style: italic; font-size: 14px; }
+      .vg-w-vtable-itanium-layout .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+      .vg-w-vtable-itanium-layout .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-vtable-itanium-layout .detail p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-vtable-itanium-layout .hint { font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin: 0 0 var(--s-1) 0; }
+      .vg-w-vtable-itanium-layout:has(#vg-w-vtable-itanium-layout-r1:checked) .slot-1 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-vtable-itanium-layout:has(#vg-w-vtable-itanium-layout-r2:checked) .slot-2 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-vtable-itanium-layout:has(#vg-w-vtable-itanium-layout-r3:checked) .slot-3 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-vtable-itanium-layout:has(#vg-w-vtable-itanium-layout-r4:checked) .slot-4 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-vtable-itanium-layout:has(#vg-w-vtable-itanium-layout-r5:checked) .slot-5 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-vtable-itanium-layout:has(#vg-w-vtable-itanium-layout-r1:checked) .detail-1 { display: block; }
+      .vg-w-vtable-itanium-layout:has(#vg-w-vtable-itanium-layout-r2:checked) .detail-2 { display: block; }
+      .vg-w-vtable-itanium-layout:has(#vg-w-vtable-itanium-layout-r3:checked) .detail-3 { display: block; }
+      .vg-w-vtable-itanium-layout:has(#vg-w-vtable-itanium-layout-r4:checked) .detail-4 { display: block; }
+      .vg-w-vtable-itanium-layout:has(#vg-w-vtable-itanium-layout-r5:checked) .detail-5 { display: block; }
+    </style>
+
+    <input type="radio" id="vg-w-vtable-itanium-layout-r1" name="vg-w-vtable-itanium-layout-sel" aria-label="select offset-to-top" checked />
+    <input type="radio" id="vg-w-vtable-itanium-layout-r2" name="vg-w-vtable-itanium-layout-sel" aria-label="select typeinfo pointer" />
+    <input type="radio" id="vg-w-vtable-itanium-layout-r3" name="vg-w-vtable-itanium-layout-sel" aria-label="select address point" />
+    <input type="radio" id="vg-w-vtable-itanium-layout-r4" name="vg-w-vtable-itanium-layout-sel" aria-label="select second function slot" />
+    <input type="radio" id="vg-w-vtable-itanium-layout-r5" name="vg-w-vtable-itanium-layout-sel" aria-label="select destructor slots" />
+
+    <svg class="vg-w-vtable-itanium-layout-main" viewBox="0 0 880 420" role="img"
+         aria-label="Itanium C++ ABI vtable 佈局——offset-to-top 與 typeinfo 在 address point 之前的負偏移，函式指標依宣告順序往下，vptr 指向 address point">
+      <text x="440" y="26" text-anchor="middle" fill="var(--ink)" class="head">_ZTV4Base —— vptr 指向 address point，header 躺在負偏移</text>
+
+      <!-- vptr arrow from object -->
+      <text x="60" y="186" fill="var(--ink-deep)" class="annot">object</text>
+      <rect x="40" y="196" width="120" height="34" fill="none" stroke="var(--ink-deep)" stroke-width="1.5"/>
+      <text x="100" y="218" text-anchor="middle" fill="var(--ink-deep)" class="slot-text">vptr</text>
+      <line x1="160" y1="213" x2="280" y2="213" stroke="var(--ink-deep)" stroke-width="2" marker-end="url(#vg-w-vtable-itanium-layout-arrow)"/>
+      <text x="190" y="204" fill="var(--ink-deep)" class="annot">points to +16</text>
+
+      <!-- slot 1: vptr[-2] offset-to-top -->
+      <rect class="slot slot-1" data-target="vg-w-vtable-itanium-layout-r1" role="button" tabindex="0" aria-label="offset-to-top" x="300" y="56" width="420" height="36" />
+      <text x="316" y="79" fill="var(--ink)" class="slot-text">offset-to-top = 0</text>
+      <text x="708" y="79" text-anchor="end" fill="var(--muted)" class="slot-off">vptr[-2] · +0</text>
+
+      <!-- slot 2: vptr[-1] typeinfo -->
+      <rect class="slot slot-2" data-target="vg-w-vtable-itanium-layout-r2" role="button" tabindex="0" aria-label="typeinfo pointer" x="300" y="98" width="420" height="36" />
+      <text x="316" y="121" fill="var(--ink)" class="slot-text">typeinfo = &amp;_ZTI4Base</text>
+      <text x="708" y="121" text-anchor="end" fill="var(--muted)" class="slot-off">vptr[-1] · +8</text>
+
+      <!-- address point line -->
+      <line x1="290" y1="140" x2="730" y2="140" stroke="var(--accent)" stroke-width="1.5" stroke-dasharray="4,3"/>
+      <text x="730" y="153" text-anchor="end" fill="var(--accent-text)" class="annot">↑ address point (vptr 落點) ↓</text>
+
+      <!-- slot 3: vptr[0] foo -->
+      <rect class="slot slot-3" data-target="vg-w-vtable-itanium-layout-r3" role="button" tabindex="0" aria-label="address point foo" x="300" y="196" width="420" height="36" />
+      <text x="316" y="219" fill="var(--ink)" class="slot-text">&amp;Base::foo</text>
+      <text x="708" y="219" text-anchor="end" fill="var(--muted)" class="slot-off">vptr[0] · +16</text>
+
+      <!-- slot 4: vptr[1] bar -->
+      <rect class="slot slot-4" data-target="vg-w-vtable-itanium-layout-r4" role="button" tabindex="0" aria-label="second slot bar" x="300" y="238" width="420" height="36" />
+      <text x="316" y="261" fill="var(--ink)" class="slot-text">&amp;Base::bar</text>
+      <text x="708" y="261" text-anchor="end" fill="var(--muted)" class="slot-off">vptr[1] · +24</text>
+
+      <!-- slot 5a: D1 -->
+      <rect class="slot slot-5" data-target="vg-w-vtable-itanium-layout-r5" role="button" tabindex="0" aria-label="complete-object destructor" x="300" y="280" width="420" height="36" />
+      <text x="316" y="303" fill="var(--ink)" class="slot-text">~Base · D1 (complete-object)</text>
+      <text x="708" y="303" text-anchor="end" fill="var(--muted)" class="slot-off">vptr[2] · +32</text>
+
+      <!-- slot 5b: D0 -->
+      <rect class="slot slot-5" data-target="vg-w-vtable-itanium-layout-r5" role="button" tabindex="0" aria-label="deleting destructor" x="300" y="322" width="420" height="36" />
+      <text x="316" y="345" fill="var(--ink)" class="slot-text">~Base · D0 (deleting)</text>
+      <text x="708" y="345" text-anchor="end" fill="var(--muted)" class="slot-off">vptr[3] · +40</text>
+
+      <text x="440" y="396" text-anchor="middle" fill="var(--muted)" class="annot">負偏移是 header（往上讀），正偏移是函式指標（依宣告順序往下）；解構子佔兩格</text>
+
+      <defs>
+        <marker id="vg-w-vtable-itanium-layout-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--ink-deep)" />
+        </marker>
+      </defs>
+    </svg>
+
+    <div>
+      <p class="hint">click any slot above · 6 slots</p>
+      <div class="detail detail-1">
+        <h3>offset-to-top · vptr[-2]</h3>
+        <p>記錄「從這個 vptr 到完整物件起點的距離」。在最基本的單一繼承下它是 <code>0</code>——vptr 就在物件起頭。它存在的理由要到多重繼承才顯現：當 <code>dynamic_cast&lt;void*&gt;</code> 或 RTTI 需要從一個 base subobject 找回最派生物件的位址，就讀這個欄位往回退。</p>
+        <p><strong>不知道的事</strong>：它不知道函式指標是什麼，只是一個帶號的 byte 距離。</p>
+      </div>
+      <div class="detail detail-2">
+        <h3>typeinfo pointer · vptr[-1]</h3>
+        <p>指向這個型別的 <code>std::type_info</code> 物件（符號 <code>_ZTI4Base</code>），RTTI 的根。<code>typeid(obj)</code> 與 <code>dynamic_cast</code> 都從這裡出發：先 <code>movq (%rdi), %rax</code> 取 vptr，再讀 <code>vptr[-1]</code> 得到 type_info，然後沿 type_info 的繼承鏈比對。</p>
+        <p><strong>不知道的事</strong>：它不參與任何虛擬呼叫的快路徑——dispatch 完全不碰它。</p>
+      </div>
+      <div class="detail detail-3">
+        <h3>address point · vptr[0]</h3>
+        <p>vptr 真正指向的位置，也是第一個虛擬函式 <code>&amp;Base::foo</code>。把 vptr 指到「中間」而非表頭，是為了讓 <code>vptr[0]</code>、<code>vptr[1]</code> 直接是函式指標、<code>vptr[-1]</code>、<code>vptr[-2]</code> 直接是 header——index 即 slot，dispatch 不必先跳過 header。</p>
+        <p><strong>不知道的事</strong>：它不知道自己被哪個 derived 覆寫了——override 只是換掉這格的內容，位置不變。</p>
+      </div>
+      <div class="detail detail-4">
+        <h3>function slot · vptr[1]</h3>
+        <p><code>&amp;Base::bar</code>，依宣告順序排在 <code>foo</code> 之後。slot 的順序是 ABI 約定的一部分：只要 base 的虛擬函式宣告順序不變，derived 就能把同名 slot 留在同一個 index、在後面 append 新的虛擬函式。這正是「在不重編 base 的前提下加虛擬函式必須加在尾端」這條相容性規則的來源。</p>
+        <p><strong>不知道的事</strong>：它不知道 caller 是誰，呼叫慣例由 <code>this</code> in <code>%rdi</code> 約定。</p>
+      </div>
+      <div class="detail detail-5">
+        <h3>destructor slots · vptr[2], vptr[3]</h3>
+        <p>一個解構子在 vtable 裡佔兩格：<code>D1</code> complete-object dtor（只解構、不釋放記憶體）排在前，<code>D0</code> deleting dtor（先呼 D1 再呼 <code>operator delete</code>）排在後。<code>delete p</code> 走 D0 slot；stack 物件離開 scope 走 D1（通常直接 inline，不必查表）。</p>
+        <p><strong>不知道的事</strong>：vtable 裡看不到第三個變體 <code>D2</code> base-object dtor——它只在 base subobject 解構時被直接呼叫，不需要虛擬分派。</p>
+      </div>
+    </div>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-vtable-itanium-layout');
+        root.querySelectorAll('.slot').forEach((rect) => {
+          rect.addEventListener('click', () => {
+            const targetId = rect.getAttribute('data-target');
+            const radio = root.querySelector('#' + targetId);
+            if (radio) radio.checked = true;
+          });
+          rect.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              rect.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            }
+          });
+        });
+      })();
+    </script>
+    <figcaption>單一繼承下 <code>Base</code> 的 vtable。vptr 指向 +16 的 address point；offset-to-top 與 typeinfo 在它之前的負偏移；函式指標依宣告順序往下，解構子佔 D1／D0 兩格。byte 偏移為 LP64（指標 8 bytes）。</figcaption>
+  </figure>
+
+  <h2>負偏移的 header：vptr 為什麼指向表中間</h2>
+
+  <p>把 vptr 設計成指向 address point 而非 vtable 的實體起點，是整個佈局裡最容易誤解、卻最關鍵的一步。直覺上你會覺得 vptr 應該指向那塊 <code>.rodata</code> 的開頭，然後 dispatch 用 <code>vptr[0]</code> 拿到第一個欄位。但 ABI 不這麼做：vptr 指向第一個函式指標，於是 <code>vptr[0]</code> 直接就是 <code>&amp;foo</code>，<code>vptr[1]</code> 直接就是 <code>&amp;bar</code>。所有的 dispatch 都是「正偏移 × 8」，不必在每次呼叫前先加上一個固定的 header 大小。</p>
+
+  <p>header 因此被推到負偏移。在 LP64 下，<code>vptr[-1]</code>（位元組偏移 −8）放 typeinfo pointer，<code>vptr[-2]</code>（−16）放 offset-to-top。虛擬繼承下還會多一個 <code>vptr[-3]</code>（−24）放 vbase offset 或 vcall offset——這格只在有虛擬繼承時存在，後面會專門講。讀 header 是「往負方向讀」，讀函式是「往正方向讀」，兩種存取在 ABI 層面被明確區分開。</p>
+
+  <p>把這個「負偏移 header、正偏移函式」的座標系拿來算具體的 byte，最快看清 address point 落在哪。下面的計算器讓你撥虛擬函式個數、再切換有沒有虛擬繼承（多一格 <code>vptr[-3]</code>）；左邊把每個欄位放到以 address point 為原點的數線上，offset-to-top／typeinfo 永遠在原點左側（負），函式指標永遠在右側（正）。</p>
+
+  <figure class="vg-w-offset-calc" data-svg-scroll="720">
+    <style>
+      .vg-w-offset-calc { display: grid; grid-template-columns: 1fr; gap: var(--s-2); }
+      .vg-w-offset-calc .controls { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); flex-wrap: wrap; }
+      .vg-w-offset-calc .controls input[type="range"] { flex: 1; min-width: 110px; height: 36px; accent-color: var(--accent); touch-action: none; }
+      .vg-w-offset-calc .controls .readout { font-family: JetBrains Mono, monospace; font-variant-numeric: tabular-nums; color: var(--accent-text); min-width: 4ch; text-align: right; }
+      .vg-w-offset-calc .controls label.chk { display: inline-flex; align-items: center; gap: 6px; min-height: 44px; cursor: pointer; }
+      .vg-w-offset-calc .controls label.chk input { width: 18px; height: 18px; accent-color: var(--accent); }
+      .vg-w-offset-calc svg.vg-w-offset-calc-main { width: 100%; height: auto; max-width: 720px; }
+      .vg-w-offset-calc .ap { stroke: var(--accent); stroke-width: 1.5; stroke-dasharray: 4 3; }
+      .vg-w-offset-calc .axis { stroke: var(--muted-2); stroke-width: 1.5; }
+      .vg-w-offset-calc .cell-neg { fill: var(--bg-soft); stroke: var(--ink-deep); stroke-width: 1.2; }
+      .vg-w-offset-calc .cell-pos { fill: var(--bg-soft); stroke: var(--accent); stroke-width: 1.2; fill-opacity: 1; }
+      .vg-w-offset-calc .cell-pos.fn { fill: var(--accent); fill-opacity: 0.12; }
+      .vg-w-offset-calc .ctext { font-family: JetBrains Mono, monospace; font-size: 11px; fill: var(--ink); }
+      .vg-w-offset-calc .otext { font-family: JetBrains Mono, monospace; font-size: 11px; fill: var(--muted); }
+      .vg-w-offset-calc .head { font-family: IM Fell English, serif; font-style: italic; font-size: 13px; fill: var(--muted); }
+      .vg-w-offset-calc .summary { font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink); margin: 0; }
+      .vg-w-offset-calc .summary code { font-family: JetBrains Mono, monospace; color: var(--accent-text); }
+    </style>
+
+    <div class="controls">
+      <label for="vg-w-offset-calc-n">虛擬函式 N =</label>
+      <input id="vg-w-offset-calc-n" class="vg-w-offset-calc-n" type="range" min="1" max="6" step="1" value="2" />
+      <span class="readout vg-w-offset-calc-nout">2</span>
+      <label class="chk"><input type="checkbox" class="vg-w-offset-calc-vi" /> 虛擬繼承（多 vptr[-3]）</label>
+    </div>
+
+    <svg class="vg-w-offset-calc-main" viewBox="0 0 720 220" role="img"
+         aria-label="以 address point 為原點，計算 vtable 各欄位的 byte 偏移——header 在負側，函式指標在正側">
+      <line class="axis" x1="40" y1="120" x2="680" y2="120" />
+      <line class="ap vg-w-offset-calc-apline" x1="360" y1="36" x2="360" y2="160" />
+      <text class="head vg-w-offset-calc-aptext" x="360" y="28" text-anchor="middle" fill="var(--accent-text)">address point · +0（vptr 落點）</text>
+      <text class="head" x="120" y="186" text-anchor="middle">← 負偏移：header</text>
+      <text class="head" x="560" y="186" text-anchor="middle">正偏移：函式指標 →</text>
+      <g class="vg-w-offset-calc-cells"></g>
+    </svg>
+
+    <p class="summary vg-w-offset-calc-summary"></p>
+    <figcaption>以 address point 為原點的 vtable 數線。每格寬度對應 8 bytes（LP64 指標）。header 欄位（offset-to-top、typeinfo、選用的 vbase/vcall offset）排在原點左側的負偏移；解構子佔 D1／D0 兩格，排在 N 個函式 slot 之後。撥 N 看正側變長、勾虛擬繼承看左側多出 <code>vptr[-3]</code>。</figcaption>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-offset-calc');
+        const range = root.querySelector('.vg-w-offset-calc-n');
+        const nout = root.querySelector('.vg-w-offset-calc-nout');
+        const vi = root.querySelector('.vg-w-offset-calc-vi');
+        const cells = root.querySelector('.vg-w-offset-calc-cells');
+        const summary = root.querySelector('.vg-w-offset-calc-summary');
+        const svg = root.querySelector('svg.vg-w-offset-calc-main');
+        const NS = 'http://www.w3.org/2000/svg';
+        const AP_X = 360, MID_Y = 120, CELL_W = 44, CELL_H = 30;
+
+        function mk(tag, attrs) {
+          const el = document.createElementNS(NS, tag);
+          for (const k in attrs) el.setAttribute(k, attrs[k]);
+          return el;
+        }
+        function cell(idx, label, off, positive) {
+          // idx: distance in slots from address point (signed). positive cells go right, header cells left.
+          const x = AP_X + idx * CELL_W - (positive ? 0 : CELL_W);
+          const g = mk('g', {});
+          const rect = mk('rect', {
+            x: x, y: MID_Y - CELL_H / 2, width: CELL_W - 2, height: CELL_H,
+            class: positive ? 'cell-pos' + (label[0] === '&' ? ' fn' : '') : 'cell-neg'
+          });
+          g.appendChild(rect);
+          const t1 = mk('text', { x: x + (CELL_W - 2) / 2, y: MID_Y + 3, 'text-anchor': 'middle', class: 'ctext' });
+          t1.textContent = label;
+          g.appendChild(t1);
+          const t2 = mk('text', { x: x + (CELL_W - 2) / 2, y: MID_Y + CELL_H / 2 + 14, 'text-anchor': 'middle', class: 'otext' });
+          t2.textContent = (off >= 0 ? '+' : '') + off;
+          g.appendChild(t2);
+          return g;
+        }
+        function render() {
+          const n = Number(range.value);
+          nout.textContent = String(n);
+          const virtualInh = vi.checked;
+          while (cells.firstChild) cells.removeChild(cells.firstChild);
+
+          // header cells (negative, left of address point)
+          // vptr[-1] typeinfo at -8, vptr[-2] off-top at -16, optional vptr[-3] at -24
+          cells.appendChild(cell(-1, 'tinfo', -8, false));
+          cells.appendChild(cell(-2, 'off-top', -16, false));
+          if (virtualInh) cells.appendChild(cell(-3, 'vbase', -24, false));
+
+          // positive cells: N function slots, then D1, D0
+          for (let i = 0; i < n; i++) {
+            cells.appendChild(cell(i, i === 0 ? '&foo' : '&fn' + i, i * 8, true));
+          }
+          cells.appendChild(cell(n, '~D1', n * 8, true));
+          cells.appendChild(cell(n + 1, '~D0', (n + 1) * 8, true));
+
+          const headerBytes = virtualInh ? 24 : 16;
+          const fnBytes = (n + 2) * 8;
+          summary.innerHTML = 'address point 在 vtable 實體起點 +<code>' + headerBytes +
+            '</code>；vptr 指向這裡。header 佔 <code>' + headerBytes + '</code> bytes（' +
+            (virtualInh ? '3' : '2') + ' 格），N=' + n + ' 個函式加 D1／D0 兩格，正側共 <code>' +
+            fnBytes + '</code> bytes。dispatch 第 k 個函式恆為 <code>jmp *' + '(k×8)(%rax)</code>，與 header 大小無關。';
+        }
+        range.addEventListener('input', render);
+        vi.addEventListener('change', render);
+        render();
+      })();
+    </script>
+  </figure>
+
+  <p>這個選擇的回報在 dispatch 的指令數上立刻看得到。一次普通虛擬呼叫，編譯器產生：</p>
+
+  <pre><code class="language-nasm">    movq    (%rdi), %rax    ; %rdi = this, 載入 vptr 到 %rax
+    jmp     *(%rax)          ; 呼叫第一個虛擬函式 (index 0)</code></pre>
+
+  <p>呼叫第二個虛擬函式只是把偏移從 0 換成 8：</p>
+
+  <pre><code class="language-nasm">    movq    (%rdi), %rax    ; 載入 vptr
+    jmp     *8(%rax)         ; 呼叫第二個虛擬函式 (index 1)</code></pre>
+
+  <p>沒有任何「跳過 header」的加法、沒有對 typeinfo 的存取——只要 dispatch 不需要 RTTI，那兩個負偏移欄位在快路徑上完全不被觸碰。它們只在 <code>dynamic_cast</code>、<code>typeid</code>、以及多重／虛擬繼承的指標調整時才登場。把它們放在「正常情況下不讀到的方向」，正是這個佈局的優雅之處。值得強調的是 <code>jmp</code> 而非 <code>call</code>——這是 tail call：dispatch 點本身常常就是函式的最後一個動作，編譯器用 <code>jmp</code> 直接把 return address 交給被呼叫的虛擬函式，省一層 stack frame。</p>
+
+  <p>把這兩條指令逐步走一遍，「間接跳躍」就不再抽象。下面的步進器把一次 <code>p-&gt;bar()</code>（index 1）的 dispatch 拆成三拍：先從 <code>this</code> 讀出 vptr、再用 index 算出 slot 位址、最後 <code>jmp</code> 過去。拖拉滑桿或按 step，看每一拍動的是哪個 register、踩的是哪一格 slot。</p>
+
+  <figure class="vg-w-dispatch-stepper" data-svg-scroll="720">
+    <style>
+      .vg-w-dispatch-stepper { display: grid; grid-template-columns: 1fr; gap: var(--s-2); }
+      .vg-w-dispatch-stepper .controls { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); flex-wrap: wrap; }
+      .vg-w-dispatch-stepper .controls input[type="range"] { flex: 1; min-width: 120px; height: 36px; accent-color: var(--accent); touch-action: none; }
+      .vg-w-dispatch-stepper .controls button { font-family: var(--sans); font-size: var(--fs-sm); min-height: 44px; min-width: 64px; padding: var(--s-1) var(--s-2); border: 1px solid var(--muted-2); border-radius: 2px; background: var(--bg-soft); color: var(--ink); cursor: pointer; }
+      .vg-w-dispatch-stepper .controls button:hover { border-color: var(--accent); color: var(--accent-text); }
+      .vg-w-dispatch-stepper .controls .readout { font-family: JetBrains Mono, monospace; font-variant-numeric: tabular-nums; color: var(--accent-text); min-width: 9ch; }
+      .vg-w-dispatch-stepper svg.vg-w-dispatch-stepper-main { width: 100%; height: auto; max-width: 720px; }
+      .vg-w-dispatch-stepper .box { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; transition: fill 200ms, stroke 200ms; }
+      .vg-w-dispatch-stepper .box.lit { fill: var(--accent); fill-opacity: 0.18; stroke: var(--accent); }
+      .vg-w-dispatch-stepper .mono { font-family: JetBrains Mono, monospace; font-size: 13px; fill: var(--ink); }
+      .vg-w-dispatch-stepper .lbl { font-family: IM Fell English, serif; font-style: italic; font-size: 12px; fill: var(--muted); }
+      .vg-w-dispatch-stepper .asm { font-family: JetBrains Mono, monospace; font-size: 13px; fill: var(--muted); transition: fill 200ms; }
+      .vg-w-dispatch-stepper .asm.lit { fill: var(--accent-text); font-weight: 600; }
+      .vg-w-dispatch-stepper .flow { stroke: var(--muted-2); stroke-width: 2; fill: none; opacity: 0; transition: opacity 200ms; }
+      .vg-w-dispatch-stepper .flow.lit { opacity: 1; stroke: var(--accent); }
+      .vg-w-dispatch-stepper .narr { font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink); margin: 0; min-height: 3em; }
+      .vg-w-dispatch-stepper .narr code { font-family: JetBrains Mono, monospace; }
+    </style>
+
+    <div class="controls">
+      <button type="button" class="vg-w-dispatch-stepper-prev" aria-label="previous step">‹ prev</button>
+      <input type="range" class="vg-w-dispatch-stepper-range" min="0" max="2" step="1" value="0" aria-label="dispatch step 0 to 2" />
+      <button type="button" class="vg-w-dispatch-stepper-next" aria-label="next step">next ›</button>
+      <span class="readout vg-w-dispatch-stepper-readout">step 1/3</span>
+    </div>
+
+    <svg class="vg-w-dispatch-stepper-main" viewBox="0 0 720 300" role="img"
+         aria-label="virtual dispatch 的三拍——load vptr、index into vtable、tail-call slot——逐拍點亮對應的 register 與 slot">
+      <!-- object -->
+      <rect class="box box-obj" x="24" y="60" width="150" height="40" />
+      <text x="34" y="78" class="mono">%rdi = this</text>
+      <text x="34" y="94" class="lbl">物件起點，內含 vptr</text>
+
+      <!-- vptr register -->
+      <rect class="box box-rax" x="24" y="150" width="150" height="40" />
+      <text x="34" y="174" class="mono vg-w-dispatch-stepper-rax">%rax = ?</text>
+
+      <!-- flow 1: this -> vtable (load vptr) -->
+      <path class="flow flow-1" d="M 174 80 C 250 80, 250 150, 320 150" marker-end="url(#vg-w-dispatch-stepper-ar)" />
+      <!-- flow 2: index into vtable -->
+      <path class="flow flow-2" d="M 174 170 C 230 170, 230 196, 320 196" marker-end="url(#vg-w-dispatch-stepper-ar)" />
+      <!-- flow 3: jump -->
+      <path class="flow flow-3" d="M 560 196 C 620 196, 620 250, 540 250" marker-end="url(#vg-w-dispatch-stepper-ar)" />
+
+      <!-- vtable -->
+      <text x="320" y="128" class="lbl">vtable（vptr 落點 = vptr[0]）</text>
+      <rect class="box slot-h" x="320" y="138" width="240" height="22" />
+      <text x="330" y="154" class="mono" font-size="11">[-1] typeinfo · [-2] off-top</text>
+      <rect class="box slot-0" x="320" y="160" width="240" height="36" />
+      <text x="330" y="183" class="mono">vptr[0] &amp;foo</text>
+      <text x="550" y="183" text-anchor="end" class="lbl">+16</text>
+      <rect class="box slot-1" x="320" y="196" width="240" height="36" />
+      <text x="330" y="219" class="mono">vptr[1] &amp;bar</text>
+      <text x="550" y="219" text-anchor="end" class="lbl">+24</text>
+
+      <!-- target -->
+      <rect class="box box-target" x="380" y="248" width="180" height="40" />
+      <text x="390" y="272" class="mono vg-w-dispatch-stepper-target">Base::bar</text>
+
+      <!-- asm lines -->
+      <text x="24" y="232" class="asm asm-0">movq (%rdi), %rax</text>
+      <text x="24" y="252" class="asm asm-1">lea  8(%rax), %r11</text>
+      <text x="24" y="272" class="asm asm-2">jmp  *8(%rax)</text>
+
+      <defs>
+        <marker id="vg-w-dispatch-stepper-ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--accent)" />
+        </marker>
+      </defs>
+    </svg>
+
+    <p class="narr vg-w-dispatch-stepper-narr"></p>
+    <figcaption>一次 <code>p-&gt;bar()</code>（index 1）的 dispatch 三拍。第一拍 <code>movq (%rdi), %rax</code> 把 vptr 載進 <code>%rax</code>；第二拍用 index×8 算出 slot 位址（這裡常被摺進定址模式，未必獨立成指令）；第三拍 <code>jmp *8(%rax)</code> tail-call 到 <code>bar</code> 的 slot。index 在編譯期已定，runtime 完全不查名字。</figcaption>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-dispatch-stepper');
+        const range = root.querySelector('.vg-w-dispatch-stepper-range');
+        const readout = root.querySelector('.vg-w-dispatch-stepper-readout');
+        const narr = root.querySelector('.vg-w-dispatch-stepper-narr');
+        const rax = root.querySelector('.vg-w-dispatch-stepper-rax');
+        const svg = root.querySelector('svg.vg-w-dispatch-stepper-main');
+        const prev = root.querySelector('.vg-w-dispatch-stepper-prev');
+        const next = root.querySelector('.vg-w-dispatch-stepper-next');
+        const steps = [
+          {
+            lit: ['flow-1', 'box-obj', 'box-rax', 'slot-h', 'asm-0'],
+            rax: '%rax = vptr',
+            narr: '第一拍：movq (%rdi), %rax —— 從 this（%rdi）讀出物件最前面的 vptr，放進 %rax。vptr 指向 vtable 的 address point。'
+          },
+          {
+            lit: ['flow-2', 'box-rax', 'slot-1', 'asm-1'],
+            rax: '%rax = vptr',
+            narr: '第二拍：用 index 1 算 slot 位址 —— 8(%rax) 就是 vptr[1]，即 bar 的 slot。index×8 是編譯期常數，通常直接摺進下一條的定址模式，不單獨佔一條指令。'
+          },
+          {
+            lit: ['flow-3', 'slot-1', 'box-target', 'asm-2'],
+            rax: '%rax = vptr',
+            narr: '第三拍：jmp *8(%rax) —— 間接跳到 slot 裡的函式指標。是 jmp 不是 call（tail call），return address 直接交給 bar。整趟零比對、零 RTTI。'
+          }
+        ];
+        function render() {
+          const i = Number(range.value);
+          const s = steps[i];
+          svg.querySelectorAll('.lit').forEach((el) => el.classList.remove('lit'));
+          s.lit.forEach((cls) => {
+            const el = svg.querySelector('.' + cls);
+            if (el) el.classList.add('lit');
+          });
+          rax.textContent = s.rax;
+          readout.textContent = 'step ' + (i + 1) + '/3';
+          narr.textContent = s.narr;
+        }
+        range.addEventListener('input', render);
+        prev.addEventListener('click', () => { range.value = Math.max(0, Number(range.value) - 1); render(); });
+        next.addEventListener('click', () => { range.value = Math.min(2, Number(range.value) + 1); render(); });
+        render();
+      })();
+    </script>
+  </figure>
+
+  <p>純虛擬函式在這個佈局裡有個具體的表現：抽象類別的 vtable 在對應的 slot 放的不是真正的函式，而是 <code>__cxa_pure_virtual</code>——runtime 提供的一個會 <code>abort</code> 的錯誤處理函式。所以「abstract class 不能實例化」這條規則，在 ABI 層面其實是「它的 vtable 存在、只是某些 slot 填了自殺函式」；當建構途中物件的動態型別恰好是這個抽象層、又有程式碼間接呼到那個 slot，撞上的就是它。同樣地，<code>-fno-rtti</code> 編譯時，編譯器仍然生成 vtable 與其函式 slot（dispatch 還是要能跑），但會把 <code>vptr[-1]</code> 的 typeinfo 指標省略或留空，並讓 <code>dynamic_cast</code> 與 <code>typeid</code> 無法使用——這再次印證 dispatch 與 RTTI 是兩條獨立的路徑，砍掉一條另一條照常運作。</p>
+
+  <p>typeinfo 那格指向的東西，是另一個由 ABI 規範佈局的物件，符號形如 <code>_ZTI4Base</code>（<code>TI</code> = type info）。它自己也是多型的——每個 <code>type_info</code> 物件前面也有一個 vptr，指向某個 <code>__cxxabiv1</code> 內部類別（<code>__class_type_info</code>、<code>__si_class_type_info</code> 單一繼承用、<code>__vmi_class_type_info</code> 多重／虛擬繼承用）的 vtable。<code>type_info</code> 物件裡帶一個指向型別名稱字串的指標，那個字串符號是 <code>_ZTS4Base</code>（<code>TS</code> = type string，內容就是 mangled name <code>4Base</code>）。於是同一個型別牽出三個關聯符號：<code>_ZTV</code>（vtable）、<code>_ZTI</code>（type_info）、<code>_ZTS</code>（type string）。<code>dynamic_cast</code> 在 runtime 做的事，就是從來源指標的 <code>vptr[-1]</code> 取出 <code>type_info</code>，沿著它記錄的 base 清單往目標型別比對；若命中且涉及指標調整，再配合 offset-to-top 與來源／目標的相對位置算出新指標。這條路徑跟 dispatch 完全分離，也因此 <code>dynamic_cast</code> 的成本級別跟一次虛擬呼叫完全不在同一個量級——它是一趟繼承圖的搜尋，不是一次間接跳躍。</p>
+
+  <h2>單一繼承的 slot 重用：override 換內容，不換位置</h2>
+
+  <p>單一繼承是這套機制最乾淨的形態。derived 的 vtable 是 base vtable 的延伸：繼承來的 slot 留在原本的 index，override 換掉該格的函式指標，新的虛擬函式 append 到尾端。看這對父子：</p>
+
+  <pre><code class="language-cpp">struct Base {
+    virtual void foo() {}
+    virtual void bar() {}
+};
+struct Derived : Base {
+    void foo() override {}   // 取代 Base::foo 的 slot
+    virtual void baz() {}    // append 到尾端
+};</code></pre>
+
+  <p><code>Derived</code> 的 vtable 在 index 0 仍是「<code>foo</code> 的 slot」，但內容換成 <code>&amp;Derived::foo</code>；index 1 仍是 <code>bar</code>（沒被 override，內容還是 <code>&amp;Base::bar</code>）；<code>baz</code> 排在 index 2。因為 slot 的 index 由「宣告順序」固定，呼叫端在編譯期就知道「<code>foo</code> 是 index 0」，無論手上拿的是 <code>Base*</code> 還是 <code>Derived*</code>，產生的都是 <code>jmp *(%rax)</code>——同一個偏移，落在不同物件的 vptr 上會解析到不同的實作。這就是 override 的本質：呼叫端的程式碼一字不變，換的只是 vptr 指向的那張表裡 index 0 的內容。</p>
+
+  <p>為什麼一個解構子要在 vtable 裡佔兩格（D1 與 D0），而不是一格？因為「解構」與「釋放記憶體」是兩件必須能分開觸發的事。stack 上的物件離開 scope，要解構但絕不能 <code>operator delete</code>（那塊記憶體不在 heap 上）；<code>delete p</code> 一個多型指標，則要先解構再釋放，而且釋放需要正確的「完整物件起點 + 大小」，這在多型脈絡下只有透過 vtable 才能拿到。把兩種需求各給一格——D1 只解構、D0 解構後釋放——呼叫端就能按情境挑正確的入口，而不必在每個解構點塞一個「要不要釋放」的旗標。這也是為什麼一個多型基底類別的虛擬解構子，會讓 vtable 多出兩格而非一格。</p>
+
+  <p>這也解釋了一條讓很多人踩坑的 ABI 相容性規則：在 base 的虛擬函式列表「中間」插入一個新虛擬函式，會把它後面所有 slot 的 index 往後推一格——任何已經編譯、寫死了舊 index 的呼叫端，全部 dispatch 到錯的 slot。所以二進位相容的做法永遠是「append 到尾端」。同理，移除一個虛擬函式、或調換兩個的宣告順序，都是 ABI break：呼叫端寫死的是 index，不是名字。這條規則對 library 作者是硬約束——一個發布過的多型介面，它的虛擬函式佈局基本上就凍結了，這也是為什麼成熟的 C++ library 傾向用 pimpl 或非虛擬介面把 vtable 藏在實作背後，留出演進空間。</p>
+
+  <p>另一個容易忽略的點是覆寫與回傳型別 covariance 的互動。當 derived override 的回傳型別是 base 回傳型別的 derived（covariant return），而這兩個型別在物件裡的偏移不同時，編譯器會在這個 slot 放一個會調整回傳指標的 thunk，而非函式本身——這跟多重繼承調整 <code>this</code> 是同一套機制，只是調整的對象從引數換成回傳值。單一繼承下 offset-to-top 恆為 <code>0</code>、沒有指標調整、沒有 thunk——這是最便宜的情形，多重與虛擬繼承的所有複雜度，都是為了在更難的拓樸下維持「<code>jmp *(%rax)</code> 這條快路徑仍然成立」這個不變量。</p>
+
+  <h2>多個 vptr 與指標調整：non-virtual thunk 的 subq</h2>
+
+  <p>多重繼承打破「一個物件一個 vptr」。考慮 <code>MultiDerived : Left, Right</code>，兩個 base 都是多型的：</p>
+
+  <pre><code class="language-cpp">struct Left  { virtual void left_func(); };
+struct Right { virtual void right_func(); };
+struct MultiDerived : Left, Right {
+    void left_func() override;
+    void right_func() override;
+};</code></pre>
+
+  <p>物件記憶體裡，<code>Left</code> subobject 在 offset 0、<code>Right</code> subobject 在 offset 16，各自帶一個 vptr。兩個 vptr 都指向同一個符號 <code>_ZTV12MultiDerived</code>，但落在不同的 address point：primary 段給 <code>Left</code>（offset-to-top = 0），secondary 段給 <code>Right</code>（offset-to-top = <code>-16</code>）。secondary 段的 offset-to-top 之所以是 −16，正是要讓 RTTI 從 <code>Right</code> subobject 退回完整物件起點。</p>
+
+  <p>這裡有一個值得停下來看的設計選擇：為什麼 <code>Left</code> 是 primary 而 <code>Right</code> 是 secondary？ABI 規定第一個非空、且其 vptr 落在 offset 0 的多型直接 base 當 primary base，它的 vtable 段與最派生型別的 vtable 段共用同一個 vptr——也就是說 <code>MultiDerived</code> 自己新增的虛擬函式，直接 append 在 primary（<code>Left</code>）那一段的尾端，不另開新段。這讓「透過 <code>Left*</code> 或透過 <code>MultiDerived*</code> 呼叫」走的是同一個 vptr、同一段表、零調整——primary base 的呼叫跟單一繼承一樣便宜。代價全部集中到 secondary base：<code>Right</code> 的 vptr 在 offset 16，它那段表的每個被 <code>MultiDerived</code> override 的 slot 都得掛 thunk。換句話說，多重繼承的指標調整成本不是平均分攤的——它偏心地壓在「非主要」的那些 base 上，這也是「把最常透過 base 指標呼叫的型別擺在繼承列表第一位」這條微優化建議的根據。</p>
+
+  <p>真正的麻煩在於 <code>this</code> 指標。當你拿著一個 <code>Right*</code>（它指向 offset 16）呼叫 <code>right_func</code>，但實際執行的 <code>MultiDerived::right_func</code> 期待的 <code>this</code> 是完整物件的起點（offset 0）。secondary vtable 裡那個 slot 不直接指向 <code>MultiDerived::right_func</code>，而是指向一個 non-virtual thunk，它先把 <code>this</code> 調回去再跳：</p>
+
+  <pre><code class="language-nasm">_ZThn16_N12MultiDerived10right_funcEv:
+    subq    $16, %rdi       ; this 往回退 16 bytes，回到完整物件起點
+    jmp     .LTHUNK0         ; 跳到真正的 MultiDerived::right_func</code></pre>
+
+  <p>mangled name 把整件事寫得很清楚：<code>Th</code> 是 non-virtual thunk，<code>n16</code> 是 −16 的調整量。關鍵字是 <em>non-virtual</em>——這個 16 是編譯期就知道的常數，因為 <code>Right</code> 在 <code>MultiDerived</code> 裡的固定偏移在編譯期已定。整個 thunk 只有一條 <code>subq</code> 加一條 <code>jmp</code>，沒有任何記憶體存取。把一個 <code>MultiDerived*</code> 轉成 <code>Right*</code> 同樣是編譯期常數加法（<code>+16</code>），轉回來則是 <code>−16</code>——指標調整在多重繼承下無所不在，但只要 base 的位置是固定的，調整量就永遠是常數。</p>
+
+  <p>把整個 <code>_ZTV12MultiDerived</code> 符號攤平在記憶體裡，能更清楚看到「一個符號、兩個 address point」是什麼意思。它是一塊連續的 <code>.rodata</code>，物件的兩個 vptr 各指進它的不同位置：</p>
+
+  <pre data-kind="output"><code>_ZTV12MultiDerived  <em>// 一塊連續資料，兩個 address point</em>
+  +0   offset-to-top = 0          <em>// ── primary 段 header</em>
+  +8   typeinfo = &amp;_ZTI12MultiDerived
+  +16  &amp;MultiDerived::left_func    <em>// ← Left subobject 的 vptr 指這（off 0）</em>
+  +24  &amp;MultiDerived::right_func   <em>// MultiDerived 新增的也 append 在此段</em>
+  +32  offset-to-top = -16        <em>// ── secondary 段 header</em>
+  +40  typeinfo = &amp;_ZTI12MultiDerived
+  +48  &amp;_ZThn16_...right_func      <em>// ← Right subobject 的 vptr 指這（off 16）</em></code></pre>
+
+  <p>注意兩段的 typeinfo 指標指向同一個 <code>_ZTI12MultiDerived</code>——無論你手上的是 <code>Left*</code> 還是 <code>Right*</code> 形態的 vptr，<code>typeid</code> 都能正確回答「這是個 <code>MultiDerived</code>」。差別只在 offset-to-top：primary 段是 0、secondary 段是 −16，RTTI 用它把任一 subobject 指標退回完整物件起點，再從那裡做 cross-cast。這就是 <code>dynamic_cast&lt;Left*&gt;(rightPtr)</code> 這種「跨同層 base 的橫向轉型」能成立的底層機制：先用 offset-to-top 退回完整物件，再用目標 base 的已知偏移前進。</p>
+
+  <p>下面這個分頁工具把三種繼承拓樸並排：切換 single / multiple / virtual，看 vtable group 從「一張表」長到「多個 vptr」再到「runtime 才能算出偏移」。每一頁附上對應的 layout 與決定性的那一行組語。</p>
+
+  <figure class="vg-w-tabs-itanium-inheritance">
+    <style>
+      .vg-w-tabs-itanium-inheritance { display: grid; gap: var(--s-2); }
+      .vg-w-tabs-itanium-inheritance input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-tabs-itanium-inheritance .tabs { display: flex; flex-wrap: wrap; gap: var(--s-2); border-bottom: 1px solid var(--line); }
+      .vg-w-tabs-itanium-inheritance .tab { font-family: var(--sans); font-size: var(--fs-sm); padding: var(--s-1) var(--s-2); cursor: pointer; color: var(--muted); min-height: 44px; display: flex; align-items: center; }
+      .vg-w-tabs-itanium-inheritance .tab:hover { color: var(--accent-text); }
+      .vg-w-tabs-itanium-inheritance .panel { display: none; padding: var(--s-2) 0; }
+      .vg-w-tabs-itanium-inheritance .panel h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-tabs-itanium-inheritance .panel p { margin: 0 0 var(--s-2) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-tabs-itanium-inheritance .panel pre { margin: 0 0 var(--s-2) 0; }
+      .vg-w-tabs-itanium-inheritance:has(#vg-w-tabs-itanium-inheritance-t1:checked) .panel-1 { display: block; }
+      .vg-w-tabs-itanium-inheritance:has(#vg-w-tabs-itanium-inheritance-t1:checked) [for="vg-w-tabs-itanium-inheritance-t1"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-itanium-inheritance:has(#vg-w-tabs-itanium-inheritance-t2:checked) .panel-2 { display: block; }
+      .vg-w-tabs-itanium-inheritance:has(#vg-w-tabs-itanium-inheritance-t2:checked) [for="vg-w-tabs-itanium-inheritance-t2"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-itanium-inheritance:has(#vg-w-tabs-itanium-inheritance-t3:checked) .panel-3 { display: block; }
+      .vg-w-tabs-itanium-inheritance:has(#vg-w-tabs-itanium-inheritance-t3:checked) [for="vg-w-tabs-itanium-inheritance-t3"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect width="18" height="18" x="3" y="3" rx="2"/><path d="M3 9h18"/><path d="M9 21V9"/>
+      </svg>
+      <span>switch tabs to compare 3 inheritance topologies · 3 tabs</span>
+    </p>
+    <input type="radio" id="vg-w-tabs-itanium-inheritance-t1" name="vg-w-tabs-itanium-inheritance-sel" aria-label="single inheritance" checked />
+    <input type="radio" id="vg-w-tabs-itanium-inheritance-t2" name="vg-w-tabs-itanium-inheritance-sel" aria-label="multiple inheritance" />
+    <input type="radio" id="vg-w-tabs-itanium-inheritance-t3" name="vg-w-tabs-itanium-inheritance-sel" aria-label="virtual inheritance" />
+    <div class="tabs">
+      <label class="tab" for="vg-w-tabs-itanium-inheritance-t1">single</label>
+      <label class="tab" for="vg-w-tabs-itanium-inheritance-t2">multiple</label>
+      <label class="tab" for="vg-w-tabs-itanium-inheritance-t3">virtual</label>
+    </div>
+
+    <div class="panel panel-1">
+      <h3>single · 一個 vptr，零調整</h3>
+      <p>物件只有一個 vptr 在 offset 0，offset-to-top 恆為 <code>0</code>。derived vtable 是 base vtable 的延伸，override 換內容、新虛擬函式 append。沒有 thunk，沒有指標調整，dispatch 就是兩條指令。</p>
+      <pre data-kind="output"><code>vtable _ZTV7Derived (一張表):
+  [-2] offset-to-top = 0
+  [-1] typeinfo      = &amp;_ZTI7Derived
+  [ 0] &amp;Derived::foo   <em>// override，內容換、index 不變</em>
+  [ 1] &amp;Base::bar      <em>// 沒 override</em>
+  [ 2] &amp;Derived::baz   <em>// 新虛擬函式 append</em></code></pre>
+      <pre><code class="language-nasm">    movq    (%rdi), %rax    ; 唯一的 vptr
+    jmp     *(%rax)          ; 直達，無調整</code></pre>
+    </div>
+
+    <div class="panel panel-2">
+      <h3>multiple · 多個 vptr，編譯期常數調整</h3>
+      <p><code>MultiDerived : Left, Right</code> 物件帶兩個 vptr：<code>Left</code> 在 offset 0、<code>Right</code> 在 offset 16。同一個 vtable 符號的兩個段，secondary 段的 offset-to-top = <code>-16</code>。呼叫 <code>Right</code> 的虛擬函式經過 non-virtual thunk，用編譯期常數 <code>subq $16</code> 把 <code>this</code> 調回去。</p>
+      <pre data-kind="output"><code>_ZTV12MultiDerived (一個符號，兩段):
+  primary (Left, off 0):
+    [-2] offset-to-top = 0
+    [ 0] &amp;MultiDerived::left_func
+  secondary (Right, off 16):
+    [-2] offset-to-top = -16   <em>// 給 RTTI 退回</em>
+    [ 0] &amp;_ZThn16_...right_func <em>// thunk，非直接函式</em></code></pre>
+      <pre><code class="language-nasm">    subq    $16, %rdi       ; 常數調整 this
+    jmp     .LTHUNK0         ; 再進真正的 right_func</code></pre>
+    </div>
+
+    <div class="panel panel-3">
+      <h3>virtual · 偏移要 runtime 才知道</h3>
+      <p>虛擬繼承下，virtual base 的位置依最派生型別而變——編譯期不知道常數。vtable 多出 <code>vptr[-3]</code> 放 vbase offset／vcall offset。virtual thunk 不能用常數，得先 <code>movq (%rdi), %r10</code> 載入 vptr，再 <code>addq -24(%r10), %rdi</code> 從 <code>vptr[-3]</code> 讀出 vcall offset 加到 <code>this</code>。多一次記憶體存取。</p>
+      <pre data-kind="output"><code>各 subobject 段的 vptr[-3]:
+  Left 段:   vbase offset = 16   <em>// Base 在 Left vptr +16</em>
+  Right 段:  vbase offset = 8    <em>// Base 在 Right vptr +8</em>
+  Base 段:   vcall offset = -16  <em>// 退回完整物件</em>
+  <em>// 同一個 Base，從不同 subobject 看偏移不同</em></code></pre>
+      <pre><code class="language-nasm">    movq    (%rdi), %r10    ; 載入 vptr
+    addq    -24(%r10), %rdi ; 從 vptr[-3] 讀 vcall offset
+    jmp     .LTHUNK0         ; runtime 算完才跳</code></pre>
+    </div>
+    <figcaption>三種繼承拓樸下 vtable group 的形狀。single 是一張表；multiple 是一個符號分多段、用編譯期常數調整；virtual 多出 <code>vptr[-3]</code>，調整量要 runtime 從表裡讀出。</figcaption>
+  </figure>
+
+  <h2>虛擬繼承的 vcall offset：runtime 才知道 base 在哪</h2>
+
+  <p>多重繼承的指標調整雖然煩，但調整量是編譯期常數。虛擬繼承把這個前提也拿掉了。虛擬繼承的目的是讓共同 base 在最派生物件裡只有一份（解決菱形繼承的 base 重複），代價是這份共同 base 的位置不再固定——它取決於最終的派生型別是誰。同一個 <code>Base</code>，在 <code>Derived : Left, Right</code> 裡的偏移，跟它單獨被 <code>Left</code> 繼承時的偏移完全不同。編譯 <code>Left</code> 的程式碼時，根本不知道未來它會被嵌進哪個更大的物件。</p>
+
+  <p>ABI 的解法是把偏移從「編譯期常數」升級成「runtime 從表裡讀出來的值」。這就是 <code>vptr[-3]</code> 這格的用途。在非虛擬 base 的 vtable 段裡，它放 vbase offset——「從這個 vptr 走到 virtual base 的距離」；在 virtual base 自己的 vtable 段裡，它放 vcall offset——「從這裡走回完整物件的距離」。以 <code>Derived : Left, Right</code>、兩者都 <code>virtual Base</code> 為例：</p>
+
+  <pre data-kind="output"><code><em>// 各段 vptr[-3] 的值（最派生型別 Derived 決定）</em>
+Left 的段:    vptr[-3] = 16     <em>// Base 在 Left vptr 之上 +16</em>
+Right 的段:   vptr[-3] = 8      <em>// Base 在 Right vptr 之上 +8</em>
+Base 的段:    vptr[-3] = -16    <em>// 完整物件在 Base vptr 之下 -16</em></code></pre>
+
+  <p>當你透過 <code>Base*</code> 呼叫一個在 <code>Derived</code> 裡被 override 的虛擬函式，slot 指向的是一個 virtual thunk。它不能寫死偏移，得在 runtime 把 vcall offset 讀出來：</p>
+
+  <pre><code class="language-nasm">_ZTv0_n24_N7Derived1fEv:
+    movq    (%rdi), %r10    ; 載入 this 的 vptr 到 %r10
+    addq    -24(%r10), %rdi ; 從 vptr[-3] (即 -24) 讀 vcall offset，加到 this
+    jmp     .LTHUNK0         ; 跳到 Derived::f()</code></pre>
+
+  <p>mangled name 是 <code>_ZTv0_n24_...</code>：<code>Tv</code> 是 virtual thunk，<code>0</code> 表示沒有額外的 non-virtual 調整，<code>n24</code> 指向 <code>vptr[-3]</code>（−24 byte）那格的 vcall offset。和 non-virtual thunk 的 <code>subq $16</code> 對比，差別一目了然：那邊是「立即數」，這邊是「先 <code>movq</code> 載入 vptr、再從 <code>-24(%r10)</code> 間接讀出調整量」——多一次記憶體存取，這就是虛擬繼承在 dispatch 路徑上額外付的代價。理解了這一點，「為什麼大家勸你避免虛擬繼承除非真的需要菱形去重」就有了具體的微觀根據：不是抽象的「複雜」，而是每次跨 virtual base 的呼叫多一次 load。</p>
+
+  <p>vbase offset 與 vcall offset 雖然都放在 <code>vptr[-3]</code> 的位置，用途要分清楚。vbase offset 解的是「資料存取」問題：當你在 <code>Left</code> 的成員函式裡存取 virtual base <code>Base</code> 的成員變數，編譯器不能用固定偏移（因為 <code>Left</code> 可能被嵌進任何更大的物件），於是它載入 <code>Left</code> 的 vptr、讀出 vbase offset、加到 <code>this</code>，得到 <code>Base</code> subobject 的位址，再從那裡存取成員。vcall offset 解的是「呼叫時的 <code>this</code> 調整」問題：當虛擬函式透過 virtual base 的 slot 被呼叫、而真正的實作在最派生型別，thunk 需要把 <code>this</code> 從 <code>Base</code> subobject 調回完整物件——但這個距離同樣依最派生型別而變，所以也得 runtime 讀出。兩者是「同一個 runtime-offset 機制」的兩種應用：一個給資料、一個給呼叫，都因為虛擬繼承讓位置不再是編譯期常數而存在。</p>
+
+  <p>實務上這牽出一個常被忽略的成本：在虛擬繼承的階層裡，光是「從派生型別存取一個 virtual base 的成員」就要先 load 一次 vbase offset。一個寫得密集、在迴圈裡反覆觸碰 virtual base 成員的函式，這些 load 會累積成可量測的開銷。編譯器在能證明 <code>this</code> 的動態型別時可以把 vbase offset hoist 出迴圈，但跨 translation unit 往往證不出來。這就是為什麼 virtual inheritance 在效能敏感的程式裡基本上被當成「最後手段」——它要解的菱形去重問題是真的，但凡能用組合（composition）或介面分離繞開的，通常都值得繞。</p>
+
+  <h2>construction vtable 與 VTT：建構途中的臨時表</h2>
+
+  <p>虛擬繼承還在物件的「建構期間」製造一個微妙的問題。建構子由內而外執行：先建 base subobject，再建 derived。但 base 的建構子執行時，物件還不是完整的 <code>Derived</code>——此時若 base 建構子呼叫一個虛擬函式，它應該解析到 <code>Base</code> 自己的版本，而不是還沒準備好的 <code>Derived</code> override。而且建構途中，virtual base 相對於正在建構的 subobject 的偏移，跟完成後的偏移可能不同。如果整個建構期間都用最終的 vtable，這些偏移會錯。</p>
+
+  <p>ABI 的對策是 construction vtable：對每個會被當成「base subobject」嵌入的型別，編譯器額外生成一份建構專用的 vtable，裡面的 vbase／vcall offset 是針對「在這個外層型別的建構脈絡下」校正過的。符號形如 <code>_ZTC7Derived0_4Left</code>——意思是「<code>Derived</code> 內、byte offset 0 處的 <code>Left</code> 的 construction vtable」。建構子在執行 base 建構的那一刻，先把 base subobject 的 vptr 指向這份 construction vtable，建完再換成最終 vtable。</p>
+
+  <p>把這些 construction vtable 餵給各個 base 建構子的調度表，叫做 VTT（Virtual Table Table）。<code>Derived</code> 的 VTT 是一個指標陣列，大致長這樣：</p>
+
+  <pre data-kind="output"><code>VTT for Derived (指標陣列):
+  [0] Derived 的 primary vtable
+  [1] Left 的 construction vtable    <em>// sub-VTT[0]</em>
+  [2] Base 的 construction vtable    <em>// sub-VTT[1]，給 Left 脈絡</em>
+  [3] Right 的 construction vtable   <em>// sub-VTT[0]</em>
+  [4] Base 的 construction vtable    <em>// sub-VTT[1]，給 Right 脈絡</em>
+  [5] 最終 Base vtable 指標
+  [6] 最終 Right vtable 指標</code></pre>
+
+  <p>建構子因此分裂成兩個變體。<code>C1</code> 是 complete-object constructor——public 入口，它負責先建好所有 virtual base（這是「只有最派生物件才建 virtual base」這條規則的執行點），再呼叫各 base 的 <code>C2</code>，最後裝上最終 vtable。<code>C2</code> 是 base-object constructor——內部用，它收到一片 sub-VTT 切片，按切片裡的指標裝上 construction vtable，並且<em>不</em>建構 virtual base（因為那是 C1 的責任，C2 只負責自己這層）。傳給 <code>Left</code> 的 C2 的 sub-VTT，就是上面 VTT 的 <code>[1]</code> 與 <code>[2]</code> 兩個指標——分別給 <code>Left</code> 自己和它脈絡下的 <code>Base</code>。（規範裡還有 <code>C3</code> allocating constructor，但多數實作不生成它，故 vtable 與 VTT 的調度只涉及 C1／C2。）</p>
+
+  <p>把 <code>new Derived</code> 整個建構流程攤成四階段，VTT 怎麼餵 construction vtable 就清楚了。點任一階段看 C1 在那一刻做什麼、物件的 vptr 此時指向哪張表。</p>
+
+  <figure class="vg-w-vtt-flow">
+    <style>
+      .vg-w-vtt-flow { display: flex; flex-direction: column; gap: var(--s-3); align-items: stretch; }
+      .vg-w-vtt-flow input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-vtt-flow .stack-title { font-family: IM Fell English, serif; font-style: italic; font-size: var(--fs-md); margin: 0 0 var(--s-1) 0; color: var(--ink); line-height: 1.4; }
+      .vg-w-vtt-flow .stack-cards { display: flex; flex-direction: column; gap: var(--s-1); list-style: none; padding: 0; margin: 0; }
+      .vg-w-vtt-flow .stack-cards label { display: block; padding: var(--s-2); border: 1px solid var(--muted-2); border-radius: 2px; cursor: pointer; transition: border-color 200ms, background 200ms; min-height: 44px; }
+      .vg-w-vtt-flow .stack-cards label:hover { border-color: var(--accent); }
+      .vg-w-vtt-flow .stack-cards .card-head { font-family: EB Garamond, serif; font-size: var(--fs-md); margin: 0 0 4px 0; color: var(--ink); display: flex; align-items: baseline; justify-content: space-between; gap: var(--s-2); flex-wrap: wrap; }
+      .vg-w-vtt-flow .stack-cards .card-sub { font-family: IM Fell English, serif; font-style: italic; font-size: var(--fs-sm); color: var(--muted); margin: 0; line-height: 1.5; }
+      .vg-w-vtt-flow .stack-cards .card-tag { font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); color: var(--accent-text); font-style: normal; }
+      .vg-w-vtt-flow:has(#vg-w-vtt-flow-r1:checked) .card-1 { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+      .vg-w-vtt-flow:has(#vg-w-vtt-flow-r2:checked) .card-2 { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+      .vg-w-vtt-flow:has(#vg-w-vtt-flow-r3:checked) .card-3 { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+      .vg-w-vtt-flow:has(#vg-w-vtt-flow-r4:checked) .card-4 { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+      .vg-w-vtt-flow svg.diagram { display: none; }
+      @media (min-width: 720px) {
+        .vg-w-vtt-flow svg.diagram { display: block; width: 100%; height: auto; max-width: 880px; }
+        .vg-w-vtt-flow .stack-title { display: none; }
+        .vg-w-vtt-flow .stack-cards { display: none; }
+      }
+      .vg-w-vtt-flow .step { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; transition: fill 200ms, stroke 200ms; }
+      .vg-w-vtt-flow .step:hover { stroke: var(--accent); }
+      .vg-w-vtt-flow .step:focus { outline: none; }
+      .vg-w-vtt-flow .step:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+      .vg-w-vtt-flow .step-text { pointer-events: none; font-family: JetBrains Mono, monospace; font-size: 13px; }
+      .vg-w-vtt-flow .step-sub { pointer-events: none; font-family: IM Fell English, serif; font-style: italic; font-size: 12px; fill: var(--muted); }
+      .vg-w-vtt-flow .arr { stroke: var(--muted-2); stroke-width: 2; fill: none; }
+      .vg-w-vtt-flow .head { font-family: IM Fell English, serif; font-style: italic; font-size: 14px; }
+      .vg-w-vtt-flow:has(#vg-w-vtt-flow-r1:checked) .step-1 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+      .vg-w-vtt-flow:has(#vg-w-vtt-flow-r2:checked) .step-2 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+      .vg-w-vtt-flow:has(#vg-w-vtt-flow-r3:checked) .step-3 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+      .vg-w-vtt-flow:has(#vg-w-vtt-flow-r4:checked) .step-4 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+      .vg-w-vtt-flow .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+      .vg-w-vtt-flow .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-vtt-flow .detail p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-vtt-flow .hint { font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin: 0 0 var(--s-1) 0; }
+      .vg-w-vtt-flow:has(#vg-w-vtt-flow-r1:checked) .detail-1 { display: block; }
+      .vg-w-vtt-flow:has(#vg-w-vtt-flow-r2:checked) .detail-2 { display: block; }
+      .vg-w-vtt-flow:has(#vg-w-vtt-flow-r3:checked) .detail-3 { display: block; }
+      .vg-w-vtt-flow:has(#vg-w-vtt-flow-r4:checked) .detail-4 { display: block; }
+    </style>
+
+    <input type="radio" id="vg-w-vtt-flow-r1" name="vg-w-vtt-flow-sel" aria-label="stage 1 build virtual base" checked />
+    <input type="radio" id="vg-w-vtt-flow-r2" name="vg-w-vtt-flow-sel" aria-label="stage 2 call Left C2" />
+    <input type="radio" id="vg-w-vtt-flow-r3" name="vg-w-vtt-flow-sel" aria-label="stage 3 call Right C2" />
+    <input type="radio" id="vg-w-vtt-flow-r4" name="vg-w-vtt-flow-sel" aria-label="stage 4 install final vtable" />
+
+    <p class="stack-title" id="vg-w-vtt-flow-title">Derived 的 C1 建構流程——VTT 怎麼餵 construction vtable</p>
+    <ul class="stack-cards" aria-labelledby="vg-w-vtt-flow-title">
+      <li class="card-1"><label for="vg-w-vtt-flow-r1">
+        <p class="card-head"><span>① C1 先建 virtual base</span><code class="card-tag">C1 only</code></p>
+        <p class="card-sub">最派生的 C1 負責建 Base（virtual base 全物件只一份），vptr 暫指 Base 的 construction vtable。</p>
+      </label></li>
+      <li class="card-2"><label for="vg-w-vtt-flow-r2">
+        <p class="card-head"><span>② 呼 Left::C2，餵 sub-VTT[0..1]</span><code class="card-tag">VTT[1],[2]</code></p>
+        <p class="card-sub">C2 收到切片，把 Left subobject 的 vptr 裝成 Left 的 construction vtable，不碰 virtual base。</p>
+      </label></li>
+      <li class="card-3"><label for="vg-w-vtt-flow-r3">
+        <p class="card-head"><span>③ 呼 Right::C2，餵 sub-VTT[0..1]</span><code class="card-tag">VTT[3],[4]</code></p>
+        <p class="card-sub">同樣裝 Right 脈絡的 construction vtable。此刻虛擬呼叫只會分派到 Right，不會誤入 Derived。</p>
+      </label></li>
+      <li class="card-4"><label for="vg-w-vtt-flow-r4">
+        <p class="card-head"><span>④ 裝最終 vtable</span><code class="card-tag">VTT[0]</code></p>
+        <p class="card-sub">各 base 建完，C1 把所有 vptr 改指最終 Derived vtable。從這一刻起虛擬呼叫才分派到 override。</p>
+      </label></li>
+    </ul>
+
+    <svg class="diagram" viewBox="0 0 880 360" role="img"
+         aria-label="Derived 的 C1 建構四階段——先建 virtual base、再以 VTT 切片餵各 base 的 C2、最後裝上最終 vtable">
+      <text x="440" y="24" text-anchor="middle" fill="var(--ink)" class="head">C1 由內向外建構，VTT 切片逐層餵 construction vtable，最後才裝最終表</text>
+
+      <rect class="step step-1" data-target="vg-w-vtt-flow-r1" role="button" tabindex="0" aria-label="stage 1" x="40" y="52" width="800" height="58" />
+      <text x="58" y="78" fill="var(--ink)" class="step-text">① C1 先建 virtual base（Base）</text>
+      <text x="58" y="98" fill="var(--muted)" class="step-sub">vptr 暫指 Base construction vtable · 只有最派生 C1 做這步</text>
+      <text x="822" y="86" text-anchor="end" fill="var(--accent-text)" class="step-sub">C1 only</text>
+      <path class="arr" d="M 440 110 L 440 124" marker-end="url(#vg-w-vtt-flow-ar)" />
+
+      <rect class="step step-2" data-target="vg-w-vtt-flow-r2" role="button" tabindex="0" aria-label="stage 2" x="40" y="128" width="800" height="58" />
+      <text x="58" y="154" fill="var(--ink)" class="step-text">② 呼 Left::C2，傳 sub-VTT = VTT[1],[2]</text>
+      <text x="58" y="174" fill="var(--muted)" class="step-sub">C2 裝 Left construction vtable，不建 virtual base</text>
+      <text x="822" y="162" text-anchor="end" fill="var(--accent-text)" class="step-sub">VTT[1],[2]</text>
+      <path class="arr" d="M 440 186 L 440 200" marker-end="url(#vg-w-vtt-flow-ar)" />
+
+      <rect class="step step-3" data-target="vg-w-vtt-flow-r3" role="button" tabindex="0" aria-label="stage 3" x="40" y="204" width="800" height="58" />
+      <text x="58" y="230" fill="var(--ink)" class="step-text">③ 呼 Right::C2，傳 sub-VTT = VTT[3],[4]</text>
+      <text x="58" y="250" fill="var(--muted)" class="step-sub">同樣裝 Right construction vtable，仍不建 virtual base</text>
+      <text x="822" y="238" text-anchor="end" fill="var(--accent-text)" class="step-sub">VTT[3],[4]</text>
+      <path class="arr" d="M 440 262 L 440 276" marker-end="url(#vg-w-vtt-flow-ar)" />
+
+      <rect class="step step-4" data-target="vg-w-vtt-flow-r4" role="button" tabindex="0" aria-label="stage 4" x="40" y="280" width="800" height="58" />
+      <text x="58" y="306" fill="var(--ink)" class="step-text">④ C1 裝最終 Derived vtable（VTT[0]）</text>
+      <text x="58" y="326" fill="var(--muted)" class="step-sub">所有 vptr 改指最終表 · 之後虛擬呼叫才分派到 override</text>
+      <text x="822" y="314" text-anchor="end" fill="var(--accent-text)" class="step-sub">VTT[0]</text>
+
+      <defs>
+        <marker id="vg-w-vtt-flow-ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--muted-2)" />
+        </marker>
+      </defs>
+    </svg>
+
+    <div>
+      <p class="hint">click any stage above · 4 stages</p>
+      <div class="detail detail-1">
+        <h3>① C1 建 virtual base</h3>
+        <p>complete-object constructor 的第一件事是建好全物件唯一的那份 virtual base <code>Base</code>。這是「只有最派生型別才建 virtual base」這條規則的執行點——任何中間層的 C2 都被告知別碰它。建完後，<code>Base</code> subobject 的 vptr 先指向 <code>Base</code> 的 construction vtable，而非最終表。</p>
+        <p><strong>此刻 vptr</strong>：指向 construction vtable，虛擬呼叫分派到 <code>Base</code> 自己的版本。</p>
+      </div>
+      <div class="detail detail-2">
+        <h3>② Left::C2 + sub-VTT</h3>
+        <p>C1 呼叫 <code>Left</code> 的 base-object constructor，並把 VTT 的 <code>[1]</code>、<code>[2]</code> 兩個指標當成 sub-VTT 切片傳進去。C2 用切片裡的指標把 <code>Left</code> subobject 的 vptr 裝成 <code>Left</code> 脈絡的 construction vtable——裡面的 vbase offset 是「在 <code>Derived</code> 裡的 <code>Left</code>」校正過的值。C2 不建 virtual base。</p>
+        <p><strong>此刻 vptr</strong>：<code>Left</code> 段指向 Left construction vtable，呼到 <code>Left</code> 的版本。</p>
+      </div>
+      <div class="detail detail-3">
+        <h3>③ Right::C2 + sub-VTT</h3>
+        <p>對 <code>Right</code> 重複同一套：傳 VTT 的 <code>[3]</code>、<code>[4]</code> 切片，裝上 <code>Right</code> 脈絡的 construction vtable。關鍵不變量是——在這個視窗裡，物件的動態型別「就是正在建的那層」，虛擬呼叫絕不會跳進尚未初始化的 <code>Derived</code> override。</p>
+        <p><strong>此刻 vptr</strong>：<code>Right</code> 段指向 Right construction vtable。</p>
+      </div>
+      <div class="detail detail-4">
+        <h3>④ 裝最終 vtable</h3>
+        <p>所有 base 都建完，C1 做最後一步：把每個 subobject 的 vptr 從 construction vtable 改指最終的 <code>Derived</code> vtable（VTT 的 <code>[0]</code>）。從這一刻起，物件正式「成為 <code>Derived</code>」，虛擬呼叫才會分派到 <code>Derived</code> 的 override。這正是「建構子裡呼虛擬函式不會分派到 derived」的物理原因——那一刻 vptr 還沒走到第④步。</p>
+        <p><strong>此刻 vptr</strong>：指向最終 Derived vtable，多型完全就位。</p>
+      </div>
+    </div>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-vtt-flow');
+        root.querySelectorAll('.step').forEach((rect) => {
+          rect.addEventListener('click', () => {
+            const targetId = rect.getAttribute('data-target');
+            const radio = root.querySelector('#' + targetId);
+            if (radio) radio.checked = true;
+          });
+          rect.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              rect.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            }
+          });
+        });
+      })();
+    </script>
+    <figcaption>菱形 <code>Derived : Left, Right</code>（兩者 <code>virtual Base</code>）的 C1 建構流程。C1 先建唯一的 virtual base，再用 VTT 切片把 construction vtable 餵給各 base 的 C2，最後才把全部 vptr 改指最終 vtable。建構途中 vptr 逐層「升級」，這就是建構子內虛擬呼叫不分派到 derived 的根本機制。</figcaption>
+  </figure>
+
+  <p>為什麼非得在建構途中換 vtable？因為「建構期間呼叫虛擬函式」這件合法但危險的事必須有明確定義。設想 <code>Base</code> 的建構子裡呼叫了一個虛擬函式 <code>f</code>，而 <code>Derived</code> override 了 <code>f</code>。標準規定：在 <code>Base</code> 建構子執行期間，物件的動態型別「就是 <code>Base</code>」，所以呼到的必須是 <code>Base::f</code>，不是 <code>Derived::f</code>——後者會碰到還沒初始化的 <code>Derived</code> 成員。要讓這條規則成立，<code>Base</code> 建構子執行時物件的 vptr 必須指向 <code>Base</code> 的（或建構脈絡校正過的）vtable，而不是最終的 <code>Derived</code> vtable。於是建構過程中 vptr 被逐步「升級」：每進入一層 base 建構子就指向那層的 vtable，全部建完後 C1 才裝上最終表。construction vtable 與 VTT 就是這套「逐步升級」在虛擬繼承下的延伸——因為虛擬繼承還額外要求建構途中的 vbase／vcall offset 也得是當下脈絡正確的值。</p>
+
+  <p>這套機制有一個直接的可觀察後果，值得寫進每個 C++ 工程師的肌肉記憶：<em>在建構子或解構子裡呼叫虛擬函式，永遠不會分派到 derived 的 override</em>。很多人把這當成一條要背的規則，但從 ABI 看它根本不是規則，而是 vptr 在那一刻「物理上就還沒指向 derived vtable」的必然結果。同理，純虛擬函式如果在建構期間被（間接）呼叫，會撞上 <code>__cxa_pure_virtual</code>——因為建構脈絡的 vtable 在那個 slot 放的正是這個錯誤處理函式。理解佈局，這些「規則」就退化成可以推導出來的事實。</p>
+
+  <p>解構走對稱的三變體，正好對應前面 vtable 圖裡看到的兩格加上一個隱藏的第三格。下面這個工具把三個變體攤開——點任一個看它解構什麼、誰擁有 virtual base。</p>
+
+  <figure class="vg-w-stack-itanium-dtor">
+    <style>
+      .vg-w-stack-itanium-dtor { display: flex; flex-direction: column; gap: var(--s-3); align-items: stretch; }
+      .vg-w-stack-itanium-dtor input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-stack-itanium-dtor .stack-title { font-family: IM Fell English, serif; font-style: italic; font-size: var(--fs-md); margin: 0 0 var(--s-1) 0; color: var(--ink); line-height: 1.4; }
+      .vg-w-stack-itanium-dtor .stack-cards { display: flex; flex-direction: column; gap: var(--s-1); list-style: none; padding: 0; margin: 0; }
+      .vg-w-stack-itanium-dtor .stack-cards label { display: block; padding: var(--s-2); border: 1px solid var(--muted-2); border-radius: 2px; cursor: pointer; transition: border-color 200ms, background 200ms; min-height: 44px; }
+      .vg-w-stack-itanium-dtor .stack-cards label:hover { border-color: var(--accent); }
+      .vg-w-stack-itanium-dtor .stack-cards .card-head { font-family: EB Garamond, serif; font-size: var(--fs-md); margin: 0 0 4px 0; color: var(--ink); display: flex; align-items: baseline; justify-content: space-between; gap: var(--s-2); flex-wrap: wrap; }
+      .vg-w-stack-itanium-dtor .stack-cards .card-sub { font-family: IM Fell English, serif; font-style: italic; font-size: var(--fs-sm); color: var(--muted); margin: 0; line-height: 1.5; }
+      .vg-w-stack-itanium-dtor .stack-cards .card-tag { font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); color: var(--accent-text); font-style: normal; }
+      .vg-w-stack-itanium-dtor:has(#vg-w-stack-itanium-dtor-r1:checked) .card-1 { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+      .vg-w-stack-itanium-dtor:has(#vg-w-stack-itanium-dtor-r2:checked) .card-2 { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+      .vg-w-stack-itanium-dtor:has(#vg-w-stack-itanium-dtor-r3:checked) .card-3 { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+      .vg-w-stack-itanium-dtor svg.diagram { display: none; }
+      @media (min-width: 720px) {
+        .vg-w-stack-itanium-dtor svg.diagram { display: block; width: 100%; height: auto; max-width: 880px; }
+        .vg-w-stack-itanium-dtor .stack-title { display: none; }
+        .vg-w-stack-itanium-dtor .stack-cards { display: none; }
+      }
+      .vg-w-stack-itanium-dtor .layer { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; transition: fill 200ms, stroke 200ms; }
+      .vg-w-stack-itanium-dtor .layer:hover { stroke: var(--accent); }
+      .vg-w-stack-itanium-dtor .layer:focus { outline: none; }
+      .vg-w-stack-itanium-dtor .layer:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+      .vg-w-stack-itanium-dtor .layer-text { pointer-events: none; font-family: JetBrains Mono, monospace; font-size: 13px; }
+      .vg-w-stack-itanium-dtor .layer-sub { pointer-events: none; font-family: IM Fell English, serif; font-style: italic; font-size: 12px; fill: var(--muted); }
+      .vg-w-stack-itanium-dtor .head { font-family: IM Fell English, serif; font-style: italic; font-size: 14px; }
+      .vg-w-stack-itanium-dtor:has(#vg-w-stack-itanium-dtor-r1:checked) .layer-1 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+      .vg-w-stack-itanium-dtor:has(#vg-w-stack-itanium-dtor-r2:checked) .layer-2 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+      .vg-w-stack-itanium-dtor:has(#vg-w-stack-itanium-dtor-r3:checked) .layer-3 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+      .vg-w-stack-itanium-dtor .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+      .vg-w-stack-itanium-dtor .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-stack-itanium-dtor .detail p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-stack-itanium-dtor .hint { font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin: 0 0 var(--s-1) 0; }
+    </style>
+
+    <input type="radio" id="vg-w-stack-itanium-dtor-r1" name="vg-w-stack-itanium-dtor-sel" aria-label="D0 deleting" checked />
+    <input type="radio" id="vg-w-stack-itanium-dtor-r2" name="vg-w-stack-itanium-dtor-sel" aria-label="D1 complete-object" />
+    <input type="radio" id="vg-w-stack-itanium-dtor-r3" name="vg-w-stack-itanium-dtor-sel" aria-label="D2 base-object" />
+
+    <p class="stack-title" id="vg-w-stack-itanium-dtor-title">三個解構子變體——誰拆什麼、誰擁有 virtual base</p>
+    <ul class="stack-cards" aria-labelledby="vg-w-stack-itanium-dtor-title">
+      <li class="card-1"><label for="vg-w-stack-itanium-dtor-r1">
+        <p class="card-head"><span>D0 · deleting</span><code class="card-tag">vtable slot</code></p>
+        <p class="card-sub">先呼 D1，再呼 operator delete 釋放記憶體。delete p 走的就是這個 slot。</p>
+      </label></li>
+      <li class="card-2"><label for="vg-w-stack-itanium-dtor-r2">
+        <p class="card-head"><span>D1 · complete-object</span><code class="card-tag">vtable slot</code></p>
+        <p class="card-sub">解構成員與 base、最後解構 virtual base，但不釋放記憶體。stack 物件離 scope 走這個。</p>
+      </label></li>
+      <li class="card-3"><label for="vg-w-stack-itanium-dtor-r3">
+        <p class="card-head"><span>D2 · base-object</span><code class="card-tag">不入 vtable</code></p>
+        <p class="card-sub">只解構 subobject 自己，跳過 virtual base——virtual base 由最派生的 D1 統一拆。</p>
+      </label></li>
+    </ul>
+
+    <svg class="diagram" viewBox="0 0 880 320" role="img"
+         aria-label="三個解構子變體 D0 / D1 / D2 的責任邊界與 virtual base 擁有權">
+      <text x="440" y="26" text-anchor="middle" fill="var(--ink)" class="head">解構三變體——只有最派生的 D1 擁有 virtual base 的拆解</text>
+
+      <rect class="layer layer-1" data-target="vg-w-stack-itanium-dtor-r1" role="button" tabindex="0" aria-label="D0 deleting destructor" x="60" y="56" width="760" height="64" />
+      <text x="80" y="84" fill="var(--ink)" class="layer-text">D0 · deleting destructor</text>
+      <text x="80" y="106" fill="var(--muted)" class="layer-sub">呼 D1 → 呼 operator delete 釋放記憶體 · delete p 走此 slot</text>
+      <text x="800" y="92" text-anchor="end" fill="var(--accent-text)" class="layer-sub">in vtable</text>
+
+      <rect class="layer layer-2" data-target="vg-w-stack-itanium-dtor-r2" role="button" tabindex="0" aria-label="D1 complete-object destructor" x="60" y="132" width="760" height="64" />
+      <text x="80" y="160" fill="var(--ink)" class="layer-text">D1 · complete-object destructor</text>
+      <text x="80" y="182" fill="var(--muted)" class="layer-sub">解構成員 + base + virtual base，不釋放記憶體 · stack 物件離 scope</text>
+      <text x="800" y="168" text-anchor="end" fill="var(--accent-text)" class="layer-sub">in vtable · owns vbase</text>
+
+      <rect class="layer layer-3" data-target="vg-w-stack-itanium-dtor-r3" role="button" tabindex="0" aria-label="D2 base-object destructor" x="60" y="208" width="760" height="64" />
+      <text x="80" y="236" fill="var(--ink)" class="layer-text">D2 · base-object destructor</text>
+      <text x="80" y="258" fill="var(--muted)" class="layer-sub">只拆 subobject，跳過 virtual base · 不出現在 vtable，直接呼叫</text>
+      <text x="800" y="244" text-anchor="end" fill="var(--muted)" class="layer-sub">not in vtable</text>
+
+      <text x="440" y="300" text-anchor="middle" fill="var(--muted)" class="layer-sub">對稱於建構：C1 建 virtual base、C2 不建；D1 拆 virtual base、D2 不拆</text>
+    </svg>
+
+    <div>
+      <p class="hint">click any variant above · 3 variants</p>
+      <div class="detail detail-1">
+        <h3>D0 · deleting destructor</h3>
+        <p>排在 vtable 的解構子第二格（<code>vptr[3]</code>）。<code>delete p</code>（<code>p</code> 是多型指標）透過虛擬分派找到的就是它：先執行 D1 把物件拆乾淨，再呼 <code>operator delete</code> 把那塊記憶體還給 allocator。把「拆」與「釋放」綁成一格，是因為釋放需要知道完整物件的起點與大小，而那只有 D0 在多型脈絡下能正確取得。</p>
+        <p><strong>誰擁有 virtual base</strong>：透過它呼到的 D1 擁有；D0 自己只多管一個 <code>operator delete</code>。</p>
+      </div>
+      <div class="detail detail-2">
+        <h3>D1 · complete-object destructor</h3>
+        <p>排在 vtable 解構子第一格（<code>vptr[2]</code>）。它解構成員、呼叫各 base 的 <code>D2</code>、最後解構 virtual base——但不釋放記憶體。stack 上的物件離開 scope 時走這條（通常 inline，不查表）。「最派生的 D1 才拆 virtual base」是整套機制的關鍵不變量：因為 virtual base 在物件裡只有一份，必須恰好被拆一次。</p>
+        <p><strong>誰擁有 virtual base</strong>：就是它。所有 base 的 D2 都被告知「別碰 virtual base」，留給最派生的 D1 統一處理。</p>
+      </div>
+      <div class="detail detail-3">
+        <h3>D2 · base-object destructor</h3>
+        <p>不出現在 vtable。當 D1 解構各個 base subobject 時，直接（非虛擬地）呼叫每個 base 的 D2。D2 只拆 subobject 自己的成員與它的非虛擬 base，<em>跳過</em> virtual base。如果 D2 也去拆 virtual base，菱形繼承下同一份 virtual base 會被拆兩次——double free。</p>
+        <p><strong>誰擁有 virtual base</strong>：不是它。D2 的存在意義恰恰是「不擁有」，把擁有權集中到最派生的 D1。</p>
+      </div>
+    </div>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-stack-itanium-dtor');
+        root.querySelectorAll('.layer').forEach((rect) => {
+          rect.addEventListener('click', () => {
+            const targetId = rect.getAttribute('data-target');
+            const radio = root.querySelector('#' + targetId);
+            if (radio) radio.checked = true;
+          });
+          rect.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              rect.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            }
+          });
+        });
+      })();
+    </script>
+    <figcaption>三個解構子變體。D0／D1 進 vtable（佔兩格），D2 只在 base subobject 拆解時被直接呼叫。virtual base 的拆解權集中在最派生的 D1，避免菱形繼承下的 double free。</figcaption>
+  </figure>
+
+  <h2>dispatch 路徑與兩種 thunk：一次呼叫到底踩過什麼</h2>
+
+  <p>把所有元件接回最開頭那兩條指令。最理想的情形——單一繼承、呼叫的虛擬函式定義在物件自己的型別上——dispatch 就是字面上的兩條：</p>
+
+  <pre><code class="language-nasm">    movq    (%rdi), %rax    ; 載入 vptr
+    jmp     *(%rax)          ; tail-call 第一個虛擬函式</code></pre>
+
+  <p>沒有 thunk、沒有指標調整、沒有 header 存取。但只要拓樸變複雜，slot 指向的就不再是函式本身，而是一段 thunk，而 thunk 有兩種，差別正是前面累積下來的所有東西的縮影。non-virtual thunk 用編譯期常數調整 <code>this</code>（<code>subq $16, %rdi</code>），出現在多重繼承呼叫非主要 base 的虛擬函式時；virtual thunk 必須在 runtime 從 <code>vptr[-3]</code> 讀出 vcall offset 再調整（<code>movq (%rdi), %r10</code> / <code>addq -24(%r10), %rdi</code>），出現在虛擬繼承跨 virtual base 呼叫時。下面的表把這兩種 thunk 與直接 dispatch 放在一起比較——點欄位標題排序，注意「記憶體存取次數」這一欄如何隨拓樸增加。</p>
+
+  <figure class="vg-w-table-itanium-thunks">
+    <style>
+      .vg-w-table-itanium-thunks { overflow-x: auto; }
+      .vg-w-table-itanium-thunks table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-itanium-thunks thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; }
+      .vg-w-table-itanium-thunks thead th[data-sort] { color: var(--accent-text); }
+      .vg-w-table-itanium-thunks thead th[data-sort]::after { content: ' ▾'; font-size: 0.7em; }
+      .vg-w-table-itanium-thunks thead th[data-sort="asc"]::after { content: ' ▴'; font-size: 0.7em; }
+      .vg-w-table-itanium-thunks tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+      .vg-w-table-itanium-thunks td.num { font-variant-numeric: tabular-nums; text-align: right; }
+      .vg-w-table-itanium-thunks td.code { font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); color: var(--ink-soft); }
+      .vg-w-table-itanium-thunks td.kind { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-table-itanium-thunks tbody tr:hover td { background: var(--bg-soft); }
+      .vg-w-table-itanium-thunks caption { text-align: left; caption-side: top; font-family: var(--scribed); font-style: italic; color: var(--muted); font-size: var(--fs-sm); padding: var(--s-1) 0; }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/><path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+      </svg>
+      <span>click column header to sort · 5 columns × 4 rows</span>
+    </p>
+    <table>
+      <caption>dispatch 與兩種 thunk 的對比。「mem 存取」指調整 <code>this</code> 額外讀記憶體的次數（不含 dispatch 必有的 vptr 載入）。點欄位標題排序。</caption>
+      <thead>
+        <tr>
+          <th data-key="path">路徑</th>
+          <th data-key="topo">出現拓樸</th>
+          <th data-key="adjust">this 調整</th>
+          <th data-key="mem" class="num">調整的 mem 存取</th>
+          <th data-key="mangle">mangle 前綴</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>direct dispatch</td>
+          <td>single inheritance</td>
+          <td class="code">無</td>
+          <td class="num" data-mem="0">0</td>
+          <td class="code">（無 thunk）</td>
+        </tr>
+        <tr>
+          <td>primary-base 呼叫</td>
+          <td>multiple（主要 base）</td>
+          <td class="code">無</td>
+          <td class="num" data-mem="0">0</td>
+          <td class="code">（無 thunk）</td>
+        </tr>
+        <tr>
+          <td>non-virtual thunk</td>
+          <td>multiple（非主要 base）</td>
+          <td class="code">subq $16, %rdi（常數）</td>
+          <td class="num" data-mem="0">0</td>
+          <td class="kind">_ZThn16_</td>
+        </tr>
+        <tr>
+          <td>virtual thunk</td>
+          <td>virtual inheritance</td>
+          <td class="code">addq -24(%r10), %rdi（runtime 讀）</td>
+          <td class="num" data-mem="1">1</td>
+          <td class="kind">_ZTv0_n24_</td>
+        </tr>
+      </tbody>
+    </table>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-table-itanium-thunks');
+        const headers = root.querySelectorAll('thead th');
+        const tbody = root.querySelector('tbody');
+        let activeKey = null, asc = true;
+        headers.forEach((h, idx) => h.addEventListener('click', () => {
+          const key = h.dataset.key;
+          if (activeKey === key) asc = !asc; else { activeKey = key; asc = true; }
+          headers.forEach((x) => x.removeAttribute('data-sort'));
+          h.setAttribute('data-sort', asc ? 'asc' : 'desc');
+          const rows = Array.from(tbody.querySelectorAll('tr'));
+          rows.sort((a, b) => {
+            let av, bv;
+            if (key === 'mem') {
+              av = Number(a.children[idx].getAttribute('data-mem'));
+              bv = Number(b.children[idx].getAttribute('data-mem'));
+            } else {
+              av = a.children[idx].textContent.trim();
+              bv = b.children[idx].textContent.trim();
+            }
+            const cmp = av < bv ? -1 : av > bv ? 1 : 0;
+            return asc ? cmp : -cmp;
+          });
+          rows.forEach((r) => tbody.appendChild(r));
+        }));
+      })();
+    </script>
+    <figcaption>四種 dispatch 路徑。直接 dispatch 與主要 base 呼叫零調整；non-virtual thunk 用編譯期常數調整（仍是零額外 mem 存取）；只有 virtual thunk 必須在 runtime 多讀一次 vcall offset。這一欄就是虛擬繼承在熱路徑上付出的全部代價。</figcaption>
+  </figure>
+
+  <p>把這張表豎著讀一遍，virtual dispatch「真正的代價」就清楚了。代價不是那兩條 dispatch 指令本身——<code>movq</code> 加一個間接 <code>jmp</code>，分支預測器熟悉得很，在現代 CPU 上幾乎免費。代價也不在 non-virtual thunk——一條 <code>subq</code> 立即數，連記憶體都不碰。真正多出來的東西只有兩處：其一是 vtable 佔的那塊 <code>.rodata</code> 與每個多型物件多出的 vptr 欄位（空間，不是時間）；其二是虛擬繼承的 virtual thunk 那一次額外的 <code>addq -24(%r10), %rdi</code> 間接讀取（時間，但只在虛擬繼承下）。日常的單一繼承多型，付的幾乎只是「一個指標的空間 + 一次可預測的間接跳躍」。</p>
+
+  <p>順帶釐清一個常見誤解：vtable dispatch 之所以難被 inline，不是因為查表慢，而是因為編譯器在呼叫點通常無法靜態證明 <code>vptr</code> 指向哪張表，於是無法把目標函式攤平進來——這是去虛擬化（devirtualization）優化想解決的問題，跟 dispatch 本身的指令成本是兩回事。理解了佈局，你也就明白為什麼 final、為什麼 LTO 下的 speculative devirtualization 能把熱路徑上的虛擬呼叫消掉：它們都是在幫編譯器把「<code>vptr</code> 一定指向這張表」這個事實補上。</p>
+
+  <p>還有一層成本是這張表沒畫出來、但在真實系統裡常常更貴的：cache 與分支預測。dispatch 的 <code>movq (%rdi), %rax</code> 要先把物件的 vptr 讀進來，再 <code>jmp *(%rax)</code> 從 vtable 讀目標位址——這是兩次相依的記憶體讀取，若 vptr 或 vtable 不在 cache 裡，dispatch 會 stall 在 load 上，而不是 stall 在「分派邏輯」上。間接 <code>jmp</code> 的目標若不被分支目標預測器（BTB）命中，還會吃一次 mispredict 的 pipeline flush。一個在多型集合上跑的迴圈，如果每次 iteration 物件的動態型別都不同，BTB 命中率會掉、dispatch 的實際成本遠高於「兩條指令」的字面值。這也是為什麼「把同型別物件排在一起批次處理」（type-based sorting）能讓多型迴圈顯著加速——它讓間接跳躍變得可預測。virtual dispatch 真正的代價，到頭來更多是記憶體階層與預測器的代價，而非 ABI 攤出來那幾條指令本身。</p>
+
+  <p>最後值得記住的對照：ABI 把這一切設計成「以空間換時間」。每個多型物件多帶一個指標寬度的 vptr，每個多型型別在二進位裡多一塊 vtable／typeinfo／VTT——這些是固定的空間成本，換來的是 dispatch 在時間上盡可能便宜。對絕大多數應用，這個交換划算到不必多想；只有在物件數量極大（每個物件 8 bytes 的 vptr 開始佔記憶體）、或在 dispatch 落在最內層熱迴圈且型別高度發散時，才需要回頭考慮「是否真的需要多型」。這正是 data-oriented design、ECS 那一派把多型換成 tagged union 或 SoA 的微觀動機：他們不是討厭多型，是在特定 workload 下不願付這套佈局的空間與預測成本。</p>
+
+  <p>這些東西都不是只能在腦中推演——它們全部是可以直接看到的真實符號。<code>g++ -fdump-lang-class</code>（舊版是 <code>-fdump-class-hierarchy</code>）會把每個型別的 vtable 佈局、VTT 結構、construction vtable 全部 dump 成文字，offset-to-top、vbase offset、vcall offset 的具體值一覽無遺。編譯產物上用 <code>nm</code> 或 <code>objdump -d</code> 搭配 <code>c++filt</code>，能看到 <code>_ZTV</code>、<code>_ZTI</code>、<code>_ZTS</code>、<code>_ZTC</code>、<code>_ZTT</code>、以及 <code>_ZThn16_</code> / <code>_ZTv0_n24_</code> 這些 thunk 符號被 c++filt 還原成人類可讀的形式。下次你對某個多型呼叫的成本沒把握，與其猜，不如直接 dump 出來數那幾條指令、看那個 slot 指向函式還是 thunk。</p>
+
+  <pre data-kind="shell"><code><em># dump 完整的 vtable / VTT / construction vtable 佈局</em>
+$ g++ -std=c++20 -fdump-lang-class -c diamond.cpp
+$ less diamond.cpp.001l.class      <em>// offset-to-top、vbase/vcall offset 全在裡面</em>
+
+<em># 從產物看 thunk 與 vtable 符號（c++filt 還原 mangled name）</em>
+$ objdump -dC diamond.o | grep -A2 thunk
+$ nm -C diamond.o | grep -E 'vtable|typeinfo|VTT|construction'</code></pre>
+
+  <p class="vg-deep-closer"><strong>What this enables</strong>：把繼承拓樸的全部複雜度——多個 vptr、編譯期常數調整、runtime 讀出的 vcall offset、兩種建構子三種解構子——在編譯期攤平成靜態的 vtable／VTT，C++ 才能在「物件導向的多型」與「<code>jmp *(%rax)</code> 這條兩指令熱路徑」之間同時站住；讀懂這張表，你手上的 devirtualization、final、虛擬繼承取捨，全都從玄學變成可以算的 byte 與 load。</p>
+</div>
