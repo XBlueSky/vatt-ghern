@@ -1,0 +1,617 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">一個沒有 GC、永遠只增不減的全域表，加上一行 <code>String.to_atom(params["type"])</code>，攻擊者只要把 query string 換成 <code>?type=a1</code>、<code>?type=a2</code>、<code>?type=a3</code>……灌個幾十萬次，你那台跑得好好的 BEAM 就會 system_limit 然後整個倒下——沒有 segfault，沒有 OOM killer，是 VM 自己決定不活了。</p>
+  <h1 class="vg-post-title">Atom 用完，VM 就掛——拆解 BEAM 那張全域 atom 表</h1>
+</header>
+
+<div class="vg-post-prose">
+
+<p><span class="vg-dropcap">讀</span>完這篇，你會知道一件對 Erlang／Elixir 工程師來說近乎反直覺的事：在 BEAM 上，「把使用者輸入轉成 atom」這個看起來人畜無害的動作，是一條乾淨俐落的 denial-of-service 路徑。它不需要 buffer overflow，不需要競態，不需要任何記憶體安全漏洞——它只是利用了 atom 這個型別一條寫死在 VM 設計裡的性質：atom 進了那張全域表就再也出不來。我們會從「atom 到底是什麼」講起，看清楚那張表為什麼填得滿、填滿之後 VM 為什麼選擇直接死掉，再追一個 HTTP 請求裡的字串是在哪一個環節被永久化成 atom 的，最後落到你下週就能套用的防禦：哪些函式要禁、用什麼替代、怎麼讓 linter 幫你守住。</p>
+
+<p>先給一個讓人願意停下來的數字。Erlang Ecosystem Foundation 作為 CVE Numbering Authority 已經發布了一批生態系的 CVE，其中 <strong>35.8% 落在 uncontrolled resource consumption（CWE-400）這一類</strong>——也就是「攻擊者用可控的少量輸入，逼系統消耗不成比例的資源」。而在這一類裡頭，atom exhaustion 是最大的貢獻者之一。換句話說，BEAM 生態系超過三分之一的已知安全漏洞，根源不是什麼精巧的記憶體破壞，而是這種「資源被慢慢吃光」的模式，atom 表首當其衝。這不是一個冷門的理論攻擊，是真的被人寫進 CVE 編號裡的東西。下面這條比例尺把這個 35.8% 放回整個 CVE 母體裡，讓你一眼看清它在「所有已知漏洞」中佔多大一塊。</p>
+
+<figure class="vg-w-cve-share-chart" data-svg-scroll="560">
+  <style>
+    .vg-w-cve-share-chart { display: grid; gap: var(--s-2); margin: var(--s-4) 0; }
+    .vg-w-cve-share-chart-main { width: 100%; height: auto; }
+    .vg-w-cve-share-chart figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+  </style>
+
+  <svg class="vg-w-cve-share-chart-main" viewBox="0 0 480 220" role="img" aria-label="EEF 已發布 CVE 中，uncontrolled resource consumption（CWE-400）佔 35.8%，其餘類別佔 64.2%">
+    <text x="24" y="34" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">EEF 已發布 CVE 的類別佔比</text>
+
+    <!-- 100% proportion bar: CWE-400 share vs the rest -->
+    <rect x="24" y="58" width="432" height="56" fill="none" stroke="var(--muted-2)" stroke-width="1" />
+    <!-- CWE-400 = 35.8% of 432 ≈ 154.7 -->
+    <rect x="24" y="58" width="154.7" height="56" fill="var(--accent)" fill-opacity="0.55" />
+    <!-- divider line at the 35.8% mark -->
+    <line x1="178.7" y1="52" x2="178.7" y2="120" stroke="var(--accent-text)" stroke-width="1.5" />
+
+    <text x="32" y="92" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">CWE-400</text>
+    <text x="32" y="108" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--accent-text)">35.8%</text>
+
+    <text x="448" y="92" text-anchor="end" font-family="EB Garamond, serif" font-size="14" fill="var(--muted)">其餘類別</text>
+    <text x="448" y="108" text-anchor="end" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">64.2%</text>
+
+    <!-- scale ticks at 0 / 25 / 50 / 75 / 100% -->
+    <line x1="24" y1="120" x2="456" y2="120" stroke="var(--muted-2)" stroke-width="1" />
+    <line x1="24" y1="120" x2="24" y2="126" stroke="var(--muted-2)" stroke-width="1" />
+    <line x1="132" y1="120" x2="132" y2="126" stroke="var(--muted-2)" stroke-width="1" />
+    <line x1="240" y1="120" x2="240" y2="126" stroke="var(--muted-2)" stroke-width="1" />
+    <line x1="348" y1="120" x2="348" y2="126" stroke="var(--muted-2)" stroke-width="1" />
+    <line x1="456" y1="120" x2="456" y2="126" stroke="var(--muted-2)" stroke-width="1" />
+    <text x="24" y="140" text-anchor="start" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">0%</text>
+    <text x="240" y="140" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">50%</text>
+    <text x="456" y="140" text-anchor="end" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">100%</text>
+
+    <text x="24" y="178" font-family="EB Garamond, serif" font-size="13" fill="var(--muted)">超過三分之一——而 atom exhaustion</text>
+    <text x="24" y="196" font-family="EB Garamond, serif" font-size="13" fill="var(--muted)">正是 CWE-400 這一塊裡的最大宗。</text>
+  </svg>
+
+  <figcaption>單一比例尺：把 EEF 已發布 CVE 當成 100%，染色那一段就是 uncontrolled resource consumption（CWE-400）的 35.8%。資料來源為 <a href="https://erlef.org/blog/security/atom-exhaustion">EEF security blog</a>；此處只如實呈現「這一類 vs 其餘」這一個已知數字，不臆測各子類別的細分。</figcaption>
+</figure>
+
+<h2>atom 不是字串——它是一張全域表裡的一個編號</h2>
+
+<p>先把 atom 這個型別講清楚，因為下面所有的問題都長在它的實作細節上。</p>
+
+<p>從語法上看，atom 是 <code>:ok</code>、<code>:error</code>、<code>:http</code>、<code>:https</code> 這種東西，在 Erlang 裡寫成 <code>ok</code>、<code>error</code>（小寫開頭的 identifier）。Elixir 的 module 名稱（<code>MyApp.User</code>）、map 的 key（<code>%{name: "x"}</code> 裡的 <code>name</code>）、boolean（<code>true</code>／<code>false</code> 本質上就是 atom）、<code>nil</code>——這些底層全都是 atom。對寫程式的人來說，atom 的體驗就是「一個有名字的常數」，比較兩個 atom 是否相等快得像比較兩個整數。</p>
+
+<p>而這正是重點。atom 比較之所以這麼快，是因為 VM 並沒有真的去逐字元比對它們的名字。每一個 atom 在 VM 內部其實是一個整數索引——它指向一張全域的 <strong>atom table</strong>。當你寫下 <code>:https</code>，VM 做的事是：去 atom table 查「https」這個名字在不在，在的話回傳它的索引，不在的話就<em>新增一筆</em>、配一個新索引、再回傳。之後程式裡所有的 <code>:https</code> 都共用同一個索引。比較兩個 atom 是否相等，就退化成比較兩個整數索引——O(1)，不碰字串。</p>
+
+<p>這套設計拿來換取效能，代價藏在三個性質裡，每一個都很關鍵：</p>
+
+<ul>
+<li><strong>全域（global）</strong>：atom table 是整個 VM 共用的一張表，不分 process、不分 application。任何一個 process 新增的 atom，會留在所有 process 都看得到的那張表裡。</li>
+<li><strong>不做垃圾回收（not garbage collected）</strong>：這是最反直覺的一條。BEAM 的每個 process 都有自己的 heap、會被 GC，但 atom table 不在 GC 的管轄範圍內。一個 atom 一旦進了表，<em>直到 VM 關閉為止都不會被回收</em>——即使再也沒有任何程式碼引用它。</li>
+<li><strong>容量有上限（fixed-size）</strong>：atom table 不是無限大的。它有一個上限，預設大約是一百萬個 atom（這個值可以用 VM 啟動參數 <code>+t</code> 調整）。一旦表被填到上限，下一個試圖新增 atom 的動作就會觸發 system_limit——VM 直接 crash。</li>
+</ul>
+
+<p>把這三條串起來，攻擊的形狀就浮現了。GC 不會幫你清掉 atom，所以這張表只增不減；它有上限，所以「只增不減」遲早會撞牆；它是全域的，所以任何一個能新增 atom 的入口，撞牆之後拖垮的是<em>整台 VM</em>，不是單一 process。一般的 memory leak 你還能靠重啟某個 process 或等 GC 紓解；atom leak 不行——唯一的「回收」手段是重啟整個 VM。</p>
+
+<p>這裡值得停下來比較 atom 和它最像的鄰居：binary（字串）。表面上 <code>:user_id</code> 和 <code>"user_id"</code> 看起來只是引號的差別，但在 VM 眼裡它們是兩種命運完全相反的東西。binary 活在 process 的 heap 上（或大 binary 的共享 heap 上），會被 reference counting 和 GC 回收——你產生再多 binary，只要沒人引用，遲早被清掉。atom 活在全域 atom table 裡，沒有 reference count、沒有 GC、沒有「沒人引用了所以可以清掉」這回事。所以同一份「把外部字串拿來用」的程式碼，用 binary 表達是安全的（短命垃圾），用 atom 表達就可能是一條 leak。攻擊者要找的，正是那些「本該用 binary 卻被寫成 atom」的地方。</p>
+
+<p>為什麼 BEAM 不替 atom table 做 GC？因為 atom 的整套效能優勢正建立在「索引永不變動」這個前提上。比較兩個 atom 只比較整數索引、pattern match 一個 atom 常數可以編譯成跳表、atom 可以安全地在 process 之間用訊息傳遞而不需要拷貝名字——這些都依賴「一個 atom 一旦配到索引 N，索引 N 就永遠是它」。要 GC atom 就得能搬動或重編索引，而那會讓上述每一條優化都失效。設計者選擇了「atom 永久、但要小心別亂創」這個 trade-off。在 atom 全部來自原始碼字面量的年代，這個 trade-off 完全合理——原始碼是有限的，atom 自然有限。問題是當 atom 開始來自<em>runtime 的外部輸入</em>，「有限」這個前提就被打破了。</p>
+
+<p>下面這個原文裡反覆強調的句子，是整篇文章的軸：</p>
+
+<blockquote>
+  <p>「Creating atoms from input is unsafe unless the set of possible values is finite, known, and enforced.」</p>
+</blockquote>
+
+<p>翻成白話：從輸入創建 atom 這件事本身不必然危險——危險的是「可能的值是無限的、未知的、或沒被強制限制」。如果你的輸入只可能是 <code>"http"</code> 或 <code>"https"</code> 這兩個值，而且你有辦法把它「強制」收束成這兩個之一，那把它轉成 atom 一點問題都沒有。問題出在你<em>沒有</em>這個保證的時候——比方說輸入是一個 HTTP query parameter，攻擊者想塞什麼進去就塞什麼。下面這個 widget 把這條「只增不減直到撞牆」的動態畫出來，你可以調整攻擊者灌入新 atom 的速率，看那條曲線多快逼近上限、VM 在哪一刻掛掉。</p>
+
+<figure class="vg-w-canvas-atom-table">
+  <style>
+    .vg-w-canvas-atom-table { display: grid; grid-template-rows: auto auto 1fr auto; gap: var(--s-2); margin: var(--s-4) 0; }
+    .vg-w-canvas-atom-table .toolbar { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); flex-wrap: wrap; }
+    .vg-w-canvas-atom-table button { font-family: var(--sans); font-size: var(--fs-sm); padding: 6px 14px; min-height: 44px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); cursor: pointer; }
+    .vg-w-canvas-atom-table button:hover { border-color: var(--accent); color: var(--accent-text); }
+    .vg-w-canvas-atom-table .clock { margin-left: auto; font-variant-numeric: tabular-nums; color: var(--ink); }
+    .vg-w-canvas-atom-table .slider { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+    .vg-w-canvas-atom-table .slider input { flex: 1; height: 36px; accent-color: var(--accent); }
+    .vg-w-canvas-atom-table .slider .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 16ch; text-align: right; }
+    .vg-w-canvas-atom-table canvas { width: 100%; height: auto; aspect-ratio: 16 / 7; display: block; }
+    .vg-w-canvas-atom-table figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    @media (max-width: 720px) {
+      .vg-w-canvas-atom-table canvas { aspect-ratio: 4 / 3; }
+      .vg-w-canvas-atom-table input[type="range"] { touch-action: none; }
+    }
+  </style>
+
+  <div class="toolbar">
+    <button id="vg-w-canvas-atom-table-toggle">▷ 開始灌入</button>
+    <button id="vg-w-canvas-atom-table-reset">↺ 重置</button>
+    <span class="clock" id="vg-w-canvas-atom-table-clock">t = 0.0s</span>
+  </div>
+
+  <div class="slider">
+    <label for="vg-w-canvas-atom-table-rate">攻擊者灌入速率</label>
+    <input id="vg-w-canvas-atom-table-rate" type="range" min="2000" max="120000" step="2000" value="40000" />
+    <span class="readout" id="vg-w-canvas-atom-table-rate-out">40,000 atom/s</span>
+  </div>
+
+  <canvas id="vg-w-canvas-atom-table-canvas"></canvas>
+
+  <figcaption>這裡把上限縮放成一個示意值（演示用 50 萬，真實預設約一百萬，可由 <code>+t</code> 調）。底部那條既有 atom 是 VM 啟動時就佔住的 module 名、library 常數等等；上方持續堆高的是攻擊者用 <code>:"id_1"</code>、<code>:"id_2"</code>…… 灌進來的新 atom。注意它<em>從不下降</em>——沒有 GC 會幫你清。撞到紅線那一刻，下一次 atom 創建觸發 system_limit，VM crash。</figcaption>
+
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-canvas-atom-table');
+      const canvas = root.querySelector('canvas');
+      const toggle = root.querySelector('#vg-w-canvas-atom-table-toggle');
+      const reset = root.querySelector('#vg-w-canvas-atom-table-reset');
+      const clock = root.querySelector('#vg-w-canvas-atom-table-clock');
+      const rate = root.querySelector('#vg-w-canvas-atom-table-rate');
+      const rateOut = root.querySelector('#vg-w-canvas-atom-table-rate-out');
+      const ctx = canvas.getContext('2d');
+
+      function getCssVar(name) {
+        return getComputedStyle(root).getPropertyValue(name).trim() || '#888';
+      }
+
+      function resize() {
+        const dpr = window.devicePixelRatio || 1;
+        const r = canvas.getBoundingClientRect();
+        canvas.width = Math.max(1, r.width * dpr);
+        canvas.height = Math.max(1, r.height * dpr);
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      }
+      new ResizeObserver(resize).observe(canvas);
+      resize();
+
+      const LIMIT = 500000;          // demo ceiling (real default ~1,048,576)
+      const BASELINE = 70000;        // atoms held at VM boot (modules, libs, consts)
+      let running = false;
+      let t = 0;
+      let used = BASELINE;
+      let crashed = false;
+      let crashT = 0;
+
+      function step(dt) {
+        if (crashed) return;
+        t += dt;
+        used += Number(rate.value) * dt;
+        if (used >= LIMIT) {
+          used = LIMIT;
+          crashed = true;
+          crashT = t;
+          running = false;
+          toggle.textContent = '▷ 開始灌入';
+        }
+      }
+
+      function fmt(n) { return Math.round(n).toLocaleString(); }
+
+      function draw() {
+        const r = canvas.getBoundingClientRect();
+        const W = r.width, H = r.height;
+        ctx.clearRect(0, 0, W, H);
+
+        const padL = 14, padR = 14, padT = 28, padB = 24;
+        const barX = padL, barW = W - padL - padR;
+        const barTop = padT, barBot = H - padB, barH = barBot - barTop;
+
+        // table frame
+        ctx.strokeStyle = getCssVar('--muted-2');
+        ctx.lineWidth = 1;
+        ctx.strokeRect(barX, barTop, barW, barH);
+
+        // baseline fill
+        const baseH = (BASELINE / LIMIT) * barH;
+        ctx.fillStyle = getCssVar('--muted-2');
+        ctx.globalAlpha = 0.35;
+        ctx.fillRect(barX, barBot - baseH, barW, baseH);
+        ctx.globalAlpha = 1;
+
+        // attacker fill
+        const attacker = used - BASELINE;
+        const attH = (attacker / LIMIT) * barH;
+        ctx.fillStyle = crashed ? getCssVar('--accent') : getCssVar('--accent');
+        ctx.globalAlpha = crashed ? 0.85 : 0.55;
+        ctx.fillRect(barX, barBot - baseH - attH, barW, attH);
+        ctx.globalAlpha = 1;
+
+        // ceiling line
+        ctx.strokeStyle = getCssVar('--accent-text');
+        ctx.setLineDash([6, 4]);
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(barX, barTop);
+        ctx.lineTo(barX + barW, barTop);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        // labels
+        ctx.font = '13px "EB Garamond", serif';
+        ctx.fillStyle = getCssVar('--muted');
+        ctx.textAlign = 'left';
+        ctx.fillText('atom table 上限 (+t)', barX + 6, barTop - 10);
+        ctx.textAlign = 'right';
+        ctx.fillStyle = getCssVar('--ink');
+        ctx.fillText(fmt(used) + ' / ' + fmt(LIMIT) + ' atom', barX + barW, barBot + 18);
+
+        if (crashed) {
+          ctx.textAlign = 'center';
+          ctx.font = '18px "EB Garamond", serif';
+          ctx.fillStyle = getCssVar('--accent-text');
+          ctx.fillText('** (system_limit) VM CRASH **', barX + barW / 2, barTop + barH / 2);
+        }
+      }
+
+      let last = performance.now();
+      function frame(now) {
+        const dt = Math.min(0.05, (now - last) / 1000);
+        last = now;
+        if (running) step(dt);
+        draw();
+        clock.textContent = crashed
+          ? 'crash @ t = ' + crashT.toFixed(1) + 's'
+          : 't = ' + t.toFixed(1) + 's';
+        requestAnimationFrame(frame);
+      }
+      requestAnimationFrame(frame);
+
+      function syncRate() {
+        rateOut.textContent = Number(rate.value).toLocaleString() + ' atom/s';
+      }
+      rate.addEventListener('input', syncRate);
+      syncRate();
+
+      toggle.addEventListener('click', () => {
+        if (crashed) return;
+        running = !running;
+        toggle.textContent = running ? '⏸ 暫停' : '▷ 開始灌入';
+        last = performance.now();
+      });
+      reset.addEventListener('click', () => {
+        running = false;
+        crashed = false;
+        t = 0;
+        used = BASELINE;
+        toggle.textContent = '▷ 開始灌入';
+      });
+    })();
+  </script>
+</figure>
+
+<p>拖到最高速率你會發現 VM 在幾秒內就掛掉——這不是誇飾。每個 atom 在表裡只佔幾十個 bytes，一百萬個 atom 換算成記憶體不過幾十 MB，遠遠談不上把機器的 RAM 吃光。也就是說，攻擊者要打垮你<em>不需要</em>把伺服器的記憶體灌爆，他只需要讓那張表的<em>計數</em>撞到上限就好。一個能持續發出請求的攻擊者，灌一百萬個不同字串是再輕鬆不過的事。這是 atom exhaustion 比一般 OOM 攻擊更陰險的地方：成本極低、訊號極小、後果是整台 VM 倒下。</p>
+
+<p>算一筆粗略的帳會更有體感。假設預設上限約一百萬、你的應用啟動後常駐約二十萬個 atom（module 名、依賴 library 的常數），那留給攻擊者的餘裕約八十萬。如果某個入口每個請求新增一個 atom，攻擊者用幾百個並發連線、每秒幾千次請求，幾分鐘內就能把餘裕吃光。如果那個入口是 <code>keys: :atoms</code> 的 JSON 解析、每個請求能塞幾萬個 key，那就不是幾分鐘，是幾個請求的事。注意這條攻擊有個讓 incident response 特別頭痛的性質：它沒有漸進式的告警曲線。記憶體用量幾乎不動、CPU 也不高，監控儀表板上一切正常——直到 atom 計數撞線那一瞬間 VM 直接消失。你不會看到「快不行了」的中間態，只會看到「好好的」然後「沒了」。</p>
+
+<p>還有一個放大係數值得留意：BEAM 預設是 fault-tolerant 的，crash 的 process 會被 supervisor 重啟。但 atom exhaustion crash 的不是 process，是整個 VM——supervisor 跟著一起死。如果你跑的是多節點 cluster，攻擊者甚至可以把同一份惡意請求廣播到每個節點，一次放倒整個 cluster。「讓它自己重啟」這套 BEAM 引以為傲的韌性，在 VM 層級的 crash 面前完全失效。</p>
+
+<h2>那個字串是在哪一行變成永久 atom 的——追一個請求的入口</h2>
+
+<p>知道了機制，下一個問題是：在一個真實的 web 應用裡，使用者輸入到底是在哪裡被轉成 atom 的？這通常不是工程師故意寫的，而是某個「方便」的 API 在背後悄悄做掉的。</p>
+
+<p>真實流量裡，不可信輸入的入口比想像中多。query string 和 path parameter 是最明顯的，但別忘了：HTTP header 的值、cookie 名稱、JSON／MessagePack body 的 key、XML 的 tag 名、表單欄位名、GraphQL 的 field 名——這些全部都是攻擊者可控的字串。任何一個被「順手」轉成 atom 拿去當 map key 或 pattern match 的地方，都是一個潛在入口。危險的不是某個特定的 framework，而是「拿外部字串當 atom 用」這個習慣本身。</p>
+
+<p>最危險的入口是那些「無條件新增 atom」的函式。它們拿到一個字串／binary，不管這個字串以前有沒有出現過，都會去 atom table 查、查不到就新增。以下是 Erlang／Elixir 兩邊的對應，每一個都接受任意輸入並無條件創建 atom：</p>
+
+<ul>
+<li>Erlang：<code>binary_to_atom/1</code>、<code>list_to_atom/1</code></li>
+<li>Elixir：<code>String.to_atom/1</code>、<code>List.to_atom/1</code></li>
+<li>JSON 解析：<code>Jason.decode(json, keys: :atoms)</code>——這一個尤其致命，因為它會把 JSON object 裡<em>每一個 key</em> 都轉成 atom。攻擊者送一份 <code>{"k1":1,"k2":1,...}</code> 的 payload，你就替他新增了一整批 atom。</li>
+<li>動態 interpolation：Elixir 的 <code>:"field_#{user_input}"</code>，或 Erlang 的 <code>list_to_atom("field_" ++ UserInput)</code>——這種把使用者輸入拼進 atom 字面量的寫法，每一個不同的 <code>user_input</code> 都是一個新 atom。</li>
+</ul>
+
+<p>下面這個 widget 把一個典型的請求路徑攤開：從攻擊者送出的 HTTP 請求，經過 router、controller，到那一行致命的 atom 創建。點任一個環節看它<em>知道什麼、不知道什麼</em>——關鍵在於：路徑上越前面的環節，越沒有能力判斷這個字串「應不應該」被永久化。</p>
+
+<figure class="vg-w-annotated-request-path" data-svg-scroll="560">
+  <style>
+    .vg-w-annotated-request-path { display: grid; grid-template-columns: 1fr; gap: var(--s-3); align-items: start; margin: var(--s-4) 0; }
+    .vg-w-annotated-request-path svg { width: 100%; height: auto; }
+    .vg-w-annotated-request-path input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+    .vg-w-annotated-request-path .component { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; transition: fill 200ms, stroke 200ms; }
+    .vg-w-annotated-request-path .component:hover { stroke: var(--accent); }
+    .vg-w-annotated-request-path .component:focus { outline: none; }
+    .vg-w-annotated-request-path .component:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .vg-w-annotated-request-path .component-text { pointer-events: none; }
+    .vg-w-annotated-request-path .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+    .vg-w-annotated-request-path .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+    .vg-w-annotated-request-path .detail p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+    .vg-w-annotated-request-path .detail code { font-size: 0.92em; }
+    .vg-w-annotated-request-path:has(#vg-w-annotated-request-path-r1:checked) .component-1 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+    .vg-w-annotated-request-path:has(#vg-w-annotated-request-path-r2:checked) .component-2 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+    .vg-w-annotated-request-path:has(#vg-w-annotated-request-path-r3:checked) .component-3 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+    .vg-w-annotated-request-path:has(#vg-w-annotated-request-path-r4:checked) .component-4 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+    .vg-w-annotated-request-path:has(#vg-w-annotated-request-path-r1:checked) .detail-1 { display: block; }
+    .vg-w-annotated-request-path:has(#vg-w-annotated-request-path-r2:checked) .detail-2 { display: block; }
+    .vg-w-annotated-request-path:has(#vg-w-annotated-request-path-r3:checked) .detail-3 { display: block; }
+    .vg-w-annotated-request-path:has(#vg-w-annotated-request-path-r4:checked) .detail-4 { display: block; }
+  </style>
+
+  <input type="radio" id="vg-w-annotated-request-path-r1" name="vg-w-annotated-request-path-sel" checked />
+  <input type="radio" id="vg-w-annotated-request-path-r2" name="vg-w-annotated-request-path-sel" />
+  <input type="radio" id="vg-w-annotated-request-path-r3" name="vg-w-annotated-request-path-sel" />
+  <input type="radio" id="vg-w-annotated-request-path-r4" name="vg-w-annotated-request-path-sel" />
+
+  <svg viewBox="0 0 480 320" role="img" aria-label="request path from HTTP input to atom creation">
+    <rect class="component component-1" data-target="vg-w-annotated-request-path-r1" role="button" tabindex="0" aria-label="select HTTP request" x="140" y="16" width="200" height="50" rx="4" />
+    <text class="component-text" x="240" y="40" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">HTTP 請求</text>
+    <text class="component-text" x="240" y="56" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" fill="var(--muted)">?type=a1 / a2 / a3 ...</text>
+
+    <rect class="component component-2" data-target="vg-w-annotated-request-path-r2" role="button" tabindex="0" aria-label="select router and params parsing" x="140" y="100" width="200" height="50" rx="4" />
+    <text class="component-text" x="240" y="124" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">Router / params 解析</text>
+    <text class="component-text" x="240" y="140" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" fill="var(--muted)">params["type"] = "a1"</text>
+
+    <rect class="component component-3" data-target="vg-w-annotated-request-path-r3" role="button" tabindex="0" aria-label="select controller dispatch" x="140" y="184" width="200" height="50" rx="4" />
+    <text class="component-text" x="240" y="208" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">Controller dispatch</text>
+    <text class="component-text" x="240" y="224" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" fill="var(--muted)">case ... routing key</text>
+
+    <rect class="component component-4" data-target="vg-w-annotated-request-path-r4" role="button" tabindex="0" aria-label="select atom creation" x="140" y="268" width="200" height="50" rx="4" />
+    <text class="component-text" x="240" y="292" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--accent-text)">String.to_atom/1</text>
+    <text class="component-text" x="240" y="308" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" fill="var(--muted)">+1 atom &#8594; 全域表</text>
+
+    <line x1="240" y1="66" x2="240" y2="100" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-annotated-request-path-arrow)" />
+    <line x1="240" y1="150" x2="240" y2="184" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-annotated-request-path-arrow)" />
+    <line x1="240" y1="234" x2="240" y2="268" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-annotated-request-path-arrow)" />
+    <defs>
+      <marker id="vg-w-annotated-request-path-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+      </marker>
+    </defs>
+  </svg>
+
+  <div>
+    <div class="detail detail-1">
+      <h3>HTTP 請求 · 攻擊面</h3>
+      <p>攻擊者完全控制這裡的字串：query string、JSON body、header 值、URI scheme，都是任意 bytes。每一個請求可以帶一個全新的、從沒出現過的值。</p>
+      <p><strong>它不知道</strong>：這個值之後會不會被當成 atom。對攻擊者來說這是<em>免費</em>的——成本只有一個 HTTP 請求。</p>
+    </div>
+    <div class="detail detail-2">
+      <h3>Router / params 解析 · 邊界</h3>
+      <p>framework 把請求拆成 <code>params</code> map，值<em>還是 binary</em>。到這裡都還安全——binary 會被 GC，灌再多也只是短命的 heap 垃圾。這是「最後一道還能擋」的防線。</p>
+      <p><strong>它不知道</strong>：下游打算拿 <code>params["type"]</code> 做什麼。它沒有「這個值合不合法」的知識，只能原封不動往下傳。</p>
+    </div>
+    <div class="detail detail-3">
+      <h3>Controller dispatch · 引爆點上游</h3>
+      <p>常見的「方便」寫法：想用 atom 當 routing key 或 map key，於是把 binary 轉成 atom 再 pattern match。寫的人腦中假設「type 只會是那幾個值」——但這個假設<em>沒有被程式碼強制</em>。</p>
+      <p><strong>它不知道</strong>：真實流量裡 <code>type</code> 是不是只有那幾個值。假設活在工程師腦裡，不在型別系統裡。</p>
+    </div>
+    <div class="detail detail-4">
+      <h3>String.to_atom/1 · 引爆</h3>
+      <p>這一行把 binary 無條件轉成 atom。binary <code>"a1"</code> 從沒出現過 &#8594; atom table 新增一筆，永不回收。重複 N 個不同值 &#8594; N 個永久 atom。撞到上限 &#8594; system_limit &#8594; 整台 VM crash。</p>
+      <p><strong>修法</strong>：換成 <code>String.to_existing_atom/1</code>，或在環節 ③ 用 explicit lookup table 把值收束成已知集合。</p>
+    </div>
+  </div>
+
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-annotated-request-path');
+      root.querySelectorAll('.component').forEach((rect) => {
+        rect.addEventListener('click', () => {
+          const targetId = rect.getAttribute('data-target');
+          const radio = root.querySelector('#' + targetId);
+          if (radio) radio.checked = true;
+        });
+        rect.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            rect.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+          }
+        });
+      });
+    })();
+  </script>
+</figure>
+
+<p>這張圖最該記住的一件事是環節 ②：在 framework 把請求拆成 <code>params</code> map 的時候，那個 <code>"a1"</code> 還只是一個 binary。binary 是會被 GC 的——攻擊者灌一百萬個 binary 進來，它們只會在 heap 上短暫存在然後被回收，撐死讓你 GC 壓力大一點，絕不會撞 atom 上限。<em>真正不可逆的轉換發生在環節 ④</em>。換句話說，整條路徑上有一條清晰的「不歸點」：在轉成 atom 之前你還有救，轉完就再也回不來。所有的防禦，本質上都是在這條線上做文章——要嘛根本不過這條線，要嘛只放已知的值過線。</p>
+
+<h2>為什麼 JSON 解析特別致命——一份 payload 灌進一整批 key</h2>
+
+<p>前面那條路徑一次只新增一個 atom（一個 <code>type</code> 值）。攻擊者要灌滿一百萬個 atom，得發一百萬個請求——雖然可行，但有 rate limit 之類的東西能擋。<code>Jason.decode(json, keys: :atoms)</code> 把這個成本一口氣壓垮了。</p>
+
+<p>當你用 <code>keys: :atoms</code> 選項解析 JSON，Jason 會把 JSON object 裡<em>每一個 key</em> 都轉成 atom。問題是 JSON object 的 key 是攻擊者完全控制的——他可以送一份這樣的 body：</p>
+
+<pre data-kind="config"><code>{
+  "a0000001": 1, "a0000002": 1, "a0000003": 1,
+  "a0000004": 1, "a0000005": 1, ... (重複到幾十萬個 key)
+}</code></pre>
+
+<p>一個 HTTP 請求、一份 payload，就替攻擊者新增了幾十萬個 atom。一兩個請求就能把表填滿。這就是為什麼原文把「JSON 解析成 atom keys」單獨拎出來警告——它把 atom exhaustion 從「需要持續灌請求」降級成「一兩發就 KO」。</p>
+
+<p>這裡有一個容易被忽略的細節值得澄清：<code>keys: :atoms</code> 之所以危險，正是因為它<em>無條件</em>新增。Jason 同時提供一個 <code>keys: :atoms!</code> 選項（帶驚嘆號），它走的是 existing-atom 路徑——只認那些<em>程式裡已經存在</em>的 atom，遇到沒見過的 key 直接拋例外而不是新增 atom。差一個驚嘆號，安全性質天差地遠。把使用者輸入餵給 <code>:atoms</code> 是把整張 atom 表的鑰匙交給攻擊者；餵給 <code>:atoms!</code> 則是「我只接受我預先定義好的那組 key」。下面我們把「無條件創建」與「只認既有」這組對立，整理成一張可排序的對照表。</p>
+
+<figure class="vg-w-table-unsafe-safe">
+  <style>
+    .vg-w-table-unsafe-safe { overflow-x: auto; margin: var(--s-4) 0; }
+    .vg-w-table-unsafe-safe table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+    .vg-w-table-unsafe-safe thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; }
+    .vg-w-table-unsafe-safe thead th[data-sort] { color: var(--accent-text); }
+    .vg-w-table-unsafe-safe tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+    .vg-w-table-unsafe-safe tbody td code { font-size: 0.9em; }
+    .vg-w-table-unsafe-safe figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-2); }
+    .vg-w-table-unsafe-safe .v-unsafe { color: var(--accent-text); font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.04em; }
+    .vg-w-table-unsafe-safe .v-safe { color: var(--sage-deep); font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.04em; }
+  </style>
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/>
+      <path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+    </svg>
+    <span>點欄位標題排序 · 4 欄 × 7 列</span>
+  </p>
+  <table>
+    <thead>
+      <tr>
+        <th data-key="lang">語言</th>
+        <th data-key="unsafe">無條件創建（危險）</th>
+        <th data-key="verdict">性質</th>
+        <th data-key="safe">既有查找（安全替代）</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td>Erlang</td><td><code>binary_to_atom/1</code></td><td><span class="v-unsafe">unsafe</span></td><td><code>binary_to_existing_atom/1</code></td></tr>
+      <tr><td>Erlang</td><td><code>list_to_atom/1</code></td><td><span class="v-unsafe">unsafe</span></td><td><code>list_to_existing_atom/1</code></td></tr>
+      <tr><td>Elixir</td><td><code>String.to_atom/1</code></td><td><span class="v-unsafe">unsafe</span></td><td><code>String.to_existing_atom/1</code></td></tr>
+      <tr><td>Elixir</td><td><code>List.to_atom/1</code></td><td><span class="v-unsafe">unsafe</span></td><td><code>List.to_existing_atom/1</code></td></tr>
+      <tr><td>Elixir</td><td><code>Module.concat/1,2</code></td><td><span class="v-unsafe">unsafe</span></td><td>白名單後再 concat</td></tr>
+      <tr><td>JSON</td><td><code>Jason.decode(_, keys: :atoms)</code></td><td><span class="v-unsafe">unsafe</span></td><td><code>keys: :atoms!</code> 或 <code>keys: :strings</code></td></tr>
+      <tr><td>Elixir</td><td><code>:"field_#{input}"</code> interpolation</td><td><span class="v-unsafe">unsafe</span></td><td>explicit lookup table</td></tr>
+    </tbody>
+  </table>
+  <figcaption>規律很乾淨：危險函式都是「拿到字串就無條件查表＋新增」，安全替代都是「只查、查不到就拋錯，絕不新增」。<code>existing</code> 這個字眼是關鍵——它把語意從「給我一個對應這字串的 atom」改成「給我一個<em>已經存在</em>的、對應這字串的 atom」。後者把新增 atom 的權力從攻擊者手上收回。</figcaption>
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-table-unsafe-safe');
+      const headers = root.querySelectorAll('thead th');
+      const tbody = root.querySelector('tbody');
+      let activeKey = null, asc = true;
+      headers.forEach(h => h.addEventListener('click', () => {
+        const key = h.dataset.key;
+        if (activeKey === key) asc = !asc; else { activeKey = key; asc = true; }
+        headers.forEach(x => x.removeAttribute('data-sort'));
+        h.setAttribute('data-sort', asc ? 'asc' : 'desc');
+        const rows = [...tbody.querySelectorAll('tr')];
+        const idx = [...headers].indexOf(h);
+        rows.sort((a, b) => {
+          const av = a.children[idx].textContent.trim();
+          const bv = b.children[idx].textContent.trim();
+          return asc ? av.localeCompare(bv) : bv.localeCompare(av);
+        });
+        rows.forEach(r => tbody.appendChild(r));
+      }));
+    })();
+  </script>
+</figure>
+
+<p>把這條「無條件創建 vs 只認既有」的差別放進同一個 input 規模下看，差異會更刺眼。下面這個 widget 讓你拖動「攻擊者送進來的不同值個數 N」，同時對照兩種處理方式的 atom 表增量：unsafe（<code>to_atom</code>）每個新值都新增一筆、隨 N 線性成長；safe（lookup table 或 <code>to_existing_atom</code>）不管 N 多大都把增量壓在零。重點不是某個絕對數字，而是兩條線的<em>斜率</em>——一條跟著攻擊者走，一條紋風不動。</p>
+
+<figure class="vg-w-safe-unsafe-growth" data-svg-scroll="560">
+  <style>
+    .vg-w-safe-unsafe-growth { display: grid; gap: var(--s-2); margin: var(--s-4) 0; }
+    .vg-w-safe-unsafe-growth .slider { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); flex-wrap: wrap; }
+    .vg-w-safe-unsafe-growth .slider label { white-space: nowrap; }
+    .vg-w-safe-unsafe-growth .slider input { flex: 1; min-width: 12ch; height: 36px; accent-color: var(--accent); }
+    .vg-w-safe-unsafe-growth .slider .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 14ch; text-align: right; }
+    .vg-w-safe-unsafe-growth-main { width: 100%; height: auto; }
+    .vg-w-safe-unsafe-growth figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    @media (max-width: 720px) {
+      .vg-w-safe-unsafe-growth .slider input { touch-action: none; }
+    }
+  </style>
+
+  <div class="slider">
+    <label for="vg-w-safe-unsafe-growth-n">攻擊者送進的不同值個數 N</label>
+    <input id="vg-w-safe-unsafe-growth-n" type="range" min="0" max="800000" step="10000" value="200000" />
+    <span class="readout" id="vg-w-safe-unsafe-growth-out">N = 200,000</span>
+  </div>
+
+  <svg class="vg-w-safe-unsafe-growth-main" viewBox="0 0 480 240" role="img" aria-label="同樣 N 個不同輸入值之下，unsafe 處理使 atom 表新增量隨 N 線性成長，safe 處理使新增量維持為零">
+    <text x="24" y="28" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">同樣 N 個不同值，兩種處理的 atom 表新增量</text>
+
+    <!-- baseline axis -->
+    <line x1="120" y1="200" x2="456" y2="200" stroke="var(--muted-2)" stroke-width="1" />
+
+    <!-- UNSAFE bar -->
+    <text x="24" y="92" font-family="EB Garamond, serif" font-size="13" fill="var(--accent-text)">unsafe</text>
+    <text x="24" y="108" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">to_atom</text>
+    <rect x="120" y="76" width="2" height="40" fill="var(--muted-2)" />
+    <rect id="vg-w-safe-unsafe-growth-unsafe" x="120" y="76" width="0" height="40" fill="var(--accent)" fill-opacity="0.6" />
+    <text id="vg-w-safe-unsafe-growth-unsafe-label" x="128" y="70" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--accent-text)">+200,000 atom</text>
+
+    <!-- SAFE bar -->
+    <text x="24" y="166" font-family="EB Garamond, serif" font-size="13" fill="var(--sage-deep)">safe</text>
+    <text x="24" y="182" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">existing / lookup</text>
+    <rect x="120" y="150" width="2" height="40" fill="var(--muted-2)" />
+    <rect id="vg-w-safe-unsafe-growth-safe" x="120" y="150" width="3" height="40" fill="var(--sage-deep)" fill-opacity="0.6" />
+    <text x="128" y="144" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--sage-deep)">+0 atom（恆定）</text>
+
+    <!-- x scale ticks: 0 .. 800k mapped to x 120..456 -->
+    <line x1="120" y1="200" x2="120" y2="206" stroke="var(--muted-2)" stroke-width="1" />
+    <line x1="456" y1="200" x2="456" y2="206" stroke="var(--muted-2)" stroke-width="1" />
+    <text x="120" y="222" text-anchor="start" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">0</text>
+    <text x="456" y="222" text-anchor="end" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">800,000</text>
+    <text x="288" y="222" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">新增的 atom 數</text>
+  </svg>
+
+  <figcaption>同樣是 N 個攻擊者控制的不同值：unsafe 那條的長度<em>正比於 N</em>，N 撞上你的 atom 餘裕那一刻就是 VM crash；safe 那條無論 N 多大都釘在零——因為它只查既有、查不到就拋錯，從不替攻擊者新增。兩條線斜率的對比，就是整篇防禦的全部重點。</figcaption>
+
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-safe-unsafe-growth');
+      const inp = root.querySelector('#vg-w-safe-unsafe-growth-n');
+      const out = root.querySelector('#vg-w-safe-unsafe-growth-out');
+      const unsafeBar = root.querySelector('#vg-w-safe-unsafe-growth-unsafe');
+      const unsafeLabel = root.querySelector('#vg-w-safe-unsafe-growth-unsafe-label');
+      const X0 = 120, X1 = 456, NMAX = 800000;
+      function onInput() {
+        const n = Number(inp.value);
+        out.textContent = 'N = ' + n.toLocaleString();
+        const w = (n / NMAX) * (X1 - X0);
+        unsafeBar.setAttribute('width', String(Math.max(0, w)));
+        unsafeLabel.setAttribute('x', String(X0 + 8 + Math.max(0, w)));
+        unsafeLabel.textContent = '+' + n.toLocaleString() + ' atom';
+        // safe bar stays a constant sliver: +0, independent of N
+      }
+      inp.addEventListener('input', onInput);
+      onInput();
+    })();
+  </script>
+</figure>
+
+<h2>三種防線——不創建、只查既有、讓 linter 守門</h2>
+
+<p>機制清楚了，剩下的就是工程上怎麼擋。原文給的防禦不是單一招數，而是一條由淺入深的防線。下面這組 tab 把三層分開講，重點是看清楚每一層各自把「atom 創建」收束在哪裡。</p>
+
+<div class="vg-w-tabs-mitigation">
+  <style>
+    .vg-w-tabs-mitigation { display: grid; gap: var(--s-2); margin: var(--s-4) 0; }
+    .vg-w-tabs-mitigation input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+    .vg-w-tabs-mitigation .tabs { display: flex; gap: var(--s-2); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+    .vg-w-tabs-mitigation .tab { font-family: var(--sans); font-size: var(--fs-sm); padding: var(--s-1) var(--s-2); cursor: pointer; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+    .vg-w-tabs-mitigation .panel { display: none; padding: var(--s-2) 0; }
+    .vg-w-tabs-mitigation .panel p { font-family: var(--serif); font-size: var(--fs-sm); margin: 0 0 var(--s-2) 0; }
+    .vg-w-tabs-mitigation:has(#vg-w-tabs-mitigation-t1:checked) .panel-1 { display: block; }
+    .vg-w-tabs-mitigation:has(#vg-w-tabs-mitigation-t1:checked) [for="vg-w-tabs-mitigation-t1"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    .vg-w-tabs-mitigation:has(#vg-w-tabs-mitigation-t2:checked) .panel-2 { display: block; }
+    .vg-w-tabs-mitigation:has(#vg-w-tabs-mitigation-t2:checked) [for="vg-w-tabs-mitigation-t2"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    .vg-w-tabs-mitigation:has(#vg-w-tabs-mitigation-t3:checked) .panel-3 { display: block; }
+    .vg-w-tabs-mitigation:has(#vg-w-tabs-mitigation-t3:checked) [for="vg-w-tabs-mitigation-t3"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+  </style>
+  <input type="radio" id="vg-w-tabs-mitigation-t1" name="vg-w-tabs-mitigation-sel" checked />
+  <input type="radio" id="vg-w-tabs-mitigation-t2" name="vg-w-tabs-mitigation-sel" />
+  <input type="radio" id="vg-w-tabs-mitigation-t3" name="vg-w-tabs-mitigation-sel" />
+  <div class="tabs">
+    <label class="tab" for="vg-w-tabs-mitigation-t1">① 根本不創建</label>
+    <label class="tab" for="vg-w-tabs-mitigation-t2">② 只查既有</label>
+    <label class="tab" for="vg-w-tabs-mitigation-t3">③ linter 守門</label>
+  </div>
+  <div class="panel panel-1">
+    <p>最強的防線：根本不在 runtime 創建 atom。如果你要做的是「把外部字串映射到一組已知的內部值」，用一個 explicit lookup table——一個 <code>case</code> 或 map——把映射寫死。沒命中就回 error，永遠不新增 atom。可能值的集合就<em>顯式</em>寫在程式碼裡，「finite, known, enforced」三個條件一次滿足。</p>
+<pre data-kind="pseudocode"><code><em>% Erlang：URI scheme 白名單，攻擊者塞什麼都不會新增 atom</em>
+scheme_to_atom(Scheme) ->
+  case Scheme of
+    &lt;&lt;"http"&gt;&gt;  -> http;
+    &lt;&lt;"https"&gt;&gt; -> https;
+    _           -> {error, unknown_scheme}
+  end.</code></pre>
+  </div>
+  <div class="panel panel-2">
+    <p>當你<em>真的</em>需要動態查 atom（比方 routing 到一個已註冊的 module）、但可能值在啟動時就已經全部存在於 atom table，用 <code>existing</code> 系列。它只查、不新增：字串對應的 atom 已存在就回傳，不存在就<em>拋例外</em>（不是新增）。攻擊者的任意輸入頂多換來一個可被 rescue 的 <code>ArgumentError</code>，換不來一筆新 atom。</p>
+<pre data-kind="pseudocode"><code><em># Elixir：只接受程式裡已存在的 atom，否則 ArgumentError</em>
+def to_known_atom(input) when is_binary(input) do
+  try do
+    {:ok, String.to_existing_atom(input)}
+  rescue
+    ArgumentError -> {:error, :unknown}
+  end
+end</code></pre>
+    <p>注意一個前提：<code>to_existing_atom</code> 只在「目標 atom 已經被定義過」時才有用。如果那個 atom 只在這條路徑上才會第一次出現，<code>existing</code> 版本會永遠拋錯。實務上你通常會在 module 裡先用一組 module attribute 或 pattern 把合法 atom「種」進表裡。</p>
+  </div>
+  <div class="panel panel-3">
+    <p>前兩層靠人記得寫對；第三層靠工具強制。Credo（Elixir 的靜態分析器）有一條 <code>Credo.Check.Warning.UnsafeToAtom</code>——它會掃出所有 <code>String.to_atom/1</code>、<code>List.to_atom/1</code>、以及 <code>Module.concat/1,2</code> 這類無條件創建 atom 的呼叫並報警。<strong>它預設是關閉的</strong>，所以你得在 <code>.credo.exs</code> 裡顯式打開。打開之後，任何人想偷懶寫 <code>String.to_atom</code> 都會在 CI 被擋下來。</p>
+<pre data-kind="config"><code># .credo.exs &#8212; 把這條從預設關閉改成啟用
+{Credo.Check.Warning.UnsafeToAtom, []}</code></pre>
+    <p>這一層的價值在於它把「不要從輸入創建 atom」這條<em>口頭約定</em>，變成 build 會強制的<em>機械規則</em>。口頭約定會被新進同事、被趕 deadline 的自己破壞；CI 規則不會。</p>
+  </div>
+</div>
+
+<p>這三層的關係不是三選一，是縱深防禦。理想狀態是：① 設計上盡量用 lookup table 避免動態 atom；② 真要動態時一律走 <code>existing</code> 版本；③ 用 Credo 在 CI 把所有不安全呼叫攔下來當最後一道網。三層各自獨立失效時，後面還有一層接住。</p>
+
+<p>還有一個常被當成「解法」但其實只是緩兵之計的東西要點名：調大 <code>+t</code>。把 atom 上限從一百萬調到一千萬，看起來像是給了你十倍的緩衝——但攻擊者只要多灌十倍的請求就好，而你付出的是十倍的常駐記憶體。<code>+t</code> 改的是「撞牆的位置」，不是「會不會撞牆」。它能在你還沒修好程式碼時買一點時間，但它<em>不是</em>修復。真正的修復永遠是切斷「不可信輸入 → atom 創建」這條線。</p>
+
+<h2>什麼時候從輸入創建 atom 是安全的——回到那條判準</h2>
+
+<p>把整篇收束成一個你可以隨身帶走的判準。原文那句話其實已經給了完整的決策樹：</p>
+
+<blockquote>
+  <p>「Creating atoms from input is unsafe unless the set of possible values is finite, known, and enforced.」</p>
+</blockquote>
+
+<p>三個條件，缺一不可：</p>
+
+<ul>
+<li><strong>finite（有限）</strong>：可能的值是有限集合。<code>"http" | "https"</code> 有限；任意 query string 無限。</li>
+<li><strong>known（已知）</strong>：這個有限集合在你寫程式時就知道，不是 runtime 才浮現。module 名稱、固定的 status 字串是已知；使用者自訂欄位名不是。</li>
+<li><strong>enforced（強制）</strong>：這是最常被漏掉的一條。「我知道 type 只會是那五個值」不算 enforced——那是假設。enforced 是指程式碼<em>主動</em>把輸入收束進那個集合：用 <code>case</code> 白名單、用 <code>to_existing_atom</code> 配 rescue、用 schema validation。沒有強制，前兩個條件只是工程師腦裡的一廂情願。</li>
+</ul>
+
+<p>反過來看那 35.8% 的 CVE 也就不意外了。atom exhaustion 之所以是 BEAM 生態系最大宗的漏洞類別之一，不是因為 Erlang／Elixir 工程師粗心，而是因為 atom 用起來實在太順手——它是 map key、是 module 名、是 pattern match 的常數，到處都是。「把字串轉成 atom」這個動作在 90% 的情境下都是對的（因為那些字串確實 finite、known、enforced），於是剩下 10% 沒守住 enforced 條件的地方，就成了乾淨的 DoS 入口。危險不在於這個動作罕見，而在於它太常見，以致於那少數不安全的用法藏在大量安全用法之中。</p>
+
+<p>所以下週你 review code 看到任何一個 <code>to_atom</code>，問題只有一個：餵進去的值，是<em>有限、已知、且被程式碼強制</em>收束的嗎？三個都 yes，放行。任何一個 no——尤其是 enforced 那條——就把它換成 <code>to_existing_atom</code> 或 lookup table，並順手在 <code>.credo.exs</code> 打開那條 check，讓下一個你不必再靠記性。</p>
+
+<p class="vg-deep-closer"><strong>Take-away</strong>：atom 是一張全域、不 GC、有上限的表裡的一個編號；從不可信輸入創建 atom，等於把這張表的鑰匙交給攻擊者——除非那組值有限、已知、且被你主動強制收束。</p>
+
+</div>
