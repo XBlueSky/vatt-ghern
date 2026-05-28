@@ -1,0 +1,612 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">傳統推薦檢索棧裡，item index、eligibility filter、reranker、user tower 是四個各自部署、各自版本、各自跨網路呼叫的微服務。SilverTorch 問的問題很直接——既然這四件事最後都要被同一張 GPU 上的同一批 tensor 算過去，為什麼不讓它們就是同一個 PyTorch model 的四個 module，在一次 forward pass 裡跑完？</p>
+  <h1 class="vg-post-title">Index as Model——Meta 把推薦檢索棧縮進一個 PyTorch forward pass</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p><span class="vg-dropcap">推</span>薦系統的線上檢索，二十年來幾乎都是同一個形狀：先用 user embedding 對龐大的 item index 做 approximate nearest neighbor（ANN）搜尋，取回幾百到幾千個候選；再把這批候選餵給一個 eligibility filter 過濾掉不可投放的項目；最後送進一個 neural reranker 做精排，輸出 top-K。這三段——retrieval、filtering、ranking——在 Meta 的線上服務裡長年被拆成三組以上獨立的微服務：item index 是一套 service、user tower 是另一套、filtering 走 CPU 上的 inverted index、reranking 又是一套。SilverTorch 的論點是把整條棧表達成「Index as Model」：item index、eligibility filter、scoring layer、user tower 全都變成同一個 PyTorch model 內部的 tensor 或 operator，在單張 GPU 上的單次 forward pass 內、在 sub-100ms 的延遲預算裡跑完。對照舊架構，throughput 拉到 23.7 倍、compute-cost 效率對 CPU baseline 達 20.9 倍（開啟 reranking 後仍有 13.35 倍）。</p>
+
+  <p>這不是把舊服務「搬上 GPU」這麼簡單。把四段檢索流程塞進一張 computation graph，每一段都得重新設計成「GPU 喜歡的形狀」——ANN 要 fused Int8 kernel、eligibility 要用 bit operation 取代 posting list、reranking 要能在放大數十倍的候選池上跑、scoring 要把多個 task 的預測合成單一分數。下面四個小節各自處理一個 module，順序對應一筆 request 在 forward pass 裡實際被算過去的順序：先有 user embedding 對 index 的 ANN（哪些 item 在 embedding 空間裡離 user 近），再有 eligibility filtering（這些 item 哪些此刻可投放），再有 neural reranking（在放大的候選池上精排），最後是 multi-task composite scoring（把多個行為預測合成最終排序分數）。先看整張圖——下面的互動小工具把這四個 module 畫成一條 pipeline，點任一個 module 看它負責什麼、又刻意不知道隔壁的什麼。</p>
+
+  <figure class="vg-w-arch-silvertorch-forward" data-svg-scroll="720">
+    <style>
+      .vg-w-arch-silvertorch-forward { display: grid; grid-template-columns: 1fr; gap: var(--s-3); align-items: start; }
+      .vg-w-arch-silvertorch-forward svg.vg-w-arch-silvertorch-forward-main { width: 100%; height: auto; max-width: 880px; }
+      .vg-w-arch-silvertorch-forward input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-arch-silvertorch-forward .component { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; transition: fill 200ms, stroke 200ms; }
+      .vg-w-arch-silvertorch-forward .component:hover { stroke: var(--accent); }
+      .vg-w-arch-silvertorch-forward .component:focus { outline: none; }
+      .vg-w-arch-silvertorch-forward .component:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+      .vg-w-arch-silvertorch-forward .component-text { pointer-events: none; font-family: EB Garamond, serif; font-size: 15px; }
+      .vg-w-arch-silvertorch-forward .component-sub { pointer-events: none; font-family: IM Fell English, serif; font-style: italic; font-size: 12px; fill: var(--muted); }
+      .vg-w-arch-silvertorch-forward .flow { font-family: JetBrains Mono, monospace; font-size: 11px; }
+      .vg-w-arch-silvertorch-forward .head { font-family: IM Fell English, serif; font-style: italic; font-size: 14px; }
+      .vg-w-arch-silvertorch-forward .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+      .vg-w-arch-silvertorch-forward .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-arch-silvertorch-forward .detail p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-arch-silvertorch-forward .hint { font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin: 0 0 var(--s-1) 0; }
+      .vg-w-arch-silvertorch-forward:has(#vg-w-arch-silvertorch-forward-r1:checked) .component-1 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-arch-silvertorch-forward:has(#vg-w-arch-silvertorch-forward-r2:checked) .component-2 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-arch-silvertorch-forward:has(#vg-w-arch-silvertorch-forward-r3:checked) .component-3 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-arch-silvertorch-forward:has(#vg-w-arch-silvertorch-forward-r4:checked) .component-4 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-arch-silvertorch-forward:has(#vg-w-arch-silvertorch-forward-r1:checked) .detail-1 { display: block; }
+      .vg-w-arch-silvertorch-forward:has(#vg-w-arch-silvertorch-forward-r2:checked) .detail-2 { display: block; }
+      .vg-w-arch-silvertorch-forward:has(#vg-w-arch-silvertorch-forward-r3:checked) .detail-3 { display: block; }
+      .vg-w-arch-silvertorch-forward:has(#vg-w-arch-silvertorch-forward-r4:checked) .detail-4 { display: block; }
+      @media (max-width: 720px) {
+        .vg-w-arch-silvertorch-forward .component-sub { font-size: 15px; }
+        .vg-w-arch-silvertorch-forward .flow { font-size: 14px; }
+      }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M9 9l5 12 1.8-5.2L21 14Z"/><path d="M7.2 2.2 8 5.1"/><path d="m5.1 8-2.9-.8"/><path d="M14 4.1 12 6"/><path d="m6 12-1.9 2"/>
+      </svg>
+      <span>click any module to read its responsibility · 4 modules</span>
+    </p>
+    <input type="radio" id="vg-w-arch-silvertorch-forward-r1" name="vg-w-arch-silvertorch-forward-sel" aria-label="select ANN module" checked />
+    <input type="radio" id="vg-w-arch-silvertorch-forward-r2" name="vg-w-arch-silvertorch-forward-sel" aria-label="select eligibility module" />
+    <input type="radio" id="vg-w-arch-silvertorch-forward-r3" name="vg-w-arch-silvertorch-forward-sel" aria-label="select reranking module" />
+    <input type="radio" id="vg-w-arch-silvertorch-forward-r4" name="vg-w-arch-silvertorch-forward-sel" aria-label="select scoring module" />
+
+    <svg class="vg-w-arch-silvertorch-forward-main" viewBox="0 0 880 360" role="img"
+         aria-label="SilverTorch 單一 forward pass 內的四個 module：fused Int8 ANN、Bloom eligibility、neural reranking、multi-task scoring，點任一 module 查看其責任">
+      <text x="440" y="24" text-anchor="middle" fill="var(--ink)" class="head">一個 nn.Module · 一次 forward pass · 一張 GPU——四段檢索是四個內部 module，不是四個微服務</text>
+
+      <!-- user tower input -->
+      <rect x="24" y="150" width="120" height="60" rx="3" fill="var(--ink-deep)" fill-opacity="0.12" stroke="var(--ink-deep)" stroke-width="1.5"/>
+      <text x="84" y="176" text-anchor="middle" fill="var(--ink)" class="component-text">user tower</text>
+      <text x="84" y="196" text-anchor="middle" class="component-sub">→ user embedding</text>
+
+      <!-- M1: fused Int8 ANN -->
+      <rect class="component component-1" data-target="vg-w-arch-silvertorch-forward-r1" role="button" tabindex="0" aria-label="select fused Int8 ANN" x="184" y="130" width="140" height="100" rx="3" />
+      <text x="254" y="170" text-anchor="middle" fill="var(--ink)" class="component-text">fused Int8</text>
+      <text x="254" y="190" text-anchor="middle" fill="var(--ink)" class="component-text">ANN</text>
+      <text x="254" y="210" text-anchor="middle" class="component-sub">item index = tensor</text>
+
+      <!-- M2: Bloom eligibility -->
+      <rect class="component component-2" data-target="vg-w-arch-silvertorch-forward-r2" role="button" tabindex="0" aria-label="select Bloom eligibility filter" x="364" y="130" width="140" height="100" rx="3" />
+      <text x="434" y="170" text-anchor="middle" fill="var(--ink)" class="component-text">Bloom</text>
+      <text x="434" y="190" text-anchor="middle" fill="var(--ink)" class="component-text">eligibility</text>
+      <text x="434" y="210" text-anchor="middle" class="component-sub">bit-ops, no posting list</text>
+
+      <!-- M3: neural reranking -->
+      <rect class="component component-3" data-target="vg-w-arch-silvertorch-forward-r3" role="button" tabindex="0" aria-label="select neural reranking" x="544" y="130" width="140" height="100" rx="3" />
+      <text x="614" y="170" text-anchor="middle" fill="var(--ink)" class="component-text">neural</text>
+      <text x="614" y="190" text-anchor="middle" fill="var(--ink)" class="component-text">rerank</text>
+      <text x="614" y="210" text-anchor="middle" class="component-sub">MLP / attention / MoL</text>
+
+      <!-- M4: multi-task scoring -->
+      <rect class="component component-4" data-target="vg-w-arch-silvertorch-forward-r4" role="button" tabindex="0" aria-label="select multi-task scoring" x="724" y="130" width="132" height="100" rx="3" />
+      <text x="790" y="170" text-anchor="middle" fill="var(--ink)" class="component-text">multi-task</text>
+      <text x="790" y="190" text-anchor="middle" fill="var(--ink)" class="component-text">score</text>
+      <text x="790" y="210" text-anchor="middle" class="component-sub">composite top-K</text>
+
+      <!-- flow arrows -->
+      <line x1="144" y1="180" x2="184" y2="180" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-arch-silvertorch-forward-arrow)"/>
+      <line x1="324" y1="180" x2="364" y2="180" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-arch-silvertorch-forward-arrow)"/>
+      <line x1="504" y1="180" x2="544" y2="180" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-arch-silvertorch-forward-arrow)"/>
+      <line x1="684" y1="180" x2="724" y2="180" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-arch-silvertorch-forward-arrow)"/>
+
+      <!-- flow annotations: candidate counts -->
+      <text x="254" y="258" text-anchor="middle" fill="var(--accent-text)" class="flow">corpus → top-2048</text>
+      <text x="434" y="258" text-anchor="middle" fill="var(--accent-text)" class="flow">eligible only</text>
+      <text x="614" y="258" text-anchor="middle" fill="var(--accent-text)" class="flow">100s of thousands</text>
+      <text x="790" y="258" text-anchor="middle" fill="var(--accent-text)" class="flow">top-K</text>
+
+      <!-- single-graph bracket -->
+      <line x1="184" y1="290" x2="856" y2="290" stroke="var(--sage-deep)" stroke-width="1.5"/>
+      <line x1="184" y1="284" x2="184" y2="290" stroke="var(--sage-deep)" stroke-width="1.5"/>
+      <line x1="856" y1="284" x2="856" y2="290" stroke="var(--sage-deep)" stroke-width="1.5"/>
+      <text x="520" y="312" text-anchor="middle" fill="var(--sage-deep)" class="component-sub">同一張 computation graph——module 之間沒有網路、沒有序列化、沒有版本 skew</text>
+
+      <text x="440" y="346" text-anchor="middle" fill="var(--muted)" class="component-sub">點任一方塊查看它的責任與「不知道的事」——舊架構這四塊是四個獨立部署的 service</text>
+
+      <defs>
+        <marker id="vg-w-arch-silvertorch-forward-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+        </marker>
+      </defs>
+    </svg>
+
+    <div>
+      <p class="hint">click a module above</p>
+      <div class="detail detail-1">
+        <h3>fused Int8 ANN · 責任邊界</h3>
+        <p>把整個 item index 以 Int8 的 embedding tensor 形式存在 model 裡（約是 16-bit 的一半記憶體），用一個 fused GPU kernel 對 user embedding 跑 IVF 風格的 ANN——在 64 個 cluster 上 probe、回傳 top-2048。索引不再是外部 service，而是 forward pass 讀到的一塊 tensor。</p>
+        <p><strong>不知道的事</strong>：item 此刻是否可投放（那是 eligibility 的事）、最終排序分數怎麼算（那是 scoring 的事）。它只負責「embedding 空間裡誰離 user 近」。</p>
+      </div>
+      <div class="detail detail-2">
+        <h3>Bloom eligibility · 責任邊界</h3>
+        <p>把 eligibility 規則編成一個直接存在 model 裡的 Bloom index，用 bit operation 判斷 candidate 是否通過，取代 CPU 上的 inverted index（posting list）。posting list 在不同 attribute、不同 query 之間長度差異巨大，在 GPU 上造成 warp divergence；bit-ops 是 dense、parallel 的工作，正是 GPU 擅長的。</p>
+        <p><strong>不知道的事</strong>：candidate 是怎麼被 ANN 選出來的、reranker 會怎麼重排。它只回答 boolean——「這個 item 此刻合不合格」。</p>
+      </div>
+      <div class="detail detail-3">
+        <h3>neural reranking · 責任邊界</h3>
+        <p>在一個被放大到 100s of thousands 的候選池上跑 MLP、stacked self-attention，或更結構化的 mixture of logits（MoL）。因為前三段都在同一張 GPU graph 裡、沒有跨 service 的 round-trip，reranker 才負擔得起對遠超 2,048 的候選做 neural 精算。</p>
+        <p><strong>不知道的事</strong>：候選的 embedding 是 Int8 還是 fp16（ANN 那層已經處理完）、最終要輸出幾個（那是 scoring 決定 top-K）。它只負責「在擴大的候選池上把相關性算細」。</p>
+      </div>
+      <div class="detail detail-4">
+        <h3>multi-task scoring · 責任邊界</h3>
+        <p>把多個 user action 的預測（點擊、停留、互動……）合成單一 composite score，讓系統可以對更廣的目標做最佳化，最後輸出 top-K。這一步落在 forward pass 末端，吃 reranker 輸出的 representation。</p>
+        <p><strong>不知道的事</strong>：候選是怎麼被檢索、過濾、精排到這一步的。它只負責「把多個 task head 的輸出折成一個可排序的純量」。</p>
+      </div>
+    </div>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-arch-silvertorch-forward');
+        root.querySelectorAll('.component').forEach((rect) => {
+          rect.addEventListener('click', () => {
+            const targetId = rect.getAttribute('data-target');
+            const radio = root.querySelector('#' + targetId);
+            if (radio) radio.checked = true;
+          });
+          rect.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              rect.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            }
+          });
+        });
+      })();
+    </script>
+    <figcaption>四個 module 同處一張 computation graph。舊架構裡這是四個（含 user tower 是五個）獨立部署、獨立版本、靠網路串起來的微服務；SilverTorch 把它們收進一次 forward pass，module 之間的「資料移動」退化成 GPU 記憶體裡的 tensor 傳遞。</figcaption>
+  </figure>
+
+  <p>把整條棧視為一個 model 的代價與收益，都集中在「資料不再跨 service 移動」這一件事上。下面先解釋舊的兩段式 ANN+rank 微服務架構到底慢在哪、脆在哪，再逐一拆開四個 module 的設計。在進入細節之前，先把「Index as Model」這句口號落成一段可讀的 pseudocode——整條檢索棧在 SilverTorch 裡長這樣，每一段都只是同一個 <code>forward</code> 方法裡的一行 tensor 操作：</p>
+
+  <pre data-kind="pseudocode"><code>class SilverTorchRetrieval(nn.Module):
+    <em>// 所有 item 的 embedding 是 model 內的 Int8 tensor，不是外部 service</em>
+    item_index_int8 : Tensor[num_items, dim]      <em>// Int8，約 16-bit 的一半記憶體</em>
+    ivf_centroids   : Tensor[num_clusters, dim]    <em>// IVF cluster 中心</em>
+    bloom_bits      : Tensor[num_attrs, bloom_len] <em>// eligibility 編成 bit 陣列</em>
+    rerank_mlp      : nn.Module                     <em>// MLP / self-attention / MoL</em>
+    task_heads      : List[nn.Module]               <em>// 多個 multi-task head</em>
+
+    def forward(user_features):
+        u = user_tower(user_features)               <em>// → user embedding</em>
+        cand = fused_int8_ann(u, item_index_int8,   <em>// 64 probes, top-2048</em>
+                              ivf_centroids, probes=64, topk=2048)
+        cand = bloom_eligible(cand, bloom_bits)     <em>// bit-ops，無 posting list</em>
+        cand = expand_pool(cand)                    <em>// 放大到 100s of thousands</em>
+        scores = rerank_mlp(u, cand)                <em>// neural 精排</em>
+        composite = combine([h(scores) for h in task_heads])
+        return topk(composite, K)                   <em>// 全程一張 graph，sub-100ms</em></code></pre>
+
+  <p>關鍵不在每一行做什麼——retrieval、filter、rerank、score 的邏輯跟舊架構一樣——而在這六行全都在同一個 <code>forward</code> 裡、同一張 GPU 上、同一次 call 內跑完。舊架構裡，這六行之間的每一個箭頭都是一次跨 service 的網路呼叫。下面三節先講舊架構為什麼那些箭頭這麼貴，再回頭逐一拆 module。</p>
+
+  <h2>兩段式微服務棧的三個結構性病灶</h2>
+
+  <p>傳統檢索棧是經典的 two-stage 設計：第一段 retrieval 用 ANN 從整個 corpus 裡撈出候選，第二段 ranking 用 neural model 精排。問題不在這個邏輯分層——邏輯上 retrieval 跟 ranking 本來就該分開——而在於 Meta 把這個邏輯分層直接對應成了物理上的服務分層。user tower 是一套 service，算出 user embedding；item index 是另一套 service，持有所有 item 的 embedding 並做 ANN；filtering 走 CPU 上的 inverted index service；reranking 又是一套 GPU service。一筆 request 要在這些 service 之間來回穿梭，而這帶來三個結構性的病灶。</p>
+
+  <p>第一個是<strong>資料移動的延遲</strong>。每一次跨 service 的 hop 都要付網路 round-trip 加上序列化／反序列化的成本。user embedding 算完要序列化、傳給 index service；index service 回傳幾千個候選 id 加 embedding，又要序列化、傳給 filtering；filtering 回傳合格集合，再傳給 reranking。在 sub-100ms 的延遲預算裡，這些 hop 的累加會直接吃掉留給「真正計算」的時間。更糟的是，這個成本跟候選數量正相關——你想讓 reranker 看更多候選，跨 service 傳的 payload 就更大，於是候選池被網路成本反向壓制。FAISS-GPU 這類 GPU baseline 的 top-k 上限大約落在 2,048，部分原因就是把更大的候選集搬出 service 邊界本身就不划算。</p>
+
+  <p>這個延遲的形狀值得拆細一點，因為它不是「網路慢」這麼籠統。一次跨 service hop 的成本大致由三段組成：把記憶體裡的 tensor 序列化成 wire format（protobuf / thrift 之類）、推過網路、在對端反序列化回 tensor。對 embedding 這種「大塊浮點數陣列」，序列化與反序列化本身就是 CPU 上的 memory-bound 工作；而候選集越大，這兩段的時間越長。把這條鏈展開成偽碼，舊架構的一次檢索其實是這樣的：</p>
+
+  <pre data-kind="pseudocode"><code><em>// 舊的 two-stage 微服務棧——每個箭頭都是一次 RPC</em>
+u = user_tower_service.embed(user)         <em>// RPC 1: 算 user embedding</em>
+                                           <em>//  serialize u → 過網 → deserialize</em>
+cand = index_service.ann(u, topk=2048)     <em>// RPC 2: ANN，回 2048 個候選</em>
+                                           <em>//  serialize 2048 × (id, emb) → 過網 → deserialize</em>
+ok = filter_service.eligible(cand)         <em>// RPC 3: CPU inverted index 過濾</em>
+                                           <em>//  serialize cand → 過網 → deserialize</em>
+ranked = rank_service.rerank(u, ok)        <em>// RPC 4: GPU reranker 精排</em>
+                                           <em>//  serialize ok → 過網 → deserialize</em>
+return ranked
+
+<em>// 想讓 reranker 看 10× 候選？RPC 2/3/4 的 payload 全部 ×10。</em>
+<em>// sub-100ms 預算裡，序列化 + 網路就先吃掉一大塊。</em></code></pre>
+
+  <p>注意每一條 RPC 的 payload 都跟候選集大小成正比。當 reranker 想看的候選從 2,048 變成 20,480，RPC 2、3、4 傳的資料量同步放大十倍——這不是「略慢一點」，而是序列化成本與網路頻寬被候選數量直接乘上去。這就是為什麼舊架構的候選池實質上被鎖在幾千：不是 reranker 算不動，是把候選搬到 reranker 面前的成本扛不住。</p>
+
+  <p>第二個是<strong>版本 skew</strong>。user-tower model、item index、filtering 規則是各自獨立更新的。當 user tower 升級到新版、產出的 embedding 分布變了，而 item index 還是舊版訓練出來的 embedding，兩邊的 embedding 就不在同一個空間裡——ANN 的距離計算失去意義，recall 悄悄崩壞。要避免這種 skew，得在多個獨立部署的 service 之間做嚴格的版本協調，這在工程上是長期的痛點：任何一次模型更新都要跨團隊、跨 service 對齊上線時機。</p>
+
+  <p>第三個是<strong>語言與團隊的裂縫</strong>。ML engineer 寫 PyTorch、infra engineer 寫 C++，檢索棧橫跨這兩個世界。一個看似簡單的改進——例如想在 reranker 前多塞一層 attention——可能要 ML 改 PyTorch model、infra 改 C++ serving，協調下來一個迭代週期要數週。模型側的創新被 serving 側的工程節奏拖住，這是 two-stage 微服務架構最隱性、卻最致命的稅。</p>
+
+  <p>SilverTorch 的「Index as Model」一次性地把這三個病灶接地：四段流程同處一張 PyTorch computation graph，module 之間的資料移動退化成 GPU 記憶體內的 tensor 傳遞，沒有網路 hop、沒有序列化；版本 skew 消失，因為 index、tower、filter 是同一個 model 的一部分，一起訓練、一起部署、天然同版本；語言裂縫合上，因為整條棧都是 PyTorch，ML engineer 改 model 就等於改了 serving 行為。下面這張對照表把舊棧與 SilverTorch 的關鍵維度並排——點欄位標題可排序。</p>
+
+  <figure class="vg-w-table-silvertorch-vs">
+    <style>
+      .vg-w-table-silvertorch-vs table { width: 100%; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-silvertorch-vs { overflow-x: auto; }
+      .vg-w-table-silvertorch-vs table { min-width: 520px; }
+      .vg-w-table-silvertorch-vs thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; }
+      .vg-w-table-silvertorch-vs thead th[data-sort] { color: var(--accent-text); }
+      .vg-w-table-silvertorch-vs thead th[data-sort="asc"]::after { content: ' ▴'; font-size: 0.7em; }
+      .vg-w-table-silvertorch-vs thead th[data-sort="desc"]::after { content: ' ▾'; font-size: 0.7em; }
+      .vg-w-table-silvertorch-vs tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+      .vg-w-table-silvertorch-vs td.dim { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+      .vg-w-table-silvertorch-vs td.old { color: var(--ink-soft); }
+      .vg-w-table-silvertorch-vs td.new { color: var(--sage-deep); }
+      .vg-w-table-silvertorch-vs tbody tr:hover td { background: var(--bg-soft); }
+      .vg-w-table-silvertorch-vs caption { text-align: left; caption-side: top; font-family: var(--scribed); font-style: italic; color: var(--muted); font-size: var(--fs-sm); padding: var(--s-1) 0; }
+      .vg-w-table-silvertorch-vs .vg-w-affordance { display: flex; align-items: center; gap: var(--s-1); font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin: 0 0 var(--s-1) 0; }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/><path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+      </svg>
+      <span>click column header to sort · 3 columns × 6 rows</span>
+    </p>
+    <table>
+      <caption>兩段式微服務棧 vs. SilverTorch 的 Index-as-Model。數字直接取自 Meta 工程部落格。點欄位標題排序。</caption>
+      <thead>
+        <tr>
+          <th data-key="dim">維度</th>
+          <th data-key="old">two-stage 微服務棧</th>
+          <th data-key="new">SilverTorch（index as model）</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td class="dim">部署形狀</td><td class="old">user tower / index / filter / rerank 各自獨立部署</td><td class="new">單一 PyTorch model，一次 forward pass</td></tr>
+        <tr><td class="dim">module 間資料移動</td><td class="old">跨 service 網路 hop + 序列化</td><td class="new">GPU 記憶體內 tensor 傳遞</td></tr>
+        <tr><td class="dim">eligibility filter</td><td class="old">CPU inverted index（posting list）</td><td class="new">model 內 Bloom index，快 291–523×</td></tr>
+        <tr><td class="dim">候選池上限（max top-k）</td><td class="old">FAISS-GPU ≈ 2,048</td><td class="new">100s of thousands</td></tr>
+        <tr><td class="dim">throughput（req/s）</td><td class="old">multi-service baseline = 1×</td><td class="new">23.7×</td></tr>
+        <tr><td class="dim">compute-cost 效率（vs CPU）</td><td class="old">1×</td><td class="new">20.9×（含 reranking 13.35×）</td></tr>
+      </tbody>
+    </table>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-table-silvertorch-vs');
+        const headers = root.querySelectorAll('thead th');
+        const tbody = root.querySelector('tbody');
+        let activeKey = null, asc = true;
+        headers.forEach((h, idx) => h.addEventListener('click', () => {
+          const key = h.dataset.key;
+          if (activeKey === key) asc = !asc; else { activeKey = key; asc = true; }
+          headers.forEach((x) => x.removeAttribute('data-sort'));
+          h.setAttribute('data-sort', asc ? 'asc' : 'desc');
+          const rows = Array.from(tbody.querySelectorAll('tr'));
+          rows.sort((a, b) => {
+            const av = a.children[idx].textContent.trim();
+            const bv = b.children[idx].textContent.trim();
+            const cmp = av.localeCompare(bv, 'en');
+            return asc ? cmp : -cmp;
+          });
+          rows.forEach((r) => tbody.appendChild(r));
+        }));
+      })();
+    </script>
+  </figure>
+
+  <h2>fused Int8 ANN：item index 變成一塊 tensor</h2>
+
+  <p>第一個 module 把 item index 從「外部 service」降維成「forward pass 讀到的一塊 tensor」。所有 item 的 embedding 以 Int8 格式存在 model 裡——Int8 是 8-bit 整數量化，相對 16-bit 浮點數大約省一半記憶體，這在 item corpus 動輒上億的規模下不是錦上添花，而是讓整個 index 能塞進單張 GPU 記憶體的前提。量化最直覺的擔憂是精度損失：把 fp16 embedding 壓成 Int8，距離計算會不會失真到傷害 recall？Meta 的實測結論是，在「64 probes and top-2048」的設定下，Int8 量化沒有可測量的 recall loss。</p>
+
+  <p>這裡的「probes」指的是 IVF（inverted file）式 ANN 的 cluster 探查。IVF 的做法是先把整個 embedding 空間用 k-means 之類的方法分成許多 cluster，query 進來時不必跟全部 item 算距離，只挑離 query 最近的若干個 cluster（即 probes）去搜。64 probes 意思是每次 query 探查 64 個 cluster，再從中回傳 top-2048 個最近鄰。這個 (64 probes, top-2048) 的組合是 recall 與計算量的平衡點——probe 太少 recall 會掉、probe 太多計算量上去；Meta 找到的點是：在這個平衡點上，Int8 的量化誤差被 ANN 本身的近似性質吸收掉了，量化不再是新的 recall 瓶頸。</p>
+
+  <p>為什麼量化誤差會被「吸收」值得多想一句。ANN 本身就是近似的——IVF 只探查 64 個 cluster、本來就會漏掉落在未探查 cluster 裡的真實最近鄰，這個近似誤差遠大於 Int8 量化引入的距離誤差。換句話說，當你已經接受了 IVF 的 recall 不是 100%，再疊一層 Int8 的小誤差，對最終 recall 的邊際影響趨近於零。這跟「在乾淨的 exact search 上做 Int8 量化」是兩回事——後者量化誤差會直接顯現，前者量化誤差淹沒在 ANN 的近似海裡。Meta 的「no measurable recall loss」要在這個前提下讀：它是針對 (64 probes, top-2048) 這個特定 operating point 的觀察，不是「Int8 對任何 ANN 設定都無損」的普適宣稱。</p>
+
+  <p>「fused」是另一個關鍵字。fused kernel 指的是把多個原本分離的 GPU 操作（解量化、距離計算、top-k 選取）合併進單一 kernel，避免中間結果反覆寫回 GPU global memory 再讀出來。對 ANN 這種 memory-bandwidth-bound 的工作，kernel 之間的 round-trip 往往比算術本身更貴；fused kernel 把這些中間 tensor 留在暫存器與 shared memory 裡，是把 Int8 ANN 跑進延遲預算的工程核心。把這層拿掉、退回外部 index service，你失去的不只是這顆 kernel 的效率，而是「index 與 user tower 同版本」這個性質——index 變回獨立 service 的那一刻，版本 skew 的風險就回來了。</p>
+
+  <p>把 IVF + Int8 + fused 三件事疊起來看，這顆 kernel 在一次 query 裡做的事大致如下：先用 user embedding 跟 IVF centroid 算距離、挑出最近的 64 個 cluster（probe），只在這 64 個 cluster 持有的 item 上算距離，邊算邊用 Int8 的整數運算解量化、邊維護一個 top-2048 的小堆。整段不寫回 global memory：</p>
+
+  <pre data-kind="pseudocode"><code>fn fused_int8_ann(u, index_int8, centroids, probes=64, topk=2048):
+    <em>// 1. 挑要 probe 的 cluster——只跟 num_clusters 個 centroid 算距離</em>
+    nearest_cells = top_n(dot(u, centroids), n=probes)   <em>// 64 cells</em>
+
+    <em>// 2. 只在這 64 個 cell 的 item 上算距離，邊解量化邊算</em>
+    heap = TopK(topk)                       <em>// 維持在暫存器/shared mem</em>
+    for cell in nearest_cells:
+        for item_int8 in index_int8[cell]:
+            d = int8_dot(u_int8, item_int8) <em>// 整數內積，硬體吃得很快</em>
+            heap.offer(item_id, d)          <em>// 不寫回 global memory</em>
+    return heap.items                       <em>// top-2048</em>
+
+<em>// 量化誤差被 ANN 的近似性質吸收——(64 probes, top-2048) 下無可測 recall loss</em></code></pre>
+
+  <h2>Bloom eligibility：bit operation 取代 posting list</h2>
+
+  <p>候選撈出來之後，要過 eligibility filter——把此刻不可投放的 item 濾掉（下架的、地區限制的、使用者已看過的……）。傳統做法是 CPU 上的 inverted index：每個 eligibility attribute 對應一個 posting list（持有具備該屬性的 item id），filtering 就是對這些 posting list 做交集／差集。這個結構在 CPU 上沒問題，但搬上 GPU 就撞牆。</p>
+
+  <p>問題出在 posting list 的長度在不同 attribute、不同 query 之間差異劇烈。GPU 的執行單位是 warp（一組 lockstep 執行的 thread），如果同一個 warp 裡的 thread 各自要走訪長度懸殊的 posting list，就會產生 intra-warp load imbalance 與 warp divergence——快的 thread 得空等慢的 thread，硬體利用率塌掉。Meta 的原文講得很直接：「posting lists can also vary dramatically in length across attributes and queries, creating intra-warp load imbalance and warp divergence on GPUs。」posting list 這個資料結構本質上是「不規則、長度可變」的，而 GPU 要的是「規則、定長、densely parallel」的工作。</p>
+
+  <p>SilverTorch 換成把 eligibility 編成一個直接存在 model 裡的 Bloom index，用 simple bit operation 判斷成員資格。Bloom filter 是一個定長的 bit 陣列加幾個 hash function——判斷一個 item 合不合格，就是算幾個 hash、檢查對應 bit 是否都為 1，全程是定長的 bit 運算，沒有可變長度的走訪。把這兩種資料結構並排寫成偽碼，差別一眼可見：</p>
+
+  <pre data-kind="pseudocode"><code><em>// 舊：inverted index，posting list 長度可變 → warp divergence</em>
+fn eligible_inverted(item, posting_lists):
+    for attr in required_attrs:
+        if item not in posting_lists[attr]:  <em>// 走訪可變長 list</em>
+            return false                     <em>// 不同 thread 走的長度差很多</em>
+    return true
+
+<em>// 新：Bloom index，定長 bit-ops → dense parallel</em>
+fn eligible_bloom(item, bloom_bits):
+    h1, h2, h3 = hash3(item)                 <em>// 定長：永遠算 3 個 hash</em>
+    return bloom_bits[h1] &amp; bloom_bits[h2] &amp; bloom_bits[h3]
+    <em>// 每個 thread 做完全相同的工作量，warp 不 diverge</em></code></pre>
+
+  <p>左邊的 <code>eligible_inverted</code> 裡，每個 thread 要走訪的 posting list 長度由 attribute 決定，同一個 warp 裡的 thread 可能一個走 10 個元素、一個走 10,000 個，硬體只能等最慢的。右邊的 <code>eligible_bloom</code> 裡，每個 thread 永遠算固定數量的 hash、做固定數量的 bit-and，工作量齊一，warp 不 diverge。這正好把不規則的 posting-list 交集，換成「dense, parallel work GPUs are good at」。代價是 Bloom filter 的本質：它有 false positive（可能把不合格的誤判為合格），但沒有 false negative（不會把合格的誤殺）。對 eligibility 這個場景，false positive 的後果是「某個本該濾掉的 item 漏進了 reranker」，而 reranker 後面還有 scoring，誤放的成本可控；用一點 false positive 換 GPU 上的 dense parallelism，是划算的。</p>
+
+  <p>效果是 Bloom index 比 CPU inverted index 快 291–523 倍。這個倍數有個區間，而區間本身透露了機制：spread 反映了不同 query、不同 attribute 組合下的 filter selectivity 差異——有多少 item 通過 eligibility 檢查會浮動，posting list 的不規則程度也隨之浮動。換句話說，舊架構在最不規則的 query 上最慢（523× 的那端），而 Bloom 的定長 bit-ops 對所有 query 都是同樣的 dense 工作，於是「最壞情況」反而是加速倍數最高的地方。這也是 GPU 加速一個老套但重要的教訓：硬體在意的不是「平均工作量」而是「工作量的方差」——一個 warp 的吞吐由它最慢的 thread 決定，把方差壓成零（定長 bit-ops）往往比把平均壓低更值錢。</p>
+
+  <p>還有一個容易被忽略的細節：Bloom index 是「直接存在 model 裡」的。這意味著 eligibility 規則跟 item index、user tower 一樣，是 model artifact 的一部分，一起部署、天然同版本。舊架構裡 filtering 規則是獨立 service 的狀態，更新 filter 與更新 index 的時機需要協調；當 filter 變成 model 內的 bloom_bits tensor，這個協調問題消失了——重新訓練／重新打包 model 的那一刻，index、filter、tower 一起換新。下面這張表把四個 module 在候選池規模上的角色串起來——每個 tab 是 pipeline 的一個 stage。</p>
+
+  <figure class="vg-w-tabs-silvertorch-funnel">
+    <style>
+      .vg-w-tabs-silvertorch-funnel { display: grid; gap: var(--s-2); }
+      .vg-w-tabs-silvertorch-funnel input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-tabs-silvertorch-funnel .tabs { display: flex; flex-wrap: wrap; gap: var(--s-2); border-bottom: 1px solid var(--line); }
+      .vg-w-tabs-silvertorch-funnel .tab { font-family: var(--sans); font-size: var(--fs-sm); padding: var(--s-1) var(--s-2); cursor: pointer; color: var(--muted); user-select: none; min-height: 44px; display: flex; align-items: center; }
+      .vg-w-tabs-silvertorch-funnel .tab:hover { color: var(--accent-text); }
+      .vg-w-tabs-silvertorch-funnel .panel { display: none; padding: var(--s-2); border-left: 2px solid var(--accent); }
+      .vg-w-tabs-silvertorch-funnel .panel h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-tabs-silvertorch-funnel .panel p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-tabs-silvertorch-funnel .panel .count { font-family: EB Garamond, serif; font-size: 1.6rem; color: var(--ink); font-variant-numeric: tabular-nums; }
+      .vg-w-tabs-silvertorch-funnel .panel .count .unit { font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-left: 0.4ch; }
+      .vg-w-tabs-silvertorch-funnel .vg-w-affordance { display: flex; align-items: center; gap: var(--s-1); font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin: 0; }
+      .vg-w-tabs-silvertorch-funnel:has(#vg-w-tabs-silvertorch-funnel-t1:checked) .panel-1 { display: block; }
+      .vg-w-tabs-silvertorch-funnel:has(#vg-w-tabs-silvertorch-funnel-t1:checked) [for="vg-w-tabs-silvertorch-funnel-t1"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-silvertorch-funnel:has(#vg-w-tabs-silvertorch-funnel-t2:checked) .panel-2 { display: block; }
+      .vg-w-tabs-silvertorch-funnel:has(#vg-w-tabs-silvertorch-funnel-t2:checked) [for="vg-w-tabs-silvertorch-funnel-t2"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-silvertorch-funnel:has(#vg-w-tabs-silvertorch-funnel-t3:checked) .panel-3 { display: block; }
+      .vg-w-tabs-silvertorch-funnel:has(#vg-w-tabs-silvertorch-funnel-t3:checked) [for="vg-w-tabs-silvertorch-funnel-t3"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-silvertorch-funnel:has(#vg-w-tabs-silvertorch-funnel-t4:checked) .panel-4 { display: block; }
+      .vg-w-tabs-silvertorch-funnel:has(#vg-w-tabs-silvertorch-funnel-t4:checked) [for="vg-w-tabs-silvertorch-funnel-t4"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect width="18" height="18" x="3" y="3" rx="2"/><path d="M3 9h18"/><path d="M9 21V9"/>
+      </svg>
+      <span>switch tabs to walk the candidate funnel · 4 stages</span>
+    </p>
+    <input type="radio" id="vg-w-tabs-silvertorch-funnel-t1" name="vg-w-tabs-silvertorch-funnel-sel" aria-label="stage ANN" checked />
+    <input type="radio" id="vg-w-tabs-silvertorch-funnel-t2" name="vg-w-tabs-silvertorch-funnel-sel" aria-label="stage eligibility" />
+    <input type="radio" id="vg-w-tabs-silvertorch-funnel-t3" name="vg-w-tabs-silvertorch-funnel-sel" aria-label="stage rerank" />
+    <input type="radio" id="vg-w-tabs-silvertorch-funnel-t4" name="vg-w-tabs-silvertorch-funnel-sel" aria-label="stage score" />
+    <div class="tabs">
+      <label class="tab" for="vg-w-tabs-silvertorch-funnel-t1">1 · ANN</label>
+      <label class="tab" for="vg-w-tabs-silvertorch-funnel-t2">2 · eligibility</label>
+      <label class="tab" for="vg-w-tabs-silvertorch-funnel-t3">3 · rerank</label>
+      <label class="tab" for="vg-w-tabs-silvertorch-funnel-t4">4 · score</label>
+    </div>
+    <div class="panel panel-1">
+      <h3>stage 1 · fused Int8 ANN</h3>
+      <p class="count">corpus → 2048<span class="unit">top-k</span></p>
+      <p>整個 item corpus（上億級）是存在 model 裡的 Int8 tensor。fused kernel 在 64 個 IVF cluster 上 probe，回傳 top-2048。這是 FAISS-GPU 這類 baseline 的 top-k 上限——但對 SilverTorch 只是起點，不是終點。</p>
+    </div>
+    <div class="panel panel-2">
+      <h3>stage 2 · Bloom eligibility</h3>
+      <p class="count">2048 → eligible<span class="unit">bit-ops</span></p>
+      <p>對候選跑 Bloom index 的 bit operation，濾掉此刻不可投放的 item。比 CPU inverted index 快 291–523×，且沒有 warp divergence。false positive 可容忍（後面還有 scoring），false negative 為零。</p>
+    </div>
+    <div class="panel panel-3">
+      <h3>stage 3 · neural reranking</h3>
+      <p class="count">100s of thousands<span class="unit">candidates</span></p>
+      <p>關鍵反直覺處：候選池在這裡被放大到數十萬，遠超舊架構的 ~2,048。因為沒有跨 service 的資料移動成本，reranker（MLP / self-attention / MoL）才負擔得起對這麼大的候選池做 neural 精算。</p>
+    </div>
+    <div class="panel panel-4">
+      <h3>stage 4 · multi-task scoring</h3>
+      <p class="count">composite → top-K<span class="unit">output</span></p>
+      <p>把多個 user action 的預測折成單一 composite score，輸出最終 top-K。整段 1→4 在同一張 GPU graph 裡跑完，落在 sub-100ms 預算內。</p>
+    </div>
+  </figure>
+
+  <h2>neural reranking：候選池放大兩個數量級的反直覺</h2>
+
+  <p>第三個 module 是 neural reranking，但這一段真正值得停下來想的，不是「用了什麼 model」（MLP、stacked self-attention、或更結構化的 mixture of logits 都用得上），而是「reranker 看得到多少候選」。舊架構裡，能送進 reranker 的候選大約是 2,048 量級——這個數字不是 reranker 算不動更多，而是把更大的候選集從 retrieval service 搬到 ranking service 的網路成本扛不住。候選池被服務邊界鎖死在幾千。</p>
+
+  <p>SilverTorch 把這個上限抬到 100s of thousands——兩個數量級。能這麼做，純粹是因為候選不再需要跨 service 搬運：ANN 撈出的候選、Bloom 過濾後的合格集合，都還是同一張 GPU graph 裡的 tensor，reranker 直接在記憶體裡讀。沒有序列化、沒有 round-trip，候選池能放大到多少，由 GPU 記憶體與計算預算決定，而不是由「跨 service payload 多大才划算」決定。</p>
+
+  <p>這個放大的意義是質變而非量變。retrieval 階段的 ANN 是近似的——它用 embedding 距離當相關性的 proxy，會漏掉「embedding 不夠近、但在精排 model 眼裡其實高度相關」的 item。候選池越大，這種 ANN 漏網之魚被撈回來的機會越高。換句話說，把 reranker 的候選池從 2,048 放大到數十萬，等於讓「便宜但粗糙的 ANN」少做篩選、讓「昂貴但精準的 neural reranker」多做判斷——把篩選的責任往精排端推。這是 two-stage 架構長年想做卻被服務邊界擋住的事：理論上你總希望 retrieval 寬鬆一點、ranking 嚴格一點，但跨 service 的資料移動成本一直在反方向拉扯。Index-as-Model 把這個拉扯拿掉了。</p>
+
+  <p>下面這個互動小工具讓你直接操作候選池大小這個變數——拖動 slider，看候選池在 2,048（FAISS-GPU 上限）到 300,000（SilverTorch 級）之間移動時，需要的跨 service 資料移動倍數如何爆炸，以及為什麼舊架構不可能跟上。</p>
+
+  <figure class="vg-w-demo-silvertorch-pool" data-svg-scroll="560">
+    <style>
+      .vg-w-demo-silvertorch-pool { display: grid; gap: var(--s-3); }
+      .vg-w-demo-silvertorch-pool .controls { display: flex; align-items: center; gap: var(--s-2); flex-wrap: wrap; }
+      .vg-w-demo-silvertorch-pool label { font-family: var(--sans); font-size: var(--fs-sm); color: var(--ink); text-transform: uppercase; letter-spacing: 0.04em; }
+      .vg-w-demo-silvertorch-pool input[type="range"] { flex: 1; min-width: 180px; accent-color: var(--accent); height: 36px; touch-action: none; }
+      .vg-w-demo-silvertorch-pool .readout { font-family: JetBrains Mono, monospace; font-variant-numeric: tabular-nums; color: var(--accent-text); min-width: 9ch; text-align: right; font-size: var(--fs-sm); }
+      .vg-w-demo-silvertorch-pool svg { width: 100%; height: auto; }
+      .vg-w-demo-silvertorch-pool .note { display: grid; grid-template-columns: 1fr; gap: var(--s-2); padding: var(--s-3); background: var(--bg-soft); border-left: 2px solid var(--accent); }
+      .vg-w-demo-silvertorch-pool .note .verdict { font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink-soft); }
+      .vg-w-demo-silvertorch-pool .note .verdict em { color: var(--accent-text); font-style: italic; }
+      .vg-w-demo-silvertorch-pool .bar { transition: width 180ms ease-out; }
+      @media (max-width: 720px) {
+        .vg-w-demo-silvertorch-pool svg { min-height: 200px; }
+        .vg-w-demo-silvertorch-pool svg text { font-size: 22px; }
+      }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M18 8l4 4-4 4"/><path d="M2 12h20"/><path d="M6 8l-4 4 4 4"/>
+      </svg>
+      <span>drag the slider to sweep candidate-pool size · 2,048 → 300,000</span>
+    </p>
+    <div class="controls">
+      <label for="vg-w-demo-silvertorch-pool-x">candidate pool =</label>
+      <input id="vg-w-demo-silvertorch-pool-x" type="range" min="2048" max="300000" step="1024" value="2048" aria-label="候選池大小" />
+      <span class="readout" data-readout>2,048</span>
+    </div>
+    <svg viewBox="0 0 880 150" role="img" aria-label="候選池大小對應的跨 service 資料移動倍數，相對 FAISS-GPU 的 2,048 baseline">
+      <text x="20" y="40" fill="var(--muted)" font-family="IM Fell English, serif" font-style="italic" font-size="13">old stack · 跨 service 搬運成本（相對 2,048 baseline）</text>
+      <rect x="20" y="50" width="838" height="22" fill="var(--muted-2)" opacity="0.18"/>
+      <rect class="bar" data-bar-old x="20" y="50" width="6" height="22" fill="var(--accent)" opacity="0.55"/>
+      <text data-label-old x="32" y="66" fill="var(--ink)" font-family="JetBrains Mono, monospace" font-size="12">1.0×</text>
+      <text x="20" y="104" fill="var(--muted)" font-family="IM Fell English, serif" font-style="italic" font-size="13">SilverTorch · GPU 記憶體內 tensor 傳遞（無網路 hop）</text>
+      <rect x="20" y="114" width="838" height="22" fill="var(--muted-2)" opacity="0.18"/>
+      <rect class="bar" data-bar-new x="20" y="114" width="838" height="22" fill="var(--sage-deep)" opacity="0.7"/>
+      <text x="848" y="130" text-anchor="end" fill="var(--bg)" font-family="JetBrains Mono, monospace" font-size="12">in-memory · 不隨候選池放大付網路稅</text>
+    </svg>
+    <div class="note">
+      <div class="verdict" data-verdict>候選池 <em>2,048</em>——舊架構的 GPU baseline 上限。在這裡兩種架構差距還小，但每放大一倍候選，舊架構的跨 service payload 就同比膨脹。</div>
+    </div>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-demo-silvertorch-pool');
+        const inp = root.querySelector('input[type="range"]');
+        const readout = root.querySelector('[data-readout]');
+        const barOld = root.querySelector('[data-bar-old]');
+        const labelOld = root.querySelector('[data-label-old]');
+        const verdict = root.querySelector('[data-verdict]');
+        const X0 = 20, W = 838, BASE = 2048;
+        function fmt(n) { return n.toLocaleString('en-US'); }
+        function recompute() {
+          const pool = Number(inp.value);
+          readout.textContent = fmt(pool);
+          // old stack cross-service movement scales linearly with pool size
+          const mult = pool / BASE;
+          // log-ish bar width so 1x..146x stays on screen; width grows with mult, capped at full
+          const w = Math.max(6, Math.min(W, (Math.log10(mult) / Math.log10(300000 / BASE)) * W));
+          barOld.setAttribute('width', String(w));
+          labelOld.setAttribute('x', String(X0 + 12));
+          labelOld.textContent = mult < 10 ? mult.toFixed(1) + '×' : Math.round(mult) + '×';
+          if (pool <= 2048) {
+            verdict.innerHTML = '候選池 <em>2,048</em>——舊架構的 GPU baseline 上限。在這裡兩種架構差距還小，但每放大一倍候選，舊架構的跨 service payload 就同比膨脹。';
+          } else if (pool < 100000) {
+            verdict.innerHTML = '候選池 <em>' + fmt(pool) + '</em>（約 ' + mult.toFixed(0) + '× baseline）——舊架構此時要把 ' + mult.toFixed(0) + ' 倍的候選 payload 跨 service 搬運，網路成本已不可行。SilverTorch 因為候選留在 GPU graph 裡，這條成本是平的。';
+          } else {
+            verdict.innerHTML = '候選池 <em>' + fmt(pool) + '</em>——進入 SilverTorch 宣稱的 100s-of-thousands 區間（約 ' + mult.toFixed(0) + '× baseline）。舊架構在這裡早已崩潰；reranker 能看這麼多候選，純粹是因為「資料移動」退化成了記憶體內 tensor 傳遞。';
+          }
+        }
+        inp.addEventListener('input', recompute);
+        recompute();
+      })();
+    </script>
+    <figcaption>拖動 slider 改變候選池大小。上條是舊架構的跨 service 搬運成本，隨候選池線性膨脹（軸為對數，把 1× 到 146× 拉開）；下條是 SilverTorch——候選不離開 GPU graph，放大候選池不付網路稅。這正是 reranker 能從 2,048 看到 100s of thousands 的物理原因。</figcaption>
+  </figure>
+
+  <h2>multi-task composite scoring：把多個目標折成一個排序純量</h2>
+
+  <p>最後一個 module 是 scoring。推薦系統很少只優化單一目標——點擊率、觀看時長、互動率、長期留存往往同時是目標，現代做法是訓練多個 task head 各自預測一種 user action，再把這些預測組合成單一分數來排序。SilverTorch 把這個 multi-task scoring 也納進 forward pass：reranker 輸出的 representation 直接餵給多個 task head，輸出合成的 composite score，排序取 top-K。</p>
+
+  <p>composite score 的形狀通常是各 task head 預測的加權組合——權重反映業務上對不同行為的相對重視。寫成偽碼，scoring module 是這樣把多個 head 折成一個排序純量：</p>
+
+  <pre data-kind="pseudocode"><code>fn multi_task_score(rep, task_heads, weights):
+    <em>// rep：reranker 對每個候選輸出的 representation</em>
+    p_click   = task_heads.click(rep)      <em>// 預測點擊</em>
+    p_dwell   = task_heads.dwell(rep)      <em>// 預測停留時長</em>
+    p_engage  = task_heads.engage(rep)     <em>// 預測互動</em>
+    <em>// 折成單一可排序純量——權重是業務目標的旋鈕</em>
+    composite = (weights.click  * p_click
+               + weights.dwell  * p_dwell
+               + weights.engage * p_engage)
+    return composite
+
+<em>// 因為這一步跟 retrieval / rerank 同處一張可訓練 graph，</em>
+<em>// 梯度能從 composite 一路回傳到更前面的 module。</em></code></pre>
+
+  <p>把 scoring 放進同一張 graph 還有一個 retrieval 設計上的連鎖效應。傳統 two-stage 架構裡，retrieval 用的相關性（embedding 距離）跟最終 ranking 用的目標（composite multi-task score）是兩套不同的東西——retrieval 不知道下游 scoring 真正在乎什麼，只能用 embedding 近似。當 retrieval、rerank、score 同處一張可一起訓練的 graph，梯度可以從 multi-task 目標一路回傳，讓更前面的 module 的行為跟最終目標對齊。這不是這篇工程文的主軸，但它是「Index as Model」在「省延遲」之外的第二層價值：把整條棧變成一個可端到端最佳化的對象。</p>
+
+  <p>把這個性質跟前面三節接起來看，四個 module 之所以能彼此「不知道對方的細節」卻又一起最佳化，靠的正是「它們是同一個 model 的 module」這個事實：責任邊界由 forward pass 的資料流定義（ANN 的輸出是 eligibility 的輸入、eligibility 的輸出是 rerank 的輸入），而最佳化邊界由共享的 computation graph 定義（梯度穿過所有 module）。舊架構裡這兩種邊界是錯位的——責任靠 RPC 介面切開，最佳化卻無法跨 service 流動，於是 retrieval 只能拿 embedding 距離當 ranking 目標的拙劣 proxy。Index-as-Model 讓這兩種邊界對齊。</p>
+
+  <h2>把倍數讀對：23.7× 吞吐、20.9× / 13.35× 成本，與它們的前提</h2>
+
+  <p>SilverTorch 公布的核心數字有三組，把它們對齊到「相對什麼 baseline、在什麼條件下」才有意義。整理如下：</p>
+
+  <pre data-kind="output"><code>throughput        23.7×   <em>// req/s，相對 multi-service baseline</em>
+compute-cost eff  20.9×   <em>// 相對 CPU baseline，未開 reranking</em>
+                  13.35×  <em>// 相對 CPU baseline，開啟 reranking（較接近 production）</em>
+bloom filtering   291–523× <em>// 相對 CPU inverted index，視 query selectivity</em>
+candidate pool    100s of thousands  <em>// vs FAISS-GPU 的 ~2,048 上限</em>
+latency budget    &lt; 100 ms <em>// 整段 forward pass 的目標</em></code></pre>
+
+  <p>這六個數字橫跨三個數量級——從 13.35× 到 523×——擺在同一條線性軸上後面的會把前面的壓成看不見。下面這張圖把它們畫在對數軸上，讓「吞吐」「成本效率」「filtering」「候選池」四類加速並排可比，每一條都標註了它各自是相對哪個 baseline 量的。</p>
+
+  <figure class="vg-w-chart-silvertorch-multipliers" data-svg-scroll="880">
+    <style>
+      .vg-w-chart-silvertorch-multipliers { display: grid; gap: var(--s-2); }
+      .vg-w-chart-silvertorch-multipliers svg.vg-w-chart-silvertorch-multipliers-main { width: 100%; height: auto; }
+      .vg-w-chart-silvertorch-multipliers figcaption { font-family: var(--scribed); font-style: italic; font-size: var(--fs-sm); color: var(--muted); }
+      .vg-w-chart-silvertorch-multipliers .vg-w-affordance { display: flex; align-items: center; gap: var(--s-1); font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin: 0; }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M3 3v18h18"/><path d="M7 16h3"/><path d="M7 11h7"/><path d="M7 6h12"/>
+      </svg>
+      <span>log-scale bar chart · 6 Meta-measured multipliers</span>
+    </p>
+    <svg class="vg-w-chart-silvertorch-multipliers-main" viewBox="0 0 880 360" role="img"
+         aria-label="SilverTorch 公布的六個加速倍數，畫在對數軸上：throughput 23.7×、compute-cost 效率 20.9× 與 13.35×、Bloom filtering 291× 與 523×、候選池放大約 146×，每條標註相對的 baseline">
+      <g id="vg-w-chart-silvertorch-multipliers-axes"></g>
+      <g id="vg-w-chart-silvertorch-multipliers-series"></g>
+    </svg>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-chart-silvertorch-multipliers');
+        const axesG = root.querySelector('#vg-w-chart-silvertorch-multipliers-axes');
+        const seriesG = root.querySelector('#vg-w-chart-silvertorch-multipliers-series');
+
+        // Meta-measured multipliers, each against a Meta-chosen baseline.
+        // [label, value(×), baseline note, accent flag]
+        const data = [
+          ['compute-cost（含 rerank）', 13.35, 'vs CPU · 開 reranking', false],
+          ['compute-cost（無 rerank）', 20.9, 'vs CPU · 上界', false],
+          ['throughput', 23.7, 'vs multi-service', true],
+          ['候選池放大', 146, 'vs FAISS-GPU 2,048', false],
+          ['Bloom filtering（下界）', 291, 'vs CPU inverted index', false],
+          ['Bloom filtering（上界）', 523, 'vs CPU inverted index', false],
+        ];
+
+        const NS = 'http://www.w3.org/2000/svg';
+        function el(tag, attrs) {
+          const e = document.createElementNS(NS, tag);
+          for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+          return e;
+        }
+
+        // Plot box — horizontal bars, log X axis (1× → 1000×)
+        const X0 = 250, X1 = 840, Y0 = 40, Y1 = 320;
+        const LOGMAX = 3; // log10(1000)
+        const xOf = v => X0 + (Math.log10(v) / LOGMAX) * (X1 - X0);
+
+        // X axis baseline + gridlines at powers of ten
+        axesG.appendChild(el('line', { x1: X0, y1: Y0, x2: X0, y2: Y0 + (Y1 - Y0), stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+        [1, 10, 100, 1000].forEach((tick) => {
+          const x = xOf(tick);
+          axesG.appendChild(el('line', { x1: x, y1: Y0, x2: x, y2: Y1, stroke: 'var(--muted-2)', 'stroke-width': 1, 'stroke-dasharray': '2 4', opacity: 0.6 }));
+          const t = el('text', { x: x, y: Y1 + 22, 'text-anchor': 'middle', 'font-family': 'JetBrains Mono, monospace', 'font-size': 13, fill: 'var(--muted)' });
+          t.textContent = tick + '×';
+          axesG.appendChild(t);
+        });
+        const xl = el('text', { x: (X0 + X1) / 2, y: Y1 + 48, 'text-anchor': 'middle', 'font-family': 'IM Fell English, serif', 'font-style': 'italic', 'font-size': 14, fill: 'var(--muted)' });
+        xl.textContent = '加速倍數（對數軸，相對各自的 Meta-chosen baseline）';
+        axesG.appendChild(xl);
+
+        // Bars
+        const n = data.length;
+        const band = (Y1 - Y0) / n;
+        const barH = Math.min(26, band * 0.5);
+        data.forEach((d, i) => {
+          const cy = Y0 + (i + 0.5) * band;
+          const y = cy - barH / 2;
+          const w = Math.max(2, xOf(d[1]) - X0);
+          const accent = d[3];
+          // row label (metric name)
+          const lab = el('text', { x: X0 - 12, y: cy - 2, 'text-anchor': 'end', 'font-family': 'EB Garamond, serif', 'font-size': 14, fill: 'var(--ink)' });
+          lab.textContent = d[0];
+          axesG.appendChild(lab);
+          // baseline note (sub-label)
+          const sub = el('text', { x: X0 - 12, y: cy + 13, 'text-anchor': 'end', 'font-family': 'IM Fell English, serif', 'font-style': 'italic', 'font-size': 11, fill: 'var(--muted)' });
+          sub.textContent = d[2];
+          axesG.appendChild(sub);
+          // bar
+          seriesG.appendChild(el('rect', { x: X0, y: y, width: w, height: barH, rx: 2, fill: accent ? 'var(--accent)' : 'var(--sage-deep)', 'fill-opacity': accent ? 0.85 : 0.7 }));
+          // value label at bar end
+          const vlab = el('text', { x: X0 + w + 8, y: cy + 4, 'text-anchor': 'start', 'font-family': 'JetBrains Mono, monospace', 'font-size': 13, fill: 'var(--ink)' });
+          vlab.textContent = d[1] + '×';
+          seriesG.appendChild(vlab);
+        });
+      })();
+    </script>
+    <figcaption>SilverTorch 公布的六個加速倍數，畫在對數軸上（線性軸會把 13.35× 壓成 523× 旁的一條細線）。每一條都標註它各自相對的 baseline——這些數字全是 Meta 在自家 workload、對 Meta 自選的 baseline（multi-service stack、CPU、CPU inverted index、FAISS-GPU 的 2,048 上限）量出來的，沒有外部驗證。throughput 那條以 accent 色標出，因為它最直接反映「消滅資料移動」的紅利。</figcaption>
+  </figure>
+
+  <p>23.7× 的吞吐是對「multi-service baseline」量的——也就是前面拆解的那套跨 service 棧。這個數字最直接地反映了「消滅資料移動」的紅利：當 module 之間不再付網路 round-trip 與序列化，同一張 GPU 在同樣時間裡能服務的 request 數量自然倍增。20.9× 與 13.35× 則是 compute-cost 效率，相對的是 CPU baseline——20.9× 是不開 reranking 的數字，13.35× 是開了 reranking 之後的。兩者的落差（20.9 → 13.35）本身就是一個訊號：neural reranking 在放大的候選池上做精算，吃掉了相當一部分效率紅利。哪個數字「對」取決於你要比的場景——如果你的系統一定要 reranking（多數 production 推薦系統都要），13.35× 才是你該拿來做容量規劃的數字，20.9× 是個沒有 reranking 的上界。</p>
+
+  <p>這篇來源是 Meta 的工程部落格、不是同儕審查的論文，所有倍數都是 Meta 自己在自己的 baseline 上量的，baseline 的選取與量測方法沒有外部驗證。把「100s of thousands」候選 reranking 跟「sub-100ms 延遲」並陳時，也值得記得這兩個極端數字未必是在同一個 model 規模、同一個候選池設定下同時成立的——「候選池能到數十萬」與「延遲在 100ms 內」可能各自是不同 operating point 上的觀察。部署面，SilverTorch 取代的是 FAISS 與既有的 inverted index filtering service，跑在 Feed 與影音內容（Reels）這類 family of apps 上；這篇沒有明確點名 Ads ranking 是不是也在其中。這些保留不否定 Index-as-Model 的工程價值，但讀的時候要把它當「Meta 在自家規模、自家 workload 上跑通的架構選擇」，而不是「對所有推薦系統都成立的普適結論」。</p>
+
+  <p>那麼，這套架構對「不是 Meta」的團隊有什麼可遷移的東西？最可遷移的不是「把 index 塞進 model」這個具體做法——多數團隊的 corpus 規模與 GPU 預算都還沒到非這麼做不可——而是底層的判斷：當你的延遲預算被「邏輯分層直接對應成物理服務分層」的資料移動成本吃掉時，把相鄰的 stage 合進同一個進程／同一張 graph、讓中間結果留在記憶體裡，往往比個別優化每個 service 更有效。這個判斷在 io_uring 合併 syscall、在 fused kernel 合併 GPU op、在這裡合併檢索 stage，是同一個形狀的工程直覺：邊界本身有成本，而最便宜的邊界是沒有邊界。</p>
+
+  <p class="vg-deep-closer"><strong>What this enables</strong>：當 item index、eligibility filter、reranker、user/item tower 全變成同一個 PyTorch model 的 module，檢索棧不再是一串靠網路串起來、各自版本、跨 PyTorch/C++ 語言邊界的微服務，而是一個可以一起訓練、一起部署、一次 forward pass 跑完、並且讓 reranker 在放大兩個數量級的候選池上做精算的單一最佳化對象——two-stage 微服務架構長年想做卻被服務邊界擋住的「retrieval 寬鬆、ranking 嚴格」，第一次在物理上變得可行。</p>
+</div>
