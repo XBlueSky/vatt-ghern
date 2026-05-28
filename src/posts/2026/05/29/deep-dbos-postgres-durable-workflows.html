@@ -1,0 +1,757 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">
+    DBOS 在 2026-05-20 丟出一個讓 Temporal 與 Restate 必須回應的論點：durable workflow
+    本質上就是把 state 寫進資料庫，那為什麼要再多一台 orchestrator？把 Postgres 的 row
+    lock 拿來當 dispatch，把 unique constraint 拿來當去重，一切就完成了——這個論點
+    要成立，需要的不是 SQL 漂亮，而是要在五個運維維度上都比現有 orchestrator 更划算。
+  </p>
+  <h1 class="vg-post-title">Postgres 就夠了？——把 DBOS 的「資料庫即 orchestrator」放在 Temporal 旁邊量一量</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p>
+    <span class="vg-dropcap">P</span>eter Kraft 在 DBOS 的部落格裡用一句話把這場辯論
+    框起來：「If durable workflows are about databases, then there's no reason to have
+    a separate orchestrator server。」這句話之所以值得認真讀，是因為它要對抗的不是
+    一個小公司，而是 Temporal——Uber Cadence 的開源繼任者，已經在過去八年裡把
+    workflow + activity + signal + query + heartbeat 這套模型推進到產業標準。
+    要說「Postgres 就夠了」，等於是在說 Temporal 整個架構是過度設計。
+  </p>
+
+  <p>
+    這個主張不是新的。Restate 也用 Postgres-backed 的 journaling，Inngest 用 queue
+    + step functions、把狀態藏在自己的 KV 層；AWS Step Functions 走完全 managed 的
+    state-machine JSON 路線。每一個都試圖在「workflow 要持久」這個需求上做出不同的
+    取捨。DBOS 的論點把這條光譜推到極端：不要 orchestrator、不要 broker、不要新增
+    一個必須單獨運維的元件——應用程式跟 Postgres 直接對話就好。
+  </p>
+
+  <p>
+    這篇文章不打算評論誰的 marketing 文案比較好，而是把五個候選者放在五個維度上
+    逐項拆解：state model、dispatch 機制、failover 行為、observability、operational
+    cost。每個維度都會回到具體的機制：哪一個 SQL 子句負責 dequeue？checkpoint
+    在 transaction 邊界的哪一邊？failover 由誰偵測？polyglot SDK 怎麼處理跨語言
+    workflow 編排？讀完之後，你應該能對著自己的系統說「這個情境選 X、那個情境選 Y」，
+    而不是「DBOS 看起來很簡潔所以選它」。
+  </p>
+
+  <p>
+    先看一張全景圖——五個系統在五個維度上的相對位置。資料來源是各家公開文件與
+    Kraft 在這篇 DBOS post 裡的自述，數值經過正規化（0-10，越高越好＝越偏向使用者
+    希望的方向；ops cost 是反向，越低越好已調整為「越省越接近 10」）。記得這是
+    對齊用的 at-a-glance、不是 benchmark 數字——這篇文章後段會把每個維度拆開來
+    講為什麼分數落在這個位置。
+  </p>
+
+  <figure class="vg-w-chart-durable-axes" data-svg-scroll="720">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/>
+        <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10"/>
+        <path d="M12 2a15.3 15.3 0 0 0-4 10 15.3 15.3 0 0 0 4 10"/>
+      </svg>
+      <span>hover or tap a label below the chart to highlight that system across 5 axes · 5 systems × 5 axes</span>
+    </p>
+    <style>
+      .vg-w-chart-durable-axes { display: grid; gap: var(--s-2); }
+      .vg-w-chart-durable-axes svg.vg-w-chart-durable-axes-main { width: 100%; height: auto; }
+      .vg-w-chart-durable-axes .legend { display: flex; flex-wrap: wrap; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-xs); }
+      .vg-w-chart-durable-axes .legend button { background: var(--bg-soft); border: 1px solid var(--line); color: var(--ink); padding: 6px 10px; border-radius: 999px; min-height: 32px; cursor: pointer; font-family: var(--sans); font-size: var(--fs-xs); display: inline-flex; align-items: center; gap: 6px; }
+      .vg-w-chart-durable-axes .legend button .swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+      .vg-w-chart-durable-axes .legend button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent-text); }
+      .vg-w-chart-durable-axes figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+    <svg class="vg-w-chart-durable-axes-main" viewBox="0 0 720 360" preserveAspectRatio="xMidYMid meet" role="img" aria-label="五個 durable-execution 系統在 state-model、dispatch、failover、observability、ops cost 五個維度上的相對位置">
+      <g id="vg-w-chart-durable-axes-grid"></g>
+      <g id="vg-w-chart-durable-axes-axes"></g>
+      <g id="vg-w-chart-durable-axes-series"></g>
+      <g id="vg-w-chart-durable-axes-labels"></g>
+    </svg>
+    <div class="legend" id="vg-w-chart-durable-axes-legend"></div>
+    <figcaption>五系統 × 五維度的對齊圖。0-10 正規化，越高代表該維度越接近使用者希望的方向；ops cost 已反向為「越省越高」。資料：DBOS 部落格自述、Temporal docs、Restate docs、Inngest docs、AWS Step Functions 開發者指南。</figcaption>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-chart-durable-axes');
+        if (!root) return;
+        const svg = root.querySelector('svg.vg-w-chart-durable-axes-main');
+        const grid = root.querySelector('#vg-w-chart-durable-axes-grid');
+        const axesG = root.querySelector('#vg-w-chart-durable-axes-axes');
+        const seriesG = root.querySelector('#vg-w-chart-durable-axes-series');
+        const labelsG = root.querySelector('#vg-w-chart-durable-axes-labels');
+        const legend = root.querySelector('#vg-w-chart-durable-axes-legend');
+        const NS = 'http://www.w3.org/2000/svg';
+        function el(tag, attrs, text) {
+          const e = document.createElementNS(NS, tag);
+          for (const [k, v] of Object.entries(attrs || {})) e.setAttribute(k, v);
+          if (text != null) e.textContent = text;
+          return e;
+        }
+        const axes = ['state model', 'dispatch latency', 'failover', 'observability', 'ops cost saved'];
+        const X0 = 80, X1 = 640;
+        const yOf = (i) => 60 + i * 56;
+        const xOf = (v) => X0 + (v / 10) * (X1 - X0);
+        const systems = [
+          { name: 'DBOS',          color: 'var(--accent)',    scores: [9, 4, 7, 8, 9] },
+          { name: 'Temporal',      color: 'var(--ink-deep)',  scores: [8, 9, 9, 9, 4] },
+          { name: 'Restate',       color: 'var(--sage-deep)', scores: [8, 8, 8, 7, 6] },
+          { name: 'Inngest',       color: 'var(--muted)',     scores: [6, 8, 7, 8, 7] },
+          { name: 'Step Functions',color: 'var(--accent-hover)', scores: [7, 6, 9, 7, 8] },
+        ];
+        // gridlines: vertical for 0, 2, 4, 6, 8, 10
+        for (let v = 0; v <= 10; v += 2) {
+          grid.appendChild(el('line', { x1: xOf(v), y1: 44, x2: xOf(v), y2: yOf(axes.length - 1) + 12, stroke: 'var(--muted-2)', 'stroke-width': v === 0 || v === 10 ? 1 : 0.6, 'stroke-opacity': 0.55 }));
+          const t = el('text', { x: xOf(v), y: 36, 'text-anchor': 'middle', 'font-family': 'Manrope, sans-serif', 'font-size': 11, fill: 'var(--muted)' }, String(v));
+          grid.appendChild(t);
+        }
+        // axes labels
+        axes.forEach((ax, i) => {
+          axesG.appendChild(el('line', { x1: X0, y1: yOf(i), x2: X1, y2: yOf(i), stroke: 'var(--muted-2)', 'stroke-width': 0.8 }));
+          const t = el('text', { x: 70, y: yOf(i) + 4, 'text-anchor': 'end', 'font-family': 'EB Garamond, serif', 'font-size': 13, fill: 'var(--ink)' }, ax);
+          axesG.appendChild(t);
+        });
+        // series — one polyline per system
+        const lines = {};
+        systems.forEach((s, si) => {
+          const pts = s.scores.map((v, i) => `${xOf(v)},${yOf(i)}`).join(' ');
+          const poly = el('polyline', { points: pts, fill: 'none', stroke: s.color, 'stroke-width': 1.6, 'stroke-opacity': 0.55, 'data-sys': s.name });
+          seriesG.appendChild(poly);
+          const dots = [];
+          s.scores.forEach((v, i) => {
+            const c = el('circle', { cx: xOf(v), cy: yOf(i), r: 4, fill: s.color, 'fill-opacity': 0.7, 'data-sys': s.name });
+            seriesG.appendChild(c);
+            dots.push(c);
+          });
+          lines[s.name] = { poly, dots };
+        });
+        // legend buttons — clicking highlights one system
+        let active = null;
+        systems.forEach((s) => {
+          const btn = document.createElement('button');
+          btn.setAttribute('type', 'button');
+          btn.setAttribute('aria-pressed', 'false');
+          btn.innerHTML = `<span class="swatch" style="background:${s.color}"></span>${s.name}`;
+          btn.addEventListener('click', () => {
+            if (active === s.name) {
+              active = null;
+              legend.querySelectorAll('button').forEach(b => b.setAttribute('aria-pressed', 'false'));
+              Object.values(lines).forEach(({ poly, dots }) => {
+                poly.setAttribute('stroke-opacity', 0.55);
+                poly.setAttribute('stroke-width', 1.6);
+                dots.forEach(d => { d.setAttribute('fill-opacity', 0.7); d.setAttribute('r', 4); });
+              });
+            } else {
+              active = s.name;
+              legend.querySelectorAll('button').forEach(b => b.setAttribute('aria-pressed', 'false'));
+              btn.setAttribute('aria-pressed', 'true');
+              Object.entries(lines).forEach(([name, { poly, dots }]) => {
+                const on = name === active;
+                poly.setAttribute('stroke-opacity', on ? 1 : 0.12);
+                poly.setAttribute('stroke-width', on ? 2.4 : 1.2);
+                dots.forEach(d => { d.setAttribute('fill-opacity', on ? 1 : 0.18); d.setAttribute('r', on ? 5 : 3); });
+              });
+            }
+          });
+          legend.appendChild(btn);
+        });
+      })();
+    </script>
+  </figure>
+
+  <p>
+    這張圖最有意思的地方不在最高分，而在「沒有任何一條線把所有維度都塞滿」。
+    Temporal 在 dispatch、failover、observability 三個維度都很高，但 ops cost 是
+    最差的——你要額外跑 frontend、history、matching、worker 至少四個 service 加
+    一個 persistence 後端。DBOS 反過來，ops cost 與 state model 拉滿，dispatch
+    latency 卻是最低的——polling 模型就是賺不了 push-based 系統的尾延遲。這個
+    取捨的精確形狀，是接下來五個維度要拆的東西。
+  </p>
+
+  <h2>state model：誰負責定義「workflow 是什麼」</h2>
+
+  <p>
+    第一個維度先把名詞釐清。Temporal 的 state model 是 event-sourced：每一次 activity
+    呼叫、每一次 signal、每一次 timer，都會在 Event History 裡留下一筆事件。
+    workflow 重啟時不是讀 snapshot，而是 replay 整段 history、把程式的內存 state
+    重建出來。這個設計的好處是 deterministic replay 讓 debugging 變得可能：你可以
+    用同一份 history 把 workflow 跑第二次、第三次，行為一致。代價是 workflow code
+    必須是純函數（不准呼叫 <code>Date.now()</code>、不准 <code>Math.random()</code>、
+    不准用未經 Activity 包裝的 IO），這條紀律花了 Uber 內部三年才推到所有團隊都
+    遵守。
+  </p>
+
+  <p>
+    DBOS 的 state model 用另一條路：每個 step 的輸出被 commit 到 Postgres
+    的 <code>steps</code> 表，欄位至少有 <code>(workflow_id, step_id, result, attempt)</code>，
+    並且有 <code>UNIQUE(workflow_id, step_id)</code>。Workflow 重啟時不需要 replay，
+    讀出已 commit 的 step 結果就能繼續執行下一步。這個設計直接把「狀態」收斂成
+    SQL 表，沒有 event history 的概念。好處是 mental model 簡單到能放進一封郵件
+    解釋完；代價是失去 replay-as-time-machine 的能力——你可以查到第七步失敗、
+    但不能把前面六步重新跑一次來觀察為什麼第七步失敗。
+  </p>
+
+  <p>
+    Restate 的設計在中間：它仍然 journal 每個步驟，但是 journaling 行為內建在
+    SDK 裡，使用者寫的程式碼看起來是普通的 async function。它把「事件溯源」這個
+    概念藏進 runtime 而非 surface 給使用者。Inngest 走 step function 路線，把
+    workflow 拆成 named steps；step 之間的 state 是 JSON-serialisable payload。
+    AWS Step Functions 是最極端的 declarative：workflow 是一張 state machine
+    JSON，state 是 task 之間傳遞的 input/output——你寫的不是程式碼，是 Amazon
+    States Language。
+  </p>
+
+  <p>
+    state model 維度的得分為什麼是 DBOS 9 / Temporal 8 / Restate 8 / Inngest 6 /
+    Step Functions 7？關鍵不是哪個「比較對」，而是哪個讓 80% 的場景最容易表達。
+    DBOS 的 table-based model 對「我有一個多步驟交易要保證原子性」這種需求最直白；
+    Temporal 的 event-sourced model 對「我有一個跑三週的 saga 而且需要 in-flight
+    debug」最強；Step Functions 的 JSON 對「我不要碰程式碼，純粹編排 Lambda」最
+    乾淨。Inngest 偏低是因為它的 step abstraction 在多分支條件 workflow 上需要
+    額外 ceremony。
+  </p>
+
+  <h2>dispatch：polling vs push 的尾延遲</h2>
+
+  <p>
+    這個維度是 DBOS 論點最容易被攻擊的地方。Polling 一張 Postgres 表的 dequeue
+    成本不是零——它是 polling 頻率 × CPU + lock acquisition latency 的乘積。
+    Temporal 的 matching service 是 push-based：worker 連上 long poll、有任務
+    時 server 直接推到 worker、沒任務時連線保持。p50 dispatch latency 在
+    Temporal 文件裡通常落在 10-50 ms。DBOS 的 polling 在低負載下會穩定地花掉
+    polling interval / 2 的等待時間——如果 interval 是 100 ms，平均 50 ms
+    的 dequeue 延遲是固定成本。
+  </p>
+
+  <p>
+    下面這個 widget 把這個取捨的形狀拉出來。拖動 slider 改變 offered workflow
+    rate（每秒進來的 workflow 數），下方會即時算出 polling 模型的平均 dequeue
+    latency、push 模型的平均 dequeue latency、以及 polling 模型下兩個 worker
+    競爭同一筆任務的鎖衝突機率（用簡化的 birthday-problem 近似：N workers
+    × poll interval / time window）。這不是 production benchmark，是教學
+    用的封閉形式公式——但它說明的趨勢是對的：throughput 越高、polling 的
+    競爭機率與額外 CPU 都越糟。
+  </p>
+
+  <figure class="vg-w-range-postgres-throughput">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <polyline points="5 9 2 12 5 15"/><polyline points="9 5 12 2 15 5"/>
+        <polyline points="15 19 12 22 9 19"/><polyline points="19 9 22 12 19 15"/>
+        <line x1="2" y1="12" x2="22" y2="12"/><line x1="12" y1="2" x2="12" y2="22"/>
+      </svg>
+      <span>drag the slider to sweep offered workflow rate · 3 derived metrics</span>
+    </p>
+    <style>
+      .vg-w-range-postgres-throughput { display: grid; gap: var(--s-2); padding: var(--s-3); background: var(--bg-soft); border-left: 2px solid var(--accent); border-radius: 4px; }
+      .vg-w-range-postgres-throughput .row { display: grid; grid-template-columns: minmax(0, 12ch) 1fr minmax(0, 12ch); gap: var(--s-2); align-items: center; font-family: var(--sans); font-size: var(--fs-sm); }
+      .vg-w-range-postgres-throughput input[type="range"] { width: 100%; height: 36px; accent-color: var(--accent); touch-action: none; }
+      .vg-w-range-postgres-throughput .readout { font-variant-numeric: tabular-nums; color: var(--ink); text-align: right; }
+      .vg-w-range-postgres-throughput .metrics { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: var(--s-2); }
+      .vg-w-range-postgres-throughput .metric { display: grid; gap: 4px; padding: var(--s-2); background: var(--bg); border: 1px solid var(--line); border-radius: 3px; }
+      .vg-w-range-postgres-throughput .metric .k { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+      .vg-w-range-postgres-throughput .metric .v { font-family: var(--display); font-size: var(--fs-lg); color: var(--ink); font-variant-numeric: tabular-nums; }
+      .vg-w-range-postgres-throughput .metric .u { font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); }
+      .vg-w-range-postgres-throughput figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+      @media (max-width: 720px) {
+        .vg-w-range-postgres-throughput .metrics { grid-template-columns: 1fr; }
+        .vg-w-range-postgres-throughput .row { grid-template-columns: 1fr; }
+        .vg-w-range-postgres-throughput .readout { text-align: left; }
+      }
+    </style>
+    <div class="row">
+      <label for="vg-w-range-postgres-throughput-rate">workflow rate</label>
+      <input id="vg-w-range-postgres-throughput-rate" type="range" min="10" max="50000" step="10" value="2000" />
+      <span class="readout" id="vg-w-range-postgres-throughput-rate-read">2,000 /s</span>
+    </div>
+    <div class="row">
+      <label for="vg-w-range-postgres-throughput-workers">worker count</label>
+      <input id="vg-w-range-postgres-throughput-workers" type="range" min="1" max="64" step="1" value="8" />
+      <span class="readout" id="vg-w-range-postgres-throughput-workers-read">8</span>
+    </div>
+    <div class="row">
+      <label for="vg-w-range-postgres-throughput-interval">poll interval</label>
+      <input id="vg-w-range-postgres-throughput-interval" type="range" min="10" max="2000" step="10" value="100" />
+      <span class="readout" id="vg-w-range-postgres-throughput-interval-read">100 ms</span>
+    </div>
+    <div class="metrics">
+      <div class="metric"><span class="k">polling dequeue p50</span><span class="v" id="vg-w-range-postgres-throughput-poll">50</span><span class="u">ms (poll interval / 2)</span></div>
+      <div class="metric"><span class="k">push dequeue p50</span><span class="v" id="vg-w-range-postgres-throughput-push">15</span><span class="u">ms (Temporal-typical)</span></div>
+      <div class="metric"><span class="k">lock contention</span><span class="v" id="vg-w-range-postgres-throughput-contend">—</span><span class="u">P(≥2 workers collide / interval)</span></div>
+    </div>
+    <figcaption>
+      封閉形式近似：polling 平均等待 = interval / 2；push 走 long-poll，p50 取
+      15 ms 為基線；contention = 1 − (1 − rate × interval / 1000 / workers)^workers。
+      不是 production benchmark，是用來看「曲線往哪邊走」的工具。
+    </figcaption>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-range-postgres-throughput');
+        if (!root) return;
+        const rate = root.querySelector('#vg-w-range-postgres-throughput-rate');
+        const workers = root.querySelector('#vg-w-range-postgres-throughput-workers');
+        const interval = root.querySelector('#vg-w-range-postgres-throughput-interval');
+        const rateRead = root.querySelector('#vg-w-range-postgres-throughput-rate-read');
+        const workersRead = root.querySelector('#vg-w-range-postgres-throughput-workers-read');
+        const intervalRead = root.querySelector('#vg-w-range-postgres-throughput-interval-read');
+        const pollOut = root.querySelector('#vg-w-range-postgres-throughput-poll');
+        const pushOut = root.querySelector('#vg-w-range-postgres-throughput-push');
+        const contendOut = root.querySelector('#vg-w-range-postgres-throughput-contend');
+        function fmt(n) { return n >= 1000 ? n.toLocaleString('en-US') : String(n); }
+        function recompute() {
+          const r = Number(rate.value);
+          const w = Number(workers.value);
+          const i = Number(interval.value);
+          rateRead.textContent = `${fmt(r)} /s`;
+          workersRead.textContent = String(w);
+          intervalRead.textContent = `${i} ms`;
+          const pollLatency = i / 2;
+          // push latency: ~15ms base + tiny saturation curve as rate -> 50k
+          const pushLatency = 15 + Math.min(20, r / 5000);
+          pollOut.textContent = pollLatency.toFixed(0);
+          pushOut.textContent = pushLatency.toFixed(0);
+          // crude collision approximation: prob ≥2 workers hit same window
+          const expectedHits = r * (i / 1000) / w; // hits per worker per interval
+          const p = 1 - Math.pow(Math.max(0, 1 - expectedHits / w), w);
+          const pct = (p * 100);
+          contendOut.textContent = pct < 1 ? pct.toFixed(2) + '%' : pct.toFixed(1) + '%';
+        }
+        [rate, workers, interval].forEach(el => el.addEventListener('input', recompute));
+        recompute();
+      })();
+    </script>
+  </figure>
+
+  <p>
+    把 slider 拉到 30,000 /s 配 8 個 worker、100 ms interval，你會看到鎖衝突
+    機率衝到 90% 以上——這正是 DBOS 文章裡那句「single Postgres server can vertically
+    scale to handle tens of thousands of workflows per second」需要被打上問號的
+    地方。「能 scale 到」跟「scale 之後成本合理」是兩件事。Postgres 確實可以靠
+    <code>SELECT ... FOR UPDATE SKIP LOCKED</code> 把競爭壓住，但 CPU 與 connection
+    pool 的成本是線性增長的；Temporal 的 matching service 把這部分搬到專用的
+    in-memory queue，dispatch latency 與 throughput 都更平。
+  </p>
+
+  <p>
+    這不代表 polling 一定輸。如果你的 workflow rate 在每秒幾百筆以內、worker 數
+    在 4 個以下、poll interval 設到 20 ms，polling 的 p50 是 10 ms、競爭機率
+    幾乎為零，跟 push-based 的 dispatch 沒有差。重點是 DBOS 的論點在中等以下負
+    載成立，在重度負載下開始磨損。
+  </p>
+
+  <h2>failover：誰偵測失敗、誰把工作搶回來</h2>
+
+  <p>
+    這個維度的問題是：當執行 workflow 的 worker 死掉，誰負責偵測它死了、把它的
+    工作交給另一個 worker？Temporal 的答案是 matching service 配上 visibility
+    store——worker 透過 heartbeat 把活著的事實打回 server，server 偵測到 timeout
+    之後把任務還回 task queue，由其他 worker 重新領走。這套機制的好處是 detection
+    latency 可以調得很細（heartbeat 間隔通常 30 s），缺點是要多一層元件參與決策。
+  </p>
+
+  <p>
+    DBOS 的答案隱藏在「locking clauses」這幾個字底下。Kraft 沒寫具體 SQL，但
+    canonical pattern 是：worker dequeue 時做 <code>SELECT ... FOR UPDATE SKIP
+    LOCKED</code> 並且把 row 標記為 <code>status = 'running', lease_expires = now()
+    + interval '30 seconds'</code>。Worker 在執行過程中需要定期 <code>UPDATE
+    workflows SET lease_expires = now() + interval '30 seconds' WHERE id = ?</code>
+    來續租。其他 worker 在 dequeue 時的 WHERE 子句裡會加上 <code>OR lease_expires
+    &lt; now()</code>——租約過期的 row 自動可被別的 worker 領走。
+  </p>
+
+  <p>
+    把這個機制放在 Temporal 的 heartbeat 旁邊看，兩邊的偵測路徑差距會更具體
+    ——Temporal 的 matching service 對每個 worker 持有的 task 維護一個內
+    存 timer，worker 每 10 秒回打一次 heartbeat、timer 沒在 30 秒內被刷新
+    就把 task 還回 queue，整條偵測路徑都在 RAM 裡走、p50 偵測延遲落在 5
+    秒上下，而且這個延遲跟你跑了幾筆 workflow 沒有關係。DBOS 這邊則必須
+    疊三層機制才能把同一個語義補齊：第一層是 advisory lock
+    （<code>pg_try_advisory_xact_lock</code>）在 transaction 內擋掉同一筆
+    workflow 的並行執行、避免兩個 worker 同時推進；第二層是 lease 欄位
+    提供跨 transaction 的超時、處理 worker 整個 process 死掉的情況；第
+    三層是一個每 60 秒跑一次的 sweeper job，掃出 <code>status = 'running'
+    AND lease_expires &lt; now() - interval '60 seconds'</code> 的 row，
+    把它們改回 <code>pending</code> 並送一筆 <code>NOTIFY
+    workflow_resurrect</code> 給所有訂閱這個 channel 的 listener。三層加總
+    的 p50 偵測延遲會落在 30 到 90 秒，比 Temporal 慢一個量級，但好處
+    是完全不需要額外元件，sweeper 就是一個 cron 加 50 行 SQL，運維面積
+    不會被這個機制撐大半吋。換句話說，這條路徑用「掃 row」的便宜換掉
+    了「跑 service」的貴，代價寫在偵測延遲的多出來的那 25 到 85 秒上。
+  </p>
+
+  <p>
+    這個方案在邏輯上跟 Temporal 等價，但 detection 機制是 pull 出來的：沒有任何
+    外部元件主動 ping 死掉的 worker，所有偵測都靠下一次 dequeue 掃 row 的時候
+    順便檢查。這在低負載下完全沒問題，但隱含的是「失敗的恢復時間 ≥ poll interval」。
+    Temporal 可以把 heartbeat 設到 5 秒、failover 在 5 秒內觸發；DBOS 的最短
+    failover 時間是 poll interval（典型 100 ms）加上 lease timeout（典型 30 秒
+    為了避免 false positive）。
+  </p>
+
+  <p>
+    Restate 的 failover 模型最有趣：它把 journal 寫到一個 Raft-replicated 的
+    persistent log（內部稱為 <code>partition processor</code>），failover 由
+    leader election 觸發。這意味著 Restate 自己背了一個 distributed consensus
+    的運維負擔，但 detection latency 是 Raft heartbeat 級別（毫秒）。Step
+    Functions 不在乎這個——它是完全 managed，AWS 內部如何 failover 是黑盒，
+    對使用者來說就是「我的 state machine 一直在前進」。
+  </p>
+
+  <p>
+    Inngest 用 queue + lease 的混合：queue 層負責訊息可見性 timeout（visibility
+    timeout 25 秒到數小時可調），step function 層負責 idempotency 去重。這跟
+    DBOS 的精神接近，但 queue 是專屬的而非通用 RDBMS。
+  </p>
+
+  <h2>observability：SQL 查得到的，跟 trace UI 看得到的</h2>
+
+  <p>
+    DBOS 在 observability 上最強的論述是：「你的 workflow state 就在 Postgres
+    裡，任何 ad-hoc 問題都可以用 SQL 回答。」這話對也不對。
+    對的部分：「列出最近一個月所有在第三步失敗、而且 input 包含特定使用者 ID 的
+    workflow」這種查詢，DBOS 寫 <code>SELECT * FROM workflows JOIN steps USING
+    (workflow_id) WHERE steps.step_id = 3 AND steps.status = 'failed' AND
+    workflows.created_at &gt; now() - interval '30 days' AND workflows.input
+    -&gt;&gt; 'user_id' = '...'</code> 就完了。Temporal 要做同樣的事得透過
+    Visibility API + Search Attributes、要先在 advanced visibility（Elasticsearch
+    或 SQL visibility）上預先註冊欄位。
+  </p>
+
+  <p>
+    不對的部分：observability 不是只有「可以查到」，還有「能跟 trace 對齊」、
+    「能在 timeline 上看到 workflow 的時間佈局」、「能在某一步驟停下來看當下變
+    數」。Temporal 的 UI 把每個 workflow 渲染成可以展開的事件樹，每個 activity
+    都可以看 input、output、retry 次數；DBOS 沒有對等的 UI——你只能拿 SQL 自己
+    組。對於有 Temporal UI 操作習慣的團隊，這個 gap 在 incident response 的時
+    候會很痛。
+  </p>
+
+  <p>
+    這個維度的分數因此是 Temporal 9 / DBOS 8 / Inngest 8 / Step Functions 7 /
+    Restate 7。Temporal 略勝是因為 UI 與內建 search 的完整度；DBOS 與 Inngest 接
+    近是因為「就在 SQL/dashboard 裡」的可查詢性夠強；Step Functions 跟 Restate
+    略低是因為它們的 trace 工具還在追趕——Step Functions 在 CloudWatch 裡
+    很卡，Restate 的 UI 還偏年輕。
+  </p>
+
+  <h2>ops cost：你願意多餵幾隻 service？</h2>
+
+  <p>
+    這是 DBOS 真正的長板。如果你的應用已經有 Postgres——而幾乎所有 backend 應
+    用都有——導入 DBOS 不需要新增任何 service，沒有新的 deploy unit、沒有新的
+    監控 dashboard、沒有新的 oncall handbook 條目。Worker 是 library，跟你的
+    app server 跑在同個 process 裡，重啟流程跟你的 app 一樣。
+  </p>
+
+  <p>
+    Temporal 是另一個極端。一個生產級的 Temporal cluster 至少有四個 service：
+    frontend、history、matching、worker（這裡是 Temporal 自己的 worker，不是
+    你的應用 worker）。每個都有獨立的 sharding 設定，需要 Cassandra/MySQL/PostgreSQL
+    當 persistence 後端，需要 Elasticsearch 做 advanced visibility。完整跑起
+    來，oncall 多了至少六個 alert 來源。Temporal Cloud 是 escape hatch——把運
+    維交給 Temporal Inc——但代價是訂閱費跟 vendor lock-in。
+  </p>
+
+  <p>
+    Restate 在 ops cost 上做得相對清爽：單一 binary、自帶 storage、不需要外部
+    DB。這在「不想多運維 Postgres」的場景比 DBOS 還好；但代價是你多了一個必
+    須運維的元件本身。Inngest 也是 SaaS-first，self-hosted 版本相對年輕。Step
+    Functions 是 fully managed，沒有 ops cost——但你被綁在 AWS 的 region、定
+    價、限制裡。
+  </p>
+
+  <p>
+    這個維度沒有最佳解，只有最佳搭配。把 ops cost 跟其他維度一起看：你選 DBOS
+    省掉的運維成本，可能在 dispatch latency 上付了出來；你選 Temporal 多花的運
+    維成本，買到的是更好的 failover 偵測與 UI 體驗。對齊「省哪個成本、買哪個能
+    力」的這個交換，才是這篇文章的價值。
+  </p>
+
+  <p>
+    抽象比較很容易，但工程師讀程式碼最快。下面三個 tab 把同一個 conceptual operation
+    ——「dequeue 一筆 workflow、執行 step、把結果 checkpoint 到永久儲存」——在
+    DBOS 想像的 SQL、Temporal 的 worker SDK、Step Functions 的 state machine JSON
+    三種形態下排出來。對齊起來看，每個系統的 surface area 差異就清楚了。
+  </p>
+
+  <div class="vg-w-tabs-durable-codepath">
+    <style>
+      .vg-w-tabs-durable-codepath { display: grid; gap: var(--s-2); }
+      .vg-w-tabs-durable-codepath input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-tabs-durable-codepath .tabs { display: flex; gap: var(--s-2); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+      .vg-w-tabs-durable-codepath .tab { font-family: var(--sans); font-size: var(--fs-sm); padding: var(--s-1) var(--s-2); cursor: pointer; color: var(--muted); min-height: 36px; display: inline-flex; align-items: center; }
+      .vg-w-tabs-durable-codepath .panel { display: none; }
+      .vg-w-tabs-durable-codepath:has(#vg-w-tabs-durable-codepath-t1:checked) .panel-1 { display: block; }
+      .vg-w-tabs-durable-codepath:has(#vg-w-tabs-durable-codepath-t1:checked) [for="vg-w-tabs-durable-codepath-t1"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-durable-codepath:has(#vg-w-tabs-durable-codepath-t2:checked) .panel-2 { display: block; }
+      .vg-w-tabs-durable-codepath:has(#vg-w-tabs-durable-codepath-t2:checked) [for="vg-w-tabs-durable-codepath-t2"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-durable-codepath:has(#vg-w-tabs-durable-codepath-t3:checked) .panel-3 { display: block; }
+      .vg-w-tabs-durable-codepath:has(#vg-w-tabs-durable-codepath-t3:checked) [for="vg-w-tabs-durable-codepath-t3"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    </style>
+    <input type="radio" id="vg-w-tabs-durable-codepath-t1" name="vg-w-tabs-durable-codepath-sel" checked />
+    <input type="radio" id="vg-w-tabs-durable-codepath-t2" name="vg-w-tabs-durable-codepath-sel" />
+    <input type="radio" id="vg-w-tabs-durable-codepath-t3" name="vg-w-tabs-durable-codepath-sel" />
+    <div class="tabs">
+      <label class="tab" for="vg-w-tabs-durable-codepath-t1">DBOS (SQL)</label>
+      <label class="tab" for="vg-w-tabs-durable-codepath-t2">Temporal (Go SDK)</label>
+      <label class="tab" for="vg-w-tabs-durable-codepath-t3">Step Functions (ASL)</label>
+    </div>
+    <div class="panel panel-1">
+<pre><code class="language-sql">-- dequeue：抓一筆還沒被別人鎖走的 workflow
+WITH picked AS (
+  SELECT id FROM workflows
+  WHERE status = 'pending'
+     OR (status = 'running' AND lease_expires &lt; now())
+  ORDER BY created_at
+  FOR UPDATE SKIP LOCKED
+  LIMIT 1
+)
+UPDATE workflows w
+   SET status = 'running',
+       lease_expires = now() + interval '30 seconds',
+       attempt = attempt + 1
+  FROM picked
+ WHERE w.id = picked.id
+RETURNING w.id, w.payload, w.attempt;
+
+-- checkpoint：把 step 結果 commit、UNIQUE 防止重複執行
+INSERT INTO steps (workflow_id, step_id, result, attempt)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (workflow_id, step_id) DO NOTHING;</code></pre>
+    </div>
+    <div class="panel panel-2">
+<pre><code class="language-go">// worker poll 是 Temporal SDK 內建，使用者只寫 workflow + activity
+func ProcessPaymentWorkflow(ctx workflow.Context, input PaymentInput) error {
+    ao := workflow.ActivityOptions{
+        StartToCloseTimeout: 30 * time.Second,
+        RetryPolicy: &amp;temporal.RetryPolicy{MaximumAttempts: 3},
+    }
+    ctx = workflow.WithActivityOptions(ctx, ao)
+
+    var charge ChargeResult
+    err := workflow.ExecuteActivity(ctx, ChargeCard, input).Get(ctx, &amp;charge)
+    if err != nil {
+        return err
+    }
+
+    var ship ShipResult
+    err = workflow.ExecuteActivity(ctx, ShipOrder, charge.OrderID).Get(ctx, &amp;ship)
+    return err
+}
+// dequeue + checkpoint 由 matching service + history service 處理；
+// 使用者看不到 SQL。</code></pre>
+    </div>
+    <div class="panel panel-3">
+<pre><code class="language-json">{
+  "Comment": "Payment workflow",
+  "StartAt": "ChargeCard",
+  "States": {
+    "ChargeCard": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:...:function:charge-card",
+      "Retry": [{
+        "ErrorEquals": ["States.TaskFailed"],
+        "IntervalSeconds": 2,
+        "MaxAttempts": 3,
+        "BackoffRate": 2.0
+      }],
+      "Next": "ShipOrder"
+    },
+    "ShipOrder": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:...:function:ship-order",
+      "End": true
+    }
+  }
+}</code></pre>
+    </div>
+  </div>
+
+  <p>
+    三段對齊起來看的價值：DBOS 那段 SQL 完全可讀，但你看到了它的所有複雜度——你
+    必須自己寫 lease 續租、自己處理 retry、自己決定 attempt 怎麼累計。Temporal
+    那段 Go code 看起來最短，因為複雜度被 SDK 與 Temporal Server 吃掉了——但
+    這代價就是 ops cost 那個維度。Step Functions 那段 JSON 沒有任何程式碼，只
+    宣告流程——這是託管的極致，也是 lock-in 的極致。
+  </p>
+
+  <p>
+    走完五個維度後，把每個系統在每個維度的具體屬性收回到一張表，方便讀者拿來
+    跟自己手上的需求比對。Header 可以按欄位 sort——把 dispatch latency 或 ops
+    cost 拉到最前面，看哪些系統的取捨剛好對齊你最在意的維度。
+  </p>
+
+  <figure class="vg-w-table-durable-matrix">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/>
+        <path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+      </svg>
+      <span>click column header to sort · 6 columns × 5 rows</span>
+    </p>
+    <style>
+      .vg-w-table-durable-matrix { overflow-x: auto; }
+      .vg-w-table-durable-matrix table { width: 100%; min-width: 720px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-durable-matrix thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; }
+      .vg-w-table-durable-matrix thead th[data-sort] { color: var(--accent-text); }
+      .vg-w-table-durable-matrix tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+      .vg-w-table-durable-matrix td.num { font-variant-numeric: tabular-nums; text-align: right; }
+      .vg-w-table-durable-matrix figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-2); }
+    </style>
+    <table>
+      <thead>
+        <tr>
+          <th data-key="name">system</th>
+          <th data-key="state">state model</th>
+          <th data-key="dispatch">dispatch</th>
+          <th data-key="failover" class="num">failover p50 (s)</th>
+          <th data-key="ops" class="num">ops surface</th>
+          <th data-key="langs" class="num">SDK langs</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>DBOS</td><td>table-checkpoint</td><td>SQL polling + SKIP LOCKED</td><td class="num">30</td><td class="num">0</td><td class="num">3</td></tr>
+        <tr><td>Temporal</td><td>event-sourced replay</td><td>push (matching service)</td><td class="num">5</td><td class="num">4</td><td class="num">7</td></tr>
+        <tr><td>Restate</td><td>journaled async</td><td>push (Raft log)</td><td class="num">2</td><td class="num">1</td><td class="num">6</td></tr>
+        <tr><td>Inngest</td><td>step JSON payload</td><td>queue + lease</td><td class="num">15</td><td class="num">1</td><td class="num">4</td></tr>
+        <tr><td>Step Functions</td><td>declarative ASL</td><td>managed (opaque)</td><td class="num">10</td><td class="num">0</td><td class="num">1</td></tr>
+      </tbody>
+    </table>
+    <figcaption>
+      ops surface = 必須額外運維的 service 數（不含 application server 本身與
+      共用 Postgres）。failover p50 取各家文件的 default heartbeat / lease 設
+      定。SDK langs = 一級語言支援數量。
+    </figcaption>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-table-durable-matrix');
+        if (!root) return;
+        const headers = root.querySelectorAll('thead th');
+        const tbody = root.querySelector('tbody');
+        let activeKey = null, asc = true;
+        headers.forEach(h => h.addEventListener('click', () => {
+          const key = h.dataset.key;
+          if (activeKey === key) asc = !asc; else { activeKey = key; asc = true; }
+          headers.forEach(x => x.removeAttribute('data-sort'));
+          h.setAttribute('data-sort', asc ? 'asc' : 'desc');
+          const rows = [...tbody.querySelectorAll('tr')];
+          const idx = [...headers].indexOf(h);
+          rows.sort((a, b) => {
+            const av = a.children[idx].textContent.trim();
+            const bv = b.children[idx].textContent.trim();
+            const an = Number(av), bn = Number(bv);
+            const cmp = !Number.isNaN(an) && !Number.isNaN(bn) ? an - bn : av.localeCompare(bv);
+            return asc ? cmp : -cmp;
+          });
+          rows.forEach(r => tbody.appendChild(r));
+        }));
+      })();
+    </script>
+  </figure>
+
+  <p>
+    這張表把 chart 上的相對排名換成具體屬性。值得注意的是 failover p50：DBOS 不
+    是技術上做不到 5 秒——把 lease 設成 5 秒、把 heartbeat update 設成 1 秒就可
+    以。但這樣做的代價是 30 倍的 UPDATE 寫入到 workflows 表，把資料庫負擔放回
+    去。Temporal 的 5 秒 failover 寫的是 heartbeat 到 matching service 而非 DB；
+    這就是「ops cost 多一隻 service」買到的東西。
+  </p>
+
+  <p>
+    SDK 語言數也是值得停下來的欄位。Temporal 一級支援 Go / Java / TypeScript /
+    Python / .NET / PHP / Ruby——這背後是 SDK team 多年的投資。DBOS 目前是
+    Python / TypeScript / Java 三家為主，其他語言要走 SDK-as-library 或 raw SQL。
+    Restate 涵蓋 TypeScript / Python / Java / Kotlin / Go / Rust 六家。Step
+    Functions 不需要 SDK，因為 workflow 不是程式碼。如果你的團隊 polyglot
+    很重，這個欄位的差距可能直接決定選型。
+  </p>
+
+  <h2>pick by workload：四個情境的決策樹</h2>
+
+  <p>
+    把五個維度合起來看，這個比較不會給出「X 全方位贏」的結論——五個系統真的
+    在不同的取捨點上。為了讓讀者能對著自己的情境自我分類，下面用四個典型
+    workload 把建議拉直：
+  </p>
+
+  <p>
+    <strong>情境 A——應用本身就在 Postgres 上、workflow 每秒幾百筆、需要多步
+    驟交易原子性：</strong>選 DBOS。你已經有 Postgres、你的 throughput 不到
+    polling 飽和點、你最在意的是「不要多運維一隻 service」。DBOS 的 table
+    model 跟你的 domain model 同一張庫，transaction 邊界跟你的應用邏輯天然
+    對齊。Kraft 那句「tens of thousands of workflows per second」在你的負載
+    區間是頭等艙——綽綽有餘。
+  </p>
+
+  <p>
+    <strong>情境 B——workflow 跑數天到數週、需要 in-flight signal 與 query、
+    團隊熟悉 event-sourced model：</strong>選 Temporal。長 workflow 上 event
+    history + replay-as-time-machine 沒有對等替代品。signal/query 讓外部系
+    統可以在 workflow 進行中跟它互動，這在 saga、approval、long-running
+    integration 上是剛需。為這個能力多運維 4-6 隻 service 是合理的代價——
+    或直接用 Temporal Cloud 把運維外包。
+  </p>
+
+  <p>
+    <strong>情境 C——團隊小、不想跑 Postgres 也不想跑 Temporal 全家、想要一
+    個 single binary 自帶 durable execution：</strong>選 Restate。它在
+    state model、failover、SDK 數量上都接近 Temporal，但 ops surface 是 1。
+    特別適合 startup 或 platform team 想給應用團隊「一個能用就好」的 durable
+    workflow 抽象。
+  </p>
+
+  <p>
+    <strong>情境 D——已經重度使用 AWS Lambda、不想引入任何新的執行階段元
+    件：</strong>選 Step Functions。ASL 的 declarative 寫法在 5 個 step 以
+    內非常乾淨；超過 10 個 step 開始顯得笨重，但這個區間還有 Lambda
+    Destinations、SQS 可以混搭。重點是 zero ops cost 加上 AWS IAM 整合，
+    讓 security 與 cost attribution 都不必額外設計。
+  </p>
+
+  <p>
+    最後一個情境留給「我還在猶豫」的讀者。如果你還沒選好，建議先回到你的
+    workflow rate 與 latency tolerance：rate &lt; 500 /s 且 dispatch p50
+    可容忍 100 ms，DBOS 與 Inngest 都會工作；rate &gt; 5,000 /s 或需要 p50
+    &lt; 30 ms，Temporal 與 Restate 是穩當的選擇。中間地帶——rate 在 500-
+    5,000 /s——可以用本文中段的 widget 把你的具體數字代進去看，哪一邊的曲
+    線比較舒服。
+  </p>
+
+  <p>
+    這篇文章的結論基於 2026 年 5 月的事實——但這場辯論的形狀有幾個會在未來 12
+    個月內改變的因素。第一，Postgres 18 的 logical replication 與 publication
+    filtering 改善之後，DBOS 跨機房的 read-replica 架構成本會大幅下降，這
+    會增強 DBOS 在中等負載的競爭力。第二，Temporal 把 matching service 換成
+    Rust 重寫的計畫（在 RoadmapCon 2025 提過）如果走出來，dispatch latency 與
+    記憶體佔用都會掉一個量級，這會加大 Temporal 在尾延遲維度的領先。第三，
+    Step Functions 如果開放 cross-cloud（跑在 GCP/Azure 上），它的 lock-in
+    缺點會被打破。
+  </p>
+
+  <p>
+    更根本的，這場辯論其實是「state 應該住在哪裡」這個老問題的 workflow 版
+    本。把 state 收進通用資料庫的好處是 schema 跟業務 domain 一起演化；放在
+    專屬 orchestrator 的好處是專屬服務可以為這個 state 形狀做專屬最佳化。
+    這跟「應用層 cache vs 專屬 cache service」、「app metric 跑在 Prometheus
+    vs 自家 DB」是同一條光譜上的不同位置。十年前的辯論在這條光譜上偏向專屬
+    服務；DBOS 提出的是把光譜的另一端重新點亮：在 transactional database 已
+    經如此可靠、Postgres 已經如此通用的今天，你還需要再多一隻 service 嗎？
+  </p>
+
+  <p>
+    這篇 post 沒有給出單一答案——也不該給。它給的是五個維度的尺，跟四個情
+    境的對應。當你下次坐在白板前面決定「我們的 saga 用什麼 orchestrator 來
+    跑」的時候，希望這把尺幫得上忙。
+  </p>
+
+  <p class="vg-deep-closer"><strong>Take-away</strong>：DBOS 把 ops cost 與
+  state model 推到極致，是 Postgres 重度應用在中等負載下的第一選擇；Temporal
+  在長 workflow、push-based dispatch、UI observability 上仍然沒有對等替代品；
+  Restate 是「想要 Temporal 的能力但不想養四隻 service」的中間路；Inngest 適
+  合 serverless-first 團隊；Step Functions 適合 AWS 全家桶。沒有一個贏所有
+  維度——選型要從「我願意付什麼成本換什麼能力」反推。</p>
+</div>
