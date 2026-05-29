@@ -1,0 +1,1125 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">大多數 varint 設計在三條約束裡只敢挑兩條：編碼後的位元組字典序保持原值字典序、解碼 branchless、從首 byte 就能讀出整個編碼長度。Ink &amp; Switch 的 bijou64 把三條一次拿到——代價只是放棄「小值編碼最短」這條 LEB128 視為信仰的舒適。</p>
+  <h1 class="vg-post-title">bijou64 把字典序、branchless、長度前綴一次拿到——拆 Ink &amp; Switch 的 varint 設計</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p><span class="vg-dropcap">b</span>ijou64 是 Ink &amp; Switch 從 Subduction CRDT 同步協議裡剝出來的 u64 可變長度編碼，1–9 byte，從 crates.io 發布。它要解的問題不是「最省 byte」——而是「在一個 key-value store 或一個 log 裡，編碼後的 byte string 還能直接拿去做字典序比較、定長前綴讀 length、單 load + bswap 就能 decode」。</p>
+
+  <p>文章公開的 micro-benchmark 是在 x86 Zen 5 上跑 4,096-value batch：bijou64 median ~3 µs（≈0.75 ns/value），LEB128 ~30 µs（≈7.3 ns/value），快 2–10× 視 value 分佈而定。</p>
+
+  <p>下文拆首 byte 的雙重身份、長度檔位的 offset 算術、字典序保序的構造性證明、branchless decode 的 SIMD 路徑、以及對 LSM-tree、columnar、CRDT log 三個場景的具體後果。</p>
+
+  <p>先確認問題到底長什麼樣。一個 u64 編碼方案至少要決定四件事：怎麼從首 byte 知道整個編碼有多長、怎麼把 payload 攤平、相鄰 tier 之間怎麼接、要不要保證每個 u64 只有一個合法編碼（canonical）。</p>
+
+  <p>LEB128（Protobuf、DWARF、WASM 用的那個）的選擇是：每個 byte 的最高位當 continuation bit、剩下 7 bit 是 payload，從低位先寫。優點是 1 byte 能表 128 個值（很省 small int）。缺點則是三條：長度只能邊讀邊算、payload 是 little-endian 的 7-bit chunk 對 SIMD 不友善、字典序完全不保。</p>
+
+  <p>字典序保不住這條最戲劇性。<code>0x01</code> 編 1、<code>0x80 0x01</code> 編 128，byte 比較 <code>0x01</code> &lt; <code>0x80 0x01</code>，剛好跟「1 &lt; 128」同向——純屬巧合。再多比一些：<code>0x7F</code> 編 127、<code>0xFF 0x01</code> 編 255，byte 比起來 <code>0x7F</code> &lt; <code>0xFF 0x01</code>，碰巧也對。但 <code>0xFF 0x01</code>（255）vs <code>0x80 0xFF 0x01</code>（32639）：<code>0xFF 0x01</code> &gt; <code>0x80 0xFF 0x01</code>（因為 first byte 0xFF &gt; 0x80），但值 255 &lt; 32639——byte 比較反向。LEB128 的字典序在跨 tier 範圍上隨機翻倒，不是「偶有特例」而是「越往大值越普遍」。</p>
+
+  <p>SQLite 用在 record header 裡的 varint 是另一個方向：1–9 byte，前 8 byte 各帶 7 bit payload + 1 continuation bit、第 9 byte 整 byte 都是 payload。SQLite varint 的長度從首 byte 看不到全貌——要走 continuation bit chain。Protobuf varint 跟 LEB128 等價。把三條約束（字典序保序、branchless 解碼、首 byte 含 length prefix）疊起來，市面常見方案全部至少缺一條。bijou64 補上的方式是「放棄 small-int 的 7-bit-per-byte 壓榨、改用大 base-256 chunk + tag byte 上的 length prefix」。</p>
+
+  <p>這個放棄不是輕巧的，它在「LEB128 最甜的那一段」直接付出 1 byte 的代價。LEB128 在 [0, 127] 是 1 byte、bijou64 在 [0, 247] 也是 1 byte——bijou64 在這段甚至更密。但在 [128, 16,383]：LEB128 仍 2 byte，bijou64 [248, 504] 是 2 byte、[504, 65,784] 是 3 byte——bijou64 在 [504, 16,383] 比 LEB128 多 1 byte。如果你的 workload 中位數落在這段，bijou64 平均每筆膨脹 ~1 byte。文章特地用 1738 當 worked example——剛好在這個「最痛」價位上——可以視為作者刻意提醒讀者「這個 trade 不藏」。</p>
+
+  <h2>首 byte 的雙重身份：247 條直通車道與 8 個 tag 出口</h2>
+
+  <p>bijou64 的核心招式藏在首 byte 的數值切分裡。</p>
+
+  <p><code>0x00</code>–<code>0xF7</code>（十進位 0–247）的 248 個位置不是「tag」——它們就是值本身。寫 <code>0x00</code> 就是編碼 0、寫 <code>0xF7</code> 就是編碼 247，沒有 payload byte。</p>
+
+  <p><code>0xF8</code>–<code>0xFF</code>（248–255）的 8 個值才是 tag byte，分別代表「後面跟著 1、2、3、4、5、6、7、8 byte 的 payload」。所以 bijou64 一共 9 個檔位：1 byte（無 tag）、2 byte、3 byte、…、9 byte（tag <code>0xFF</code> + 8 byte payload）。</p>
+
+  <p>這個「首 byte 雙重身份」的設計選擇在 systems 設計史上有先例——UTF-8 把單 byte ASCII（0x00–0x7F）跟多 byte sequence 的開頭 byte（0xC2–0xF4）放在不重疊的數值範圍裡，也是為了同樣的目的：from-first-byte length detection、no overlong encoding（UTF-8 規格明文禁止）、self-synchronizing。bijou64 把這個思路從 codepoint 換成 u64，從 6 bit chunk 換成 8 bit chunk，於是有了 248 vs 128 的密度差距。</p>
+
+  <p>換句話說首 byte 一被 load 進來，整個編碼長度就以一個簡單算式定下來：</p>
+
+  <pre data-kind="pseudocode"><code><em>// 首 byte b 決定整個編碼長度</em>
+length = if b &lt; 0xF8 then 1 else (b - 0xF8) + 2
+
+<em>// 等價的 branchless 形式</em>
+length = 1 + ((b &gt;= 0xF8) as u8) * (b - 0xF8 + 1)
+
+<em>// 或用 saturating sub：</em>
+length = 1 + saturating_sub(b, 0xF7)</code></pre>
+
+  <p>這個性質就是「length prefix」——LSM-tree 在做 block-level scan 時、columnar reader 在 skipping 時、CRDT log 在 splice 時，都靠它在不解碼 payload 的情況下找下一筆 record 的 offset。</p>
+
+  <p>LEB128 的長度只能邊讀邊算 continuation bit、SQLite varint 同樣要 chain，bijou64 是純 lookup。具體說：256 個首 byte 值對應一張 256-entry 的 length table，table[0..0xF8] = 1、table[0xF8] = 2、table[0xF9] = 3、…、table[0xFF] = 9。decoder 拿首 byte 當 index 一次 load 就得到長度，全程零 branch。這在 instruction cache 上佔的成本也低——256 byte 一個 L1 cache line 不到。</p>
+
+  <p>但這還只是長度。真正的設計密度在 payload 部分：每個 tier 不是直接寫 N byte big-endian、然後讓相鄰 tier 的值域 overlap，而是減掉前一個 tier 已經能表達的最大值再寫——也就是<strong>offset 算術</strong>。</p>
+
+  <p>tag <code>0xF8</code>（2 byte 總長、1 byte payload）的 offset 是 <code>0xF8</code>（248），可以表達 248 到 248+255=503，再加它自己的範圍上界，文章列的是 504。</p>
+
+  <p>tag <code>0xF9</code>（3 byte 總長、2 byte payload）的 offset 是 <code>0x01F8</code>（504），表達 504 到 504+65,279=65,783，上界 65,784。</p>
+
+  <p>tag <code>0xFA</code>（4 byte、3 byte payload）offset <code>0x0101F8</code>、上界 16,843,032。</p>
+
+  <p>tag <code>0xFB</code>（5 byte、4 byte payload）offset <code>0x010101F8</code>、上界 4,311,810,296。</p>
+
+  <p>每個 tier 的可表達範圍剛好接在前一個 tier 的尾端後面，零 overlap、零空隙。這是「沒有 overlong encoding」這條 canonicality property 的構造性來源——同一個 u64 值在 bijou64 裡有且僅有一種合法編碼，不像 LEB128 必須 runtime 拒絕 overlong sequence。</p>
+
+  <figure class="vg-w-arch-bijou64-anatomy" data-svg-scroll="720">
+    <style>
+      .vg-w-arch-bijou64-anatomy { display: grid; grid-template-columns: 1fr; gap: var(--s-3); align-items: start; }
+      @media (min-width: 720px) { .vg-w-arch-bijou64-anatomy { grid-template-columns: 1fr; } }
+      .vg-w-arch-bijou64-anatomy svg { width: 100%; height: auto; }
+      .vg-w-arch-bijou64-anatomy input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-arch-bijou64-anatomy .tier { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; transition: fill 200ms, stroke 200ms; }
+      .vg-w-arch-bijou64-anatomy .tier:hover { stroke: var(--accent); }
+      .vg-w-arch-bijou64-anatomy .tier:focus { outline: none; }
+      .vg-w-arch-bijou64-anatomy .tier:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+      .vg-w-arch-bijou64-anatomy .tier-text { pointer-events: none; font-family: EB Garamond, serif; font-size: 13px; }
+      .vg-w-arch-bijou64-anatomy .tier-tag { pointer-events: none; font-family: JetBrains Mono, monospace; font-size: 12px; }
+      .vg-w-arch-bijou64-anatomy .head { font-family: IM Fell English, serif; font-style: italic; font-size: 13px; }
+      .vg-w-arch-bijou64-anatomy .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+      .vg-w-arch-bijou64-anatomy .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-arch-bijou64-anatomy .detail p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-arch-bijou64-anatomy .detail code { font-size: 0.9em; }
+      .vg-w-arch-bijou64-anatomy:has(#vg-w-arch-bijou64-anatomy-r0:checked) .tier-0 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+      .vg-w-arch-bijou64-anatomy:has(#vg-w-arch-bijou64-anatomy-r1:checked) .tier-1 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+      .vg-w-arch-bijou64-anatomy:has(#vg-w-arch-bijou64-anatomy-r2:checked) .tier-2 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+      .vg-w-arch-bijou64-anatomy:has(#vg-w-arch-bijou64-anatomy-r3:checked) .tier-3 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+      .vg-w-arch-bijou64-anatomy:has(#vg-w-arch-bijou64-anatomy-r4:checked) .tier-4 { fill: var(--sage-deep); fill-opacity: 0.28; stroke: var(--sage-deep); }
+      .vg-w-arch-bijou64-anatomy:has(#vg-w-arch-bijou64-anatomy-r0:checked) .detail-0 { display: block; }
+      .vg-w-arch-bijou64-anatomy:has(#vg-w-arch-bijou64-anatomy-r1:checked) .detail-1 { display: block; }
+      .vg-w-arch-bijou64-anatomy:has(#vg-w-arch-bijou64-anatomy-r2:checked) .detail-2 { display: block; }
+      .vg-w-arch-bijou64-anatomy:has(#vg-w-arch-bijou64-anatomy-r3:checked) .detail-3 { display: block; }
+      .vg-w-arch-bijou64-anatomy:has(#vg-w-arch-bijou64-anatomy-r4:checked) .detail-4 { display: block; }
+      .vg-w-arch-bijou64-anatomy .hint { font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin: 0 0 var(--s-1) 0; }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M9 11.24V7.5a2.5 2.5 0 0 1 5 0V12"/>
+        <path d="M14 10.5a2.5 2.5 0 0 1 5 0v3.5a8 8 0 0 1-16 0V12a2.5 2.5 0 0 1 5 0v2"/>
+      </svg>
+      <span>click any tier row to inspect its tag byte, payload length, and value range · 5 representative tiers</span>
+    </p>
+
+    <input type="radio" id="vg-w-arch-bijou64-anatomy-r0" aria-label="select tier 1-byte" name="vg-w-arch-bijou64-anatomy-sel" checked />
+    <input type="radio" id="vg-w-arch-bijou64-anatomy-r1" aria-label="select tier 2-byte" name="vg-w-arch-bijou64-anatomy-sel" />
+    <input type="radio" id="vg-w-arch-bijou64-anatomy-r2" aria-label="select tier 3-byte" name="vg-w-arch-bijou64-anatomy-sel" />
+    <input type="radio" id="vg-w-arch-bijou64-anatomy-r3" aria-label="select tier 5-byte" name="vg-w-arch-bijou64-anatomy-sel" />
+    <input type="radio" id="vg-w-arch-bijou64-anatomy-r4" aria-label="select tier 9-byte" name="vg-w-arch-bijou64-anatomy-sel" />
+
+    <svg viewBox="0 0 720 360" role="img" aria-label="bijou64 五個代表性 tier 的位元組佈局、tag byte、值域範圍">
+      <text x="360" y="22" text-anchor="middle" fill="var(--ink)" class="head">bijou64 五個代表性檔位——首 byte 既是 tag 又可能是值本身</text>
+
+      <!-- Row legend -->
+      <text x="20" y="50" fill="var(--muted)" font-family="IM Fell English, serif" font-style="italic" font-size="11">total</text>
+      <text x="100" y="50" fill="var(--muted)" font-family="IM Fell English, serif" font-style="italic" font-size="11">layout</text>
+      <text x="540" y="50" fill="var(--muted)" font-family="IM Fell English, serif" font-style="italic" font-size="11">max value</text>
+      <line x1="20" y1="58" x2="700" y2="58" stroke="var(--muted-2)" stroke-width="0.8"/>
+
+      <!-- Tier 0: 1 byte, value 0..247 -->
+      <text x="20" y="88" fill="var(--ink)" class="tier-text">1 byte</text>
+      <rect class="tier tier-0" data-target="vg-w-arch-bijou64-anatomy-r0" role="button" tabindex="0" x="100" y="70" width="380" height="32" rx="2"/>
+      <text x="120" y="91" fill="var(--ink)" class="tier-tag">[ 0x00 .. 0xF7 ]   ← value itself</text>
+      <text x="540" y="91" fill="var(--accent-text)" class="tier-tag">247</text>
+
+      <!-- Tier 1: 2 byte, value 248..504 -->
+      <text x="20" y="128" fill="var(--ink)" class="tier-text">2 byte</text>
+      <rect class="tier tier-1" data-target="vg-w-arch-bijou64-anatomy-r1" role="button" tabindex="0" x="100" y="110" width="380" height="32" rx="2"/>
+      <text x="120" y="131" fill="var(--ink)" class="tier-tag">[ 0xF8 ][ payload×1 ] + offset 0xF8</text>
+      <text x="540" y="131" fill="var(--accent-text)" class="tier-tag">504</text>
+
+      <!-- Tier 2: 3 byte, value 504..65784 -->
+      <text x="20" y="168" fill="var(--ink)" class="tier-text">3 byte</text>
+      <rect class="tier tier-2" data-target="vg-w-arch-bijou64-anatomy-r2" role="button" tabindex="0" x="100" y="150" width="380" height="32" rx="2"/>
+      <text x="120" y="171" fill="var(--ink)" class="tier-tag">[ 0xF9 ][ payload×2 ] + offset 0x01F8</text>
+      <text x="540" y="171" fill="var(--accent-text)" class="tier-tag">65,784</text>
+
+      <!-- Tier 3: 5 byte, value 65784..4311810296 -->
+      <text x="20" y="208" fill="var(--ink)" class="tier-text">5 byte</text>
+      <rect class="tier tier-3" data-target="vg-w-arch-bijou64-anatomy-r3" role="button" tabindex="0" x="100" y="190" width="380" height="32" rx="2"/>
+      <text x="120" y="211" fill="var(--ink)" class="tier-tag">[ 0xFB ][ payload×4 ] + offset 0x010101F8</text>
+      <text x="540" y="211" fill="var(--accent-text)" class="tier-tag">4.31e9</text>
+
+      <!-- Tier 4: 9 byte, value max -->
+      <text x="20" y="248" fill="var(--ink)" class="tier-text">9 byte</text>
+      <rect class="tier tier-4" data-target="vg-w-arch-bijou64-anatomy-r4" role="button" tabindex="0" x="100" y="230" width="380" height="32" rx="2"/>
+      <text x="120" y="251" fill="var(--ink)" class="tier-tag">[ 0xFF ][ payload×8 ] + bounds check</text>
+      <text x="540" y="251" fill="var(--accent-text)" class="tier-tag">2^64 − 1</text>
+
+      <!-- Footer caption -->
+      <text x="360" y="296" text-anchor="middle" fill="var(--muted)" class="tier-tag" font-style="italic">tier 4 / 6 / 7 / 8 byte 用 0xFA / 0xFC / 0xFD / 0xFE，同樣套 offset 累加</text>
+      <text x="360" y="318" text-anchor="middle" fill="var(--muted)" class="tier-tag" font-style="italic">canonical 不變式：每個 u64 ↔ 一個合法編碼，9-byte tier 對 ≥ 2^64 的輸入被 bounds check 擋下</text>
+      <text x="360" y="346" text-anchor="middle" fill="var(--sage-deep)" class="tier-tag" font-style="italic">offset 算術讓相鄰檔位接邊不重疊——這就是「沒有 overlong encoding」的構造性證明</text>
+    </svg>
+
+    <div>
+      <p class="hint">click a tier above</p>
+      <div class="detail detail-0">
+        <h3>1-byte tier · value = byte 本身</h3>
+        <p>首 byte 落在 <code>[0x00, 0xF7]</code>。寫 <code>0x05</code> 就是 5、寫 <code>0xF7</code> 就是 247。沒有 tag、沒有 payload、沒有 offset。</p>
+        <p><strong>不負責的事</strong>：值 ≥ 248。一旦超界，編碼器跳進 2-byte tier。一個 byte 編 248 個值——比 LEB128（1 byte 128 個）少一倍密度，這是 bijou64 為了字典序付出的成本。</p>
+      </div>
+      <div class="detail detail-1">
+        <h3>2-byte tier · 一個 tag + 一個 payload byte</h3>
+        <p>首 byte 是 <code>0xF8</code>。後面跟 1 byte big-endian payload。實際值 = <code>payload + 0xF8</code>（248）。</p>
+        <p>編碼 504：504 − 248 = 256，但 256 超出 1 byte 上界（255）——所以 504 是這個 tier 的最後一個合法值嗎？文章列的上界是 504，意味著 payload <code>0x00..0xFF</code> + offset 0xF8 表示 248..503，加上「2-byte tier 自身的最大值」算到 504。相鄰 tier 之間「沒有空隙」是構造目標。</p>
+      </div>
+      <div class="detail detail-2">
+        <h3>3-byte tier · tag 0xF9 + 2 byte big-endian payload</h3>
+        <p>首 byte <code>0xF9</code>，後 2 byte big-endian payload，offset <code>0x01F8</code>（504）。</p>
+        <p>worked example：編碼 <code>1738</code>。1738 − 504 = 1234 = <code>0x04D2</code>。輸出 <code>0xF9 0x04 0xD2</code>。decode 反向：load 24 bit、減 offset、得到原值。big-endian 是字典序保序的關鍵——`0x04D2` 比起 `0x04D3` 在 byte string 上小，剛好對應 1234 &lt; 1235。</p>
+      </div>
+      <div class="detail detail-3">
+        <h3>5-byte tier · tag 0xFB + 4 byte big-endian payload</h3>
+        <p>首 byte <code>0xFB</code>，後 4 byte big-endian payload，offset <code>0x010101F8</code>（前面 1-、2-、3-、4-byte tier 累加的最大值再加 1）。</p>
+        <p>5-byte tier 上界 <code>0x010101F8 + 0xFFFFFFFF = 0x01010101F7</code>，文章列為 4,311,810,296（約 4.31e9）。「offset 累加」這個構造保證每加一個 tier，下界剛好接上上一個 tier 的上界，零浪費。</p>
+      </div>
+      <div class="detail detail-4">
+        <h3>9-byte tier · tag 0xFF + 8 byte big-endian payload</h3>
+        <p>首 byte <code>0xFF</code>，後 8 byte big-endian payload，覆蓋到 <code>2^64 − 1</code>。</p>
+        <p>9-byte tier 是唯一需要 runtime bounds check 的檔位——如果 payload + offset 溢位超過 2^64，必須拒絕。其他八個 tier 都不需要 check，因為值域分配本身就排除了非法 input。canonical decoding is decoding——這正是 LEB128 處理 overlong encoding 時要額外做的事。</p>
+      </div>
+    </div>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-arch-bijou64-anatomy');
+        root.querySelectorAll('.tier').forEach((rect) => {
+          rect.addEventListener('click', () => {
+            const targetId = rect.getAttribute('data-target');
+            const radio = root.querySelector('#' + targetId);
+            if (radio) radio.checked = true;
+          });
+          rect.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              rect.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            }
+          });
+        });
+      })();
+    </script>
+  </figure>
+
+  <p>把 1738 那個範例展開來看：1738 不夠 1-byte tier（&gt; 247），也不夠 2-byte tier（&gt; 504），落到 3-byte tier；3-byte tier 的 offset 是 504，1738 − 504 = 1234 = <code>0x04D2</code>；輸出 <code>0xF9 0x04 0xD2</code>。decode 也對稱：讀 <code>0xF9</code>，看到首 byte ≥ 0xF8，計算 length = (0xF9 − 0xF8) + 2 = 3，剩下 2 byte 作 big-endian load、加上 offset 0x01F8——回到 1738。整段沒有 branch，length lookup 跟 offset lookup 都是 256-entry 表。</p>
+
+  <p>把這個 worked example 跟 LEB128 同 value 並排看，差距具體在哪。</p>
+
+  <p>LEB128 編 1738 是兩個 7-bit chunk <code>0x0A</code> + <code>0x0D</code>，前者帶 continuation bit 變 <code>0x8A</code>——輸出 <code>0x8A 0x0D</code> 是 2 byte。bijou64 是 3 byte，多 1 byte。</p>
+
+  <p>代價清楚，收益也清楚：1738 的 bijou64 編碼 <code>0xF9 0x04 0xD2</code> 跟 1739 的編碼 <code>0xF9 0x04 0xD3</code> 直接 memcmp 比較就是 1738 &lt; 1739。LEB128 在 byte 上比較 <code>0x8A 0x0D</code> 跟 <code>0x8B 0x0D</code>，因為 little-endian 反向，剛好同向只是巧合；換個跨 byte 的範例就會反。</p>
+
+  <p>「巧合對」跟「構造性對」的差別正是 LSM-tree 工程師最在意的——巧合在 unit test 過得去、在 production 跨 tier 的 key range 上就會出事。</p>
+
+  <p>另一個值得特別看的細節是 9-byte tier 的 bounds check。</p>
+
+  <p>1-byte tier 涵蓋 [0, 247]、2-byte 到 8-byte tier 各自接續、累加到 8-byte tier 的上界——這個累加值本身就已經接近 2^64。9-byte tier 的 payload 是完整 8 byte 即 2^64 個可能值，加上 8-byte tier 的上界當 offset，最大可表達值會超過 2^64。</p>
+
+  <p>這是 bijou64 唯一需要做 runtime check 的地方：decode 出來的 value 如果 wrap around 了，就是 illegal encoding 必須拒絕。其他八個 tier 都不需要 check——值域分配本身就排除了非法 input、也排除了「同一個值有第二個編碼」的可能性。這是 bijou64 文章中「canonical decoding is decoding」這個 slogan 的數學基礎。</p>
+
+  <h2>字典序保序：構造性而非碰巧</h2>
+
+  <p>varint 的字典序保序通常是一件「碰運氣」的事——LEB128 不保，SQLite varint 不保，Protobuf varint 不保。bijou64 保——而且不是 case-by-case 證明，是構造上必然。</p>
+
+  <p>三件事疊起來推出字典序保序。</p>
+
+  <p>第一，首 byte 嚴格決定 tier，tier-i 的所有合法值嚴格小於 tier-(i+1) 的所有合法值——因為 offset 是「前面所有 tier 能表達的最大值 + 1」，相鄰 tier 之間零 overlap、零空隙。所以跨 tier 比較時，首 byte 比較就足以決定大小：tier-1 的首 byte 範圍 <code>0x00..0xF7</code>、tier-2 首 byte 必為 <code>0xF8</code>、tier-3 必為 <code>0xF9</code>……首 byte 排序剛好等於 tier 排序，剛好等於值大小排序。</p>
+
+  <p>第二，同 tier 內 payload 是 big-endian——大值寫在前面。兩個同 tier 的 byte string 比較時，比較的就是 payload 的 big-endian 字典序，等價於 payload 的數值大小。</p>
+
+  <p>第三，所有編碼長度一致地以 tag byte 開頭（或是直接是 1-byte 值本身），不存在「短編碼是長編碼的 prefix」這種破壞字典序的情況——因為 tag byte 範圍跟 1-byte 值範圍嚴格不交。1-byte 編碼的 byte 都 &lt; 0xF8，多 byte 編碼首 byte 都 ≥ 0xF8，兩段不重疊。</p>
+
+  <p>所以 bijou64 編碼後直接拿 <code>memcmp</code> 比較等於拿 u64 大小比較。</p>
+
+  <p>這在 RocksDB、Pebble、LMDB、Sled 這類 LSM-tree / B-tree key-value store 裡是黃金性質——store 的內部排序是 byte-level、index seek 是 byte-level、bloom filter 跟 prefix iterator 都假設 byte ordering 等於語意 ordering。</p>
+
+  <p>LEB128 完全做不到，要麼自己反向編、要麼存 raw u64 big-endian（放棄壓縮）、要麼存兩份。bijou64 編碼後是 byte string，順序語意保留，是 LSM-tree key 的 drop-in 升級。</p>
+
+  <p>把這條性質再放大檢視一次：「字典序保序」其實是兩個約束的合取。</p>
+
+  <p>第一個約束是「跨編碼長度的順序」——短編碼跟長編碼之間誰大誰小要明確。bijou64 用「tag byte 範圍嚴格 &gt; 1-byte 值範圍、後續 tag byte 嚴格遞增」這條規則保證：1-byte 編碼的所有 byte string 都嚴格小於 2-byte 編碼的所有 byte string，2-byte 都小於 3-byte，以此類推。</p>
+
+  <p>LEB128 不保——<code>0xFF 0x01</code> 編 255，但 byte 上「以 0xFF 開頭」會被誤認為很大、實際上比 <code>0x80 0xFF 0x01</code>（編 32639）小很多。</p>
+
+  <p>第二個約束是「同編碼長度內的順序」——固定長度下 payload byte 怎麼排。bijou64 全用 big-endian，payload 高位先寫——這跟一般人寫 hex 時的順序一致、跟人類直覺的「大數先寫」一致、跟 memcmp 預設方向一致。</p>
+
+  <p>三條合起來造就「memcmp 等於 u64 大小比較」這個性質。順帶說一下：這個性質還有一個方向——bijou64 不需要任何 endian-aware 反向程序，無論 host 是 little-endian 還是 big-endian，編碼後的 byte string 都是 big-endian 順序。x86、ARM 在儲存時走 little-endian，但 bijou64 wire bytes 永遠是 big-endian——decoder 用 <code>u64::from_be_bytes</code> 自然解、host endianness 不影響。</p>
+
+  <p>這條性質帶來一個次要但實用的好處：跟 bijou64 配對的 prefix encoding（比如 RocksDB 的 prefix iterator、SSTable index 的 prefix-compressed keys）天然就跟「u64 數值 prefix」對齊。在 RocksDB 裡 prefix iterator 假設「兩個 key 共享 prefix 就在同一個 prefix bucket」——對 bijou64 編碼的 user_id key，「相鄰一段 u64 range 共享同一個 tag byte」自然成立，prefix bucket 就是 u64 的 tier 群組。這個對齊在 bloom filter false positive rate 上有可測量的影響——同 bucket 的 key 共享 hash seed，少 1% 的跨 tier mix 就能在大 SSTable 上減少幾百萬次 disk read。</p>
+
+  <h2>三條約束的對照——SQLite、Protobuf、ULEB128 各自缺哪一條</h2>
+
+  <p>下方分頁把四個方案在三條約束上的表現並排——逐個 scheme 點開可以看 1738 在那個 scheme 下的 byte sequence、字典序保序情況、length 從首 byte 是否能讀出、decoder 是否能避開 per-byte branching。1738 故意挑成所有方案都會走多 byte 路徑、又不會大到撐爆某個 tier 的「中等大小」例子。</p>
+
+  <figure class="vg-w-tabs-bijou64-vs-others">
+    <style>
+      .vg-w-tabs-bijou64-vs-others { display: grid; gap: var(--s-2); }
+      .vg-w-tabs-bijou64-vs-others input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-tabs-bijou64-vs-others .tabs { display: flex; gap: var(--s-2); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+      .vg-w-tabs-bijou64-vs-others .tab { font-family: var(--sans); font-size: var(--fs-sm); padding: var(--s-1) var(--s-2); cursor: pointer; color: var(--muted); min-height: 44px; display: inline-flex; align-items: center; }
+      .vg-w-tabs-bijou64-vs-others .panel { display: none; padding: var(--s-2) 0; }
+      .vg-w-tabs-bijou64-vs-others:has(#vg-w-tabs-bijou64-vs-others-t1:checked) .panel-1 { display: block; }
+      .vg-w-tabs-bijou64-vs-others:has(#vg-w-tabs-bijou64-vs-others-t1:checked) [for="vg-w-tabs-bijou64-vs-others-t1"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-bijou64-vs-others:has(#vg-w-tabs-bijou64-vs-others-t2:checked) .panel-2 { display: block; }
+      .vg-w-tabs-bijou64-vs-others:has(#vg-w-tabs-bijou64-vs-others-t2:checked) [for="vg-w-tabs-bijou64-vs-others-t2"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-bijou64-vs-others:has(#vg-w-tabs-bijou64-vs-others-t3:checked) .panel-3 { display: block; }
+      .vg-w-tabs-bijou64-vs-others:has(#vg-w-tabs-bijou64-vs-others-t3:checked) [for="vg-w-tabs-bijou64-vs-others-t3"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-bijou64-vs-others:has(#vg-w-tabs-bijou64-vs-others-t4:checked) .panel-4 { display: block; }
+      .vg-w-tabs-bijou64-vs-others:has(#vg-w-tabs-bijou64-vs-others-t4:checked) [for="vg-w-tabs-bijou64-vs-others-t4"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-bijou64-vs-others .crit { display: grid; grid-template-columns: 1fr; gap: var(--s-1); margin: var(--s-1) 0; }
+      @media (min-width: 720px) { .vg-w-tabs-bijou64-vs-others .crit { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+      .vg-w-tabs-bijou64-vs-others .crit > div { padding: var(--s-2); background: var(--bg-soft); border-left: 2px solid var(--muted-2); }
+      .vg-w-tabs-bijou64-vs-others .crit > div.pass { border-left-color: var(--sage-deep); }
+      .vg-w-tabs-bijou64-vs-others .crit > div.fail { border-left-color: var(--accent); }
+      .vg-w-tabs-bijou64-vs-others .crit-head { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+      .vg-w-tabs-bijou64-vs-others .crit-mark { font-family: JetBrains Mono, monospace; font-size: var(--fs-sm); color: var(--ink); }
+      .vg-w-tabs-bijou64-vs-others .crit.pass .crit-mark { color: var(--sage-deep); }
+      .vg-w-tabs-bijou64-vs-others .crit.fail .crit-mark { color: var(--accent-text); }
+      .vg-w-tabs-bijou64-vs-others .crit-body { font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink-soft); margin-top: var(--s-1); }
+      .vg-w-tabs-bijou64-vs-others .bytes { font-family: JetBrains Mono, monospace; font-size: var(--fs-sm); padding: var(--s-1) var(--s-2); background: var(--bg-soft); border-left: 2px solid var(--accent); display: inline-block; margin: var(--s-1) 0; }
+    </style>
+    <input type="radio" id="vg-w-tabs-bijou64-vs-others-t1" aria-label="bijou64 tab" name="vg-w-tabs-bijou64-vs-others-sel" checked />
+    <input type="radio" id="vg-w-tabs-bijou64-vs-others-t2" aria-label="LEB128 tab" name="vg-w-tabs-bijou64-vs-others-sel" />
+    <input type="radio" id="vg-w-tabs-bijou64-vs-others-t3" aria-label="SQLite varint tab" name="vg-w-tabs-bijou64-vs-others-sel" />
+    <input type="radio" id="vg-w-tabs-bijou64-vs-others-t4" aria-label="Protobuf varint tab" name="vg-w-tabs-bijou64-vs-others-sel" />
+    <div class="tabs" role="tablist">
+      <label class="tab" for="vg-w-tabs-bijou64-vs-others-t1">bijou64</label>
+      <label class="tab" for="vg-w-tabs-bijou64-vs-others-t2">ULEB128</label>
+      <label class="tab" for="vg-w-tabs-bijou64-vs-others-t3">SQLite varint</label>
+      <label class="tab" for="vg-w-tabs-bijou64-vs-others-t4">Protobuf varint</label>
+    </div>
+
+    <div class="panel panel-1">
+      <p>編碼 <code>1738</code>：<span class="bytes">0xF9 0x04 0xD2</span> · 3 byte。tag <code>0xF9</code> 表「2 byte payload」，big-endian payload <code>0x04D2</code> + offset 504 = 1738。</p>
+      <div class="crit">
+        <div class="pass">
+          <div class="crit-head">字典序保序</div>
+          <div class="crit-mark">✓ pass</div>
+          <div class="crit-body">tier 排序 = 首 byte 排序 = 值大小；同 tier 內 payload big-endian 排序 = 值大小。memcmp 等價於 u64 比較。</div>
+        </div>
+        <div class="pass">
+          <div class="crit-head">首 byte length prefix</div>
+          <div class="crit-mark">✓ pass</div>
+          <div class="crit-body">length = b &lt; 0xF8 ? 1 : b − 0xF6。256-entry lookup table 即可 O(1) 取得長度，毋須掃 continuation bit。</div>
+        </div>
+        <div class="pass">
+          <div class="crit-head">branchless decode</div>
+          <div class="crit-mark">✓ pass</div>
+          <div class="crit-body">後 8 byte 一次 64-bit load + bswap + offset table lookup + mask，全程無 per-byte branch。SIMD-vectorizable。</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel panel-2">
+      <p>編碼 <code>1738</code>：<span class="bytes">0xCA 0x0D</span> · 2 byte。1738 = <code>0b11011001010</code>，分成 7-bit chunk <code>0001101 1001010</code>，從低位先寫、continuation bit 0x80 加在非末位。</p>
+      <div class="crit">
+        <div class="fail">
+          <div class="crit-head">字典序保序</div>
+          <div class="crit-mark">× fail</div>
+          <div class="crit-body">low-endian 7-bit chunk 把高位放在後面，跨 byte 比較直接反轉。比 1 ↔ 128：1 = <code>0x01</code>、128 = <code>0x80 0x01</code>，byte 比較 <code>0x01</code> &lt; <code>0x80 0x01</code> 巧合對；比 128 ↔ 256 就反了。</div>
+        </div>
+        <div class="fail">
+          <div class="crit-head">首 byte length prefix</div>
+          <div class="crit-mark">× fail</div>
+          <div class="crit-body">長度從 continuation bit chain 取出——必須逐 byte 掃直到首位 0。1 byte 跟 9 byte 在首 byte 看不出差別。</div>
+        </div>
+        <div class="fail">
+          <div class="crit-head">branchless decode</div>
+          <div class="crit-mark">× fail</div>
+          <div class="crit-body">每讀一 byte 就要分支判斷 MSB；7-bit-per-byte 對 SIMD 不友善（需要 shuffle + mask + variable shift）。BMI2 的 PEXT 可以幫忙但要 hardware feature gating。</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel panel-3">
+      <p>編碼 <code>1738</code>：<span class="bytes">0x8D 0x4A</span> 或同類 · 2 byte。SQLite varint 在 1–8 byte 時用 7-bit chunk + continuation bit、第 9 byte 整 byte 都是 payload。big-endian 內順序——比 LEB128 多一點 byte 比較友善但仍非完全保序。</p>
+      <div class="crit">
+        <div class="fail">
+          <div class="crit-head">字典序保序</div>
+          <div class="crit-mark">× fail</div>
+          <div class="crit-body">前 8 byte 是 big-endian chunk 順序，看起來像是會保序——但跨 byte 數的編碼之間，短編碼前綴可能比長編碼前綴大（continuation bit 在高位）。實務上需要存 raw u64 才安全。</div>
+        </div>
+        <div class="fail">
+          <div class="crit-head">首 byte length prefix</div>
+          <div class="crit-mark">× fail</div>
+          <div class="crit-body">同樣靠 continuation bit chain 確定長度。SQLite 在 record header 解析時必須順序讀 byte。</div>
+        </div>
+        <div class="fail">
+          <div class="crit-head">branchless decode</div>
+          <div class="crit-mark">× fail</div>
+          <div class="crit-body">每 byte 都要 continuation bit branch、第 9 byte 又是特例。decoder 是手寫 switch + loop，沒辦法做純 branchless SIMD path。</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel panel-4">
+      <p>編碼 <code>1738</code>：<span class="bytes">0xCA 0x0D</span> · 2 byte。Protobuf varint 在 wire format 裡跟 LEB128 等價——uint64 直接 LEB128 編碼、int64 用 ZigZag 後再 LEB128。</p>
+      <div class="crit">
+        <div class="fail">
+          <div class="crit-head">字典序保序</div>
+          <div class="crit-mark">× fail</div>
+          <div class="crit-body">與 LEB128 同分析。Protobuf 從不要求 wire format 在 byte 順序上有語意——field tag + varint 的 stream 本來就靠 parser 重組。</div>
+        </div>
+        <div class="fail">
+          <div class="crit-head">首 byte length prefix</div>
+          <div class="crit-mark">× fail</div>
+          <div class="crit-body">continuation bit chain。Protobuf wire reader 是逐 byte loop、靠 MSB 判斷是否繼續。</div>
+        </div>
+        <div class="fail">
+          <div class="crit-head">branchless decode</div>
+          <div class="crit-mark">× fail</div>
+          <div class="crit-body">同 LEB128。Protozero、protobuf-c 這些優化實作會手寫 unroll path，但本質還是 chain。</div>
+        </div>
+      </div>
+    </div>
+  </figure>
+
+  <p>分頁的結構刻意把四個方案放在三條一致的尺上，是為了反駁一個直覺：「varint 都差不多吧」。差別具體在哪——LEB128 在小值密度上贏（1 byte 表 128 個，bijou64 表 248 個但底層算術重一些）、bijou64 在比較與 decode 上贏，SQLite varint 兩條都沒贏只是歷史包袱、Protobuf 直接是 LEB128。挑選 varint 的問題其實是「我的下游消費者是什麼」——LSM-tree key？選 bijou64。Protobuf message field？沿用 LEB128。CRDT log row id？bijou64 兩條約束都需要。</p>
+
+  <p>Protobuf 的位置又不太一樣——Protobuf wire format 確實有「現役」的 forward-compat 約束（任何讀過 v0.x 訊息的 client 都得能讀新版），但它的設計目標從來不包含「byte string 可 memcmp」或「length prefix」——Protobuf message 本來就是 field-tagged 結構、reader 是 field-by-field 解析、不存在「memcmp 整段 message 比大小」的需求。所以 LEB128 在 Protobuf wire format 裡是 well-fit、不是 misfit。bijou64 不是要打進 Protobuf wire format 取代 LEB128；它是要進到 Protobuf message 之外的、需要 byte-string 性質的場景。把這條邊界畫清楚有助於避免「新的 varint 就要取代舊的」這種一刀切的迷思。</p>
+
+  <p>下面這個 slider 把抽象的 tier 邊界做成可手感的東西——對數軸跨越 0 到 2^40 的 u64 值，拉動數值，bijou64 與 ULEB128 的 byte 數、首 byte（tag）、payload bytes 同步更新。重點不是看「哪邊比較短」，是看 tier 切換的位置在哪：bijou64 的 tier 邊界在 248、504、65,784、16,843,032、4.31e9、…；LEB128 的 tier 邊界在 128、16,384、2,097,152、…。兩個方案在不同的 value 段各自占優、各自惡化。把 slider 拉過邊界附近你會看到「分頁的勝負是位置決定的、不是平均決定的」。</p>
+
+  <figure class="vg-w-range-bijou64-encoder">
+    <style>
+      .vg-w-range-bijou64-encoder { display: grid; gap: var(--s-3); padding: var(--s-3); background: var(--bg-soft); border-left: 2px solid var(--accent); }
+      .vg-w-range-bijou64-encoder .control { display: grid; gap: var(--s-2); }
+      .vg-w-range-bijou64-encoder label { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+      .vg-w-range-bijou64-encoder input[type="range"] { width: 100%; height: 36px; accent-color: var(--accent); }
+      .vg-w-range-bijou64-encoder .value-row { display: flex; align-items: baseline; gap: var(--s-2); flex-wrap: wrap; }
+      .vg-w-range-bijou64-encoder .value-num { font-family: EB Garamond, serif; font-size: 1.8rem; font-variant-numeric: tabular-nums; color: var(--ink); }
+      .vg-w-range-bijou64-encoder .value-hex { font-family: JetBrains Mono, monospace; color: var(--muted); font-size: var(--fs-sm); }
+      .vg-w-range-bijou64-encoder .compare { display: grid; grid-template-columns: 1fr; gap: var(--s-2); }
+      @media (min-width: 720px) { .vg-w-range-bijou64-encoder .compare { grid-template-columns: 1fr 1fr; } }
+      .vg-w-range-bijou64-encoder .scheme { padding: var(--s-2); background: var(--bg); border: 1px solid var(--line); }
+      .vg-w-range-bijou64-encoder .scheme h4 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-range-bijou64-encoder .bytes-display { font-family: JetBrains Mono, monospace; font-size: var(--fs-md); color: var(--ink); padding: var(--s-1) 0; word-break: break-all; }
+      .vg-w-range-bijou64-encoder .bytes-display .tag { color: var(--accent-text); font-weight: 600; }
+      .vg-w-range-bijou64-encoder .bytes-display .payload { color: var(--ink-deep); }
+      .vg-w-range-bijou64-encoder .bytes-display .cont { color: var(--accent-text); }
+      .vg-w-range-bijou64-encoder .bytes-display .data { color: var(--ink-deep); }
+      .vg-w-range-bijou64-encoder .meta { font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink-soft); }
+      .vg-w-range-bijou64-encoder .meta em { color: var(--sage-deep); font-style: italic; }
+      .vg-w-range-bijou64-encoder .ticks { display: flex; justify-content: space-between; font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); color: var(--muted); margin-top: -0.5em; }
+    </style>
+
+    <div class="control">
+      <label for="vg-w-range-bijou64-encoder-x">u64 value (log-spaced 0 .. 2^40)</label>
+      <input id="vg-w-range-bijou64-encoder-x" type="range" min="0" max="1000" step="1" value="380" />
+      <div class="ticks"><span>0</span><span>248</span><span>65k</span><span>16M</span><span>4.3G</span><span>2^40</span></div>
+      <div class="value-row">
+        <span>value =</span>
+        <span class="value-num" data-num>1738</span>
+        <span class="value-hex" data-hex>0x06CA</span>
+      </div>
+    </div>
+
+    <div class="compare">
+      <div class="scheme">
+        <h4>bijou64 → <span data-blen>3</span> byte</h4>
+        <div class="bytes-display" data-bbytes>0xF9 0x04 0xD2</div>
+        <p class="meta" data-bmeta>tier 3——tag 0xF9 + 2 byte payload + offset 0x01F8 = 504</p>
+      </div>
+      <div class="scheme">
+        <h4>ULEB128 → <span data-llen>2</span> byte</h4>
+        <div class="bytes-display" data-lbytes>0xCA 0x0D</div>
+        <p class="meta" data-lmeta>2 個 7-bit chunk——每 byte 高位是 continuation flag</p>
+      </div>
+    </div>
+
+    <p class="meta" data-summary>於此 value，bijou64 比 ULEB128 多 1 byte——這是小整數段的常見差距，bijou64 換來的是字典序保序與 branchless decode。</p>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-range-bijou64-encoder');
+        const inp = root.querySelector('input');
+        const numEl = root.querySelector('[data-num]');
+        const hexEl = root.querySelector('[data-hex]');
+        const blen = root.querySelector('[data-blen]');
+        const bbytes = root.querySelector('[data-bbytes]');
+        const bmeta = root.querySelector('[data-bmeta]');
+        const llen = root.querySelector('[data-llen]');
+        const lbytes = root.querySelector('[data-lbytes]');
+        const lmeta = root.querySelector('[data-lmeta]');
+        const summary = root.querySelector('[data-summary]');
+
+        // Map slider 0..1000 to u64 value 0..2^40 in log space
+        // s=0 -> 0; s>0 -> floor(2^(40 * s/1000)) - 1 + small shift
+        function sliderToValue(s) {
+          if (s === 0) return 0;
+          // 1..1000 -> 1..2^40
+          const exp = 40 * (s / 1000);
+          return Math.max(1, Math.round(Math.pow(2, exp))) - 1;
+        }
+
+        function hex(n, width) {
+          return '0x' + n.toString(16).toUpperCase().padStart(width, '0');
+        }
+
+        // bijou64 encode: tier sizes by max-cumulative value
+        // tier1 (1 byte): 0..247
+        // tier_k (k+1 byte total) covers offset_k .. offset_k + 256^k - 1, where offset_k = previous max + 1
+        const tiers = (() => {
+          const out = [];
+          let offset = 0;
+          let maxVal = 247;
+          out.push({ totalLen: 1, offset: 0, max: 247, tag: null });
+          offset = 248;
+          for (let payload = 1; payload <= 8; payload++) {
+            const cap = Math.pow(256, payload);
+            const max = offset + cap - 1;
+            out.push({ totalLen: payload + 1, offset, max, tag: 0xF7 + payload });
+            offset = max + 1;
+          }
+          return out;
+        })();
+
+        function encodeBijou(v) {
+          if (v <= 247) return { len: 1, bytes: [v], tag: null, payloadVal: null, tier: tiers[0] };
+          for (let i = 1; i < tiers.length; i++) {
+            const t = tiers[i];
+            if (v <= t.max) {
+              const payloadVal = v - t.offset;
+              const payload = [];
+              let p = payloadVal;
+              const payloadLen = t.totalLen - 1;
+              for (let k = payloadLen - 1; k >= 0; k--) {
+                payload.push((p >>> (k * 8)) & 0xFF);
+              }
+              // For values above 2^32 we need BigInt for accuracy
+              if (v > 0xFFFFFFFF) {
+                const bv = BigInt(v);
+                const bo = BigInt(t.offset);
+                const bp = bv - bo;
+                const buf = [];
+                for (let k = BigInt(payloadLen - 1); k >= 0n; k--) {
+                  buf.push(Number((bp >> (k * 8n)) & 0xFFn));
+                }
+                return { len: t.totalLen, bytes: [t.tag, ...buf], tag: t.tag, payloadVal: bp, tier: t };
+              }
+              return { len: t.totalLen, bytes: [t.tag, ...payload], tag: t.tag, payloadVal, tier: t };
+            }
+          }
+          return null;
+        }
+
+        function encodeULEB128(v) {
+          const bytes = [];
+          let bv = BigInt(v);
+          if (bv === 0n) return [0];
+          while (bv !== 0n) {
+            let b = Number(bv & 0x7Fn);
+            bv >>= 7n;
+            if (bv !== 0n) b |= 0x80;
+            bytes.push(b);
+          }
+          return bytes;
+        }
+
+        function fmt(bytes) {
+          return bytes.map(b => hex(b, 2)).join(' ');
+        }
+
+        function update() {
+          const s = Number(inp.value);
+          const v = sliderToValue(s);
+          numEl.textContent = v.toLocaleString('en-US');
+          hexEl.textContent = hex(v, v < 256 ? 2 : v < 65536 ? 4 : v < 0x100000000 ? 8 : 12);
+
+          const b = encodeBijou(v);
+          const l = encodeULEB128(v);
+
+          blen.textContent = String(b.len);
+          if (b.len === 1) {
+            bbytes.innerHTML = '<span class="payload">' + hex(b.bytes[0], 2) + '</span>';
+            bmeta.innerHTML = 'tier 1——首 byte 直接是值（0..247），<em>無 tag、無 offset</em>';
+          } else {
+            bbytes.innerHTML = '<span class="tag">' + hex(b.tag, 2) + '</span> ' +
+              b.bytes.slice(1).map(x => '<span class="payload">' + hex(x, 2) + '</span>').join(' ');
+            bmeta.innerHTML = 'tier ' + b.len + '——tag ' + hex(b.tag, 2) +
+              ' + ' + (b.len - 1) + ' byte payload + offset ' + hex(b.tier.offset, b.tier.offset < 256 ? 2 : 4);
+          }
+
+          llen.textContent = String(l.length);
+          lbytes.innerHTML = l.map((x, i) => {
+            const klass = (i < l.length - 1) ? 'cont' : 'data';
+            return '<span class="' + klass + '">' + hex(x, 2) + '</span>';
+          }).join(' ');
+          lmeta.innerHTML = l.length + ' 個 7-bit chunk——前 ' + (l.length - 1) + ' byte 帶 continuation flag (0x80)';
+
+          const diff = b.len - l.length;
+          if (diff > 0) {
+            summary.innerHTML = '於此 value，bijou64 多 ' + diff + ' byte。<em>換來：字典序保序、length 從首 byte 一目了然、branchless decode</em>。';
+          } else if (diff < 0) {
+            summary.innerHTML = '於此 value，bijou64 比 ULEB128 少 ' + (-diff) + ' byte——大 value 段 bijou64 的 base-256 chunking 開始反超 LEB128 的 7-bit-per-byte。';
+          } else {
+            summary.innerHTML = '於此 value，兩者 byte 數打平——但 bijou64 多了字典序保序與 length prefix 兩條性質。';
+          }
+        }
+
+        inp.addEventListener('input', update);
+        update();
+      })();
+    </script>
+    <figcaption>滑桿是對數軸（0 → 2^40）；每個 tier 邊界附近兩個方案的 byte 數會跳變。bijou64 在 ≤ 247 與大 value 段比 LEB128 短、在小整數段（248–~16k）比 LEB128 多 1 byte——這是字典序保序與 branchless decode 的 byte 成本。</figcaption>
+  </figure>
+
+  <p>把 slider 拉到 1234 附近（剛好落在 bijou64 第 3 tier 起點與 LEB128 第 2 tier 上界之間），可以看到 bijou64 = 3 byte、LEB128 = 2 byte——這是 bijou64 為了拿下字典序付的「最痛」價位。把 slider 拉到 2^31 附近，兩者大致打平；再往上 bijou64 開始反超——因為 bijou64 的 base-256 chunk 比 LEB128 的 7-bit chunk 在大值段密度更高（每 byte 8 vs 7 bit）。</p>
+
+  <p>具體算一次。</p>
+
+  <p>u64 = 2^40 ≈ 1.1e12 這個 value，bijou64 落在 6-byte tier（tag <code>0xFC</code>、5 byte big-endian payload + offset 0x01010101F8）共 6 byte；LEB128 走 <code>ceil(40 / 7) = 6</code> chunk 也是 6 byte——兩者打平。</p>
+
+  <p>再上 u64 = 2^48，bijou64 還是 6 byte（5-byte payload 上界 ≈ 2^40 + 2^40 ≈ 2.2e12，~7.4e13 仍在 7-byte tier），LEB128 需要 <code>ceil(48/7) = 7</code> byte——bijou64 反超 1 byte。</p>
+
+  <p>再上 u64 ≈ 2^60，bijou64 是 8 byte 進 9-byte tier；LEB128 需要 <code>ceil(60/7) = 9</code> byte——再次打平。</p>
+
+  <p>極端值 u64 = 2^64 - 1，bijou64 9 byte、LEB128 10 byte——bijou64 贏 1 byte。所以 bijou64 在 [0, 247] 跟「大值段」雙頭贏，在中間有一段 byte 稅。</p>
+
+  <p>這個分佈的形狀直接決定了 bijou64 的「合理應用區」。對「值幾乎都在小整數段」的 workload（Protobuf field tag 99% 在 [1, 15]），bijou64 不會贏；對「值均勻散佈在 64-bit 空間」的 workload（CRDT actor_id × seq_number、UUID 後段、hash output），bijou64 大多數時候都贏；對「值偏中位數但有長尾」的 workload（LSM-tree user_id），bijou64 中位數時略輸、長尾時贏回，加上字典序保序的語意收益。</p>
+
+  <p>把這條曲線放進你心裡的工具箱裡，下次面對「該選哪個 varint」的問題就有可以演算的具體判據——而不是靠「LEB128 是業界標準所以選 LEB128」這種惰性。</p>
+
+  <h2>Branchless decode 與 micro-benchmark：每 value 0.75 ns</h2>
+
+  <p>編碼設計再漂亮，最後決定 hot path 成本的是「decode 一個 value 要幾個 cycle」。bijou64 設計上每個解碼都是 O(1) 而且 branch-prediction-friendly——首 byte 一 load 進來，整段 decode 路徑沒有 conditional jump。Rust 的 reference implementation 大致這樣寫：</p>
+
+  <pre><code class="language-rust">// First byte's two roles:
+//   - if &lt; 0xF8, IS the value (and length = 1)
+//   - otherwise, IS the tag (length = (tag - 0xF8) + 2)
+#[inline(always)]
+pub fn decode(buf: &amp;[u8]) -&gt; (u64, usize) {
+    let first = buf[0];
+    if first &lt; 0xF8 {
+        return (first as u64, 1);
+    }
+    let payload_len = (first - 0xF7) as usize; // 1..=8
+    let total_len = payload_len + 1;
+
+    // Load up to 8 payload bytes into a u64 register (single unaligned load + bswap).
+    let mut buf8 = [0u8; 8];
+    buf8[8 - payload_len..].copy_from_slice(&amp;buf[1..total_len]);
+    let payload = u64::from_be_bytes(buf8);
+
+    // OFFSETS[1..=8] precomputed at compile time
+    let value = payload.wrapping_add(OFFSETS[payload_len]);
+    (value, total_len)
+}
+
+// Compile-time offset table — every tier's lower bound
+const OFFSETS: [u64; 9] = [
+    0,                  // tier 1 unused (handled above)
+    0xF8,               // tier 2 -&gt;  248
+    0x01F8,             // tier 3 -&gt;  504
+    0x0101F8,           // tier 4 -&gt;  65_784
+    0x010101F8,         // tier 5 -&gt;  16_843_032
+    0x01010101F8,       // tier 6 -&gt;  4_311_810_296
+    0x0101010101F8,     // tier 7
+    0x010101010101F8,   // tier 8
+    0x01010101010101F8, // tier 9
+];
+</code></pre>
+
+  <p>解碼路徑的關鍵是「single unaligned 64-bit load + bswap + add」——三條 x86 指令。</p>
+
+  <p>LEB128 對應的路徑是「逐 byte read、shift 7、mask 7 bit、OR 進累積值、看 MSB 決定要不要繼續」，每個 byte 都是一次條件分支。這個 chain 對 branch predictor 不友善：「下一個 byte 還要不要繼續」是 data-dependent，predictor 沒辦法靜態決定。</p>
+
+  <p>對 inference workload 不重要，對 LSM-tree compaction、columnar scan、CRDT log replay 這種 hot loop 差距會放大。Ink &amp; Switch 在 x86 Zen 5 上跑的 micro-benchmark 整理如下——4,096 個 value 一 batch、median 取自多次重複：</p>
+
+  <figure class="vg-w-table-bijou64-bench">
+    <style>
+      .vg-w-table-bijou64-bench { overflow-x: auto; }
+      .vg-w-table-bijou64-bench table { width: 100%; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); min-width: 480px; }
+      .vg-w-table-bijou64-bench thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; }
+      .vg-w-table-bijou64-bench thead th[data-sort] { color: var(--accent-text); }
+      .vg-w-table-bijou64-bench thead th[data-sort="asc"]::after { content: ' ▴'; font-size: 0.7em; }
+      .vg-w-table-bijou64-bench thead th[data-sort="desc"]::after { content: ' ▾'; font-size: 0.7em; }
+      .vg-w-table-bijou64-bench tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); }
+      .vg-w-table-bijou64-bench td.num { font-variant-numeric: tabular-nums; text-align: right; font-family: JetBrains Mono, monospace; }
+      .vg-w-table-bijou64-bench td.win { color: var(--sage-deep); font-family: JetBrains Mono, monospace; font-variant-numeric: tabular-nums; text-align: right; }
+      .vg-w-table-bijou64-bench td.lose { color: var(--accent-text); font-family: JetBrains Mono, monospace; font-variant-numeric: tabular-nums; text-align: right; }
+      .vg-w-table-bijou64-bench td.op { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+      .vg-w-table-bijou64-bench tbody tr:hover td { background: var(--bg-soft); }
+      .vg-w-table-bijou64-bench caption { text-align: left; caption-side: top; font-family: var(--scribed); font-style: italic; color: var(--muted); font-size: var(--fs-sm); padding: var(--s-1) 0; }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/>
+        <path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+      </svg>
+      <span>click column header to sort · 5 columns × 5 rows · numbers from Ink &amp; Switch x86 Zen 5 micro-bench</span>
+    </p>
+    <table>
+      <caption>x86 Zen 5、4,096-value batch median——decode 是 bijou64 的明顯主場、encode 在最小值段 LEB128 略勝、wire size 兩者 2–3% 之內。</caption>
+      <thead>
+        <tr>
+          <th data-key="op">運算</th>
+          <th data-key="dist">value 分佈</th>
+          <th data-key="bijou" class="num">bijou64</th>
+          <th data-key="leb" class="num">LEB128</th>
+          <th data-key="ratio" class="num">ratio</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="op">decode batch</td>
+          <td>uniform u64</td>
+          <td class="num">~3 µs</td>
+          <td class="num">~30 µs</td>
+          <td class="win" data-ratio="10.0">10× faster</td>
+        </tr>
+        <tr>
+          <td class="op">decode per value</td>
+          <td>uniform u64</td>
+          <td class="num">0.75 ns</td>
+          <td class="num">7.3 ns</td>
+          <td class="win" data-ratio="9.7">9.7× faster</td>
+        </tr>
+        <tr>
+          <td class="op">decode (steep CDF)</td>
+          <td>small int heavy</td>
+          <td class="num">~3 µs</td>
+          <td class="num">~6 µs</td>
+          <td class="win" data-ratio="2.0">2× faster</td>
+        </tr>
+        <tr>
+          <td class="op">encode</td>
+          <td>248..65,535 段</td>
+          <td class="num">~1.24×</td>
+          <td class="num">baseline</td>
+          <td class="lose" data-ratio="-1.24">LEB128 略勝</td>
+        </tr>
+        <tr>
+          <td class="op">wire size</td>
+          <td>realistic mix</td>
+          <td class="num">±2%</td>
+          <td class="num">baseline</td>
+          <td class="num" data-ratio="0">內 2–3%</td>
+        </tr>
+      </tbody>
+    </table>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-table-bijou64-bench');
+        const headers = root.querySelectorAll('thead th');
+        const tbody = root.querySelector('tbody');
+        let activeKey = null, asc = true;
+        headers.forEach((h, idx) => h.addEventListener('click', () => {
+          const key = h.dataset.key;
+          if (activeKey === key) asc = !asc; else { activeKey = key; asc = true; }
+          headers.forEach((x) => x.removeAttribute('data-sort'));
+          h.setAttribute('data-sort', asc ? 'asc' : 'desc');
+          const rows = Array.from(tbody.querySelectorAll('tr'));
+          rows.sort((a, b) => {
+            let av, bv;
+            if (key === 'ratio') {
+              av = Number(a.children[idx].getAttribute('data-ratio'));
+              bv = Number(b.children[idx].getAttribute('data-ratio'));
+            } else {
+              av = a.children[idx].textContent.trim().replace(/[,~×μµ]/g, '');
+              bv = b.children[idx].textContent.trim().replace(/[,~×μµ]/g, '');
+              const an = Number.parseFloat(av), bn = Number.parseFloat(bv);
+              if (!Number.isNaN(an) && !Number.isNaN(bn)) { av = an; bv = bn; }
+            }
+            const cmp = av < bv ? -1 : av > bv ? 1 : 0;
+            return asc ? cmp : -cmp;
+          });
+          rows.forEach((r) => tbody.appendChild(r));
+        }));
+      })();
+    </script>
+  </figure>
+
+  <p>解碼 2× 到 10× 的差距不是平均——是依 value 分佈而動。</p>
+
+  <p>Uniform u64（也就是真的隨機落在整個 64-bit 空間的分佈）是 bijou64 最有利的情境，因為平均 value 大、LEB128 平均要走 9 byte chain，每 byte 都是條件分支，branch predictor 在「chain 多長」的維度上猜不準。</p>
+
+  <p>改成 steep CDF（多數值落在小整數段、長尾才偶爾出現大值），LEB128 的優勢回來了——小整數段它每個 value 1 byte 就結束，bijou64 反而要 2 byte（值 248..504）。所以「平均下來 5× faster」這種說法掩蓋了實際差距：對 CRDT log seq number（這正是 Subduction 場景）這種「隨時間單調遞增、跨越多個 tier」的 workload，bijou64 是清楚贏；對 Protobuf 那種「99% 的 field tag 在 [1, 15] 範圍內」的場景，LEB128 仍然合理。</p>
+
+  <p>把 0.75 ns/value 這個數字放進 perf 模型裡看看。</p>
+
+  <p>Zen 5 在 5.7 GHz 上一個 cycle ≈ 0.18 ns，0.75 ns ≈ 4 cycle 完成一次 decode——這跟「unaligned load 4 cycle + bswap 1 cycle + add 1 cycle」大致對得上，剩下 1 cycle 給 length lookup 跟 dispatch。</p>
+
+  <p>LEB128 的 7.3 ns/value ≈ 41 cycle，對應「平均 4 byte chain × 8 cycle/iteration（含 branch misprediction）」也差不多。換算到 throughput，bijou64 在單 thread 上 decode rate ≈ 1.3 G value/s，LEB128 約 137 M value/s。</p>
+
+  <p>對「每秒 decode 億級 value」的 columnar query engine 來說，這個差距直接落在 wall-clock latency 上。</p>
+
+  <p>把同一筆編碼後的 byte sequence 餵給兩個 decoder，看 instruction 路徑的差別最直觀。下面這個 before/after slider 並列 LEB128 跟 bijou64 解 <code>1738</code> 時 CPU 走的步驟：左邊是 LEB128 的 byte-by-byte chain（讀一 byte、查 MSB、shift 7、OR 進累積值——重複到 MSB = 0），右邊是 bijou64 的 single unaligned load + bswap + offset add。拖中間分隔線比較兩條路徑在「per-byte branch 數」與「register dependency chain」上的差距。</p>
+
+  <figure class="vg-w-ba-bijou64-decode" data-interactive="drag" data-svg-scroll="720">
+    <style>
+      .vg-w-ba-bijou64-decode { position: relative; aspect-ratio: 16 / 9; overflow: hidden; border: 1px solid var(--line); }
+      .vg-w-ba-bijou64-decode .layer { position: absolute; inset: 0; }
+      .vg-w-ba-bijou64-decode .after { clip-path: polygon(50% 0, 100% 0, 100% 100%, 50% 100%); }
+      .vg-w-ba-bijou64-decode svg { width: 100%; height: 100%; display: block; }
+      .vg-w-ba-bijou64-decode .divider {
+        position: absolute; top: 0; bottom: 0; left: 50%;
+        width: 32px; transform: translateX(-50%);
+        cursor: ew-resize; touch-action: none; z-index: 2;
+      }
+      .vg-w-ba-bijou64-decode .divider::before {
+        content: ''; position: absolute; left: 50%; top: 0; bottom: 0;
+        width: 2px; transform: translateX(-50%);
+        background: var(--accent);
+      }
+      .vg-w-ba-bijou64-decode .divider::after {
+        content: '↔'; position: absolute; left: 50%; top: 50%;
+        transform: translate(-50%, -50%);
+        background: var(--accent); color: var(--bg);
+        width: 32px; height: 32px; border-radius: 50%;
+        display: grid; place-items: center;
+        font-family: var(--sans); font-size: 16px;
+      }
+      .vg-w-ba-bijou64-decode .head { font-family: IM Fell English, serif; font-style: italic; font-size: 14px; fill: var(--ink); }
+      .vg-w-ba-bijou64-decode .sub { font-family: JetBrains Mono, monospace; font-size: 11px; fill: var(--muted); }
+      .vg-w-ba-bijou64-decode .step { font-family: JetBrains Mono, monospace; font-size: 12px; fill: var(--ink); }
+      .vg-w-ba-bijou64-decode .num { font-family: EB Garamond, serif; font-size: 13px; fill: var(--accent-text); font-style: italic; }
+      .vg-w-ba-bijou64-decode .box-leb { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.2; }
+      .vg-w-ba-bijou64-decode .box-leb-branch { fill: color-mix(in srgb, var(--accent) 12%, var(--bg-soft)); stroke: var(--accent); stroke-width: 1.2; }
+      .vg-w-ba-bijou64-decode .box-bij { fill: var(--bg-soft); stroke: var(--sage-deep); stroke-width: 1.2; }
+      .vg-w-ba-bijou64-decode .arrow { stroke: var(--muted); stroke-width: 1.2; fill: none; marker-end: url(#vg-w-ba-bijou64-decode-arrow); }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M8 3H5a2 2 0 0 0-2 2v3"/>
+        <path d="M21 8V5a2 2 0 0 0-2-2h-3"/>
+        <path d="M3 16v3a2 2 0 0 0 2 2h3"/>
+        <path d="M16 21h3a2 2 0 0 0 2-2v-3"/>
+        <path d="M9 12h6"/>
+      </svg>
+      <span>drag the divider to compare decode pipelines for value 1738 · LEB128 byte-by-byte chain vs bijou64 single load</span>
+    </p>
+
+    <svg class="layer before" viewBox="0 0 720 405" role="img" aria-label="LEB128 byte-by-byte decode chain for value 1738">
+      <defs>
+        <marker id="vg-w-ba-bijou64-decode-arrow" viewBox="0 0 10 10" refX="9" refY="5"
+                markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--muted)"/>
+        </marker>
+      </defs>
+      <rect width="720" height="405" fill="var(--bg)"/>
+      <text x="20" y="28" class="head">LEB128 · per-byte chain (branchy)</text>
+      <text x="20" y="46" class="sub">input bytes: 0xCA 0x0D   →   decode value = 1738</text>
+
+      <rect class="box-leb" x="20" y="68" width="320" height="44" rx="2"/>
+      <text x="36" y="88" class="step">load byte b0 = 0xCA</text>
+      <text x="36" y="104" class="num">acc = 0x4A;  shift = 7</text>
+
+      <rect class="box-leb-branch" x="20" y="124" width="320" height="44" rx="2"/>
+      <text x="36" y="144" class="step">if (b0 &amp; 0x80) → continue  ← branch #1</text>
+      <text x="36" y="160" class="num">predictor sees data-dependent jump</text>
+
+      <line class="arrow" x1="180" y1="170" x2="180" y2="190"/>
+
+      <rect class="box-leb" x="20" y="192" width="320" height="44" rx="2"/>
+      <text x="36" y="212" class="step">load byte b1 = 0x0D</text>
+      <text x="36" y="228" class="num">acc |= 0x0D &lt;&lt; 7 = 1738</text>
+
+      <rect class="box-leb-branch" x="20" y="248" width="320" height="44" rx="2"/>
+      <text x="36" y="268" class="step">if (b1 &amp; 0x80) → continue  ← branch #2</text>
+      <text x="36" y="284" class="num">terminates: MSB clear</text>
+
+      <line class="arrow" x1="180" y1="294" x2="180" y2="314"/>
+
+      <rect class="box-leb" x="20" y="316" width="320" height="44" rx="2"/>
+      <text x="36" y="336" class="step">return (1738, len=2)</text>
+      <text x="36" y="352" class="num">~7.3 ns/value on Zen 5 · 41 cycle</text>
+
+      <text x="20" y="385" class="sub" fill="var(--accent-text)">cost: N byte → N branches · chain dependency across loads</text>
+    </svg>
+
+    <svg class="layer after" viewBox="0 0 720 405" id="vg-w-ba-bijou64-decode-after" role="img" aria-label="bijou64 single-load branchless decode for value 1738">
+      <rect width="720" height="405" fill="var(--bg)"/>
+      <text x="380" y="28" class="head">bijou64 · single load + bswap + add (branchless)</text>
+      <text x="380" y="46" class="sub">input bytes: 0xF9 0x04 0xD2   →   decode value = 1738</text>
+
+      <rect class="box-bij" x="380" y="68" width="320" height="44" rx="2"/>
+      <text x="396" y="88" class="step">b0 = buf[0] = 0xF9</text>
+      <text x="396" y="104" class="num">len = LEN_TABLE[0xF9] = 3  (1 lookup)</text>
+
+      <line class="arrow" x1="540" y1="114" x2="540" y2="134"/>
+
+      <rect class="box-bij" x="380" y="136" width="320" height="44" rx="2"/>
+      <text x="396" y="156" class="step">payload = u64::from_be_bytes(buf[1..])</text>
+      <text x="396" y="172" class="num">single unaligned 64-bit load + bswap</text>
+
+      <line class="arrow" x1="540" y1="182" x2="540" y2="202"/>
+
+      <rect class="box-bij" x="380" y="204" width="320" height="44" rx="2"/>
+      <text x="396" y="224" class="step">value = payload + OFFSETS[len-1]</text>
+      <text x="396" y="240" class="num">0x04D2 + 0x01F8 = 1738   · 1 add</text>
+
+      <line class="arrow" x1="540" y1="250" x2="540" y2="270"/>
+
+      <rect class="box-bij" x="380" y="272" width="320" height="44" rx="2"/>
+      <text x="396" y="292" class="step">return (1738, len=3)</text>
+      <text x="396" y="308" class="num">~0.75 ns/value · 4 cycle · zero data-dep branch</text>
+
+      <text x="380" y="385" class="sub" fill="var(--sage-deep)">cost: 1 lookup + load + bswap + add · SIMD-able</text>
+    </svg>
+
+    <div class="divider" id="vg-w-ba-bijou64-decode-divider"></div>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-ba-bijou64-decode');
+        const after = root.querySelector('#vg-w-ba-bijou64-decode-after');
+        const divider = root.querySelector('#vg-w-ba-bijou64-decode-divider');
+        let dragging = false;
+        function setPct(pct) {
+          const clamped = Math.max(0, Math.min(100, pct));
+          after.style.clipPath = 'polygon(' + clamped + '% 0, 100% 0, 100% 100%, ' + clamped + '% 100%)';
+          divider.style.left = clamped + '%';
+        }
+        divider.addEventListener('pointerdown', (e) => {
+          dragging = true;
+          divider.setPointerCapture(e.pointerId);
+        });
+        root.addEventListener('pointermove', (e) => {
+          if (!dragging) return;
+          const rect = root.getBoundingClientRect();
+          setPct(((e.clientX - rect.left) / rect.width) * 100);
+        });
+        root.addEventListener('pointerup', () => { dragging = false; });
+        root.addEventListener('pointercancel', () => { dragging = false; });
+      })();
+    </script>
+
+    <figcaption>同一個 value 1738 在兩個 decoder 上的 instruction sequence——左邊 LEB128 走 byte-by-byte chain，每 byte 一次 MSB branch + 一次 OR-shift；右邊 bijou64 是 table lookup → unaligned 64-bit load → bswap → add。branch 數差距是 N vs 0、cycle 差距 41 vs 4——這是 9× decode 速度差的微結構成因。</figcaption>
+  </figure>
+
+  <p>encode 的部分稍微複雜：bijou64 encode 需要先決定 value 落在哪個 tier（一個 leading-zero-count 或 lookup）、再做 offset 減、再 big-endian write。LEB128 encode 是「while value &gt;= 128: write low 7 bit + 0x80, shift」——非常簡單但是 byte-by-byte，多 byte 時 branch 多。</p>
+
+  <p>在「小值段」（值幾乎都 &lt; 65,535），LEB128 平均要寫 2 byte、bijou64 也要 2 byte 但多一個 leading-zero detect，所以 LEB128 略勝 1.24×。對應 Ink &amp; Switch 公布的「encode 上 LEB128 在 248..65,535 段贏 ~1.24×」這個數字。</p>
+
+  <p>這個 trade 在 encode 上比 decode 上更平均——大多數 systems 場景 decode rate 遠高於 encode rate（一次寫多次讀），所以 encode 上的小輸不太重要。</p>
+
+  <p>另一個值得提的測量結果是 wire size——bijou64 跟 LEB128 在「真實 mix」（混合大小不均勻分佈）的 workload 上 byte 總量在 2–3% 之內。也就是說，bijou64 為了字典序保序付的 byte tax 不像直覺以為那麼重——小值段付 1 byte，大值段反而拿回來，平均下來大致打平。對網路傳輸量算錢的場景（gRPC、Kafka）不會因為換成 bijou64 而頻寬爆炸。對 storage 量算錢的場景（columnar storage）同樣 2–3% 差距通常被 compression 吃掉。</p>
+
+  <h2>LSM-tree key、columnar row id、CRDT log seq：三個場景的具體後果</h2>
+
+  <p>把 bijou64 的三條性質映射到三個常見的 systems 場景，可以看出它具體在誰的痛點上幫到忙。每個場景對應一條主要約束，三條剛好都能對上。</p>
+
+  <p><strong>LSM-tree key</strong>——主約束是字典序保序。</p>
+
+  <p>RocksDB、Pebble、LMDB 的 key 是 byte string，內部排序是 lexicographic，bloom filter、iterator、prefix seek 全部假設 byte ordering = 語意 ordering。如果想用 64-bit integer 當 key（user id、timestamp、sequence number），現行做法是 big-endian raw u64（8 byte 固定）——浪費 byte 但保序。</p>
+
+  <p>bijou64 是「保序 + 變長」，small u64 可以用 1 byte（247 個 user 直接是 byte 值）、中等用 3 byte，整個 SSTable 可以省下可觀比例的 byte。對 OLTP RocksDB（每筆 key 1–4 byte 是大宗）這是直接的 disk space 收益。</p>
+
+  <p><strong>Columnar row id</strong>——主約束是 length prefix + branchless decode。</p>
+
+  <p>Apache Arrow、Parquet 的 row id 是 monotonic u64，columnar reader 在做 predicate pushdown / projection 時需要「skip N rows」的能力，而 skip 需要快速知道第 N row 在哪個 byte。固定長度 u64 是現行方案（8 byte × N rows = O(1) offset）；用 LEB128 的話 skip 變成 O(N) byte scan。</p>
+
+  <p>bijou64 的「length 從首 byte O(1) lookup」讓 skip 變成 O(N) tag-byte scan——還是 O(N) 但每 step 只是 256-entry table lookup 加 add，比 LEB128 的 chain scan 快數倍。對 query engine 在做 column skipping 是直接降低 CPU 成本。</p>
+
+  <p><strong>CRDT log seq number</strong>——主約束是 branchless decode + canonical encoding。Subduction（bijou64 的母項目）跟其他 CRDT 框架在 sync 時，要在 device 之間 ship 大量「(actor_id, seq) → operation」的 log entry，seq number 是 monotonic u64、actor_id 也是。每個 sync session 可能 decode 百萬筆，hot path 直接卡在 varint decode 上。Canonical encoding 對 CRDT 另有重要性：若做 hash chaining 或 Merkle tree，編碼必須唯一——bijou64 沒有 overlong representation，每個 u64 一對一個 byte string，「canonical decoding is decoding」省掉了 LEB128 必須額外做 overlong-rejection 的 path。</p>
+
+  <p>展開講一下 canonical 為什麼對 CRDT 攸關。</p>
+
+  <p>CRDT 在 cross-device sync 時常見的設計是「每個 operation 算個 hash、把 hash 串成 Merkle tree、兩台機器用 tree root 比對是否 in sync」。這個流程的前提是「同一個 operation 在不同 device 算出的 hash 必須相同」——而 hash 的 input 是 byte string，byte string 來自 varint 編碼後的 wire bytes。</p>
+
+  <p>如果同一個 (actor, seq) 在某個 device 用了一個 overlong encoding，另一個 device 用了 canonical encoding，hash 就不同、Merkle tree 就誤判 out-of-sync。LEB128 為了防這件事必須在 decode 時 reject overlong（不是只 accept canonical encoding）並在 encode 時保證寫出 canonical，工程上多兩道邊界檢查。</p>
+
+  <p>bijou64 直接由 value range 排除了 overlong 的可能性，這道工程成本不再存在。對 byzantine-tolerant 系統還有更深的意義：惡意 peer 沒辦法用「同一個值的兩個不同編碼」來製造 hash 碰撞或 replay attack。</p>
+
+  <p>把這三個場景的選型決定整理成一個簡單規則：「下游有沒有 memcmp」「skip 是不是 O(1) 需求」「decode 是不是 hot loop」三條中有一條 yes，bijou64 就應該被列入評估；兩條以上 yes，bijou64 應為首選。三條全是 yes 的場景（CRDT），bijou64 幾乎沒有對手。</p>
+
+  <p>對 greenfield 設計，這個規則直接套用；對 brownfield，要再加一條「format 是否還能 bump version」——版本不能動的（SQLite、Protobuf wire format）就停留在 LEB128 / SQLite varint，版本可以動的（自家 LSM-tree、自家 columnar store、自家 CRDT log）才有改造空間。</p>
+
+  <p>對選型者來說，三個問題其實要先回答：byte string 會被 memcmp 嗎？skip 路徑要 O(1) length 嗎？decode 是 hot loop 嗎？三個答案有任何一個是 yes，bijou64 就是該嚴肅考慮的選項。三個全是 yes（CRDT 場景），它幾乎沒有競爭對手。Ink &amp; Switch 還預告了 <code>bijou32</code> 跟 <code>bijou128</code>——同樣的構造可以遷移到 32-bit 與 128-bit 域，spec 用 CC BY-SA 4.0、code 用 dual MIT/Apache-2.0 授權，crates.io 上的 crate 名就是 <code>bijou64</code>。</p>
+
+  <p>把這三個場景對應到 bijou64 的三條構造性質，可以看出「哪條性質扛起了該場景的選型重量」——點下面的卡片切換場景，右邊 detail panel 展開該場景的工程後果與既有方案的成本。</p>
+
+  <figure class="vg-w-stack-bijou64-usecases">
+    <style>
+      .vg-w-stack-bijou64-usecases { display: flex; flex-direction: column; gap: var(--s-3); align-items: stretch; }
+      .vg-w-stack-bijou64-usecases input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+
+      .vg-w-stack-bijou64-usecases .stack-title {
+        font-family: IM Fell English, serif; font-style: italic;
+        font-size: var(--fs-md); margin: 0 0 var(--s-1) 0;
+        color: var(--ink); line-height: 1.4;
+      }
+      .vg-w-stack-bijou64-usecases .stack-cards {
+        display: flex; flex-direction: column; gap: var(--s-1);
+        list-style: none; padding: 0; margin: 0;
+      }
+      .vg-w-stack-bijou64-usecases .stack-cards label {
+        display: block; padding: var(--s-2);
+        border: 1px solid var(--muted-2); border-radius: 2px;
+        cursor: pointer; transition: border-color 200ms, background 200ms;
+        min-height: 44px;
+      }
+      .vg-w-stack-bijou64-usecases .stack-cards label:hover { border-color: var(--accent); }
+      .vg-w-stack-bijou64-usecases .stack-cards .card-head {
+        font-family: EB Garamond, serif; font-size: var(--fs-md);
+        margin: 0 0 4px 0; color: var(--ink);
+        display: flex; align-items: baseline; justify-content: space-between;
+        gap: var(--s-2); flex-wrap: wrap;
+      }
+      .vg-w-stack-bijou64-usecases .stack-cards .card-sub {
+        font-family: IM Fell English, serif; font-style: italic;
+        font-size: var(--fs-sm); color: var(--muted);
+        margin: 0; line-height: 1.5;
+      }
+      .vg-w-stack-bijou64-usecases .stack-cards .card-tag {
+        font-family: JetBrains Mono, monospace; font-size: var(--fs-xs);
+        color: var(--accent-text); font-style: normal;
+      }
+      .vg-w-stack-bijou64-usecases:has(#vg-w-stack-bijou64-usecases-r1:checked) .card-1 {
+        border-color: var(--accent);
+        background: color-mix(in srgb, var(--accent) 8%, transparent);
+      }
+      .vg-w-stack-bijou64-usecases:has(#vg-w-stack-bijou64-usecases-r2:checked) .card-2 {
+        border-color: var(--accent);
+        background: color-mix(in srgb, var(--accent) 8%, transparent);
+      }
+      .vg-w-stack-bijou64-usecases:has(#vg-w-stack-bijou64-usecases-r3:checked) .card-3 {
+        border-color: var(--accent);
+        background: color-mix(in srgb, var(--accent) 8%, transparent);
+      }
+
+      .vg-w-stack-bijou64-usecases svg.diagram { display: none; }
+      @media (min-width: 720px) {
+        .vg-w-stack-bijou64-usecases svg.diagram { display: block; width: 100%; height: auto; max-width: 880px; }
+        .vg-w-stack-bijou64-usecases .stack-title { display: none; }
+        .vg-w-stack-bijou64-usecases .stack-cards { display: none; }
+      }
+
+      .vg-w-stack-bijou64-usecases .layer { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; transition: fill 200ms, stroke 200ms; }
+      .vg-w-stack-bijou64-usecases .layer:hover { stroke: var(--accent); }
+      .vg-w-stack-bijou64-usecases:has(#vg-w-stack-bijou64-usecases-r1:checked) .layer-1 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+      .vg-w-stack-bijou64-usecases:has(#vg-w-stack-bijou64-usecases-r2:checked) .layer-2 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+      .vg-w-stack-bijou64-usecases:has(#vg-w-stack-bijou64-usecases-r3:checked) .layer-3 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+      .vg-w-stack-bijou64-usecases .layer-text { pointer-events: none; font-family: EB Garamond, serif; font-size: 14px; fill: var(--ink); }
+      .vg-w-stack-bijou64-usecases .layer-sub { pointer-events: none; font-family: JetBrains Mono, monospace; font-size: 12px; fill: var(--muted); }
+      .vg-w-stack-bijou64-usecases .layer-tag { pointer-events: none; font-family: JetBrains Mono, monospace; font-size: 12px; fill: var(--accent-text); }
+      .vg-w-stack-bijou64-usecases .head { font-family: IM Fell English, serif; font-style: italic; font-size: 14px; fill: var(--ink); }
+
+      .vg-w-stack-bijou64-usecases .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+      .vg-w-stack-bijou64-usecases .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-stack-bijou64-usecases .detail p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-stack-bijou64-usecases .detail code { font-size: 0.9em; }
+      .vg-w-stack-bijou64-usecases:has(#vg-w-stack-bijou64-usecases-r1:checked) .detail-1 { display: block; }
+      .vg-w-stack-bijou64-usecases:has(#vg-w-stack-bijou64-usecases-r2:checked) .detail-2 { display: block; }
+      .vg-w-stack-bijou64-usecases:has(#vg-w-stack-bijou64-usecases-r3:checked) .detail-3 { display: block; }
+      .vg-w-stack-bijou64-usecases .hint { font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin: 0 0 var(--s-1) 0; }
+    </style>
+
+    <input type="radio" id="vg-w-stack-bijou64-usecases-r1" name="vg-w-stack-bijou64-usecases-sel" checked aria-label="LSM-tree key 場景" />
+    <input type="radio" id="vg-w-stack-bijou64-usecases-r2" name="vg-w-stack-bijou64-usecases-sel" aria-label="Columnar row id 場景" />
+    <input type="radio" id="vg-w-stack-bijou64-usecases-r3" name="vg-w-stack-bijou64-usecases-sel" aria-label="CRDT log seq 場景" />
+
+    <p class="stack-title" id="vg-w-stack-bijou64-usecases-title">三條約束 ↔ 三個場景——選哪個 varint 不再是惰性問題</p>
+    <ul class="stack-cards" aria-labelledby="vg-w-stack-bijou64-usecases-title">
+      <li class="card-1"><label for="vg-w-stack-bijou64-usecases-r1">
+        <p class="card-head"><span>LSM-tree key（RocksDB / Pebble / LMDB）</span><code class="card-tag">字典序保序</code></p>
+        <p class="card-sub">SSTable index seek 是 byte-level；bloom filter、prefix iterator 都假設 byte ordering = 語意 ordering——bijou64 是 raw big-endian u64 的「保序變長」升級。</p>
+      </label></li>
+      <li class="card-2"><label for="vg-w-stack-bijou64-usecases-r2">
+        <p class="card-head"><span>Columnar row id（Arrow / Parquet）</span><code class="card-tag">length prefix</code></p>
+        <p class="card-sub">predicate pushdown 要做 skip N rows——固定 8 byte 是 O(1)、LEB128 是 O(N) chain scan，bijou64 用首 byte length lookup 把 skip 變成 O(N) 但每 step 只一次 table load。</p>
+      </label></li>
+      <li class="card-3"><label for="vg-w-stack-bijou64-usecases-r3">
+        <p class="card-head"><span>CRDT log seq（Subduction / Automerge）</span><code class="card-tag">branchless + canonical</code></p>
+        <p class="card-sub">sync session decode 百萬筆 (actor, seq, op)——hot path 卡在 varint decode；Merkle chain 要求 canonical 編碼，bijou64 由 value range 排除 overlong。</p>
+      </label></li>
+    </ul>
+
+    <svg class="diagram" viewBox="0 0 880 360" role="img" aria-label="bijou64 三條構造性質對應三個 systems 場景的選型映射圖">
+      <text x="40" y="24" class="head">三條約束 ↔ 三個場景——選哪個 varint 不再是惰性問題</text>
+
+      <rect class="layer layer-1" x="40" y="56" width="800" height="76" rx="2" role="button" tabindex="0" data-target="vg-w-stack-bijou64-usecases-r1"/>
+      <text x="60" y="84" class="layer-text">LSM-tree key · RocksDB / Pebble / LMDB</text>
+      <text x="60" y="108" class="layer-sub">SSTable index seek、bloom filter、prefix iterator 全部假設 byte ordering = 語意 ordering</text>
+      <text x="720" y="100" class="layer-tag" text-anchor="end">字典序保序</text>
+
+      <line x1="440" y1="138" x2="440" y2="152" stroke="var(--muted)" stroke-width="1.2"/>
+      <polygon points="436,148 444,148 440,156" fill="var(--muted)"/>
+
+      <rect class="layer layer-2" x="40" y="160" width="800" height="76" rx="2" role="button" tabindex="0" data-target="vg-w-stack-bijou64-usecases-r2"/>
+      <text x="60" y="188" class="layer-text">Columnar row id · Arrow / Parquet</text>
+      <text x="60" y="212" class="layer-sub">predicate pushdown 要 skip N rows；固定 u64 是 O(1)、LEB128 是 chain scan、bijou64 每 step 一次 table</text>
+      <text x="720" y="204" class="layer-tag" text-anchor="end">length prefix</text>
+
+      <line x1="440" y1="242" x2="440" y2="256" stroke="var(--muted)" stroke-width="1.2"/>
+      <polygon points="436,252 444,252 440,260" fill="var(--muted)"/>
+
+      <rect class="layer layer-3" x="40" y="264" width="800" height="76" rx="2" role="button" tabindex="0" data-target="vg-w-stack-bijou64-usecases-r3"/>
+      <text x="60" y="292" class="layer-text">CRDT log seq · Subduction / Automerge</text>
+      <text x="60" y="316" class="layer-sub">sync 解碼百萬筆 (actor, seq, op)；Merkle chain 要求 canonical 編碼一一對應</text>
+      <text x="720" y="308" class="layer-tag" text-anchor="end">branchless + canonical</text>
+    </svg>
+
+    <div>
+      <p class="hint">click any scenario above</p>
+      <div class="detail detail-1">
+        <h3>LSM-tree key · 字典序保序為主</h3>
+        <p>RocksDB / Pebble / LMDB 的 SSTable 是 byte-string-sorted，所有 index seek、bloom filter probe、prefix iterator 都假設「byte 順序 = 語意順序」。要把 u64（user_id、timestamp、sequence）做 key，現行解法是寫 8 byte big-endian raw——保序但永遠 8 byte。</p>
+        <p><strong>bijou64 的角色</strong>：「保序 + 變長」——小 u64 用 1 byte、中位用 3 byte，整個 SSTable disk footprint 直接縮水。對 OLTP RocksDB（key 1–4 byte 大宗）是 drop-in 升級。一個次要好處：bijou64 的 tag-byte tier 結構天然跟 prefix iterator 的 prefix bucket 對齊，bloom filter false positive rate 可測量地下降。</p>
+      </div>
+      <div class="detail detail-2">
+        <h3>Columnar row id · length prefix 為主</h3>
+        <p>Apache Arrow / Parquet 的 row id 是 monotonic u64；columnar reader 在 predicate pushdown / projection 時要「skip N rows」——固定 8 byte 是 O(1) offset，LEB128 是 O(N) byte chain scan（每 byte 都要看 continuation bit）。</p>
+        <p><strong>bijou64 的角色</strong>：首 byte 直接給 length，skip 變成 O(N) tag-byte scan——還是 O(N) 但每 step 只一個 256-entry table lookup + add，比 LEB128 的 chain 快數倍。對 query engine 的 column skipping 直接降低 CPU 成本，又不放棄壓縮。</p>
+      </div>
+      <div class="detail detail-3">
+        <h3>CRDT log seq · branchless decode + canonical 兩條都要</h3>
+        <p>Subduction（bijou64 的母項目）在 cross-device sync 時 ship 大量 <code>(actor_id, seq) → operation</code> log——每個 sync session decode 百萬筆，hot path 直接卡在 varint decode 上。bijou64 的 single-load + bswap + add 路徑讓 decode rate ≈ 1.3 G value/s。</p>
+        <p>更深的一條：CRDT 常做 Merkle chain 比對 root 是否 in sync。同一個 operation 在不同 device 必須算出相同 hash——這要求 byte string 編碼 canonical。bijou64 由 value range 構造性排除 overlong encoding，LEB128 必須額外寫 overlong-rejection path。對 byzantine-tolerant 系統還能擋掉「兩個合法編碼製造 hash 碰撞」的攻擊面。</p>
+      </div>
+    </div>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-stack-bijou64-usecases');
+        root.querySelectorAll('.layer').forEach((rect) => {
+          rect.addEventListener('click', () => {
+            const targetId = rect.getAttribute('data-target');
+            const radio = root.querySelector('#' + targetId);
+            if (radio) radio.checked = true;
+          });
+          rect.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              rect.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            }
+          });
+        });
+      })();
+    </script>
+
+    <figcaption>三條 bijou64 構造性質 ↔ 三個 systems 場景的選型映射。LSM-tree 主要吃「字典序保序」、columnar 吃「length prefix」、CRDT 兩條 decode 性質都吃。三個答案有任何一個是 yes，bijou64 就值得評估；三個全 yes（CRDT），它幾乎沒有對手。</figcaption>
+  </figure>
+
+  <h2>限制與設計成本：為什麼這條路不是 free lunch</h2>
+
+  <p>把所有好處列完之後也要把代價說清楚。</p>
+
+  <p>第一個代價在前面 slider 已經看過：小整數段（248..16k 左右）bijou64 每 value 比 LEB128 多 1 byte——這段恰好覆蓋很多實際 workload 的中位數區間。Protobuf 把 wire 格式定死成 LEB128 的歷史原因之一就是大量 field tag、enum value、小 int field 落在這段；改成 bijou64 那一段的 message 會膨脹 ~1 byte/field——對單訊息不痛，對 Kafka 大流量乘起來就有感。</p>
+
+  <p>所以 bijou64 不是要取代 LEB128 在 application protocol field encoding 的位置——它是要在 LSM-tree key、columnar row id、CRDT log 這些「decode 是 hot loop、字典序有意義、length prefix 重要」的地方贏 LEB128。</p>
+
+  <p>第二個代價是構造複雜度。LEB128 的編碼器跟解碼器加起來不到 30 行 C，每個 system programmer 都寫過。bijou64 的編碼器需要「找出值落在哪個 tier、減去 offset、寫 tag 加 N byte big-endian」——decoder 要「讀首 byte、分支或 table lookup 出 length、讀 N byte big-endian、加 offset」。</p>
+
+  <p>複雜度雖然不大但確實高於 LEB128，特別是要在 SIMD path 上做加速時，offset table 跟 tag byte 的 conditional 要小心。Rust reference impl 是健康的範例（一個 inline 函式涵蓋熱路徑），但 C 實作要重複 maintainer 的 due diligence——尤其是 9-byte tier 的 bounds check 那段，漏寫就有 overflow 風險。</p>
+
+  <p>第三個是 ecosystem inertia。LEB128 已經寫進 Protobuf、DWARF、WASM binary format、SQLite、Cap'n Proto（部分場景）——任何想換 bijou64 的 system 都要付遷移成本。Subduction 是新項目所以能直接用 bijou64；改造 RocksDB 要動 SSTable format、bump version、處理 backward compatibility。對 greenfield project 是 free choice，對 brownfield 是 migration project。Ink &amp; Switch 把 spec 用 CC BY-SA 4.0、reference impl 用 dual MIT/Apache-2.0 釋出，正是為了讓 ecosystem 至少能評估、引用、實作——能不能真的進到 RocksDB 或其他主流項目，那是另一回事。</p>
+
+  <p>第四個值得提的是 micro-architecture 假設。</p>
+
+  <p>bijou64 的「single unaligned 64-bit load + bswap」依賴 x86、ARMv8 這類「unaligned load 不會 fault 且不慢」的 ISA。</p>
+
+  <p>在更受限的環境（embedded MCU、historical SPARC、某些 RISC-V profile）上 unaligned load 會觸發 fault 或慢一個量級——decoder 必須退化成 byte-by-byte loop，這時 bijou64 對 LEB128 的優勢縮小、可能甚至消失。</p>
+
+  <p>對 datacenter / server / desktop 場景沒影響，但對 embedded firmware 場景要驗算。對 SIMD 加速路徑，bijou64 可以用 AVX2 / AVX-512 一次 load 多筆 record——而 LEB128 因為 chain dependency 沒辦法在 record 內 SIMD，只能 record 之間 batch。這個 architectural 上的不對稱才是 bijou64 在 throughput 上能領先一個數量級的真正原因。</p>
+
+  <p>最後是一個 meta 觀察——這個 spec 的真正貢獻不在 bijou64 本身，而在於它把「varint 三條約束」這個 design space 講清楚。</p>
+
+  <p>任何未來的 varint 提案都會被放在這個三軸上量度：字典序保序、length prefix、branchless decode。三軸都拿到 → bijou64；只取後兩 → LEB128（或 Protobuf）；都不取 → SQLite varint。</p>
+
+  <p>把 design space 講清楚比提出新方案更重要——下次某個系統的設計者面對「哪個 varint」時，至少有三個明確問題可以對自己問，而不是預設沿用 LEB128。Ink &amp; Switch 在 industrial research 的角色就是這樣：不一定要當贏家，但要把選項說清楚到讓贏家容易被辨識。</p>
+
+  <p class="vg-deep-closer"><strong>What this enables</strong>：把 varint 從「最省 byte」的思路抽出來、改用「byte string 直接能 memcmp、首 byte 是 length prefix、decode branchless」這三條約束驅動設計，bijou64 讓 64-bit integer 在 LSM-tree key、columnar row id、CRDT log seq 等場景裡可以同時是「序的承載物」與「壓縮的承載物」——而不必再用兩份編碼或固定 8 byte 來換取保序性。</p>
+</div>

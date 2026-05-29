@@ -1,0 +1,630 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">把兩段文字並排再上點顏色，聽起來像三天可以做完的 UI 任務——直到你打開 100k 行 patch，發現 scrolling 卡到一秒一幀、CJK 字串在 wrap 的位置跨欄錯位、ranker 還沒算完使用者已經切到下一支 PR。Pierre 那篇 on-rendering-diffs 把這四個看似不相關的問題串成同一條 thread：hunk 切分、token-level 對齊、virtual scroll、word-wrap 對齊。</p>
+  <h1 class="vg-post-title">為什麼 diff rendering 比想像難——hunk、align、virtual scroll、wrap 四件事</h1>
+</header>
+
+<div class="vg-post-prose">
+<p><span class="vg-dropcap">P</span>ierre 的這篇文，明面上是「我們做 code review UI 的過程中遇到的事」，骨子裡是一篇關於「為什麼 diff rendering 跟你想的不一樣」的 cross-cutting integration。GitHub、Linear、Phabricator、Gerrit 的 review 介面，從外面看都是「左邊舊版、右邊新版、紅綠標色、可選 unified 或 split」，這個 surface 描述讓人以為這是一個 90 年代就解掉的問題。實際上，這四家工具在每個子問題上的選法都不一樣，每個選法都是某個維度上的 trade-off，而把這些 trade-off 全部搞對的，至今沒有任何一家。</p>
+
+<p>Pierre 那篇文章本身的重點，其實壓在第三件事——virtual scroll——上：他們用了一個被稱作 inverse sticky 的 trick，把 render region 的下緣黏到 viewport 底部，再用 `(contentHeight - viewportHeight) * -1` 這種負偏移把可視窗口推到 patch 內部任何位置。但要解釋為什麼這件事重要，得先把另外三件事擺出來。否則只看 virtualization 部份，會誤以為這是純 perf 議題，跟「diff 怎麼 render」沒什麼關係。實際上，hunk 切分、token alignment、wrap behaviour 三者全部會直接影響 virtual scroll 必須 maintain 的不變量——你 estimate height 用什麼公式，正是這四件事的乘積。</p>
+
+<p>下面那張可點擊的 architecture diagram 是這篇文章的單一入口：點任一個子問題的方框，看它的責任、它倚賴的上下游 invariant、以及它刻意「不知道」什麼。後面五個 H2 各自展開：先講 hunk 怎麼從 raw patch 算出來，然後 token-level alignment 為什麼不能單靠 character diff、virtual scroll 的三種主流做法跟 inverse sticky 的位置、word-wrap 在 CJK 場景的對齊難題，最後把四個 review 工具的選法擺成一張對照表。</p>
+
+<h2>四個子問題的責任邊界</h2>
+
+<figure class="vg-w-annotated-diff-arch" data-svg-scroll="720">
+  <style>
+    .vg-w-annotated-diff-arch { display: grid; grid-template-columns: 1fr; gap: var(--s-3); align-items: start; margin: var(--s-4) 0; }
+    .vg-w-annotated-diff-arch svg { width: 100%; height: auto; }
+    .vg-w-annotated-diff-arch input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+    .vg-w-annotated-diff-arch .component { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; transition: fill 200ms, stroke 200ms; }
+    .vg-w-annotated-diff-arch .component:hover { stroke: var(--accent); }
+    .vg-w-annotated-diff-arch .component-text { pointer-events: none; }
+    .vg-w-annotated-diff-arch .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+    .vg-w-annotated-diff-arch .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+    .vg-w-annotated-diff-arch .detail p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+    .vg-w-annotated-diff-arch .hint { font-family: var(--scribed); color: var(--muted); font-size: var(--fs-xs); margin-top: var(--s-1); }
+    .vg-w-annotated-diff-arch:has(#vg-w-annotated-diff-arch-r1:checked) .component-1 { fill: var(--accent); fill-opacity: 0.18; stroke: var(--accent); }
+    .vg-w-annotated-diff-arch:has(#vg-w-annotated-diff-arch-r2:checked) .component-2 { fill: var(--accent); fill-opacity: 0.18; stroke: var(--accent); }
+    .vg-w-annotated-diff-arch:has(#vg-w-annotated-diff-arch-r3:checked) .component-3 { fill: var(--accent); fill-opacity: 0.18; stroke: var(--accent); }
+    .vg-w-annotated-diff-arch:has(#vg-w-annotated-diff-arch-r4:checked) .component-4 { fill: var(--accent); fill-opacity: 0.18; stroke: var(--accent); }
+    .vg-w-annotated-diff-arch:has(#vg-w-annotated-diff-arch-r1:checked) .detail-1 { display: block; }
+    .vg-w-annotated-diff-arch:has(#vg-w-annotated-diff-arch-r2:checked) .detail-2 { display: block; }
+    .vg-w-annotated-diff-arch:has(#vg-w-annotated-diff-arch-r3:checked) .detail-3 { display: block; }
+    .vg-w-annotated-diff-arch:has(#vg-w-annotated-diff-arch-r4:checked) .detail-4 { display: block; }
+  </style>
+
+  <input type="radio" id="vg-w-annotated-diff-arch-r1" aria-label="select hunk splitter" name="vg-w-annotated-diff-arch-sel" checked />
+  <input type="radio" id="vg-w-annotated-diff-arch-r2" aria-label="select token alignment" name="vg-w-annotated-diff-arch-sel" />
+  <input type="radio" id="vg-w-annotated-diff-arch-r3" aria-label="select virtual scroll" name="vg-w-annotated-diff-arch-sel" />
+  <input type="radio" id="vg-w-annotated-diff-arch-r4" aria-label="select word wrap" name="vg-w-annotated-diff-arch-sel" />
+
+  <svg viewBox="0 0 720 360" role="img" aria-label="Four sub-problems of diff rendering">
+    <defs>
+      <marker id="vg-w-annotated-diff-arch-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+      </marker>
+    </defs>
+
+    <text x="360" y="22" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--muted)" font-style="italic">raw patch · 100k lines · 60 fps wall clock</text>
+
+    <rect class="component component-1" data-target="vg-w-annotated-diff-arch-r1" x="20" y="60" width="320" height="100" rx="4" role="button" tabindex="0" />
+    <text class="component-text" x="180" y="98" text-anchor="middle" font-family="EB Garamond, serif" font-size="16" fill="var(--ink)">hunk splitter</text>
+    <text class="component-text" x="180" y="120" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">Myers · patience · histogram</text>
+    <text class="component-text" x="180" y="140" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)" font-style="italic">decides what counts as one change</text>
+
+    <rect class="component component-2" data-target="vg-w-annotated-diff-arch-r2" x="380" y="60" width="320" height="100" rx="4" role="button" tabindex="0" />
+    <text class="component-text" x="540" y="98" text-anchor="middle" font-family="EB Garamond, serif" font-size="16" fill="var(--ink)">token alignment</text>
+    <text class="component-text" x="540" y="120" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">syntax-aware → word → char</text>
+    <text class="component-text" x="540" y="140" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)" font-style="italic">colour the changed range, not the whole line</text>
+
+    <rect class="component component-3" data-target="vg-w-annotated-diff-arch-r3" x="20" y="200" width="320" height="100" rx="4" role="button" tabindex="0" />
+    <text class="component-text" x="180" y="238" text-anchor="middle" font-family="EB Garamond, serif" font-size="16" fill="var(--ink)">virtual scroll</text>
+    <text class="component-text" x="180" y="260" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">native · sticky-rAF · inverse-sticky</text>
+    <text class="component-text" x="180" y="280" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)" font-style="italic">render only the visible band</text>
+
+    <rect class="component component-4" data-target="vg-w-annotated-diff-arch-r4" x="380" y="200" width="320" height="100" rx="4" role="button" tabindex="0" />
+    <text class="component-text" x="540" y="238" text-anchor="middle" font-family="EB Garamond, serif" font-size="16" fill="var(--ink)">word-wrap alignment</text>
+    <text class="component-text" x="540" y="260" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">CJK / monospace mixed metrics</text>
+    <text class="component-text" x="540" y="280" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)" font-style="italic">left + right wrap at the same logical column</text>
+
+    <line x1="340" y1="110" x2="380" y2="110" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-annotated-diff-arch-arrow)" />
+    <line x1="180" y1="160" x2="180" y2="200" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-annotated-diff-arch-arrow)" />
+    <line x1="540" y1="160" x2="540" y2="200" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-annotated-diff-arch-arrow)" />
+    <line x1="340" y1="250" x2="380" y2="250" stroke="currentColor" stroke-width="1.5" stroke-dasharray="3 3" marker-end="url(#vg-w-annotated-diff-arch-arrow)" />
+
+    <text x="360" y="345" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)" font-style="italic">DOM · ~hundreds of nodes · &lt;16 ms per scroll frame</text>
+  </svg>
+
+  <div>
+    <div class="detail detail-1">
+      <h3>hunk splitter · responsibility</h3>
+      <p>輸入 raw patch (unified diff format)，輸出 hunk array：每個 hunk 是一段「相鄰被改動的行」加上上下 context lines。底層 algorithm 通常是 Myers diff（O(ND), GNU diff 預設）或 patience diff（Bram Cohen 在 bzr 提的, 處理大量重複行更穩）。</p>
+      <p><strong>不知道</strong>：UI 要怎麼把這個 hunk 畫出來、行內哪些 token 變了、什麼字會 wrap。它只輸出結構化的 line-level delta。</p>
+      <p class="hint">用 patience diff 在重構（移動函式、改 import 順序）的 patch 上會明顯比 Myers 乾淨——less spurious matches in repeated braces。</p>
+    </div>
+    <div class="detail detail-2">
+      <h3>token alignment · responsibility</h3>
+      <p>對每個「modified」hunk 中 paired old/new line，找出真正改的 token range，行內用色塊精確標記。三層 fallback：先試 syntax-aware（已 parsed 的 AST node 對齊）、退到 word-level（whitespace + punctuation boundary）、最後到 character diff。</p>
+      <p><strong>不知道</strong>：hunk 是怎麼被切出來的、scroll 時是不是還在 viewport 裡。它只負責「這一對行的細節」。</p>
+      <p class="hint">直接用 character diff 看起來最忠實，實際上會把 rename 一個變數高亮成一堆零碎色塊——人眼讀不出來改了什麼。</p>
+    </div>
+    <div class="detail detail-3">
+      <h3>virtual scroll · responsibility</h3>
+      <p>給 100k 行 patch 維持 60 fps：只把可視窗口附近的 hunk 放進 DOM，其他用估算高度的 spacer 代替。Pierre 列三種主流做法：native scrollable region + estimated height、sticky 容器 + rAF、emulated scrolling + 自繪 scrollbar。他們挑的是第四種「inverse sticky」——把 render region 的下緣黏到 viewport 底部。</p>
+      <p><strong>不知道</strong>：每一行內到底改了哪些 token、行裡有沒有 CJK 字元。它只需要每個 hunk 的「估算高度」就能算出 spacer 大小。</p>
+      <p class="hint">估算式：(lineHeight × diff.splitLineCount) + (diff.hunks.length × hunkSeparatorHeight)。</p>
+    </div>
+    <div class="detail detail-4">
+      <h3>word-wrap alignment · responsibility</h3>
+      <p>split view 下，左右兩欄要在同一「邏輯列」wrap，才能保持「同一行就是同一行」的視覺對齊。monospace 拉丁字元時 trivially 成立；混入 CJK 之後 character width 不一致、glyph metrics 不對齊，瀏覽器原生 wrap 會在左右欄不同位置斷行。</p>
+      <p><strong>不知道</strong>：hunk 是哪一段 patch 的、token 級高亮在哪裡。它只看 visual layout。</p>
+      <p class="hint">如果不解決這個，CJK heavy 的 codebase（comments、文件、i18n string）在 split view 下會徹底亂掉——這是為什麼很多人改用 unified view。</p>
+    </div>
+  </div>
+
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-annotated-diff-arch');
+      root.querySelectorAll('.component').forEach((rect) => {
+        rect.addEventListener('click', () => {
+          const targetId = rect.getAttribute('data-target');
+          const radio = root.querySelector('#' + targetId);
+          if (radio) radio.checked = true;
+        });
+        rect.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            rect.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+          }
+        });
+      });
+    })();
+  </script>
+</figure>
+
+<p>四個子問題之間有 directed 的 dependency：hunk splitter 的輸出餵給 token alignment 跟 virtual scroll；token alignment 的輸出影響每行高度，又回頭被 virtual scroll 的 height-estimate 倚賴；word-wrap 是 visual layer 的最後一道，但它的 wrap 結果反過來決定某一個 hunk 在 viewport 裡實際占多高。誰倚賴誰、誰刻意不知道誰，是這四個 component 能否各自 reason 的關鍵。如果 virtual scroll 一定要等 token alignment 完成才能 estimate 高度，整個系統就會在大 patch 下 block 在 token 分析上——這跟 Reels 那邊「closeness 不能 online 推理」是同一類 forcing function。</p>
+
+<h2>hunk 切分：為什麼 Myers 不是唯一解</h2>
+
+<p>從 raw patch 算 hunk 看起來像 textbook 題目：跑一次 LCS（最長共同子序列），把不在 LCS 裡的行標成 add/delete，相鄰 add/delete 合在一起加上幾行 context 就是 hunk。Eugene W. Myers 在 1986 年的 An O(ND) Difference Algorithm 給了到目前為止仍是預設的選法——時間複雜度跟「兩段文本實際差異量 D」成正比，而不是跟兩段長度 N、M 的乘積成正比。GNU diff、git diff 預設都是 Myers。</p>
+
+<p>但 Myers 在 source code 上有一個出名的 failure mode：大量重複的短行（單一 `}`、`)`、空行、`return;`）會被 algorithm 視為「可對齊的 common subsequence」，導致「明明是把函式 A 整段刪掉、函式 B 整段加進來」這種重構，被切成「函式 A 中間穿插函式 B」的 noise hunk——因為兩段裡都有 `}` 跟空行，algorithm 為了 minimize edit distance 會把它們強行 align 在一起。</p>
+
+<p>Bram Cohen 在 bzr 提的 patience diff（後來成為 git 的 `--patience` option）給了 alternative：先只用「兩邊都唯一出現一次的行」當 anchor 對齊，再 recursive 處理 anchor 之間的 segment。「唯一」這個條件直接過濾掉所有 `}` 跟空行——這些到處重複的行不會被誤當成 anchor。結果是 refactor 大塊的 patch 切出來明顯更乾淨。代價是 worst case 更慢，且如果兩邊真的沒什麼唯一行（極端例子是兩個檔案都是相同 boilerplate），patience 退化得也比 Myers 難看。</p>
+
+<p>還有第三條選擇：histogram diff（JGit 的 default，git 在 2.43 之後也預設啟用），可以視為 patience 的 generalization——按每行出現頻率排序，從最 rare 的開始當 anchor 往下推。實務上 histogram 在大多數 patch 上都比 patience 略好，差距小到一般 reviewer 感覺不出來，但在「函式 inline 進另一個函式」這種重構上 histogram 通常給的 hunk 邊界更直觀。</p>
+
+<pre data-kind="pseudocode"><code><em>// Myers: minimize total edit distance, no anchor preference</em>
+diff_myers(A, B):
+  D = shortest_edit_script(A, B)         <em>// O((N+M) × D)</em>
+  return hunks_from_edit_script(D)
+
+<em>// Patience: anchor on unique lines, recurse between anchors</em>
+diff_patience(A, B):
+  anchors = lines_unique_in_both(A, B)   <em>// only lines that appear exactly once on each side</em>
+  ordered = longest_increasing_subseq(anchors)
+  for each gap between consecutive anchors:
+    diff_patience(A[gap], B[gap])        <em>// recurse, eventually falls back to Myers in small gap</em>
+
+<em>// Histogram: same idea, anchor by frequency rank not just uniqueness</em>
+diff_histogram(A, B):
+  buckets = group_lines_by_frequency(A ∪ B)
+  for bucket in increasing_frequency:
+    pick_anchors_from(bucket)            <em>// rarest lines first, deeper recursion shallower</em>
+    if found enough → recurse on gaps
+</code></pre>
+
+<p>選哪個 algorithm 不是 perf 議題（三者在實務 patch 大小下差距 sub-second），是 readability 議題——同一個 patch 跑 Myers 跟跑 patience 切出來的 hunk 邊界可能差很多，reviewer 對「改了什麼」的理解也跟著差。Phabricator 跟 Gerrit 預設用 Myers；GitHub 在 2018 年之後對 large refactor 預設改用 histogram；Linear 沒公開但從 review output 看起來是 patience。這個選擇直接影響到下游 token alignment 拿到的 hunk 形狀——hunk 邊界錯了，token-level 高亮再準也救不回來。</p>
+
+<p>還有一個 hunk 切分的細節跟 UI 很相關：context line 的數量。git 預設給三行 context，但 review UI 上經常要把整個 hunk「擴展」上下文——使用者點 `[N more lines above]` 按鈕，patch viewer 要能向 file 兩端延伸抓 raw lines。這要求 patch 不能只是「diff 結果」這一個 data structure，背後得保留兩個 full file 的 reference（或至少是「足夠的 surrounding context」），否則使用者點 expand 之後系統只能再去 server 抓一次 file——這對 Pierre 的「local-first 不再對 server round-trip」的 design 直接打臉。GitHub 的做法是 lazy fetch additional context；Phabricator 是 patch viewer initial load 就把完整 file 拉下來；Gerrit 介於兩者之間。每種策略的 tradeoff 都不一樣：lazy fetch 省 initial bandwidth 但 expand 有 latency，eager load 反之。</p>
+
+<figure class="vg-w-ba-myers-patience" data-interactive="drag" data-svg-scroll="720">
+  <style>
+    .vg-w-ba-myers-patience { position: relative; aspect-ratio: 16 / 9; overflow: hidden; margin: var(--s-4) 0; border: 1px solid var(--line); background: var(--bg-soft); }
+    .vg-w-ba-myers-patience .layer { position: absolute; inset: 0; width: 100%; height: 100%; }
+    .vg-w-ba-myers-patience .after { clip-path: polygon(50% 0, 100% 0, 100% 100%, 50% 100%); }
+    .vg-w-ba-myers-patience .divider {
+      position: absolute; top: 0; bottom: 0; left: 50%;
+      width: 32px; transform: translateX(-50%);
+      cursor: ew-resize; touch-action: none; z-index: 2;
+    }
+    .vg-w-ba-myers-patience .divider::before {
+      content: ''; position: absolute; left: 50%; top: 0; bottom: 0;
+      width: 2px; transform: translateX(-50%);
+      background: var(--accent);
+    }
+    .vg-w-ba-myers-patience .divider::after {
+      content: '↔'; position: absolute; left: 50%; top: 50%;
+      transform: translate(-50%, -50%);
+      background: var(--accent); color: var(--bg);
+      width: 32px; height: 32px; border-radius: 50%;
+      display: grid; place-items: center;
+      font-family: var(--sans); font-size: 16px;
+    }
+    .vg-w-ba-myers-patience figcaption { font-family: var(--scribed); color: var(--muted); font-size: var(--fs-xs); margin-top: var(--s-1); position: absolute; bottom: 4px; left: 8px; right: 40px; pointer-events: none; }
+    @media (max-width: 720px) {
+      .vg-w-ba-myers-patience svg.layer text { font-size: 12px; }
+    }
+  </style>
+
+  <svg class="layer before" viewBox="0 0 720 405" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Myers diff output on the same refactor patch">
+    <rect width="720" height="405" fill="var(--bg-soft)" />
+    <text x="20" y="26" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--muted)" font-style="italic">Myers · minimize edit distance</text>
+    <text x="20" y="44" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">@@ -1,18 +1,18 @@</text>
+
+    <g font-family="JetBrains Mono, monospace" font-size="12">
+      <rect x="14" y="56" width="340" height="18" fill="#c0392b" fill-opacity="0.18"/>
+      <text x="20" y="69" fill="var(--ink)">- function fetchUser(id) {</text>
+      <rect x="14" y="76" width="340" height="18" fill="#c0392b" fill-opacity="0.18"/>
+      <text x="20" y="89" fill="var(--ink)">-   return db.users.find(id);</text>
+      <text x="20" y="109" fill="var(--ink)">  }</text>
+      <text x="20" y="129" fill="var(--ink)"></text>
+      <rect x="14" y="136" width="340" height="18" fill="#27ae60" fill-opacity="0.18"/>
+      <text x="20" y="149" fill="var(--ink)">+ function saveOrder(o) {</text>
+      <rect x="14" y="156" width="340" height="18" fill="#27ae60" fill-opacity="0.18"/>
+      <text x="20" y="169" fill="var(--ink)">+   return db.orders.put(o);</text>
+      <text x="20" y="189" fill="var(--ink)">  }</text>
+      <text x="20" y="209" fill="var(--ink)"></text>
+      <rect x="14" y="216" width="340" height="18" fill="#c0392b" fill-opacity="0.18"/>
+      <text x="20" y="229" fill="var(--ink)">- function fetchOrder(id) {</text>
+      <rect x="14" y="236" width="340" height="18" fill="#c0392b" fill-opacity="0.18"/>
+      <text x="20" y="249" fill="var(--ink)">-   return db.orders.find(id);</text>
+      <text x="20" y="269" fill="var(--ink)">  }</text>
+      <text x="20" y="289" fill="var(--ink)"></text>
+      <rect x="14" y="296" width="340" height="18" fill="#27ae60" fill-opacity="0.18"/>
+      <text x="20" y="309" fill="var(--ink)">+ function saveUser(u) {</text>
+      <rect x="14" y="316" width="340" height="18" fill="#27ae60" fill-opacity="0.18"/>
+      <text x="20" y="329" fill="var(--ink)">+   return db.users.put(u);</text>
+      <text x="20" y="349" fill="var(--ink)">  }</text>
+    </g>
+    <text x="360" y="395" text-anchor="end" font-family="EB Garamond, serif" font-size="12" fill="#c0392b" font-style="italic">4 interleaved hunks · `}` lines aligned as common subsequence</text>
+  </svg>
+
+  <svg class="layer after" viewBox="0 0 720 405" preserveAspectRatio="xMidYMid meet" id="vg-w-ba-myers-patience-after" role="img" aria-label="Patience diff output on the same refactor patch">
+    <rect width="720" height="405" fill="var(--bg-soft)" />
+    <text x="700" y="26" text-anchor="end" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--accent-text)" font-style="italic">Patience · unique-line anchors</text>
+    <text x="700" y="44" text-anchor="end" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">@@ -1,9 +1,9 @@</text>
+
+    <g font-family="JetBrains Mono, monospace" font-size="12">
+      <rect x="360" y="56" width="346" height="78" fill="#c0392b" fill-opacity="0.18"/>
+      <text x="368" y="69" fill="var(--ink)">- function fetchUser(id) {</text>
+      <text x="368" y="89" fill="var(--ink)">-   return db.users.find(id);</text>
+      <text x="368" y="109" fill="var(--ink)">- }</text>
+      <text x="368" y="129" fill="var(--ink)">-</text>
+      <rect x="360" y="136" width="346" height="78" fill="#c0392b" fill-opacity="0.18"/>
+      <text x="368" y="149" fill="var(--ink)">- function fetchOrder(id) {</text>
+      <text x="368" y="169" fill="var(--ink)">-   return db.orders.find(id);</text>
+      <text x="368" y="189" fill="var(--ink)">- }</text>
+      <text x="368" y="209" fill="var(--ink)"></text>
+      <rect x="360" y="216" width="346" height="78" fill="#27ae60" fill-opacity="0.18"/>
+      <text x="368" y="229" fill="var(--ink)">+ function saveOrder(o) {</text>
+      <text x="368" y="249" fill="var(--ink)">+   return db.orders.put(o);</text>
+      <text x="368" y="269" fill="var(--ink)">+ }</text>
+      <text x="368" y="289" fill="var(--ink)">+</text>
+      <rect x="360" y="296" width="346" height="78" fill="#27ae60" fill-opacity="0.18"/>
+      <text x="368" y="309" fill="var(--ink)">+ function saveUser(u) {</text>
+      <text x="368" y="329" fill="var(--ink)">+   return db.users.put(u);</text>
+      <text x="368" y="349" fill="var(--ink)">+ }</text>
+    </g>
+    <text x="700" y="395" text-anchor="end" font-family="EB Garamond, serif" font-size="12" fill="var(--accent-text)" font-style="italic">2 contiguous hunks · unique fn names anchor; `}` ignored</text>
+  </svg>
+
+  <div class="divider" id="vg-w-ba-myers-patience-divider" role="separator" aria-label="drag to reveal patience diff output"></div>
+  <figcaption>同一份 fetch→save 函式對換的 refactor patch：左半 Myers 把 `}` 跟空行強行對齊成「函式 A 中穿插函式 B」的 4 個 noise hunk，右半 patience 用 unique function name 當 anchor，切出 2 個乾淨 contiguous hunk。拖中間的滑桿掃過。</figcaption>
+
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-ba-myers-patience');
+      const after = root.querySelector('#vg-w-ba-myers-patience-after');
+      const divider = root.querySelector('#vg-w-ba-myers-patience-divider');
+      let dragging = false;
+      function setPct(pct) {
+        const clamped = Math.max(0, Math.min(100, pct));
+        after.style.clipPath = 'polygon(' + clamped + '% 0, 100% 0, 100% 100%, ' + clamped + '% 100%)';
+        divider.style.left = clamped + '%';
+      }
+      divider.addEventListener('pointerdown', (e) => {
+        dragging = true;
+        divider.setPointerCapture(e.pointerId);
+      });
+      root.addEventListener('pointermove', (e) => {
+        if (!dragging) return;
+        const rect = root.getBoundingClientRect();
+        setPct(((e.clientX - rect.left) / rect.width) * 100);
+      });
+      root.addEventListener('pointerup', () => { dragging = false; });
+      root.addEventListener('pointercancel', () => { dragging = false; });
+    })();
+  </script>
+</figure>
+
+<h2>token alignment：為什麼 character diff 不夠</h2>
+
+<p>hunk 切好之後，UI 還得回答另一個問題：在 modified 的成對 old/new line 內，哪一段才是「真正改的」？把整行染色看起來資訊量充足，實際上對 single-character 的改動（typo fix、rename 一個變數）會把「真正改了一個字」這個重要訊息淹沒在整行紅綠裡。 reviewer 必須再花 cognitive load 在腦中 character-by-character 比對才能看出改了什麼。</p>
+
+<p>最 naive 的 fix 是 character diff：對成對 line 跑一次字元級 Myers，找出 minimum edit script，把對應 character range 上色。問題：minimum edit script 在 identifier rename 上會給出醜陋結果。把 `userProfile` 改成 `userSettings`，character diff 會告訴你「`P` 改成 `S`、`r` 改成 `e`、`o` 改成 `t`、`f` 保留、`i` 改成 `t`、`l` 改成 `i`、`e` 改成 `n`、加 `g`、加 `s`」——七、八個零碎的紅綠片段。 reviewer 看到的不是「我改了一個變數名」，而是「行內有一坨花花綠綠的東西」。</p>
+
+<p>實務做法是 word-level alignment：先用 whitespace + punctuation 把行切成 token，再對 token 序列跑 diff。`userProfile` 跟 `userSettings` 都是一個 token，diff 結果直接是「`userProfile` 整個換成 `userSettings`」，視覺上是一個乾淨的紅塊配一個乾淨的綠塊。 reviewer 一眼看到「就是 rename 了」。 但 word-level 在「加了個 `await`」這種 prefix 改動上 又會退化——`return foo()` 跟 `return await foo()` 兩個 token 序列，diff 出來是「中間插了一個 token」，這個結果剛好。</p>
+
+<p>再上一層是 syntax-aware：用 parser 把行 token 化成 AST node，diff 在 AST node 這個層級進行。優點是 `if (x == y)` 改成 `if (x === y)` 不會被切成「`==` 變 `===`」這種 lexical diff，而是「BinaryExpression 的 operator 從 `Equality` 變 `StrictEquality`」這種 semantic diff。缺點：要每種語言都養一個 parser，加上 incremental parsing 才能塞進 diff 計算的 budget。Phabricator 的 ArcanistDiffParser、GitHub 在 2023 年加入的 Tree-sitter 整合都走這條路。Gerrit 走相反方向——只給行級高亮，行內不做 token-level，理由是 token-level 在 cherry-pick / rebase 多人衝突場景下會誤導 reviewer 對「改動意圖」的理解。這個立場在純 prose review 來看保守，但在 kernel-style 多 maintainer 流程裡有道理。</p>
+
+<p>三層 fallback 在實作上通常是這樣的 cascade：syntax-aware 試試看，parser 失敗或時間超 budget 就降到 word-level；word-level 算出的 edit script 如果 cost 超過某個 threshold（意味著大概 token 切錯）就降到 character。 cascade 的成本是要為每行 maintain 三個 evaluator，加上 cost-threshold 邏輯，但 visual 結果比單一 strategy 穩定很多。</p>
+
+<h2>virtual scroll：inverse sticky 的位置在哪</h2>
+
+<p>100k 行 patch 攤平 render 進 DOM 是不可能的——每行至少幾個 element、合計幾十萬 node、瀏覽器 layout pass 直接破秒。所有 review tool 都必須做 virtualization。Pierre 把已知的做法列了三種：</p>
+
+<p>第一種：native scrollable region 加上 estimated total height。整段 patch 用 `height: estimated_total_height` 撐出一個高度等於「估算」的 scrollable container，scroll event 時計算 viewport 對應到哪些 hunk，render 那一段對應的 DOM。優點是用 native scrollbar、滾動慣性、瀏覽器原生快捷鍵全部 work。缺點是 estimated_total_height 必須準確——估錯一點，scrollbar 拖到底但 patch 還沒到底，或反過來。 Pierre 引用的高度估算公式：`(lineHeight × diff.splitLineCount) + (diff.hunks.length × hunkSeparatorHeight)`。 對 plain text 的 diff 這個估算夠準，但碰上會 wrap 的行（CJK comment、長 URL）就開始漂——這也是為什麼 wrap 問題會回頭影響 virtual scroll。</p>
+
+<p>第二種：sticky 容器 + rAF 內手動更新。 用一個 fixed-position container 加上 fake scrollbar，每幀靠 `requestAnimationFrame` 算 viewport 範圍。完全 bypass native scrolling，可以對 estimated height 沒那麼敏感（因為 scrollbar 是自繪的）。缺點是失去 native scroll feel——慣性、accessibility、鍵盤 PgUp/PgDn 全要自己實作。Phabricator 早期版本就是這條路，因為當年 Chrome 的 scroll event 太慢。</p>
+
+<p>第三種：emulated scrolling，用 transform 推動內容，外面套一個自繪 scrollbar。視覺上跟第二種很像，主要差別是 inertia 跟 momentum scrolling 全自寫。這條路只有 Gerrit 在 2024 之後的 V3 改版採用，因為他們要 support 一個 review 介面內並排顯示多個 diff，原生 scroll 沒辦法做這個。</p>
+
+<p>Pierre 的 inverse sticky 算是第一種的變體：保留 native scroll，但 render region 不是「scroll position 對應的中間區段」，而是「下緣黏到 viewport 底部」。 具體公式：`render_region_top = scroll_position - viewport_height`， `render_region_bottom = scroll_position + buffer`。 用 negative offset `(contentHeight - viewportHeight) * -1` 把上面尚未進入 viewport 的部分推開。 這個做法的好處不是它快，是它把「scroll 過 patch 邊界時的 reflow jitter」消掉——下緣黏住 viewport，意味著新進入 viewport 的 row 從底部往上長，不會把已經穩定的視覺位置推來推去。</p>
+
+<p>下面這個 slider 讓你掃 patch size 跟每行平均字元數，估算「靜態 render」「naive virtual scroll」「inverse sticky」三種策略下，per-frame DOM node count 跟 layout time。 16 ms 那條紅線是 60 fps 的 budget——任何策略一旦把 estimated layout time 推過這條線，捲動就會肉眼可見地卡。</p>
+
+<figure class="vg-w-frame-budget" data-svg-scroll="640">
+  <style>
+    .vg-w-frame-budget { margin: var(--s-4) 0; padding: var(--s-3); border: 1px solid var(--line); background: var(--bg-soft); }
+    .vg-w-frame-budget .controls { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s-3); margin-bottom: var(--s-3); }
+    @media (max-width: 520px) { .vg-w-frame-budget .controls { grid-template-columns: 1fr; } }
+    .vg-w-frame-budget label.knob { display: grid; gap: var(--s-1); font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+    .vg-w-frame-budget .val { font-family: var(--sans); font-variant-numeric: tabular-nums; font-size: var(--fs-md); color: var(--accent-text); }
+    .vg-w-frame-budget input[type=range] { width: 100%; accent-color: var(--accent); min-height: 32px; touch-action: none; }
+    .vg-w-frame-budget svg { width: 100%; height: auto; display: block; margin-top: var(--s-2); }
+    @media (max-width: 720px) {
+      .vg-w-frame-budget svg { aspect-ratio: 16 / 9; min-height: 220px; }
+      .vg-w-frame-budget svg text { font-size: 18px; }
+    }
+    .vg-w-frame-budget .reading { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--s-2); margin-top: var(--s-2); font-family: var(--serif); font-size: var(--fs-sm); }
+    @media (max-width: 520px) { .vg-w-frame-budget .reading { grid-template-columns: 1fr; } }
+    .vg-w-frame-budget .reading .cell { padding: var(--s-1) var(--s-2); border-left: 2px solid var(--muted-2); }
+    .vg-w-frame-budget .reading .cell strong { display: block; font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin-bottom: 2px; }
+    .vg-w-frame-budget .reading .cell.warn { border-left-color: var(--accent); color: var(--accent-text); }
+    .vg-w-frame-budget .caption { font-family: var(--scribed); color: var(--muted); font-size: var(--fs-xs); display: block; margin-bottom: var(--s-2); }
+  </style>
+  <span class="caption">拖兩個 slider 看每種策略的 per-frame layout time。red line 是 60 fps 的 16 ms budget。</span>
+  <div class="controls">
+    <label class="knob">patch size (lines)
+      <span class="val" id="vg-w-frame-budget-n-val">10,000</span>
+      <input type="range" id="vg-w-frame-budget-n" min="1000" max="100000" step="1000" value="10000" />
+    </label>
+    <label class="knob">avg cols per line
+      <span class="val" id="vg-w-frame-budget-c-val">60</span>
+      <input type="range" id="vg-w-frame-budget-c" min="20" max="160" step="10" value="60" />
+    </label>
+  </div>
+  <svg viewBox="0 0 640 220" role="img" aria-label="Per-frame layout time across three rendering strategies">
+    <rect x="60" y="20" width="540" height="160" fill="none" stroke="var(--line)" />
+    <line x1="60" y1="180" x2="600" y2="180" stroke="var(--ink)" stroke-width="1" />
+    <line x1="60" y1="20" x2="60" y2="180" stroke="var(--ink)" stroke-width="1" />
+    <g font-family="EB Garamond, serif" font-size="10" fill="var(--muted)">
+      <line x1="60" y1="180" x2="56" y2="180" stroke="var(--ink)" /><text x="52" y="183" text-anchor="end">0 ms</text>
+      <line x1="60" y1="140" x2="56" y2="140" stroke="var(--ink)" /><text x="52" y="143" text-anchor="end">8</text>
+      <line x1="60" y1="100" x2="56" y2="100" stroke="var(--ink)" /><text x="52" y="103" text-anchor="end">16</text>
+      <line x1="60" y1="60" x2="56" y2="60" stroke="var(--ink)" /><text x="52" y="63" text-anchor="end">32</text>
+      <line x1="60" y1="20" x2="56" y2="20" stroke="var(--ink)" /><text x="52" y="23" text-anchor="end">64+</text>
+      <text x="40" y="100" transform="rotate(-90, 40, 100)" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)" font-style="italic">layout time / frame (log)</text>
+    </g>
+    <line x1="60" y1="100" x2="600" y2="100" stroke="#c0392b" stroke-width="1" stroke-dasharray="4 3" />
+    <text x="600" y="96" text-anchor="end" font-family="EB Garamond, serif" font-size="10" fill="#c0392b" font-style="italic">16 ms · 60 fps cap</text>
+    <g id="vg-w-frame-budget-bars"></g>
+    <g font-family="EB Garamond, serif" font-size="11" fill="var(--ink)" text-anchor="middle">
+      <text x="150" y="200">static render</text>
+      <text x="330" y="200">naive virtual</text>
+      <text x="510" y="200">inverse sticky</text>
+    </g>
+  </svg>
+  <div class="reading">
+    <div class="cell" id="vg-w-frame-budget-c1"><strong>static</strong><span>...</span></div>
+    <div class="cell" id="vg-w-frame-budget-c2"><strong>naive virtual</strong><span>...</span></div>
+    <div class="cell warn" id="vg-w-frame-budget-c3"><strong>inverse sticky</strong><span>...</span></div>
+  </div>
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-frame-budget');
+      const nIn = root.querySelector('#vg-w-frame-budget-n');
+      const cIn = root.querySelector('#vg-w-frame-budget-c');
+      const nVal = root.querySelector('#vg-w-frame-budget-n-val');
+      const cVal = root.querySelector('#vg-w-frame-budget-c-val');
+      const c1 = root.querySelector('#vg-w-frame-budget-c1 span');
+      const c2 = root.querySelector('#vg-w-frame-budget-c2 span');
+      const c3 = root.querySelector('#vg-w-frame-budget-c3 span');
+      const barG = root.querySelector('#vg-w-frame-budget-bars');
+      function fmt(n) { return Math.round(n).toLocaleString('en-US'); }
+      function yFor(ms) {
+        // log scale: 0→180, 8→140, 16→100, 32→60, 64→20, cap at 20
+        if (ms <= 0) return 180;
+        const v = Math.log2(ms + 1);
+        const t = Math.min(1, v / 6.5); // log2(64+1) ≈ 6.02 → just over cap
+        return 180 - t * 160;
+      }
+      function bar(x, ms, color) {
+        const y = yFor(ms);
+        const h = 180 - y;
+        return '<rect x="' + x + '" y="' + y + '" width="80" height="' + h + '" fill="' + color + '" fill-opacity="0.35" stroke="' + color + '" stroke-width="1.5"/>'
+             + '<text x="' + (x + 40) + '" y="' + (y - 4) + '" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--ink)">' + (ms < 100 ? ms.toFixed(1) : Math.round(ms)) + ' ms</text>';
+      }
+      function update() {
+        const n = +nIn.value;
+        const c = +cIn.value;
+        nVal.textContent = n.toLocaleString('en-US');
+        cVal.textContent = c;
+        // Static: layout cost roughly ∝ n × c × 0.0008 ms per char (rough estimate including text node + style + box)
+        const staticMs = n * c * 0.0008;
+        // Naive virtual: only render visible (say 60 lines) but layout estimated total height on every scroll
+        const naiveMs = 60 * c * 0.0008 + n * 0.0001; // visible cost + height-estimate touch cost
+        // Inverse sticky: only render visible + buffer (~120 lines), no full-tree touch
+        const stickyMs = 120 * c * 0.0008 + 0.5; // fixed overhead for sticky position recalc
+        c1.textContent = staticMs.toFixed(1) + ' ms';
+        c2.textContent = naiveMs.toFixed(2) + ' ms';
+        c3.textContent = stickyMs.toFixed(2) + ' ms';
+        barG.innerHTML =
+          bar(110, staticMs, '#c0392b') +
+          bar(290, naiveMs, 'var(--ink-deep)') +
+          bar(470, stickyMs, 'var(--accent)');
+      }
+      nIn.addEventListener('input', update);
+      cIn.addEventListener('input', update);
+      update();
+    })();
+  </script>
+</figure>
+
+<p>把 patch 推到 10k 行 + 每行 60 字元，static render 已經破了 16 ms（事實上瀏覽器這時的 initial paint 也早就破秒）；naive virtual 在這個 size 還守得住，但拉到 100k 行就開始飄；inverse sticky 因為「只 layout visible + buffer」這個 invariant 跟 patch size 無關，無論 patch 多大都維持低個位數 ms。這個 scaling 性質才是 inverse sticky 對前兩種的真正優勢——不是常數因子，是 patch size 不再進入 frame budget 公式。</p>
+
+<p>Pierre 也誠實標記了還沒解的問題：「serialization in the highlighting pipeline」跟「沒做 horizontal scrolling virtualization for extremely long lines」。前者意味著如果語法高亮算得慢，virtualization 的好處會被吃掉一半——high-fan-in serialize point 通常會成為 perf 瓶頸；後者意味著一行 50k 字元的 minified bundle dump 進 patch viewer，水平方向還是會慢，因為 viewer 還是把整行的 DOM 建出來。這兩個 caveat 不影響架構正確性，但會在實務 user complaint 裡浮現。</p>
+
+<h2>word-wrap：CJK 給的麻煩</h2>
+
+<p>split view 預設 invariant 是「左欄第 N 行的視覺位置 = 右欄第 N 行的視覺位置」——reviewer 的眼睛掃過去能水平 align「對應的 old / new」。這個 invariant 在純 ASCII monospace 場景 trivially 成立：每個字元固定寬度，每行剛好 80 column 就 wrap。混入 CJK 之後，這個 invariant 直接破。</p>
+
+<p>原因有兩層。第一層是 character width：CJK 字元在 monospace font 裡通常算 2 個 column（東亞 wide character 的 Unicode property），ASCII 是 1 個。但 fallback font 的 metrics 不一定遵守這個——如果系統挑了一個 proportional CJK font，每個字的 advance width 都不一樣。第二層是 line-break opportunity：CJK 沒有 whitespace 作為 break point，瀏覽器預設可以在任何字之間斷行（line-break: anywhere），這跟拉丁文「只在 whitespace 或 hyphen 斷行」是完全不同的 algorithm。</p>
+
+<p>結果是：左欄 `// 處理 user 的請求並回傳 JSON response 給前端` 在某個 column 斷行，右欄 `// handle the user request and return JSON response to client` 在另一個位置斷行——兩邊 wrap 位置不同，從第 N 行往下，左右欄就再也 align 不上。reviewer 視覺上得從頭重新對位，每幾行就斷一次。</p>
+
+<pre data-kind="pseudocode"><code><em>// Naive: let the browser wrap; align by source line only</em>
+render_split_naive(oldLines, newLines):
+  for (oldLine, newLine) in zip(oldLines, newLines):
+    emit_row(oldLine, newLine)        <em>// each cell wraps independently → vertical drift</em>
+
+<em>// Logical-column wrap: pre-compute the wrap column per row, force same wrap on both sides</em>
+render_split_aligned(oldLines, newLines, colWidth):
+  for (oldLine, newLine) in zip(oldLines, newLines):
+    wrapCol = min(
+      wrap_column_for(oldLine, colWidth),
+      wrap_column_for(newLine, colWidth)
+    )
+    visualOld = wrap_at(oldLine, wrapCol)
+    visualNew = wrap_at(newLine, wrapCol)
+    rowHeight = max(lines_after_wrap(visualOld), lines_after_wrap(visualNew))
+    emit_row_with_height(visualOld, visualNew, rowHeight)
+</code></pre>
+
+<p>這個 fix 看起來簡單——「兩邊 wrap 在同一 column」——實際上要寫對得處理「測量 column」這件事：CJK 字元在不同 font 下 advance width 不一致，瀏覽器 layout 算出的 wrap column 跟 application code 預設的 column 數字不對齊。要嘛 application 自己 maintain 一套 character width table（並且跟瀏覽器實際 layout 對得起來），要嘛用 <code>&lt;canvas&gt;</code> 的 <code>measureText</code> 去 query 每個字串的 visual width（per-row 一次 measure，成本不低）。Pierre 沒展開這段——他的文章重點在 virtual scroll——但行間提到「the width estimator has to round consistently on both sides or split view drifts」。</p>
+
+<p>還有一條 wrap behaviour 跟 hunk 切分有關：如果一行 logical line 被 wrap 成多個 visual line，virtual scroll 的 height estimator 必須知道這件事，否則 estimated_total_height 會偏小，使用者拖到 scrollbar 底部時 patch 還沒結束。實作上要嘛在 wrap layer 算完之後把實際 visual line count 喂回 virtual scroll layer，要嘛在 height estimator 裡加上一個 pessimistic wrap factor（每行假設 wrap 1.2 次）。前者準但慢，後者快但 inaccurate——又是一個沒有 free lunch 的 trade-off。</p>
+
+<p>大多數 review tool 在這件事上的選擇是「先放棄 split view，CJK 友善的場景用 unified view」。GitHub 的預設是 unified；Linear 預設 split 但 CJK comment 多的 PR 會 silently 切回 unified（這是反向的 fallback）；Phabricator 提供 toggle 但不在 viewport 層 align；Gerrit 倒是把這件事認真做了——他們的 split viewer 真的會 force 兩邊在同一 logical column wrap，代價是 wrap 算 column 的 measurement step 非要靠 `canvas.measureText` 不可。</p>
+
+<h2>四家工具的選法</h2>
+
+<p>把四個子問題跟四家工具擺成 cross 表，每一格是一個 design decision。可以排序——看哪家在哪一格最激進、哪家最保守。</p>
+
+<figure class="vg-w-tabs-tool-compare">
+  <style>
+    .vg-w-tabs-tool-compare { margin: var(--s-4) 0; }
+    .vg-w-tabs-tool-compare .tablist { display: flex; gap: 0; border-bottom: 1.5px solid var(--ink); margin-bottom: var(--s-2); flex-wrap: wrap; }
+    .vg-w-tabs-tool-compare input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+    .vg-w-tabs-tool-compare label.tab { padding: var(--s-1) var(--s-2); font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1.5px; }
+    .vg-w-tabs-tool-compare .panel { display: none; padding: var(--s-2) 0; }
+    .vg-w-tabs-tool-compare .panel h3 { font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); margin: var(--s-2) 0 var(--s-1) 0; }
+    .vg-w-tabs-tool-compare .panel p { font-family: var(--serif); font-size: var(--fs-sm); margin: 0 0 var(--s-1) 0; }
+    .vg-w-tabs-tool-compare .panel .grid { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s-2); margin-top: var(--s-2); }
+    @media (max-width: 520px) { .vg-w-tabs-tool-compare .panel .grid { grid-template-columns: 1fr; } }
+    .vg-w-tabs-tool-compare .panel .cell { padding: var(--s-2); background: var(--bg-soft); border-left: 2px solid var(--accent); }
+    .vg-w-tabs-tool-compare .panel .cell strong { display: block; font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin-bottom: 4px; }
+    .vg-w-tabs-tool-compare:has(#vg-w-tabs-tool-compare-t1:checked) label[for="vg-w-tabs-tool-compare-t1"],
+    .vg-w-tabs-tool-compare:has(#vg-w-tabs-tool-compare-t2:checked) label[for="vg-w-tabs-tool-compare-t2"],
+    .vg-w-tabs-tool-compare:has(#vg-w-tabs-tool-compare-t3:checked) label[for="vg-w-tabs-tool-compare-t3"],
+    .vg-w-tabs-tool-compare:has(#vg-w-tabs-tool-compare-t4:checked) label[for="vg-w-tabs-tool-compare-t4"] { color: var(--accent-text); border-bottom-color: var(--accent); }
+    .vg-w-tabs-tool-compare:has(#vg-w-tabs-tool-compare-t1:checked) .panel-1,
+    .vg-w-tabs-tool-compare:has(#vg-w-tabs-tool-compare-t2:checked) .panel-2,
+    .vg-w-tabs-tool-compare:has(#vg-w-tabs-tool-compare-t3:checked) .panel-3,
+    .vg-w-tabs-tool-compare:has(#vg-w-tabs-tool-compare-t4:checked) .panel-4 { display: block; }
+  </style>
+  <p class="vg-w-affordance" style="display: flex; align-items: center; gap: 6px; font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin: 0 0 var(--s-2) 0;">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <rect width="18" height="7" x="3" y="3" rx="1"/><rect width="9" height="7" x="3" y="14" rx="1"/><rect width="5" height="7" x="16" y="14" rx="1"/>
+    </svg>
+    <span>switch tabs to compare 4 review tools across all sub-problems · 4 tabs</span>
+  </p>
+  <input type="radio" id="vg-w-tabs-tool-compare-t1" name="vg-w-tabs-tool-compare-sel" checked />
+  <input type="radio" id="vg-w-tabs-tool-compare-t2" name="vg-w-tabs-tool-compare-sel" />
+  <input type="radio" id="vg-w-tabs-tool-compare-t3" name="vg-w-tabs-tool-compare-sel" />
+  <input type="radio" id="vg-w-tabs-tool-compare-t4" name="vg-w-tabs-tool-compare-sel" />
+  <div class="tablist">
+    <label class="tab" for="vg-w-tabs-tool-compare-t1">GitHub</label>
+    <label class="tab" for="vg-w-tabs-tool-compare-t2">Linear</label>
+    <label class="tab" for="vg-w-tabs-tool-compare-t3">Phabricator</label>
+    <label class="tab" for="vg-w-tabs-tool-compare-t4">Gerrit</label>
+  </div>
+  <div class="panel panel-1">
+    <h3>GitHub · the bazaar default</h3>
+    <p>受眾跨度最大——從 OSS hobbyist 到 enterprise，得在「對 90% 場景夠用」跟「不要 over-engineer」之間找平衡。歷史包袱多（前後切換過 jQuery、Rails view、React），任何一個 sub-problem 都有 toggle 給高階使用者調。</p>
+    <div class="grid">
+      <div class="cell"><strong>hunk splitter</strong>大 refactor 用 histogram，一般場景 Myers。`?diff=split` 跟 `?w=1` 兩個 query param 切視圖跟 whitespace。</div>
+      <div class="cell"><strong>token alignment</strong>2023 接了 Tree-sitter，多數語言能做 syntax-aware；fallback 是 word-level。</div>
+      <div class="cell"><strong>virtual scroll</strong>對長 patch 用 native scrollable + estimated height。10k+ 行會出現 "diff too large to display" 截斷——他們選了 hard cap 而不是死撐 virtualization 完美。</div>
+      <div class="cell"><strong>word-wrap</strong>預設 unified；split 模式下 wrap 不對齊也不修——直接把這個 case 推給「unified is the answer」。</div>
+    </div>
+  </div>
+  <div class="panel panel-2">
+    <h3>Linear · the boutique</h3>
+    <p>受眾窄、可控；engineering team 對「local-first / instant」這條 axiom 押得很重。Pierre 這篇文背景就是這條路——所有 review 介面都得在 client-side 跑得起來，不能依賴 server round-trip。</p>
+    <div class="grid">
+      <div class="cell"><strong>hunk splitter</strong>從外部 review 結果推測是 patience，傾向 anchor-aligned cleanliness。</div>
+      <div class="cell"><strong>token alignment</strong>word-level 為主；少數 high-traffic language 做 syntax-aware。</div>
+      <div class="cell"><strong>virtual scroll</strong>inverse sticky——Pierre 文章的本體。對 100k+ 行 patch 不截斷，全部 virtualize。</div>
+      <div class="cell"><strong>word-wrap</strong>split 模式下會 silently 切回 unified for CJK heavy diff——選擇 graceful degradation 而不是強行修。</div>
+    </div>
+  </div>
+  <div class="panel panel-3">
+    <h3>Phabricator · the kernel-style</h3>
+    <p>原本為 Facebook 內部 kernel-style 流程設計，現在繼續用的多是「重 commit / 重 review trail」的團隊。設計傾向「review 是長期 audit log」，所以 patch viewer 要 deterministic、不要太多 dynamic behaviour。</p>
+    <div class="grid">
+      <div class="cell"><strong>hunk splitter</strong>Myers 預設。ArcanistDiffParser 在 server side 算好 hunk，client 端不重新切。</div>
+      <div class="cell"><strong>token alignment</strong>ArcanistDiffParser 內建 PHP-aware syntax-level diff；其他語言 fallback 到 word-level。</div>
+      <div class="cell"><strong>virtual scroll</strong>早期 sticky-rAF 自繪 scrollbar；近年 V2 改 native scrollable region。整個 file load 進 DOM 上限約 5k 行。</div>
+      <div class="cell"><strong>word-wrap</strong>提供 toggle，但 split 模式不在 viewport 層 align——跟 GitHub 同陣營，這個問題不修。</div>
+    </div>
+  </div>
+  <div class="panel panel-4">
+    <h3>Gerrit · the formal one</h3>
+    <p>kernel / Android / Chromium 等大型多 maintainer 流程的選擇。review trail 是 first class citizen，每個 patch set 都是獨立 entity；UI 偏 conservative 而精準。</p>
+    <div class="grid">
+      <div class="cell"><strong>hunk splitter</strong>Myers 預設；極大 patch 走特別處理 path。</div>
+      <div class="cell"><strong>token alignment</strong>刻意只做行級高亮，不做 token-level——理由是 multi-maintainer cherry-pick 場景下 token-level 高亮會誤導改動意圖。</div>
+      <div class="cell"><strong>virtual scroll</strong>V3 改版的 emulated scrolling，支援單一 review 介面內並排多個 diff。代價是 inertia / accessibility 全部自寫。</div>
+      <div class="cell"><strong>word-wrap</strong>force 兩邊在同一 logical column wrap，靠 `canvas.measureText` 算 width——四家裡唯一認真把這件事做掉的。</div>
+    </div>
+  </div>
+</figure>
+
+<p>四家在 hunk splitter 跟 token alignment 上選擇趨同（Myers 為主、word-level 加 syntax-aware fallback），在 virtual scroll 跟 word-wrap 上選擇分歧最大——這兩件事剛好是 user-visible 但 hard 的 sub-problem。容易做的事大家做一樣，難做的事各自挑了不同 trade-off。 GitHub 用 hard cap 迴避極端 case；Linear 賭一個更難的 virtualization scheme 換 no-truncate；Phabricator 認 5k 行上限換 deterministic；Gerrit 把 wrap 做到底，付出全自寫 scroll 跟 measurement 的 maintenance cost。</p>
+
+<h2>tradeoff 對照表</h2>
+
+<p>把四個子問題的「主流 algorithm」「成本維度」「失敗 mode」「補救手段」擺成可排序的對照表——點欄位標題排序。把第三欄（failure mode）排序最有用，能看出哪些 sub-problem 的失敗會牽到別的 sub-problem。</p>
+
+<figure class="vg-w-table-diff-tradeoffs">
+  <style>
+    .vg-w-table-diff-tradeoffs { margin: var(--s-4) 0; overflow-x: auto; }
+    .vg-w-table-diff-tradeoffs table { width: 100%; min-width: 560px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+    .vg-w-table-diff-tradeoffs thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; }
+    .vg-w-table-diff-tradeoffs thead th[data-sort] { color: var(--accent-text); }
+    .vg-w-table-diff-tradeoffs tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+    .vg-w-table-diff-tradeoffs caption { font-family: var(--scribed); color: var(--muted); font-size: var(--fs-xs); text-align: left; padding: 0 0 var(--s-2) 0; }
+  </style>
+  <p class="vg-w-affordance" style="display: flex; align-items: center; gap: 6px; font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin: 0 0 var(--s-2) 0;">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/><path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+    </svg>
+    <span>click column header to sort · 5 columns × 4 rows</span>
+  </p>
+  <table>
+    <caption>四個子問題的 default、cost、failure mode、補救手段。排序「failure mode」這欄能看出 cascade dependency。</caption>
+    <thead>
+      <tr>
+        <th data-key="problem">sub-problem</th>
+        <th data-key="default">主流 algorithm</th>
+        <th data-key="cost">成本維度</th>
+        <th data-key="fail">失敗 mode</th>
+        <th data-key="cure">補救手段</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>hunk splitter</td>
+        <td>Myers diff (1986)</td>
+        <td>O((N+M) × D) time</td>
+        <td>重構 patch 切出 noise hunk</td>
+        <td>改用 patience / histogram</td>
+      </tr>
+      <tr>
+        <td>token alignment</td>
+        <td>word-level diff</td>
+        <td>per-row O(L²)</td>
+        <td>rename 高亮成零碎色塊</td>
+        <td>加 syntax-aware AST diff</td>
+      </tr>
+      <tr>
+        <td>virtual scroll</td>
+        <td>native scroll + height-estimate</td>
+        <td>height-estimate accuracy</td>
+        <td>大 patch scrollbar 拖到底 patch 沒結束</td>
+        <td>inverse sticky · emulated scroll</td>
+      </tr>
+      <tr>
+        <td>word-wrap alignment</td>
+        <td>browser default wrap</td>
+        <td>per-row measureText cost</td>
+        <td>CJK split view 行間 drift</td>
+        <td>force same logical-column wrap</td>
+      </tr>
+    </tbody>
+  </table>
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-table-diff-tradeoffs');
+      const headers = root.querySelectorAll('thead th');
+      const tbody = root.querySelector('tbody');
+      let activeKey = null, asc = true;
+      headers.forEach(h => h.addEventListener('click', () => {
+        const key = h.dataset.key;
+        if (activeKey === key) asc = !asc; else { activeKey = key; asc = true; }
+        headers.forEach(x => x.removeAttribute('data-sort'));
+        h.setAttribute('data-sort', asc ? 'asc' : 'desc');
+        const rows = [...tbody.querySelectorAll('tr')];
+        const idx = [...headers].indexOf(h);
+        rows.sort((a, b) => {
+          const av = a.children[idx].textContent.trim();
+          const bv = b.children[idx].textContent.trim();
+          return asc ? av.localeCompare(bv) : bv.localeCompare(av);
+        });
+        rows.forEach(r => tbody.appendChild(r));
+      }));
+    })();
+  </script>
+</figure>
+
+<p>把表按「failure mode」排序，會跳出來一個 pattern：失敗都是「在某個 axis 上 push 過邊界」——大 refactor、大 patch、CJK 混入、long-line identifier。四件事的 default algorithm 在「中等大小、中等難度」的 patch 上都 work，崩潰都發生在 distribution edge。production-grade review UI 的差別不在中央場景做得多好，而在邊界情形不徹底崩。</p>
+
+<p>還有一個沒寫進表裡但值得指出的 cross-cut：四個 sub-problem 的 fix 跟 fix 之間會干擾。把 hunk splitter 從 Myers 改成 histogram，hunk 數量變了，token alignment 拿到的成對行也跟著變；把 token alignment 從 word-level 升級到 syntax-aware，每行的 visual height 因為高亮塊變多／變少而微調，virtual scroll 的 height estimate 跟著要校；把 virtual scroll 從 native 改成 inverse sticky，wrap 的測量 timing 也要改——因為 wrap 算到一半新行就被 virtualization 推進來。 每個 sub-problem 不獨立，整套東西是一個 coupled system。Pierre 這篇文章把這四件事擺在一起講，正是因為「分開做 perfect 但合起來不對」這個風險，要在 architecture 階段就先看到。</p>
+
+<p>對自家想做 review UI 的 team，這篇文最大的 take-away 不是「inverse sticky 怎麼寫」，而是先確認你想解的是哪一個 sub-problem——很多自家 UI 從 word-level alignment 開始，卻發現真正的 user pain 在 wrap 不齊；或者反過來，flag 自己「我們要做 super fast scrolling」，卻沒注意 token alignment 在自家 codebase（大量 generated code、autoformat noise）切得不準。 sub-problem 沒選對，再好的 algorithm 都白用。</p>
+
+<p class="vg-deep-closer"><strong>So what</strong>：diff rendering 的「困難」不在任何單一 algorithm，而在 hunk、token、virtual scroll、wrap 四個 sub-problem 必須 coupled 起來解、但又彼此不能 directly 倚賴對方的內部結構。Pierre 那篇文把它們擺在同一個 frame 裡的價值大過任何單一 technique——下次評估自家 review UI 投資的方向時，先問「我們最弱的那個 sub-problem 是哪一個」，再去找對應的 algorithm。Myers vs patience、word vs syntax-aware、native vs inverse sticky、瀏覽器 wrap vs forced wrap：每一對 alternative 都有自己的場景，沒有 universal answer。能在 cross-cut 上做 informed choice 的 team，比押在某一個 algorithm 上「賭未來不會踩坑」的 team，產出的工具會耐用得多。</p>
+</div>
