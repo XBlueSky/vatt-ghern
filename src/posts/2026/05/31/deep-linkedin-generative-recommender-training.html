@@ -1,0 +1,1077 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">LinkedIn 把推薦系統從 DLRM 改寫成 1.1B 參數的 generative recommender 之後，工程師第一次量訓練吞吐時看到的不是「比 DLRM 慢」，而是 H100 的 SM 大部分時間在等 padding token、attention kernel 卡在 mask 形狀、optimizer step 觸發 eager non-inf check——四個瓶頸層層疊上去，總 GPU hour 是 baseline 的近三倍。一年的追查最後砍掉 65%。</p>
+  <h1 class="vg-post-title">Faster than Light——LinkedIn 怎麼把 generative recommender 的訓練吞吐拉上來</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p>
+    <span class="vg-dropcap">L</span>inkedIn 在 2026 年五月底發了一篇工程部落格，
+    標題叫〈Faster than Light：Optimizing Generative Recommender Training Efficiency〉。
+    表面上是一份標準的工程紀錄——「我們做了 A、B、C，省了 65% GPU hour」——
+    但讀進去會發現，這篇文章真正在描述的，是一個團隊面對
+    「新一代推薦模型上線之後訓練成本爆炸」這個 puzzle，
+    如何一條一條切診斷、把問題從 data pipeline 一路追到 optimizer fused flag 的內部過程。
+  </p>
+
+  <p>
+    故事的起點是這樣：LinkedIn 內部有兩條主要的推薦線——Feed 與 Ads。
+    兩條線歷史上都跑在 DLRM 架構上，~500M 參數、~90 天 user history window、
+    純 element-wise sparse embedding 加上一個 MLP。
+    2024 年下半 LinkedIn 內部開始把這兩條線都換成 generative recommender——
+    transformer-based、sequential ranking、
+    輸出是一整串「該 user 對 sequence 中每個 item 採取行動的機率」。
+    模型大小一下跳到 ~1.1B 參數，user history window 拉長到 360 天，
+    訓練語料的單一 sample 從一個 ~90 維 dense vector 變成一條最多上千 token 的序列。
+  </p>
+
+  <p>
+    結果是：同樣的 H100 集群、同樣的 batch size，
+    新模型的訓練 step time 比舊的長 4–5 倍。
+    如果只是「比較大的模型本來就該慢一些」，那這篇文章不會存在。
+    問題是團隊去量 GPU 利用率時，看到的 SM occupancy 反而比 DLRM 還低——
+    SM 大部分時間在 idle，但 step time 卻拉長了。
+    這就是這篇 investigation 真正的起點：
+    模型變大了，但 GPU 沒有變忙；時間花在了不該花的地方。
+  </p>
+
+  <p>
+    下面這篇文章的結構，照著 LinkedIn 自己的調查路徑走：
+    先是「step time 哪一段被吃掉了」這個全景問題，
+    接著三個獨立的候選假設——
+    attention kernel？batch shape？optimizer 與 metrics 的非計算開銷？——
+    一條一條被拆開實驗。
+    最後把所有優化疊起來，看真正撐起 65% 降幅的是哪幾條。
+  </p>
+
+  <p>
+    背景再交代一句：generative recommender 這個概念近兩年在工業界跑得很快。
+    Meta 在 2024 年發了 HSTU（Hierarchical Sequential Transduction Units）一系列論文、
+    Pinterest 在 2024 下半也公開了內部從 two-tower DLRM 轉 generative ranker 的工程紀錄，
+    YouTube 與 TikTok 內部都有類似動作。
+    LinkedIn 屬於這條浪潮的後段——
+    他們的優勢是看過前面幾家踩的坑、可以直接 skip 一些已知不該做的事；
+    劣勢是他們的工程棧（FSDP2 + torch.compile + 自家內部 dataloader）
+    跟前面幾家的（FBGEMM / TorchRec / DLRM-specific 框架）不完全重疊，
+    所以前人經驗的可遷移性沒那麼直接。
+  </p>
+
+  <p>
+    這篇 blog 公開的合作者名單是：
+    Chen Zhu、Tommy Li、Tao Huang、Jonathan Hung、Yang Pei、Jenny Zhang、Lijuan Zhang。
+    這個名單裡有 ML infra、AI training、Ads 三條線的工程師——
+    說明這次優化不是「單一 infra 團隊把自己負責的 pipeline 修一修」，
+    而是橫跨 model side、infra side 與 product side 的多方協作。
+    文章還特別 acknowledged「AI partners from Feed and Ads teams」——
+    意思是優化過程中需要 product team 提供 workload trace、AUC 評估、線上 A/B 結果，
+    三條線缺一就跑不完。
+  </p>
+
+  <h2>觀察到的反常：模型變大、SM 卻 idle</h2>
+
+  <p>
+    DLRM 換成 generative recommender 的那一刻，所有人預期的是
+    「同等 batch size 下，FLOPs 倍增、step time 倍增、GPU 利用率不變」。
+    實際看到的是 step time 倍增、但 GPU 利用率不升反降。
+    換句話說，新增的 FLOPs 並沒有真正塞到 H100 的 tensor core 上。
+  </p>
+
+  <p>
+    第一個被挑出來檢查的數字是 padding ratio。
+    Generative recommender 的輸入是 user action sequence——
+    某些 user 兩週只滑了三次 Feed，sequence 長度是 3；
+    另一些重度 user 一週點了 200 個 Ads，sequence 長度是 200。
+    一個 batch 裡如果有 64 個 user，最長那個是 200，
+    其他 63 個就被 pad 到 200。
+    整個 batch tensor 變成 64×200，
+    但實際有效 token 可能只佔 64×26 = 1664 個位置——
+    剩下 11136 個位置都是 padding，attention 與 FFN 對這些 padding token 照做不誤。
+  </p>
+
+  <p>
+    LinkedIn 自己量出來的數字觸目驚心：
+    Ads GR 的 padding ratio 達到 ~87%，Feed GR 是 ~75%。
+    也就是說，工程師花錢買來的 H100 SM cycle，
+    超過七成是在算「pad token 應該 attention 到誰」這種沒有意義的工作。
+    這個數字一旦看到，後面的優化主軸就確定了——
+    不是去調 attention kernel 的 micro-arch，
+    而是先想辦法不要餵那麼多 padding。
+  </p>
+
+  <p>
+    更糟的是這個 padding ratio 不是 stationary 分佈。
+    LinkedIn 的觀察是「only a few users taking 10x longer action sequences」——
+    也就是 sequence length 是高度 skewed 的長尾分佈，
+    少數 user 的序列拉很長，把整個 batch 的 max length 抬上去，
+    剩下的 user 全部跟著被 pad 到那個 max。
+    隨機 sampling 一個 batch，理論上你只要洗到一個重度 user，
+    整個 batch 的 padding ratio 就跳起來。
+  </p>
+
+  <figure class="vg-w-param-demo-gr-throughput" data-svg-scroll="720">
+    <style>
+      .vg-w-param-demo-gr-throughput { display: grid; grid-template-rows: auto 1fr auto auto; gap: var(--s-2); }
+      .vg-w-param-demo-gr-throughput .controls { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); flex-wrap: wrap; }
+      .vg-w-param-demo-gr-throughput .controls input { flex: 1; min-width: 12ch; height: 36px; accent-color: var(--accent); touch-action: none; }
+      .vg-w-param-demo-gr-throughput .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 6ch; text-align: right; }
+      .vg-w-param-demo-gr-throughput svg { width: 100%; height: auto; }
+      .vg-w-param-demo-gr-throughput .legend { display: flex; gap: var(--s-3); flex-wrap: wrap; font-family: var(--sans); font-size: var(--fs-xs); color: var(--ink-soft); }
+      .vg-w-param-demo-gr-throughput .legend-row { display: flex; align-items: center; gap: var(--s-1); font-variant-numeric: tabular-nums; }
+      .vg-w-param-demo-gr-throughput .swatch { width: 14px; height: 2px; }
+      .vg-w-param-demo-gr-throughput .swatch-eff { background: var(--sage-deep); }
+      .vg-w-param-demo-gr-throughput .swatch-pad { background: var(--accent); }
+      .vg-w-param-demo-gr-throughput .swatch-marks { background: var(--ink); width: 10px; height: 10px; border-radius: 50%; }
+      .vg-w-param-demo-gr-throughput figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/>
+        <path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+      </svg>
+      <span>drag handle to sweep batch padding ratio from 0% to 95% · two curves + Feed/Ads markers</span>
+    </p>
+
+    <div class="controls">
+      <label for="vg-w-param-demo-gr-throughput-pad">padding ratio =</label>
+      <input id="vg-w-param-demo-gr-throughput-pad" type="range" min="0" max="95" value="75" step="1" />
+      <span class="readout" id="vg-w-param-demo-gr-throughput-pad-readout">75%</span>
+    </div>
+
+    <svg viewBox="0 0 720 320" preserveAspectRatio="xMidYMid meet" role="img"
+         aria-label="padding ratio 與有效 throughput／浪費 FLOPs 的關係曲線">
+      <g id="vg-w-param-demo-gr-throughput-axes"></g>
+      <path id="vg-w-param-demo-gr-throughput-curve-eff" fill="none" stroke="var(--sage-deep)" stroke-width="2" />
+      <path id="vg-w-param-demo-gr-throughput-curve-pad" fill="none" stroke="var(--accent)" stroke-width="2" />
+      <line id="vg-w-param-demo-gr-throughput-cursor" stroke="var(--ink)" stroke-width="1" stroke-dasharray="3,3" />
+      <circle id="vg-w-param-demo-gr-throughput-dot-eff" r="4" fill="var(--sage-deep)" />
+      <circle id="vg-w-param-demo-gr-throughput-dot-pad" r="4" fill="var(--accent)" />
+      <text id="vg-w-param-demo-gr-throughput-readout-eff" font-family="EB Garamond, serif" font-size="13" fill="var(--sage-deep)" text-anchor="start" />
+      <text id="vg-w-param-demo-gr-throughput-readout-pad" font-family="EB Garamond, serif" font-size="13" fill="var(--accent-text)" text-anchor="start" />
+      <g id="vg-w-param-demo-gr-throughput-marks"></g>
+    </svg>
+
+    <div class="legend">
+      <span class="legend-row"><span class="swatch swatch-eff"></span>有效 throughput（占 dense-batch 上限）</span>
+      <span class="legend-row"><span class="swatch swatch-pad"></span>被 padding 吃掉的 FLOPs 占比</span>
+      <span class="legend-row"><span class="swatch swatch-marks"></span>LinkedIn 量到的 Feed (75%) 與 Ads (87%) 位置</span>
+    </div>
+
+    <figcaption>把 padding ratio 從 0 拉到 95%，有效 throughput 大致線性衰退；曲線右半（&gt;70%）的「實際工作占比」已經低到 GPU 大半在算空白。LinkedIn 在 Feed GR 量到 75%、Ads GR 量到 87%，兩個點都標在曲線上。</figcaption>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-param-demo-gr-throughput');
+        if (!root) return;
+        const input = root.querySelector('input');
+        const readout = root.querySelector('.readout');
+        const axes = root.querySelector('#vg-w-param-demo-gr-throughput-axes');
+        const marks = root.querySelector('#vg-w-param-demo-gr-throughput-marks');
+        const NS = 'http://www.w3.org/2000/svg';
+        function el(tag, attrs) {
+          const e = document.createElementNS(NS, tag);
+          for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+          return e;
+        }
+        const X0 = 70, X1 = 690, Y0 = 270, Y1 = 30;
+        function xOf(p) { return X0 + (p / 100) * (X1 - X0); }
+        function yOf(v) { return Y0 - (v / 100) * (Y0 - Y1); }
+
+        axes.appendChild(el('line', { x1: X0, y1: Y0, x2: X1, y2: Y0, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+        axes.appendChild(el('line', { x1: X0, y1: Y0, x2: X0, y2: Y1, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+
+        for (let v = 0; v <= 100; v += 20) {
+          const y = yOf(v);
+          axes.appendChild(el('line', { x1: X0 - 4, y1: y, x2: X0, y2: y, stroke: 'var(--muted-2)' }));
+          const t = el('text', { x: X0 - 8, y: y + 4, 'text-anchor': 'end', 'font-family': 'Manrope, sans-serif', 'font-size': 11, fill: 'var(--muted)' });
+          t.textContent = `${v}%`;
+          axes.appendChild(t);
+        }
+        for (let p = 0; p <= 100; p += 20) {
+          const x = xOf(p);
+          axes.appendChild(el('line', { x1: x, y1: Y0, x2: x, y2: Y0 + 4, stroke: 'var(--muted-2)' }));
+          const t = el('text', { x: x, y: Y0 + 18, 'text-anchor': 'middle', 'font-family': 'Manrope, sans-serif', 'font-size': 11, fill: 'var(--muted)' });
+          t.textContent = `${p}%`;
+          axes.appendChild(t);
+        }
+        const xl = el('text', { x: (X0 + X1) / 2, y: Y0 + 38, 'text-anchor': 'middle', 'font-family': 'EB Garamond, serif', 'font-size': 13, fill: 'var(--muted)' });
+        xl.textContent = 'padding ratio in batch';
+        axes.appendChild(xl);
+        const yl = el('text', { x: 18, y: (Y0 + Y1) / 2, 'text-anchor': 'middle', 'font-family': 'EB Garamond, serif', 'font-size': 13, fill: 'var(--muted)', transform: `rotate(-90 18 ${(Y0 + Y1) / 2})` });
+        yl.textContent = 'share of GPU work';
+        axes.appendChild(yl);
+
+        // Build curves: effective = 100 - padding; wasted = padding
+        const partsEff = [], partsPad = [];
+        for (let p = 0; p <= 100; p += 1) {
+          partsEff.push(`${p === 0 ? 'M' : 'L'} ${xOf(p).toFixed(1)} ${yOf(100 - p).toFixed(1)}`);
+          partsPad.push(`${p === 0 ? 'M' : 'L'} ${xOf(p).toFixed(1)} ${yOf(p).toFixed(1)}`);
+        }
+        root.querySelector('#vg-w-param-demo-gr-throughput-curve-eff').setAttribute('d', partsEff.join(' '));
+        root.querySelector('#vg-w-param-demo-gr-throughput-curve-pad').setAttribute('d', partsPad.join(' '));
+
+        // Static markers for Feed (75%) and Ads (87%)
+        function mark(p, label) {
+          marks.appendChild(el('circle', { cx: xOf(p), cy: yOf(p), r: 5, fill: 'var(--ink)' }));
+          const t = el('text', { x: xOf(p) + 8, y: yOf(p) - 6, 'font-family': 'Manrope, sans-serif', 'font-size': 11, fill: 'var(--ink)' });
+          t.textContent = label;
+          marks.appendChild(t);
+        }
+        mark(75, 'Feed GR · 75%');
+        mark(87, 'Ads GR · 87%');
+
+        const cursor = root.querySelector('#vg-w-param-demo-gr-throughput-cursor');
+        const dotEff = root.querySelector('#vg-w-param-demo-gr-throughput-dot-eff');
+        const dotPad = root.querySelector('#vg-w-param-demo-gr-throughput-dot-pad');
+        const rdEff = root.querySelector('#vg-w-param-demo-gr-throughput-readout-eff');
+        const rdPad = root.querySelector('#vg-w-param-demo-gr-throughput-readout-pad');
+
+        function update() {
+          const p = Number(input.value);
+          readout.textContent = `${p}%`;
+          const x = xOf(p);
+          cursor.setAttribute('x1', x); cursor.setAttribute('x2', x);
+          cursor.setAttribute('y1', Y1); cursor.setAttribute('y2', Y0);
+          const eff = 100 - p;
+          dotEff.setAttribute('cx', x); dotEff.setAttribute('cy', yOf(eff));
+          dotPad.setAttribute('cx', x); dotPad.setAttribute('cy', yOf(p));
+          rdEff.setAttribute('x', x + 10); rdEff.setAttribute('y', yOf(eff) + 4);
+          rdEff.textContent = `effective ${eff}%`;
+          rdPad.setAttribute('x', x + 10); rdPad.setAttribute('y', yOf(p) + 4);
+          rdPad.textContent = `wasted ${p}%`;
+        }
+        input.addEventListener('input', update);
+        update();
+      })();
+    </script>
+  </figure>
+
+  <p>
+    把滑桿拉到 75（Feed GR 的位置）：四分之三的 H100 FLOPs 在算 padding。
+    再拉到 87（Ads GR 的位置）：將近九成的計算在算空白。
+    這個數字一旦攤開，就會明白為什麼前面說「模型變大但 GPU 沒變忙」——
+    SM 確實在跑 instruction，只是 instruction 處理的 token 大多是 zero。
+    tensor core 的 throughput 沒問題，
+    問題在 input tensor 本身的有效資訊量。
+  </p>
+
+  <p>
+    但 padding 只是第一條線索。
+    LinkedIn 同時做了第二份量測：
+    把 step time 用 nsys 拆成 forward / backward / optimizer / dataloader / metrics 五段，
+    看每一段佔多少。
+    結果第一條意外的細節跳出來：「metrics 計算佔了大約 15% 的 step time」。
+    對一個剛 forward 完幾個億 FLOPs 的訓練 loop 來說，
+    metrics 應該是個 trivial 的事——
+    拿 prediction 跟 label 算個 AUC，撐死幾百 microsecond。
+    15% 顯然不對。
+  </p>
+
+  <p>
+    第三條線索是 dataloader。
+    Generative recommender 的 input pipeline 比 DLRM 複雜得多——
+    要把 user 過去 360 天的 raw action event 解析、
+    token 化、padding、truncating、packing、然後 batching。
+    原本的 Python dataloader 在 main training loop 旁邊跑，
+    但 GPU 還是會等。
+    Nsys timeline 上會看到 forward 段的開頭有一個 ~10 ms 的 gap，
+    那是 dataloader 還沒餵下一個 batch 上來。
+  </p>
+
+  <p>
+    所以團隊面對的不是「一個瓶頸」，
+    而是四個獨立的瓶頸同時拖累訓練：
+    padding 浪費 FLOPs、attention kernel 沒用 Flash 路徑、
+    metrics 在 fwd 之外吃 15%、dataloader 拖到下一個 step 開始。
+    四個瓶頸對應四個不同的子系統，要分開除錯、分開驗證。
+  </p>
+
+  <p>
+    有件事值得在進入候選假設之前先強調：
+    這四個瓶頸不是同等重要的。
+    從前面的數字推下去，padding 是最大的一條——
+    75–87% 的 GPU FLOPs 在算空白
+    意味著「如果完全 packed」可以把計算量降 3–8 倍。
+    這個量級遠大於 attention kernel 的 +25% 或 optimizer 的 +15%。
+    但 packing 不是免費——
+    它需要 dataloader 改寫、attention mask 重設計、loss reduction 重 normalize，
+    工程成本最高。
+    換句話說，「最大的瓶頸」與「最便宜下手的瓶頸」不一定是同一條。
+  </p>
+
+  <p>
+    LinkedIn 的策略是兩條同時推：
+    低成本 quick win（如 optimizer fused flag、metrics CUDA kernel）先上、
+    高成本根本性改造（dataloader 重寫、packed sequence、HSDP）排在後面分批 land。
+    這個排序也決定了 blog 敘事的順序——
+    文章按子系統分節寫，但讀者要注意每個優化在 timeline 上的位置可能差好幾個 quarter。
+  </p>
+
+  <h2>第一條候選假設：attention kernel 沒走 Flash 路徑</h2>
+
+  <p>
+    看到 generative recommender 訓練慢，
+    多數工程師的第一反應是「換 FlashAttention」。
+    LinkedIn 也走了這條路，但細節比「裝個 fa3 pip package」複雜得多。
+  </p>
+
+  <p>
+    問題是這樣：generative recommender 的 attention mask 不是純 causal。
+    對 user u 在 time t 的 prediction，你要 attend 過去的所有 action，
+    但不能 attend 同一個 sequence 裡其他 user 的 action（如果是 packed sequence），
+    也不能 attend 比 t 晚的 action（causal），
+    還可能要 attend 過去 7 天內的 action 並 down-weight 30 天前的（time-based decay）——
+    LinkedIn 在文章裡稱這類為「time-based 3D masks」。
+  </p>
+
+  <p>
+    FlashAttention-3 對標準 causal mask 跑得最快，
+    但它假設 mask shape 是 lower-triangular。
+    對 generative recommender 的 packed sequence + time-based mask，
+    FA3 直接不接，
+    得退回 PyTorch SDPA 的 generic implementation——
+    後者沒有 fused kernel，每個 attention head 各做一次 softmax + matmul，
+    HBM 讀寫量爆增。
+  </p>
+
+  <p>
+    解法是 dual-path：
+    對「mask 形狀符合 FA3 接受範圍」的 case 走 FA3；
+    對「需要 custom mask」的 case 走 FlexAttention
+    （PyTorch 2.5 開始 stable，能 compile-time generate fused kernel based on mask spec）。
+    整個 attention layer 在 compile time 根據 mask 形狀挑路徑——
+    FA3 走 fixed kernel、FlexAttention 走 inductor 生成的 fused kernel。
+  </p>
+
+  <figure class="vg-w-tabs-attn-kernel">
+    <style>
+      .vg-w-tabs-attn-kernel { display: grid; gap: var(--s-2); }
+      .vg-w-tabs-attn-kernel input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-tabs-attn-kernel .tabs { display: flex; gap: var(--s-2); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+      .vg-w-tabs-attn-kernel .tab { font-family: var(--sans); font-size: var(--fs-sm); padding: var(--s-1) var(--s-2); cursor: pointer; color: var(--muted); min-height: 44px; display: flex; align-items: center; }
+      .vg-w-tabs-attn-kernel .panel { display: none; padding: var(--s-2); border-left: 2px solid var(--accent); background: var(--bg-soft); }
+      .vg-w-tabs-attn-kernel .panel h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-tabs-attn-kernel .panel p { margin: 0 0 var(--s-2) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-tabs-attn-kernel .panel .metric { font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-top: var(--s-1); }
+      .vg-w-tabs-attn-kernel .panel .metric strong { font-family: var(--serif); font-size: var(--fs-md); color: var(--ink); text-transform: none; letter-spacing: 0; }
+      .vg-w-tabs-attn-kernel:has(#vg-w-tabs-attn-kernel-t1:checked) .panel-1 { display: block; }
+      .vg-w-tabs-attn-kernel:has(#vg-w-tabs-attn-kernel-t1:checked) [for="vg-w-tabs-attn-kernel-t1"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-attn-kernel:has(#vg-w-tabs-attn-kernel-t2:checked) .panel-2 { display: block; }
+      .vg-w-tabs-attn-kernel:has(#vg-w-tabs-attn-kernel-t2:checked) [for="vg-w-tabs-attn-kernel-t2"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-attn-kernel:has(#vg-w-tabs-attn-kernel-t3:checked) .panel-3 { display: block; }
+      .vg-w-tabs-attn-kernel:has(#vg-w-tabs-attn-kernel-t3:checked) [for="vg-w-tabs-attn-kernel-t3"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-attn-kernel figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect width="18" height="18" x="3" y="3" rx="2"/>
+        <path d="M9 3v18"/><path d="M14 9h4"/><path d="M14 14h4"/>
+      </svg>
+      <span>switch tabs to compare three attention kernel paths · 3 tabs</span>
+    </p>
+    <input type="radio" id="vg-w-tabs-attn-kernel-t1" name="vg-w-tabs-attn-kernel-sel" checked />
+    <input type="radio" id="vg-w-tabs-attn-kernel-t2" name="vg-w-tabs-attn-kernel-sel" />
+    <input type="radio" id="vg-w-tabs-attn-kernel-t3" name="vg-w-tabs-attn-kernel-sel" />
+    <div class="tabs">
+      <label class="tab" for="vg-w-tabs-attn-kernel-t1">PyTorch SDPA · baseline</label>
+      <label class="tab" for="vg-w-tabs-attn-kernel-t2">FlashAttention-3 · causal</label>
+      <label class="tab" for="vg-w-tabs-attn-kernel-t3">FlexAttention · custom mask</label>
+    </div>
+    <div class="panel panel-1">
+      <h3>generic SDPA path</h3>
+      <p>PyTorch 內建的 <code>scaled_dot_product_attention</code> 對任意 mask 都跑得動，但走的是 unfused implementation——softmax 與 matmul 各自一個 kernel，attention matrix 完整 materialize 到 HBM。Sequence length 達到 512 以上時，HBM 讀寫量隨 L² 爆增，bandwidth-bound。</p>
+      <p>對 generative recommender 的 packed sequence + time-based mask，這是唯一保證能跑的 path——但也是最慢的。</p>
+      <p class="metric">適用 mask：<strong>任意</strong> · 編譯選擇：<strong>無</strong> · vs baseline：<strong>1.0×</strong></p>
+    </div>
+    <div class="panel panel-2">
+      <h3>FlashAttention-3 · causal mask</h3>
+      <p>FA3 把 attention 整段重排成 tile-based，softmax 在 SRAM 內完成、attention matrix 從不寫回 HBM。對 lower-triangular causal mask 跑得最快——在 H100 上達到 ~75% peak FLOPs。</p>
+      <p>限制是 mask shape：FA3 只認 standard causal / standard rectangular。LinkedIn 把 Ads GR 中能套 causal 的 attention layer 切出來走這條 path——這部分占比約 60%。</p>
+      <p class="metric">適用 mask：<strong>causal only</strong> · 編譯選擇：<strong>build-time</strong> · vs baseline：<strong>+25% 快</strong></p>
+    </div>
+    <div class="panel panel-3">
+      <h3>FlexAttention · arbitrary mask</h3>
+      <p>PyTorch 2.5 的 FlexAttention 接受 user-defined mask function（接 <code>(b, h, q_idx, kv_idx)</code> 回傳 bool），透過 <code>torch.compile</code> 的 inductor pass 在 build-time generate 一個 fused triton kernel。Mask 可以是 packed-sequence boundary、time-based decay、document mask 任意組合。</p>
+      <p>對 generative recommender 的「regular mask」（causal + packed boundary）測得 +15% 快；對「time-based 3D mask」（causal + packed + 時間窗口 decay）測得 <strong>2× 快</strong>——這個雙倍是因為原本 SDPA 對 3D mask 完全沒有 fused path。</p>
+      <p class="metric">適用 mask：<strong>任意（user-defined）</strong> · 編譯選擇：<strong>torch.compile</strong> · vs baseline：<strong>+15% 至 +100%</strong></p>
+    </div>
+    <figcaption>三條 attention path 並存在同一個 training graph 裡——compiler 依 mask shape 在 build time 挑路徑。FA3 適用範圍窄但最快、FlexAttention 適用範圍寬且能 compile-time fuse、純 SDPA 是 fallback。</figcaption>
+  </figure>
+
+  <p>
+    FA3 加 FlexAttention 在 Ads GR 上合計帶來 +25% 的 attention 段加速。
+    但這還只是 attention layer 本身——
+    attention 在整個 step time 裡的占比，撐死 30%。
+    換句話說，假設 attention 完全免費，step time 也只會降三成。
+    所以 attention kernel 雖然是熱門候選，並不是真正的瓶頸主軸。
+    團隊很快意識到這點，轉去追其他段。
+  </p>
+
+  <p>
+    FlexAttention 的設計值得多寫一句。
+    它的 trick 是讓 user 寫純 Python mask function、
+    由 inductor 在編譯時 fuse 進 triton kernel——
+    這個機制比「給你六種預設 mask 選」靈活得多，
+    因為 packed-sequence boundary + time-based decay 這種組合
+    本來就不在任何預設 mask 裡。
+    對 LinkedIn 來說，這代表 attention path 不需要為每個業務團隊的 custom mask 開一個 hand-tuned CUDA kernel。
+  </p>
+
+  <p>
+    更實務的細節：FlexAttention 的 compile cost 不可忽略。
+    第一次 build 會跑 inductor pass 把 mask function lower 到 triton、
+    然後 autotune kernel block size——
+    這對 ~12-layer model 是 ~30 秒的 cold start。
+    Production training job 通常一次跑數十小時，
+    這 30 秒可以攤銷掉，但 ad-hoc evaluation script 會痛。
+    LinkedIn 用 PyTorch 的 inductor cache 把編好的 kernel 存到 disk，
+    下次同 mask + 同 shape 就直接命中。
+  </p>
+
+  <p>
+    還有一條 attention 路徑上的工程細節：
+    torch 2.10+ 的 SDPA 在 mask shape 認得的 case 上會自動 dispatch 到 FA3，
+    不再需要顯式呼叫 fa3 wrapper。
+    這個 dispatch 邏輯在 inductor lowering 階段執行，
+    行為類似 BLAS library 的 gemm 自動挑 backend——
+    user code 寫 <code>torch.nn.functional.scaled_dot_product_attention</code> 就好，
+    下面跑什麼由 runtime 與 compile-time hint 共同決定。
+    LinkedIn 的 codebase 直接吃這個 dispatch，沒有在 model code 裡 hardcode FA3。
+    這讓他們之後升 torch 版本時不會被 vendor-specific API 鎖死。
+  </p>
+
+  <p>
+    反過來說，這個 dispatch 也會掩蓋 performance 問題：
+    如果某個 mask 的 shape 看起來像 causal 但帶了一個小小的修飾
+    （例如某些 head 用 sliding window），
+    自動 dispatch 可能默默退回 generic SDPA、user 卻以為自己跑的是 FA3。
+    LinkedIn 提到他們在 profiling 時會 explicit 打開
+    <code>TORCH_LOGS=schedule,fusion</code> 看 inductor 真正生成的 kernel，
+    這是 sanity check 的標準動作。
+  </p>
+
+  <figure class="vg-w-code-flexattention-mask">
+    <style>
+      .vg-w-code-flexattention-mask { display: grid; gap: var(--s-2); }
+      .vg-w-code-flexattention-mask .header { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); display: flex; gap: var(--s-2); align-items: baseline; flex-wrap: wrap; }
+      .vg-w-code-flexattention-mask .header strong { font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink); text-transform: none; letter-spacing: 0; }
+      .vg-w-code-flexattention-mask pre { margin: 0; }
+      .vg-w-code-flexattention-mask .anno { display: grid; grid-template-columns: max-content 1fr; gap: var(--s-1) var(--s-2); font-family: var(--serif); font-size: var(--fs-sm); padding: var(--s-2); border-left: 2px solid var(--accent); background: var(--bg-soft); }
+      .vg-w-code-flexattention-mask .anno .lbl { font-family: var(--mono); font-size: var(--fs-xs); color: var(--accent-text); padding-top: 3px; }
+      .vg-w-code-flexattention-mask figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/>
+      </svg>
+      <span>read mask function · 3 boolean predicates compose into a packed + causal + time-decay mask</span>
+    </p>
+    <p class="header">
+      <strong>FlexAttention mask function</strong>
+      <span>packed sequence with time-window decay</span>
+    </p>
+<pre><code class="language-python">from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+
+# segment_ids: [B, L] — which user each token in the packed batch belongs to
+# token_time:  [B, L] — wall-clock time (seconds since epoch) for each action
+# WINDOW = 30 * 86400  # 30-day attention window
+
+def gr_mask(b, h, q_idx, kv_idx):
+    same_user = segment_ids[b, q_idx] == segment_ids[b, kv_idx]   # packed-sequence boundary
+    causal    = q_idx &gt;= kv_idx                                   # no peeking at future actions
+    in_window = (token_time[b, q_idx] - token_time[b, kv_idx]) &lt; WINDOW
+    return same_user &amp; causal &amp; in_window
+
+# create_block_mask lifts the predicate to a sparse block representation;
+# torch.compile / inductor lowers the AND-composition + softmax into one
+# fused Triton kernel — attention matrix never materialises in HBM.
+block_mask = create_block_mask(gr_mask, B=batch, H=heads, Q_LEN=L, KV_LEN=L)
+out = flex_attention(q, k, v, block_mask=block_mask)
+</code></pre>
+    <div class="anno">
+      <span class="lbl">same_user</span><span>packed token 帶 <code>segment_ids</code>；謂詞把 attention 限制在「同一 user 子序列」，避免 neighbour leakage。</span>
+      <span class="lbl">causal</span><span>下三角；t 時刻 prediction 不能看 t 之後的 action。</span>
+      <span class="lbl">in_window</span><span>time-based 3D 軸——只 attend 過去 30 天內。這條把 mask 從 2D 升到 3D、FA3 不接的原因。</span>
+      <span class="lbl">inductor</span><span><code>create_block_mask</code> 編成稀疏 bitmap、<code>torch.compile</code> 降到 fused Triton kernel；softmax 在 SRAM 完成、不寫 HBM。</span>
+    </div>
+    <figcaption>三個 boolean predicate 用 <code>&amp;</code> 合成 generative recommender 的 mask。FlexAttention 讓 user 在 Python 寫純函式、inductor compile-time fuse——LinkedIn 不必 hand-tune CUDA mask kernel 的真正答案。</figcaption>
+  </figure>
+
+  <h2>第二條候選假設：batch shape 與 padding</h2>
+
+  <p>
+    Attention kernel 拆完之後，下一個被質疑的是 batch shape 本身。
+    前面看到 padding ratio 是 75–87%，
+    那有沒有可能直接把 padding 拿掉？
+  </p>
+
+  <p>
+    第一招是 <strong>packed sequences</strong>：
+    不要每個 user 一個 row 然後 pad 到 batch 內最長值，
+    而是把多個 user 的 sequence 沿 token 維度首尾相接，
+    用 segment id 區隔。
+    這樣 64×200 的 batch tensor 變成 1×(64×平均長度) 的 packed tensor——
+    以平均長度 26 算，packed tensor 是 1×1664，
+    比 64×200=12800 小 7.7 倍。
+  </p>
+
+  <p>
+    packed sequence 要做的事情不複雜，但要做對：
+    dataloader 要做 packing、
+    attention mask 要認 segment boundary
+    （這正是 FlexAttention 派上用場的地方）、
+    loss reduction 要按 segment 分組 normalize 而不是整個 batch 平均。
+    LinkedIn 在文章裡量到 packed sequence 帶來
+    <strong>>30% GPU hour 減少 + 40% memory 減少</strong>。
+    記憶體的省下來尤其關鍵——
+    同一張 H100 80 GB 上能塞更大的 effective batch、
+    跑更深的 model variant、
+    或留出空間給 activation checkpointing。
+  </p>
+
+  <p>
+    第二招更激進：<strong>dynamic batching</strong>——
+    把 sequence length 相近的 user 群聚到同一個 batch，
+    避免「一個 200-token user 把 63 個 5-token user 拖到 200」。
+    這個招數聽起來像 GPU NLP 的標準作業，
+    但在推薦系統訓練裡有個微妙的副作用。
+  </p>
+
+  <p>
+    LinkedIn 量到 dynamic batching 能帶來 <strong>>50% GPU time 減少</strong>——
+    這是文章裡單一優化最大的 throughput 數字。
+    但他們也報了一個冷酷的結果：在 Ads training 上，
+    dynamic batching 直接「caused AUC impact」。
+    換句話說，模型訓練吞吐翻倍，但學出來的東西沒原來好。
+  </p>
+
+  <p>這個 trade 為什麼會發生？工程合理的猜測是：sequence length 本身與 user behavior 高度相關——重度 user（長 sequence）的 click pattern 跟輕度 user（短 sequence）的 click pattern 結構不同。原本 random batch 把這兩類混在一起，gradient 是「混合 user distribution 的平均方向」。改成 dynamic batching 之後，每個 batch 內 user 同質性升高，gradient 變成「特定 user segment 的方向」——以 mini-batch SGD 的視角，這像是把訓練 sample 按 cluster 排好餵進去，每個 step 的 gradient noise 結構變了，optimizer 的隱含 implicit regularization 也跟著變。</p>
+
+  <p>LinkedIn 在 Feed GR 採用 dynamic batching、Ads GR 不採用——是一個 case-by-case 的 trade。他們也試了 hybrid 策略：把同一個 batch 內的 user 按 length sort 但不分群（length-aware bucketing），這部分省吞吐但對 AUC 影響較小。文章沒給 hybrid 策略的精確數字，留作未來實驗。</p>
+
+  <figure class="vg-w-range-batching-tradeoff">
+    <style>
+      .vg-w-range-batching-tradeoff { display: grid; grid-template-rows: auto auto auto; gap: var(--s-2); padding: var(--s-2); border-left: 2px solid var(--accent); background: var(--bg-soft); }
+      .vg-w-range-batching-tradeoff .controls { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); flex-wrap: wrap; }
+      .vg-w-range-batching-tradeoff .controls input { flex: 1; min-width: 12ch; height: 36px; accent-color: var(--accent); touch-action: none; }
+      .vg-w-range-batching-tradeoff .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 6ch; text-align: right; }
+      .vg-w-range-batching-tradeoff .grid { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s-3); }
+      @media (max-width: 720px) { .vg-w-range-batching-tradeoff .grid { grid-template-columns: 1fr; } }
+      .vg-w-range-batching-tradeoff .stat { font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-range-batching-tradeoff .stat .label { font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; display: block; margin-bottom: var(--s-1); }
+      .vg-w-range-batching-tradeoff .stat .value { font-family: var(--display); font-size: 1.8rem; font-variant-numeric: tabular-nums; color: var(--ink); display: block; }
+      .vg-w-range-batching-tradeoff .stat .value.good { color: var(--sage-deep); }
+      .vg-w-range-batching-tradeoff .stat .value.bad { color: var(--accent-text); }
+      .vg-w-range-batching-tradeoff .verdict { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); padding-top: var(--s-1); border-top: 1px solid var(--line); }
+    </style>
+    <p class="vg-w-affordance" style="margin: 0 0 var(--s-1) 0;">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/>
+        <path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+      </svg>
+      <span>drag to set dynamic-batching aggressiveness · GPU savings vs AUC regression</span>
+    </p>
+
+    <div class="controls">
+      <label for="vg-w-range-batching-tradeoff-x">grouping 強度 =</label>
+      <input id="vg-w-range-batching-tradeoff-x" type="range" min="0" max="100" value="60" step="1" />
+      <span class="readout" id="vg-w-range-batching-tradeoff-x-readout">60</span>
+    </div>
+
+    <div class="grid">
+      <div class="stat">
+        <span class="label">GPU time 節省</span>
+        <span class="value good" id="vg-w-range-batching-tradeoff-gpu">−30.0%</span>
+      </div>
+      <div class="stat">
+        <span class="label">AUC regression（Ads 觀察）</span>
+        <span class="value" id="vg-w-range-batching-tradeoff-auc">−0.08%</span>
+      </div>
+    </div>
+
+    <p class="verdict" id="vg-w-range-batching-tradeoff-verdict">中等 grouping：吞吐確實升、AUC 還在安全區。Feed GR 的選擇大致落在這個強度區間。</p>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-range-batching-tradeoff');
+        if (!root) return;
+        const inp = root.querySelector('input');
+        const out = root.querySelector('.readout');
+        const gpuEl = root.querySelector('#vg-w-range-batching-tradeoff-gpu');
+        const aucEl = root.querySelector('#vg-w-range-batching-tradeoff-auc');
+        const verdict = root.querySelector('#vg-w-range-batching-tradeoff-verdict');
+
+        function update() {
+          const x = Number(inp.value);
+          out.textContent = String(x);
+          // GPU time savings: 0 at x=0, -50% at x=100, near-linear with slight concavity
+          const gpu = -(x * 0.5 * (1 + (100 - x) / 500));
+          // AUC regression: near 0 below grouping≈40, then accelerates
+          // sources mention "AUC impact" qualitatively; we model regression growing from ~0 at low grouping to ~-0.45% at full grouping
+          let auc;
+          if (x < 35) auc = -(x / 35) * 0.04;
+          else auc = -0.04 - Math.pow((x - 35) / 65, 2) * 0.42;
+
+          gpuEl.textContent = `${gpu.toFixed(1)}%`;
+          aucEl.textContent = `${auc.toFixed(2)}%`;
+          aucEl.className = 'value';
+          if (auc < -0.15) aucEl.classList.add('bad');
+          else aucEl.classList.add('good');
+
+          if (x < 25) verdict.textContent = '弱 grouping：吞吐升幅有限、AUC 幾乎無感。';
+          else if (x < 55) verdict.textContent = '中等 grouping：吞吐確實升、AUC 還在安全區。Feed GR 的選擇大致落在這個強度區間。';
+          else if (x < 80) verdict.textContent = '強 grouping：吞吐達到接近 −50%，但 AUC regression 開始可見。Ads training 在這段觸發了停損。';
+          else verdict.textContent = '極致 grouping：吞吐衝到滿，但 AUC 已掉超過 0.3%——這個量在線上 A/B 直接是負收益。';
+        }
+        inp.addEventListener('input', update);
+        update();
+      })();
+    </script>
+  </figure>
+
+  <p>這個 widget 的曲線形狀是定性的——LinkedIn 公開資料沒有逐點的 grouping-strength × AUC 數字。但它捕捉到 trade 的本質：「吞吐免費」是個謊言，dynamic batching 真實付出了 AUC，只是付得多少要看 grouping aggressiveness。Feed GR 的應用代表 LinkedIn 認為這個 trade 在 Feed workload 上是值得的（最終線上 A/B 還拿了 +2.10% session time），Ads training 拒絕代表他們在 Ads workload 上覺得不值。同一個技術、不同產品線、相反結論。</p>
+
+  <p>把 packed sequences 與 dynamic batching 加起來，batch shape 這條軸總共貢獻了大約 GPU hour 30–50% 的下降——這已經比 attention kernel 那條軸貢獻多。這也跟前面 padding ratio 75–87% 的數字對得上：浪費在 padding token 上的 cycle 終於回到了有效 token 上。</p>
+
+  <p>還有一個 batch-shape 軸的後續優化值得記：<strong>memory-bound optimization</strong>。packed sequence 把 batch tensor 縮小之後，HBM 多出大量空間。團隊把 effective batch size 拉大、開啟 activation checkpointing（只存 layer boundary 的 activation、backward 時重算中間值），把 H100 的 80 GB HBM 推到 100% 利用——對 Ads 帶來額外 30% GPU hour 下降。這是「把記憶體當資源去花」的標準動作，但只有先解決 padding 才有空間做。</p>
+
+  <p>關於 activation checkpointing 還要補一句：它不是免費的——backward 時要重新算一遍 forward 的中間值，純 FLOPs 增加 33%（multi-head attention 的 forward 占 forward 總計算的 ~30%）。但因為 H100 的 tensor core 在這個 workload 上原本就 underutilized（前面講的 padding + idle），多出來的 FLOPs 剛好填進空閒的 cycle。換句話說，activation checkpointing 在 underutilized GPU 上接近免費，在 saturated GPU 上很貴。LinkedIn 的選擇是「先 underutilized 時開、解決完其他瓶頸之後再看要不要關掉」。</p>
+
+  <p>還有一個值得記的是 batch shape 與 sparse embedding 的互動。Generative recommender 的 ~1B sparse embedding 參數來自 user id table、item id table、author id table 等多張 lookup。當 effective batch 變大、sequence 變 packed，每個 batch 命中的 embedding row 數也變多，embedding gradient 的 sparse update 量隨之放大。LinkedIn 沒有展開講這條，但這是 DLRM 時代就遺留的問題——sparse parameter server 的 throughput 是否能跟上 dense computation 的加速，是 generative recommender 規模化的下一個 known 問題。</p>
+
+  <figure class="vg-w-glossary-pytorch-terms">
+    <style>
+      .vg-w-glossary-pytorch-terms { display: grid; gap: var(--s-2); }
+      .vg-w-glossary-pytorch-terms .glist { display: grid; gap: var(--s-2); padding: 0; margin: 0; list-style: none; }
+      .vg-w-glossary-pytorch-terms .gitem { padding: var(--s-2); border-left: 2px solid var(--muted-2); }
+      .vg-w-glossary-pytorch-terms .gitem .term { font-family: var(--display); font-size: var(--fs-md); color: var(--ink); display: flex; align-items: baseline; gap: var(--s-2); flex-wrap: wrap; }
+      .vg-w-glossary-pytorch-terms .gitem .term .tag { font-family: var(--mono); font-size: var(--fs-xs); color: var(--accent-text); font-weight: normal; }
+      .vg-w-glossary-pytorch-terms .gitem .def { font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink-soft); margin: var(--s-1) 0 0 0; line-height: 1.6; }
+      .vg-w-glossary-pytorch-terms .gitem .pop {
+        position: absolute;
+        background: var(--bg-soft); border: 1px solid var(--line);
+        padding: var(--s-1) var(--s-2);
+        font-family: var(--scribed); font-size: var(--fs-sm); color: var(--ink);
+        max-width: 36ch; opacity: 0; pointer-events: none;
+        transition: opacity 120ms; z-index: 2;
+        translate: 0 var(--s-1);
+      }
+      .vg-w-glossary-pytorch-terms .gitem { position: relative; }
+      .vg-w-glossary-pytorch-terms .gitem .hint { font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-decoration: underline dotted var(--muted-2); cursor: help; }
+      .vg-w-glossary-pytorch-terms .gitem .hint:hover + .pop,
+      .vg-w-glossary-pytorch-terms .gitem .hint:focus + .pop { opacity: 1; }
+      @supports (anchor-name: --x) {
+        .vg-w-glossary-pytorch-terms #vg-w-glossary-pytorch-terms-h1 { anchor-name: --vg-w-glossary-pytorch-terms-a1; }
+        .vg-w-glossary-pytorch-terms #vg-w-glossary-pytorch-terms-p1 { position-anchor: --vg-w-glossary-pytorch-terms-a1; top: anchor(bottom); left: anchor(start); }
+        .vg-w-glossary-pytorch-terms #vg-w-glossary-pytorch-terms-h2 { anchor-name: --vg-w-glossary-pytorch-terms-a2; }
+        .vg-w-glossary-pytorch-terms #vg-w-glossary-pytorch-terms-p2 { position-anchor: --vg-w-glossary-pytorch-terms-a2; top: anchor(bottom); left: anchor(start); }
+        .vg-w-glossary-pytorch-terms #vg-w-glossary-pytorch-terms-h3 { anchor-name: --vg-w-glossary-pytorch-terms-a3; }
+        .vg-w-glossary-pytorch-terms #vg-w-glossary-pytorch-terms-p3 { position-anchor: --vg-w-glossary-pytorch-terms-a3; top: anchor(bottom); left: anchor(start); }
+        .vg-w-glossary-pytorch-terms #vg-w-glossary-pytorch-terms-h4 { anchor-name: --vg-w-glossary-pytorch-terms-a4; }
+        .vg-w-glossary-pytorch-terms #vg-w-glossary-pytorch-terms-p4 { position-anchor: --vg-w-glossary-pytorch-terms-a4; top: anchor(bottom); left: anchor(start); }
+      }
+      @supports not (anchor-name: --x) {
+        .vg-w-glossary-pytorch-terms .pop { position: static; opacity: 1; pointer-events: auto; margin-top: var(--s-1); translate: none; display: block; }
+        .vg-w-glossary-pytorch-terms .hint { cursor: default; text-decoration: none; }
+      }
+      .vg-w-glossary-pytorch-terms figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1 0-5H20"/>
+      </svg>
+      <span>hover the dotted term for a one-line clarification · 4 glossary entries</span>
+    </p>
+    <ul class="glist">
+      <li class="gitem">
+        <p class="term"><span>packed sequence</span> <span class="tag">batch-shape</span></p>
+        <p class="def">多個 user 的 sequence 沿 token 維度首尾相接、用 <code>segment_ids</code> 區隔；64×200 padded batch 折成 1×packed。需要 <span class="hint" tabindex="0" id="vg-w-glossary-pytorch-terms-h1">三件事同時成立</span><span class="pop" id="vg-w-glossary-pytorch-terms-p1">dataloader packing、attention mask 認 segment boundary、loss reduction 按 segment normalize；任一條沒做對破壞 gradient。</span>。</p>
+      </li>
+      <li class="gitem">
+        <p class="term"><span>time-based 3D mask</span> <span class="tag">attention</span></p>
+        <p class="def">packed + causal 再加「只 attend 過去 N 天內的 action」predicate；mask 從 2D 變 3D。<span class="hint" tabindex="0" id="vg-w-glossary-pytorch-terms-h2">FA3 為什麼不接</span><span class="pop" id="vg-w-glossary-pytorch-terms-p2">FA3 tile 排程假設 lower-triangular 形狀；3D mask 不在這個假設裡——FlexAttention 才能 compile-time fuse 任意 predicate。</span>。</p>
+      </li>
+      <li class="gitem">
+        <p class="term"><span>FSDP vs HSDP</span> <span class="tag">parallelism</span></p>
+        <p class="def">FSDP 跨「所有 GPU」all-gather；HSDP 改成「<span class="hint" tabindex="0" id="vg-w-glossary-pytorch-terms-h3">node 內 shard、node 間 DDP</span><span class="pop" id="vg-w-glossary-pytorch-terms-p3">node 內 NVLink 高頻寬 all-gather；node 間 InfiniBand 只交換 gradient——直接針對 IB bottleneck。</span>」。Ads 拿到 −10% time + −20% memory。</p>
+      </li>
+      <li class="gitem">
+        <p class="term"><span>SDPA auto-dispatch</span> <span class="tag">runtime</span></p>
+        <p class="def">PyTorch 2.10+ 的 <code>scaled_dot_product_attention</code> 自動 dispatch 到 FA3。優點：不必 hardcode FA3；<span class="hint" tabindex="0" id="vg-w-glossary-pytorch-terms-h4">隱憂</span><span class="pop" id="vg-w-glossary-pytorch-terms-p4">「看起來像 causal 但加了 sliding window」的 mask 默默退回 generic SDPA——要靠 <code>TORCH_LOGS=schedule,fusion</code> 驗證。</span>。</p>
+      </li>
+    </ul>
+    <figcaption>四個術語在前三節反覆出現；攤在一起可看出它們是同一 stack 的相鄰幾層。</figcaption>
+  </figure>
+
+  <h2>第三條候選假設：metrics 與 optimizer 的非計算開銷</h2>
+
+  <p>剩下的瓶頸更隱蔽。前面看 step time breakdown 時跳出來的「metrics 佔 15%」就是其中一條。</p>
+
+  <p>LinkedIn 用的 metrics 是 bucketized AUC——把 prediction score 分到 bucket、按 bucket 累計 true positive / false positive、最後算 area under curve。原本實作是 Python loop 加 numpy index 操作，每個 step 結束後跑一遍，把 ~1M sample 的 prediction 餵進去 update 一次累計值。問題是這個 update 動作走 host-device round trip：GPU 算完 prediction → copy 回 CPU → numpy 算 AUC → 結果丟回 GPU。每次 round trip 把 GPU pipeline 抽乾，等到下一個 forward 才能重新塞 work。</p>
+
+  <p>解法是寫一個 custom CUDA kernel 把 bucketized AUC 跟 boolean masking fuse 在 GPU 上。LinkedIn 報的數字是：metrics update 時間從 <strong>~40 ms 降到 ~0.5 ms</strong>，端到端帶來 <strong>~22% GPU 節省</strong>。這個 22% 是真實的，因為原本那 40 ms 每個 step 都會發生、而且發生時 GPU 在 idle。</p>
+
+  <p>22% 對「metrics」這個聽起來無關痛癢的子系統來說，是個誇張的數字。這也是這條 investigation 一個重要的方法論教訓：訓練 loop 的時間不只是「forward + backward + optimizer」這三段，任何在這三段之間插入的 host-side 計算都是 GPU idle 時間，量級可以跟主計算同數量級。</p>
+
+  <p>第二條非計算開銷是 <strong>optimizer 的 fused flag</strong>。PyTorch 的 <code>torch.optim.Adam</code> 從 1.13 開始有個 <code>fused=True</code> flag，會走 fused multi-tensor implementation，而不是對每個 parameter group 各 launch 一次 elementwise kernel。對 1.1B 參數的 model，原本 optimizer step 要 launch 數百個 kernel——每個 kernel 的 launch overhead 在 H100 上是 ~5–10 µs，加起來可能是好幾個 millisecond 純 launch 時間。</p>
+
+  <p>更糟的是非 fused path 觸發了「eager non-inf check」——PyTorch 為了支援 gradient scaling，每個 elementwise step 之後會做一次 inf/nan 檢查，這個檢查在 non-fused path 上是另一個 kernel launch。LinkedIn 報這個 flag 一打開：<strong>optimizer time 減少 ~50%、GPU hour 節省 ~15%</strong>。</p>
+
+  <p>~15% 的代價只是一個 <code>fused=True</code>——這應該寫進每個 PyTorch 訓練 codebase 的 default config，但 LinkedIn 也承認他們是在做這個 investigation 時才注意到 default 是 false。這類「default 沒打開的 flag」是個經典模式：library 為了 backward compatibility 把效能 flag 預設 off，user 不去查就一直留著 off。</p>
+
+  <p>第三條同類性質的開銷是 embedding lookups。Generative recommender 的 sparse embedding 是 ~1B 參數，分散在數個 embedding table 裡（user id、item id、author id、taxonomy id、…）。原本每個 lookup 各自一個 kernel launch，整個 forward 開頭 launch 數十個獨立 kernel。LinkedIn 寫了一個 fused embedding lookup——把多個 table 的 indexing 合進一個 kernel——帶來 <strong>+10% Ads GR 訓練時間下降</strong>。</p>
+
+  <p>第四條是 dataloader 本身。原本 Python dataloader 處理 padding / truncating / packing / batching 各自走一段 Python code、用 numpy 做 chunk 級操作、最後在 main thread 跟 GPU 同步。LinkedIn 用 C++ 重寫整個 dataloader，把這四個步驟 fuse 成一個 C++ pipeline——<strong>平均 training step time 下降 ~50%</strong>。這個 ~50% 跟 attention kernel 的 +25% 是不同等級的數字，因為 dataloader 改善的是「GPU 等 input 的 idle gap」，把 GPU 從半閒置帶到全工作。</p>
+
+  <p>第五條是 evaluation。原本每 N 個 step 跑一次 evaluation，evaluation 段 GPU 全部用來算 prediction、但 training step 必須暫停等 evaluation 完成。改成 <strong>checkpoint 並行 evaluation</strong>——training 繼續、evaluation job 在另一組 GPU 上跑 last-checkpoint——把 evaluation 從 critical path 拿掉，Feed GR 帶來 <strong>16% GPU hour 減少</strong>。</p>
+
+  <p>第六條是 <strong>HSDP（Hybrid Sharded Data Parallel）</strong>。FSDP 的 default 是把參數 shard 跨所有 GPU，每個 step 開始要 all-gather、結束要 reduce-scatter，跨 node 的 NVLink 與 InfiniBand 都要走。HSDP 改成「在 node 內 shard、在 node 之間 DDP」——node 內 NVLink 頻寬高、走 shard；node 間 IB 頻寬低、走 DDP（只交換 gradient）。對 Ads 帶來 <strong>10% training time 減少 + 20% memory 減少</strong>。</p>
+
+  <p>第七條 <strong>incremental training</strong>：原本 GR 每天從 base checkpoint 重訓、要跑 25.5 小時；改成「warm-start 上一天 checkpoint、只訓 new user activity、用 causal mask 確保不洩漏未來」——降到 9 小時，<strong>64% 訓練時間下降</strong>。這條優化在文章裡是壓軸，因為它把「每天訓一遍」這個高頻成本砍掉三分之二。</p>
+
+  <p>incremental training 要做對其實不容易。最大的風險是 distribution drift——如果只訓最近一天的 user activity，模型會慢慢忘掉長期 user signal、forget catastrophic 那一類問題會在第 N 天爆發。LinkedIn 用「warm-start + 全量歷史 sequence 但只 supervise 新 user action」的設計：模型看的還是 360 天 history，但 loss 只算 last-day 的 prediction error。這個設計讓 forward pass 仍接觸完整 history、防止 representation 退化，同時只在最近一天做 gradient 更新。</p>
+
+  <p>causal mask 在這個設計裡扮演正確性閘門——確保 prediction 不會看到 same-day 之後的 action，避免 data leakage 把 evaluation 數字虛報。Causal mask 本身對 attention kernel 來說是熟悉的形狀，所以這個變更不影響前面挑 FA3 路徑那一段的優化。</p>
+
+  <p>「節省 64% 訓練時間」這個數字要小心讀：它指的是「每天的訓練從 25.5 小時降到 9 小時」，不是「總計算量降 64%」。如果 base checkpoint 也是用 incremental 訓練出來的（每天從前一天的 checkpoint 累積過來），長期下來模型確實沒有重做過全量訓練；如果 base checkpoint 每隔幾週要重新做一次 full re-training（防止 distribution drift 累積），那 full re-training 的成本還在。LinkedIn 在文章裡沒明說頻率，但業界 default 是每 4–8 週做一次 full re-train。</p>
+
+  <p>下面這張表把所有 11 條優化攤平，按 LinkedIn 報的 GPU 節省排序。讀者可以點 column header 重排——按「節省」排，會看到 incremental training 跟 dataloader 是兩個最大樁；按「子系統」排，會看到 attention kernel 那條軸事實上只貢獻了一個中等程度的數字。</p>
+
+  <figure class="vg-w-table-bottlenecks">
+    <style>
+      .vg-w-table-bottlenecks table { width: 100%; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-bottlenecks thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; }
+      .vg-w-table-bottlenecks thead th[data-sort] { color: var(--accent-text); }
+      .vg-w-table-bottlenecks thead th[data-sort="asc"]::after { content: " ↑"; }
+      .vg-w-table-bottlenecks thead th[data-sort="desc"]::after { content: " ↓"; }
+      .vg-w-table-bottlenecks tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); color: var(--ink-soft); }
+      .vg-w-table-bottlenecks td.num { font-variant-numeric: tabular-nums; text-align: right; color: var(--ink); }
+      .vg-w-table-bottlenecks td.scope { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+      .vg-w-table-bottlenecks figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); padding-top: var(--s-2); }
+      .vg-w-table-bottlenecks { overflow-x: auto; }
+      .vg-w-table-bottlenecks table { min-width: 560px; }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/>
+        <path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+      </svg>
+      <span>click column header to sort · 4 columns × 11 rows</span>
+    </p>
+    <table>
+      <thead>
+        <tr>
+          <th data-key="opt">優化動作</th>
+          <th data-key="bucket">子系統</th>
+          <th data-key="saving" class="num">GPU 節省</th>
+          <th data-key="note">適用</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>incremental training（warm-start + causal mask）</td><td class="scope">data-pipeline</td><td class="num">64%</td><td>25.5h → 9h</td></tr>
+        <tr><td>C++ fused dataloader（padding/truncating/packing/batching）</td><td class="scope">data-pipeline</td><td class="num">50%</td><td>step time avg</td></tr>
+        <tr><td>dynamic batching</td><td class="scope">batch-shape</td><td class="num">50%</td><td>Feed only · Ads AUC 受損</td></tr>
+        <tr><td>optimizer fused flag（Adam）</td><td class="scope">optimizer</td><td class="num">15%</td><td>−50% optimizer time</td></tr>
+        <tr><td>packed sequences</td><td class="scope">batch-shape</td><td class="num">30%</td><td>+40% memory 省</td></tr>
+        <tr><td>fused bucketized AUC CUDA kernel</td><td class="scope">metrics</td><td class="num">22%</td><td>40ms → 0.5ms</td></tr>
+        <tr><td>memory optimization（batch size 拉滿 + activation ckpt）</td><td class="scope">memory</td><td class="num">30%</td><td>100% HBM 利用</td></tr>
+        <tr><td>parallel checkpoint evaluation</td><td class="scope">eval</td><td class="num">16%</td><td>Feed GR</td></tr>
+        <tr><td>HSDP（node 內 shard、node 間 DDP）</td><td class="scope">parallelism</td><td class="num">10%</td><td>+20% memory 省</td></tr>
+        <tr><td>fused embedding lookup</td><td class="scope">embedding</td><td class="num">10%</td><td>Ads GR</td></tr>
+        <tr><td>FA3 + FlexAttention compile-time dispatch</td><td class="scope">attention</td><td class="num">25%</td><td>attention 段</td></tr>
+      </tbody>
+    </table>
+    <figcaption>11 條優化、4 個 column 都可排序。注意「節省」欄的數字不直接相加——它們在不同子系統上量、且互相依賴。LinkedIn 報的端到端總降幅是 <strong>up to 65%</strong>。</figcaption>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-table-bottlenecks');
+        if (!root) return;
+        const headers = root.querySelectorAll('thead th');
+        const tbody = root.querySelector('tbody');
+        let activeKey = null, asc = true;
+        headers.forEach(h => h.addEventListener('click', () => {
+          const key = h.dataset.key;
+          if (activeKey === key) asc = !asc; else { activeKey = key; asc = true; }
+          headers.forEach(x => x.removeAttribute('data-sort'));
+          h.setAttribute('data-sort', asc ? 'asc' : 'desc');
+          const rows = [...tbody.querySelectorAll('tr')];
+          const idx = [...headers].indexOf(h);
+          rows.sort((a, b) => {
+            const av = a.children[idx].textContent.trim().replace('%', '');
+            const bv = b.children[idx].textContent.trim().replace('%', '');
+            const an = Number.parseFloat(av);
+            const bn = Number.parseFloat(bv);
+            const cmp = !Number.isNaN(an) && !Number.isNaN(bn) ? an - bn : av.localeCompare(bv, 'zh-Hant');
+            return asc ? cmp : -cmp;
+          });
+          rows.forEach(r => tbody.appendChild(r));
+        }));
+      })();
+    </script>
+  </figure>
+
+  <p>把整張表按「GPU 節省」由大到小排，會發現一個有意思的結構：最大的三個樁——incremental training (64%)、dataloader (50%)、dynamic batching (50%)——全都不是「把 kernel 跑得更快」這種優化。它們是「先別跑這段」、「pipeline 別卡 GPU」、「batch shape 別浪費」。Attention kernel 那條軸看起來像主流敘事（行業每個人都在講 FlashAttention），實際只是排序中後段的 25%。</p>
+
+  <h2>真正的根因：訓練吞吐是個 multi-resource scheduling 問題</h2>
+
+  <p>把所有候選假設加起來看，這篇 investigation 真正的結論不是「attention kernel 比想像中重要」或「dataloader 比想像中重要」，而是：訓練吞吐是一個 multi-resource scheduling 問題，GPU 是其中一條資源，但只是其中一條。</p>
+
+  <p>具體說，整條 training pipeline 上有至少六條資源在搶 timeline 的 critical path：</p>
+
+  <p>（一）GPU SM 與 tensor core——做 attention、FFN、embedding matmul 的核心 FLOPs。LinkedIn 一開始量到 SM 利用率低，是因為這條資源沒被餵飽——padding 太多、kernel launch 太碎、attention path 走 unfused fallback。</p>
+
+  <p>（二）HBM 頻寬——讀寫 weight、activation、optimizer state。FSDP/HSDP 影響的就是這條，packed sequence 減少 activation footprint 影響的也是這條。</p>
+
+  <p>（三）NVLink 與 InfiniBand——node 內、node 間的 collective communication。HSDP 把 all-gather 限制在 node 內走 NVLink，跨 node 只走輕量 DDP gradient sync，是直接針對這條的優化。</p>
+
+  <p>（四）CPU dataloader thread——做 packing、tokenization、batching。原本 Python dataloader 是這條的瓶頸，導致 GPU 開頭等 input。C++ fused dataloader 是針對這條。</p>
+
+  <p>（五）host-device round trip——metrics calculation 就掛在這條上，因為它要 GPU 算完之後 copy 回 CPU 算 AUC 再 copy 回去。fused AUC CUDA kernel 是針對這條。</p>
+
+  <p>（六）kernel launch queue——每個 CUDA kernel launch 有 5–10 µs overhead。Adam optimizer 跑數百個獨立 kernel 卡在這條，fused embedding lookup 也是。fused flag 是直接針對這條。</p>
+
+  <figure class="vg-w-stack-multi-resource">
+    <style>
+      .vg-w-stack-multi-resource { display: flex; flex-direction: column; gap: var(--s-3); align-items: stretch; }
+      .vg-w-stack-multi-resource input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-stack-multi-resource .stack-title {
+        font-family: IM Fell English, serif; font-style: italic;
+        font-size: var(--fs-md); margin: 0 0 var(--s-1) 0;
+        color: var(--ink); line-height: 1.4;
+      }
+      .vg-w-stack-multi-resource .stack-cards {
+        display: flex; flex-direction: column; gap: var(--s-1);
+        list-style: none; padding: 0; margin: 0;
+      }
+      .vg-w-stack-multi-resource .stack-cards label {
+        display: block; padding: var(--s-2);
+        border: 1px solid var(--muted-2); border-radius: 2px;
+        cursor: pointer; transition: border-color 200ms, background 200ms;
+        min-height: 44px;
+      }
+      .vg-w-stack-multi-resource .stack-cards label:hover { border-color: var(--accent); }
+      .vg-w-stack-multi-resource .stack-cards .card-head {
+        font-family: EB Garamond, serif; font-size: var(--fs-md);
+        margin: 0 0 4px 0; color: var(--ink);
+        display: flex; align-items: baseline; justify-content: space-between;
+        gap: var(--s-2); flex-wrap: wrap;
+      }
+      .vg-w-stack-multi-resource .stack-cards .card-sub {
+        font-family: IM Fell English, serif; font-style: italic;
+        font-size: var(--fs-sm); color: var(--muted);
+        margin: 0; line-height: 1.5;
+      }
+      .vg-w-stack-multi-resource .stack-cards .card-tag {
+        font-family: JetBrains Mono, monospace; font-size: var(--fs-xs);
+        color: var(--accent-text); font-style: normal;
+      }
+      .vg-w-stack-multi-resource:has(#vg-w-stack-multi-resource-r1:checked) .card-1,
+      .vg-w-stack-multi-resource:has(#vg-w-stack-multi-resource-r2:checked) .card-2,
+      .vg-w-stack-multi-resource:has(#vg-w-stack-multi-resource-r3:checked) .card-3,
+      .vg-w-stack-multi-resource:has(#vg-w-stack-multi-resource-r4:checked) .card-4,
+      .vg-w-stack-multi-resource:has(#vg-w-stack-multi-resource-r5:checked) .card-5,
+      .vg-w-stack-multi-resource:has(#vg-w-stack-multi-resource-r6:checked) .card-6 {
+        border-color: var(--accent);
+        background: color-mix(in srgb, var(--accent) 8%, transparent);
+      }
+
+      .vg-w-stack-multi-resource svg.diagram { display: none; }
+      @media (min-width: 720px) {
+        .vg-w-stack-multi-resource svg.diagram { display: block; width: 100%; height: auto; max-width: 880px; }
+        .vg-w-stack-multi-resource .stack-title { display: none; }
+        .vg-w-stack-multi-resource .stack-cards { display: none; }
+      }
+
+      .vg-w-stack-multi-resource .layer { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; }
+      .vg-w-stack-multi-resource:has(#vg-w-stack-multi-resource-r1:checked) .layer-1,
+      .vg-w-stack-multi-resource:has(#vg-w-stack-multi-resource-r2:checked) .layer-2,
+      .vg-w-stack-multi-resource:has(#vg-w-stack-multi-resource-r3:checked) .layer-3,
+      .vg-w-stack-multi-resource:has(#vg-w-stack-multi-resource-r4:checked) .layer-4,
+      .vg-w-stack-multi-resource:has(#vg-w-stack-multi-resource-r5:checked) .layer-5,
+      .vg-w-stack-multi-resource:has(#vg-w-stack-multi-resource-r6:checked) .layer-6 {
+        fill: color-mix(in srgb, var(--accent) 22%, transparent); stroke: var(--accent);
+      }
+
+      .vg-w-stack-multi-resource .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; background: var(--bg-soft); }
+      .vg-w-stack-multi-resource:has(#vg-w-stack-multi-resource-r1:checked) .detail-1,
+      .vg-w-stack-multi-resource:has(#vg-w-stack-multi-resource-r2:checked) .detail-2,
+      .vg-w-stack-multi-resource:has(#vg-w-stack-multi-resource-r3:checked) .detail-3,
+      .vg-w-stack-multi-resource:has(#vg-w-stack-multi-resource-r4:checked) .detail-4,
+      .vg-w-stack-multi-resource:has(#vg-w-stack-multi-resource-r5:checked) .detail-5,
+      .vg-w-stack-multi-resource:has(#vg-w-stack-multi-resource-r6:checked) .detail-6 { display: block; }
+      .vg-w-stack-multi-resource .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-stack-multi-resource .detail p { margin: 0; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-stack-multi-resource figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M9 11.24V7.5a2.5 2.5 0 0 1 5 0v3.74"/>
+        <path d="M16 11h-8a2 2 0 0 0-2 2v6a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2v-6a2 2 0 0 0-2-2Z"/>
+      </svg>
+      <span>click any resource to read which optimization targets it · 6 critical-path resources</span>
+    </p>
+
+    <input type="radio" id="vg-w-stack-multi-resource-r1" name="vg-w-stack-multi-resource-sel" checked aria-label="GPU SM" />
+    <input type="radio" id="vg-w-stack-multi-resource-r2" name="vg-w-stack-multi-resource-sel" aria-label="HBM bandwidth" />
+    <input type="radio" id="vg-w-stack-multi-resource-r3" name="vg-w-stack-multi-resource-sel" aria-label="NVLink/IB" />
+    <input type="radio" id="vg-w-stack-multi-resource-r4" name="vg-w-stack-multi-resource-sel" aria-label="CPU dataloader" />
+    <input type="radio" id="vg-w-stack-multi-resource-r5" name="vg-w-stack-multi-resource-sel" aria-label="host-device round trip" />
+    <input type="radio" id="vg-w-stack-multi-resource-r6" name="vg-w-stack-multi-resource-sel" aria-label="kernel launch queue" />
+
+    <p class="stack-title" id="vg-w-stack-multi-resource-title">六條資源各自卡在 critical path 的不同段</p>
+    <ul class="stack-cards" aria-labelledby="vg-w-stack-multi-resource-title">
+      <li class="card-1"><label for="vg-w-stack-multi-resource-r1">
+        <p class="card-head"><span>R1 · GPU SM &amp; tensor core</span><code class="card-tag">FLOPs</code></p>
+        <p class="card-sub">attention／FFN／embedding matmul 的核心 FLOPs；padding 過多時 SM 跑空 instruction。</p>
+      </label></li>
+      <li class="card-2"><label for="vg-w-stack-multi-resource-r2">
+        <p class="card-head"><span>R2 · HBM 頻寬</span><code class="card-tag">80 GB/s/GPU</code></p>
+        <p class="card-sub">weight／activation／optimizer state 的讀寫；packed sequence + activation ckpt 都針對它。</p>
+      </label></li>
+      <li class="card-3"><label for="vg-w-stack-multi-resource-r3">
+        <p class="card-head"><span>R3 · NVLink &amp; InfiniBand</span><code class="card-tag">collective</code></p>
+        <p class="card-sub">node 內 NVLink、node 間 InfiniBand；FSDP 的 all-gather／reduce-scatter 都走它。</p>
+      </label></li>
+      <li class="card-4"><label for="vg-w-stack-multi-resource-r4">
+        <p class="card-head"><span>R4 · CPU dataloader thread</span><code class="card-tag">host-bound</code></p>
+        <p class="card-sub">packing／tokenization／batching；Python 寫的話 GPU 開頭等 input ~10 ms。</p>
+      </label></li>
+      <li class="card-5"><label for="vg-w-stack-multi-resource-r5">
+        <p class="card-head"><span>R5 · host-device round trip</span><code class="card-tag">copy &amp; sync</code></p>
+        <p class="card-sub">GPU 算完 → copy 回 CPU → numpy → copy 回去；metrics 計算就掛在這條。</p>
+      </label></li>
+      <li class="card-6"><label for="vg-w-stack-multi-resource-r6">
+        <p class="card-head"><span>R6 · kernel launch queue</span><code class="card-tag">~5–10 µs/launch</code></p>
+        <p class="card-sub">每個 CUDA kernel launch 的 overhead；non-fused Adam 跑數百個 kernel 卡在這。</p>
+      </label></li>
+    </ul>
+
+    <svg class="diagram" viewBox="0 0 880 360" role="img" aria-label="六條 training pipeline 資源及對應優化動作">
+      <text x="20" y="22" font-family="IM Fell English, serif" font-style="italic" font-size="15" fill="var(--ink)">六條資源各自卡在 critical path 的不同段</text>
+
+      <g>
+        <rect class="layer layer-1" x="20" y="42" width="270" height="92" rx="2" />
+        <text x="34" y="66" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">R1 · GPU SM &amp; tensor core</text>
+        <text x="34" y="86" font-family="IM Fell English, serif" font-style="italic" font-size="13" fill="var(--muted)">attention / FFN / matmul 的核心 FLOPs</text>
+        <text x="34" y="106" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--accent-text)">↳ FA3 + FlexAttention</text>
+        <text x="34" y="122" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--accent-text)">↳ packed sequence</text>
+      </g>
+
+      <g>
+        <rect class="layer layer-2" x="305" y="42" width="270" height="92" rx="2" />
+        <text x="319" y="66" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">R2 · HBM 頻寬</text>
+        <text x="319" y="86" font-family="IM Fell English, serif" font-style="italic" font-size="13" fill="var(--muted)">weight / activation / optimizer state</text>
+        <text x="319" y="106" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--accent-text)">↳ activation checkpointing</text>
+        <text x="319" y="122" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--accent-text)">↳ memory-bound batch 拉滿</text>
+      </g>
+
+      <g>
+        <rect class="layer layer-3" x="590" y="42" width="270" height="92" rx="2" />
+        <text x="604" y="66" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">R3 · NVLink &amp; InfiniBand</text>
+        <text x="604" y="86" font-family="IM Fell English, serif" font-style="italic" font-size="13" fill="var(--muted)">node 內外的 collective communication</text>
+        <text x="604" y="106" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--accent-text)">↳ HSDP（node 內 shard、間 DDP）</text>
+      </g>
+
+      <g>
+        <rect class="layer layer-4" x="20" y="156" width="270" height="92" rx="2" />
+        <text x="34" y="180" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">R4 · CPU dataloader thread</text>
+        <text x="34" y="200" font-family="IM Fell English, serif" font-style="italic" font-size="13" fill="var(--muted)">packing / tokenization / batching</text>
+        <text x="34" y="220" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--accent-text)">↳ C++ fused dataloader</text>
+        <text x="34" y="236" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--accent-text)">↳ incremental training</text>
+      </g>
+
+      <g>
+        <rect class="layer layer-5" x="305" y="156" width="270" height="92" rx="2" />
+        <text x="319" y="180" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">R5 · host-device round trip</text>
+        <text x="319" y="200" font-family="IM Fell English, serif" font-style="italic" font-size="13" fill="var(--muted)">GPU → CPU → numpy → GPU 的同步往返</text>
+        <text x="319" y="220" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--accent-text)">↳ fused bucketized AUC kernel</text>
+      </g>
+
+      <g>
+        <rect class="layer layer-6" x="590" y="156" width="270" height="92" rx="2" />
+        <text x="604" y="180" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">R6 · kernel launch queue</text>
+        <text x="604" y="200" font-family="IM Fell English, serif" font-style="italic" font-size="13" fill="var(--muted)">每個 CUDA kernel launch 的 5–10 µs overhead</text>
+        <text x="604" y="220" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--accent-text)">↳ Adam fused=True</text>
+        <text x="604" y="236" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--accent-text)">↳ fused embedding lookup</text>
+      </g>
+
+      <text x="440" y="288" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="13" fill="var(--muted)">「GPU 跑滿」的傳統心智模型只看 R1——其他五條任一沒餵滿，R1 就會 idle。</text>
+      <text x="440" y="312" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--accent-text)">點任一塊看 LinkedIn 怎麼針對性下手。</text>
+    </svg>
+
+    <div>
+      <div class="detail detail-1">
+        <h3>R1 · GPU SM &amp; tensor core</h3>
+        <p>核心 FLOPs。Padding 75–87% 時 SM idle。對策：<strong>FA3 + FlexAttention（+25%）</strong>、<strong>packed sequence</strong>。</p>
+      </div>
+      <div class="detail detail-2">
+        <h3>R2 · HBM 頻寬</h3>
+        <p>weight / activation / optimizer state 讀寫。packed + activation ckpt + HSDP 都搶這條；省下的空間讓 batch 拉滿：<strong>+30% GPU hour</strong>。</p>
+      </div>
+      <div class="detail detail-3">
+        <h3>R3 · NVLink &amp; InfiniBand</h3>
+        <p>FSDP all-gather 把跨 node IB 變 bottleneck。HSDP 改 node 內 NVLink shard、node 間 DDP：<strong>−10% time + −20% memory</strong>。</p>
+      </div>
+      <div class="detail detail-4">
+        <h3>R4 · CPU dataloader thread</h3>
+        <p>Python packing/batching 讓 GPU 開頭等 ~10 ms。C++ fused dataloader：<strong>−50% step time</strong>。Incremental：<strong>25.5h → 9h</strong>。</p>
+      </div>
+      <div class="detail detail-5">
+        <h3>R5 · host-device round trip</h3>
+        <p>GPU → CPU → numpy → GPU 同步往返抽乾 pipeline。Fused AUC kernel：<strong>40 ms → 0.5 ms</strong>、端到端 <strong>~22%</strong>。</p>
+      </div>
+      <div class="detail detail-6">
+        <h3>R6 · kernel launch queue</h3>
+        <p>每 kernel launch ~5–10 µs；non-fused optimizer launch 數百個。<code>Adam(fused=True)</code> + fused embedding：<strong>−15%</strong>。</p>
+      </div>
+    </div>
+    <figcaption>六條資源不是同時 saturate——一條卡 path、其他五條 idle。65% 是六條 each-optimized、bottleneck 一條條平移的結果。</figcaption>
+  </figure>
+
+  <p>傳統的訓練優化心智模型是「把 GPU 跑滿」——這假設 GPU SM 是唯一資源、其他都是次要。對 generative recommender 這種「sequence length 變動 + 大 sparse embedding + 大量 metrics」的工作量來說，這個心智模型錯了。GPU SM 反而是最後才會卡的那個，前面五條資源任何一條沒餵滿，GPU 就在等。</p>
+
+  <p>這也解釋了為什麼 LinkedIn 報告把 65% GPU hour 下降拆成這麼多獨立的優化——因為這 65% 不是單一根因，而是六條資源各自被優化之後，累加起來把 critical path 整體向下平移的結果。任何單一優化只能解一條資源，其他五條的瓶頸還在。</p>
+
+  <p>更具體地說，這 65% 的累加方式不是 1−(1−0.5)×(1−0.5)×… 的純乘法——因為這些優化 partially overlap，packed sequence 同時降 HBM 與 dataloader 壓力、HSDP 同時降 NVLink 與 HBM、fused optimizer 同時降 kernel launch 與 host-device 同步。LinkedIn 在文章裡明確說：「these system optimizations reduced end-to-end GPU hours by up to 65%」——「up to」這個詞代表 65% 是 best case，個別工作量可能拿不到全部。</p>
+
+  <p>另一個值得注意的細節是 production 結果：Feed GR 在線上 A/B 拿到 <strong>+2.10% session time spent</strong>。這個數字之所以重要，是因為它證明「訓練吞吐優化」不是「為了讓 ML infra 團隊好看的內部指標」——65% GPU hour 下降意味著 LinkedIn 能用同一筆預算多訓練 2.85 倍的實驗、迭代更多模型版本，這個迭代速度才是 production session time 上升的真正引擎。</p>
+
+  <p>還有一個常被忽略的維度：這篇文章在描述的不只是「我們做了哪些優化」，更是「我們在什麼順序下發現這些優化」。先量 padding ratio、再量 step time breakdown、再追各段的子瓶頸——這個診斷順序本身就是教給其他團隊的方法論。換一個團隊照搬「裝個 FlashAttention」、跳過 padding ratio 那一步，會發現 attention 加速了但總 step time 沒怎麼降——因為他們解的是真正的瓶頸的下游。</p>
+
+  <p>從技術棧的角度看，這套優化用到的元件清單其實是 2025 末到 2026 初的 PyTorch 生態系標準配置：<code>torch.compile</code> 加 inductor、<code>FlexAttention</code>（PyTorch 2.5+）、<code>FA3</code>（FlashAttention-3）、<code>FSDP2</code> 的 hybrid sharding 模式、<code>Adam(fused=True)</code>、Ray Core（規劃中的 disaggregated dataloading）。沒有任何一個元件是 LinkedIn 自己新發明的——他們做的工作是把這些元件正確地組合起來、量出真正的瓶頸、依瓶頸的優先順序逐條套用。</p>
+
+  <p>對其他正在做大型推薦模型訓練的團隊而言，這份 case study 有幾個直接可拿走的 default：（a）任何 sequence-based 訓練都先量 padding ratio，超過 30% 就一定要做 packed sequence；（b）metrics calculation 任何超過 1% step time 的部分都該 fuse 進 GPU；（c）optimizer 的 fused flag 是免費午餐，沒開就是漏錢；（d）dataloader 用 Python 寫的話，超過 ~500M 參數的訓練都該考慮 C++ 重寫；（e）evaluation 不要在 training critical path 上跑，並行化是 cheap win；（f）跨 node 訓練 default 用 HSDP 而不是 FSDP。</p>
+
+  <p>反過來說，這篇文章也展示了什麼不該做：不要先去調 attention kernel——除非你的 baseline 已經是 FlashAttention，不然這條軸的潛在收益遠小於 dataloader / padding / metrics 那三條。FlashAttention 的行業 hype 很容易讓工程師把它當第一個 try 的東西，但對大多數推薦系統訓練負載，attention 占整個 step time 的 ratio 沒有大家想得高。先量、再優化。</p>
+
+  <p>最後值得記一句的是這份報告的誠實程度。文章把 dynamic batching 在 Ads 上造成 AUC regression 這件事明白寫出來——很多 ML infra blog 會略過「我們試了 X，AUC 掉了」這種反例。LinkedIn 這次沒有，他們把它寫進了正文，並區分了「Feed 採用、Ads 不採用」的決策。這種誠實在工程文獻裡是稀缺資源，因為它讓其他團隊知道 trade 在哪裡、不會盲目套用一個在自家 workload 上會崩的優化。</p>
+
+  <p>還有一個延伸觀察值得記下來。LinkedIn 文章裡沒講的是「這些優化各自需要多少工程人月才 land」。從技術描述可以反推：C++ fused dataloader 是個從零寫的元件、需要重做測試、需要跟 ML team 對齊 input contract——這應該是數個工程季度的工作。Fused bucketized AUC CUDA kernel 是一個獨立 kernel、寫加測加 profile 應該是幾人週。Optimizer fused flag 是改一行 config。如果按「人月 / GPU 節省」這個維度排，會發現 optimizer fused flag 跟 evaluation 並行化是 ROI 最高的、dataloader 重寫雖然帶來 50% step time 但工程成本最大。</p>
+
+  <p>這個工程成本 vs 效益的排序，是讀這類 blog 真正需要做的二階分析。文章寫的順序是「我們做了什麼」，但讀者該關心的是「在我們團隊只有 1-2 個 infra engineer 的情況下，哪些先做」。對絕大多數中小型 AI infra team 來說，正確的選擇是：先抓 optimizer fused flag、再做 metrics CUDA kernel、再追 attention path——這三個加起來已經是 30–50% 的 win，工程成本可控。Packed sequence、HSDP、incremental training 這些更深的優化適合等團隊夠大、value 夠明顯之後再投入。</p>
+
+  <p>另外一條觀察是 LinkedIn 跟 Meta 在這條 generative recommender 之路上的策略差異。Meta 在 2024 年 HSTU 論文中花了大量篇幅描述 model architecture——relative position bias、target-aware attention、user-history split 等等。LinkedIn 這篇文章幾乎不討論 architecture，只說「我們改成 generative recommender」、然後全文聚焦在訓練系統優化。這個差異反映了兩家公司的研究文化：Meta 把 model contribution 推到前面，LinkedIn 把 infra contribution 推到前面。對讀者來說，這代表你不會在這篇 blog 裡看到 architectural insight，但會看到 infra-side 的細節遠多於 Meta 那篇——兩者互補。</p>
+
+  <p>還有最後一個容易忽略的維度：成本。文章報的「up to 65% GPU hour reduction」如果按 H100 集群租金估算，對 LinkedIn 這種規模（推估每年 GR 訓練消耗 GPU hour 是六位數量級）大致是每年數百萬美元級別的 infra 成本下降。即使按 LinkedIn 自有 datacenter 的 amortized cost 算，也是 capital expenditure 顯著下降。這條「infra optimization 直接對應 P&amp;L」的線索是 Engineering blog 很少明說但是真實存在的——這也是為什麼 LinkedIn 願意花團隊資源去做這個 investigation：它的 ROI 在 corporate level 完全合理。</p>
+
+  <p>但成本只是一面。另一面是 iteration velocity——65% GPU hour 下降代表同一筆預算可以跑 2.85 倍的實驗。對 ML team 來說，這意味著從「一週能 try 一個假設」變成「一週能 try 三個假設」。這個 velocity 才是長期競爭優勢的來源——不是某一次優化省了多少錢，而是省下來的錢讓你跑得多快。LinkedIn 報的線上 A/B +2.10% session time 是這個 iteration velocity 累積之後的下游結果，不是某一個優化單獨帶來的。</p>
+
+  <p>對讀者而言，這篇 case study 的最大 takeaway 不是任何單一技巧。最重要的是看到「面對複雜系統的 performance puzzle，正確姿勢是 attribution → hypothesis → experiment → cumulative roll-out」這個 four-step loop——這也是 SRE 文獻裡的 USE method、Google 的 Four Golden Signals、Brendan Gregg 的 flame graph 方法論共同強調的內核。具體技術會變、performance counter 會換、framework 會迭代，但這個 loop 不會。</p>
+
+  <p>從這個角度看，這份報告值得讀的不是「LinkedIn 找到了哪些瓶頸」，而是「LinkedIn 用什麼順序找到這些瓶頸」。如果你的團隊現在正在準備從 DLRM 換到 generative recommender，或者已經換完但訓練成本未控住，這篇文章提供的不只是技術 menu，更是診斷流程的 reference implementation——按 padding ratio → step time breakdown → 各段內部 sub-bottleneck 這個順序量下去，多半會走出類似的優化路徑。</p>
+
+  <p class="vg-deep-closer"><strong>Take-away</strong>：訓練吞吐優化的第一個動作是 attribution，不是優化——把 step time 拆成 forward / backward / optimizer / dataloader / metrics 五段，量每段占比、再量每段內的子瓶頸（padding ratio、kernel launch 數、host-device round trip）；下手的優先順序按「節省占比 × 落地成本」排，而不是按「業界 hype 排名」排——FlashAttention 在這個排序裡可能只排第六。</p>
+</div>
