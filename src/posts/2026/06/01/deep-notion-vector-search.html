@@ -1,0 +1,560 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">兩年內 Notion 把它的 vector search 從一台 Postgres 上的 pgvector 起步，跑到把 60 億級 embedding 釘在 turbopuffer 的 object-storage backend 上——同期間每條 query 的成本不是漲，是被砍到約 1/10。document 數量 10× 成長、cost 1/10——這個 cost / scale 反向曲線才是這篇 retrospective 真正的看點，不是 vector DB 換了哪一家。</p>
+  <h1 class="vg-post-title">Notion 兩年的 vector search 路：從 pgvector 單機到 60 億 chunk、成本砍掉九成</h1>
+</header>
+
+<div class="vg-post-prose">
+
+<p><span class="vg-dropcap">N</span>otion 工程團隊（Preeti Gondi、Mickey Liu、Nathan Louie、Calder Lund、Jacob Sager）在這篇〈Two Years of Vector Search at Notion〉裡，把 2023 年 11 月發布 Notion AI 至今的整條 vector 路一次攤開：從一開始用 pgvector + Postgres 把問題硬塞進「能 ship」的形狀，到今天 trillions-of-edges 不到的尺度但 multi-billion objects 的 production 系統，每一段轉折都不是技術 fashion，而是被「下一個量級的 workload 撞牆」逼出來的。</p>
+
+<p>把兩年壓成一句 mental model：這不是「換 vector DB」的故事，是「把 vector search 從一個 monolithic black box，切成三層彼此解耦的 sub-system，每層各自跟自己的 cost / latency / freshness 軸做 trade-off」的故事。三層分別是 chunking strategy（怎麼把 page 切成 vector-ready 的 unit）、embedding model（怎麼把 unit 變成 vector）、ANN index（怎麼把 vector 存起來、查回來）。一開始這三件事被綁在 pgvector + Postgres 的單一 stack 裡——它能讓你 ship，但任何一層想動，都要把另外兩層拖著一起動。今天這三層在 Notion 內部分別住在 DynamoDB（page-state 跟 chunking 一起）、Ray on Anyscale（embedding 生成 + serving）、turbopuffer（ANN + 存儲）這三個獨立 system 裡，各自獨立 scale、獨立 iterate。</p>
+
+<p>下面這張 architecture diagram 是讀這篇文章的單一入口——點任一個 box 看它的責任、它刻意不知道什麼、以及它跟相鄰 component 之間的 interface 在哪。剩下章節各自展開：那條從 600M 到 60 億 document 的時間線怎麼走、Page State Project 為什麼是真正的成本魔法、turbopuffer 換掉 dedicated pod 之後 p50 怎麼從 70-100 ms 滑到 50-70 ms、以及 Ray 為什麼能砍掉 embedding infrastructure cost 的 90% 以上。</p>
+
+<h2>六個 component 的責任邊界</h2>
+
+<figure class="vg-w-annotated-notion-vec-stack" data-svg-scroll="720">
+  <style>
+    .vg-w-annotated-notion-vec-stack { display: grid; grid-template-columns: 1fr; gap: var(--s-3); align-items: start; margin: var(--s-4) 0; }
+    @media (max-width: 720px) { .vg-w-annotated-notion-vec-stack { grid-template-columns: 1fr; } }
+    .vg-w-annotated-notion-vec-stack svg { width: 100%; height: auto; }
+    .vg-w-annotated-notion-vec-stack input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+    .vg-w-annotated-notion-vec-stack .component { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; transition: fill 200ms, stroke 200ms; }
+    .vg-w-annotated-notion-vec-stack .component:hover { stroke: var(--accent); }
+    .vg-w-annotated-notion-vec-stack .component:focus { outline: none; }
+    .vg-w-annotated-notion-vec-stack .component:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .vg-w-annotated-notion-vec-stack .component-text { pointer-events: none; }
+    .vg-w-annotated-notion-vec-stack .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+    .vg-w-annotated-notion-vec-stack .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+    .vg-w-annotated-notion-vec-stack .detail p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+    .vg-w-annotated-notion-vec-stack .hint { font-family: var(--scribed); color: var(--muted); font-size: var(--fs-xs); margin-top: var(--s-1); }
+    .vg-w-annotated-notion-vec-stack:has(#vg-w-annotated-notion-vec-stack-r1:checked) .component-1 { fill: var(--accent); fill-opacity: 0.18; stroke: var(--accent); }
+    .vg-w-annotated-notion-vec-stack:has(#vg-w-annotated-notion-vec-stack-r2:checked) .component-2 { fill: var(--accent); fill-opacity: 0.18; stroke: var(--accent); }
+    .vg-w-annotated-notion-vec-stack:has(#vg-w-annotated-notion-vec-stack-r3:checked) .component-3 { fill: var(--accent); fill-opacity: 0.18; stroke: var(--accent); }
+    .vg-w-annotated-notion-vec-stack:has(#vg-w-annotated-notion-vec-stack-r4:checked) .component-4 { fill: var(--accent); fill-opacity: 0.18; stroke: var(--accent); }
+    .vg-w-annotated-notion-vec-stack:has(#vg-w-annotated-notion-vec-stack-r5:checked) .component-5 { fill: var(--accent); fill-opacity: 0.18; stroke: var(--accent); }
+    .vg-w-annotated-notion-vec-stack:has(#vg-w-annotated-notion-vec-stack-r6:checked) .component-6 { fill: var(--accent); fill-opacity: 0.18; stroke: var(--accent); }
+    .vg-w-annotated-notion-vec-stack:has(#vg-w-annotated-notion-vec-stack-r1:checked) .detail-1 { display: block; }
+    .vg-w-annotated-notion-vec-stack:has(#vg-w-annotated-notion-vec-stack-r2:checked) .detail-2 { display: block; }
+    .vg-w-annotated-notion-vec-stack:has(#vg-w-annotated-notion-vec-stack-r3:checked) .detail-3 { display: block; }
+    .vg-w-annotated-notion-vec-stack:has(#vg-w-annotated-notion-vec-stack-r4:checked) .detail-4 { display: block; }
+    .vg-w-annotated-notion-vec-stack:has(#vg-w-annotated-notion-vec-stack-r5:checked) .detail-5 { display: block; }
+    .vg-w-annotated-notion-vec-stack:has(#vg-w-annotated-notion-vec-stack-r6:checked) .detail-6 { display: block; }
+  </style>
+
+  <input type="radio" id="vg-w-annotated-notion-vec-stack-r1" aria-label="select page state" name="vg-w-annotated-notion-vec-stack-sel" checked />
+  <input type="radio" id="vg-w-annotated-notion-vec-stack-r2" aria-label="select embedding ray" name="vg-w-annotated-notion-vec-stack-sel" />
+  <input type="radio" id="vg-w-annotated-notion-vec-stack-r3" aria-label="select ann turbopuffer" name="vg-w-annotated-notion-vec-stack-sel" />
+  <input type="radio" id="vg-w-annotated-notion-vec-stack-r4" aria-label="select offline batcher" name="vg-w-annotated-notion-vec-stack-sel" />
+  <input type="radio" id="vg-w-annotated-notion-vec-stack-r5" aria-label="select online indexer" name="vg-w-annotated-notion-vec-stack-sel" />
+  <input type="radio" id="vg-w-annotated-notion-vec-stack-r6" aria-label="select query path" name="vg-w-annotated-notion-vec-stack-sel" />
+
+  <svg viewBox="0 0 720 380" role="img" aria-label="Notion vector search architecture: page-state, embedding, ANN, batchers, indexer, query">
+    <defs>
+      <marker id="vg-w-annotated-notion-vec-stack-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+      </marker>
+    </defs>
+
+    <text x="360" y="20" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--muted)" font-style="italic">three independent layers · ~6 billion chunks · sub-minute online freshness</text>
+
+    <rect class="component component-1" data-target="vg-w-annotated-notion-vec-stack-r1" x="20" y="50" width="200" height="90" rx="4" role="button" tabindex="0" />
+    <text class="component-text" x="120" y="86" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">page state (DynamoDB)</text>
+    <text class="component-text" x="120" y="108" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">xxHash per span + metadata</text>
+    <text class="component-text" x="120" y="126" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)" font-style="italic">change detection layer</text>
+
+    <rect class="component component-2" data-target="vg-w-annotated-notion-vec-stack-r2" x="260" y="50" width="200" height="90" rx="4" role="button" tabindex="0" />
+    <text class="component-text" x="360" y="86" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">embedding (Ray on Anyscale)</text>
+    <text class="component-text" x="360" y="108" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">OSS model · GPU + CPU pipelined</text>
+    <text class="component-text" x="360" y="126" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)" font-style="italic">batch + Ray Serve</text>
+
+    <rect class="component component-3" data-target="vg-w-annotated-notion-vec-stack-r3" x="500" y="50" width="200" height="90" rx="4" role="button" tabindex="0" />
+    <text class="component-text" x="600" y="86" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">ANN (turbopuffer)</text>
+    <text class="component-text" x="600" y="108" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">namespace per workspace · S3-backed</text>
+    <text class="component-text" x="600" y="126" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)" font-style="italic">object-storage native</text>
+
+    <rect class="component component-4" data-target="vg-w-annotated-notion-vec-stack-r4" x="60" y="180" width="280" height="76" rx="4" role="button" tabindex="0" />
+    <text class="component-text" x="200" y="212" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">offline batcher (Ray, was Spark / EMR)</text>
+    <text class="component-text" x="200" y="232" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">bulk re-index · onboarding · backfills</text>
+
+    <rect class="component component-5" data-target="vg-w-annotated-notion-vec-stack-r5" x="380" y="180" width="280" height="76" rx="4" role="button" tabindex="0" />
+    <text class="component-text" x="520" y="212" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">online indexer (Kafka consumers)</text>
+    <text class="component-text" x="520" y="232" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">page edit → vector DB · sub-minute</text>
+
+    <rect class="component component-6" data-target="vg-w-annotated-notion-vec-stack-r6" x="20" y="296" width="680" height="62" rx="4" role="button" tabindex="0" />
+    <text class="component-text" x="360" y="326" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">query path (Ray Serve embed → turbopuffer ANN)</text>
+    <text class="component-text" x="360" y="344" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">p50 50–70 ms · no third-party hop</text>
+
+    <line x1="220" y1="95" x2="260" y2="95" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-annotated-notion-vec-stack-arrow)" />
+    <line x1="460" y1="95" x2="500" y2="95" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-annotated-notion-vec-stack-arrow)" />
+    <line x1="200" y1="180" x2="280" y2="140" stroke="currentColor" stroke-width="1" stroke-dasharray="3 3" marker-end="url(#vg-w-annotated-notion-vec-stack-arrow)" />
+    <line x1="520" y1="180" x2="420" y2="140" stroke="currentColor" stroke-width="1" stroke-dasharray="3 3" marker-end="url(#vg-w-annotated-notion-vec-stack-arrow)" />
+    <line x1="120" y1="140" x2="160" y2="180" stroke="currentColor" stroke-width="1" stroke-dasharray="3 3" marker-end="url(#vg-w-annotated-notion-vec-stack-arrow)" />
+    <line x1="520" y1="256" x2="520" y2="296" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-annotated-notion-vec-stack-arrow)" />
+    <line x1="600" y1="140" x2="600" y2="296" stroke="currentColor" stroke-width="1" stroke-dasharray="3 3" marker-end="url(#vg-w-annotated-notion-vec-stack-arrow)" />
+    <text x="608" y="220" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)" font-style="italic">read path</text>
+  </svg>
+
+  <div>
+    <div class="detail detail-1">
+      <h3>page state · responsibility</h3>
+      <p>把每一個 page 的「上一次處理過的形狀」存進 DynamoDB——按 span 切 xxHash 64-bit，metadata 另存一份 hash。下一次 edit 進來，比對哪些 span 變了、metadata 變沒變，只把 diff 餵給下游。</p>
+      <p><strong>Does not know</strong>：embedding model 用什麼、ANN 怎麼存。它只負責「最小化下游 work」這件事。</p>
+      <p class="hint">2025 年 7 月上線的 Page State Project，整體 data volume 砍掉 70%。</p>
+    </div>
+    <div class="detail detail-2">
+      <h3>embedding · responsibility</h3>
+      <p>跑 open-source embedding model，把 chunk 變 vector。Ray on Anyscale 在同一個 cluster 內把 CPU side 的 tokenize / preprocess 跟 GPU side 的 forward pass 串成 pipeline——不會 GPU 等 CPU、也不會 CPU 等 GPU。query 時走 Ray Serve，model 常駐 GPU，沒有第三方 API hop。</p>
+      <p><strong>Does not know</strong>：哪個 chunk 之後會被哪個 query 命中、ANN 用哪種 index。</p>
+      <p class="hint">投影 embedding infrastructure 成本砍掉 90%+——把 Spark/EMR 的 double-compute 拆掉是主因。</p>
+    </div>
+    <div class="detail detail-3">
+      <h3>ANN · responsibility</h3>
+      <p>turbopuffer 把每個 workspace 當一個 namespace，全部建在 object storage（S3 風格）上——storage / compute 完全解耦。read 走 cache + S3，write 直接 append 進 object。沒有 dedicated pod、沒有 instance 級的 capacity 規劃。</p>
+      <p><strong>Does not know</strong>：vector 是怎麼產生的、page 是怎麼 chunk 的。只看 vector + namespace + filter。</p>
+      <p class="hint">換掉 dedicated pod 之後 p50 從 70-100 ms 滑到 50-70 ms，search engine 帳單砍掉 60%。</p>
+    </div>
+    <div class="detail detail-4">
+      <h3>offline batcher · responsibility</h3>
+      <p>處理新 workspace onboarding、整路 model 升級時的 full re-index、historical backfill 這類「一次性、量大、不趕」的 work。2025 年 7 月之前是 Spark on EMR，現在是 Ray on Anyscale——同一個 cluster type 既跑 batch 也跑 serving，硬體不重複買。</p>
+      <p><strong>Does not know</strong>：online edit 的順序、query 的 distribution。</p>
+      <p class="hint">Ray 取代 EMR 之後 AWS 計算成本砍掉 35%。</p>
+    </div>
+    <div class="detail detail-5">
+      <h3>online indexer · responsibility</h3>
+      <p>Kafka consumer 收 page edit event，調 page-state diff，重新 embed 變動的 span，PATCH 進 turbopuffer。整路 SLA 是 sub-minute——使用者改一個段落，幾十秒後 search 就會 reflect。metadata-only 的 edit 完全不走 embedding 路徑，直接 vector DB PATCH。</p>
+      <p><strong>Does not know</strong>：bulk job 在跑什麼、ANN 怎麼存。它跟 offline batcher 走完全不同的 write path。</p>
+      <p class="hint">2023 年發布時就在這個位置——dual-path（offline + online）是 day-one 設計。</p>
+    </div>
+    <div class="detail detail-6">
+      <h3>query path · responsibility</h3>
+      <p>使用者輸入 query，Ray Serve 把 query 變 embedding（dynamic batching：多個 concurrent query 合併成一個 GPU batch），打到 turbopuffer，回 top-K + workspace ACL filter。整段沒有第三方 API hop，p50 50-70 ms。</p>
+      <p><strong>Does not know</strong>：embedding model 是怎麼訓練的、turbopuffer 內部怎麼 shard。它只是兩個 stable interface 之間的 thin orchestrator。</p>
+      <p class="hint">把第三方 embedding API 從 query path 拿掉，是 latency 跟 reliability 雙贏。</p>
+    </div>
+  </div>
+
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-annotated-notion-vec-stack');
+      root.querySelectorAll('.component').forEach((rect) => {
+        rect.addEventListener('click', () => {
+          const targetId = rect.getAttribute('data-target');
+          const radio = root.querySelector('#' + targetId);
+          if (radio) radio.checked = true;
+        });
+        rect.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            rect.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+          }
+        });
+      });
+    })();
+  </script>
+</figure>
+
+<p>讀完之後你應該能清楚回答這幾個問題：page state 為什麼是一個獨立 component 而不是 chunking pipeline 的內部細節；為什麼 query path 跟 online indexer 都走 Ray、但走的是 Ray 的兩個不同 mode；以及 turbopuffer 把 storage 跟 compute 解耦這件事，對「成本砍九成」這個 headline 到底貢獻了哪一塊。</p>
+
+<h2>第一年：把問題 ship 進 production 的 pgvector + Postgres 起步</h2>
+
+<p>2023 年 11 月 Notion AI 發布的時候，整個 vector search stack 是 pgvector 跑在 Postgres 上、配上 dedicated 的「pod」cluster——storage 跟 compute 綁在同一台 instance、按 workspace 切 shard、按 capacity 提前 provision 一批機器再說。這個選擇放在 2023 年初的 timeline 上完全合理：團隊還小、要 ship 的功能還沒打磨完、整個 product 還在驗證 vector search 對 Notion 是不是真的有用；任何把基礎建設打高大上的決定，都會把 product validation 的時間吃掉。pgvector + Postgres 的好處是「工程師已經懂 Postgres」——operability、backup、monitoring、permission model 全部用既有的 Postgres 那套，零學習成本就上線。</p>
+
+<p>但這個架構的代價在 2024 年 1 月撞牆：原始的 index 在 1 個月內就接近 capacity。Notion AI 是當時 Notion 主推的功能，新使用者 / 新 workspace 的 onboard 速度遠超原始 provisioning 的假設——document 數量從約 6 億，朝著「下個 quarter 就破 10 億」的曲線爬。如果照原本的設計繼續用，每次 capacity 撞頂都得做一次 incremental re-sharding——把現有 index 拆開、重新分配到更多 pod、過程中保持 read availability。re-sharding 本身就是高風險 operation，每月一次的頻率不可持續。</p>
+
+<p>當時的緩解是改成 generation-based provisioning：與其在現有 cluster 上做 re-shard，不如直接 provision 一組新的 index set（generation N+1），把新 workspace 寫到新 generation，舊 workspace 留在 generation N 慢慢 migrate。這把 re-sharding 的問題換成 routing 的問題——每個 read query 要先知道 workspace 屬於哪個 generation。技術上可行，但「generation routing」這個概念本身就是個 leaky abstraction：每多一個 generation，運維 surface area 就多一塊，總 generation 數量是有上限的。這個方案幫團隊撐過 2024 年的中段，但所有人都知道它不是終局答案。</p>
+
+<p>同時期還有一個更隱藏的問題：active workspace 從發布到 2024 年 4 月成長了 15×、daily onboarding 容量需求漲了 600×、vector DB 整體 capacity 也跟著放大了 8×。這幾個數字疊在一起的含義是：原始架構的瓶頸不在單機 throughput，而在「provisioning 速度跟得上 onboarding 速度」這件事。dedicated pod 是預先配好的，新 workspace 要 onboard，就得確保 pod 池子裡有 capacity slot——沒有就要新加機器，加機器有 lead time。當 onboarding rate 朝 600× 漲時，pod 池子的 provisioning lead time 變成 product 體驗的瓶頸：新使用者建好 workspace 卻看不到 AI search 工作，因為 vector DB 的 capacity 還在開機。</p>
+
+<p>2024 年 5 月的第一次大手術就是針對這個：把 vector database migration 到 serverless 架構——storage 跟 compute decouple，按使用量計費。一次性把 cost 砍掉 50%，更重要的是把 provisioning 從「先買硬體再 onboard」改成「按需擴展、按需收縮」。但這個 migration 雖然砍了成本、解了 provisioning 瓶頸，並沒有改變「整套 stack 還是綁在同一個 vendor 上」這件事——chunking、embedding、ANN 三層仍然要服從同一個 control plane 的能力邊界。</p>
+
+<h2>2024-2025：turbopuffer migration 跟「全部 re-index」的賭注</h2>
+
+<p>2024 年中到 2025 年 1 月是第二次大手術：評估、選擇、並完整 migration 到 turbopuffer。turbopuffer 的核心差異是 object-storage native——每個 namespace（在 Notion 場景就是每個 workspace）的 vector 直接存在 S3-like backend，read 走 cache + lazy load，write append 進 object。這完全跳脫「dedicated instance 配 capacity」的 mental model，因為 object storage 的 capacity 是 effectively infinite、cost 是 per-byte-stored 而不是 per-instance-hour。</p>
+
+<p>關鍵是這次 migration 是個 forcing function：既然要動，把長期累積的技術債一起還掉——embedding model 從舊版直接升級到新一代、整路 vector full re-index。這在工程上是個大膽決定：60 億級 chunk 全部重新 embed + 重新建索引、過程中還要保持 production read 不間斷。如果 migration 出錯，回退路徑也不便宜——舊 stack 的硬體可能已經開始縮編、新 model 的 embedding 跟舊 model 的不相容。</p>
+
+<p>migration 結果：search engine 帳單砍掉 60%、AWS EMR 計算成本砍掉 35%、p50 query latency 從 70-100 ms 滑到 50-70 ms。三個數字裡 p50 那條最有意思——表面看是 turbopuffer 比較快，實際上是「同時換 ANN backend 跟 embedding model」帶來的綜合效果。新 model 維度可能更低、推理更快；turbopuffer 的 object-storage cache 在 hot workspace 上的 read pattern 比 dedicated pod 的 disk I/O 更可預期。兩者疊起來才有 20-30 ms 的 p50 改善。</p>
+
+<p>cost 那兩個數字也值得拆開看：search engine 60% 跟 EMR 35% 是兩個不同 budget line。前者是「為了 search 本身付給 vector DB vendor 的錢」，後者是「為了 embedding bulk job 付給 AWS 的錢」。後者能跟 vector DB migration 掛上鉤，是因為 turbopuffer 的 namespace 模型讓 bulk re-index 的 write path 簡化——不需要 generation routing、不需要 incremental re-shard 規劃，bulk job 的 orchestration 變簡單，需要的 EMR 算力也跟著下來。</p>
+
+<p>turbopuffer migration 還帶來一個容易被低估的好處：sharding 概念從架構上消失了。前一代要按 workspace 切 pod、要管 routing；turbopuffer 用 namespace 取代 sharding 概念，每個 workspace 是一個獨立 namespace，object storage 不在乎你開 1 萬個還是 1 億個 namespace。前一代每加一個 generation 就多一個 routing layer；現在 routing 只剩 workspace ID → namespace ID 的 trivial 對應。team 不必再養「sharding strategy 怎麼演進」這個額外腦袋。</p>
+
+<h2>2025：Page State Project 跟「演算法層的省」</h2>
+
+<p>到 2025 年 7 月為止，前面兩年的所有 optimization 基本是 infrastructure 層的：換 vendor、換架構、解耦 storage 跟 compute。infrastructure 層的省有極限——把 dedicated 換成 serverless，cost 大概砍對折；換更便宜的 vector DB，再砍對折；極限大概到原本的 1/4。Notion 的 cost-per-query 砍到 1/10，剩下的 6/10 來自演算法層的省：Page State Project。</p>
+
+<p>Page State Project 的觀察非常簡單：絕大多數 page edit 不是改寫整 page，是改一段話、改一個 metadata 欄位、改一個 link target。如果每次 edit 都把整 page 重新 chunk + 重新 embed + 重新 push 到 vector DB，等於把 95% 的 work 浪費在重複處理沒變的 span。換句話說，前一代 pipeline 的 cost driver 不是 query rate，是 edit rate × per-edit-overhead。</p>
+
+<p>實作上：每個 page 的「上一次處理過的狀態」被存在 DynamoDB 裡——每個 span 一個 xxHash 64-bit、metadata 另存一個 hash。下一次 edit 進來，pipeline 先把新的 page chunk 出來、算每個新 span 的 hash、跟 DynamoDB 裡的舊 hash 比對：</p>
+
+<pre data-kind="pseudocode"><code>// online indexer · per page edit event
+new_spans, new_meta = chunk(page_v2)
+old_state = dynamodb.get(page_id)  // previous spans+hashes
+diff = compare_hashes(new_spans, old_state.spans)
+
+// case 1: metadata-only change
+if diff.text_unchanged and diff.meta_changed:
+    turbopuffer.patch(page_id, metadata=new_meta)
+    return  <em>// no embedding work at all</em>
+
+// case 2: minimal span diff
+for span in diff.changed_spans:
+    vec = embed(span)  <em>// only changed spans go to GPU</em>
+    turbopuffer.upsert(span.id, vec, metadata=new_meta)
+
+dynamodb.put(page_id, new_state)  <em>// persist the new fingerprint</em>
+</code></pre>
+
+<p>兩個關鍵 case：metadata-only 的 edit 完全跳過 embedding——這在 Notion 場景非常常見（改 page icon、改 tag、改 author、改 cover image 都算）。改一個 emoji 觸發一次完整 embedding pipeline 的話，cost 是不可承受的。第二個 case 是 minimal span diff——只有真的被改的 span 才送進 GPU。對「改一個段落」這種 90+% 的 edit，re-embed 工作量大概是原本的 5-10%。</p>
+
+<p>整路 data volume 砍掉 70%。這 70% 不是 storage volume，是「進入下游 pipeline 的處理量」——進 Ray cluster 的 chunk 少了 70%、進 turbopuffer 的 vector write 少了 70%、Kafka topic 的 throughput 也少了 70%。每一段都跟著省錢。但這套還有個非顯然的好處：page-state 是個獨立 component，不在 chunking 內部、也不在 embedding 內部、也不在 vector DB 內部。三層任何一層想換實作，page-state 不用動；page-state 自己想改 hash 演算法、改 storage、改 schema，三層也不用動。</p>
+
+<p>下面這個 slider widget 把這個演算法層的省算給你看：拖兩個 knob——一個 page 平均多少 tokens、每次 edit 改變了多少 % 的 spans——對比 naive 全 re-chunk 跟 Page State minimal re-embed 兩種方式的 per-edit 成本差。</p>
+
+<figure class="vg-w-range-rechunk-cost" data-svg-scroll="640">
+  <style>
+    .vg-w-range-rechunk-cost { margin: var(--s-4) 0; padding: var(--s-3); border: 1px solid var(--line); background: var(--bg-soft); }
+    .vg-w-range-rechunk-cost .controls { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s-3); margin-bottom: var(--s-3); }
+    @media (max-width: 520px) { .vg-w-range-rechunk-cost .controls { grid-template-columns: 1fr; } }
+    .vg-w-range-rechunk-cost label.knob { display: grid; gap: var(--s-1); font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+    .vg-w-range-rechunk-cost .val { font-family: var(--sans); font-variant-numeric: tabular-nums; font-size: var(--fs-md); color: var(--accent-text); }
+    .vg-w-range-rechunk-cost input[type=range] { width: 100%; accent-color: var(--accent); min-height: 36px; touch-action: none; }
+    .vg-w-range-rechunk-cost svg { width: 100%; height: auto; display: block; margin-top: var(--s-2); }
+    .vg-w-range-rechunk-cost .reading { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--s-2); margin-top: var(--s-2); font-family: var(--serif); font-size: var(--fs-sm); }
+    @media (max-width: 720px) { .vg-w-range-rechunk-cost .reading { grid-template-columns: 1fr; } }
+    .vg-w-range-rechunk-cost .reading .cell { padding: var(--s-1) var(--s-2); border-left: 2px solid var(--muted-2); }
+    .vg-w-range-rechunk-cost .reading .cell strong { display: block; font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin-bottom: 2px; }
+    .vg-w-range-rechunk-cost .reading .cell.win { border-left-color: var(--accent); color: var(--accent-text); }
+    .vg-w-range-rechunk-cost .cap { font-family: var(--scribed); color: var(--muted); font-size: var(--fs-xs); display: block; margin-bottom: var(--s-2); }
+  </style>
+  <span class="cap">拖兩個 slider：一個 page 的 token 總量、這次 edit 改變了多少 % 的 spans。bar chart 對比 naive 全 re-embed vs Page State minimal re-embed 的 GPU token 成本。</span>
+  <div class="controls">
+    <label class="knob">tokens per page <span class="val" id="vg-w-range-rechunk-cost-t-val">2000</span>
+      <input type="range" id="vg-w-range-rechunk-cost-t" min="200" max="10000" step="100" value="2000" />
+    </label>
+    <label class="knob">% spans changed in this edit <span class="val" id="vg-w-range-rechunk-cost-p-val">8%</span>
+      <input type="range" id="vg-w-range-rechunk-cost-p" min="0" max="100" step="1" value="8" />
+    </label>
+  </div>
+  <svg viewBox="0 0 640 200" role="img" aria-label="Cost of naive re-embed vs Page State minimal re-embed">
+    <rect x="40" y="20" width="560" height="140" fill="none" stroke="var(--line)" />
+    <line x1="40" y1="160" x2="600" y2="160" stroke="var(--ink)" stroke-width="1" />
+    <line x1="40" y1="20" x2="40" y2="160" stroke="var(--ink)" stroke-width="1" />
+
+    <text x="40" y="14" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">GPU tokens embedded per edit (lower is cheaper)</text>
+
+    <!-- naive bar (full red bar at fixed width derived from tokens) -->
+    <rect id="vg-w-range-rechunk-cost-naive" x="60" y="50" width="200" height="44" fill="var(--ink)" fill-opacity="0.5" stroke="var(--ink)" />
+    <text id="vg-w-range-rechunk-cost-naive-lbl" x="160" y="78" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">2,000</text>
+    <text x="60" y="46" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)" font-style="italic">naive · full re-embed</text>
+
+    <!-- page-state bar -->
+    <rect id="vg-w-range-rechunk-cost-ps" x="60" y="108" width="16" height="44" fill="var(--accent)" fill-opacity="0.55" stroke="var(--accent)" />
+    <text id="vg-w-range-rechunk-cost-ps-lbl" x="80" y="136" text-anchor="start" font-family="EB Garamond, serif" font-size="13" fill="var(--accent-text)">160</text>
+    <text x="60" y="104" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)" font-style="italic">Page State · minimal re-embed</text>
+  </svg>
+  <div class="reading">
+    <div class="cell"><strong>naive cost</strong><span id="vg-w-range-rechunk-cost-naive-val">2,000 tok</span></div>
+    <div class="cell"><strong>page state cost</strong><span id="vg-w-range-rechunk-cost-ps-val">160 tok</span></div>
+    <div class="cell win"><strong>savings</strong><span id="vg-w-range-rechunk-cost-savings">12.5× cheaper</span></div>
+  </div>
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-range-rechunk-cost');
+      const tIn = root.querySelector('#vg-w-range-rechunk-cost-t');
+      const pIn = root.querySelector('#vg-w-range-rechunk-cost-p');
+      const tVal = root.querySelector('#vg-w-range-rechunk-cost-t-val');
+      const pVal = root.querySelector('#vg-w-range-rechunk-cost-p-val');
+      const naiveBar = root.querySelector('#vg-w-range-rechunk-cost-naive');
+      const naiveLbl = root.querySelector('#vg-w-range-rechunk-cost-naive-lbl');
+      const psBar = root.querySelector('#vg-w-range-rechunk-cost-ps');
+      const psLbl = root.querySelector('#vg-w-range-rechunk-cost-ps-lbl');
+      const naiveR = root.querySelector('#vg-w-range-rechunk-cost-naive-val');
+      const psR = root.querySelector('#vg-w-range-rechunk-cost-ps-val');
+      const sav = root.querySelector('#vg-w-range-rechunk-cost-savings');
+      function fmt(n) { return Math.round(n).toLocaleString('en-US'); }
+      function update() {
+        const t = +tIn.value;
+        const p = +pIn.value;
+        tVal.textContent = fmt(t);
+        pVal.textContent = p + '%';
+        // naive: always full re-embed = t tokens
+        // page-state: p% of tokens go through GPU (assume even span distribution)
+        const naive = t;
+        const ps = Math.max(1, Math.round(t * p / 100));
+        // bar widths: log-ish, naive maps full token range 200..10000 to 60..580 px
+        const naiveW = 60 + (Math.log10(naive) - Math.log10(200)) / (Math.log10(10000) - Math.log10(200)) * 480;
+        const psW = ps <= 1 ? 4 : 60 + (Math.log10(ps) - Math.log10(200)) / (Math.log10(10000) - Math.log10(200)) * 480;
+        const psWClamped = Math.max(6, psW - 60 + 4); // tiny bar floor
+        const naiveWFinal = Math.max(20, naiveW - 60);
+        naiveBar.setAttribute('width', naiveWFinal);
+        naiveLbl.setAttribute('x', 60 + naiveWFinal / 2);
+        naiveLbl.textContent = fmt(naive);
+        psBar.setAttribute('width', psWClamped);
+        psLbl.setAttribute('x', 60 + psWClamped + 6);
+        psLbl.textContent = fmt(ps);
+        naiveR.textContent = fmt(naive) + ' tok';
+        psR.textContent = fmt(ps) + ' tok';
+        const ratio = naive / ps;
+        sav.textContent = ratio >= 100 ? '>100× cheaper' : ratio.toFixed(1) + '× cheaper';
+      }
+      tIn.addEventListener('input', update);
+      pIn.addEventListener('input', update);
+      update();
+    })();
+  </script>
+</figure>
+
+<p>把 % spans changed 拉到 1-2%（很常見的「改一段話」場景），Page State 大概只動 1-2% 的 GPU tokens，省 50-100×。把它拉到 100%（rare 的「整 page 重寫」場景），兩條 bar 一樣高——這是 page state 的 worst case 也是最差也只是打平 naive，不會更糟。重要的是這個方案沒有「不適用的情境」：它對所有 edit pattern 都單調 dominate naive。</p>
+
+<p>還有一個容易被忽略的點：xxHash 選 64-bit 是個 deliberate trade-off。64-bit hash 在 60 億級 span 上的 collision 機率，按 birthday paradox 算大約是 6e9² / 2^64 ≈ 2e-3——非零但極低。collision 的後果是「某個 span 沒被偵測到改變」，導致 vector DB 裡留著 stale embedding；對 search quality 來說是非常局部、非常輕微的退化，遠低於 collision 換來的 storage 跟 compare cost 的省。換 256-bit hash 是 4× storage、4× compare cost，換來消除一個對 product quality 幾乎不可見的尾部問題——不划算。</p>
+
+<h2>Ray on Anyscale 的雙重身份：bulk + serving 同 cluster</h2>
+
+<p>2025 年 7 月開始的最後一塊大手術：embedding pipeline 從 Spark on EMR 整路換到 Ray on Anyscale。Spark 適合 ETL 那種 row-wise transformation，但 embedding pipeline 的 workload 形狀很特別——CPU 重的 chunking / preprocessing，跟 GPU 重的 model forward pass，要在同一個 job 裡串起來。Spark 在 GPU scheduling 跟 CPU/GPU 異質 workload 上一直不是強項，需要 Spark + 外掛 GPU executor + 第三方 embedding API 三段拼起來；中間多一個 service hop，每一跳都是 cost、latency、reliability 的來源。</p>
+
+<p>Ray 的 dataflow primitive 天生支援這種 pipelining：CPU 任務跟 GPU 任務在同一個 Ray cluster 內、用 actor 模型互相 feed，GPU 不會等 CPU、CPU 不會等 GPU。embedding model 也從第三方 API 換成 OSS model self-host——文章特別強調：「Ray lets us run open-source embedding models directly, without being gated by external providers. As new models are released, we can experiment and adopt them immediately.」這對 product velocity 不是 marginal improvement，是 step change——換 model 從「找 vendor 談、等 vendor 支援、跟 vendor 對齊 SLA」變成「pip install 一個新 weights 就跑」。</p>
+
+<p>更聰明的部分是 Ray Serve 跟 Ray batch 共用同一個 Anyscale cluster type。query path 用 Ray Serve——model 常駐在 GPU、dynamic batching 把多個 concurrent query 合併成同一個 forward pass。bulk re-index 用 Ray dataflow——同樣的 cluster type、不同的 job 形狀。同一份硬體投資、同一套 operability tooling、同一個 team 的 expertise 範圍，serving 跟 batch 兩個世界共用。AWS EMR 計算成本砍 35% 的數字裡，這個「不買兩套硬體」就是主貢獻。</p>
+
+<p>還有一個對 query latency 的 second-order 影響：把第三方 embedding API 從 query path 拿掉，p50 跟 p99 都會明顯改善。第三方 API 的 p99 是你不可控的——對方 region 抖動、network 抖動、rate limit、retry，全部都會 leak 進你自己的 query latency。Ray Serve 自託管後，p99 由你自己的 GPU 跟自己的 network 決定，可以針對性地調 batch size、scaling policy、reserved instance ratio。Notion 文章雖然沒拆出 query path 內各段的 p50 貢獻，但「沒有第三方 API hop」幾乎肯定佔 20-30 ms 改善裡的相當比例。</p>
+
+<h2>把兩年壓成一張時間線：每一階段的主要 win 是什麼</h2>
+
+<p>下面這張可排序的 table 把兩年的主要里程碑列齊，每一段標出主要 win 落在哪個 axis（latency / cost / freshness / capacity），點欄位標題可以重新排序。</p>
+
+<figure class="vg-w-table-notion-eras">
+  <style>
+    .vg-w-table-notion-eras { margin: var(--s-4) 0; overflow-x: auto; }
+    .vg-w-table-notion-eras table { width: 100%; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); min-width: 560px; }
+    .vg-w-table-notion-eras thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; }
+    .vg-w-table-notion-eras thead th[data-sort] { color: var(--accent-text); }
+    .vg-w-table-notion-eras tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+    .vg-w-table-notion-eras td.num { font-variant-numeric: tabular-nums; text-align: right; }
+    .vg-w-table-notion-eras caption { font-family: var(--scribed); color: var(--muted); font-size: var(--fs-xs); text-align: left; padding: 0 0 var(--s-2) 0; }
+  </style>
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/><path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+    </svg>
+    <span>click column header to sort · 5 columns × 6 rows</span>
+  </p>
+  <table>
+    <caption>兩年五個 era，每一段的主要 win 落在哪個 axis。cost 數字是該階段宣告的相對改善（相對前一階段或 baseline）。</caption>
+    <thead>
+      <tr>
+        <th data-key="date">milestone</th>
+        <th data-key="stack">stack of that era</th>
+        <th data-key="win">main win</th>
+        <th data-key="cost" class="num">cost delta</th>
+        <th data-key="axis">primary axis</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>2023-11 launch</td>
+        <td>pgvector + Postgres · dedicated pods · external embedding API</td>
+        <td>ship Notion AI · dual-path (Spark offline + Kafka online) day-one</td>
+        <td class="num">baseline</td>
+        <td>time-to-market</td>
+      </tr>
+      <tr>
+        <td>2024-01 generation routing</td>
+        <td>same pods · generation-based provisioning</td>
+        <td>避免月級 re-shard · 撐住 onboarding 600× 漲幅</td>
+        <td class="num">0%</td>
+        <td>capacity</td>
+      </tr>
+      <tr>
+        <td>2024-05 serverless</td>
+        <td>vector DB serverless · storage / compute 解耦</td>
+        <td>按使用量計費 · provisioning 從 day-level 降到 minute-level</td>
+        <td class="num">-50%</td>
+        <td>cost + capacity</td>
+      </tr>
+      <tr>
+        <td>2024-05 to 2025-01 turbopuffer</td>
+        <td>turbopuffer namespace + object storage · 新一代 embedding model</td>
+        <td>full re-index · p50 從 70-100 ms 降到 50-70 ms</td>
+        <td class="num">-60% search engine</td>
+        <td>latency + cost</td>
+      </tr>
+      <tr>
+        <td>2025-07 page state</td>
+        <td>DynamoDB xxHash per-span fingerprint</td>
+        <td>metadata-only edit 跳過 embedding · changed-span-only re-embed</td>
+        <td class="num">-70% data volume</td>
+        <td>cost (algorithmic)</td>
+      </tr>
+      <tr>
+        <td>2025-07 ray pipeline</td>
+        <td>Ray on Anyscale (batch + Serve 共 cluster) · OSS embedding model</td>
+        <td>CPU/GPU pipelining · 拿掉第三方 API hop · 同硬體投資 serve 兩種 workload</td>
+        <td class="num">-90%+ embedding infra (proj)</td>
+        <td>cost + latency + velocity</td>
+      </tr>
+    </tbody>
+  </table>
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-table-notion-eras');
+      const headers = root.querySelectorAll('thead th');
+      const tbody = root.querySelector('tbody');
+      let activeKey = null, asc = true;
+      headers.forEach(h => h.addEventListener('click', () => {
+        const key = h.dataset.key;
+        if (activeKey === key) asc = !asc; else { activeKey = key; asc = true; }
+        headers.forEach(x => x.removeAttribute('data-sort'));
+        h.setAttribute('data-sort', asc ? 'asc' : 'desc');
+        const rows = [...tbody.querySelectorAll('tr')];
+        const idx = [...headers].indexOf(h);
+        rows.sort((a, b) => {
+          const av = a.children[idx].textContent.trim();
+          const bv = b.children[idx].textContent.trim();
+          const an = Number.parseFloat(av), bn = Number.parseFloat(bv);
+          const cmp = !Number.isNaN(an) && !Number.isNaN(bn) ? an - bn : av.localeCompare(bv);
+          return asc ? cmp : -cmp;
+        });
+        rows.forEach(r => tbody.appendChild(r));
+      }));
+    })();
+  </script>
+</figure>
+
+<p>把 cost 那欄按數字降序排，你會看到一個很有意思的形狀：early-era 的 win 主要在 capacity（撐住 onboarding 速度），mid-era 在 infrastructure cost（serverless / vendor 換），late-era 全是 algorithmic 跟 architectural（page state、Ray 雙身份）。換句話說：infrastructure 層的省會先打出 50% 量級的 quick win，但要再打出下一個 quantum 的省，必須往上游走、去動 chunking strategy 跟 pipeline 拓樸——也就是回到 product 跟 algorithm 的範疇。這條路徑對任何想複製 Notion 這種 cost curve 的團隊都有參考性：先別急著重寫 algorithm，先把 infrastructure 換對；infrastructure 換到位之後，再回頭看 algorithm 還能省多少。順序反了會兩邊都不到位。</p>
+
+<h2>三層解耦對 future-proofing 的真正意義</h2>
+
+<p>整篇 retrospective 最容易被誤讀的一句話是「我們把 chunking、embedding、ANN 三層解耦了」。表面看是「現在用了三個 vendor 而不是一個」，實際上的工程意義是：未來任何一層想換實作，可以在不動其他兩層的前提下進行。下面這個 tab 把這三層各自的 swap 場景排出來看——什麼時候會想換、換的時候有什麼 contract 要守、上次有耦合時換的代價是什麼。</p>
+
+<figure class="vg-w-tabs-notion-layers">
+  <style>
+    .vg-w-tabs-notion-layers { display: grid; gap: var(--s-2); margin: var(--s-4) 0; }
+    .vg-w-tabs-notion-layers input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+    .vg-w-tabs-notion-layers .tabs { display: flex; gap: var(--s-2); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+    .vg-w-tabs-notion-layers .tab { font-family: var(--sans); font-size: var(--fs-sm); padding: var(--s-1) var(--s-2); cursor: pointer; color: var(--muted); min-height: 32px; display: flex; align-items: center; }
+    .vg-w-tabs-notion-layers .panel { display: none; padding: var(--s-2); }
+    .vg-w-tabs-notion-layers .panel h4 { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); margin: 0 0 var(--s-1) 0; }
+    .vg-w-tabs-notion-layers .panel p { font-family: var(--serif); font-size: var(--fs-sm); margin: 0 0 var(--s-2) 0; }
+    .vg-w-tabs-notion-layers .panel ul { font-family: var(--serif); font-size: var(--fs-sm); margin: 0 0 var(--s-2) var(--s-3); padding: 0; }
+    .vg-w-tabs-notion-layers .panel li { margin: 0 0 var(--s-1) 0; }
+    .vg-w-tabs-notion-layers:has(#vg-w-tabs-notion-layers-t1:checked) .panel-1 { display: block; }
+    .vg-w-tabs-notion-layers:has(#vg-w-tabs-notion-layers-t1:checked) [for="vg-w-tabs-notion-layers-t1"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    .vg-w-tabs-notion-layers:has(#vg-w-tabs-notion-layers-t2:checked) .panel-2 { display: block; }
+    .vg-w-tabs-notion-layers:has(#vg-w-tabs-notion-layers-t2:checked) [for="vg-w-tabs-notion-layers-t2"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    .vg-w-tabs-notion-layers:has(#vg-w-tabs-notion-layers-t3:checked) .panel-3 { display: block; }
+    .vg-w-tabs-notion-layers:has(#vg-w-tabs-notion-layers-t3:checked) [for="vg-w-tabs-notion-layers-t3"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+  </style>
+  <input type="radio" id="vg-w-tabs-notion-layers-t1" name="vg-w-tabs-notion-layers-sel" checked />
+  <input type="radio" id="vg-w-tabs-notion-layers-t2" name="vg-w-tabs-notion-layers-sel" />
+  <input type="radio" id="vg-w-tabs-notion-layers-t3" name="vg-w-tabs-notion-layers-sel" />
+  <div class="tabs">
+    <label class="tab" for="vg-w-tabs-notion-layers-t1">chunking 層</label>
+    <label class="tab" for="vg-w-tabs-notion-layers-t2">embedding 層</label>
+    <label class="tab" for="vg-w-tabs-notion-layers-t3">ANN 層</label>
+  </div>
+  <div class="panel panel-1">
+    <h4>chunking · 什麼時候會想換</h4>
+    <p>Notion 引入新 block type（embedded video、AI agent 留下的對話、shared canvas）時，chunking 策略要重新設計——某些 block 應該獨立成 chunk，某些應該跟父 block 合併。</p>
+    <ul>
+      <li><strong>對下游的 contract</strong>：chunk 必須有穩定的 ID，page-state 的 hash key 才能對齊。</li>
+      <li><strong>解耦後的代價</strong>：改 chunking 不需要重建索引（除非 chunk ID schema 變）、不需要動 embedding model、不需要動 ANN backend。改 hash 演算法要一次 full backfill，但只動 DynamoDB。</li>
+      <li><strong>耦合的話會怎樣</strong>：chunking 跟 embedding 綁在一起時，改 chunk boundary 等於改 embedding distribution，整路 vector 都要重算。</li>
+    </ul>
+  </div>
+  <div class="panel panel-2">
+    <h4>embedding · 什麼時候會想換</h4>
+    <p>OSS 出新版 embedding model、search quality 評估指標惡化、想試 multilingual 或 domain-specific 模型——任何想動 embedding 維度或品質的時候。</p>
+    <ul>
+      <li><strong>對下游的 contract</strong>：output 是固定維度的 float vector + chunk ID。新 model 通常維度不同——這個 contract change 還是會 cascade，但只 cascade 到 ANN namespace 的重建，不會 cascade 回 chunking。</li>
+      <li><strong>解耦後的代價</strong>：full re-embed + full re-index（這就是 2024 turbopuffer migration 做的）。但 chunking 不動、page-state 不動、query path 應用層不動。</li>
+      <li><strong>耦合的話會怎樣</strong>：跟第三方 API 綁定時，model 升級要等 vendor、定價要照 vendor 走、可用性要看 vendor。Ray 自託管打開了 model swap 的 cadence——「new model release immediately experimentable」。</li>
+    </ul>
+  </div>
+  <div class="panel panel-3">
+    <h4>ANN · 什麼時候會想換</h4>
+    <p>scale 撞牆（pgvector → dedicated pod → turbopuffer 就是兩次 ANN 換代）、cost 結構不對（per-instance 不適合 multi-tenant workspace 分佈）、新的 ANN 演算法或 storage 模式出現。</p>
+    <ul>
+      <li><strong>對下游的 contract</strong>：accept 固定維度 vector + namespace + metadata filter，回 top-K。</li>
+      <li><strong>解耦後的代價</strong>：double-write 一段時間、shadow read 驗證 recall、cutover——大概是「一個 quarter 的 migration project」量級。embedding 不動、chunking 不動、page-state 不動。</li>
+      <li><strong>耦合的話會怎樣</strong>：pgvector 時代 ANN 跟 Postgres 綁在一起，換 ANN 等於要動整個 Postgres-based persistence layer——對 backup、permission、HA 全部有影響。所以那一代 ANN 換代要走「serverless 過渡 → turbopuffer」兩步，不能一步到位。</li>
+    </ul>
+  </div>
+</figure>
+
+<p>把三個 tab 對齊看，會發現「解耦」這個詞的真正內容：每一層想換實作時，下游的 cascade 範圍小到可預測，沒有「換 A 結果要動 B 跟 C」這種 surprise dependency。三層之間靠 stable interface 對接：chunk ID + vector + metadata filter。interface 越穩定、實作越可替換、團隊越可以平行 iterate。解耦的代價是初期要花心力定義 interface、要忍受「短期看起來比 monolithic 慢」；解耦的收益是長期任何一層想動，都不會把另外兩層拖下水。Notion 的兩年路徑，本質上是從「monolithic pgvector stack」走到「interface-stable three-layer stack」這條從 quick start 到 long-term scalability 的常見軌跡。</p>
+
+<h2>對其他正在做 vector search 的團隊有什麼借鑑</h2>
+
+<p>把這篇 retrospective 抽乾，留下對自己可能適用的條目：第一，pgvector + Postgres 在 day one 仍然是合理選擇——它讓 product 能 ship、讓團隊驗證 vector search 是不是值得投資。但要在心裡知道這個 stack 大概撐到 1-2 億 vector 等級，再上去就要重新設計。Notion 一年內就撞到這個牆，是因為 onboarding 太快；產品 onboarding 沒這麼快的話，這個 stack 可能撐三五年。不要因為「Notion 都換掉了」就跳過 pgvector 階段，那會在 product 還沒驗證就先花 1-2 個季的工程量在不需要的 infrastructure 上。</p>
+
+<p>第二，dedicated instance / pod-based vector DB 在多租戶 workspace model 下 inherently 不合適。workspace 數量隨 product 成長 super-linear 增長，per-instance 的 capacity 規劃永遠跟不上 workspace 數量曲線。object-storage native 的 vector DB（turbopuffer 跟它的同類）是 multi-tenant SaaS 場景下的天然選擇——namespace 數量幾乎免費。如果你的產品形狀是「無限多個小 workspace」，這個架構決策應該在比 Notion 更早的時點做出來。</p>
+
+<p>第三，第三方 embedding API 是 v0 的 enabler、不該是 production 的長期解。query path 的 latency / p99 / reliability 留在第三方手裡是不可接受的；cost 也跟你的 query volume 成正比，沒有 economies of scale。轉到 OSS model + 自託管 GPU 的 inflection point，比大多數團隊以為的早——大概在每月 embedding API bill 過 $50k 量級就值得評估。Ray Serve 把這個轉換的工程複雜度壓到可接受。</p>
+
+<p>第四，演算法層的省（Page State 那種）通常在 infrastructure 層的省走完之後才會浮出來。infrastructure 換到位之前，algorithmic optimization 的 leverage 看不清——你不知道 cost driver 是 query 還是 edit、是 hot data 還是 cold data、是 GPU 還是 network。infrastructure 整理乾淨之後，下一個量級的 cost win 一定在 algorithm 跟 architecture，不在 infrastructure。順序是先 infrastructure，再 algorithm。</p>
+
+<p>第五，「decouple chunking / embedding / ANN」這個原則對任何規模都適用——不是只有 60 億級才需要。剛開始時三層可能住在同一個 Python process 裡，但要用 stable interface 切開：chunk ID 是 first-class entity、vector 跟 metadata 在 interface 上分離、ANN 只看 vector + filter 不看 schema。這幾條 invariant 不需要任何 infrastructure 投資，只需要 code-level 紀律。它讓你未來要把任何一層換成 production-grade 實作時，cascade 範圍可預測。</p>
+
+<p>第六，要有「敢做 full re-index」的工程文化。2024 turbopuffer migration 就是賭一次：60 億 vector 全部重新 embed、新 model + 新 ANN backend 同時換。怕就會把 migration 切成五個 quarter 的小步、每步都不痛但加起來什麼都沒解決。一次性 full re-index 的恐懼，通常被高估——主要 risk 在 read availability，做好 dual-write + shadow read 之後，cutover 本身的 risk 就被收斂到一個短時間窗口。能做 full re-index 的團隊，後續每次 model 升級都會更從容。</p>
+
+<h2>workspace ACL 跟「filter pushdown 到 ANN」</h2>
+
+<p>Notion 的 search 不是「全平台 60 億 chunk 對所有人開放」——每個 query 都帶著嚴格的 workspace + permission boundary。一個使用者只能 search 他能存取的 workspace；workspace 內也分 page-level 的 read permission；某些 block 對某些 role 隱藏。這些 ACL 條件必須在 retrieval 時就生效——讓 ANN 回 K 個 candidate、應用層再用 ACL 過濾的做法在這個量級下會死得很慘：絕大多數 candidate 會被 ACL 篩掉，剩不到幾個能 surface 給 user，recall 會塌掉。</p>
+
+<p>turbopuffer 的 namespace model 在這裡很 elegant：一個 workspace = 一個 namespace，跨 workspace 的 ACL 邊界自動由 namespace 邊界承載——使用者 query workspace A，就 ANN 在 namespace A 裡找，physically 不會碰到 namespace B 的任何 vector。namespace 之內的 page-level / block-level ACL 則靠 metadata filter 下推：每個 vector 都帶一份 (page_id, allowed_roles, visibility_state) metadata，turbopuffer 的 ANN search 接受 pre-filter，這些 filter 在 candidate 還沒進入 distance 計算前就被剃掉。pre-filter 跟 post-filter 在 ANN 上的效果差距是 1-2 個 order of magnitude——pre-filter 在實作上更難（需要 vector DB 原生支援），但 production 上是 must-have。</p>
+
+<p>這個 contract 也對 page-state 設計回推了要求：metadata-only 的 edit 必須能單獨更新 ANN 端的 metadata，不重算 vector——這就是前面 pseudocode 裡 turbopuffer.patch 那條路徑為什麼存在。如果改一個 page 的 visibility 還要重算 embedding，那 ACL 變更（管理員改 sharing setting 這種高頻 operation）會把整路 GPU 燒爆。把 vector 跟 metadata 在 ANN 端分開更新，是把「ACL 變更」這個 product event 跟「文字內容變更」這個 product event 在 cost 上徹底解耦。</p>
+
+<h2>Kafka consumer 的 sub-minute 語意</h2>
+
+<p>online indexer 是 Kafka consumer——這個選擇背後有它自己的一組 trade-off。為什麼不是 webhook 或 RPC？因為 page edit 是 high-volume、burst-y 的 event stream——product 上線新功能、某個大團隊集體編輯、bot 大批 import——任何 sync 設計都會在 burst 時失守。Kafka 的 buffer + consumer group 讓 throughput 跟 latency 解耦：burst 期間 latency 會放大（從 sub-minute 變成幾分鐘），但不會 drop event、不會反壓回 Notion 應用伺服器。對 search freshness 來說，「late 但 eventually consistent」遠優於「fast 但有 drop」。</p>
+
+<p>sub-minute 是 SLA，不是 best-effort。要打到這個數字，consumer 端 worker 並行度要足夠、page-state lookup 必須是 cache-friendly、embedding 跟 vector write 不能 serialize。實作上 consumer 大概是按 page_id hash 分 partition，同一個 page 的多次連續 edit 進同一個 partition、保序處理；不同 page 平行處理，互不影響。這個分區設計同時解決兩個問題：保 per-page 順序（連續兩次 edit 不會 race 出 stale state）、又最大化 throughput。但代價是 hot page 會變成 hot partition——某個爆紅文件被高頻編輯時，那個 partition 的 lag 會被推高。緩解通常是 dynamic partition split 或限制 per-page 更新頻率，文章沒明說 Notion 採用哪個。</p>
+
+<p>另一個容易被低估的 corner case：edit 跟 delete 的 ordering。使用者刪一個 page，幾秒後 restore 回來——兩個 event 進 Kafka，consumer 要保證 restore 後 vector 仍在 turbopuffer 裡。如果 delete event 比 restore 晚被 process，vector 會被誤刪。實務上會用 versioned write（每個 event 帶 version，consumer skip 比當前 version 舊的 event）或 idempotent upsert（restore = 重新 embed + upsert，等於 delete 的 inverse operation）來處理。這類細節在 sub-minute SLA 下會反覆出現——event ordering 不是 nice-to-have，是 correctness。</p>
+
+<h2>Ray Serve 的 dynamic batching 跟 p99</h2>
+
+<p>query path 的 embedding 用 Ray Serve，model 常駐 GPU。dynamic batching 是 throughput 跟 latency 的中央 trade-off：把同時抵達的 N 個 query 合併成一個 batch 一起 forward，GPU 利用率高、cost-per-query 低；但每個 query 要等 batch window 結束才開始算。Notion 用什麼 window size？文章沒講明，從 p50 50-70 ms 的數字推測，大概落在 5-15 ms。這個範圍裡 GPU batch size 可以累積到 4-16，吃掉 GPU 利用率的甜蜜點，又不會把 p99 拉到難看的數字。</p>
+
+<p>p99 才是 dynamic batching 真正的考驗。p50 漂亮意味著大多數 query 在 batch 內順利匯流；但偶爾會出現「query 抵達時 batch 剛好開始上一輪」的對齊不利，這個 query 就要等完整個 window + GPU forward + ANN search。p99 的數字 Notion 沒在這篇文裡公開——這在以 p50 為主打的 retrospective 裡是個合理的 omission，但 production team 自己一定盯著。Ray Serve 提供的工具是 max-batch-size + max-wait-time-ms 兩個 knob，大多數團隊會把 max-wait 設得保守（5-10 ms）以保 p99，犧牲一點 GPU 利用率。</p>
+
+<p>還有一個 second-order 問題：embedding model 自己的 forward time 是 query length 的函數——一個 5 字的 query 跟一個 200 字的 query 在同 batch 裡會被 pad 到一樣長度，短 query 浪費掉 pad 部分的 compute。對 search query 這種「絕大多數很短」的 distribution，naive padding 是 cost 的大頭。比較成熟的實作會做 length-bucketed batching：把長度相近的 query 放同一個 batch，pad 比例最小化。Ray Serve 原生不直接做這個，要在 application 層自己 group——文章沒提，但 60 億級的成本敏感度下這幾乎一定做了。</p>
+
+<h2>cross-region 跟 cold-start onboarding</h2>
+
+<p>Notion 是全球 SaaS，user 分佈在多個 region，但 vector DB 通常不會 globally replicate——成本太高、freshness 一致性難保。取捨大概是：vector DB 集中在主 region（推測是 us-east-1），cross-region query 接受 inter-region network latency。對 sub-second target 來說，跨 region 來回大概多 50-100 ms——對 search 這種 user-tolerant 的 operation 還可接受，對 chat 這種 turn-by-turn 互動則需要在 region 內 cache hot vector 或 deploy local replica。</p>
+
+<p>cold-start onboarding 是另一條獨立 path：新 workspace 被建出來，所有歷史 page 必須一次性被 chunk + embed + index。前一代用 Spark on EMR 跑 bulk job——onboarding 速度受限於 EMR provisioning 時間。Ray cluster 共用 batch 跟 serving，意味著 onboarding job 可以在 spare GPU capacity 上 pippet 跑：query 流量低谷期，serving GPU 自動轉去跑 backfill；query 流量高峰時，backfill 自動讓位給 serving。同一份硬體投資、兩種 workload 互補。這個「workload 互補」是雲時代 cost optimization 的常見手法，但要 implementation 上做對，需要的是統一的資源排程模型——Ray actor model 剛好提供這個。</p>
+
+<p>還有一個 cold-start 的 quality 問題：剛 onboard 的新 workspace，page-state DynamoDB 還沒任何記錄，所有 chunk 都被當「新 span」處理——這是 Page State Project 的最壞 case，第一輪 onboarding 沒有任何 incremental gain。但這沒問題：onboarding 是一次性 cost，攤平到 workspace 整個生命週期、跟之後成千上萬次 edit 比，第一次 full embed 的 cost 微不足道。Page State Project 解決的是 steady-state edit volume，不是 first-load。</p>
+
+<h2>monitoring、recall regression、跟「悄悄變差」的恐懼</h2>
+
+<p>vector search 系統最危險的退化不是 query latency 上升（那會立刻被 dashboard 抓到），是 recall 悄悄變差——某些 query 的 top-K 結果變得跟使用者預期越來越遠，但沒有 metric 直接 catch。每一次 model swap、每一次 ANN backend 更換、每一次 chunking 策略調整，都可能引入 recall regression。Notion 在 turbopuffer migration 那段一定要面對這個——換 ANN 後 recall 跟舊系統相比是漲還是跌？沒有 golden eval set 就無法 answer。</p>
+
+<p>實務上會有兩種互補的 eval 方式。第一是 offline golden set：把過去一段時間真實 query 配上「正確答案」（通常是使用者後續真的點開 / interact 的結果）做成 dataset，新系統跟舊系統都跑一遍、比 NDCG@10 或 recall@K。第二是 online A/B：把新系統的結果跟舊系統的結果各餵給一部分使用者，看 click-through、long-dwell、後續 query reformulation rate。前者 cheap 但會 overfit 到 historical query distribution，後者 expensive 但反映 ground truth。成熟團隊兩種都做。</p>
+
+<p>還有一個 subtle 的 quality metric：result diversity。vector search 容易在 distribution tail 上把「幾個很像的 chunk」連 surface 上來——同一個 page 的不同段落、同一個主題的不同 page。對使用者來說，三個幾乎相同的 result 不如三個互補的 result。實務上會在 ANN 回 top-K' (K' &gt; K) 之後做 MMR (Maximal Marginal Relevance) 之類的 diversity rerank。這層 rerank 不在這篇 retrospective 顯著提及，但對 quality 來說常是 last-mile 必經之路。</p>
+
+<h2>還沒解決的：multi-modal、agent、跟 sub-second 互動</h2>
+
+<p>retrospective 是把過去兩年的解結清楚，沒有 explicit 講「下一步是什麼」。但從架構形狀可以推測未來 2-3 個方向。第一個是 multi-modal——Notion 在加入 embedded image、embedded video、AI agent 留下的 conversation history 之後，這些 non-text content 也要 embed 進 vector space。文字 embedding 跟 image embedding 不在同一個 space，要嘛走 CLIP 風格的 joint space 模型、要嘛 maintain 多個 parallel namespace + 在 query time 跨 namespace fan-out。前者統一但 model 訓練 / swap 成本高，後者靈活但 ANN 端要支援 multi-namespace query。</p>
+
+<p>第二個是 agent workload。AI agent 不像人類 user，會在很短時間內發出大量 query——一個 task 可能觸發幾十次 vector search，每次 query 之間還有 LLM inference。對 vector DB 來說，agent 流量 burst-y、scale 比 user 流量大一兩個 order、對 p99 容忍度比 user 高（agent 等得起，user 等不起）。Notion 既然在猛推 AI agent 功能，這個 traffic shape 應該已經在 production 上開始壓 vector DB——dynamic batching 的 window 是不是要分 user / agent 各一條 path、namespace 是不是要按 traffic class 分 priority，都是設計題。</p>
+
+<p>第三個是 sub-second 互動 latency。現在 p50 50-70 ms 是純 ANN+embed 的時間，加上 LLM inference 跟 result rendering，end-to-end 通常落在 1-3 秒。對 chat 體驗來說，這個還不夠快——使用者期望接近即時。要把 end-to-end 壓到 sub-second，vector search 部分還要再砍——可能透過更輕量的 embedding model（speed 換 quality）、predictive prefetch（猜下一個 query 提前算）、或 query result cache（重複 query 走 cache）。這幾個方向都是已知技術，問題在哪個 trade-off 對 Notion 最划算。</p>
+
+<h2>把「component contract」抽出來當第一性原理</h2>
+
+<p>把整篇 retrospective 抽掉所有 vendor 名字、所有具體技術選擇，剩下的骨架其實是一套關於 component contract 的原則：每個 component 必須有 well-defined input/output、必須 explicit 列出它刻意不知道什麼、必須能在 implementation 全換的前提下保持 interface 不動。chunking 不知道 embedding 用哪個 model、embedding 不知道 ANN 怎麼存、ANN 不知道 vector 是怎麼算出來的——這些「不知道」不是溝通不足，是 deliberate ignorance，是維持解耦的方法。</p>
+
+<p>這個原則在分散式系統設計上其實是老生常談——Conway's Law 的反操作、microservices 的核心理念、Domain-Driven Design 的 bounded context。Notion 把它應用到 ML pipeline 上，看起來新鮮主要是因為 ML 系統相比 OLTP 系統更年輕，這套工程紀律還沒被 ML 圈普遍內化。很多 ML 團隊還在 monolithic notebook + monolithic job 的階段，chunking / embedding / serving 全部住在同一個 Python script 裡，互相 hardcode 對方的 schema。短期 ship 快，長期任何一處想換實作，整個 stack 都要重做。</p>
+
+<p>從這個視角，turbopuffer / Ray / DynamoDB 這些 vendor 名字其實是 second-order detail——換成 Pinecone / Modal / Aurora 也大概率成立，前提是 vendor 的 interface 仍然乾淨。真正的 first-order decision 是「願不願意花初期工程量定義跨 component 的 interface」。願意的話，任何 vendor 換代都是局部 surgery；不願意的話，任何 vendor 換代都是 full-stack rewrite。Notion 兩年走的不是技術跳躍，是工程紀律的累積——這對其他 team 的可借鑑度，遠高於「用哪家 vendor」這個表層問題。</p>
+
+<p class="vg-deep-closer"><strong>The lesson</strong>：vector search 的成熟度不在「我用了 turbopuffer / Ray / open-source model」這些 vendor 名字上，而在 chunking / embedding / ANN 三層之間 interface 有多乾淨、page state 這類 algorithmic abstraction 有沒有被獨立出來成為 first-class component、敢不敢在量級撞牆時做 full re-index 這種大手術。Notion 兩年的 cost 砍九成、document 漲十倍，最後沉澱出來的不是「我們選對 vendor」，是「我們把 system 切成可以獨立 swap 的三層」。前者是運氣，後者是工程選擇——而且後者讓未來每一次量級成長都更輕鬆，不像前者每隔一段就要重新賭一次。</p>
+
+</div>
