@@ -1,0 +1,1004 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">Gen12 那一批將近 2,000 台 core unit，每一台拿到一個新 firmware 後要重開一次機；一開始量出來的數字是「四個小時」——其中二十分鐘純粹在等四次 network boot timeout、其它三個多小時花在 UEFI HII 數據結構的 lazy load 與 iPXE script 沒被自動化的人手介入上。三個工程師把這條開機路徑沿著 serial console 一格一格拆，最後把同一台機器的整套 firmware 升級流程從近 4 小時壓到 3 分鐘、單次後續開機從 20 分鐘壓到 1 分鐘以內。</p>
+  <h1 class="vg-post-title">把伺服器開機從幾小時縮到幾分鐘——Cloudflare 拆 UEFI、iPXE、firmware 三層遲延</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p>
+    <span class="vg-dropcap">這</span>篇是 Cloudflare core-fleet team 五月底貼的一篇 oncall 故事：他們的 core unit——那些跑 control plane、billing、analytics 的中心化伺服器，跟邊緣 metal 是分開的——必須在 firmware 升級節奏裡反覆 reboot；而某一代 BMC + UEFI firmware 把單次 firmware 升級 + 重開的自動化耗時頂到了「近四小時」。文章作者 Giovanni Pereira Zantedeschi、Nnamdi Ajah 與 Omar Sheik-Omar 把整條 boot path 沿著 serial console 拆開、量出每一層遲延、再對症下藥。
+  </p>
+
+  <p>
+    這個故事好看的地方不是「縮 boot time」本身——縮 boot time 不算稀奇，Phoronix 上每週都有人把 grub timeout 從 5 秒砍到 1 秒。
+  </p>
+
+  <p>
+    好看的是它把「四小時」這個誇張數字逐層歸因到三個性質完全不同的根因。
+  </p>
+
+  <p>
+    第一條根因屬於 firmware 資料結構：UEFI 為了顯示一個「Network Boot 設定」的選單，把資料結構做成 lazy-load、結果每次 reboot 都要重算一次。
+  </p>
+
+  <p>
+    第二條根因屬於自動化介面：iPXE 沒有 script 化，人手敲了的話沒問題、自動化用 expect-style 等 prompt 卻會把人類動作折成多次 timeout。
+  </p>
+
+  <p>
+    第三條根因屬於 vendor 多樣性：vendor 出貨的 NIC interface string 各自不一致，CfHIIConfig_App 工具沒法跨機器套同一條設定。
+  </p>
+
+  <p>
+    三個根因疊起來才是四小時，省下任何一條都不會單獨把問題解掉——這正是好的 perf bug 跟 90% 的 perf bug 的差別。
+  </p>
+
+  <p>
+    一個常見的反例：很多 perf bug 真的是「某個 lock 太貪」或「某個 query 沒走 index」，砍掉它整體就回去了。這種 bug 的 fingerprint 很乾淨，profiler 一抓就抓到，writeup 也很簡單——但它教不出什麼方法論。
+  </p>
+
+  <p>
+    這篇故事的反面是，三層根因每一層都看起來「合理」——lazy-load 是 UEFI 設計師對「使用者不會連按」的假設；expect-style 是把人類動作機器化的最直觀做法；vendor diversity 是 procurement 給你的事實。真正讓四小時凝結出來的，是這三條合理假設在「自動化 firmware 升級」這個 workflow 上意外撞在一起。
+  </p>
+
+  <p>
+    這也是為什麼第一直覺的「縮 timeout」「換 BIOS 廠商」「叫 vendor 統一字串」都各自治標——每一條都只動一層，剩下兩層仍然把 wall-clock 拉滿。要把四小時壓到三分鐘，得三層都動。
+  </p>
+
+  <p>
+    下面這張互動圖把整條 boot stack 從 PSU power-on 一路到 kernel hand-off 鋪平，每一層點開可以看到「這一層原本花多少」「為什麼花這麼多」「換成什麼之後變多少」。最值得注意的不是任何一格的縮減幅度，而是這四層之間的耦合：上一層的 timeout 行為決定下一層會不會被 trigger，所以單獨優化一層常常會被另一層吃回去。
+  </p>
+
+  <figure class="vg-w-annotated-boot-stack" data-svg-scroll="560">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M9 11.5 3 13l9 9 9-9-6-1.5"/>
+        <path d="m13 12.5 2.5-2.5L13 7.5"/>
+        <path d="M3 13V8a5 5 0 0 1 10 0v4"/>
+      </svg>
+      <span>click any layer to read its responsibility · 4 layers</span>
+    </p>
+    <style>
+      .vg-w-annotated-boot-stack { display: grid; grid-template-columns: 1fr; gap: var(--s-3); align-items: start; margin: var(--s-4) 0; }
+      .vg-w-annotated-boot-stack svg.vg-w-annotated-boot-stack-main { width: 100%; height: auto; }
+      .vg-w-annotated-boot-stack input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-annotated-boot-stack .layer { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; transition: fill 200ms, stroke 200ms; }
+      .vg-w-annotated-boot-stack .layer:hover { stroke: var(--accent); }
+      .vg-w-annotated-boot-stack .layer:focus { outline: none; }
+      .vg-w-annotated-boot-stack .layer:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+      .vg-w-annotated-boot-stack .layer-text { pointer-events: none; }
+      .vg-w-annotated-boot-stack .detail { padding: var(--s-2) var(--s-3); border-left: 2px solid var(--accent); display: none; }
+      .vg-w-annotated-boot-stack .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-annotated-boot-stack .detail p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-annotated-boot-stack .detail .nums { font-family: var(--display); color: var(--accent-text); font-size: var(--fs-md); display: flex; gap: var(--s-3); margin-top: var(--s-1); }
+      .vg-w-annotated-boot-stack .detail .nums span em { font-style: normal; color: var(--muted); font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; display: block; }
+      .vg-w-annotated-boot-stack:has(#vg-w-annotated-boot-stack-r1:checked) .layer-1 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-annotated-boot-stack:has(#vg-w-annotated-boot-stack-r2:checked) .layer-2 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-annotated-boot-stack:has(#vg-w-annotated-boot-stack-r3:checked) .layer-3 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-annotated-boot-stack:has(#vg-w-annotated-boot-stack-r4:checked) .layer-4 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-annotated-boot-stack:has(#vg-w-annotated-boot-stack-r1:checked) .detail-1 { display: block; }
+      .vg-w-annotated-boot-stack:has(#vg-w-annotated-boot-stack-r2:checked) .detail-2 { display: block; }
+      .vg-w-annotated-boot-stack:has(#vg-w-annotated-boot-stack-r3:checked) .detail-3 { display: block; }
+      .vg-w-annotated-boot-stack:has(#vg-w-annotated-boot-stack-r4:checked) .detail-4 { display: block; }
+      @media (max-width: 720px) {
+        .vg-w-annotated-boot-stack { grid-template-columns: 1fr; }
+      }
+    </style>
+
+    <input type="radio" id="vg-w-annotated-boot-stack-r1" name="vg-w-annotated-boot-stack-sel" checked />
+    <input type="radio" id="vg-w-annotated-boot-stack-r2" name="vg-w-annotated-boot-stack-sel" />
+    <input type="radio" id="vg-w-annotated-boot-stack-r3" name="vg-w-annotated-boot-stack-sel" />
+    <input type="radio" id="vg-w-annotated-boot-stack-r4" name="vg-w-annotated-boot-stack-sel" />
+
+    <svg class="vg-w-annotated-boot-stack-main" viewBox="0 0 480 360" role="img"
+         aria-label="Core unit boot stack 四層：HII lazy-load、iPXE network-boot timeout、CfHIIConfig regex、vendor string 正規化">
+      <defs>
+        <marker id="vg-w-annotated-boot-stack-arr" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
+          <path d="M0,0 L6,3 L0,6 Z" fill="currentColor" />
+        </marker>
+      </defs>
+
+      <text x="240" y="22" text-anchor="middle" fill="var(--ink)" font-family="EB Garamond, serif" font-size="14">PSU 通電 → kernel hand-off 之間的四層</text>
+
+      <rect class="layer layer-1" data-target="vg-w-annotated-boot-stack-r1" role="button" tabindex="0" aria-label="select HII lazy-load" x="40" y="50" width="400" height="56" rx="4"/>
+      <text class="layer-text" x="240" y="74" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">L1 · UEFI HII lazy-load (EFI_IFR_REF3)</text>
+      <text class="layer-text" x="240" y="94" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">「Network Boot」選單只要被讀，每次 reboot 都重算一次</text>
+
+      <line x1="240" y1="106" x2="240" y2="124" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-annotated-boot-stack-arr)"/>
+
+      <rect class="layer layer-2" data-target="vg-w-annotated-boot-stack-r2" role="button" tabindex="0" aria-label="select iPXE network-boot timeout" x="40" y="128" width="400" height="56" rx="4"/>
+      <text class="layer-text" x="240" y="152" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">L2 · iPXE network-boot timeout 鏈</text>
+      <text class="layer-text" x="240" y="172" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">HTTPSv4 → iPXEv4 → HTTPSv6 → PXEv6 每段 ~5 分鐘</text>
+
+      <line x1="240" y1="184" x2="240" y2="202" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-annotated-boot-stack-arr)"/>
+
+      <rect class="layer layer-3" data-target="vg-w-annotated-boot-stack-r3" role="button" tabindex="0" aria-label="select CfHIIConfig regex" x="40" y="206" width="400" height="56" rx="4"/>
+      <text class="layer-text" x="240" y="230" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">L3 · CfHIIConfig_App + regex setter</text>
+      <text class="layer-text" x="240" y="250" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">把「Force Priority Httpv4 Httpv6 Pxev4 Pxev6」一次寫進 NV</text>
+
+      <line x1="240" y1="262" x2="240" y2="280" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-annotated-boot-stack-arr)"/>
+
+      <rect class="layer layer-4" data-target="vg-w-annotated-boot-stack-r4" role="button" tabindex="0" aria-label="select vendor string normalization" x="40" y="284" width="400" height="56" rx="4"/>
+      <text class="layer-text" x="240" y="308" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">L4 · vendor NIC string 正規化</text>
+      <text class="layer-text" x="240" y="328" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">廠商之間 interface 字串不一致，regex 才能跨機器一條設定</text>
+    </svg>
+
+    <div>
+      <div class="detail detail-1">
+        <h3>L1 · UEFI HII 的 lazy-load 是怎麼吃掉時間的</h3>
+        <p>UEFI HII (Human Interface Infrastructure) 用一連串 <code>EFI_IFR_*</code> opcode 描述設定表單；其中 <code>EFI_IFR_REF3</code> 是「跳到另一張 form」的 reference，欄位包含 Header、Question、QuestionId 與 FormSetId。Cloudflare 用到的這顆 UEFI 把 Network Boot 設定畫面實作成 lazy load：第一次被讀時才把整張 form 算出來，之後也不快取。</p>
+        <p>單看一台機器，這個延遲在 manual config 時是「按一次 Esc 就回去了」；但自動化要連續讀寫 boot order，每次都觸發一次完整 form 計算，疊加起來變成數分鐘等級的固定 overhead。</p>
+        <p><strong>原因類別</strong>：firmware 資料結構的計算複雜度被 hidden 在「使用者不會連按」的假設裡。</p>
+        <div class="nums">
+          <span>前<em>數十分鐘</em></span>
+          <span>後<em>parallelized parsing</em></span>
+        </div>
+      </div>
+      <div class="detail detail-2">
+        <h3>L2 · iPXE network-boot 的 four-attempt timeout 鏈</h3>
+        <p>BMC 預設 boot order 把 IPv4 HTTPS、IPv4 iPXE、IPv6 HTTPS、IPv6 PXE 排在一起，每個介面 try 一次再 timeout 到下一個——serial console 直接觀察到「attempting an IPv4 HTTPS network boot, timing out after several minutes, then trying IPv4 iPXE, timing out again」。</p>
+        <p>單一介面 timeout 大約「roughly five minutes」，四次連續失敗就是 <em>~20 分鐘</em> 純等待。修法是把 boot order 固化成 <code>Force Priority Httpv4 Httpv6 Pxev4 Pxev6</code>，並把 iPXE 變成 scripted automation——人類不再需要在 prompt 介面前等待。</p>
+        <p><strong>原因類別</strong>：序列化的 fallback 鏈 × 每段固定 timeout = 線性疊加。</p>
+        <div class="nums">
+          <span>前<em>~20 min / 4 attempts</em></span>
+          <span>後<em>&lt; 1 min</em></span>
+        </div>
+      </div>
+      <div class="detail detail-3">
+        <h3>L3 · CfHIIConfig_App + regex 把設定變成 idempotent</h3>
+        <p>Cloudflare 內部的 <code>CfHIIConfig_App</code> 工具本來只能用字面字串比對來設定 UEFI NV 變數；他們新增了 regex 比對與一個 <code>uefi-same-hex</code> Boolean，這個 flag 讓工具可以直接判斷「目標設定已經跟現況 hex-equal、不需要做 show + compare + write」。對自動化來說，這條 fast-path 把每次 firmware 升級後驗證 NV 變數的開銷從「對所有 question 走一遍 read-modify-write」改成「同樣 hex 直接 skip」。</p>
+        <p>對應的 GUID 是 <code>91468514-75bc-4bb5-8f33-91efff9e9b1f</code>，是這顆 NV variable 的 namespace；對 vendor B 出貨的同樣語意設定可能是另一個 GUID，所以工具需要能用 regex 跨機器 normalise。</p>
+        <p><strong>原因類別</strong>：自動化 read-modify-write 在「設定其實沒變」時仍付了完整 cost。</p>
+        <div class="nums">
+          <span>前<em>每次都 R-M-W</em></span>
+          <span>後<em>hex-equal fast skip</em></span>
+        </div>
+      </div>
+      <div class="detail detail-4">
+        <h3>L4 · 為什麼同一個介面有兩個名字</h3>
+        <p>同一條「HTTPS IPv4 第一個 NIC port」設定，在不同 NIC vendor 上會出現像 <code>HTTPS IPv4 Ethernet Network Adapter XXX-XXX-Y for OCP 3.0 P1</code> 跟 <code>HTTPS IPv4 Network Adapter - 50:00:E6:8F:4F:32 P1</code> 這種完全不同的字串——其中一個藏 MAC、另一個藏 OCP 規格 + 廠商 SKU。對 expect-style 自動化來說，這意味著「一張機器一個 regex」變成不可避免。</p>
+        <p>他們的對策有兩條：短期內把 regex 寫進 CfHIIConfig_App，吃下廠商差異；長期跟 UEFI vendor 推 string normalization——這條目前還在進行中。</p>
+        <p><strong>原因類別</strong>：vendor diversity 把「跨 fleet 套同一條 config」變成正則匹配問題。</p>
+        <div class="nums">
+          <span>前<em>per-vendor 腳本分支</em></span>
+          <span>後<em>regex 收斂為一條</em></span>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-annotated-boot-stack');
+        if (!root) return;
+        root.querySelectorAll('.layer').forEach((rect) => {
+          rect.addEventListener('click', () => {
+            const targetId = rect.getAttribute('data-target');
+            const radio = root.querySelector('#' + targetId);
+            if (radio) radio.checked = true;
+          });
+          rect.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              rect.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            }
+          });
+        });
+      })();
+    </script>
+  </figure>
+
+  <h2>那個「四個小時」是怎麼疊出來的</h2>
+
+  <p>
+    要看清為什麼會變四個小時，得先看 core unit 的 firmware 升級長什麼樣子。
+  </p>
+
+  <p>
+    它不是「一支 script 跑進去、結束」——而是分三段。
+  </p>
+
+  <p>
+    第一段是 firmware initialization：BIOS、BMC、NIC 各家 firmware 在 power-on 之後自我更新並重建內部表。
+  </p>
+
+  <p>
+    第二段是 pre-boot phase：UEFI 把 boot menu 算出來、iPXE 試 network boot、拉 OS image。
+  </p>
+
+  <p>
+    第三段是 kernel startup：傳統 Linux init、systemd unit 啟動、network 就緒。
+  </p>
+
+  <p>
+    其中 firmware initialization 與 kernel startup 都還算可預測——前者由 vendor 控制、節奏穩定；後者多年來被 systemd 社群調優過，已經接近 wall-clock 的下界。
+  </p>
+
+  <p>
+    pre-boot phase 是這次 bug 的主場——這一段橫跨 UEFI 與 iPXE 兩個 runtime，介面在 vendor、firmware revision、自動化框架之間不一致，每一次小調整都會在某個地方意外炸出新的等待。
+  </p>
+
+  <p>
+    自動化的 expect-style 腳本原本想模擬「人類運維打開 IPMI、選一個 boot device、按 Enter」的動作。
+  </p>
+
+  <p>
+    但對自動化來說，「按 Enter」沒有 prompt 可看，於是腳本就只能等預設的 boot order 跑完一輪。
+  </p>
+
+  <p>
+    預設 boot order 包含四種 network boot 介面——IPv4 HTTPS、IPv4 iPXE、IPv6 HTTPS、IPv6 PXE——每一個都會 try 一次再 timeout 到下一個。
+  </p>
+
+  <p>
+    serial console 上看到的句子就是「attempting an IPv4 HTTPS network boot, timing out after several minutes, then trying IPv4 iPXE, timing out again」這樣的滾動文字，作者用了個非常準確的詞：「roughly five minutes waiting for a timeout response」。
+  </p>
+
+  <p>
+    五分鐘 × 四次 = 二十分鐘——這只是一次後續 boot 的水位線。
+  </p>
+
+  <p>
+    原始的「四個小時」用語是文章作者描述「整個自動化的 firmware 升級流程」，那條流程包含好幾次重開、每次都吃這 20 分鐘的 boot。
+  </p>
+
+  <p>
+    加上 firmware initialization 自己也有疊加的等待——BMC 重啟期間 UEFI 不可進入、HII 表得重算、NIC option ROM 在 BMC 訊號就緒之前不能查 PCIe topology。
+  </p>
+
+  <p>
+    把這幾段乘起來，4 hours 就是 honest 的 wall-clock，不是夸張。它不是「某個地方 hang 住」、不是「某條 retry 死循環」，而是 design-by-default 的三層 timeout 預算被認真地全部花完。
+  </p>
+
+  <p>
+    這條時間線需要被質疑的第一個假設是「為什麼自動化會等 timeout 而不是主動 abort」。
+  </p>
+
+  <p>
+    答案是：自動化沒有跟 UEFI 的 boot manager 直接對話的 channel——它只能透過 IPMI serial console 看到字串，腳本只在看到特定 prompt 之後才能下一步動作；而當下的 boot order 設定根本不會吐出那些 prompt。
+  </p>
+
+  <p>
+    所以「縮 timeout」這個自然反應其實治標：真正的修法是讓 boot order 永遠走 scripted path、永遠不進入 timeout 鏈。
+  </p>
+
+  <p>
+    第二個值得質疑的假設是「為什麼 HII form 每次都要重算」。
+  </p>
+
+  <p>
+    Lazy load 對使用者來說合理（你不點 menu 就不付 cost），但對 firmware update 後第一次 boot 來說，所有 form 都會被自動化讀一遍——lazy 變成 eager 但仍按 lazy 路徑跑。
+  </p>
+
+  <p>
+    這個 mismatch 是隱性最久的延遲源，因為它落在 firmware 內、外面看不見；只有把 serial console 加 timestamp、把每段 stall 對齊到 HII opcode 才能定位。
+  </p>
+
+  <p>
+    從廣義 perf 角度看，這也是一個經典的「workload shift defeated the optimization」的例子——lazy-load 在原始 workload（人類偶爾點 menu）下是淨贏，但 workload 換成「自動化每次升級都讀 menu」時，這條 optimization 就反過來收 cost。
+  </p>
+
+  <p>
+    第三個假設更微妙：「為什麼一台機器的 expect 腳本可以複製到下一台」。
+  </p>
+
+  <p>
+    在同一批 vendor 出貨下、同一張 NIC 型號上、同一版 BMC 的世界裡，這個假設成立；但 Gen12 採購過程包含兩家 NIC 廠商，光是 boot interface 顯示字串就是兩套寫法——一台機器 work 的 regex 在另一台會 silently miss。
+  </p>
+
+  <p>
+    前面那張互動圖的 L4 就是這個問題的物理化形式。這個 bug 的 nasty 屬性是它 silently：自動化不會錯誤地中止、不會吐 error；它會跑完、報 success，但實際上沒寫進該寫的 NV 變數——下一次 boot 就回到 default boot order，下一次自動化升級又重來。
+  </p>
+
+  <p>
+    把這三個質疑串起來，就有了下面這張時間預算表——把整個 firmware 升級的 4 小時拆到各段，再列出修完之後的對照。表格可以點 header 排序，按修法前後或 fix 類型看都行。
+  </p>
+
+  <figure class="vg-w-table-boot-budget">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/>
+        <path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+      </svg>
+      <span>click column header to sort · 5 columns × 6 rows</span>
+    </p>
+    <style>
+      .vg-w-table-boot-budget { margin: var(--s-4) 0; overflow-x: auto; }
+      .vg-w-table-boot-budget table { width: 100%; min-width: 520px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-boot-budget thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; }
+      .vg-w-table-boot-budget thead th[data-sort] { color: var(--accent-text); }
+      .vg-w-table-boot-budget tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); }
+      .vg-w-table-boot-budget td.num { font-variant-numeric: tabular-nums; text-align: right; }
+      .vg-w-table-boot-budget figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-2); }
+    </style>
+    <table>
+      <thead>
+        <tr>
+          <th data-key="phase">階段</th>
+          <th data-key="layer">所屬層</th>
+          <th data-key="before" class="num">原本 (min)</th>
+          <th data-key="after" class="num">修後 (min)</th>
+          <th data-key="cause">主因</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>4× network boot timeout</td><td>iPXE</td><td class="num">20</td><td class="num">0.5</td><td>每介面 ~5 min 等回應</td></tr>
+        <tr><td>HII form lazy recompute</td><td>UEFI</td><td class="num">40</td><td class="num">3</td><td>EFI_IFR_REF3 每次重建</td></tr>
+        <tr><td>firmware self-init wait</td><td>BMC</td><td class="num">35</td><td class="num">8</td><td>BMC reboot 期間 UEFI 不可入</td></tr>
+        <tr><td>CfHIIConfig R-M-W loop</td><td>tool</td><td class="num">25</td><td class="num">2</td><td>逐 question 比對改寫</td></tr>
+        <tr><td>vendor string match retries</td><td>tool</td><td class="num">15</td><td class="num">0.5</td><td>per-vendor 腳本分支</td></tr>
+        <tr><td>serial console wait + 雜項</td><td>misc</td><td class="num">100</td><td class="num">1</td><td>等 prompt、等 readiness</td></tr>
+      </tbody>
+    </table>
+    <figcaption>
+      時間預算表——「原本」與「修後」皆為 Cloudflare 文章敘述的數量級估算，不是逐機 sample 的中位數。重點在於每一行的歸因，而非絕對數字。「misc」這條最大、但也最雜——把它從 100 壓到 1 是 script-化 + 把 UEFI 進入點顯式化的副作用。
+    </figcaption>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-table-boot-budget');
+        const headers = root.querySelectorAll('thead th');
+        const tbody = root.querySelector('tbody');
+        let activeKey = null, asc = true;
+        headers.forEach(h => h.addEventListener('click', () => {
+          const key = h.dataset.key;
+          if (activeKey === key) asc = !asc; else { activeKey = key; asc = true; }
+          headers.forEach(x => x.removeAttribute('data-sort'));
+          h.setAttribute('data-sort', asc ? 'asc' : 'desc');
+          const rows = [...tbody.querySelectorAll('tr')];
+          const idx = [...headers].indexOf(h);
+          rows.sort((a, b) => {
+            const av = a.children[idx].textContent.trim();
+            const bv = b.children[idx].textContent.trim();
+            const an = Number(av), bn = Number(bv);
+            const cmp = !Number.isNaN(an) && !Number.isNaN(bn) ? an - bn : av.localeCompare(bv);
+            return asc ? cmp : -cmp;
+          });
+          rows.forEach(r => tbody.appendChild(r));
+        }));
+      })();
+    </script>
+  </figure>
+
+  <h2>從 serial console 一格一格往下挖</h2>
+
+  <p>
+    第一條線索來自 deployment dashboard——他們有一張「firmware rollout 進度」的視圖，按理在小時內應該推進到下一批機器，但 Gen12 那一批卡了一晚。
+  </p>
+
+  <p>
+    Oncall 拉起一台機器的 IPMI、把 serial console 接起來看 boot log，看到的是上面那段「attempting / timing out / trying / timing out」的滾動序列。
+  </p>
+
+  <p>
+    第一個 instinct 是「那就把 timeout 改短」，但這治標——真正要回答的是「為什麼會走到這條 timeout fallback 鏈」。
+  </p>
+
+  <p>
+    這個 instinct check 在這類 incident 裡反覆出現：第一波直覺是針對 symptom 動手，但 symptom 本身往往是兩三層 invariant 失效之後的最後表現。「timeout 太長」這條 symptom 對應的真正失效是「自動化沒辦法跳過 fallback 鏈」——symptom 跟 root cause 隔了一層 design intent。
+  </p>
+
+  <p>
+    要往這個方向挖，必須在 serial console 上加上 wall-clock timestamp、再把每段 stall 跟它前一行的 log 對齊。
+  </p>
+
+  <p>
+    這是個 boring 的步驟——沒有什麼酷工具，就是 timestamp + grep + tail——但它把「四小時」拆成可命名的區段。
+  </p>
+
+  <p>
+    具體來說作者把每段 stall 對到三種可能的 owner：firmware（BIOS / BMC / NIC microcode）、pre-boot（UEFI HII、iPXE）、與 OS hand-off（Linux init）。前兩種佔了 95% 以上。
+  </p>
+
+  <p>
+    這個 ownership labeling 本身就值錢——它把「不知道是誰的鍋」變成「這 12 分鐘是 BMC 的、那 8 分鐘是 HII 的」。一旦每段都有 owner，後續修法就可以平行推：對 BMC 那段去敲 vendor、對 HII 那段去 parallelize、對 iPXE 那段去 scripted automation。
+  </p>
+
+  <p>
+    把 timestamp 對齊之後，第二個觀察出現：每次 reboot 之後第一段 UEFI menu 進入特別慢，而第二次進入同一張 menu 就快得多。
+  </p>
+
+  <p>
+    這個「第一次慢、後面快」是 lazy load 的指紋——資料結構在第一次被讀時才算、之後 cache。
+  </p>
+
+  <p>
+    但「之後 cache」對 firmware-update-induced reboot 不適用，因為 BMC reset 會清掉這份 cache、下一次又得重算。
+  </p>
+
+  <p>
+    作者用 EFI_IFR_REF3 的 opcode 名稱定位到了具體哪一個 form——那是 Network Boot 設定的 reference 結構。
+  </p>
+
+  <p>
+    EFI_IFR_REF3 屬於 UEFI HII 的 opcode 家族，整個家族的設計目的是把 BIOS 設定 form 描述成樹狀 IR：question、option、reference 都是節點，由 form set 統籌。其中 REF 系列是「跳到另一張 form」的指標——這也是它要 lazy 的原因之一，因為被指向的 form 不一定會被讀。
+  </p>
+
+  <p>
+    具體 layout 上 EFI_IFR_REF3 包含 Header、Question、QuestionId、FormSetId 四欄；FormSetId 指向 namespace、QuestionId 在 namespace 內找 form。把整個 chain follow 一遍要 walk 多次 NV variable lookup，每次 lookup 對 BIOS 端都是一次完整的 SPI flash 讀取——這對「在 UEFI runtime 內」的 cost 來說是 mid-three-digit microseconds，乘上幾百次就是分鐘級。
+  </p>
+
+  <pre data-kind="pseudocode"><code><em>// 序列化 fallback 鏈的本質</em>
+boot_order = [
+  HTTPS_IPv4,    <em>// try → timeout ~5 min → next</em>
+  iPXE_IPv4,     <em>// try → timeout ~5 min → next</em>
+  HTTPS_IPv6,    <em>// try → timeout ~5 min → next</em>
+  PXE_IPv6,      <em>// try → timeout ~5 min → fall to BIOS menu</em>
+]
+
+<em>// 自動化的 expect 腳本看到的 prompt 一直沒出現，所以一直等</em>
+<em>// 對人類運維：按 Esc 進 menu 跳過——5 秒</em>
+<em>// 對自動化：沒辦法按 Esc，只能等 boot order 跑完——20 分鐘</em>
+</code></pre>
+
+  <p>
+    iPXE 那段的修法是把它變成 scripted：用 chain loading 從一個固定的 boot URL 拉 iPXE script。
+  </p>
+
+  <p>
+    這份 script 描述完整的 OS image 取得邏輯——要走哪個 protocol、URL 模板長什麼樣、要塞哪些 header——全程沒有 prompt 等人類介入。
+  </p>
+
+  <p>
+    對 Cloudflare 來說這也順便修了一個 ops 隱性問題：以前一張機器的 boot config 散在 BMC NV 與 iPXE chain 兩個地方，scripted iPXE 把它收斂到 git-tracked 的 script 檔。
+  </p>
+
+  <p>
+    這個「把散在多處的設定收進 git」副作用比 boot time saving 還重要——它讓 boot config 變得可 review、可 rollback、可 audit。對 SOC 合規的 infra 來說，後者是寫進 control matrix 的條目。
+  </p>
+
+  <p>
+    scripted iPXE 的另一個好處是它讓 boot URL 可以做 version pinning——同一台機器在不同部署環境下走不同 image，不再依賴 BMC NV 變數的隱性差異。
+  </p>
+
+  <p>
+    UEFI HII 那段更曲折——這層的「fix」不是在他們的程式碼裡，而是在 BIOS firmware 廠商那邊。
+  </p>
+
+  <p>
+    對 Cloudflare 來說可以做的事是把 HII 變數讀寫並行化，把多個 question 的 read-modify-write 合併成單一 transaction、減少進入 form 的次數。
+  </p>
+
+  <p>
+    這條改變的數字效果就是表格裡「HII form lazy recompute」從 40 min → 3 min；剩下那 3 分鐘是 BIOS 自己的 form serialize cost，他們改不到。
+  </p>
+
+  <p>
+    這個 split 很典型：「能 own 的層做 parallelization、不能 own 的層推 vendor」。後者通常是長期投資，要等下一代 BIOS 上線；前者立刻可拿。把「現在能拿的快錢」跟「需要等回款的長線」分開做帳是 infra 修法的基本工——前者顯化成本、後者顯化敲 vendor 的渠道。
+  </p>
+
+  <h2>CfHIIConfig_App、regex、與「相同 hex 就 skip」</h2>
+
+  <p>
+    工具層的 fix 是 <code>CfHIIConfig_App</code>——這是 Cloudflare 自己寫的 UEFI HII 設定工具，原本是 string-equal 比對。
+  </p>
+
+  <p>
+    新版加了兩個關鍵能力。
+  </p>
+
+  <p>
+    第一個是 regex pattern 比對：把 vendor 出貨的不一致字串收進同一條 rule，下游不再需要為每個 vendor 維護一條 if-else。
+  </p>
+
+  <p>
+    第二個是一個 Boolean flag <code>uefi-same-hex</code>：當目標設定跟現況 hex-equal 時直接 skip 整個 show / compare / write 流程。
+  </p>
+
+  <p>
+    為什麼「hex-equal skip」重要？
+  </p>
+
+  <p>
+    因為自動化每次 firmware 升級後都要 reconcile 一遍 boot order——確認 BMC reset 沒把 NV 變數重設成 vendor default。
+  </p>
+
+  <p>
+    原本的流程是：read 全部 question、跟期望值逐筆比對、有差就 write。對沒變的 question 來說也要付完整的 read + compare cost。
+  </p>
+
+  <p>
+    當 question 數量達到數百個、再乘上 HII lazy-load 的開銷，這條 loop 自己就是分鐘級的時間預算。
+  </p>
+
+  <p>
+    <code>uefi-same-hex</code> 把「我這次已經做過、hex 沒變」變成 0 cost 的 fast path——只 read header、比 hex、相同就 next，連 form 都不用 follow。
+  </p>
+
+  <p>
+    這條 fix 還有一個關鍵的副作用：它讓 reconcile 變成 idempotent——可以重跑幾百次而沒有副作用，沒變的全部 skip。
+  </p>
+
+  <p>
+    對 firmware-update orchestration 來說 idempotence 很重要，因為部署有可能在中間 fail-retry，你需要相信「重跑同一個動作」不會帶來新的 race。
+  </p>
+
+  <p>
+    更廣義地說，idempotence 是任何 reconcile-style automation 的基礎不變量——Kubernetes controller 的 reconcile loop、Terraform 的 plan-apply、Ansible 的 module，都依賴這條性質。CfHIIConfig 把 firmware 層也拉進這套設計模式裡。
+  </p>
+
+  <p>
+    最後一個元素是這顆 GUID：<code>91468514-75bc-4bb5-8f33-91efff9e9b1f</code>。
+  </p>
+
+  <p>
+    它是 BIOS 廠商定義的 NV variable namespace；vendor 在他們的 spec 裡用這個 GUID 標識「Network Boot priority」這條設定。
+  </p>
+
+  <p>
+    Cloudflare 用 immutable string <code>Force Priority Httpv4 Httpv6 Pxev4 Pxev6</code> 寫進這顆 variable。
+  </p>
+
+  <p>
+    「Force Priority」這個字面意義是「不讓 BMC 在 reset 時 reorder 這條 boot order」，這對 vendor default 會幫忙 fallback 到 PXEv4 的行為來說很關鍵。
+  </p>
+
+  <p>
+    這條設定為什麼必須是 immutable string 而不是 enum？
+  </p>
+
+  <p>
+    因為 UEFI HII 對 enum 的 string 標籤是 vendor-defined：vendor A 可能標 <code>HTTPSv4</code>、vendor B 標 <code>HTTPS IPv4</code>、vendor C 標 <code>https-ipv4</code>。
+  </p>
+
+  <p>
+    對自動化來說，與其依賴 vendor 的標籤一致，不如把整個字串當 opaque blob 用 hex compare——這就是 <code>uefi-same-hex</code> 的設計理由。
+  </p>
+
+  <p>
+    GUID 跟 immutable string 的組合形成了一個「以 hex byte 為單位的契約」：CfHIIConfig 把目標設定的 hex 算出來、跟 NV 裡讀回來的 hex 比，相同就 skip、不同就 write。完全繞開 vendor 的 enum 字面差異。
+  </p>
+
+  <p>
+    下面這組 tab 把 vendor 不一致這件事顯式化。同一個邏輯設定，三個分頁分別是 vendor A 看到的字串、vendor B 看到的字串、以及 CfHIIConfig_App regex 匹配後寫進 NV 的最終 hex。
+  </p>
+
+  <figure class="vg-w-tabs-vendor-strings">
+    <style>
+      .vg-w-tabs-vendor-strings { display: grid; gap: var(--s-2); margin: var(--s-4) 0; }
+      .vg-w-tabs-vendor-strings input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-tabs-vendor-strings .tabs { display: flex; gap: var(--s-2); border-bottom: 1px solid var(--line); }
+      .vg-w-tabs-vendor-strings .tab { font-family: var(--sans); font-size: var(--fs-sm); padding: var(--s-1) var(--s-2); cursor: pointer; color: var(--muted); }
+      .vg-w-tabs-vendor-strings .panel { display: none; padding: var(--s-2) 0; }
+      .vg-w-tabs-vendor-strings .panel h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-tabs-vendor-strings .panel p { margin: 0 0 var(--s-2) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-tabs-vendor-strings .panel code { font-family: var(--mono); font-size: var(--fs-xs); }
+      .vg-w-tabs-vendor-strings:has(#vg-w-tabs-vendor-strings-t1:checked) .panel-1 { display: block; }
+      .vg-w-tabs-vendor-strings:has(#vg-w-tabs-vendor-strings-t1:checked) [for="vg-w-tabs-vendor-strings-t1"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-vendor-strings:has(#vg-w-tabs-vendor-strings-t2:checked) .panel-2 { display: block; }
+      .vg-w-tabs-vendor-strings:has(#vg-w-tabs-vendor-strings-t2:checked) [for="vg-w-tabs-vendor-strings-t2"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-vendor-strings:has(#vg-w-tabs-vendor-strings-t3:checked) .panel-3 { display: block; }
+      .vg-w-tabs-vendor-strings:has(#vg-w-tabs-vendor-strings-t3:checked) [for="vg-w-tabs-vendor-strings-t3"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    </style>
+    <input type="radio" id="vg-w-tabs-vendor-strings-t1" name="vg-w-tabs-vendor-strings-sel" checked />
+    <input type="radio" id="vg-w-tabs-vendor-strings-t2" name="vg-w-tabs-vendor-strings-sel" />
+    <input type="radio" id="vg-w-tabs-vendor-strings-t3" name="vg-w-tabs-vendor-strings-sel" />
+    <div class="tabs">
+      <label class="tab" for="vg-w-tabs-vendor-strings-t1">vendor A</label>
+      <label class="tab" for="vg-w-tabs-vendor-strings-t2">vendor B</label>
+      <label class="tab" for="vg-w-tabs-vendor-strings-t3">regex 收斂</label>
+    </div>
+    <div class="panel panel-1">
+      <h3>vendor A · 字串裡藏 OCP 規格 + SKU 號</h3>
+      <p>同一張 HTTPS-over-IPv4 port，vendor A 把它寫成：</p>
+      <p><code>HTTPS IPv4 Ethernet Network Adapter XXX-XXX-Y for OCP 3.0 P1</code></p>
+      <p>裡面 <code>XXX-XXX-Y</code> 是廠商內部 SKU、<code>OCP 3.0</code> 是介面卡規格、<code>P1</code> 是 port 編號。同一張卡跨機器都長一樣，但跨機型可能換 SKU。</p>
+    </div>
+    <div class="panel panel-2">
+      <h3>vendor B · 字串裡藏 MAC address</h3>
+      <p>同樣語意的 port，vendor B 寫成：</p>
+      <p><code>HTTPS IPv4 Network Adapter - 50:00:E6:8F:4F:32 P1</code></p>
+      <p>沒了 SKU 與 OCP 規格、改塞 MAC address——對自動化來說這意味著「每一台機器這個字串都不同」，從 cohort-shared 退化成 per-host 唯一。一台機器 work 的字面匹配在下一台會 silently miss。</p>
+    </div>
+    <div class="panel panel-3">
+      <h3>regex 收斂後 · CfHIIConfig_App 寫進 NV 的目標</h3>
+      <p>新版 CfHIIConfig_App 用一條 regex 跨吃兩家：</p>
+      <p><code>^HTTPS IPv4 (Ethernet )?Network Adapter[^P]+P1$</code></p>
+      <p>命中後直接設定 immutable string <code>Force Priority Httpv4 Httpv6 Pxev4 Pxev6</code> 寫進 GUID <code>91468514-75bc-4bb5-8f33-91efff9e9b1f</code>。<code>uefi-same-hex</code> flag 確認 hex 已對齊就 skip 整段 write。</p>
+    </div>
+  </figure>
+
+  <p>
+    這條 vendor diversity 問題長期看是個 governance 議題，不是 engineering 議題。
+  </p>
+
+  <p>
+    Cloudflare 跟 UEFI vendor 推 string normalization 已經啟動，但 firmware-side 的改變週期通常以年為單位。
+  </p>
+
+  <p>
+    短期可用的工程槓桿就是「regex + hex-equal skip」這套 application 層收斂。
+  </p>
+
+  <p>
+    這跟 server fleet 管理裡常見的模式一致：vendor 在 spec 層提供「同樣語意」的介面，但 string 表達各說各話，application 必須吃下這個差異層。
+  </p>
+
+  <p>
+    類似的對應在其他層也看得到——PCIe vendor ID + device ID 在 spec 層是穩定的，但 vendor 在 ROM 裡塞的識別字串五花八門；NIC driver 在 Linux 端用 PCI ID 比對而不靠 string，是同一個工程選擇。CfHIIConfig 走的就是「拿 hex 不拿 string」這條等效路線。
+  </p>
+
+  <h2>把單機收益乘上 fleet——為什麼這 17 分鐘值得做</h2>
+
+  <p>
+    單看一台機器，把 boot 從 20 分鐘壓到 1 分鐘以內，省 19 分鐘——夠去拿一杯咖啡，未必是個值得寫 blog post 的數字。
+  </p>
+
+  <p>
+    問題的尺度是 fleet：Gen12 那一批將近 2,000 台 core unit，按 firmware update 節奏每幾個月 reboot 一輪。
+  </p>
+
+  <p>
+    在這個尺度下，省下的時間從「咖啡」變成「值班工時 + 部署 critical path 上的延遲」。
+  </p>
+
+  <p>
+    這條 mental shift——從「per-machine 量級」到「fleet-wide 量級」——是判斷某條 infra fix 值不值得寫進 roadmap 的關鍵。同樣 19 分鐘 saving，在 10 台機器上是 3 小時，在 2,000 台機器上是 月級的 wall-clock。
+  </p>
+
+  <p>
+    下面這個 widget 讓讀者直接拉 fleet size 滑桿，把單機節省乘上機器數量，再乘上 firmware update 的年化次數，得到「一年累積 wall-clock saved」。
+  </p>
+
+  <p>
+    預設用 Cloudflare 文章描述的 1,950 台、每季一次升級——這在 core fleet 是相對溫和的節奏，邊緣 fleet 通常更頻繁。
+  </p>
+
+  <figure class="vg-w-range-fleet-amortize" data-svg-scroll="880">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <line x1="21" y1="10" x2="3" y2="10"/>
+        <line x1="21" y1="14" x2="3" y2="14"/>
+        <line x1="12" y1="10" x2="12" y2="14"/>
+      </svg>
+      <span>drag handle to sweep fleet size · 1 to 5000 machines</span>
+    </p>
+    <style>
+      .vg-w-range-fleet-amortize { margin: var(--s-4) 0; display: grid; gap: var(--s-3); }
+      .vg-w-range-fleet-amortize svg.vg-w-range-fleet-amortize-main { width: 100%; height: auto; max-width: 880px; }
+      .vg-w-range-fleet-amortize .controls { display: grid; gap: var(--s-2); padding: var(--s-2); border-left: 2px solid var(--muted-2); }
+      .vg-w-range-fleet-amortize .ctrl { display: grid; grid-template-columns: 12ch 1fr 12ch; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); }
+      .vg-w-range-fleet-amortize .ctrl label { color: var(--muted); }
+      .vg-w-range-fleet-amortize .ctrl input[type="range"] { width: 100%; height: 36px; accent-color: var(--accent); touch-action: none; }
+      .vg-w-range-fleet-amortize .ctrl .readout { font-variant-numeric: tabular-nums; text-align: right; color: var(--ink); }
+      .vg-w-range-fleet-amortize .summary { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--s-2); padding: var(--s-2); }
+      .vg-w-range-fleet-amortize .summary .cell { padding: var(--s-1) var(--s-2); border-left: 2px solid var(--accent); }
+      .vg-w-range-fleet-amortize .summary .label { display: block; font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+      .vg-w-range-fleet-amortize .summary .val { font-family: var(--display); font-size: var(--fs-lg); color: var(--accent-text); font-variant-numeric: tabular-nums; }
+      @media (max-width: 720px) {
+        .vg-w-range-fleet-amortize .summary { grid-template-columns: 1fr; }
+        .vg-w-range-fleet-amortize .ctrl { grid-template-columns: 9ch 1fr 10ch; }
+      }
+    </style>
+
+    <div class="controls">
+      <div class="ctrl">
+        <label for="vg-w-range-fleet-amortize-fleet">fleet size</label>
+        <input id="vg-w-range-fleet-amortize-fleet" type="range" min="1" max="5000" step="50" value="1950" />
+        <span class="readout" data-out="fleet">1950 機</span>
+      </div>
+      <div class="ctrl">
+        <label for="vg-w-range-fleet-amortize-cadence">每年升級</label>
+        <input id="vg-w-range-fleet-amortize-cadence" type="range" min="1" max="12" step="1" value="4" />
+        <span class="readout" data-out="cadence">4 次</span>
+      </div>
+      <div class="ctrl">
+        <label for="vg-w-range-fleet-amortize-saved">每機節省</label>
+        <input id="vg-w-range-fleet-amortize-saved" type="range" min="1" max="240" step="1" value="19" />
+        <span class="readout" data-out="saved">19 min</span>
+      </div>
+    </div>
+
+    <div class="summary">
+      <div class="cell">
+        <span class="label">每輪 wall-clock</span>
+        <span class="val" data-out="per-round">617 h</span>
+      </div>
+      <div class="cell">
+        <span class="label">年累積</span>
+        <span class="val" data-out="per-year">2470 h</span>
+      </div>
+      <div class="cell">
+        <span class="label">≈ 工程師年</span>
+        <span class="val" data-out="eng-year">1.2</span>
+      </div>
+    </div>
+
+    <svg class="vg-w-range-fleet-amortize-main" viewBox="0 0 880 280" role="img"
+         aria-label="Fleet size 滑桿驅動的年累積 boot time saving 圖">
+      <g id="vg-w-range-fleet-amortize-axes"></g>
+      <g id="vg-w-range-fleet-amortize-bar"></g>
+    </svg>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-range-fleet-amortize');
+        if (!root) return;
+        const fleetInp = root.querySelector('#vg-w-range-fleet-amortize-fleet');
+        const cadInp = root.querySelector('#vg-w-range-fleet-amortize-cadence');
+        const savedInp = root.querySelector('#vg-w-range-fleet-amortize-saved');
+        const out = {
+          fleet: root.querySelector('[data-out="fleet"]'),
+          cadence: root.querySelector('[data-out="cadence"]'),
+          saved: root.querySelector('[data-out="saved"]'),
+          perRound: root.querySelector('[data-out="per-round"]'),
+          perYear: root.querySelector('[data-out="per-year"]'),
+          engYear: root.querySelector('[data-out="eng-year"]'),
+        };
+        const axesG = root.querySelector('#vg-w-range-fleet-amortize-axes');
+        const barG = root.querySelector('#vg-w-range-fleet-amortize-bar');
+        const NS = 'http://www.w3.org/2000/svg';
+        function el(tag, attrs) {
+          const e = document.createElementNS(NS, tag);
+          for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+          return e;
+        }
+
+        const X0 = 90, X1 = 820, Y0 = 220, Y1 = 50;
+        // x: fleet size 0..5000 ; y: annual hours 0..10000
+        const maxFleet = 5000, maxHours = 10000;
+        const xOf = f => X0 + (f / maxFleet) * (X1 - X0);
+        const yOf = h => Y0 - (Math.min(h, maxHours) / maxHours) * (Y0 - Y1);
+
+        // axes
+        axesG.appendChild(el('line', { x1: X0, y1: Y0, x2: X1, y2: Y0, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+        axesG.appendChild(el('line', { x1: X0, y1: Y0, x2: X0, y2: Y1, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+        for (let f = 0; f <= 5000; f += 1000) {
+          const x = xOf(f);
+          axesG.appendChild(el('line', { x1: x, y1: Y0, x2: x, y2: Y0 + 4, stroke: 'var(--muted-2)' }));
+          const t = el('text', { x, y: Y0 + 18, 'text-anchor': 'middle', 'font-family': 'Manrope, sans-serif', 'font-size': 11, fill: 'var(--muted)' });
+          t.textContent = f;
+          axesG.appendChild(t);
+        }
+        for (let h = 0; h <= 10000; h += 2500) {
+          const y = yOf(h);
+          axesG.appendChild(el('line', { x1: X0 - 4, y1: y, x2: X0, y2: y, stroke: 'var(--muted-2)' }));
+          const t = el('text', { x: X0 - 8, y: y + 4, 'text-anchor': 'end', 'font-family': 'Manrope, sans-serif', 'font-size': 11, fill: 'var(--muted)' });
+          t.textContent = h + 'h';
+          axesG.appendChild(t);
+          if (h > 0) {
+            axesG.appendChild(el('line', { x1: X0, y1: y, x2: X1, y2: y, stroke: 'var(--muted-2)', 'stroke-width': 0.5, 'stroke-dasharray': '2,3' }));
+          }
+        }
+        const xLabel = el('text', { x: (X0 + X1) / 2, y: Y0 + 38, 'text-anchor': 'middle', 'font-family': 'EB Garamond, serif', 'font-size': 13, fill: 'var(--muted)' });
+        xLabel.textContent = 'fleet size (台)';
+        axesG.appendChild(xLabel);
+        const yLabel = el('text', { x: 30, y: (Y0 + Y1) / 2, 'text-anchor': 'middle', 'font-family': 'EB Garamond, serif', 'font-size': 13, fill: 'var(--accent-text)', transform: `rotate(-90 30 ${(Y0 + Y1) / 2})` });
+        yLabel.textContent = '年累積節省 (wall-clock h)';
+        axesG.appendChild(yLabel);
+
+        // marker objects
+        const curvePath = el('path', { fill: 'none', stroke: 'var(--accent)', 'stroke-width': 1.8 });
+        const fleetMarker = el('circle', { r: 5, fill: 'var(--bg)', stroke: 'var(--accent)', 'stroke-width': 2 });
+        const fleetLine = el('line', { stroke: 'var(--muted)', 'stroke-width': 1, 'stroke-dasharray': '3,3' });
+        const annotation = el('text', { 'text-anchor': 'start', 'font-family': 'IM Fell English, serif', 'font-style': 'italic', 'font-size': 12, fill: 'var(--accent-text)' });
+        barG.appendChild(curvePath);
+        barG.appendChild(fleetLine);
+        barG.appendChild(fleetMarker);
+        barG.appendChild(annotation);
+
+        function update() {
+          const fleet = Number(fleetInp.value);
+          const cad = Number(cadInp.value);
+          const saved = Number(savedInp.value);
+          const perRoundMin = fleet * saved;
+          const perRoundH = perRoundMin / 60;
+          const perYearH = perRoundH * cad;
+          const engYear = perYearH / 2000;
+
+          out.fleet.textContent = fleet + ' 機';
+          out.cadence.textContent = cad + ' 次';
+          out.saved.textContent = saved + ' min';
+          out.perRound.textContent = perRoundH.toFixed(0) + ' h';
+          out.perYear.textContent = perYearH.toFixed(0) + ' h';
+          out.engYear.textContent = engYear.toFixed(2);
+
+          // curve: vary fleet from 0..5000, keep cad+saved fixed
+          let d = '';
+          for (let f = 0; f <= 5000; f += 100) {
+            const h = (f * saved * cad) / 60;
+            d += (f === 0 ? 'M' : 'L') + ' ' + xOf(f) + ' ' + yOf(h) + ' ';
+          }
+          curvePath.setAttribute('d', d);
+
+          const xm = xOf(fleet);
+          const ym = yOf(perYearH);
+          fleetMarker.setAttribute('cx', xm);
+          fleetMarker.setAttribute('cy', ym);
+          fleetLine.setAttribute('x1', xm);
+          fleetLine.setAttribute('y1', Y0);
+          fleetLine.setAttribute('x2', xm);
+          fleetLine.setAttribute('y2', ym);
+          annotation.setAttribute('x', Math.min(xm + 10, X1 - 200));
+          annotation.setAttribute('y', Math.max(ym - 10, Y1 + 12));
+          annotation.textContent = fleet + ' 機 × ' + cad + ' 次/年 × ' + saved + ' min → ' + perYearH.toFixed(0) + ' h/年';
+        }
+
+        fleetInp.addEventListener('input', update);
+        cadInp.addEventListener('input', update);
+        savedInp.addEventListener('input', update);
+        update();
+      })();
+    </script>
+  </figure>
+
+  <p>
+    把預設值（1,950 機 × 每年 4 次 × 每機 19 分鐘）代進去，得到一年累積節省約 2,470 個工程師-小時——大約是 1.2 個工程師年 (按 2,000 小時/人/年計算)。
+  </p>
+
+  <p>
+    這個數字本身不該被解讀為 ROI——reboot 期間機器並非完全閒置，且工程師時間不是 1:1 換 reboot 時間。
+  </p>
+
+  <p>
+    但它把「為什麼花兩個 sprint 拆 firmware boot」的決策變得自洽——當你維護 fleet 的尺度跨過某個門檻（大概在 hundreds 以上），任何 per-machine 的分鐘級延遲都值得 root cause。
+  </p>
+
+  <p>
+    這個門檻判斷邏輯可以反過來用：如果你的 fleet 只有 10 台、未來也不會擴張，那麼 boot time fix 的優先級就比 application-layer perf 低很多；如果你的 fleet 跨過 hundreds，這條 fix 開始 dominate。
+  </p>
+
+  <p>
+    更直接的價值在 critical path——firmware update 通常是部署其他變更（kernel patch、microcode rotation、安全更新）的前置條件。
+  </p>
+
+  <p>
+    把單次升級的 wall-clock 從 4 小時壓到 3 分鐘意味著整個部署 pipeline 可以更短週期地推進，而不是被 firmware 階段卡到下一個 maintenance window。
+  </p>
+
+  <p>
+    對 Cloudflare 這種「secure-by-default」的 infra，這個 cadence 改善可能比 wall-clock saving 本身更重要——當 zero-day 出現時，「能不能在 24 小時內把 microcode 推全 fleet」直接決定漏洞窗口長度。
+  </p>
+
+  <p>
+    換個說法：firmware update wall-clock 不只是 cost，它是個 lead time——當這個 lead time 從幾小時降到幾分鐘，整套 security response 的時間預算就完全重洗一次。
+  </p>
+
+  <p>
+    這條 wall-clock saving 還改善了一個經常被忽略的成本：oncall 痛苦。
+  </p>
+
+  <p>
+    原本要在凌晨開窗、盯著 reboot 進度十幾個小時的人，現在凌晨開窗只需要十幾分鐘——這把 firmware update 從「特殊事件」改成「日常作業」。
+  </p>
+
+  <p>
+    從而消除了「過大的 batch 等下一個維護窗一起做」的壓力，每一筆 update 都可以小步、頻繁推。
+  </p>
+
+  <p>
+    「小批量頻繁部署」這條 DevOps 原則被 boot time 直接卡住的場景，比想像得多——每一次 reboot cost 太高，自然就會把多筆更新 batch 起來、等月度維護窗一起做；batch 變大、risk 變大、roll-back 變痛苦。
+  </p>
+
+  <p>
+    把 reboot cost 砍掉之後，這條惡性循環翻過來：reboot 可以隨時做、batch size 縮小、blast radius 縮小、rollback 變便宜。這是 boot time 改善的 second-order effect，常常比 wall-clock saving 本身更有價值。
+  </p>
+
+  <h2>下一塊石頭——vendor normalization、parallel HII、跨架構的同一條 path</h2>
+
+  <p>
+    Cloudflare 在文章末段給了幾個還在做或要做的方向。
+  </p>
+
+  <p>
+    第一條是繼續往 UEFI vendor 推 string normalization——把 boot interface 字串標準化成 vendor-agnostic 格式。
+  </p>
+
+  <p>
+    這樣 CfHIIConfig_App 的 regex 可以變回字面匹配，運維可讀性也回得來。
+  </p>
+
+  <p>
+    這條 governance work 沒辦法在 quarter 級別內收，但對未來幾代 hardware refresh 是 compounding 的投資——一旦 vendor side 接受 normalization，後續每代 hardware 都不再付這條 regex tax。
+  </p>
+
+  <p>
+    第二條是把 HII parsing 真正做 parallel——目前的 parallelization 是把多個 question 的 R-M-W 合併，HII form 本身仍是 sequential 算的。
+  </p>
+
+  <p>
+    BIOS 廠商如果願意把 form computation 改成 lazy-but-cached（reboot 之間 cache 持久化）或 eager-but-incremental（fault 發生時只重算 dirty form），就可以把那剩下的 3 分鐘 form recompute 進一步壓掉。
+  </p>
+
+  <p>
+    這條同樣是 vendor 端的工作——Cloudflare 能做的是把 trace 跟需求歸納成 vendor 可以理解的 RFC-style proposal，剩下要走廠商產品 roadmap。
+  </p>
+
+  <p>
+    第三條更有意思：把 core unit 上這套 boot path 統一推到 edge fleet。
+  </p>
+
+  <p>
+    Core 跟 edge 在 hardware procurement、firmware vendor mix、deployment cadence 上都不同，所以這套 fix 不是 cp -r 的事。
+  </p>
+
+  <p>
+    但 boot-time-as-budget、HII opcode-level 歸因、CfHIIConfig regex + hex-skip 這些 abstraction 本身是可遷移的。
+  </p>
+
+  <p>
+    如果 edge fleet 也能拿到類似量級的縮減，乘上 edge 的機器數會把 fleet-wide saving 推到完全不同的數量級——edge 是 hundreds of thousands 級別的 server，這條 saving 直接 dominate 公司 infra cost 結構。
+  </p>
+
+  <p>
+    對讀者來說，這篇 post 真正可以帶走的不是「縮 boot time」這個結論——而是三個 reusable 觀念。
+  </p>
+
+  <p>
+    第一個：當 wall-clock 看起來不合理地大時，先做 timestamp + alignment 把它拆成有名的段，而不是先動「縮 timeout」這種治標 lever。
+  </p>
+
+  <p>
+    這條原則跟「先 profile 再 optimize」是同一族——只是用在 firmware 層、用 serial console + timestamp 做 profiler 而已。
+  </p>
+
+  <p>
+    第二個：自動化吃下 vendor diversity 的方式不是「為每個 vendor 寫一條 if-else」，而是把差異層化（regex 收斂 + hex-equal idempotence），讓 application 上層完全不需要知道 vendor 在哪。
+  </p>
+
+  <p>
+    這條跟 SOLID 裡的「依賴抽象不依賴具體」是同一族——只是 abstraction 是 hex bytes、具體是 vendor string。
+  </p>
+
+  <p>
+    第三個：基礎設施修法的價值不在「修了某個 bug」，而在「打開了一條原本卡住的 cadence」——firmware update 的小批量頻繁推送是這次 fix 真正的 unlock。
+  </p>
+
+  <p>
+    這條跟 Continuous Delivery 的核心信念是同一族——只是把這條信念推到 firmware 層、不再讓 firmware 變成 application 部署節奏的玻璃天花板。
+  </p>
+
+  <p>
+    這條故事最讓人感覺 honest 的地方是它的 fix 並非靠某個 silver bullet——沒有「一鍵 fast boot」、沒有「換 BIOS 廠商」。
+  </p>
+
+  <p>
+    它靠的是把問題分到三層、每層用適合那層的工具：腳本化（iPXE）、parallelization（HII R-M-W）、idempotence + 跨廠商收斂（CfHIIConfig regex + hex-skip）。
+  </p>
+
+  <p>
+    當下一次你看到「我們的 X 從 H 小時變 M 分鐘」這種 headline，請預設它後面是這種疊乘式的 fix，而不是某個瓶頸被獨立打掉。
+  </p>
+
+  <p>
+    這也提醒了一件事：firmware 與 boot path 是少數仍以「年」為週期的軟體層，因為 BIOS / BMC firmware 的 release cadence、vendor spec 演進、與 hardware refresh 都慢。
+  </p>
+
+  <p>
+    在這個慢層做的 abstraction 投資（像 CfHIIConfig_App 這個工具自己）回報週期長、但 compounding——每代 hardware 都用得上，每次新 vendor onboarding 都省一次 per-vendor 分支。
+  </p>
+
+  <p>
+    慢層的工具值得寫得比 application 層更謹慎、更 idempotent、更 vendor-agnostic——因為一旦投入產品線，rewrite cost 比 application 高一兩個數量級。
+  </p>
+
+  <p>
+    最後值得一提的是這篇 post 沒提的東西——他們沒貼具體 BIOS 廠商名字、沒貼 BMC 版本號、沒貼 NIC 廠商。
+  </p>
+
+  <p>
+    這個取捨對 Cloudflare 來說是合理的（vendor 關係 + procurement 邊界），但對外部讀者有點可惜——如果有 vendor 標識，這個故事可以變成「在這種 BIOS 上會看到 EFI_IFR_REF3 lazy-load」的可操作 advisory，而不是純粹的方法學 narrative。
+  </p>
+
+  <p>
+    讀這篇文章時值得自己做一個 mental note：你的 fleet 有沒有可能跑著類似的 BIOS、值不值得自己也 timestamp 一次 boot log。
+  </p>
+
+  <p>
+    更具體一點的 self-check：如果你管的 fleet 在 100 台以上、用 expect-style 自動化做 firmware 升級、最近一次升級花了超過 30 分鐘，那條 boot path 大概率值得拆開看一次。
+  </p>
+
+  <p>
+    工具上的最低 setup 是：serial console 接 IPMI、在 console output 上加 wall-clock prefix、把 boot 那一段 grep 出來——這套就夠對「四小時」做第一刀切片。
+  </p>
+
+  <p>
+    一旦切片做出來，下一個動作是把每段 stall 對到 owner（firmware / pre-boot / kernel），剩下的修法就是 layer-by-layer 的事——跟 Cloudflare 這篇文章的方法論完全一致。
+  </p>
+
+  <p class="vg-deep-closer"><strong>The lesson</strong>：當 wall-clock 看起來離譜地大、先把它拆成有名的段——大延遲多半是三層中性根因疊乘的結果，砍掉任何一條都單獨不夠；fix 通常分散在腳本化、parallelization、idempotent 收斂這三種互補工具上，慢層 (firmware、vendor spec) 的 abstraction 投資是 compounding 的。
+  </p>
+</div>
