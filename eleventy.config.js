@@ -369,13 +369,15 @@ export default function (eleventyConfig) {
       const rows = [];
       for (let i = 0; i < cells.length; i += 7) rows.push(cells.slice(i, i + 7));
 
-      // Also reuse the week grouping for the per-month week list
+      // Also reuse the week grouping for the per-month week list.
+      // Use ISO-8601 week numbering (Monday-Sunday weeks, week 1 contains the
+      // first Thursday) so a single ISO week never appears in two month
+      // sections — that would emit two <section aria-label="YYYY-WNN">
+      // landmarks with the same accessible name, which html-validate's
+      // unique-landmark rule treats as an error.
       const weekOut = new Map();
       for (const d of monthDays) {
-        const dt = new Date(d.date);
-        const onejan = new Date(dt.getFullYear(), 0, 1);
-        const week = Math.ceil((((dt - onejan) / 86400000) + onejan.getDay() + 1) / 7);
-        const wkey = `${dt.getFullYear()}-W${String(week).padStart(2, "0")}`;
+        const wkey = isoWeekKey(d.date);
         if (!weekOut.has(wkey)) weekOut.set(wkey, []);
         weekOut.get(wkey).push(d);
       }
