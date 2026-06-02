@@ -86,10 +86,11 @@ contract (`skills/daily-news/references/widget-isolation.md`):
    templates, surfaced on the gallery so authors can see a pattern live.
 
 The gallery at `/widgets/` lists all three (catalog widgets, cookbook hero
-templates, cookbook snippets). Catalog widgets render live at
-`/widgets/catalog/<name>/`; cookbook demos at `/widgets/cookbook/<id>/`;
-isolation/independence inspection at `/widget-tests/<name>/`. None are linked
-from site nav.
+templates, cookbook snippets) and is linked from site nav. Catalog widgets
+render live at `/widgets/catalog/<name>/`; cookbook demos at
+`/widgets/cookbook/<id>/`; isolation/independence inspection at
+`/widget-tests/<name>/` (the `/widget-tests/` pages stay unlinked — dev-only
+inspection).
 
 ## Routine quality gates
 
