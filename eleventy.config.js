@@ -148,6 +148,9 @@ export default function (eleventyConfig) {
     emitted.add(name);
 
     const partialPath = join(__dirname, "src", "_includes", "widgets", `${name}.njk`);
+    if (!existsSync(partialPath)) {
+      throw new Error(`{% widget "${name}" %}: no such catalog widget — expected src/_includes/widgets/${name}.njk`);
+    }
     const partial = readFileSync(partialPath, "utf8");
 
     return `<figure class="vg-w-${name}" id="${id}" data-widget="${name}" data-pagefind-ignore>${partial}</figure>${scriptTag}`;

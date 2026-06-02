@@ -50,6 +50,7 @@ function loadCatalog() {
       summary: w.summary,
       suits: w.suits || [],
       interactive: (w.interactive || []).length > 0,
+      instanceState: w.instance_state || "in-memory",
       keyIdioms: w.key_idioms || [],
       link: `/widgets/catalog/${w.name}/`,
     }));
