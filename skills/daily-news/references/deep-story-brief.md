@@ -22,6 +22,9 @@ You are writing ONE deep-story for vatt'ghern's daily-news routine.
 - output_path:    src/posts/{{YYYY}}/{{MM}}/{{DD}}/deep-{{slug}}.html
 - sidecar_path:   src/posts/{{YYYY}}/{{MM}}/{{DD}}/deep-{{slug}}.11tydata.json
 - related_roundup: /{{YYYY}}/{{MM}}/{{DD}}/roundup/
+- recent_widgets: [{{template-id}}, ...]   (heroes + supports used by recent
+                  and same-day deep-stories; the parent fills this in Step 7a.
+                  Use it to rotate widget choices — see step 9. May be empty.)
 
 ## What to do
 
@@ -65,6 +68,13 @@ You are writing ONE deep-story for vatt'ghern's daily-news routine.
 9. **Pick widgets from the cookbook**:
    - exactly 1 Tier-1 template as the post's hero widget
    - 2-4 Tier-2 snippets for supporting widgets
+   - **Rotate against `recent_widgets`.** If a template id in `recent_widgets`
+     (above) is one of your candidate picks, prefer a different candidate that
+     answers the same question — especially for the hero. Only repeat a
+     `recent_widgets` entry if no other candidate genuinely fits the story. This
+     is how the site avoids shipping the same hero / the same `tab-switcher` +
+     `matter-of-fact-table` combo every day (see INDEX § Hero rotation and the
+     Tier-2 "NOT defaults" note).
    - Read the detail pages for the picked Tier-1 and Tier-2 entries
    - In scratch (not the file), write a widget plan: each widget's
      conceptual question + the picked template/snippet + the

@@ -451,6 +451,16 @@ Each brief carries these fields:
 - `output_path` — `src/posts/YYYY/MM/DD/deep-<kebab-slug>.html`
 - `sidecar_path` — same path with `.11tydata.json`
 - `related_roundup` — `/YYYY/MM/DD/roundup/`
+- `recent_widgets` — a flat list of the `widget_templates` used by the last
+  ~5 deep-stories, PLUS the hero each of today's *other* deep-stories is
+  planning. Collect the recent part by reading the `widget_templates` field
+  of the most recent `deep-*.11tydata.json` sidecars (newest first, ~5 posts);
+  add today's sibling heroes so the ≤3 concurrent stories don't all pick the
+  same hero. This list lets each sub-agent rotate its widget choices (brief
+  step 9 + cookbook INDEX § Hero rotation). It exists to stop the site shipping
+  the same hero and the same `tab-switcher` + `matter-of-fact-table` combo every
+  day. If you can't cheaply gather it, pass an empty list — the sub-agent still
+  applies the cookbook's rotation guidance, just without cross-post awareness.
 
 Briefs must be finalised before any dispatch in Step 7b — the parent
 agent is the only place that knows the cluster→archetype mapping and

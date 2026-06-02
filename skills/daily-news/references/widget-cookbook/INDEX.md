@@ -55,6 +55,17 @@ Snippets are smaller patterns. Some are zero parts of Tier-1 templates
 (observers, animation, canvas loop); some are standalone capabilities
 (tables, tabs, 3D transforms).
 
+> **`tab-switcher-pure-css` and `matter-of-fact-table` are NOT defaults.**
+> They are safe, so they get over-used — nearly every recent deep-story shipped
+> both, which is the main reason the site's widgets look alike. Only reach for
+> `tab-switcher-pure-css` when the story genuinely has a **staged sequence** (4
+> ordered steps, a before→after→after progression). Only reach for
+> `matter-of-fact-table` when there is genuinely **tabular data** the prose needs
+> to reference at a glance. If a story has neither, do NOT pad it with these —
+> pick supports from the Observers / Pointer / modern-CSS rows below that actually
+> match the concept (a morph, a drag, a 3D layer view, a scroll reveal). Two
+> well-matched supports beat four generic ones.
+
 ### Observers + animation foundations
 
 | Snippet id | One-line purpose |
@@ -89,16 +100,32 @@ Detailed pages: all live under `tier-2-snippets/<id>.md`.
 
 ## Picking guidance by archetype
 
-| Archetype | Typical hero choice | Typical Tier-2 supports |
+Every archetype lists **multiple** candidate heroes — pick the one that
+fits *this* story AND that you have not used in the last few deep-stories
+(see "Hero rotation" below). Do not default to the first one listed.
+
+| Archetype | Candidate heroes (rotate — don't always pick the first) | Tier-2 supports that often fit |
 |---|---|---|
-| `narrative` | annotated-diagram-walkthrough OR mini-canvas-simulation | tab-switcher-pure-css, timeline-scrubber, intersection-observer-reveal |
-| `technical-deep-dive` | annotated-diagram-walkthrough | css-3d-transform, tab-switcher-pure-css |
-| `investigation` | interactive-param-demo OR data-driven-chart | range-input-binding, matter-of-fact-table |
-| `comparison` | data-driven-chart | matter-of-fact-table, before-after-slider |
-| `explainer` | interactive-param-demo OR mini-canvas-simulation | range-input-binding, canvas-2d-loop |
+| `narrative` | annotated-diagram-walkthrough · mini-canvas-simulation · data-driven-chart | timeline-scrubber, intersection-observer-reveal, before-after-slider |
+| `technical-deep-dive` | annotated-diagram-walkthrough · data-driven-chart · mini-canvas-simulation | css-3d-transform, draggable-svg-handle, svg-path-morph |
+| `investigation` | interactive-param-demo · data-driven-chart · annotated-diagram-walkthrough | range-input-binding, before-after-slider, tooltip-popover-anchor |
+| `comparison` | data-driven-chart · annotated-diagram-walkthrough · interactive-param-demo | before-after-slider, stack-cards-svg-fallback |
+| `explainer` | interactive-param-demo · mini-canvas-simulation · data-driven-chart | range-input-binding, canvas-2d-loop, svg-path-morph |
 | `freeform` | any | any |
 
 The mapping is suggestive, not normative. Pick what fits the story.
+
+### Hero rotation (avoid site-wide visual sameness)
+
+`annotated-diagram-walkthrough` answers "which component owns what?" and is
+genuinely useful — but it is *also* the easiest hero to reach for, so it gets
+over-picked. If the brief gives you a `recent_widgets` list (the heroes used by
+recent and same-day deep-stories), **do not pick a hero that already appears in
+it** unless no other candidate can answer your story's central question. When two
+candidates both fit, choose the one NOT in `recent_widgets`. The goal: across any
+run of ~4 deep-stories, the reader should see more than one kind of hero figure.
+A `data-driven-chart` or `mini-canvas-simulation` that fits is worth more to the
+site than a third consecutive `annotated-diagram-walkthrough`.
 
 ## Mandatory feedback loop
 
