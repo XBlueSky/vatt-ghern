@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import { checkCatalogTemplateRefs } from "./archetype-check.mjs";
 
 const INC = path.join(process.cwd(), "src", "_includes", "widgets");
 const STATIC = path.join(process.cwd(), "src", "static", "widgets");
@@ -59,4 +60,15 @@ for (const file of sidecars) {
 
 test("widget-catalog-check ran against at least one widget", () => {
   assert.ok(sidecars.length >= 1, "expected ≥1 catalog widget");
+});
+
+test("catalog:<name> in widget_templates must resolve to an existing trio", () => {
+  // A present catalog widget resolves with no errors.
+  assert.deepEqual(checkCatalogTemplateRefs(["catalog:feature-flags", "data-driven-chart"]), []);
+  // A missing catalog widget is reported.
+  const errs = checkCatalogTemplateRefs(["catalog:does-not-exist"]);
+  assert.equal(errs.length, 1);
+  assert.match(errs[0], /does-not-exist/);
+  // Non-catalog (cookbook) ids are ignored by this check.
+  assert.deepEqual(checkCatalogTemplateRefs(["data-driven-chart", "tab-switcher-pure-css"]), []);
 });

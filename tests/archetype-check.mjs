@@ -32,8 +32,33 @@ import { fileURLToPath } from "node:url";
 const here = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(here, "..");
 
+// Validate that every "catalog:<name>" entry in a sidecar's widget_templates
+// resolves to an existing catalog-widget trio (partial + sidecar + static JS).
+// Catalog widgets are summoned via {% widget "<name>" %}; this guards the
+// routine against referencing a widget that was never authored. Returns an
+// array of error strings (empty when all refs resolve or none are present).
+export function checkCatalogTemplateRefs(widgetTemplates) {
+  const errs = [];
+  const inc = join(REPO_ROOT, "src", "_includes", "widgets");
+  const stat = join(REPO_ROOT, "src", "static", "widgets");
+  for (const t of widgetTemplates || []) {
+    if (typeof t !== "string" || !t.startsWith("catalog:")) continue;
+    const name = t.slice("catalog:".length);
+    const ok =
+      existsSync(join(inc, `${name}.njk`)) &&
+      existsSync(join(inc, `${name}.widget.json`)) &&
+      existsSync(join(stat, `${name}.js`));
+    if (!ok) errs.push(`widget_templates references missing catalog widget: ${name}`);
+  }
+  return errs;
+}
+
+// CLI entry only when run directly (`node tests/archetype-check.mjs <dir>`).
+// When imported (e.g. a test importing checkCatalogTemplateRefs), skip the CLI
+// so the module doesn't process.exit() out from under the importer.
+const RUN_AS_CLI = process.argv[1] === fileURLToPath(import.meta.url);
 const root = process.argv[2];
-if (!root) {
+if (RUN_AS_CLI && !root) {
   process.stderr.write("Usage: archetype-check.mjs <dir>\n");
   process.exit(2);
 }
@@ -288,6 +313,11 @@ function checkWidgetContract(path, html) {
   } else if (sidecar.widget_count != null && sidecar.widget_templates.length !== sidecar.widget_count) {
     violations.push(`${path}: sidecar widget_count (${sidecar.widget_count}) != widget_templates.length (${sidecar.widget_templates.length})`);
   }
+  if (Array.isArray(sidecar.widget_templates)) {
+    for (const e of checkCatalogTemplateRefs(sidecar.widget_templates)) {
+      violations.push(`${path}: ${e}`);
+    }
+  }
 
   // 4. Prose substance — CJK char count inside .vg-post-body, with widget code stripped.
   // Floor 4000 CJK chars ≈ 1300 中文字 ≈ 5-7 分鐘讀完. The target is density, not length;
@@ -401,29 +431,31 @@ function checkUniversal(path, html) {
   }
 }
 
-for (const path of walk(root)) {
-  let html;
-  try {
-    html = readFileSync(path, "utf8");
-  } catch {
-    continue;
+if (RUN_AS_CLI) {
+  for (const path of walk(root)) {
+    let html;
+    try {
+      html = readFileSync(path, "utf8");
+    } catch {
+      continue;
+    }
+    // Only check post URLs that look like /YYYY/MM/DD/<slug>/index.html
+    const isPostPath = /[/\\](\d{4})[/\\](\d{2})[/\\](\d{2})[/\\][^/\\]+[/\\]index\.html$/.test(path);
+    if (isPostPath && path.endsWith(`${sep}roundup${sep}index.html`)) {
+      checkRoundup(path, html);
+    } else if (isPostPath && /[/\\]deep-[^/\\]+[/\\]index\.html$/.test(path)) {
+      checkDeepStory(path, html);
+    }
+    checkUniversal(path, html);
   }
-  // Only check post URLs that look like /YYYY/MM/DD/<slug>/index.html
-  const isPostPath = /[/\\](\d{4})[/\\](\d{2})[/\\](\d{2})[/\\][^/\\]+[/\\]index\.html$/.test(path);
-  if (isPostPath && path.endsWith(`${sep}roundup${sep}index.html`)) {
-    checkRoundup(path, html);
-  } else if (isPostPath && /[/\\]deep-[^/\\]+[/\\]index\.html$/.test(path)) {
-    checkDeepStory(path, html);
+
+  // Warnings: visible but non-fatal. Encourage variety without enforcing it.
+  for (const w of warnings) process.stdout.write(`warning: ${w}\n`);
+
+  if (violations.length > 0) {
+    for (const v of violations) process.stderr.write(v + "\n");
+    process.exit(1);
   }
-  checkUniversal(path, html);
+  const warnNote = warnings.length > 0 ? ` (${warnings.length} warning${warnings.length === 1 ? "" : "s"})` : "";
+  process.stdout.write(`OK: archetype-check passed for ${root}${warnNote}\n`);
 }
-
-// Warnings: visible but non-fatal. Encourage variety without enforcing it.
-for (const w of warnings) process.stdout.write(`warning: ${w}\n`);
-
-if (violations.length > 0) {
-  for (const v of violations) process.stderr.write(v + "\n");
-  process.exit(1);
-}
-const warnNote = warnings.length > 0 ? ` (${warnings.length} warning${warnings.length === 1 ? "" : "s"})` : "";
-process.stdout.write(`OK: archetype-check passed for ${root}${warnNote}\n`);
