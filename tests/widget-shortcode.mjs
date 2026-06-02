@@ -27,7 +27,7 @@ test("widget shortcode wraps partial in vg-w figure with data-widget", async () 
   assert.match(html, /data-widget="feature-flags"/);
   assert.match(html, /data-pagefind-ignore/);
   assert.match(html, /id="vg-w-feature-flags-1"/);
-  assert.match(html, /data-fixture/);
+  assert.match(html, /data-flag-table/); // partial body inlined (real feature-flags anchor)
   assert.match(html, /<script src="\/static\/widgets\/feature-flags\.js" defer><\/script>/);
 });
 
