@@ -114,6 +114,44 @@ export default function (eleventyConfig) {
   // currentColor stroke so SVG follows surrounding text color in both themes.
   eleventyConfig.addShortcode("lucide", lucideIcon);
 
+  // ── Widget shortcode ──────────────────────────────────────────
+  // {% widget "name" %}               — auto-increment id
+  // {% widget "name", id="board-a" %} — explicit id
+  // Emits <figure class="vg-w-<name>" data-widget data-pagefind-ignore> with the
+  // partial inlined, plus a deduped <script src="/static/widgets/<name>.js" defer>
+  // per page. <figure> (not <div>) so catalog widgets inherit figure CSS and are
+  // counted by the vg-w-* enforcer regex in tests/archetype-check.mjs.
+  const widgetEmittedScripts = new Map(); // pageInputPath → Set<widgetName>
+  const widgetIdCounter = new Map();      // pageInputPath → Map<widgetName, int>
+
+  eleventyConfig.on("eleventy.before", () => {
+    widgetEmittedScripts.clear();
+    widgetIdCounter.clear();
+  });
+
+  eleventyConfig.addShortcode("widget", function (name, opts) {
+    opts = opts || {};
+    const pageKey = this.page.inputPath;
+
+    if (!widgetIdCounter.has(pageKey)) widgetIdCounter.set(pageKey, new Map());
+    const perPage = widgetIdCounter.get(pageKey);
+    perPage.set(name, (perPage.get(name) || 0) + 1);
+    const autoId = `vg-w-${name}-${perPage.get(name)}`;
+    const id = opts.id || autoId;
+
+    if (!widgetEmittedScripts.has(pageKey)) widgetEmittedScripts.set(pageKey, new Set());
+    const emitted = widgetEmittedScripts.get(pageKey);
+    const scriptTag = emitted.has(name)
+      ? ""
+      : `<script src="/static/widgets/${name}.js" defer></script>`;
+    emitted.add(name);
+
+    const partialPath = join(__dirname, "src", "_includes", "widgets", `${name}.njk`);
+    const partial = readFileSync(partialPath, "utf8");
+
+    return `<figure class="vg-w-${name}" id="${id}" data-widget="${name}" data-pagefind-ignore>${partial}</figure>${scriptTag}`;
+  });
+
   // Asset passthrough inside posts (images, videos, CSVs, PDFs — no JSON sidecars).
   eleventyConfig.addPassthroughCopy(
     "src/posts/**/*.{png,jpg,jpeg,gif,svg,webp,avif,mp4,webm,csv,pdf}"
