@@ -22,6 +22,9 @@ You are writing ONE deep-story for vatt'ghern's daily-news routine.
 - output_path:    src/posts/{{YYYY}}/{{MM}}/{{DD}}/deep-{{slug}}.html
 - sidecar_path:   src/posts/{{YYYY}}/{{MM}}/{{DD}}/deep-{{slug}}.11tydata.json
 - related_roundup: /{{YYYY}}/{{MM}}/{{DD}}/roundup/
+- recent_widgets: [{{template-id}}, ...]   (heroes + supports used by recent
+                  and same-day deep-stories; the parent fills this in Step 7a.
+                  Use it to rotate widget choices — see step 9. May be empty.)
 
 ## What to do
 
@@ -34,6 +37,19 @@ You are writing ONE deep-story for vatt'ghern's daily-news routine.
 4. Read the design-system: skills/daily-news/references/design-system.md
 5. Read the widget-isolation contract:
    skills/daily-news/references/widget-isolation.md
+5.5 **Consult the catalog before hand-writing widgets.** Read
+   skills/daily-news/references/widget-catalog.md — the list of finished,
+   reusable catalog widgets. For each one, weigh its `suits` and summary
+   against the concept questions this story must answer. For any CLEAN match:
+   - Summon it with `{% widget "name" %}` (one line) instead of hand-writing.
+   - It counts as one widget toward the ≥3 floor (and the ≥5 `vg-w-*` enforcer
+     count): the shortcode emits a `<figure class="vg-w-<name>">` wrapper that
+     the counter sees, and its injected `<script src>` satisfies the
+     ≥1-interactive rule — summoning never makes the post fail the contract.
+   - Record it in the sidecar like any widget (see step 11 accounting).
+   Do NOT force a catalog widget where `suits` does not clearly match — a
+   contrived summon is worse than a hand-written inline widget. When nothing
+   matches, proceed to the cookbook steps and hand-write inline as usual.
 6. **Read the widget cookbook entry point**:
    skills/daily-news/references/widget-cookbook/INDEX.md
 7. **Read mandatory cookbook files**:
@@ -52,6 +68,13 @@ You are writing ONE deep-story for vatt'ghern's daily-news routine.
 9. **Pick widgets from the cookbook**:
    - exactly 1 Tier-1 template as the post's hero widget
    - 2-4 Tier-2 snippets for supporting widgets
+   - **Rotate against `recent_widgets`.** If a template id in `recent_widgets`
+     (above) is one of your candidate picks, prefer a different candidate that
+     answers the same question — especially for the hero. Only repeat a
+     `recent_widgets` entry if no other candidate genuinely fits the story. This
+     is how the site avoids shipping the same hero / the same `tab-switcher` +
+     `matter-of-fact-table` combo every day (see INDEX § Hero rotation and the
+     Tier-2 "NOT defaults" note).
    - Read the detail pages for the picked Tier-1 and Tier-2 entries
    - In scratch (not the file), write a widget plan: each widget's
      conceptual question + the picked template/snippet + the
@@ -64,7 +87,13 @@ You are writing ONE deep-story for vatt'ghern's daily-news routine.
 11. Write the sidecar to {{sidecar_path}} per the schema in
     references/archetypes.md § Sidecar spec. `sources[]` MUST include
     EVERY variant_url. Sidecar MUST include `widget_count`,
-    `widget_questions`, and `widget_templates` fields. The sidecar
+    `widget_questions`, and `widget_templates` fields. When a story mixes
+    hand-written inline widgets and summoned catalog widgets, BOTH count in
+    all three fields. For `widget_templates`: an inline widget contributes its
+    cookbook template id (e.g. `data-driven-chart`); a summoned catalog widget
+    contributes `catalog:<name>` (e.g. `catalog:feature-flags`) — the prefix
+    distinguishes summoned-from-catalog from authored-from-template. `widget_count`
+    must equal both `widget_questions.length` and `widget_templates.length`. The sidecar
     `summary` field MUST be Traditional Chinese (繁體中文), matching
     the post body's language — it surfaces in the homepage "Today's
     deep reads" cards and the RSS feed alongside the Chinese title.

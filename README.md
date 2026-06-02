@@ -23,6 +23,7 @@ hosted on Cloudflare Pages.
 |---|---|
 | `src/posts/YYYY/MM/DD/` | Bespoke HTML for one daily roundup + up to three deep-stories |
 | `src/_includes/layouts/` | Nunjucks layouts (base, post, archetype) |
+| `src/_includes/widgets/` | Reusable catalog widgets — summon with `{% widget "name" %}`; gallery at `/widgets/` |
 | `src/_data/sources.yml` | 45 priority-tiered sources the daily-news skill crawls |
 | `skills/daily-news/` | Claude skill: persona, archetypes, source dispatcher, anti-dup |
 | `commands/` | Slash commands: `/vatt-ghern:daily-news`, `:weekly`, `:monthly` |
@@ -52,6 +53,7 @@ npm run og                                    # rebuild OG images
 npm run card                                  # rebuild today.svg
 npm run social                                # rebuild repo social preview
 npm run sigil                                 # rebuild sigil webp variants
+npm run widgets:catalog                       # refresh routine-facing widget-catalog.md from sidecars
 npm run sources:list                          # list daily-news sources
 npm run sources:dry-run -- --type=arxiv       # dry-fetch one source type
 ```

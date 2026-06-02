@@ -1,4 +1,5 @@
 import rssPlugin from "@11ty/eleventy-plugin-rss";
+import MarkdownIt from "markdown-it";
 import syntaxHighlight from "@11ty/eleventy-plugin-syntaxhighlight";
 import Prism from "prismjs";
 import loadLanguages from "prismjs/components/index.js";
@@ -113,6 +114,184 @@ export default function (eleventyConfig) {
   //   {% lucide "chevron-left", "vg-mn-arrow", "previous month" %}
   // currentColor stroke so SVG follows surrounding text color in both themes.
   eleventyConfig.addShortcode("lucide", lucideIcon);
+
+  // ── Widget gallery silhouettes ─────────────────────────────────
+  // A tiny structural thumbnail per catalog widget / cookbook template, so the
+  // /widgets/ gallery cards show what each pattern LOOKS like instead of a bare
+  // text list. viewBox 0 0 120 72; stroke-based; `vg-sil-accent`/`-accent-fill`
+  // classes pick up terracotta. Keyed by widget/template id; missing id → ''.
+  const WIDGET_SILHOUETTES = {
+    // ── catalog widgets ──
+    "feature-flags": `
+      <line x1="12" y1="22" x2="52" y2="22"/>
+      <circle cx="62" cy="22" r="3" class="vg-sil-accent"/>
+      <line x1="12" y1="36" x2="52" y2="36"/>
+      <circle cx="62" cy="36" r="3"/>
+      <line x1="12" y1="50" x2="52" y2="50"/>
+      <circle cx="62" cy="50" r="3" class="vg-sil-accent"/>
+      <rect x="78" y="14" width="30" height="44"/>
+      <line x1="84" y1="24" x2="102" y2="24"/>
+      <line x1="84" y1="32" x2="98" y2="32"/>
+      <line x1="84" y1="40" x2="103" y2="40"/>
+      <line x1="84" y1="48" x2="95" y2="48"/>`,
+
+    // ── cookbook hero (tier 1) ──
+    "annotated-diagram-walkthrough": `
+      <rect x="10" y="22" width="26" height="16"/>
+      <line x1="36" y1="30" x2="44" y2="30"/>
+      <rect x="44" y="22" width="26" height="16" class="vg-sil-accent"/>
+      <line x1="70" y1="30" x2="78" y2="30"/>
+      <rect x="78" y="22" width="26" height="16"/>
+      <line x1="10" y1="50" x2="80" y2="50"/>
+      <line x1="10" y1="58" x2="58" y2="58"/>`,
+    "data-driven-chart": `
+      <line x1="22" y1="14" x2="22" y2="58"/>
+      <line x1="22" y1="58" x2="108" y2="58"/>
+      <rect x="22" y="20" width="50" height="8"/>
+      <rect x="22" y="32" width="78" height="8" class="vg-sil-accent-fill"/>
+      <rect x="22" y="44" width="34" height="8"/>`,
+    "interactive-param-demo": `
+      <line x1="14" y1="18" x2="62" y2="18"/>
+      <circle cx="42" cy="18" r="3" class="vg-sil-accent"/>
+      <path d="M14,50 C26,34 34,34 46,50 C58,66 66,66 78,50 C90,34 98,34 106,46" class="vg-sil-accent"/>`,
+    "mini-canvas-simulation": `
+      <rect x="12" y="12" width="22" height="9"/>
+      <rect x="14" y="28" width="92" height="34"/>
+      <circle cx="34" cy="40" r="2.5"/>
+      <circle cx="52" cy="50" r="2.5" class="vg-sil-accent"/>
+      <circle cx="70" cy="36" r="2.5"/>
+      <circle cx="88" cy="48" r="2.5" class="vg-sil-accent"/>
+      <circle cx="60" cy="44" r="2.5"/>`,
+
+    // ── cookbook snippet (tier 2) ──
+    "before-after-slider": `
+      <rect x="14" y="16" width="92" height="40"/>
+      <line x1="60" y1="12" x2="60" y2="60" class="vg-sil-accent"/>
+      <circle cx="60" cy="36" r="4" class="vg-sil-accent-fill"/>`,
+    "canvas-2d-loop": `
+      <rect x="14" y="10" width="12" height="8"/>
+      <rect x="14" y="22" width="92" height="36"/>
+      <path d="M20,40 C32,28 44,52 56,40 C68,28 80,52 92,40 C97,35 101,38 104,40" class="vg-sil-accent"/>`,
+    "css-3d-transform": `
+      <rect x="34" y="30" width="34" height="32"/>
+      <line x1="34" y1="30" x2="50" y2="16"/>
+      <line x1="68" y1="30" x2="84" y2="16" class="vg-sil-accent"/>
+      <line x1="50" y1="16" x2="84" y2="16"/>
+      <line x1="68" y1="62" x2="84" y2="48"/>
+      <line x1="84" y1="16" x2="84" y2="48" class="vg-sil-accent"/>`,
+    "css-container-query": `
+      <rect x="12" y="16" width="32" height="40"/>
+      <rect x="16" y="22" width="24" height="10" class="vg-sil-accent"/>
+      <rect x="16" y="36" width="24" height="6"/>
+      <rect x="52" y="16" width="56" height="40"/>
+      <rect x="56" y="22" width="48" height="10" class="vg-sil-accent"/>
+      <rect x="56" y="36" width="30" height="6"/>`,
+    "draggable-svg-handle": `
+      <line x1="16" y1="38" x2="104" y2="38" stroke-dasharray="3 3"/>
+      <circle cx="46" cy="38" r="6" class="vg-sil-accent-fill"/>
+      <circle cx="80" cy="38" r="4"/>`,
+    "intersection-observer-reveal": `
+      <rect x="20" y="12" width="80" height="14"/>
+      <rect x="20" y="30" width="80" height="14" class="vg-sil-accent"/>
+      <rect x="20" y="48" width="80" height="14" stroke-dasharray="3 3"/>
+      <line x1="10" y1="30" x2="14" y2="30" class="vg-sil-accent"/>
+      <line x1="10" y1="44" x2="14" y2="44" class="vg-sil-accent"/>`,
+    "matter-of-fact-table": `
+      <rect x="12" y="14" width="96" height="44"/>
+      <line x1="12" y1="26" x2="108" y2="26"/>
+      <line x1="80" y1="14" x2="80" y2="58"/>
+      <line x1="18" y1="34" x2="60" y2="34"/>
+      <line x1="86" y1="34" x2="102" y2="34" class="vg-sil-accent"/>
+      <line x1="18" y1="44" x2="56" y2="44"/>
+      <line x1="86" y1="44" x2="102" y2="44" class="vg-sil-accent"/>`,
+    "range-input-binding": `
+      <line x1="14" y1="34" x2="86" y2="34"/>
+      <circle cx="50" cy="34" r="5" class="vg-sil-accent-fill"/>
+      <rect x="94" y="27" width="16" height="14"/>`,
+    "stack-cards-svg-fallback": `
+      <rect x="12" y="16" width="44" height="14"/>
+      <rect x="12" y="34" width="44" height="14" class="vg-sil-accent"/>
+      <line x1="60" y1="37" x2="68" y2="37"/>
+      <rect x="72" y="14" width="36" height="12"/>
+      <rect x="72" y="30" width="36" height="12" class="vg-sil-accent"/>
+      <rect x="72" y="46" width="36" height="12"/>`,
+    "svg-path-morph": `
+      <circle cx="34" cy="36" r="16"/>
+      <line x1="56" y1="36" x2="70" y2="36"/>
+      <rect x="76" y="20" width="32" height="32" class="vg-sil-accent"/>`,
+    "tab-switcher-pure-css": `
+      <rect x="14" y="16" width="28" height="11" class="vg-sil-accent-fill"/>
+      <rect x="44" y="16" width="28" height="11"/>
+      <rect x="74" y="16" width="28" height="11"/>
+      <rect x="14" y="29" width="88" height="27"/>`,
+    "timeline-scrubber": `
+      <line x1="14" y1="40" x2="106" y2="40"/>
+      <line x1="24" y1="36" x2="24" y2="44"/>
+      <line x1="44" y1="36" x2="44" y2="44"/>
+      <line x1="64" y1="36" x2="64" y2="44"/>
+      <line x1="84" y1="36" x2="84" y2="44"/>
+      <circle cx="64" cy="40" r="5" class="vg-sil-accent-fill"/>`,
+    "tooltip-popover-anchor": `
+      <rect x="32" y="16" width="56" height="18"/>
+      <path d="M54,34 l6,6 l6,-6"/>
+      <line x1="30" y1="52" x2="90" y2="52"/>
+      <line x1="48" y1="52" x2="72" y2="52" class="vg-sil-accent"/>`,
+    "view-transition-api": `
+      <rect x="12" y="20" width="38" height="32"/>
+      <rect x="70" y="20" width="38" height="32" class="vg-sil-accent"/>
+      <path d="M54,36 l12,0 m-4,-4 l4,4 l-4,4"/>`,
+    "web-animations-api": `
+      <rect x="16" y="32" width="14" height="14" class="vg-sil-accent-fill"/>
+      <path d="M30,40 C50,40 60,24 80,24 C92,24 98,32 104,36" stroke-dasharray="2 3"/>
+      <circle cx="80" cy="24" r="2"/>
+      <circle cx="104" cy="36" r="2"/>`,
+  };
+  eleventyConfig.addFilter("widgetSilhouette", (widget_id) => {
+    const body = WIDGET_SILHOUETTES[widget_id];
+    if (!body) return "";
+    return `<svg class="vg-w-gallery-sil" viewBox="0 0 120 72" preserveAspectRatio="xMidYMid meet" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">${body}</svg>`;
+  });
+
+  // ── Widget shortcode ──────────────────────────────────────────
+  // {% widget "name" %}               — auto-increment id
+  // {% widget "name", id="board-a" %} — explicit id
+  // Emits <figure class="vg-w-<name>" data-widget data-pagefind-ignore> with the
+  // partial inlined, plus a deduped <script src="/static/widgets/<name>.js" defer>
+  // per page. <figure> (not <div>) so catalog widgets inherit figure CSS and are
+  // counted by the vg-w-* enforcer regex in tests/archetype-check.mjs.
+  const widgetEmittedScripts = new Map(); // pageInputPath → Set<widgetName>
+  const widgetIdCounter = new Map();      // pageInputPath → Map<widgetName, int>
+
+  eleventyConfig.on("eleventy.before", () => {
+    widgetEmittedScripts.clear();
+    widgetIdCounter.clear();
+  });
+
+  eleventyConfig.addShortcode("widget", function (name, opts) {
+    opts = opts || {};
+    const pageKey = this.page.inputPath;
+
+    if (!widgetIdCounter.has(pageKey)) widgetIdCounter.set(pageKey, new Map());
+    const perPage = widgetIdCounter.get(pageKey);
+    perPage.set(name, (perPage.get(name) || 0) + 1);
+    const autoId = `vg-w-${name}-${perPage.get(name)}`;
+    const id = opts.id || autoId;
+
+    if (!widgetEmittedScripts.has(pageKey)) widgetEmittedScripts.set(pageKey, new Set());
+    const emitted = widgetEmittedScripts.get(pageKey);
+    const scriptTag = emitted.has(name)
+      ? ""
+      : `<script src="/static/widgets/${name}.js" defer></script>`;
+    emitted.add(name);
+
+    const partialPath = join(__dirname, "src", "_includes", "widgets", `${name}.njk`);
+    if (!existsSync(partialPath)) {
+      throw new Error(`{% widget "${name}" %}: no such catalog widget — expected src/_includes/widgets/${name}.njk`);
+    }
+    const partial = readFileSync(partialPath, "utf8");
+
+    return `<figure class="vg-w-${name}" id="${id}" data-widget="${name}" data-pagefind-ignore>${partial}</figure>${scriptTag}`;
+  });
 
   // Asset passthrough inside posts (images, videos, CSVs, PDFs — no JSON sidecars).
   eleventyConfig.addPassthroughCopy(
@@ -405,6 +584,9 @@ export default function (eleventyConfig) {
     // Newest month first for top-of-page rendering, but keep navigation linear.
     return out.reverse();
   });
+
+  const mdLib = new MarkdownIt({ html: true, linkify: true });
+  eleventyConfig.addFilter("md", (s) => (s ? mdLib.render(String(s)) : ""));
 
   return {
     dir: { input: "src", output: "_site", includes: "_includes", data: "_data" },

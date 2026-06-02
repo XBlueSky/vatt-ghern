@@ -121,6 +121,41 @@ Widget class prefix: `vg-w-<widget-type>-<topic-slug>`. Examples:
 The `<topic-slug>` keeps two posts using the same widget type (two
 timelines on the same day) from colliding.
 
+## Catalog widgets (reusable, summoned via `{% widget %}`)
+
+Beyond inline figures (authored fresh per post), vatt-ghern has reusable
+**catalog widgets** that any post can summon with `{% widget "name" %}`. The
+list of available catalog widgets lives in `widget-catalog.md` (auto-generated
+from the sidecars — read it during deep-story authoring, step 5.5). A catalog
+widget is three files:
+
+- `src/_includes/widgets/<name>.njk` — partial: one `<style>` block (every
+  selector prefixed `.vg-w-<name>`), markup wrapped in `.vg-w-<name>__shell`,
+  affordance hint as first child, **no `<script>`**.
+- `src/static/widgets/<name>.js` — IIFE with guard
+  `window.__vgWidget_<name>__bound`, `init(root)` per instance, per-instance
+  state deep-copy (`INITIAL.map(...)`), `root.querySelector*` only. Target the
+  main SVG via `svg.vg-w-<name>-main`, never bare `querySelector('svg')` (the
+  first child is the affordance icon — same trap as Rule "Selector gotcha").
+- `src/_includes/widgets/<name>.widget.json` — sidecar: `name`, `title`,
+  `summary`, `suits`, `interactive`, `instance_state`, `key_idioms`.
+
+The `{% widget %}` shortcode wraps the partial in
+`<figure class="vg-w-<name>" data-widget data-pagefind-ignore>` and injects a
+deduped `<script src="/static/widgets/<name>.js" defer>` once per page. The
+`vg-w-<name>` class means catalog widgets are counted by the ≥5-widget enforcer
+in `tests/archetype-check.mjs`, and the injected script satisfies the
+≥1-interactive rule — summoning a catalog widget never makes a post fail the
+contract. In the sidecar, a summoned catalog widget is recorded in
+`widget_templates` as `catalog:<name>`; `tests/archetype-check.mjs` verifies that
+reference resolves to a real trio.
+
+After adding or editing a catalog widget, run `npm run widgets:catalog` to
+refresh `widget-catalog.md`. Inspect any catalog widget in isolation at
+`/widget-tests/<name>/` (renders it twice for an independence check). Browse all
+catalog widgets and cookbook demos at `/widgets/`. The structural contract for a
+catalog widget is enforced by `tests/widget-catalog-check.mjs`.
+
 ## When widgets need to share styles
 
 If two widgets on the same page genuinely share styles (e.g., the same

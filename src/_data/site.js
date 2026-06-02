@@ -13,6 +13,7 @@ export default {
     { href: "/topics/", label: "topics", showIfTopics: true },
     { href: "/tags/", label: "tags" },
     { href: "/archetypes/", label: "archetypes" },
+    { href: "/widgets/", label: "widgets" },
     { href: "/feed.xml", label: "feed" },
   ],
 };

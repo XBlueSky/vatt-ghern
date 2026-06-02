@@ -69,6 +69,29 @@ Implementation: `src/static/read-tracker.js`.
 - Post-trail: chrome strip with topic crumb, date, tags, read-toggle.
 - Share buttons: copy link + Twitter + Threads, IM Fell italic text links.
 
+## Widgets
+
+Three coexisting forms, all sharing the `vg-w-` namespace and the isolation
+contract (`skills/daily-news/references/widget-isolation.md`):
+
+1. **Inline widgets** — SVG + scoped CSS + IIFE authored directly into a
+   deep-story's HTML. One-off, per-post. The default for a concept figure
+   specific to one story. Wrapper: `<figure class="vg-w-<type>-<topic>">`.
+2. **Catalog widgets** — reusable components summoned with
+   `{% widget "name" %}` (partial + external `/static/widgets/<name>.js` +
+   `.widget.json` sidecar). For interactive components worth reusing across
+   posts. The routine consults `widget-catalog.md` and summons one when a
+   story's concept matches its `suits`, else hand-writes inline.
+3. **Cookbook demos** — runnable illustrations of the tier-1/tier-2 cookbook
+   templates, surfaced on the gallery so authors can see a pattern live.
+
+The gallery at `/widgets/` lists all three (catalog widgets, cookbook hero
+templates, cookbook snippets) and is linked from site nav. Catalog widgets
+render live at `/widgets/catalog/<name>/`; cookbook demos at
+`/widgets/cookbook/<id>/`; isolation/independence inspection at
+`/widget-tests/<name>/` (the `/widget-tests/` pages stay unlinked — dev-only
+inspection).
+
 ## Routine quality gates
 
 **Step 7.5 — Content quality gate**: dual independent reviewer
