@@ -1,4 +1,5 @@
 import rssPlugin from "@11ty/eleventy-plugin-rss";
+import MarkdownIt from "markdown-it";
 import syntaxHighlight from "@11ty/eleventy-plugin-syntaxhighlight";
 import Prism from "prismjs";
 import loadLanguages from "prismjs/components/index.js";
@@ -443,6 +444,9 @@ export default function (eleventyConfig) {
     // Newest month first for top-of-page rendering, but keep navigation linear.
     return out.reverse();
   });
+
+  const mdLib = new MarkdownIt({ html: true, linkify: true });
+  eleventyConfig.addFilter("md", (s) => (s ? mdLib.render(String(s)) : ""));
 
   return {
     dir: { input: "src", output: "_site", includes: "_includes", data: "_data" },
