@@ -107,7 +107,7 @@
           '': { title: '全部關掉：四條都沒守住', body: '這是大多數「我自己寫一個 intrusive list」開頭的狀態——把 <code>next: *mut Node</code> 跟 <code>prev: *mut Node</code> 塞進 value，<code>insert</code> 跟 <code>remove</code> 都用 raw pointer，看起來 work，Miri 會在第一個 iter_mut 上直接報 <code>encountered dangling reference</code>。要把 unsafe 寫對，這四個 checkbox 必須同時亮。' },
           'pin': { title: '只守 Pin：drop 會跑，但鏈結照樣被踩爛', body: '把 node 包進 <code>Pin&lt;Box&lt;T&gt;&gt;</code>，<code>PhantomPinned</code> 阻止 move，這保證 drop 一定先於 dealloc 跑、自我引用的位址不會搬家。但只要 iter_mut 同時拿 <code>&amp;mut next.value</code> 跟 <code>&amp;mut node.value</code>，aliasing 那條就破——Tree Borrows 看到 Active 狀態被另一個 Reserved 蓋寫，立刻 UB。Pin 只解決「位址不變」這一段，不解決 borrow 階層。' },
           'provenance': { title: '只守 Provenance：tag 對了但 alias 沒對', body: '所有 raw pointer 走 <code>NonNull&lt;T&gt;</code>、retag 在 <code>UnsafePinned</code> projection 下做，這讓 Stacked Borrows 的 borrow stack 不會被誤拋。但只要 <code>iter_mut</code> 在同一個 retag scope 下發出兩個指向不同 node 的 <code>&amp;mut</code>，aliasing 仍然假設它們無交集——若 <code>Ord</code> 出 bug 讓兩個 node 拿到同一個 index，兩個 <code>&amp;mut</code> 真的指到同一塊 region，UB。' },
-          'aliasing': { title: '只守 Aliasing：&amp;mut 不重疊，但 node 被搬家', body: '在 Vec 上用 <code>split_at_mut</code> 嚴格切兩半保證沒有 overlap——這個技巧對「平的陣列」work。問題是 intrusive node 的 <code>prev/next</code> 是 raw pointer 而不是 index，當 Vec re-allocate 把 node 搬到新位址，這些 raw pointer 變 dangling。Pin 沒上、provenance 沒框、ownership 沒講，aliasing 一條本身正確也救不了整個資料結構。' },
+          'aliasing': { title: '只守 Aliasing：&mut 不重疊，但 node 被搬家', body: '在 Vec 上用 <code>split_at_mut</code> 嚴格切兩半保證沒有 overlap——這個技巧對「平的陣列」work。問題是 intrusive node 的 <code>prev/next</code> 是 raw pointer 而不是 index，當 Vec re-allocate 把 node 搬到新位址，這些 raw pointer 變 dangling。Pin 沒上、provenance 沒框、ownership 沒講，aliasing 一條本身正確也救不了整個資料結構。' },
           'ownership': { title: '只守 Ownership：Rc/Arc 合約對了，內部仍 UB', body: '每個 node 進 map 之前先 <code>Arc::new</code>，外部拿 <code>Arc&lt;Node&gt;</code>，看起來 ownership 漂亮。但 <code>Arc&lt;T&gt;</code> 提供的是 shared ownership——它沒給你 <code>&amp;mut T</code>。Map 內部仍需要 mutate 鏈結欄位、需要 <code>&amp;mut</code>，這條 path 沒守住 aliasing 或 provenance 一樣 UB。ownership handoff 是 API 邊界上的合約、不是 internal sound 的證明。' },
           'pin+provenance': { title: 'Pin + Provenance：基底對，沒處理 borrow', body: 'node 不會搬家、tag 跟著 pointer 走，但兩個並存的 <code>&amp;mut</code> 仍是 UB。Tree Borrows 會在 Active 對 Active 的兩次 access 之間判 violation。' },
           'pin+aliasing': { title: 'Pin + Aliasing：位址穩、不重疊，但 raw pointer 沒 tag', body: 'Pin 保證位址不變、aliasing 保證不重疊，但所有 raw pointer 沒走 <code>NonNull</code>、沒在 <code>UnsafePinned</code> 下 retag。Stacked Borrows 看到一個 tag 過期的 pointer 再去 deref，<code>encountered a dangling SbTag</code>。' },
@@ -287,23 +287,47 @@
   <p>這個差別不是「優化」——它把整個不變式集合改寫。<code>LinkedList</code> 的 node 在 list 內部、caller 拿不到 node 的 raw pointer，list 自己決定何時 deref、何時 mutate；caller 看到的只有 <code>front() / back() / iter_mut()</code> 這些借出 <code>&amp;T</code> / <code>&amp;mut T</code> 的方法，borrow checker 把 alias、lifetime、Drop 順序全在編譯期就釘死。intrusive list 的 link 在 <code>T</code> 自己身上、<code>T</code> 由 caller 持有或 map 持有，list 要 traverse 必須 deref <code>T</code> 才看得到 <code>next</code>——這個 deref 跟「caller 仍然可能持有 <code>&amp;mut T</code>」之間沒有編譯期 barrier，於是 alias、move、drop guarantee、provenance 全部變成 runtime invariant，必須用 <code>Pin</code>、<code>UnsafePinned</code>、<code>NonNull</code> 這套組合在 type 層手動表達。</p>
 
   <figure class="vg-w-table-iddqd-node-layout-comparison">
-  <pre data-kind="pseudocode"><code><em>// 兩種 node 在「鏈結 metadata 從哪來」這個維度上的對照</em>
-
-safe LinkedList&lt;T&gt;             intrusive list&lt;T&gt;
-─────────────────────          ─────────────────────
-Node&lt;T&gt; {                       T {
-  prev: *mut Node,                 prev: NonNull&lt;T&gt;,      <em>// link 在 T 本身</em>
-  next: *mut Node,                 next: NonNull&lt;T&gt;,
-  value: T,         <em>// T 被 move 進 Node</em>    payload: ...,
-}                                }
-
-ownership:                       ownership:
-  list 配 Node, list owns Node     caller / Arc / map 持有 T
-  caller 失去 T                    list 只記頭尾 + entry pointers
-borrow:                          borrow:
-  borrow checker 看得到所有 borrow   link mutation 透過 raw pointer
-  &amp;mut T 從 list 借出, lifetime    &amp;mut T 跟 raw pointer 必須對齊
-  跟 list 綁                      （= pin + provenance + alias）</code></pre>
+  <style>
+    .vg-w-table-iddqd-node-layout-comparison { overflow-x: auto; }
+    .vg-w-table-iddqd-node-layout-comparison table { width: 100%; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); min-width: 28rem; }
+    .vg-w-table-iddqd-node-layout-comparison thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); vertical-align: bottom; }
+    .vg-w-table-iddqd-node-layout-comparison thead th.axis { color: var(--accent-text); }
+    .vg-w-table-iddqd-node-layout-comparison tbody th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; font-weight: 600; color: var(--muted); padding: var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; white-space: nowrap; }
+    .vg-w-table-iddqd-node-layout-comparison tbody td { padding: var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+    .vg-w-table-iddqd-node-layout-comparison tbody tr:last-child th, .vg-w-table-iddqd-node-layout-comparison tbody tr:last-child td { border-bottom: none; }
+    .vg-w-table-iddqd-node-layout-comparison code { font-size: 0.92em; }
+  </style>
+  <table>
+    <thead>
+      <tr>
+        <th scope="col">維度（link metadata 從哪來）</th>
+        <th scope="col" class="axis"><code>safe LinkedList&lt;T&gt;</code></th>
+        <th scope="col" class="axis"><code>intrusive list&lt;T&gt;</code></th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <th scope="row">node 容器</th>
+        <td>獨立的 <code>Node&lt;T&gt;</code>，<code>value: T</code> 被 move 進去</td>
+        <td>沒有 <code>Node</code>，link 直接是 <code>T</code> 自己的 field</td>
+      </tr>
+      <tr>
+        <th scope="row">link pointer</th>
+        <td><code>prev / next: *mut Node</code></td>
+        <td><code>prev / next: NonNull&lt;T&gt;</code></td>
+      </tr>
+      <tr>
+        <th scope="row">ownership</th>
+        <td>list 配 <code>Node</code>、list owns <code>Node</code>；caller 失去 <code>T</code></td>
+        <td>caller / <code>Arc</code> / map 持有 <code>T</code>；list 只記頭尾 + entry pointers</td>
+      </tr>
+      <tr>
+        <th scope="row">borrow</th>
+        <td>borrow checker 看得到所有 borrow；<code>&amp;mut T</code> 從 list 借出、lifetime 跟 list 綁</td>
+        <td>link mutation 透過 raw pointer；<code>&amp;mut T</code> 跟 raw pointer 必須對齊（= pin + provenance + alias）</td>
+      </tr>
+    </tbody>
+  </table>
   </figure>
 
   <p>iddqd 走的是這條困難路——把 <code>IdHashMap</code> 跟 <code>IdOrdMap</code> 設計成「map 內部不額外配置 node、value 自己就帶足夠資訊讓 map 做 indexed lookup」。這個設計選擇值不值得，跟 throughput 的 trade-off 是真實的：每次 lookup 少一次間接、cache 行為更好、insert 不需要先 Box——但 sound 的代價是 author 必須親手寫死那四條不變式。下面四節分別處理它們。</p>
@@ -770,9 +794,9 @@ impl&lt;'a, T: KeyedItem&gt; OccupiedEntry&lt;'a, T&gt; {
         const fields = [
           { center: 220, name: 'value', title: 'value : T —— structural pinning',
             body: '<code>fn value_pin(self: Pin&lt;&amp;mut Self&gt;) -&gt; Pin&lt;&amp;mut T&gt;</code>——projection 出來的 <code>T</code> 也是 pinned，<em>type-wide commitment</em>：iddqd 的整個生命週期裡都不能對 value 做 move-out。caller 拿到的是 <code>Pin&lt;&amp;mut T&gt;</code>，可以 mutate 內容，不能搬位址。對 self-referential T、generator state machine 是 sound 必需的選擇。' },
-          { center: 440, name: 'prev', title: 'prev : NonNull&lt;Node&lt;T&gt;&gt; —— non-structural pinning',
+          { center: 440, name: 'prev', title: 'prev : NonNull<Node<T>> —— non-structural pinning',
             body: '<code>fn prev_mut(self: Pin&lt;&amp;mut Self&gt;) -&gt; &amp;mut Option&lt;NonNull&lt;Node&gt;&gt;</code>——projection 出來的是<em>普通</em> <code>&amp;mut</code>，因為 prev 是 link metadata、外部不應該看到、library 內部會 mutate。<code>core::pin</code> docs 把這條叫 non-structural pinning：「pinning does not propagate to a field」。實作要走 <code>get_unchecked_mut</code>，附 SAFETY 註解寫死「I am not moving this」。' },
-          { center: 660, name: 'next', title: 'next : NonNull&lt;Node&lt;T&gt;&gt; —— non-structural pinning',
+          { center: 660, name: 'next', title: 'next : NonNull<Node<T>> —— non-structural pinning',
             body: '與 prev 同理。library 內部把 next 視為一個普通的 raw pointer 容器、需要時隨意 mutate。對外不暴露——caller 永遠不會看到 <code>Pin&lt;&amp;mut NonNull&lt;Node&gt;&gt;</code> 也不會看到 <code>&amp;mut NonNull&lt;Node&gt;</code>，這個 wrapper 限制是 encapsulation 的一環。' },
         ];
 
@@ -830,7 +854,6 @@ impl&lt;'a, T: KeyedItem&gt; OccupiedEntry&lt;'a, T&gt; {
 
   <p>把四條合約合起來看，iddqd 的 unsafe block 其實非常少——而且每一個都有對應一條 invariant 的 <code>SAFETY</code> 註解：「pinned, so location stable」「distinct index, so no overlap」「retag scope ends at fn return」「caller still holds Arc, so storage live」。這種寫法是 unsafe-heavy Rust 的<em>標準</em>實踐——不是「我寫得對，相信我」，而是「每段 unsafe 各自指向一條型別不變式、由 type system / runtime check / external invariant 三者其中之一明確支撐」。<code>iddqd</code> 的 unsafe block 數量大概比同等功能的 C 實作多一個數量級的<em>註解</em>，但 unsafe 的<em>真實程式碼</em>很少——這是 Rust unsafe 文化的本質：用 type 跟 comment 把所有條件外顯，剩下的全交給 borrow checker。</p>
 
-  <figure class="vg-w-table-iddqd-safety-clauses">
   <pre data-kind="pseudocode"><code><em>// iddqd 內部 unsafe block 的標準骨架</em>
 
 unsafe {
@@ -844,13 +867,51 @@ unsafe {
     let item: &amp;mut T = raw.as_mut();
     let item = std::mem::transmute::&lt;&amp;mut T, &amp;'a mut T&gt;(item);
     Some(item)
-}
+}</code></pre>
 
-<em>// 四條 SAFETY clauses ↔ 四條不變式 ↔ 四個 Miri 檢查模式</em>
-<em>//   Pin 不變式破     → 'storage of pinned value reused'</em>
-<em>//   lifetime 不變式破 → borrow checker compile error (不會編)</em>
-<em>//   alias 不變式破   → 'two phase borrowed mutably'</em>
-<em>//   provenance 不變式破 → 'encountered a dangling SbTag'</em></code></pre>
+  <figure class="vg-w-table-iddqd-safety-clauses">
+  <style>
+    .vg-w-table-iddqd-safety-clauses { overflow-x: auto; }
+    .vg-w-table-iddqd-safety-clauses table { width: 100%; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); min-width: 28rem; }
+    .vg-w-table-iddqd-safety-clauses thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); vertical-align: bottom; }
+    .vg-w-table-iddqd-safety-clauses thead th.axis { color: var(--accent-text); }
+    .vg-w-table-iddqd-safety-clauses tbody th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.04em; text-align: left; font-weight: 600; color: var(--accent-text); padding: var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; white-space: nowrap; }
+    .vg-w-table-iddqd-safety-clauses tbody td { padding: var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+    .vg-w-table-iddqd-safety-clauses tbody tr:last-child th, .vg-w-table-iddqd-safety-clauses tbody tr:last-child td { border-bottom: none; }
+    .vg-w-table-iddqd-safety-clauses td code { font-size: 0.9em; }
+  </style>
+  <figcaption class="vg-w-affordance">四條 SAFETY clause ↔ 四條正交不變式 ↔ 缺一條時 Miri 報的錯</figcaption>
+  <table>
+    <thead>
+      <tr>
+        <th scope="col">SAFETY clause</th>
+        <th scope="col" class="axis">不變式</th>
+        <th scope="col">破了之後 Miri 報什麼</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <th scope="row">clause 1</th>
+        <td>Pin — <code>Pin&lt;Box&lt;Node&gt;&gt;</code> 配置，地址不變</td>
+        <td><code>storage of pinned value reused</code></td>
+      </tr>
+      <tr>
+        <th scope="row">clause 2</th>
+        <td>lifetime — caller 持有 <code>&amp;mut Map</code>，無併發 mutate</td>
+        <td>borrow checker compile error（根本不會編）</td>
+      </tr>
+      <tr>
+        <th scope="row">clause 3</th>
+        <td>alias — B-tree distinct index 保證 <code>NonNull</code> 不與其他 active <code>&amp;mut</code> 重疊</td>
+        <td><code>two phase borrowed mutably</code></td>
+      </tr>
+      <tr>
+        <th scope="row">clause 4</th>
+        <td>provenance — <code>NonNull</code> retag scope 限在 fn 內，跨 fn 邊界重新 retag</td>
+        <td><code>encountered a dangling SbTag</code></td>
+      </tr>
+    </tbody>
+  </table>
   </figure>
 
   <p>不變式之間的<em>正交性</em>意味著一條工程上的可驗證心法：寫完一段 unsafe block 後，自問四遍——「這段 code 對 Pin 假設了什麼？對 Provenance 假設了什麼？對 Aliasing 假設了什麼？對 Ownership 假設了什麼？」每個答案都該對應 SAFETY 註解一句。如果某條問不出答案，那段 unsafe 對該 invariant 的依賴是「相信運氣」、不是「相信合約」。</p>
@@ -858,23 +919,51 @@ unsafe {
   <p>對團隊的決策矩陣可以這樣寫：</p>
 
   <figure class="vg-w-table-iddqd-decision-tree">
-  <pre data-kind="pseudocode"><code><em>// 「我要不要寫 intrusive collection」的決策樹</em>
-
-Q1: 我的 value 是不是會同時參與多個 collection?
-    no  → 不要寫 intrusive, 用 IndexMap / HashMap / BTreeMap
-    yes → Q2
-
-Q2: 我能不能用 Arc&lt;T&gt; + 多個 HashMap&lt;Key, Arc&lt;T&gt;&gt; 表達?
-    yes → 走這條; safe, slow lookups, no unsafe
-    no  → Q3
-
-Q3: 我有沒有預算寫 SAFETY 註解 + 維護 Miri CI matrix?
-    no  → 找一個 production-quality crate (iddqd, intrusive-collections)
-    yes → Q4
-
-Q4: 團隊有沒有人能審 unsafe code? 還在嗎?
-    no  → 別寫. 半年內離職那段 unsafe 變成沒有 maintainer 的 CVE 候選
-    yes → 可以開始, 但先在 dev branch 跑三個月 Miri 沒紅再 ship</code></pre>
+  <style>
+    .vg-w-table-iddqd-decision-tree { overflow-x: auto; }
+    .vg-w-table-iddqd-decision-tree table { width: 100%; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); min-width: 30rem; }
+    .vg-w-table-iddqd-decision-tree thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); vertical-align: bottom; }
+    .vg-w-table-iddqd-decision-tree thead th.no { color: var(--accent-text); }
+    .vg-w-table-iddqd-decision-tree thead th.yes { color: var(--sage-deep); }
+    .vg-w-table-iddqd-decision-tree tbody th { font-family: var(--sans); font-size: var(--fs-xs); text-align: left; font-weight: 600; color: var(--muted); padding: var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+    .vg-w-table-iddqd-decision-tree tbody td { padding: var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+    .vg-w-table-iddqd-decision-tree tbody tr:last-child th, .vg-w-table-iddqd-decision-tree tbody tr:last-child td { border-bottom: none; }
+    .vg-w-table-iddqd-decision-tree td.no { color: var(--accent-text); }
+    .vg-w-table-iddqd-decision-tree td.yes { color: var(--sage-deep); }
+    .vg-w-table-iddqd-decision-tree td code { font-size: 0.9em; color: var(--ink); }
+  </style>
+  <figcaption class="vg-w-affordance">「我要不要寫 intrusive collection」——四問決策樹，每個 no 都有 fallback</figcaption>
+  <table>
+    <thead>
+      <tr>
+        <th scope="col">問</th>
+        <th scope="col" class="no">no →</th>
+        <th scope="col" class="yes">yes →</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <th scope="row">Q1：value 會同時參與多個 collection？</th>
+        <td class="no">不要寫 intrusive，用 <code>IndexMap</code> / <code>HashMap</code> / <code>BTreeMap</code></td>
+        <td class="yes">往 Q2</td>
+      </tr>
+      <tr>
+        <th scope="row">Q2：能用 <code>Arc&lt;T&gt;</code> + 多個 <code>HashMap&lt;Key, Arc&lt;T&gt;&gt;</code> 表達？</th>
+        <td class="no">往 Q3</td>
+        <td class="yes">走這條；safe、lookup 慢、no unsafe</td>
+      </tr>
+      <tr>
+        <th scope="row">Q3：有預算寫 SAFETY 註解 + 維護 Miri CI matrix？</th>
+        <td class="no">找 production-quality crate（<code>iddqd</code>、<code>intrusive-collections</code>）</td>
+        <td class="yes">往 Q4</td>
+      </tr>
+      <tr>
+        <th scope="row">Q4：團隊有人能審 unsafe code？而且還在？</th>
+        <td class="no">別寫。半年內人一走，那段 unsafe 變成沒 maintainer 的 CVE 候選</td>
+        <td class="yes">可以開始，但先在 dev branch 跑三個月 Miri 沒紅再 ship</td>
+      </tr>
+    </tbody>
+  </table>
   </figure>
 
   <p>四個 Q 全部 yes 才有資格寫 intrusive。實務上 Q3 跟 Q4 是大多數團隊的 bottleneck——SAFETY 註解寫起來比 logic 還久、reviewer 要懂 Stacked / Tree Borrows 才看得懂註解、人一走那段 code 變遺孤。Oxide 之所以願意 maintain iddqd，是因為他們的 control plane 本來就有兩三位專職的 Rust 系統工程師、團隊 culture 也習慣寫長 SAFETY block。一般 SaaS / web backend 團隊沒這條件、應該走 <code>indexmap</code> + <code>HashMap&lt;Key, Arc&lt;T&gt;&gt;</code>。</p>
