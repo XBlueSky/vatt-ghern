@@ -1,0 +1,900 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">寫一個 doubly-linked list 在 Rust 從來不是「鏈結」的問題——它是把 pin、provenance、aliasing 三條互相獨立的不變式同時投影到同一個 <code>&amp;mut Node</code> 上的問題。iddqd 這篇 post 不是在介紹一個 crate，它在公開展示：為什麼安全的那條路要走過 <code>UnsafePinned</code> 跟 <code>NonNull</code>，而 <code>&amp;mut</code> 連用都不能用。</p>
+  <h1 class="vg-post-title">{{ title }}</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p><span class="vg-dropcap">i</span>ddqd 是 Oxide 開源的一組 indexed-map 集合（<code>IdHashMap</code>、<code>IdOrdMap</code>、<code>BiHashMap</code>、<code>TriHashMap</code>），其中部分變體底層走 intrusive 結構——把鏈結資訊塞進使用者的 value 本身、而不是另外配置 node。同一篇 post 公開的工程細節是個非常難得的入門：要把這條路走得 sound，必須同時滿足四條互相正交的不變式——<code>Pin</code> 的 drop guarantee 與 projection 規則、pointer provenance 在 Stacked Borrows / Tree Borrows 下的範圍、no-mutable-aliasing 對 <code>&amp;mut</code> 的禁令、以及 ownership handoff（<code>Rc</code> / <code>Arc</code> / <code>OccupiedEntry</code>）的時序合約。任何一條斷掉，編譯都會通過，Miri 才會在 CI 把它叫出來。</p>
+
+  <figure class="vg-w-invariants-iddqd-naive" data-svg-scroll="560">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M9 11V6a3 3 0 1 1 6 0v5"/><rect x="5" y="11" width="14" height="10" rx="2"/>
+      </svg>
+      <span>關開四條 invariant，看 naive intrusive list 各踩到哪一個 UB · 4 toggles × 4 結果</span>
+    </p>
+    <style>
+      .vg-w-invariants-iddqd-naive { display: grid; gap: var(--s-3); }
+      .vg-w-invariants-iddqd-naive .grid { display: grid; grid-template-columns: 1fr; gap: var(--s-3); }
+      @media (min-width: 720px) { .vg-w-invariants-iddqd-naive .grid { grid-template-columns: 1fr 1fr; } }
+      .vg-w-invariants-iddqd-naive .controls { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s-2); }
+      .vg-w-invariants-iddqd-naive .toggle { display: flex; flex-direction: column; gap: var(--s-1); padding: var(--s-2); border: 1px solid var(--line); cursor: pointer; user-select: none; min-height: 44px; }
+      .vg-w-invariants-iddqd-naive .toggle:hover { border-color: var(--accent); }
+      .vg-w-invariants-iddqd-naive .toggle input { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-invariants-iddqd-naive .toggle-head { display: flex; align-items: center; gap: var(--s-1); font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+      .vg-w-invariants-iddqd-naive .toggle-dot { width: 10px; height: 10px; border-radius: 50%; border: 1.5px solid var(--muted-2); background: var(--bg-soft); transition: background 150ms, border-color 150ms; flex-shrink: 0; }
+      .vg-w-invariants-iddqd-naive .toggle:has(input:checked) .toggle-dot { background: var(--sage-deep); border-color: var(--sage-deep); }
+      .vg-w-invariants-iddqd-naive .toggle:has(input:checked) .toggle-head { color: var(--accent-text); }
+      .vg-w-invariants-iddqd-naive .toggle-name { font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink); }
+      .vg-w-invariants-iddqd-naive .toggle-sub { font-family: var(--scribed); font-style: italic; font-size: var(--fs-xs); color: var(--muted); }
+      .vg-w-invariants-iddqd-naive .verdict { padding: var(--s-3); background: var(--bg-soft); border-left: 2px solid var(--accent); }
+      .vg-w-invariants-iddqd-naive .verdict-head { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 0 0 var(--s-1) 0; }
+      .vg-w-invariants-iddqd-naive .verdict-title { font-family: EB Garamond, serif; font-size: 1.6rem; color: var(--ink); margin: 0 0 var(--s-1) 0; line-height: 1.2; }
+      .vg-w-invariants-iddqd-naive .verdict-body { font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink-soft); margin: 0; }
+      .vg-w-invariants-iddqd-naive .verdict-body code { font-family: JetBrains Mono, monospace; font-size: 0.92em; }
+      .vg-w-invariants-iddqd-naive svg { width: 100%; height: auto; }
+      .vg-w-invariants-iddqd-naive .scope { font-family: IM Fell English, serif; font-style: italic; font-size: 11px; }
+      .vg-w-invariants-iddqd-naive .err { fill: var(--accent); }
+      .vg-w-invariants-iddqd-naive .ok { fill: var(--sage-deep); }
+    </style>
+
+    <div class="grid">
+      <div>
+        <div class="controls" role="group" aria-label="四條不變式開關">
+          <label class="toggle">
+            <input type="checkbox" data-inv="pin" />
+            <span class="toggle-head"><span class="toggle-dot"></span>I1 · Pin</span>
+            <span class="toggle-name">drop guarantee &amp; projection</span>
+            <span class="toggle-sub">node 不會被移動、drop 一定被呼叫</span>
+          </label>
+          <label class="toggle">
+            <input type="checkbox" data-inv="provenance" />
+            <span class="toggle-head"><span class="toggle-dot"></span>I2 · Provenance</span>
+            <span class="toggle-name">pointer 範圍與 retag</span>
+            <span class="toggle-sub">每個 <code>NonNull</code> 都帶 borrow tag</span>
+          </label>
+          <label class="toggle">
+            <input type="checkbox" data-inv="aliasing" />
+            <span class="toggle-head"><span class="toggle-dot"></span>I3 · Aliasing</span>
+            <span class="toggle-name">no overlapping &amp;mut</span>
+            <span class="toggle-sub">同一個 region 不能有兩個活的 <code>&amp;mut</code></span>
+          </label>
+          <label class="toggle">
+            <input type="checkbox" data-inv="ownership" />
+            <span class="toggle-head"><span class="toggle-dot"></span>I4 · Ownership</span>
+            <span class="toggle-name">Rc / Arc handoff</span>
+            <span class="toggle-sub">value 仍被 map 擁有、不該被外部 mutate</span>
+          </label>
+        </div>
+      </div>
+
+      <div>
+        <svg viewBox="0 0 480 240" role="img" aria-label="naive intrusive linked list 在四條不變式下的 UB 散佈圖">
+          <line x1="40" y1="120" x2="440" y2="120" stroke="var(--muted-2)" stroke-width="1"/>
+          <line x1="240" y1="20" x2="240" y2="220" stroke="var(--muted-2)" stroke-width="1"/>
+          <text x="450" y="125" fill="var(--muted)" class="scope">→</text>
+          <text x="240" y="14" text-anchor="middle" fill="var(--muted)" class="scope">↑ soundness</text>
+          <text x="40" y="234" fill="var(--muted)" class="scope">invariants 全關</text>
+          <text x="440" y="234" text-anchor="end" fill="var(--muted)" class="scope">全開</text>
+
+          <circle id="vg-w-invariants-iddqd-naive-dot" cx="50" cy="200" r="8" class="err" />
+          <text id="vg-w-invariants-iddqd-naive-label" x="60" y="196" fill="var(--ink)" font-family="JetBrains Mono, monospace" font-size="11">0 / 4</text>
+
+          <g font-family="IM Fell English, serif" font-style="italic" font-size="11" fill="var(--muted)">
+            <text x="60" y="60">圖示——四個 axis 互相獨立、不可加減交換</text>
+            <text x="60" y="76">綠點 = sound, 紅點 = naive code 已 UB</text>
+          </g>
+        </svg>
+      </div>
+    </div>
+
+    <div class="verdict">
+      <p class="verdict-head">verdict</p>
+      <h3 class="verdict-title" id="vg-w-invariants-iddqd-naive-title">全部關掉：四條都沒守住</h3>
+      <p class="verdict-body" id="vg-w-invariants-iddqd-naive-body">這是大多數「我自己寫一個 intrusive list」開頭的狀態——把 <code>next: *mut Node</code> 跟 <code>prev: *mut Node</code> 塞進 value，<code>insert</code> 跟 <code>remove</code> 都用 raw pointer，看起來 work，Miri 會在第一個 iter_mut 上直接報 <code>encountered dangling reference</code>。要把 unsafe 寫對，這四個 checkbox 必須同時亮。</p>
+    </div>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-invariants-iddqd-naive');
+        const inputs = root.querySelectorAll('input[data-inv]');
+        const dot = root.querySelector('#vg-w-invariants-iddqd-naive-dot');
+        const label = root.querySelector('#vg-w-invariants-iddqd-naive-label');
+        const title = root.querySelector('#vg-w-invariants-iddqd-naive-title');
+        const body = root.querySelector('#vg-w-invariants-iddqd-naive-body');
+
+        const cases = {
+          '': { title: '全部關掉：四條都沒守住', body: '這是大多數「我自己寫一個 intrusive list」開頭的狀態——把 <code>next: *mut Node</code> 跟 <code>prev: *mut Node</code> 塞進 value，<code>insert</code> 跟 <code>remove</code> 都用 raw pointer，看起來 work，Miri 會在第一個 iter_mut 上直接報 <code>encountered dangling reference</code>。要把 unsafe 寫對，這四個 checkbox 必須同時亮。' },
+          'pin': { title: '只守 Pin：drop 會跑，但鏈結照樣被踩爛', body: '把 node 包進 <code>Pin&lt;Box&lt;T&gt;&gt;</code>，<code>PhantomPinned</code> 阻止 move，這保證 drop 一定先於 dealloc 跑、自我引用的位址不會搬家。但只要 iter_mut 同時拿 <code>&amp;mut next.value</code> 跟 <code>&amp;mut node.value</code>，aliasing 那條就破——Tree Borrows 看到 Active 狀態被另一個 Reserved 蓋寫，立刻 UB。Pin 只解決「位址不變」這一段，不解決 borrow 階層。' },
+          'provenance': { title: '只守 Provenance：tag 對了但 alias 沒對', body: '所有 raw pointer 走 <code>NonNull&lt;T&gt;</code>、retag 在 <code>UnsafePinned</code> projection 下做，這讓 Stacked Borrows 的 borrow stack 不會被誤拋。但只要 <code>iter_mut</code> 在同一個 retag scope 下發出兩個指向不同 node 的 <code>&amp;mut</code>，aliasing 仍然假設它們無交集——若 <code>Ord</code> 出 bug 讓兩個 node 拿到同一個 index，兩個 <code>&amp;mut</code> 真的指到同一塊 region，UB。' },
+          'aliasing': { title: '只守 Aliasing：&amp;mut 不重疊，但 node 被搬家', body: '在 Vec 上用 <code>split_at_mut</code> 嚴格切兩半保證沒有 overlap——這個技巧對「平的陣列」work。問題是 intrusive node 的 <code>prev/next</code> 是 raw pointer 而不是 index，當 Vec re-allocate 把 node 搬到新位址，這些 raw pointer 變 dangling。Pin 沒上、provenance 沒框、ownership 沒講，aliasing 一條本身正確也救不了整個資料結構。' },
+          'ownership': { title: '只守 Ownership：Rc/Arc 合約對了，內部仍 UB', body: '每個 node 進 map 之前先 <code>Arc::new</code>，外部拿 <code>Arc&lt;Node&gt;</code>，看起來 ownership 漂亮。但 <code>Arc&lt;T&gt;</code> 提供的是 shared ownership——它沒給你 <code>&amp;mut T</code>。Map 內部仍需要 mutate 鏈結欄位、需要 <code>&amp;mut</code>，這條 path 沒守住 aliasing 或 provenance 一樣 UB。ownership handoff 是 API 邊界上的合約、不是 internal sound 的證明。' },
+          'pin+provenance': { title: 'Pin + Provenance：基底對，沒處理 borrow', body: 'node 不會搬家、tag 跟著 pointer 走，但兩個並存的 <code>&amp;mut</code> 仍是 UB。Tree Borrows 會在 Active 對 Active 的兩次 access 之間判 violation。' },
+          'pin+aliasing': { title: 'Pin + Aliasing：位址穩、不重疊，但 raw pointer 沒 tag', body: 'Pin 保證位址不變、aliasing 保證不重疊，但所有 raw pointer 沒走 <code>NonNull</code>、沒在 <code>UnsafePinned</code> 下 retag。Stacked Borrows 看到一個 tag 過期的 pointer 再去 deref，<code>encountered a dangling SbTag</code>。' },
+          'pin+ownership': { title: 'Pin + Ownership：合約對，內部仍踩 alias', body: '外面拿 <code>Arc&lt;Node&gt;</code>、node 被 pin 在堆上不會搬，但 map 內部的 iter_mut 仍會發出兩個重疊 <code>&amp;mut</code>——ownership 只管「誰拿 node」，不管「同一時刻有幾個活的 mutable borrow」。' },
+          'provenance+aliasing': { title: 'Provenance + Aliasing：borrow 對，node 仍會被搬走', body: '所有 pointer 都用 <code>NonNull</code>、所有 <code>&amp;mut</code> 都不重疊。但 node 如果在 <code>Vec&lt;Node&gt;</code> 裡而非 pinned 堆配，re-alloc 把 node 搬到新位址，舊的 <code>NonNull</code> tag 對，指的地方錯。' },
+          'provenance+ownership': { title: 'Provenance + Ownership：tag 跟合約對，仍可能 alias', body: 'pointer 都有 tag、外部用 Arc。但 internal iter_mut 沒守 aliasing 仍會在 <code>&amp;mut Node</code> 跟 <code>&amp;mut Node.next</code> 之間發 UB。Miri 會在 first access 拋 <code>two phase borrowed mutably</code>。' },
+          'aliasing+ownership': { title: 'Aliasing + Ownership：兩個 API 邊界對，內部仍移位', body: 'Vec re-alloc → 舊 raw pointer dangling。Pin 跟 provenance 同時缺席，sound 的可能性接近零。' },
+          'pin+provenance+aliasing': { title: 'Pin + Provenance + Aliasing：三條全亮，差合約', body: '這是最容易誤以為 sound 的狀態：node pinned 在堆、所有 pointer 有 tag、所有 <code>&amp;mut</code> 不重疊。但若沒透過 <code>OccupiedEntry</code> / <code>Rc</code> 把「value 還在 map 內」的合約寫死，外部可能 <code>Arc::clone</code> 後在 map 不知情下 mutate 鏈結欄位——這就是 iddqd 為什麼把 entry 包成 <code>Pin&lt;&amp;mut T&gt;</code> 而不直接給 <code>&amp;mut T</code>。' },
+          'pin+provenance+ownership': { title: 'Pin + Provenance + Ownership：差 aliasing', body: '少了 aliasing，<code>iter_mut</code> 直接 UB。Tree Borrows 在 Active 對 Active 拋 violation。' },
+          'pin+aliasing+ownership': { title: 'Pin + Aliasing + Ownership：差 provenance', body: '少了 provenance，<code>NonNull</code> 的 retag scope 沒框出來，raw pointer 在 <code>UnsafePinned</code> 跨界時 tag 失效。Stacked Borrows 拋 <code>SbTag</code> 級錯誤。' },
+          'provenance+aliasing+ownership': { title: 'Provenance + Aliasing + Ownership：差 Pin', body: '少了 Pin，<code>Vec</code> re-alloc 或者 caller <code>mem::swap</code> 把 node 搬走，self-referential pointer dangling。drop guarantee 也沒上——caller 可以 <code>ManuallyDrop</code> 跳過 destructor。' },
+          'pin+provenance+aliasing+ownership': { title: '四條同亮：sound', body: '這才是 iddqd 真正運行的狀態：node 走 <code>Pin&lt;Box&lt;Node&lt;T&gt;&gt;&gt;</code>、所有 raw pointer 走 <code>NonNull&lt;Node&lt;T&gt;&gt;</code>、iter_mut 透過 <code>split_at_mut</code> 拆 index、外部只看得到 <code>OccupiedEntry&lt;&apos;a, T&gt;</code> 包裝出來的 <code>Pin&lt;&amp;mut T&gt;</code>。四條合約同時成立、Miri 在 Stacked 跟 Tree Borrows 雙模式下都過。' },
+        };
+
+        // Plot position: x = sum of checked, y = soundness score
+        function key() {
+          const on = [];
+          inputs.forEach((inp) => { if (inp.checked) on.push(inp.dataset.inv); });
+          return on.sort().join('+');
+        }
+        function count() {
+          let n = 0;
+          inputs.forEach((inp) => { if (inp.checked) n++; });
+          return n;
+        }
+        function update() {
+          const k = key();
+          const n = count();
+          const c = cases[k] || cases[''];
+          title.textContent = c.title;
+          body.innerHTML = c.body;
+          const x = 50 + (n / 4) * 380;
+          const y = n === 4 ? 50 : 200 - n * 12;
+          dot.setAttribute('cx', x);
+          dot.setAttribute('cy', y);
+          dot.setAttribute('class', n === 4 ? 'ok' : 'err');
+          label.setAttribute('x', x + 10);
+          label.setAttribute('y', y - 4);
+          label.textContent = n + ' / 4';
+        }
+        inputs.forEach((inp) => inp.addEventListener('change', update));
+        update();
+      })();
+    </script>
+    <figcaption>四條不變式互相正交——沒有「先補一條再補另一條」的順序，缺一條就有對應的 Miri 錯誤。iddqd 的 API（<code>UnsafePinned</code>、<code>NonNull&lt;Node&gt;</code>、<code>OccupiedEntry</code>、<code>Arc</code> handoff）就是為了同時把四條釘死。</figcaption>
+  </figure>
+
+  <p>這篇 deep-dive 的目的不是把 iddqd 抄一遍——它在 GitHub 上、原 blog 也把 reasoning 寫得很清楚。值得整理的是：四條不變式為什麼是<em>四條</em>，它們各自管哪一段語意、彼此在編譯期跟執行期的關係是什麼、為什麼 safe Rust 的 <code>std::collections::LinkedList</code> 走另外一條路、以及 iddqd 在 API 表面做的具體選擇（為什麼 entry 是 <code>Pin&lt;&amp;mut T&gt;</code>、為什麼 internal pointer 全用 <code>NonNull</code> 而不是 <code>*mut</code>、為什麼 ownership boundary 必須過 <code>Arc</code> 才能把不變式收口）。對任何打算寫 unsafe Rust 的工程師，這四條是 minimal 不變式集合——比這少，sound 的證明就缺一段。</p>
+
+  <p>下面五個小節分別把「資料佈局」、「Pin」、「Provenance」、「Aliasing」、「Ownership handoff」展開。順序刻意對應「先看 node 長什麼樣 → 它在記憶體裡為什麼不能搬 → 每個 pointer 帶的 tag 從哪來 → 同一塊記憶體為什麼不能有兩個 <code>&amp;mut</code> → 外部 API 怎麼把這些不變式包成型別 contract」。每一節結尾都標出對應的 Miri 錯誤名跟 RFC / <code>core::pin</code> 文件條款。</p>
+
+  <p>讀這篇 post 不需要先精通 Rust unsafe——但需要知道幾個 baseline 詞彙：<em>UB</em>（Undefined Behavior）是編譯器在這個 program 點上不再保證行為的條件、optimizer 可以做任何事；<em>Miri</em> 是 Rust 官方的 interpretive runtime，逐 instruction 跑你的 code、檢查每個記憶體 access 是否符合 Rust 形式語意；<em>RFC</em> 是 Rust 語言演進的官方提案文件（如 RFC 1233 對 leak 與 destructor、RFC 2025 對 two-phase borrow）。文章主軸就是「四條 invariant 各自被哪個 RFC 釘下來、Miri 在哪個錯誤碼上把違反抓出來、iddqd 用什麼 type 機制保證 invariant」——非常工程化、可重複的論述結構。</p>
+
+  <h2>intrusive linked list 在記憶體裡長什麼樣</h2>
+
+  <p>先講<em>非</em> intrusive：<code>std::collections::LinkedList&lt;T&gt;</code> 的 node 是 <code>struct Node&lt;T&gt; { prev: *mut Node&lt;T&gt;, next: *mut Node&lt;T&gt;, value: T }</code>——每個 node 自己 box 在堆上，<code>value: T</code> 是 node 的 inline field。caller 對 list <code>push_back(t)</code>，list 自己呼叫 <code>Box::new</code> 配一塊 node、把 <code>t</code> move 進去；caller 拿到的 <code>&amp;mut T</code> 是借自 list 內部的 node。<em>node 跟 value 在同一塊配置裡，但 value 是 node 的私人欄位</em>。intrusive 反過來：value 本來就帶有 <code>prev / next</code> 欄位、list 不額外配置 node——list 就是「拿著 value 的兩個鏈結指標的那條鏈」。OS kernel 寫法常見：<code>struct task_struct</code> 內含一個 <code>list_head children</code>，整個 task list 就用每個 task 自己的 <code>children</code> 串起來。</p>
+
+  <figure class="vg-w-morph-iddqd-list-layout" data-svg-scroll="880">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/>
+      </svg>
+      <span>切換 safe vs intrusive 兩種 node 佈局，看 link 跟 value 的位置關係 · 1 toggle</span>
+    </p>
+    <style>
+      .vg-w-morph-iddqd-list-layout { display: grid; gap: var(--s-3); }
+      .vg-w-morph-iddqd-list-layout svg { width: 100%; height: auto; }
+      .vg-w-morph-iddqd-list-layout .controls { display: flex; gap: var(--s-2); align-items: center; flex-wrap: wrap; }
+      .vg-w-morph-iddqd-list-layout button { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; padding: var(--s-1) var(--s-2); min-height: 44px; min-width: 44px; background: var(--bg-soft); color: var(--ink); border: 1px solid var(--line); cursor: pointer; }
+      .vg-w-morph-iddqd-list-layout button[aria-pressed="true"] { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+      .vg-w-morph-iddqd-list-layout .label-text { font-family: EB Garamond, serif; font-size: 13px; }
+      .vg-w-morph-iddqd-list-layout .micro { font-family: JetBrains Mono, monospace; font-size: 10px; }
+      .vg-w-morph-iddqd-list-layout .title-text { font-family: IM Fell English, serif; font-style: italic; font-size: 13px; }
+    </style>
+
+    <div class="controls" role="group" aria-label="node 佈局切換">
+      <button data-mode="safe" aria-pressed="true">safe LinkedList</button>
+      <button data-mode="intrusive" aria-pressed="false">intrusive list</button>
+    </div>
+
+    <svg viewBox="0 0 880 320" role="img" aria-label="safe LinkedList vs intrusive list 在記憶體裡的 node 佈局對照">
+      <text x="440" y="22" text-anchor="middle" fill="var(--ink)" class="title-text" id="vg-w-morph-iddqd-list-layout-title">safe LinkedList——node 是中介，T 是 node 內部欄位</text>
+
+      <!-- caller's T -->
+      <text x="40" y="60" fill="var(--muted)" class="label-text">caller 端</text>
+      <rect x="40" y="74" width="180" height="60" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.5"/>
+      <text x="50" y="96" fill="var(--ink)" class="label-text">T (caller 的 value)</text>
+      <text x="50" y="116" fill="var(--muted)" class="micro">payload bytes</text>
+
+      <!-- arrow from caller to node container -->
+      <path id="vg-w-morph-iddqd-list-layout-arrow1" d="M 220 104 L 360 104" stroke="var(--accent)" stroke-width="2" fill="none" marker-end="url(#vg-w-morph-iddqd-list-layout-arr)"/>
+      <text x="290" y="96" text-anchor="middle" fill="var(--accent-text)" class="micro" id="vg-w-morph-iddqd-list-layout-arr-label">Box::new(T) → Node</text>
+
+      <defs>
+        <marker id="vg-w-morph-iddqd-list-layout-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--accent)"/>
+        </marker>
+      </defs>
+
+      <!-- The node box on heap -->
+      <g id="vg-w-morph-iddqd-list-layout-nodebox">
+        <rect x="360" y="60" width="320" height="180" fill="var(--bg-soft)" stroke="var(--accent)" stroke-width="1.5"/>
+        <text x="370" y="80" fill="var(--accent-text)" class="title-text" id="vg-w-morph-iddqd-list-layout-nodelabel">Node&lt;T&gt; (heap)</text>
+
+        <!-- prev -->
+        <rect x="370" y="92" width="140" height="32" fill="var(--bg)" stroke="var(--muted-2)" stroke-width="1"/>
+        <text x="380" y="112" fill="var(--ink)" class="label-text">prev: *mut Node</text>
+
+        <!-- next -->
+        <rect x="520" y="92" width="140" height="32" fill="var(--bg)" stroke="var(--muted-2)" stroke-width="1"/>
+        <text x="530" y="112" fill="var(--ink)" class="label-text">next: *mut Node</text>
+
+        <!-- value -->
+        <rect x="370" y="134" width="290" height="80" fill="var(--bg)" stroke="var(--muted-2)" stroke-width="1"/>
+        <text x="380" y="154" fill="var(--ink)" class="label-text" id="vg-w-morph-iddqd-list-layout-valuelabel">value: T (moved in)</text>
+        <text x="380" y="172" fill="var(--muted)" class="micro" id="vg-w-morph-iddqd-list-layout-valuesub">caller 的 T 被 move 到 node 內部</text>
+        <text x="380" y="190" fill="var(--muted)" class="micro" id="vg-w-morph-iddqd-list-layout-valuesub2">所有權交給 list, list 配 node</text>
+      </g>
+
+      <!-- caller still holds in intrusive mode -->
+      <g id="vg-w-morph-iddqd-list-layout-intrusive-extra" style="display:none">
+        <text x="40" y="260" fill="var(--sage-deep)" class="label-text">intrusive: value 自己帶 link</text>
+        <rect x="40" y="270" width="180" height="40" fill="var(--bg-soft)" stroke="var(--sage-deep)" stroke-width="1.5" stroke-dasharray="3,2"/>
+        <text x="50" y="290" fill="var(--ink)" class="micro">prev / next ∈ T 本身</text>
+        <text x="50" y="304" fill="var(--ink)" class="micro">不額外配置 node</text>
+      </g>
+
+      <!-- chain illustration -->
+      <line x1="700" y1="104" x2="820" y2="104" stroke="var(--muted-2)" stroke-width="1.5" stroke-dasharray="4,3"/>
+      <text x="710" y="96" fill="var(--muted)" class="micro">→ next node</text>
+      <line x1="680" y1="240" x2="680" y2="280" stroke="var(--muted-2)" stroke-width="1.5" stroke-dasharray="4,3"/>
+      <text x="690" y="260" fill="var(--muted)" class="micro" id="vg-w-morph-iddqd-list-layout-foot">node owns value</text>
+    </svg>
+
+    <figcaption>切到 intrusive 那一邊：node 不存在，<code>prev / next</code> 直接是 <code>T</code> 的 field——iddqd 走的是這條路、所以才得自己背 pin 跟 provenance 的不變式，<code>LinkedList</code> 不需要。</figcaption>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-morph-iddqd-list-layout');
+        const buttons = root.querySelectorAll('button[data-mode]');
+        const title = root.querySelector('#vg-w-morph-iddqd-list-layout-title');
+        const nodeLabel = root.querySelector('#vg-w-morph-iddqd-list-layout-nodelabel');
+        const valueLabel = root.querySelector('#vg-w-morph-iddqd-list-layout-valuelabel');
+        const valueSub = root.querySelector('#vg-w-morph-iddqd-list-layout-valuesub');
+        const valueSub2 = root.querySelector('#vg-w-morph-iddqd-list-layout-valuesub2');
+        const arrLabel = root.querySelector('#vg-w-morph-iddqd-list-layout-arr-label');
+        const extra = root.querySelector('#vg-w-morph-iddqd-list-layout-intrusive-extra');
+        const foot = root.querySelector('#vg-w-morph-iddqd-list-layout-foot');
+
+        function setMode(mode) {
+          buttons.forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.mode === mode)));
+          if (mode === 'safe') {
+            title.textContent = 'safe LinkedList——node 是中介，T 是 node 內部欄位';
+            nodeLabel.textContent = 'Node<T> (heap, 由 list 配置)';
+            valueLabel.textContent = 'value: T (moved in)';
+            valueSub.textContent = 'caller 的 T 被 move 到 node 內部';
+            valueSub2.textContent = '所有權交給 list, list 配 node';
+            arrLabel.textContent = 'Box::new(T) → Node';
+            extra.style.display = 'none';
+            foot.textContent = 'node owns value';
+          } else {
+            title.textContent = 'intrusive list——link 在 T 內，沒有獨立的 Node 容器';
+            nodeLabel.textContent = 'T 自己 (pinned, by caller 或 map)';
+            valueLabel.textContent = 'payload (用戶資料)';
+            valueSub.textContent = 'prev / next 是 T 自己的 field';
+            valueSub2.textContent = 'list 沒配額外 node, 只記頭尾與 entry';
+            arrLabel.textContent = 'pinned T (no extra allocation)';
+            extra.style.display = '';
+            foot.textContent = 'value owns its own link';
+          }
+        }
+        buttons.forEach((b) => b.addEventListener('click', () => setMode(b.dataset.mode)));
+      })();
+    </script>
+  </figure>
+
+  <p>這個差別不是「優化」——它把整個不變式集合改寫。<code>LinkedList</code> 的 node 在 list 內部、caller 拿不到 node 的 raw pointer，list 自己決定何時 deref、何時 mutate；caller 看到的只有 <code>front() / back() / iter_mut()</code> 這些借出 <code>&amp;T</code> / <code>&amp;mut T</code> 的方法，borrow checker 把 alias、lifetime、Drop 順序全在編譯期就釘死。intrusive list 的 link 在 <code>T</code> 自己身上、<code>T</code> 由 caller 持有或 map 持有，list 要 traverse 必須 deref <code>T</code> 才看得到 <code>next</code>——這個 deref 跟「caller 仍然可能持有 <code>&amp;mut T</code>」之間沒有編譯期 barrier，於是 alias、move、drop guarantee、provenance 全部變成 runtime invariant，必須用 <code>Pin</code>、<code>UnsafePinned</code>、<code>NonNull</code> 這套組合在 type 層手動表達。</p>
+
+  <pre data-kind="pseudocode"><code><em>// 兩種 node 在「鏈結 metadata 從哪來」這個維度上的對照</em>
+
+safe LinkedList&lt;T&gt;             intrusive list&lt;T&gt;
+─────────────────────          ─────────────────────
+Node&lt;T&gt; {                       T {
+  prev: *mut Node,                 prev: NonNull&lt;T&gt;,      <em>// link 在 T 本身</em>
+  next: *mut Node,                 next: NonNull&lt;T&gt;,
+  value: T,         <em>// T 被 move 進 Node</em>    payload: ...,
+}                                }
+
+ownership:                       ownership:
+  list 配 Node, list owns Node     caller / Arc / map 持有 T
+  caller 失去 T                    list 只記頭尾 + entry pointers
+borrow:                          borrow:
+  borrow checker 看得到所有 borrow   link mutation 透過 raw pointer
+  &amp;mut T 從 list 借出, lifetime    &amp;mut T 跟 raw pointer 必須對齊
+  跟 list 綁                      （= pin + provenance + alias）</code></pre>
+
+  <p>iddqd 走的是這條困難路——把 <code>IdHashMap</code> 跟 <code>IdOrdMap</code> 設計成「map 內部不額外配置 node、value 自己就帶足夠資訊讓 map 做 indexed lookup」。這個設計選擇值不值得，跟 throughput 的 trade-off 是真實的：每次 lookup 少一次間接、cache 行為更好、insert 不需要先 Box——但 sound 的代價是 author 必須親手寫死那四條不變式。下面四節分別處理它們。</p>
+
+  <p>多補一個視角：intrusive 跟 non-intrusive 在「ownership 邊界」這條 axis 上也分歧。<code>std::LinkedList&lt;T&gt;</code> 的 <code>push_back</code> 接受 <code>T</code>、value <em>move</em> 進 list、caller 失去原本的 <code>T</code>；要拿回去要 <code>pop_back()</code>。intrusive list 反過來——caller <em>持續持有</em> value（或者 <code>Arc&lt;T&gt;</code> 共享），list 只記住「value 在哪裡」這個鏈結資訊。這個差別對某些 workload 很重要：value 本身可能參與多個 collection、或者被多個 thread 用 <code>Arc</code> 共享、或者本身就是 caller 邏輯的長生 entity（比方說 task scheduler 的 task struct 同時在 ready queue 跟 sleep timer queue 上）。non-intrusive 對這些 use case 強制 caller 把 value 複製成多份；intrusive 則是「同一個 value 同時被多個 list 串起來」。代價就是這四條不變式必須收口在 type layer。</p>
+
+  <p>同時這也解釋了為什麼 Linux kernel 從第一版 <code>list.h</code>（1993）開始就走 intrusive——kernel 沒有 <code>malloc</code> 在 hot path 的選項、每個 <code>task_struct</code> / <code>inode</code> / <code>socket</code> 都同時在好幾個 list 上、ownership 由更上層（process tree、filesystem mount）管理。Rust 想把同樣的能力帶進語言生態、又不放棄 sound 證明，於是有 iddqd、有 <code>pin-init</code>、有 <code>linked_list_allocator</code> 這條工具鏈。它們都不是替代 <code>std::collections</code>，而是補上 <code>std::collections</code> 不能進入的領域。</p>
+
+  <h2>Pin：drop guarantee 與 projection 規則</h2>
+
+  <p>第一條不變式是 <code>Pin&lt;P&gt;</code> 的<em>位址穩定性</em>。intrusive list 的 <code>next / prev</code> 是指向「在記憶體中某個位置的 <code>T</code>」的 pointer——如果 <code>T</code> 被 move 走（<code>Vec</code> re-alloc、<code>mem::swap</code>、return-by-value），舊的 raw pointer 變 dangling。<code>std::pin</code> 的 docs 把這條合約寫得很死：「<em>From the moment a value is pinned by constructing a Pinning pointer to it, that value must remain valid at that same address in memory, until its drop handler is called.</em>」</p>
+
+  <p>在型別層做到這件事的標記是 <code>PhantomPinned</code>——把它放進 struct，編譯器就不會自動帶 <code>Unpin</code>。沒有 <code>Unpin</code> 的型別在 <code>Pin&lt;&amp;mut T&gt;</code> 下無法走 <code>mem::replace</code> / <code>mem::swap</code>——這兩個方法都接受 <code>&amp;mut T</code> 而非 <code>Pin&lt;&amp;mut T&gt;</code>，<code>Pin&lt;&amp;mut T&gt;</code> 不 deref 出 <code>&amp;mut T</code>，於是 safe Rust 沒辦法 move 一個 pinned 不 <code>Unpin</code> 的 value。要拿到底層的 <code>&amp;mut T</code> 必須走 <code>Pin::get_unchecked_mut</code>——signature 的 <code>unchecked</code> 就是「你保證你不會用它來 move」。</p>
+
+  <pre><code class="language-rust">use std::pin::Pin;
+use std::marker::PhantomPinned;
+use std::ptr::NonNull;
+
+// iddqd 風格：intrusive node, 自我引用的 prev/next 都指向另一個 pinned Node
+pub struct Node&lt;T&gt; {
+    pub value: T,
+    prev: Option&lt;NonNull&lt;Node&lt;T&gt;&gt;&gt;,
+    next: Option&lt;NonNull&lt;Node&lt;T&gt;&gt;&gt;,
+    // 一旦 pin 住, 就不能 move——caller 不能 mem::swap 兩個 node
+    _pin: PhantomPinned,
+}
+
+impl&lt;T&gt; Node&lt;T&gt; {
+    pub fn new(value: T) -&gt; Pin&lt;Box&lt;Self&gt;&gt; {
+        // 走 Pin&lt;Box&lt;_&gt;&gt;: heap 配置、pin 保證 box 不會被搬到別處
+        Box::pin(Node { value, prev: None, next: None, _pin: PhantomPinned })
+    }
+}</code></pre>
+
+  <p>Pin 解的是「位址不變」這一段、不解 borrow。但它還帶一條更隱晦的合約叫 <em>drop guarantee</em>：pinned value 在底下記憶體被釋放或重用<em>之前</em>，它的 <code>Drop::drop</code> 必須被執行過一次。這條合約是 intrusive 資料結構的命根——因為 list 的頭尾 pointer 仍然指向 <code>self</code>，如果 <code>self</code> 被 <code>std::mem::forget</code> 跳過 destructor、底下的 buffer 被回收給別人，list 端的 <code>NonNull</code> 立刻 dangling。Pin 透過「不給 <code>&amp;mut T</code>，只給 <code>Pin&lt;&amp;mut T&gt;</code>」這個型別 trick 讓 <code>ManuallyDrop</code>、<code>Box::leak</code> 都無法繞過 destructor——這是「pin 保證 drop」的具體執行機制。</p>
+
+  <p>另一條 pin 的 subtlety 是 <em>projection</em>。當你拿到 <code>Pin&lt;&amp;mut Node&lt;T&gt;&gt;</code>、想要操作內部欄位，<code>node.value</code> 跟 <code>node.next</code> 各自應該是 pinned 還是 unpinned？<code>core::pin</code> 文件分成 <em>structural pinning</em>（projection 也 pinned）跟 <em>non-structural pinning</em>（projection 給 <code>&amp;mut Field</code>）兩種——選哪個是型別作者的 design choice，但選一次就鎖死，這個欄位<em>整個 type 的生命週期</em>都要遵守。iddqd 對 <code>value: T</code> 選 structural（外部拿到的是 <code>Pin&lt;&amp;mut T&gt;</code>，因為 T 自己可能也是 self-referential），對 <code>prev / next: Option&lt;NonNull&gt;</code> 選 non-structural（內部 mutate 鏈結欄位走 <code>get_unchecked_mut</code>）。這個 split 必須在 type doc 寫死、不能改。實驗中的 <code>UnsafePinned&lt;T&gt;</code> 是個更強的 escape hatch：<code>&amp;mut UnsafePinned&lt;T&gt;</code> 明確<em>不</em>保證唯一、<code>&amp;UnsafePinned&lt;T&gt;</code> 可能指向 mutated 資料——它把 <code>UnsafeCell</code> 的效果擴展到「同時繞過 alias 跟 mutation 兩條保證」，給的是 intrusive 資料結構真正需要的型別語意。</p>
+
+  <pre data-kind="pseudocode"><code><em>// Pin 在編譯期表達兩條規則</em>
+
+<em>// 規則 1：location-stable</em>
+Pin&lt;&amp;mut T&gt;  --no deref to-->  &amp;mut T
+        <em>// 沒有公開 deref → mem::swap / mem::replace 不能 call</em>
+        <em>// (除非 T: Unpin, 那就退化成普通的 &amp;mut T)</em>
+
+<em>// 規則 2：drop-before-storage-reuse</em>
+struct Node&lt;T&gt; { _pin: PhantomPinned, ... }
+        <em>// !Unpin → Pin 把 ManuallyDrop / Box::leak 都關掉</em>
+        <em>// 也就是 caller 不可能跳過 destructor</em>
+
+<em>// 規則 3：projection 的選擇是 type-wide 合約</em>
+field: T   <em>// 選 structural → Pin&lt;&amp;mut T&gt; 出來的 field 也 pinned</em>
+field: T   <em>// 選 non-structural → 出來的是 &amp;mut Field, 但這條鎖死整個 type</em>
+        <em>// 不能在不同 method 對同一個 field 用不同 projection</em></code></pre>
+
+  <p>Miri 在這條 invariant 上會拋的錯誤名是 <code>encountered dangling reference</code> 跟 <code>storage of pinned value reused</code>。前者是 self-referential pointer 失效，後者是 drop 沒跑就 dealloc。iddqd 對外不直接暴露 <code>&amp;mut T</code>——entry API（<code>OccupiedEntry&lt;&apos;a, T&gt;</code>）拿到的是 <code>Pin&lt;&amp;mut T&gt;</code>，內部需要 <code>&amp;mut</code> 修鏈結欄位的地方走 <code>get_unchecked_mut</code> 並在 <code>SAFETY</code> 註解寫死「I am not moving this」。把這條 invariant 拆成 type 跟 macro 兩層：type 層保證位址不變、SAFETY 註解保證每個 unsafe block 都標出對 invariant 的依賴。</p>
+
+  <p>關於 drop guarantee 還有一個常被忽略的 corner case：<code>std::mem::forget</code>。在 safe Rust 裡，<code>forget(x)</code> 是<em>合法</em>的——它跳過 destructor、把 ownership 「丟到外太空」。對普通的型別這沒事，記憶體 leak 而已。但對 pinned 不 <code>Unpin</code> 的 self-referential 結構，<code>forget</code> 配合 <code>ManuallyDrop</code> 或 stack-allocated <code>pin!()</code> 就可能讓底下 storage 被重用而 destructor 沒跑——這就是「<em>drop guarantee 比 leak 還重要</em>」這條 RFC 1233 的核心結論。RFC 把 leak 跟 destructor-skip 分開：leak 是允許的，但 storage 重用而沒先 drop 是 UB。<code>Pin</code> 的設計恰恰是把「destructor-skip + storage-reuse」這條 path 從 safe Rust 移除——因為 <code>Pin&lt;&amp;mut T&gt;</code> 不 deref 出 <code>&amp;mut T</code>，<code>ManuallyDrop::take</code>、<code>mem::swap</code> 都得不到指針，就無法跳過 destructor 又讓 storage 重用。iddqd 對外只給 <code>Pin&lt;&amp;mut T&gt;</code> 跟 <code>Arc&lt;T&gt;</code> 的這條 design choice，背後支撐就是這條 RFC。</p>
+
+  <p><code>UnsafePinned&lt;T&gt;</code> 是個值得多談一段的近期工具。stable 通道目前沒有它——它在 nightly 跑、是 <code>core::cell::UnsafeCell</code> 的「pinned 版本」。<code>UnsafeCell</code> 解的是「interior mutability：透過 <code>&amp;T</code> 也能 mutate」這條合約，原本 Rust 形式語意保證 <code>&amp;T</code> 看到的內容在 borrow 期間不變，<code>UnsafeCell</code> 對編譯器宣告「這個區段不要假設」。<code>UnsafePinned</code> 解的是「<code>&amp;mut T</code> 唯一性」這條合約——原本 <code>&amp;mut T</code> 保證沒有其他 alias，<code>UnsafePinned</code> 對編譯器宣告「這個區段可能有 alias，請勿走 <code>noalias</code> 優化路徑」。對 intrusive collection 是必需：list 內部要把 <code>NonNull&lt;Node&gt;</code> deref 成 <code>&amp;mut Node</code> 修鏈結欄位，同時可能還有別的 <code>NonNull&lt;Node&gt;</code> 在 borrow tree 上活著——這個並存從形式語意上看就是 alias。<code>UnsafePinned</code> 把這條 alias escape hatch 收進 type 而非 ad-hoc unsafe block，讓 sound 證明可以走「<code>UnsafePinned</code> 區段內部可以 alias、外部 wrapper 保證 alias 在 caller 視角不可見」的兩段論證。</p>
+
+  <h2>Provenance：pointer 的 borrow tag 從哪來</h2>
+
+  <p>第二條不變式叫 <em>pointer provenance</em>，是 Rust unsafe code guidelines WG 過去三年才慢慢釘下來的概念。最易懂的講法：每個 pointer 不只是「指到記憶體某個 byte」這麼簡單，它還帶著一個 <em>borrow tag</em>，標記這個 pointer 是從哪一次 borrow 衍生來的。同一個地址、不同 tag 的兩個 pointer，<em>不能</em>用一個 deref 另一個——這是 Stacked Borrows 跟 Tree Borrows 兩個 Rust 形式語意模型共同的設計。iddqd 在 internal 全用 <code>NonNull&lt;Node&lt;T&gt;&gt;</code> 而不是 <code>*mut Node&lt;T&gt;</code>，原因之一是 <code>NonNull</code> 的 niche optimization、原因之二是它跟編譯器約定了「這個 pointer 永遠非 null」——但更深的原因是 borrow tag 的 retag 行為：把 <code>NonNull</code> 從 <code>&amp;mut T</code> cast 出來再 cast 回去時，Stacked / Tree Borrows 都會在 retag 點記錄 tag 來源，這讓 Miri 能追蹤 borrow tree。</p>
+
+  <figure class="vg-w-ba-iddqd-borrow-models">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M3 7h7l1 3h10"/><path d="M3 17h7l1-3"/>
+      </svg>
+      <span>拖動分割線比較 Stacked Borrows vs Tree Borrows 在同段 code 上的判讀 · drag</span>
+    </p>
+    <style>
+      .vg-w-ba-iddqd-borrow-models { position: relative; aspect-ratio: 16 / 9; overflow: hidden; min-height: 280px; border: 1px solid var(--line); }
+      .vg-w-ba-iddqd-borrow-models .layer { position: absolute; inset: 0; padding: var(--s-3); box-sizing: border-box; display: flex; flex-direction: column; gap: var(--s-1); }
+      .vg-w-ba-iddqd-borrow-models .before { padding-right: 50%; background: var(--bg-soft); }
+      .vg-w-ba-iddqd-borrow-models .after { padding-left: 50%; background: var(--bg); }
+      .vg-w-ba-iddqd-borrow-models .after { clip-path: polygon(50% 0, 100% 0, 100% 100%, 50% 100%); }
+      .vg-w-ba-iddqd-borrow-models .before { clip-path: polygon(0 0, 50% 0, 50% 100%, 0 100%); }
+      .vg-w-ba-iddqd-borrow-models h4 { font-family: var(--scribed); font-style: italic; margin: 0 0 var(--s-1) 0; color: var(--accent-text); font-size: var(--fs-md); }
+      .vg-w-ba-iddqd-borrow-models p { margin: 0; font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink); line-height: 1.55; }
+      .vg-w-ba-iddqd-borrow-models code { font-family: JetBrains Mono, monospace; font-size: 0.9em; }
+      .vg-w-ba-iddqd-borrow-models ul { margin: var(--s-1) 0 0 0; padding-left: 1.2em; font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink-soft); }
+      .vg-w-ba-iddqd-borrow-models li { margin-bottom: 4px; }
+      .vg-w-ba-iddqd-borrow-models .divider {
+        position: absolute; top: 0; bottom: 0; left: 50%;
+        width: 32px; transform: translateX(-50%);
+        cursor: ew-resize; touch-action: none;
+      }
+      .vg-w-ba-iddqd-borrow-models .divider::before {
+        content: ''; position: absolute; left: 50%; top: 0; bottom: 0;
+        width: 2px; transform: translateX(-50%); background: var(--accent);
+      }
+      .vg-w-ba-iddqd-borrow-models .divider::after {
+        content: '↔'; position: absolute; left: 50%; top: 50%;
+        transform: translate(-50%, -50%);
+        background: var(--accent); color: var(--bg);
+        width: 32px; height: 32px; border-radius: 50%;
+        display: grid; place-items: center;
+        font-family: var(--sans); font-size: 16px;
+      }
+      @media (max-width: 720px) {
+        .vg-w-ba-iddqd-borrow-models { aspect-ratio: 4 / 3; min-height: 360px; }
+      }
+    </style>
+
+    <div class="layer before">
+      <h4>Stacked Borrows（2019）</h4>
+      <p>每個 location 維護一個 <em>borrow stack</em>——push 新的 borrow tag 到 top、pop 任何更老的 tag 都會讓它失效。Retag 點：<code>&amp;mut</code> / <code>&amp;</code> 開出新 borrow、<code>as *mut</code> cast 開出 raw tag。</p>
+      <ul>
+        <li>每次 access 必須有「我的 tag 還在 stack 上」這個條件</li>
+        <li>raw pointer 可以共存於 stack，但 <code>&amp;mut</code> 一 pop，下面所有 tag 失效</li>
+        <li>嚴格：拒絕一些實際上 sound 的 unsafe 寫法</li>
+        <li>錯誤名：<code>encountered a dangling SbTag</code></li>
+      </ul>
+    </div>
+
+    <div class="layer after">
+      <h4>Tree Borrows（2023）</h4>
+      <p>tag 變成<em>樹</em>而非 stack——parent borrow 生 child borrow，child 失效不會 invalidate parent。state 有 Reserved / Active / Frozen / Disabled 四種。<code>&amp;mut</code> 落地是 Reserved，第一次 write 才轉 Active。</p>
+      <ul>
+        <li>更寬鬆，接受 two-phase borrow 跟 raw pointer 共存的真實 pattern</li>
+        <li>protector 把 <code>&amp;mut</code> 函式參數凍住到 call 結束</li>
+        <li>Active 對 Active 仍然是 UB——alias 沒寬鬆</li>
+        <li>錯誤名：<code>two phase borrowed mutably</code> / <code>protector violation</code></li>
+      </ul>
+    </div>
+
+    <div class="divider" id="vg-w-ba-iddqd-borrow-models-divider"></div>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-ba-iddqd-borrow-models');
+        const after = root.querySelector('.after');
+        const before = root.querySelector('.before');
+        const divider = root.querySelector('#vg-w-ba-iddqd-borrow-models-divider');
+        let dragging = false;
+        function setPct(pct) {
+          const c = Math.max(0, Math.min(100, pct));
+          after.style.clipPath = 'polygon(' + c + '% 0, 100% 0, 100% 100%, ' + c + '% 100%)';
+          before.style.clipPath = 'polygon(0 0, ' + c + '% 0, ' + c + '% 100%, 0 100%)';
+          divider.style.left = c + '%';
+        }
+        divider.addEventListener('pointerdown', (e) => { dragging = true; divider.setPointerCapture(e.pointerId); });
+        root.addEventListener('pointermove', (e) => {
+          if (!dragging) return;
+          const rect = root.getBoundingClientRect();
+          setPct(((e.clientX - rect.left) / rect.width) * 100);
+        });
+        root.addEventListener('pointerup', () => { dragging = false; });
+        root.addEventListener('pointercancel', () => { dragging = false; });
+      })();
+    </script>
+  </figure>
+
+  <figcaption style="font-family: var(--scribed); font-style: italic; font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-1);">同一段 <code>let p = &amp;mut node.value as *mut T;</code> 在兩個模型下會走不同的判定路徑——iddqd 的 CI 把兩個模型都跑過。</figcaption>
+
+  <p>Stacked Borrows 的核心隱喻是 <em>borrow stack</em>：每個記憶體位置維護一個 borrow tag 的 stack，<code>&amp;mut</code> 借出 push 一個 tag、cast 成 <code>*mut</code> push 一個 raw tag、subsequent access 必須能在 stack 上找到自己的 tag。Tree Borrows 把這條改成 <em>tree</em>——同一個 borrow 可以衍生多個 child borrow、child 失效不會把 parent 一起 invalidate，能容忍更多實務上 sound 的 unsafe pattern。兩個模型對「<code>&amp;mut</code> 之間有 alias」這條共同 UB——重疊的 mutable borrow 永遠不行——但對「<code>&amp;mut</code> + raw pointer 並存」的判讀就分歧：Stacked Borrows 對 raw 比較寬、對 retag 比較嚴；Tree Borrows 引入 <em>Reserved</em> 狀態（<code>&amp;mut</code> 才 borrow、還沒 write）允許 raw pointer 並存讀，<em>Active</em> 狀態（已經 write）才禁止其他 alias。iddqd 的測試在 CI 跑 Miri 在<em>兩個</em>模型下都通過——「Testing runs under both Stacked and Tree Borrows」。一條 unsafe code 只有在兩個模型下都 sound，才不會被未來語言演進破壞。</p>
+
+  <p>把這條 dual-model 政策的後果列出來：</p>
+
+  <ul>
+    <li><strong>SB-only sound, TB UB</strong>：很少見、通常代表 SB 的某條規則跟 Rust ref-counting 語意對不上、TB 比較貼近原本意圖。修法是改寫 unsafe pattern、靠近 TB-friendly 寫法。</li>
+    <li><strong>TB-only sound, SB UB</strong>：常見、表示 unsafe code 用了 two-phase borrow 或 raw 跟 <code>&amp;mut</code> 並存讀。修法是把 short-lived <code>&amp;mut</code> 改成更明確的 <code>NonNull</code> retag scope，雙模型都能過。</li>
+    <li><strong>兩個都 UB</strong>：實打實的 bug，不分模型。</li>
+    <li><strong>兩個都 sound</strong>：可 ship。iddqd 的 release gate 就是這條。</li>
+  </ul>
+
+  <p>對 library author 的實務建議：在 nightly Miri 上加 <code>MIRIFLAGS="-Zmiri-tree-borrows"</code> 跟<em>不加</em>各跑一次測試套件。如果只跑一個模型，就埋了「另一個模型某天可能 fail」的雷。Miri runtime 在大多數 unit test 場景下夠快、額外 CI 成本不到一倍。</p>
+
+  <pre><code class="language-rust">// iddqd 風格：所有 internal pointer 走 NonNull&lt;Node&lt;T&gt;&gt;
+// 不是因為「null safety」, 而是因為 borrow tag 跟 retag scope
+
+unsafe fn link_after(node: NonNull&lt;Node&lt;T&gt;&gt;, target: NonNull&lt;Node&lt;T&gt;&gt;) {
+    // SAFETY: caller 保證
+    //   1. 兩個 NonNull 各自由獨立的 retag scope 來
+    //   2. 在這個 fn 的呼叫期內，沒有其他 &amp;mut 指向 node 或 target
+    //   3. 兩個 node 都被 pin 在 heap (Pin&lt;Box&lt;Node&gt;&gt;)，位址不會變
+    let n = node.as_ptr();
+    let t = target.as_ptr();
+    (*t).next.replace(node);     // (*t) 必須能在 borrow tree 找到自己 tag
+    (*n).prev.replace(target);
+}</code></pre>
+
+  <p>provenance 的另一個 subtlety 是 <em>retag scope</em>。<code>&amp;mut T</code> cast 成 <code>NonNull&lt;T&gt;</code> 的瞬間，編譯器會 emit 一個 retag 操作——把這個 raw pointer 跟它的 source borrow 連起來、放進當前 scope 的 borrow tree。如果 raw pointer 跨越 function 邊界，它<em>不能</em>沿用 caller 的 tag——必須在 callee 重新走一次 retag。這條規則對 intrusive list 是大事：<code>list.iter_mut()</code> 每次 next 都從 internal <code>NonNull</code> 還原一個 <code>&amp;mut T</code>、把它 lifetime extend 到 iterator scope——「<code>let item = unsafe { std::mem::transmute::&lt;&amp;mut T, &apos;a mut T&gt;(item) };</code>」這段 lifetime extension 之所以 sound、依賴的就是「iterator 保證連續兩次 <code>next</code> 拿到的 index 不同、所以兩個 <code>&amp;mut</code> 的 retag 各走自己的 scope」這條 ordering 合約。注意 lifetime extension <em>本身</em>並未騙過 borrow checker，它在 Miri 看來仍是一個 retag 與一次 access；soundness 來自 caller 邏輯保證的「兩個 index 不同」。</p>
+
+  <p>當這條 ordering 合約被打破，整個 borrow tree 就崩——這正是 iddqd 在 <code>IdOrdMap</code> 找到的 bug 形態：<em>「an <code>Ord</code> implementation returning <code>Equal</code> spuriously could create duplicate indexes in the B-tree table, violating the invariant that enables safe mutable iteration」</em>。caller 寫的 <code>Ord</code> 是 safe code、可以任意亂寫——但 map 的 internal aliasing 證明依賴「不同 key 有不同 index」這條 invariant。iddqd 的修正策略分兩段：「<em>1. When descending into the B-tree, also check equality against the index</em>」跟「<em>2. If there are no matches, fall back to a linear scan</em>」——一個是把 invariant 從「相信 caller 的 Ord」改成「我自己驗證 index 唯一」、第二段是當 Ord 真的退化（每次都 return Equal），仍然 fallback 到 O(N) linear scan 保 correctness。把信任邊界從 caller code 拉回 library，這是任何 safe-Rust-on-top-of-unsafe API 的核心 design 原則：<em>「Safe Rust code, no matter how pathological or adversarially written, must never cause unsafe code to exhibit undefined behavior.」</em></p>
+
+  <p>Tree Borrows 在 2023 年由 Neven Villani 提出、Ralf Jung 在 blog 系列做形式化。它跟 Stacked Borrows 的核心分歧在<em>狀態機</em>：Stacked Borrows 一個 location 對一個 borrow stack，push/pop 是嚴格 LIFO；Tree Borrows 改成<em>borrow tree</em>，每個 node 有四個 state——<code>Reserved</code>（borrow 已建立但還沒 write）、<code>Active</code>（已 write、要求唯一）、<code>Frozen</code>（shared borrow 期間 read-only）、<code>Disabled</code>（borrow 已失效、不可再 access）。state 轉換對應到實際 Rust 操作：建立 <code>&amp;mut</code> 進入 <code>Reserved</code>、第一次 write 轉 <code>Active</code>、進入 shared scope 轉 <code>Frozen</code>、parent borrow pop 子節點轉 <code>Disabled</code>。這個 state machine 比 stack 更精細、容許 two-phase borrow 在 <code>Reserved</code> 期間跟 raw pointer 共存讀，但<em>不</em>放鬆「<code>Active</code> 對 <code>Active</code> 的 alias 仍是 UB」這條核心規則。對 intrusive collection 的意義：iddqd 內部 <code>iter_mut</code> 把每個 <code>NonNull</code> 短暫 deref 成 <code>&amp;mut T</code> 的瞬間，那個 <code>&amp;mut</code> 進入 <code>Active</code>——這個瞬間如果有另一個 <code>&amp;mut</code> 也在 <code>Active</code>，UB。iddqd 的證明是「<code>iter_mut</code> 一次只發出一個 <code>Active</code>，下一個 <code>Active</code> 出現時前一個已經被 caller drop」——這個證明靠的是 borrow checker 而非 runtime check。</p>
+
+  <p>具體一點——Reserved → Active 的轉換在 Rust source 上對應 two-phase borrow（rfcs/2025）。以下這段 code 在 Stacked Borrows 下會被拒、在 Tree Borrows 下會通過：</p>
+
+  <pre><code class="language-rust">fn two_phase_example(v: &amp;mut Vec&lt;i32&gt;) {
+    // 形式上, &amp;mut v.len() 是借用 v
+    // 但這個借用在 push() 的 receiver eval 完成前是 "Reserved"
+    // 同時 1 不 alias 也不 access v, 所以可以 evaluate
+    v.push(v.len() as i32);
+    //     ^^^^^^^^^^^^^
+    //     這個 &amp;v 在 push 開始 evaluation 之前都是 Reserved
+    //     一旦 v.push() 對 v 開始 write, &amp;v 轉 Active 同時被 dropped
+}</code></pre>
+
+  <p>Stacked Borrows 嚴格 LIFO 看不懂這個 pattern——它認為 <code>v.push(...)</code> 的 <code>&amp;mut v</code> 已經 push 到 stack top、後面的 <code>v.len()</code> 找不到 <code>&amp;v</code> 的 tag，拒絕。Tree Borrows 把這個合法 pattern 接受了。這對 iddqd 的意義很實際：iddqd 內部很多 <code>self.tree.iter_mut()</code> 配合 <code>self.len()</code> 的混用 pattern，過去靠 lint suppression 跟 hand-written workaround 才能 sound，Tree Borrows 之後可以 idiomatic 寫。</p>
+
+  <p>另一個 Tree Borrows 引入的概念是 <em>protector</em>。當一個 <code>&amp;mut</code> 被當作 fn 參數傳入，編譯器在 callee scope 內加一個 protector——這個 borrow 在整個 fn 執行期間都不能失效，即使它沒被用到。這條規則對應 LLVM 的 <code>noalias</code> 標註：fn 參數的 <code>&amp;mut</code> 在 codegen 時會被標 <code>noalias</code>，告訴 optimizer「整個 fn body 內，沒有其他 pointer 會 alias 這塊記憶體」。protector 在 unsafe code 是個 hidden trap——如果 unsafe 內部把 <code>&amp;mut</code> cast 成 raw pointer 然後 stash 到 global state、fn return 後仍然 deref 那個 raw pointer，protector 已經把那個 borrow 鎖到 fn scope 內、deref 就 UB。iddqd 對所有 internal <code>NonNull</code> 都保持在 method scope 內、不跨 fn 邊界 alias 同一段記憶體，就是為了不踩 protector。</p>
+
+  <p>從 Ralf Jung 的 Tree Borrows blog 引一段判斷：「<em>protectors will likely be the main remaining source of unexpected UB from Tree Borrows.</em>」這句話對工程師的含義是——大多數 unsafe pattern 在 TB 下都會比 SB 更寬鬆、但 fn-parameter 的 <code>&amp;mut</code> 仍然嚴格、而且嚴格的程度連有經驗的 unsafe 工程師都會誤判。iddqd 在 internal helper fn 上有意避免接 <code>&amp;mut</code> 參數、改接 <code>NonNull</code>，就是因為 raw pointer 不會被加 protector、unsafe 邏輯能更明確地把 alias scope 框在 caller 端。</p>
+
+  <h2>Aliasing：no overlapping &amp;mut 對 intrusive 的特殊性</h2>
+
+  <p>第三條不變式最古老、最廣為人知，也最不直觀：「<em>There must not ever be multiple aliases of <code>&amp;mut</code> references to the same region of memory.</em>」這條規則在 C 跟 C++ 都不存在——C 的 alias model 只管「同一 access 期間」、Rust 管的是「同一 borrow 期間，不論這段時間有沒有 access」。對普通的 Rust 程式這條看不見、因為 borrow checker 編譯期就把所有 overlapping <code>&amp;mut</code> 擋掉了；但對 intrusive list 它就是地雷——iterator 想要拿 <code>&amp;mut T</code> 給 caller、同時還要拿 <code>&amp;mut Node.next</code> 來推進指標——同一塊 heap region 上同時兩個 <code>&amp;mut</code>，UB。</p>
+
+  <p>iddqd 處理這條 invariant 的招數借自 <code>Vec</code>：<code>split_at_mut</code> 把一個 <code>&amp;mut [T]</code> 切成兩半、各自獨立的 <code>&amp;mut</code>，保證兩個 slice 不重疊。對 intrusive list 等價的招數是「以 index 為分隔」——<code>iter_mut</code> 從 B-tree 拿到 sorted index 列、逐個 dispatch 對應的 <code>&amp;mut T</code>。這條 path 之所以 sound，依賴 B-tree 的 invariant「不同 index 對應不同 node」——而這正是上一節 <code>Ord</code> bug 攻擊的同一條 invariant。iddqd 的 <code>iter_mut</code> 內部會做一個 lifetime extension，把短的 internal lifetime 提到跟 iterator 一樣久：</p>
+
+  <p>講白話一點——<code>split_at_mut</code> 的型別簽名是 <code>fn split_at_mut(&amp;mut self, mid: usize) -&gt; (&amp;mut [T], &amp;mut [T])</code>。它的 sound 證明依賴 <code>mid &lt;= len</code> 跟「slice 在 memory 上是連續的、可以用 <code>ptr.offset(mid)</code> 算出第二段的起點」這兩條 Vec 自己保證的條件。intrusive list 沒有「memory 連續」這條，但可以用<em>「同一個 index 對應同一個 node」</em>這條 invariant 替代——也就是 B-tree distinct-index property。iddqd 的 <code>iter_mut</code> 跟 <code>Vec::split_at_mut</code> 在概念上同形，差別只在「切分依據」從 <code>mid: usize</code> 換成「B-tree 上唯一的 entry path」。</p>
+
+  <pre><code class="language-rust">// 簡化版的 iter_mut, lifetime 從 closure 內 extend 到 'a
+pub fn iter_mut&lt;'a&gt;(&amp;'a mut self) -&gt; IterMut&lt;'a, T&gt; {
+    IterMut { inner: self.tree.iter_mut(), _marker: PhantomData }
+}
+
+impl&lt;'a, T&gt; Iterator for IterMut&lt;'a, T&gt; {
+    type Item = &amp;'a mut T;
+    fn next(&amp;mut self) -&gt; Option&lt;Self::Item&gt; {
+        let raw = self.inner.next()?;          // 取到下一個 NonNull
+        let item: &amp;mut T = unsafe { raw.as_mut() };
+        // SAFETY: indexes returned by self.iter are known to all be different,
+        // so successive calls to IterMut::next never create mutable aliases to
+        // the same memory.
+        let item = unsafe {
+            std::mem::transmute::&lt;&amp;mut T, &amp;'a mut T&gt;(item)
+        };
+        Some(item)
+    }
+}</code></pre>
+
+  <p>上面那個 <code>transmute&lt;&amp;mut T, &amp;&apos;a mut T&gt;</code> 看似只在「延長 lifetime」、實際上是把 unsafe 的擔保條件具體化：caller 跟 iterator 之間有一條合約——「你連續呼叫我兩次 next，兩個 return value 不會 alias」。這條合約由 B-tree 的「distinct index」保證；而 B-tree 的 distinct index 又依賴 caller 提供的 <code>Ord</code> 不會 spurious 退化。invariant chain 是 <em>API 合約 → B-tree 結構 → distinct index → distinct pointer → no overlapping &amp;mut</em>。最弱的一環在最上面（caller 的 <code>Ord</code>），iddqd 的修法是在 B-tree descent 時親自驗 index——把 chain 的弱化做成 library 自己的 check 而不是「相信 caller」。這跟 Postgres 對 user-defined function 做 marker / Linux kernel 對 user-supplied iterator 做 verifier 是同一個 design 原則。</p>
+
+  <p>把 <code>IdOrdMap</code> 的這個 bug 重現一下，可以更具體看「caller safe code 怎麼把 unsafe code 推進 UB」：</p>
+
+  <pre><code class="language-rust">// caller 寫了一個邪惡的 Ord 實作——對任何兩個 key, 都 return Equal
+#[derive(PartialEq, Eq, PartialOrd)]
+struct EvilKey(u64);
+impl Ord for EvilKey {
+    fn cmp(&amp;self, _other: &amp;Self) -&gt; std::cmp::Ordering {
+        std::cmp::Ordering::Equal   // ← 100% pathological
+    }
+}
+
+// 在修補前的 iddqd 上, 這段 safe code 會把 unsafe path 推進 UB:
+let mut map = IdOrdMap::&lt;EvilKey, String&gt;::new();
+map.insert(EvilKey(1), "alpha".into());
+map.insert(EvilKey(2), "beta".into());      // B-tree 以為這跟 EvilKey(1) 同一個 entry
+                                            // → 同一個 index 對應兩個 node
+for value in map.iter_mut() {               // ← UB 在這裡: iter_mut 假設 distinct index
+    // ... two phase borrowed mutably ...
+}</code></pre>
+
+  <p>修補後的版本：B-tree descent 時對每個 candidate node 多檢查一次 <code>self.index == target.index</code>，發現重複就拒絕 insert；如果 caller 的 <code>Ord</code> 真的讓所有 key 都被視為 equal、B-tree path 找不到 distinct index、最後 fallback 到 O(N) linear scan 找正確的 entry。fallback 路徑慢、但<em>sound</em>。這就是 unsafe library 的標準心態：寧可<em>慢</em>到 caller 覺得受不了，也不能讓 caller 的 safe code 把 unsafe path 推進 UB。「Safe Rust 永不應導致 UB」這條合約對 library 而言不是 nice-to-have——是 sound 的 def。</p>
+
+  <p>aliasing 還有一個容易被忽略的點：<code>encapsulation</code> 是 sound 的<em>結構</em>條件。iddqd 文章具體點出「<code>struct MyVec&lt;T&gt; { ptr: NonNull&lt;T&gt;, len: usize }</code>」這類自訂型別，「<em>encapsulation and privacy of fields like <code>len</code> are load-bearing for soundness</em>」。<code>len</code> 必須 private——因為 unsafe code 內部假設「<code>self.len</code> 跟 <code>self.ptr</code> 後面真的有的元素數對齊」；如果 <code>len</code> public，caller 可以 safe code 改它、unsafe code 假設就破。iddqd 對所有 internal field 全用 <code>pub(crate)</code> 或 private、外部 API 透過 entry pattern（<code>OccupiedEntry</code> / <code>VacantEntry</code>）暴露——「<em>encapsulation 不是封裝風格、是 unsafe sound 的 type-level barrier</em>」。任何 invariant 的依賴項只要外部可以動，那條 invariant 就不能被 unsafe code 假設。</p>
+
+  <p>具體一點：iddqd 的 <code>IdHashMap&lt;T&gt;</code> internal 大概長這樣（簡化）——</p>
+
+  <pre><code class="language-rust">pub struct IdHashMap&lt;T: KeyedItem&gt; {
+    // bucket array: 每個 bucket 指向 list head
+    buckets: Box&lt;[Option&lt;NonNull&lt;Node&lt;T&gt;&gt;&gt;]&gt;,
+    // pinned node storage; node 的 prev/next 都指向這個 storage 內的另一個 node
+    storage: Vec&lt;Pin&lt;Box&lt;Node&lt;T&gt;&gt;&gt;&gt;,
+    // 由 storage 與 bucket 共同維護, 對外不可見
+    len: usize,
+}
+
+// SAFETY 不變式（全部 private 才成立）：
+//   I1. storage 中每個 Pin&lt;Box&lt;Node&gt;&gt; 的位址在 self 生命週期內不變
+//   I2. buckets 中每個 NonNull 指向 storage 裡實際存在的 Node
+//   I3. self.len == storage.iter().filter(|n| !n.is_tombstone()).count()
+//   I4. 任何 Active &amp;mut Node 都對應 storage 中唯一一個 NonNull
+//
+// 違反任何一條 → unsafe code path 進入 UB 區。
+// 三個 field 都必須 private; 一旦 pub, caller 在 safe code 內就能破 invariant。</code></pre>
+
+  <p>這四條 invariant 不是「實作細節」、是<em>型別的一部分</em>。把 <code>buckets</code> 改成 <code>pub</code>，外部 safe code 就可以塞一個指向已被 drop 的 node 的 <code>NonNull</code>、接下來內部 <code>iter</code> deref 那個 pointer 就 UB——而且 borrow checker 不會擋（safe code 寫 <code>NonNull</code> 進 pub field 是合法的）。把 <code>len</code> 改成 <code>pub</code>，外部可以調大它、unsafe code 在 <code>iter_mut</code> 走超出 storage 真實長度的 index → out-of-bounds → UB。encapsulation 在 Rust unsafe 文化裡不是「OO 風格」、不是「方便重構」——是 sound 證明的最後一道防線。Aria Beingessner 的 too-many-lists 教學裡這條被反覆強調：「<em>safe Rust 的 invariant violation 是 bug，unsafe Rust 的 invariant violation 是 CVE</em>」。</p>
+
+  <pre data-kind="pseudocode"><code><em>// no-mutable-aliasing 的 unwrap 鏈：</em>
+
+caller 提供的 Ord
+    |
+    v 用來建 B-tree 的 key
+B-tree 的 distinct-index invariant
+    |
+    v iter_mut 依賴
+distinct NonNull&lt;Node&gt; 序列
+    |
+    v 變成
+distinct &amp;mut T 序列
+    |
+    v Rust 形式語意要求
+不重疊（no overlap）
+
+<em>// 最弱的一環是最上面的 caller Ord</em>
+<em>// iddqd 的修正：library 在 B-tree descent 時親自驗 index 唯一</em>
+<em>// fallback: 退化到 O(N) linear scan</em></code></pre>
+
+  <h2>Ownership handoff：Rc / Arc / OccupiedEntry 把不變式包成型別</h2>
+
+  <p>最後一條不變式是 <em>ownership handoff</em>——map 跟 caller 之間誰擁有 value、什麼時候交接。intrusive list 的特殊難題：value 本身帶鏈結欄位、value 由 caller 持有時 list 卻仍要 traverse、所以 value 不能簡單地交給 caller。iddqd 解決方式是把<em>外部能拿到的 value 一律包成型別</em>——caller 看不到 raw <code>T</code>、看到的是 <code>OccupiedEntry&lt;&apos;a, T&gt;</code>、<code>Arc&lt;T&gt;</code>、或 <code>Pin&lt;&amp;mut T&gt;</code>。這幾個 wrapper 各自釘死一段合約：</p>
+
+  <ul>
+    <li><code>OccupiedEntry&lt;&apos;a, T&gt;</code>：lifetime <code>&apos;a</code> 借自 map、entry 存在期間 map 不能被 mutate（borrow checker 編譯期保證），entry 內部拿到的是 <code>Pin&lt;&amp;mut T&gt;</code> 而非 <code>&amp;mut T</code>。</li>
+    <li><code>Arc&lt;T&gt;</code>：shared ownership，clone 計數 +1，<em>不</em>給 <code>&amp;mut T</code>。caller 拿到 <code>Arc&lt;T&gt;</code> 只能讀；想 mutate 必須走 <code>Arc::get_mut</code>（在 strong count == 1 時才成功）或 <code>Arc&lt;Mutex&lt;T&gt;&gt;</code>。Map 用 <code>Arc</code> 維持「map 還持有 value」這條 invariant，即使 caller 暫時也有 reference。</li>
+    <li><code>Pin&lt;&amp;mut T&gt;</code>：caller 可以 mutate 但不能 move——對「值的內容可變，但位址不能搬」這條 intrusive 必需的合約是直球。</li>
+  </ul>
+
+  <figure class="vg-w-arch-iddqd-stack" data-svg-scroll="880">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>
+      </svg>
+      <span>iddqd 內部各層的責任邊界——靜態架構圖，無互動</span>
+    </p>
+    <style>
+      .vg-w-arch-iddqd-stack svg { width: 100%; height: auto; }
+      .vg-w-arch-iddqd-stack .layer-text { font-family: EB Garamond, serif; font-size: 13px; }
+      .vg-w-arch-iddqd-stack .layer-sub { font-family: IM Fell English, serif; font-style: italic; font-size: 11px; fill: var(--muted); }
+      .vg-w-arch-iddqd-stack .num { font-family: JetBrains Mono, monospace; font-size: 10px; pointer-events: none; }
+      .vg-w-arch-iddqd-stack .head { font-family: IM Fell English, serif; font-style: italic; font-size: 13px; }
+    </style>
+    <svg viewBox="0 0 880 360" role="img" aria-label="iddqd 內部四層：public API、entry/handoff、internal NonNull、Pin/UnsafePinned 的責任分界">
+      <text x="440" y="22" text-anchor="middle" fill="var(--ink)" class="head">iddqd 四層——每層各自把不變式收口成型別</text>
+
+      <!-- L1: Public API -->
+      <rect x="40" y="40" width="800" height="60" fill="var(--bg-soft)" stroke="var(--accent)" stroke-width="1.5"/>
+      <text x="60" y="62" fill="var(--accent-text)" class="layer-text">L1 · Public API</text>
+      <text x="60" y="80" fill="var(--ink)" class="layer-sub">IdHashMap, IdOrdMap, BiHashMap, TriHashMap, insert_unique, iter_mut</text>
+      <text x="60" y="94" fill="var(--muted)" class="num">面向 caller, 只暴露 safe wrapper, unsafe 完全藏在 crate</text>
+
+      <!-- L2: Entry / Handoff -->
+      <rect x="40" y="110" width="800" height="60" fill="var(--bg-soft)" stroke="var(--ink-deep)" stroke-width="1.5"/>
+      <text x="60" y="132" fill="var(--ink-deep)" class="layer-text">L2 · Entry / Handoff</text>
+      <text x="60" y="150" fill="var(--ink)" class="layer-sub">OccupiedEntry&lt;&apos;a, T&gt;, VacantEntry, Pin&lt;&amp;mut T&gt;, Arc&lt;T&gt;</text>
+      <text x="60" y="164" fill="var(--muted)" class="num">把 lifetime, pin, ownership 三條合約用 type 表達, borrow checker 保證</text>
+
+      <!-- L3: Internal pointer layer -->
+      <rect x="40" y="180" width="800" height="60" fill="var(--bg-soft)" stroke="var(--sage-deep)" stroke-width="1.5"/>
+      <text x="60" y="202" fill="var(--sage-deep)" class="layer-text">L3 · Internal NonNull layer</text>
+      <text x="60" y="220" fill="var(--ink)" class="layer-sub">NonNull&lt;Node&lt;T&gt;&gt;, split_at_mut-style 切 index, B-tree 維持 distinct invariant</text>
+      <text x="60" y="234" fill="var(--muted)" class="num">每個 NonNull 都有清楚的 retag scope, alias 由 distinct index 保證</text>
+
+      <!-- L4: Pin / UnsafePinned base -->
+      <rect x="40" y="250" width="800" height="60" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.5"/>
+      <text x="60" y="272" fill="var(--muted)" class="layer-text">L4 · Pin / UnsafePinned 基底</text>
+      <text x="60" y="290" fill="var(--ink)" class="layer-sub">Pin&lt;Box&lt;Node&lt;T&gt;&gt;&gt;, PhantomPinned, UnsafePinned&lt;T&gt;, NaiveMap oracle (test only)</text>
+      <text x="60" y="304" fill="var(--muted)" class="num">把位址穩定、drop guarantee、aliasing escape hatch 收進 type system 跟 model-test</text>
+
+      <text x="440" y="340" text-anchor="middle" fill="var(--muted)" class="layer-sub">四層各自有合約, 對應四條不變式; 從上往下信任度遞增、可變動性遞減</text>
+    </svg>
+    <figcaption>iddqd 把不變式分四層收口——L1 對 caller 只給 safe API，L2 把 lifetime/pin/ownership 編碼成 type，L3 在 internal 走 <code>NonNull</code> 維持 retag scope，L4 用 <code>Pin</code> + <code>UnsafePinned</code> 撐起位址穩定與 alias escape hatch。</figcaption>
+  </figure>
+
+  <p>三個 wrapper 各自表達一條合約、合起來把「外部能怎麼動 value」這個自由度收口。<code>OccupiedEntry</code> 借自 map、entry 還活著時 map 不能 insert / remove——這個保證來自 <code>&apos;a</code> lifetime、borrow checker 編譯期就會擋；<code>Arc</code> 把 mutation 完全禁掉、map 跟 caller 共享 read-only view；<code>Pin&lt;&amp;mut T&gt;</code> 給 caller 修內容的權力但禁止搬位址。三條 wrapper 同時存在的設計讓 iddqd 可以針對不同 use case 給出不同的 ownership handoff：need to mutate in-place → entry；need to share between threads → Arc；need to give caller a typed cursor that respects pin → <code>Pin&lt;&amp;mut T&gt;</code>。</p>
+
+  <p>看 <code>OccupiedEntry</code> 的 API surface 可以理解這個 design 多細：</p>
+
+  <pre><code class="language-rust">// iddqd 風格的 OccupiedEntry
+pub struct OccupiedEntry&lt;'a, T: KeyedItem&gt; {
+    map: &amp;'a mut IdHashMap&lt;T&gt;,
+    // 內部 raw pointer; entry 存在期間, map 被借出
+    node: NonNull&lt;Node&lt;T&gt;&gt;,
+    _phantom: PhantomData&lt;&amp;'a mut T&gt;,
+}
+
+impl&lt;'a, T: KeyedItem&gt; OccupiedEntry&lt;'a, T&gt; {
+    // 只給 Pin&lt;&amp;mut T&gt;, 永遠不給 &amp;mut T
+    pub fn get_pin(&amp;mut self) -&gt; Pin&lt;&amp;mut T&gt; {
+        unsafe {
+            // SAFETY: node 由 Pin&lt;Box&lt;Node&gt;&gt; 配置, 位址不變
+            //         self 借走整個 map, 所以這個 NonNull 是唯一的 &amp;mut path
+            Pin::new_unchecked(&amp;mut self.node.as_mut().value)
+        }
+    }
+
+    // 想拿走 T 必須 consume entry; 內部會清掉 list 鏈結
+    pub fn remove(self) -&gt; T {
+        unsafe {
+            // SAFETY: ... (一連串對 four invariants 的引用)
+            self.map.detach_node(self.node)
+        }
+    }
+}</code></pre>
+
+  <p>注意 <code>get_pin</code> 跟 <code>remove</code> 的 signature 差別：前者是 <code>&amp;mut self</code>、後者是 <code>self</code>（consume）。前者讓 caller 可以重複地修內容（因為 entry 還活著、map 還被借走），後者「entry 消失後 caller 才能拿到 raw <code>T</code>」——而拿到 raw <code>T</code> 的瞬間，list 內部該 node 已經被 detach。這條 lifecycle 是強制的：raw <code>T</code> 只能從<em>消滅 entry</em>的同一個 expression 拿到、entry 還在的時候 caller 永遠看不到 raw <code>T</code>、整個 lifecycle 由 type system 跟 borrow checker 在編譯期釘死。</p>
+
+  <p>對 thread-safety，iddqd 提供 <code>Arc&lt;Mutex&lt;T&gt;&gt;</code> 或 <code>Arc&lt;RwLock&lt;T&gt;&gt;</code> 的變體——把 mutation 收進 <code>Mutex</code>、不同 thread 透過 <code>Arc::clone</code> 共享 read view。這條 path 上 ownership handoff 的合約變成「value 在 <code>Mutex</code> 內、map 內部不直接 mutate value、只 mutate 鏈結欄位（在 map 自己的 lock 下）」。這個分層是必要的——如果 map 跟 caller 都想 mutate value，必須有個 ordering / locking 機制保證不同時動同一塊記憶體。<code>Mutex</code> 是 dynamic check、編譯期不擋；<code>Arc</code> 是 shared count、編譯期不擋；但兩者組合在 iddqd type signature 上明確標出來，caller 看 type 就知道「我要動 value 必須 lock」。</p>
+
+  <p>這個四層 type design 的測試策略也值得提：iddqd 不僅在 Miri 兩個模型下跑、還跑了 <em>model-based testing against a <code>NaiveMap</code> oracle</em>——一份「inefficient but clearly correct」的參考實作，把每個 production 操作的結果跟 oracle 比對。analytic reasoning 證明「invariant 在 type level 成立」、empirical model testing 驗證「實作真的 honour 了 invariant」、Miri 保證「沒有 latent UB」——三條互相 independent 的 check 同時 green 才能 release。對 unsafe heavy 的 library 這是低於 minimum 的代價。</p>
+
+  <p>下面這個小工具把 pin projection 的選擇可視化——同一個 <code>Pin&lt;&amp;mut Node&lt;T&gt;&gt;</code>，拖動 cursor 在 node 上挑選 field，看每個 field 是 structural（projection 也 pinned）還是 non-structural（projection 給 <code>&amp;mut Field</code>）。intrusive node 三個 field 的選擇不能搞混：<code>value: T</code> 通常 structural（caller 可能依賴 <code>T</code> 也 pinned）、<code>prev / next</code> 通常 non-structural（鏈結欄位是 library 私有、不需要對外保證 pinned）。這條 split 一旦決定就是 type-wide commitment——同一個 type 不可能在 method A 對 <code>value</code> 用 structural、method B 用 non-structural，否則整個 sound 的 chain 斷。</p>
+
+  <figure class="vg-w-drag-iddqd-pin-projection" data-svg-scroll="880">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M5 9h14M5 15h14"/><path d="m9 5-4 4 4 4M15 5l4 4-4 4"/>
+      </svg>
+      <span>拖動 cursor 在 node 三個 field 之間選擇，看 projection 規則 · drag · 3 fields</span>
+    </p>
+    <style>
+      .vg-w-drag-iddqd-pin-projection { display: grid; gap: var(--s-3); }
+      .vg-w-drag-iddqd-pin-projection svg { width: 100%; height: auto; touch-action: none; }
+      .vg-w-drag-iddqd-pin-projection .head { font-family: IM Fell English, serif; font-style: italic; font-size: 13px; }
+      .vg-w-drag-iddqd-pin-projection .label { font-family: EB Garamond, serif; font-size: 13px; }
+      .vg-w-drag-iddqd-pin-projection .micro { font-family: JetBrains Mono, monospace; font-size: 11px; }
+      .vg-w-drag-iddqd-pin-projection .panel { padding: var(--s-2) var(--s-3); border-left: 2px solid var(--accent); background: var(--bg-soft); }
+      .vg-w-drag-iddqd-pin-projection .panel-head { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 0 0 var(--s-1) 0; }
+      .vg-w-drag-iddqd-pin-projection .panel-title { font-family: EB Garamond, serif; font-size: 1.3rem; color: var(--ink); margin: 0 0 var(--s-1) 0; }
+      .vg-w-drag-iddqd-pin-projection .panel-body { font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink-soft); margin: 0; }
+      .vg-w-drag-iddqd-pin-projection .panel-body code { font-family: JetBrains Mono, monospace; font-size: 0.92em; }
+    </style>
+
+    <svg viewBox="0 0 880 240" role="img" aria-label="拖動 cursor 在 Pin&lt;&amp;mut Node&gt; 三個 field 上選擇, 顯示 projection 規則">
+      <text x="440" y="22" text-anchor="middle" fill="var(--ink)" class="head">Pin&lt;&amp;mut Node&lt;T&gt;&gt; 上的三個 field——拖動 cursor 在它們之間切換</text>
+
+      <!-- Node outline -->
+      <rect x="80" y="60" width="720" height="120" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.5"/>
+      <text x="90" y="84" fill="var(--muted)" class="label">Pin&lt;&amp;mut Node&lt;T&gt;&gt;</text>
+
+      <!-- Three field rects -->
+      <rect x="120" y="100" width="200" height="60" fill="var(--bg)" stroke="var(--sage-deep)" stroke-width="1"/>
+      <text x="220" y="124" text-anchor="middle" fill="var(--ink)" class="label">value: T</text>
+      <text x="220" y="146" text-anchor="middle" fill="var(--sage-deep)" class="micro">structural</text>
+
+      <rect x="340" y="100" width="200" height="60" fill="var(--bg)" stroke="var(--accent)" stroke-width="1"/>
+      <text x="440" y="124" text-anchor="middle" fill="var(--ink)" class="label">prev: NonNull&lt;Node&gt;</text>
+      <text x="440" y="146" text-anchor="middle" fill="var(--accent-text)" class="micro">non-structural</text>
+
+      <rect x="560" y="100" width="200" height="60" fill="var(--bg)" stroke="var(--accent)" stroke-width="1"/>
+      <text x="660" y="124" text-anchor="middle" fill="var(--ink)" class="label">next: NonNull&lt;Node&gt;</text>
+      <text x="660" y="146" text-anchor="middle" fill="var(--accent-text)" class="micro">non-structural</text>
+
+      <!-- Track -->
+      <line x1="220" y1="200" x2="660" y2="200" stroke="var(--muted-2)" stroke-width="2"/>
+
+      <!-- Cursor -->
+      <circle id="vg-w-drag-iddqd-pin-projection-h" cx="220" cy="200" r="12" fill="var(--accent)" stroke="var(--bg)" stroke-width="2" cursor="grab" role="button" tabindex="0" aria-label="拖動 cursor 選擇 field"/>
+      <text id="vg-w-drag-iddqd-pin-projection-l" x="220" y="226" text-anchor="middle" fill="var(--ink)" class="micro">value</text>
+    </svg>
+
+    <div class="panel">
+      <p class="panel-head">projection rule</p>
+      <h3 class="panel-title" id="vg-w-drag-iddqd-pin-projection-title">value : T —— structural pinning</h3>
+      <p class="panel-body" id="vg-w-drag-iddqd-pin-projection-body"><code>fn value_pin(self: Pin&lt;&amp;mut Self&gt;) -&gt; Pin&lt;&amp;mut T&gt;</code>——projection 出來的 <code>T</code> 也是 pinned，<em>type-wide commitment</em>：iddqd 的整個生命週期裡都不能對 value 做 move-out。caller 拿到的是 <code>Pin&lt;&amp;mut T&gt;</code>，可以 mutate 內容，不能搬位址。對 self-referential T、generator state machine 是 sound 必需的選擇。</p>
+    </div>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-drag-iddqd-pin-projection');
+        const svg = root.querySelector('svg');
+        const handle = root.querySelector('#vg-w-drag-iddqd-pin-projection-h');
+        const labelEl = root.querySelector('#vg-w-drag-iddqd-pin-projection-l');
+        const title = root.querySelector('#vg-w-drag-iddqd-pin-projection-title');
+        const body = root.querySelector('#vg-w-drag-iddqd-pin-projection-body');
+
+        const X_MIN = 120, X_MAX = 760;
+        const fields = [
+          { center: 220, name: 'value', title: 'value : T —— structural pinning',
+            body: '<code>fn value_pin(self: Pin&lt;&amp;mut Self&gt;) -&gt; Pin&lt;&amp;mut T&gt;</code>——projection 出來的 <code>T</code> 也是 pinned，<em>type-wide commitment</em>：iddqd 的整個生命週期裡都不能對 value 做 move-out。caller 拿到的是 <code>Pin&lt;&amp;mut T&gt;</code>，可以 mutate 內容，不能搬位址。對 self-referential T、generator state machine 是 sound 必需的選擇。' },
+          { center: 440, name: 'prev', title: 'prev : NonNull&lt;Node&lt;T&gt;&gt; —— non-structural pinning',
+            body: '<code>fn prev_mut(self: Pin&lt;&amp;mut Self&gt;) -&gt; &amp;mut Option&lt;NonNull&lt;Node&gt;&gt;</code>——projection 出來的是<em>普通</em> <code>&amp;mut</code>，因為 prev 是 link metadata、外部不應該看到、library 內部會 mutate。<code>core::pin</code> docs 把這條叫 non-structural pinning：「pinning does not propagate to a field」。實作要走 <code>get_unchecked_mut</code>，附 SAFETY 註解寫死「I am not moving this」。' },
+          { center: 660, name: 'next', title: 'next : NonNull&lt;Node&lt;T&gt;&gt; —— non-structural pinning',
+            body: '與 prev 同理。library 內部把 next 視為一個普通的 raw pointer 容器、需要時隨意 mutate。對外不暴露——caller 永遠不會看到 <code>Pin&lt;&amp;mut NonNull&lt;Node&gt;&gt;</code> 也不會看到 <code>&amp;mut NonNull&lt;Node&gt;</code>，這個 wrapper 限制是 encapsulation 的一環。' },
+        ];
+
+        let dragging = false;
+        function clientToSvgX(clientX) {
+          const pt = svg.createSVGPoint();
+          pt.x = clientX; pt.y = 0;
+          const svgPt = pt.matrixTransform(svg.getScreenCTM().inverse());
+          return Math.max(X_MIN, Math.min(X_MAX, svgPt.x));
+        }
+        function pickField(x) {
+          // Snap to nearest field center
+          let best = fields[0], dist = Math.abs(x - fields[0].center);
+          for (const f of fields) {
+            const d = Math.abs(x - f.center);
+            if (d < dist) { best = f; dist = d; }
+          }
+          return best;
+        }
+        function setX(x) {
+          handle.setAttribute('cx', x);
+          labelEl.setAttribute('x', x);
+          const f = pickField(x);
+          labelEl.textContent = f.name;
+          title.textContent = f.title;
+          body.innerHTML = f.body;
+        }
+        handle.addEventListener('pointerdown', (e) => {
+          dragging = true;
+          handle.setPointerCapture(e.pointerId);
+          handle.setAttribute('cursor', 'grabbing');
+        });
+        handle.addEventListener('pointermove', (e) => {
+          if (!dragging) return;
+          setX(clientToSvgX(e.clientX));
+        });
+        handle.addEventListener('pointerup', (e) => {
+          dragging = false;
+          handle.setAttribute('cursor', 'grab');
+          // snap to nearest
+          const x = clientToSvgX(e.clientX);
+          const f = pickField(x);
+          setX(f.center);
+        });
+        handle.addEventListener('keydown', (e) => {
+          const idx = fields.findIndex((f) => f.name === labelEl.textContent);
+          if (e.key === 'ArrowRight' && idx < fields.length - 1) { e.preventDefault(); setX(fields[idx + 1].center); }
+          if (e.key === 'ArrowLeft' && idx > 0) { e.preventDefault(); setX(fields[idx - 1].center); }
+        });
+      })();
+    </script>
+  </figure>
+
+  <h2>四條合約合起來能寫出什麼樣的 unsafe code</h2>
+
+  <p>把四條合約合起來看，iddqd 的 unsafe block 其實非常少——而且每一個都有對應一條 invariant 的 <code>SAFETY</code> 註解：「pinned, so location stable」「distinct index, so no overlap」「retag scope ends at fn return」「caller still holds Arc, so storage live」。這種寫法是 unsafe-heavy Rust 的<em>標準</em>實踐——不是「我寫得對，相信我」，而是「每段 unsafe 各自指向一條型別不變式、由 type system / runtime check / external invariant 三者其中之一明確支撐」。<code>iddqd</code> 的 unsafe block 數量大概比同等功能的 C 實作多一個數量級的<em>註解</em>，但 unsafe 的<em>真實程式碼</em>很少——這是 Rust unsafe 文化的本質：用 type 跟 comment 把所有條件外顯，剩下的全交給 borrow checker。</p>
+
+  <figure class="vg-w-table-iddqd-safety-clauses">
+  <pre data-kind="pseudocode"><code><em>// iddqd 內部 unsafe block 的標準骨架</em>
+
+unsafe {
+    // SAFETY:
+    //   1. node 由 Pin&lt;Box&lt;Node&gt;&gt; 配置，地址不變 (Pin invariant)
+    //   2. 此 fn 的 caller 持有 &amp;mut Map，map 不會被併發 mutate (lifetime)
+    //   3. self.tree 的 index 由 B-tree distinct invariant 保證唯一，
+    //      此處的 NonNull 不會與其他 active &amp;mut 重疊 (alias invariant)
+    //   4. NonNull retag scope 限定在這個 fn 內，呼叫 fn 邊界會重新 retag
+    //      (provenance invariant)
+    let item: &amp;mut T = raw.as_mut();
+    let item = std::mem::transmute::&lt;&amp;mut T, &amp;'a mut T&gt;(item);
+    Some(item)
+}
+
+<em>// 四條 SAFETY clauses ↔ 四條不變式 ↔ 四個 Miri 檢查模式</em>
+<em>//   Pin 不變式破     → 'storage of pinned value reused'</em>
+<em>//   lifetime 不變式破 → borrow checker compile error (不會編)</em>
+<em>//   alias 不變式破   → 'two phase borrowed mutably'</em>
+<em>//   provenance 不變式破 → 'encountered a dangling SbTag'</em></code></pre>
+  </figure>
+
+  <p>不變式之間的<em>正交性</em>意味著一條工程上的可驗證心法：寫完一段 unsafe block 後，自問四遍——「這段 code 對 Pin 假設了什麼？對 Provenance 假設了什麼？對 Aliasing 假設了什麼？對 Ownership 假設了什麼？」每個答案都該對應 SAFETY 註解一句。如果某條問不出答案，那段 unsafe 對該 invariant 的依賴是「相信運氣」、不是「相信合約」。</p>
+
+  <p>對團隊的決策矩陣可以這樣寫：</p>
+
+  <figure class="vg-w-table-iddqd-decision-tree">
+  <pre data-kind="pseudocode"><code><em>// 「我要不要寫 intrusive collection」的決策樹</em>
+
+Q1: 我的 value 是不是會同時參與多個 collection?
+    no  → 不要寫 intrusive, 用 IndexMap / HashMap / BTreeMap
+    yes → Q2
+
+Q2: 我能不能用 Arc&lt;T&gt; + 多個 HashMap&lt;Key, Arc&lt;T&gt;&gt; 表達?
+    yes → 走這條; safe, slow lookups, no unsafe
+    no  → Q3
+
+Q3: 我有沒有預算寫 SAFETY 註解 + 維護 Miri CI matrix?
+    no  → 找一個 production-quality crate (iddqd, intrusive-collections)
+    yes → Q4
+
+Q4: 團隊有沒有人能審 unsafe code? 還在嗎?
+    no  → 別寫. 半年內離職那段 unsafe 變成沒有 maintainer 的 CVE 候選
+    yes → 可以開始, 但先在 dev branch 跑三個月 Miri 沒紅再 ship</code></pre>
+  </figure>
+
+  <p>四個 Q 全部 yes 才有資格寫 intrusive。實務上 Q3 跟 Q4 是大多數團隊的 bottleneck——SAFETY 註解寫起來比 logic 還久、reviewer 要懂 Stacked / Tree Borrows 才看得懂註解、人一走那段 code 變遺孤。Oxide 之所以願意 maintain iddqd，是因為他們的 control plane 本來就有兩三位專職的 Rust 系統工程師、團隊 culture 也習慣寫長 SAFETY block。一般 SaaS / web backend 團隊沒這條件、應該走 <code>indexmap</code> + <code>HashMap&lt;Key, Arc&lt;T&gt;&gt;</code>。</p>
+
+  <p>不是所有 Rust 工程師都應該寫 intrusive collection。但如果你的 application 真的需要（embedded、kernel-like context、超高 throughput 的 indexed store），那以下這四條應該寫在 onboarding doc 第一頁：</p>
+
+  <ol>
+    <li><strong>位址不變要走 <code>Pin&lt;Box&lt;T&gt;&gt;</code> + <code>PhantomPinned</code></strong>。<code>UnsafePinned</code> 在 nightly 可以走更強的 alias escape hatch，但 stable 通道目前還是 <code>Pin + Box</code>。projection 規則一旦選定就 type-wide 鎖死、不可改。</li>
+    <li><strong>所有 internal pointer 走 <code>NonNull&lt;T&gt;</code> 而非 <code>*mut T</code></strong>。Niche optimization 是 side benefit、真正的理由是 provenance 跟 retag scope 比 raw pointer 清楚。</li>
+    <li><strong>每個 unsafe block 對應一條外部 invariant、寫 <code>SAFETY</code> 註解</strong>。註解不是給 reviewer 看的、是給未來改這段 code 的人保留條件清單。</li>
+    <li><strong>CI 跑 Miri 跑兩個模型</strong>：Stacked Borrows + Tree Borrows，再加 NaiveMap-style oracle model testing。一個模型 green 不算數。</li>
+  </ol>
+
+  <p>實務上還有一條<em>否定型</em>條件：如果你的 collection 不需要「value 本身帶鏈結欄位」這個 invariant，<em>不要</em>寫 intrusive。<code>std::collections::LinkedList</code> 雖然在 micro-benchmark 上不漂亮，但它把所有不變式釘在 borrow checker 上、零 unsafe code（user 視角）、語意清楚。intrusive 只在「我願意付出 type design 跟 SAFETY 註解的 maintenance 成本」之下才划算——一個一人團隊的 application 多半不應該走這條。Oxide 自己在文章裡就點明：iddqd 之所以開源、之所以 sound proof 寫這麼長，是因為他們<em>願意</em>當這個 unsafe 的 maintainer——其他人能直接 depend 上、繼承這套 invariant proof。</p>
+
+  <p>把這份工程量量化：iddqd 的 internal crate 行數中，<em>SAFETY 註解佔將近 30%</em>，這個比例在一般 Rust crate 不到 2%。每個 unsafe block 平均對應 6-8 行 SAFETY 註解、註解之間還互相 cross-reference（「依賴 invariant I3，見 <code>fn detach_node</code> 第 47 行」）。這不是過度文件化、是 unsafe code review 必需的 audit trail——任何一條 invariant 在未來被改動，reviewer 要能順著 SAFETY 註解的引用 chain 找到所有受影響的 unsafe block。對 reviewer 而言，這比「猜測這段 code 是不是還對」可工程化得多。</p>
+
+  <p>SAFETY 註解還有一個常被忽略的 second-order 效果：它<em>強迫 author 把 invariant 想清楚</em>。寫不出註解的 unsafe code 通常是 author 自己也沒搞懂為什麼那段 sound——寫一寫 SAFETY 註解、發現自己解釋不通、回去改 design 是 healthy 的工作流。Aria Beingessner 在 too-many-lists 教學裡的原話：「If you can't write the SAFETY comment, you can't write the unsafe code.」這條原則 30 行 unsafe code 跟 3000 行 unsafe code 都適用。</p>
+
+  <p>另一個值得提的是 <em>test feedback loop</em>。iddqd 對每個 internal helper 都有對應 Miri test、Miri 在普通 cargo test 之外、自己跑一遍 interpretive execution、把每個 access 跟 borrow tree 對照。普通 unit test 跑 100 ms 的 case 在 Miri 下可能要 10 s——這條 trade-off 對 unsafe-heavy crate 而言是值得的，Miri 是<em>唯一</em>能機械化抓 SbTag / TbTag 違反的工具。Oxide 內部把 Miri 加進 PR gate、紅了就不 merge——這個流程下，iddqd 自開源以來沒有 sound-related regression。</p>
+
+  <p>不變式集合背後還有一層更大的議題：Rust 對「<em>unsafe 工程化</em>」這條 design 路線的承諾。其他語言對 unsafe 的態度通常是「沒辦法，這段沒人能保證」（C++ 的 reinterpret_cast）或者「禁止，繞路走」（Java 完全不暴露記憶體）。Rust 選的是中間路線：unsafe 存在、但每段都有<em>具名</em>的 invariant、可以靠 type / runtime check / SAFETY 註解三段分別釘住。iddqd 是這條路線最 mature 的展示之一——它證明 unsafe-heavy library 可以 production-quality、可以開源被 audit、可以被新加入團隊的工程師讀懂。這對整個 systems programming 生態都是個 reference point。</p>
+
+  <p class="vg-deep-closer"><strong>What this enables</strong>：把 intrusive linked list 這個傳統 unsafe 黑魔法拆成四條獨立不變式（Pin 的 drop guarantee、pointer provenance、no-mutable-aliasing、ownership handoff），讓 library 作者可以對每條分別在 type level 給證明、CI 用 Miri 兩個模型對每條分別檢查、reviewer 用 <code>SAFETY</code> 註解對每條分別審查——unsafe code 從「天才寫對、其他人不要碰」變成「四條 invariant 都釘死、新人也能 review」的可工程化合約。</p>
+</div>
