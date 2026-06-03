@@ -1,0 +1,838 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">五月初一個下午，vLLM 上的 DeepSeek-V4-Flash 在 MI300X 上開機失敗：FP8 cache 寫進去是一個 byte，讀出來剛好錯了一個 factor of two。整套 stack 沒有 segfault，沒有 NaN，只是模型輸出徹底亂掉——這是 fnuz 與 OCP 兩個 FP8 標準互看不順眼的味道。</p>
+  <h1 class="vg-post-title">DeepSeek-V4-Flash 在 AMD MI300X 上 bring-up——一份 ROCm 案場的時間軸</h1>
+</header>
+
+<div class="vg-post-prose">
+
+<p><span class="vg-dropcap">六</span>月初 Fergus Finn 把這個月在 doubleword 內部走過的 bring-up 寫成一篇案場日誌；本文順著那條時間軸把每一個壞掉的地方、找出根因的那一刻、以及最後把 2485 tok/s 推到 2699 tok/s 的優化都串起來看。</p>
+
+<p>這不是一篇 vendor PR。</p>
+
+<p>doubleword 是一家把 self-hosted inference 賣給 enterprise 的公司，MI300X 對他們是「能不能用、CP 值能不能打 H100」的商業判斷。</p>
+
+<p>Fergus 寫的是這個判斷背後三十天的工程實作：哪一條 kernel path 是缺的、哪一條是壞的、根因在哪一層、最小修補是什麼、修完之後量到多少。</p>
+
+<p>比起 marketing 端講的「MI300X 比 H100 便宜多少」，這份案場日誌更有用：它告訴你要把一個 frontier model serve 起來必須付出的具體成本。</p>
+
+<p>本文的結構順著事情發生的順序走，五個事件、五個根因。</p>
+
+<p>最後拉一條 takeaway——這條 bring-up 的軌跡對 inference backend 工程的一般教訓是什麼。</p>
+
+<p>每一節的格式都一樣：先呈現症狀（reader 看到什麼），再說明嫌疑（為什麼懷疑這層），然後揭示根因（具體是哪一行 code），最後給出修補（哪一個 commit、改動的核心是什麼）。</p>
+
+<p>這個格式刻意模仿 oncall postmortem 的節奏——bring-up 在本質上是一連串的 mini-postmortem，只是 trigger 不是 production incident，而是「按下 serve、什麼沒反應 / 反應錯了」。</p>
+
+<h2>開機之前——MI300X 已經在那裡兩年了</h2>
+
+<p>MI300X 在 2023 年 12 月發表。</p>
+
+<p>它是 AMD 第一顆把 CDNA3 計算 die、HBM3、以及 chiplet I/O 全部塞到同一個 socket 的 datacenter GPU。</p>
+
+<p>單卡 192 GB HBM3，是同時期 H100 SXM 的 2.4 倍。</p>
+
+<p>FP8 算力標稱 2.6 PFLOPS，比同時期 H100 SXM 高出將近 30%。</p>
+
+<p>紙面數字非常漂亮。</p>
+
+<p>問題是這顆卡上線快兩年之後，主流 inference stack 對它的支援還在「能跑大部分模型，但有些剛發表的新東西不行」的灰色狀態。</p>
+
+<p>在 H100 那邊，新 model release 跟新 kernel 通常同一週就上 vLLM。</p>
+
+<p>在 MI300X 這邊，能不能 serve 變成一個要單獨評估的工程命題。</p>
+
+<p>這個差距的成因不是 AMD 沒做事，而是 NVIDIA 的 inference stack 跟 model authors 之間的對接路徑長期固化——FlashAttention 作者、vLLM committer、PyTorch core team 與 NVIDIA 的 kernel 工程師之間是同一張通訊錄。</p>
+
+<p>AMD 那邊的對應路徑這兩年才開始成形：ROCm team、AITER maintainers、社群裡的少數對 MI300X 有實機的開發者，連接還很鬆。新模型一發表，這條鬆連接需要時間消化。</p>
+
+<p>從 vLLM 的角度看，這個灰色狀態的成因是兩條互相牽扯的依賴鏈。</p>
+
+<p>第一條是 AITER——AMD 維護的 ROCm-native attention/MoE kernel collection，補的是 ROCm 上 PyTorch 沒有的 fused kernels。它的位置類似 H100 上的 FlashAttention 加 FlashInfer 加 cuBLASLt 的混合體，但覆蓋度落後 NVIDIA 那邊半年到一年。</p>
+
+<p>第二條是 Triton，用來補 AITER 沒覆蓋到的 long-tail kernel。Triton 在 ROCm 上跑得起來，但 codegen 出來的程式碼跟 AMD MFMA 指令集的契合度不如 CDNA 自家寫的 kernel；用 Triton 做 fast path 是無奈之選，用它做 fallback 反而剛好。</p>
+
+<p>在 H100 那邊 vLLM 把 FlashAttention 與 NVIDIA-tuned kernels 視為 first-class，跑得很順；在 MI300X 這邊每一條新的模型架構——尤其是用了 sparse MLA、MoE expert routing、新型 FP8 quant scheme 的——都要靠 AITER 加 Triton 兩條鏈接上才能跑。任意一條鏈缺了該模型需要的那個 op，模型就 serve 不起來。</p>
+
+<p>DeepSeek-V4-Flash 是 2026 年初發表的開源 MoE 模型，三個架構元素同時撞上 ROCm 的灰色地帶。</p>
+
+<p>第一是 sparse MLA attention。</p>
+
+<p>Multi-head Latent Attention 把 K/V 壓到 latent space 算 attention。</p>
+
+<p>sparse 變體再加一層 dynamic mask 只算被命中的 K/V tile。</p>
+
+<p>這個架構在 H100 上跑 FlashInfer 或 FlashAttention-3 的 sparse path 是有 tested kernel 的，MI300X 這邊 AITER 的覆蓋有缺口。</p>
+
+<p>第二是 fused FP8 KV-cache compressor。</p>
+
+<p>模型把 K/V 寫進 cache 之前先做 compress + quant + cache write 三件事 fused 成一個 kernel——這個 fused kernel 必須用對 FP8 dialect 才能跟讀回來時的 dequant 一致。</p>
+
+<p>第三是 MoE 上 256-expert top-8 routing。</p>
+
+<p>每個 token 都要從 256 個 expert 裡選 8 個算 forward，這個 routing 走的是一條 bitmatrix-based dispatch，dispatch 後面接 expert-mask 加 fused matmul。</p>
+
+<p>任何一個環節壞掉都會讓 token 被 route 到錯誤 expert，產出輕微但偵測不到的 quality 退化。</p>
+
+<p>任意一個架構元素在 ROCm 上的 kernel 路徑壞掉，模型輸出就會徹底亂掉——這就是 Fergus 在五月初接手時看到的狀態：「拿出 v4-flash 的 weights、vLLM 加上 ROCm fork、按下 serve、輸出是 garbage」。</p>
+
+<p>故事不是「重寫一整套 backend」，故事是把這四五個地方一個一個找出來、定位根因、最小改動修掉、再回頭量一遍 token/s。下面這條軸線是案場時間的折疊版本，從 2023 年 12 月的硬體發表，一路走到 2026 年 6 月 1 日 commit 全部 land 完。</p>
+
+<figure class="vg-w-timeline-bringup-arc" data-svg-scroll="880">
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 14"/>
+    </svg>
+    <span>2023 年 12 月到 2026 年 6 月的 bring-up 時間軸 · 6 個關鍵事件</span>
+  </p>
+  <svg class="vg-w-timeline-bringup-arc-main" viewBox="0 0 880 220" style="width: 100%; height: auto;">
+    <style>
+      .vg-w-timeline-bringup-arc text { font-family: "EB Garamond", serif; }
+      .vg-w-timeline-bringup-arc .ev-label { font-family: "Manrope", sans-serif; font-size: 11px; fill: var(--ink); }
+      .vg-w-timeline-bringup-arc .ev-time { font-family: "Manrope", sans-serif; font-size: 10px; fill: var(--muted); letter-spacing: 0.04em; text-transform: uppercase; }
+      .vg-w-timeline-bringup-arc .ev-desc { font-family: "Spectral", serif; font-size: 11px; fill: var(--ink-soft); }
+      .vg-w-timeline-bringup-arc .axis-label { font-family: "Manrope", sans-serif; font-size: 10px; fill: var(--muted); }
+    </style>
+    <line x1="55" y1="110" x2="840" y2="110" stroke="var(--muted-2)" stroke-width="1.5"/>
+    <line x1="55" y1="100" x2="55" y2="120" stroke="var(--muted-2)" stroke-width="1.5"/>
+    <line x1="840" y1="100" x2="840" y2="120" stroke="var(--muted-2)" stroke-width="1.5"/>
+    <circle cx="90" cy="110" r="5" fill="var(--muted)"/>
+    <text class="ev-time" x="90" y="80" text-anchor="middle">2023 · 12</text>
+    <text class="ev-label" x="90" y="65" text-anchor="middle">MI300X 出貨</text>
+    <text class="ev-desc" x="90" y="138" text-anchor="middle">CDNA3 · 192 GB HBM3</text>
+    <text class="ev-desc" x="90" y="152" text-anchor="middle">fnuz FP8 dtype</text>
+    <circle cx="295" cy="110" r="5" fill="var(--muted)"/>
+    <text class="ev-time" x="295" y="80" text-anchor="middle">2026 · 04</text>
+    <text class="ev-label" x="295" y="65" text-anchor="middle">v4-flash 發表</text>
+    <text class="ev-desc" x="295" y="138" text-anchor="middle">sparse MLA + MoE + FP8 cache</text>
+    <circle cx="470" cy="110" r="6" fill="var(--accent)"/>
+    <text class="ev-time" x="470" y="80" text-anchor="middle">2026 · 05 初</text>
+    <text class="ev-label" x="470" y="65" text-anchor="middle">vLLM 輸出 garbage</text>
+    <text class="ev-desc" x="470" y="138" text-anchor="middle">FP8 byte 讀出來差 2×</text>
+    <circle cx="615" cy="110" r="5" fill="var(--accent)"/>
+    <text class="ev-time" x="615" y="80" text-anchor="middle">2026 · 05 中</text>
+    <text class="ev-label" x="615" y="65" text-anchor="middle">AITER 護欄</text>
+    <text class="ev-desc" x="615" y="138" text-anchor="middle">cb8a18556 · gfx942 拒絕</text>
+    <circle cx="735" cy="110" r="5" fill="var(--accent)"/>
+    <line x1="735" y1="115" x2="735" y2="139" stroke="var(--muted-2)" stroke-width="0.75" stroke-dasharray="2,2"/>
+    <text class="ev-label" x="735" y="152" text-anchor="middle">capture-safe</text>
+    <text class="ev-desc" x="735" y="167" text-anchor="middle">22cc02230 · 靜態 metadata</text>
+    <text class="ev-time" x="735" y="182" text-anchor="middle">2026 · 05 末</text>
+    <circle cx="820" cy="110" r="6" fill="var(--sage-deep)"/>
+    <text class="ev-time" x="820" y="80" text-anchor="middle">2026 · 06 · 01</text>
+    <text class="ev-label" x="820" y="65" text-anchor="middle">2699 tok/s</text>
+    <text class="ev-desc" x="820" y="138" text-anchor="middle">+8.6% 案場結束</text>
+    <text class="axis-label" x="55" y="200">硬體發表</text>
+    <text class="axis-label" x="840" y="200" text-anchor="end">bring-up 完工</text>
+  </svg>
+  <figcaption>從硬體發表到 vLLM 可正常 serve DeepSeek-V4-Flash，相隔 30 個月。最後一條從 garbage 走到 2699 tok/s 的修補密集發生在 5 月那 5 週裡。</figcaption>
+</figure>
+
+<p>軸線右邊密集那一段裡的每一個事件都對應一個 git commit；本文後續每一節挖一個事件出來，從症狀、根因、修補一路講到對未來 bring-up 的啟示。</p>
+
+<h2>第一個壞掉的是 FP8 dtype</h2>
+
+<p>Fergus 接手的第一個現象不是 crash，而是「輸出是 garbage」。</p>
+
+<p>這是最難 debug 的失敗模式之一。</p>
+
+<p>所有東西都跑完了。</p>
+
+<p>沒有 exception。</p>
+
+<p>weight load 一切正常。</p>
+
+<p>但 decode 出來的字串就是雜訊。</p>
+
+<p>GPU stack 沒有任何信號告訴你哪裡不對。</p>
+
+<p>traditional debug 路徑會先檢查 weight 是否正確 load、tokenizer 是否對齊、sampler 是否被誤設成 random。</p>
+
+<p>這些都過了之後才會開始懷疑數值層。</p>
+
+<p>問題是數值層的 bug 不會在 framework log 裡留下任何足跡——loss 不會 NaN、attention score 不會跳到無窮大，只是整體的 logits 平移／放大成一個沒有意義的 distribution。</p>
+
+<p>下游 sampler 從這個 distribution 抽出來的 token 跟 prompt 完全脫鉤。</p>
+
+<p>FP8 是嫌疑犯。</p>
+
+<p>DeepSeek-V4-Flash 的 KV cache 用 FP8 存。</p>
+
+<p>attention 算分數時把 cache 讀回來反 quantize 成 BF16。</p>
+
+<p>如果存進去跟讀出來用的 FP8 dialect 不一致，數值會變成原本的兩倍或一半，整條 attention pipeline 拿到完全亂掉的 logits。</p>
+
+<p>模型還是會輸出 token，只是這些 token 跟 prompt 沒有任何關係。</p>
+
+<p>關鍵的事實是：MI300X 的 FP8 是 <code>fnuz</code>——finite, nans, unsigned zero。這個 dialect 是 AMD 跟 Graphcore 在 2023 年提出的；NVIDIA、Arm、Intel 透過 Open Compute Project 提出另一個 OCP-standard FP8。兩者的 exponent bias 差一。</p>
+
+<p>用 Fergus 的話：「the same byte read as the wrong dialect comes back off by exactly a factor of two」。一個 byte 讀錯方言，回來剛好差 2×——這就是 garbage output 的物理機制。</p>
+
+<p>下面這張圖把 fnuz 與 OCP 的差別具體拆出來。E4M3 FP8 的 bit 排列是 1 個 sign bit + 4 個 exponent bit + 3 個 mantissa bit；兩個 dialect 的 byte layout 完全一樣，差別只在 <code>value = (1 + mantissa/2³) × 2^(exp − bias)</code> 這個公式裡的 <code>bias</code> 常數。fnuz 用 bias=8、OCP 用 bias=7。同一個 byte <code>0 1000 000</code>，fnuz 算出 1.0，OCP 算出 2.0。</p>
+
+<figure class="vg-w-morph-fp8-bias" data-svg-scroll="800">
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M3 12h18"/><path d="m17 8 4 4-4 4"/><path d="m7 8-4 4 4 4"/>
+    </svg>
+    <span>點 button 在兩種 FP8 dialect 之間切換 · 觀察同一個 bit pattern 的 value 差 2×</span>
+  </p>
+  <style>
+    .vg-w-morph-fp8-bias { display: grid; gap: var(--s-2); }
+    .vg-w-morph-fp8-bias svg.vg-w-morph-fp8-bias-main { width: 100%; height: auto; }
+    .vg-w-morph-fp8-bias .controls { display: flex; gap: var(--s-2); align-items: center; font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); flex-wrap: wrap; }
+    .vg-w-morph-fp8-bias button { font-family: var(--sans); font-size: var(--fs-sm); padding: 6px 14px; min-height: 44px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); cursor: pointer; }
+    .vg-w-morph-fp8-bias button:hover { border-color: var(--accent); color: var(--accent-text); }
+    .vg-w-morph-fp8-bias .readout { font-family: var(--mono); font-size: var(--fs-sm); color: var(--ink); margin-left: auto; }
+  </style>
+  <div class="controls">
+    <button id="vg-w-morph-fp8-bias-toggle">切換 dialect</button>
+    <span class="readout" id="vg-w-morph-fp8-bias-readout">fnuz · bias=8 · value=1.0</span>
+  </div>
+  <svg class="vg-w-morph-fp8-bias-main" viewBox="0 0 720 280">
+    <style>
+      .vg-w-morph-fp8-bias text { font-family: "EB Garamond", serif; }
+      .vg-w-morph-fp8-bias .field-label { font-family: "Manrope", sans-serif; font-size: 11px; fill: var(--muted); letter-spacing: 0.06em; text-transform: uppercase; }
+      .vg-w-morph-fp8-bias .bit-text { font-family: "JetBrains Mono", monospace; font-size: 18px; fill: var(--ink); font-weight: 600; }
+      .vg-w-morph-fp8-bias .val-text { font-family: "EB Garamond", serif; font-size: 26px; fill: var(--accent-text); }
+      .vg-w-morph-fp8-bias .formula { font-family: "JetBrains Mono", monospace; font-size: 13px; fill: var(--ink-soft); }
+      .vg-w-morph-fp8-bias .note { font-family: "Spectral", serif; font-size: 12px; fill: var(--muted); font-style: italic; }
+    </style>
+    <text class="field-label" x="60" y="40">8 bits</text>
+    <rect x="60" y="50" width="32" height="40" fill="none" stroke="var(--muted-2)"/>
+    <rect x="92" y="50" width="128" height="40" fill="none" stroke="var(--muted-2)"/>
+    <rect x="220" y="50" width="96" height="40" fill="none" stroke="var(--muted-2)"/>
+    <text class="bit-text" x="76" y="78" text-anchor="middle">0</text>
+    <text class="bit-text" x="156" y="78" text-anchor="middle">1000</text>
+    <text class="bit-text" x="268" y="78" text-anchor="middle">000</text>
+    <text class="field-label" x="76" y="106" text-anchor="middle">sign</text>
+    <text class="field-label" x="156" y="106" text-anchor="middle">exp = 8</text>
+    <text class="field-label" x="268" y="106" text-anchor="middle">mantissa</text>
+    <text class="formula" x="60" y="150">value = (1 + mantissa/2³) × 2^(exp − bias)</text>
+    <text class="formula" x="60" y="180" id="vg-w-morph-fp8-bias-formula">value = (1 + 0) × 2^(8 − 8) = 1.0</text>
+    <text class="field-label" x="60" y="220">reconstructed value</text>
+    <text class="val-text" x="60" y="250" id="vg-w-morph-fp8-bias-val">1.0</text>
+    <text class="note" x="380" y="220">同一個 byte，bias 改 1，value 差 2×</text>
+    <text class="note" x="380" y="240" id="vg-w-morph-fp8-bias-note">目前：fnuz dialect（MI300X 原生）</text>
+  </svg>
+  <figcaption>FP8 E4M3 的 fnuz 對應 bias=8；OCP 對應 bias=7。同一個 byte <code>0 1000 000</code>，在 fnuz 解出 1.0，在 OCP 解出 2.0——KV cache 寫一個 dialect、讀另一個 dialect 就會整條 attention 偏 2×。</figcaption>
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-morph-fp8-bias');
+      const btn = root.querySelector('#vg-w-morph-fp8-bias-toggle');
+      const formula = root.querySelector('#vg-w-morph-fp8-bias-formula');
+      const val = root.querySelector('#vg-w-morph-fp8-bias-val');
+      const readout = root.querySelector('#vg-w-morph-fp8-bias-readout');
+      const note = root.querySelector('#vg-w-morph-fp8-bias-note');
+      let isFnuz = true;
+      btn.addEventListener('click', () => {
+        isFnuz = !isFnuz;
+        if (isFnuz) {
+          formula.textContent = 'value = (1 + 0) × 2^(8 − 8) = 1.0';
+          val.textContent = '1.0';
+          readout.textContent = 'fnuz · bias=8 · value=1.0';
+          note.textContent = '目前：fnuz dialect（MI300X 原生）';
+        } else {
+          formula.textContent = 'value = (1 + 0) × 2^(8 − 7) = 2.0';
+          val.textContent = '2.0';
+          readout.textContent = 'OCP · bias=7 · value=2.0';
+          note.textContent = '目前：OCP dialect（H100、新 AMD 晶片）';
+        }
+      });
+    })();
+  </script>
+</figure>
+
+<p>把 cache write 那一端用 fnuz 編碼、cache read 那一端用 OCP 解碼，整個 attention 的數值剛好被放大 2×；反過來則被縮小 2×。Attention softmax 對 input scale 不是完全 invariant 的——溫度等於 sqrt(d_head) 對輸入 scale 敏感——所以這 2× 偏差會讓 logits 的 distribution 整體偏掉到完全沒辦法產生有意義 token 的程度。</p>
+
+<p>修復方式不浪漫但有效。</p>
+
+<p>commit <code>236de4e64</code>「makes the DeepSeek v4 compressor and fused compress / quant / cache writes use the platform FP8 dtype」——讓 cache write 那條路徑統一用 <code>current_platform</code> 報出來的 dtype。</p>
+
+<p>第二條相關的 commit <code>bd06e5d87</code> 進一步處理 sliding-window K-cache：「routes the sliding-window K-cache through a fnuz-aware fused quantise-and-insert helper」。</p>
+
+<p>sliding-window K-cache 是給長 context 用的 ring buffer。</p>
+
+<p>每個 step 把新算的 K 量化後 insert 進去。</p>
+
+<p>這條 path 原本繞過 platform dtype 的注入，得單獨 patch。</p>
+
+<p>這兩個 patch 加起來把整條 FP8 pipeline 校準到 MI300X 的 fnuz 方言上。</p>
+
+<p>背後有一個 subtle 的點值得記住。</p>
+
+<p><code>current_platform</code> 是 vLLM 抽象出來的硬體 dispatch 層，但 DeepSeek 模型本身的 compressor 是 model code 那邊寫死了 OCP dtype。</p>
+
+<p>「正確 dispatch」這件事必須跨 vLLM 與 model code 兩個邊界——一個 platform-aware 的 dtype helper 在 model code 裡是「該注入」還是「該硬寫」，是設計選擇。</p>
+
+<p>Fergus 走的是注入這條路。</p>
+
+<p>這個選擇對 model author 不是免費的——他們必須在 model code 裡承認 platform 是一個 first-class 的變數，而不是「總之我寫 FP8 就好、framework 會處理」。</p>
+
+<p>把 FP8 校正之後，garbage 變成「至少看起來像中文跟 code」。</p>
+
+<p>但隨後 sparse MLA 那條路又踩到第二個地雷。</p>
+
+<p>throughput 還沒人看，因為連 baseline 都還沒成立。</p>
+
+<p>對下次接到類似 ticket 的人來說，這一節最該記的是一個 quick check。</p>
+
+<p>在 ROCm 上 serve 模型如果輸出 garbage，第一步不是看 weight 也不是看 sampler，是去 grep 整個 cache write path 上對 FP8 dtype 的指定方式。</p>
+
+<p>如果有任何一處 hardcode 了 OCP 或者 hardcode 了 fnuz 而沒走 platform dispatch，那條 path 就是嫌疑犯。</p>
+
+<p>這個檢查只要 5 分鐘，可以省掉幾天的 attention numeric debug。</p>
+
+<h2>第二個壞掉的是 AITER 的 sparse MLA 路徑</h2>
+
+<p>FP8 校正過後，輸出至少看起來像「合法的 token sequence」。</p>
+
+<p>但是 quality 還是低於預期。</p>
+
+<p>throughput 也只有 vLLM benchmark 在 H100 上的零頭。</p>
+
+<p>下一個嫌疑犯是 attention path 本身。</p>
+
+<p>DeepSeek-V4-Flash 用的是 sparse MLA——multi-head latent attention with sparsity。</p>
+
+<p>MLA 的精神是把 K/V projection 壓縮成 latent space，再用 dynamic mask 決定每個 query 跟哪些 key 算 attention。</p>
+
+<p>sparse 那邊則進一步只算 mask 命中的 K/V tiles。</p>
+
+<p>這個架構在 H100 上跑 FlashInfer 或 FlashAttention-3 的 sparse path 是有 tested kernel 的。</p>
+
+<p>但 MI300X 這邊 AITER 的覆蓋有缺口。</p>
+
+<p>Fergus 點名三條 path 在 gfx942 上是缺的或壞的：</p>
+
+<ul>
+  <li><code>paged MQA logits</code>（gfx942 缺）</li>
+  <li><code>sparse MLA prefill</code>（gfx942 缺）</li>
+  <li><code>sparse MLA decode</code>（gfx942 缺）</li>
+</ul>
+
+<p>另外有兩條 path 雖然存在於 AITER 裡，但「break specifically on gfx942」——也就是同樣的 API、同樣的呼叫姿勢，在較新的 AMD 晶片上跑得起來，在 MI300X (gfx942) 上跑出錯誤結果：</p>
+
+<ul>
+  <li><code>AITER prefill MQA logits</code>（在 gfx942 上輸出錯）</li>
+  <li><code>AITER sparse prefill logits</code>（在 gfx942 上輸出錯）</li>
+</ul>
+
+<p>這種「條件式正確」是 multi-arch kernel library 最難 debug 的失敗模式。</p>
+
+<p>unit test 在 CI 跑的是某一張卡，過了，PR merged。</p>
+
+<p>另一張卡上就壞掉，但 issue tracker 上找不到對應的 bug 報告，因為大部分用 ROCm 的人不在 gfx942 上跑這個 op。</p>
+
+<p>典型的 hardware-conditional silent breakage——issue 的存在依賴某一個特定 hardware × workload 交集，社群裡同時觸到這個交集的人非常少。</p>
+
+<p>Fergus 走的修法分兩段。</p>
+
+<p>第一段是寫 ROCm-specific helper。</p>
+
+<p>對於 AITER 缺的 path，直接寫一個 Triton 版本當 fallback。</p>
+
+<p>對於 AITER 有但 gfx942 壞的 path，加一個 <code>current_platform</code> guard，在 gfx942 上拒絕 dispatch、強制走 Triton。</p>
+
+<p>第二段是 commit <code>cb8a18556</code> 把這個邏輯 land 進 vLLM 的 ROCm backend，把上述五條 path 全部接到「在 gfx942 上 refuse AITER、走 Triton 後援」的 dispatch 行為。</p>
+
+<figure class="vg-w-arch-aiter-fallback" data-svg-scroll="880">
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z"/><path d="m9 12 2 2 4-4"/>
+    </svg>
+    <span>看哪些 attention path 走 AITER、哪些走 Triton fallback · 5 條 path</span>
+  </p>
+  <svg class="vg-w-arch-aiter-fallback-main" viewBox="0 0 880 320" style="width: 100%; height: auto;">
+    <style>
+      .vg-w-arch-aiter-fallback text { font-family: "EB Garamond", serif; }
+      .vg-w-arch-aiter-fallback .path-label { font-family: "Manrope", sans-serif; font-size: 12px; fill: var(--ink); }
+      .vg-w-arch-aiter-fallback .tag { font-family: "Manrope", sans-serif; font-size: 10px; fill: var(--bg); letter-spacing: 0.04em; }
+      .vg-w-arch-aiter-fallback .lane-label { font-family: "Manrope", sans-serif; font-size: 11px; fill: var(--muted); letter-spacing: 0.06em; text-transform: uppercase; }
+      .vg-w-arch-aiter-fallback .note { font-family: "Spectral", serif; font-size: 11px; fill: var(--muted); font-style: italic; }
+    </style>
+    <text class="lane-label" x="40" y="40">attention path</text>
+    <text class="lane-label" x="400" y="40" text-anchor="middle">gfx942 dispatch</text>
+    <text class="lane-label" x="700" y="40" text-anchor="middle">後援 kernel</text>
+    <line x1="40" y1="55" x2="840" y2="55" stroke="var(--muted-2)" stroke-width="0.5"/>
+    <text class="path-label" x="40" y="85">paged MQA logits</text>
+    <rect x="280" y="68" width="100" height="24" rx="3" fill="var(--accent)" opacity="0.85"/>
+    <text class="tag" x="330" y="84" text-anchor="middle">refuse</text>
+    <line x1="380" y1="80" x2="650" y2="80" stroke="var(--sage-deep)" stroke-width="1.5" stroke-dasharray="4 3"/>
+    <polygon points="650,80 644,76 644,84" fill="var(--sage-deep)"/>
+    <rect x="650" y="68" width="100" height="24" rx="3" fill="var(--sage-deep)" opacity="0.85"/>
+    <text class="tag" x="700" y="84" text-anchor="middle">Triton</text>
+    <text class="path-label" x="40" y="125">sparse MLA prefill</text>
+    <rect x="280" y="108" width="100" height="24" rx="3" fill="var(--accent)" opacity="0.85"/>
+    <text class="tag" x="330" y="124" text-anchor="middle">refuse</text>
+    <line x1="380" y1="120" x2="650" y2="120" stroke="var(--sage-deep)" stroke-width="1.5" stroke-dasharray="4 3"/>
+    <polygon points="650,120 644,116 644,124" fill="var(--sage-deep)"/>
+    <rect x="650" y="108" width="100" height="24" rx="3" fill="var(--sage-deep)" opacity="0.85"/>
+    <text class="tag" x="700" y="124" text-anchor="middle">Triton</text>
+    <text class="path-label" x="40" y="165">sparse MLA decode</text>
+    <rect x="280" y="148" width="100" height="24" rx="3" fill="var(--accent)" opacity="0.85"/>
+    <text class="tag" x="330" y="164" text-anchor="middle">refuse</text>
+    <line x1="380" y1="160" x2="650" y2="160" stroke="var(--sage-deep)" stroke-width="1.5" stroke-dasharray="4 3"/>
+    <polygon points="650,160 644,156 644,164" fill="var(--sage-deep)"/>
+    <rect x="650" y="148" width="100" height="24" rx="3" fill="var(--sage-deep)" opacity="0.85"/>
+    <text class="tag" x="700" y="164" text-anchor="middle">Triton</text>
+    <text class="note" x="755" y="164">+ capture-safe metadata</text>
+    <text class="path-label" x="40" y="205">AITER prefill MQA logits</text>
+    <rect x="280" y="188" width="100" height="24" rx="3" fill="var(--accent)" opacity="0.85"/>
+    <text class="tag" x="330" y="204" text-anchor="middle">refuse</text>
+    <line x1="380" y1="200" x2="650" y2="200" stroke="var(--sage-deep)" stroke-width="1.5" stroke-dasharray="4 3"/>
+    <polygon points="650,200 644,196 644,204" fill="var(--sage-deep)"/>
+    <rect x="650" y="188" width="100" height="24" rx="3" fill="var(--sage-deep)" opacity="0.85"/>
+    <text class="tag" x="700" y="204" text-anchor="middle">Triton</text>
+    <text class="path-label" x="40" y="245">AITER sparse prefill logits</text>
+    <rect x="280" y="228" width="100" height="24" rx="3" fill="var(--accent)" opacity="0.85"/>
+    <text class="tag" x="330" y="244" text-anchor="middle">refuse</text>
+    <line x1="380" y1="240" x2="650" y2="240" stroke="var(--sage-deep)" stroke-width="1.5" stroke-dasharray="4 3"/>
+    <polygon points="650,240 644,236 644,244" fill="var(--sage-deep)"/>
+    <rect x="650" y="228" width="100" height="24" rx="3" fill="var(--sage-deep)" opacity="0.85"/>
+    <text class="tag" x="700" y="244" text-anchor="middle">Triton</text>
+    <text class="note" x="40" y="295">五條 attention path 在 gfx942 上全部 refuse AITER、走 Triton fallback；sparse MLA decode 那條另外要求 capture-safe metadata。</text>
+  </svg>
+  <figcaption>commit <code>cb8a18556</code>「implements ROCm-specific helpers with fallback to Triton when AITER coverage gaps exist」並加 gfx942 guard 拒絕分派到壞掉的 AITER path。重點不是禁用 AITER，是讓 dispatch 層在 gfx942 上跑得到 Triton 後援。</figcaption>
+</figure>
+
+<p>這裡有一個常見的 backend 設計陷阱值得拆解。</p>
+
+<p>當你有 fast path（AITER）和 slow path（Triton），「fast path 在某張卡壞了」時，最 lazy 的修法是全域禁用 fast path。</p>
+
+<p>這條路很誘人。</p>
+
+<p>patch 簡短、不需要動 dispatch 層、不需要寫 hardware-aware code，CI 馬上會綠。</p>
+
+<p>但這條路有兩個成本。</p>
+
+<p>第一是其他硬體上 AITER 還是 fast 的，全域禁用會直接降低 H100 跟新 AMD chip 的 throughput——這是 doubleword 不能接受的，因為他們同時 serve 多個 hardware target。</p>
+
+<p>第二是 staging 的成本。</p>
+
+<p>如果未來 AITER 把這條 path 修好了，你又要回頭把全域 disable 拿掉，且要小心不要拿錯。</p>
+
+<p>每張新發表的卡上，又要重新走一輪「先全部禁用、再逐條打開」。</p>
+
+<p>Fergus 沒走這條路。</p>
+
+<p>保留 AITER 在覆蓋且 correctness 過關的 path 上跑，僅針對 gfx942 + sparse MLA 這個交集拒絕分派。</p>
+
+<p>這需要 dispatch 層把硬體 ID 與 kernel ID 兩個維度都納入決策，犧牲一點程式碼複雜度，換到 H100 跟其他 AMD chip 不受影響。</p>
+
+<p>refuse-and-fallback 的姿勢還有另一個好處。</p>
+
+<p>未來 AITER 把缺的 kernel 補齊或修好 gfx942 path 時，guard 可以一條一條移除，不需要重寫 vLLM 的 ROCm backend。</p>
+
+<p>這個 staging strategy 在多廠商 kernel library 競爭的 AI infra 裡值得學起來。</p>
+
+<p>還有一個工程細節值得提。</p>
+
+<p>Triton fallback 並不是免費的。</p>
+
+<p>Triton codegen 對 AMD MFMA 指令集的 lowering 沒有 AITER 那麼緊，同樣一個 op 跑 Triton 通常比跑 AITER 慢 20-40%。</p>
+
+<p>但「慢且正確」遠比「快且錯」要重要——尤其在 production inference 路徑上，correctness regression 是直接打到用戶的 quality。</p>
+
+<p>fallback 在 throughput 上的代價在後面 graph capture 跟 launch shape 固化兩個優化裡會被部分追回來。</p>
+
+<p>修完之後 sparse MLA 跑得起來、輸出 quality 對齊 H100 reference。</p>
+
+<p>但 throughput 還是不對：量出來只有 800 tok/s 左右，遠低於同尺寸模型在 MI300X 上應有的數字。</p>
+
+<p>第三個壞點開始浮現。</p>
+
+<h2>第三個壞掉的是 HIP graph capture</h2>
+
+<p>第二輪 patch 之後 sparse MLA 走 Triton 跑得起來。</p>
+
+<p>throughput 卻只有 800 tok/s——比同尺寸的 dense model 在 MI300X 上低了 3 倍以上。</p>
+
+<p>這個落差不可能來自 fallback overhead，從規模上是另一個 root cause。</p>
+
+<p>原因是 HIP graph capture 沒開。</p>
+
+<p>HIP graph 是 ROCm 上對應 CUDA graph 的機制。</p>
+
+<p>把 inference 的 forward path 錄下來成一張 graph，每次 decode 一個 token 時 replay 整張 graph，省去每個 kernel launch 的 host overhead。</p>
+
+<p>對於 small-batch decode——每次只算 1 token、kernel 數量爆多——這個 overhead 佔比可達 30-50%。</p>
+
+<p>MoE 模型尤其重，因為每一層要 launch 的 expert matmul kernel 數量隨 top-k 線性放大。</p>
+
+<p>graph capture 對 kernel 內部行為的要求很硬。</p>
+
+<p>Fergus 把它精準寫為「the captured region has to be a pure function of its device inputs」。</p>
+
+<p>錄下來的這段 code 必須完全由 device input 決定 output。</p>
+
+<p>不能依賴 host 上的狀態。</p>
+
+<p>不能在 capture 期間做 host-to-device scalar write。</p>
+
+<p>不能做動態 allocation。</p>
+
+<p>Sparse MLA decode 原本的 metadata builder 違反這條規矩。</p>
+
+<p>每個 step 都根據當前 batch 的 sparsity pattern 重新算 metadata、把結果寫成 ragged tensor。</p>
+
+<p>這個 ragged 是動態 allocation——allocation size 隨 sparsity pattern 變化，無法在 capture 之前固定。</p>
+
+<p>capture 一進來就拒絕，於是 graph 沒抓到，每個 step 都退回 kernel-by-kernel launch。</p>
+
+<p>commit <code>22cc02230</code>「rebuilds the sparse MLA decode metadata as static, capture-safe tensors: no dynamic ragged allocations, no host-to-device scalar writes under capture」。</p>
+
+<p>把 metadata 改寫成固定形狀的 tensor。</p>
+
+<p>sparsity pattern 用 bitmask 表達在 tensor element 上。</p>
+
+<p>allocation 在 capture 之前完成。</p>
+
+<p>capture 一過去之後，每個 decode step 走的是 device-side 的 graph replay，host overhead 接近零。</p>
+
+<p>這個改動的代價是 metadata tensor 的形狀必須對 maximum sparsity 預留空間。</p>
+
+<p>若實際 sparsity 比上限稀疏，會有部分 tensor lane 被 mask 掉但仍佔記憶體。</p>
+
+<p>在 192 GB HBM3 上這點 overhead 不是瓶頸。</p>
+
+<p>對 H100 的 80 GB HBM3e 才會比較吃緊。</p>
+
+<p>設計上這條改動是 MI300X-friendly 的，順手也對 H100 不傷。</p>
+
+<p>下面這個 hero canvas 模擬把 capture 走通前後的 throughput 對比畫出來。動態 metadata 的 trace 是 launch overhead 佔大頭、token/s 在 800 上下；static metadata 走 graph replay 之後 token/s 升到 2400+，再加上後面 FP8 + AITER fallback 的合作，最後落在 2485 tok/s baseline。觀察 token/s trace 的形狀差異——graph capture 之前是鋸齒（每個 step 抖動），之後是平滑曲線。</p>
+
+<figure class="vg-w-canvas-bringup-arc">
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <polygon points="5 3 19 12 5 21 5 3"/>
+    </svg>
+    <span>按 play 觀察 bring-up 三個階段的 token/s · 五分鐘走完 garbage → 2485 → 2699</span>
+  </p>
+  <style>
+    .vg-w-canvas-bringup-arc { display: grid; grid-template-rows: auto 1fr auto; gap: var(--s-2); }
+    .vg-w-canvas-bringup-arc .toolbar { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); flex-wrap: wrap; }
+    .vg-w-canvas-bringup-arc button { font-family: var(--sans); font-size: var(--fs-sm); padding: 6px 14px; min-height: 44px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); cursor: pointer; }
+    .vg-w-canvas-bringup-arc button:hover { border-color: var(--accent); color: var(--accent-text); }
+    .vg-w-canvas-bringup-arc .stage-tag { font-family: var(--mono); color: var(--accent-text); margin-left: auto; font-size: var(--fs-sm); }
+    .vg-w-canvas-bringup-arc canvas { width: 100%; height: auto; aspect-ratio: 16 / 9; display: block; background: var(--bg); }
+    .vg-w-canvas-bringup-arc figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    @media (max-width: 720px) {
+      .vg-w-canvas-bringup-arc canvas { aspect-ratio: 4 / 3; }
+    }
+  </style>
+  <div class="toolbar">
+    <button id="vg-w-canvas-bringup-arc-toggle">play 觀察 bring-up 過程</button>
+    <button id="vg-w-canvas-bringup-arc-reset">reset</button>
+    <span class="stage-tag" id="vg-w-canvas-bringup-arc-stage">t=0 · stage=尚未開機</span>
+  </div>
+  <canvas id="vg-w-canvas-bringup-arc-canvas"></canvas>
+  <figcaption>四個階段：(1) garbage 階段 (FP8 dialect 錯亂、tok/s 等於 0)、(2) FP8 校正後 sparse MLA 透過 Triton fallback 跑起來 (~800 tok/s)、(3) HIP graph capture 通過 (~2485 tok/s)、(4) Triton launch shape 固化 + MXFP4 tile tuning (~2699 tok/s)。每個階段的轉換對應實際 commit landed 的時間。</figcaption>
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-canvas-bringup-arc');
+      const canvas = root.querySelector('canvas');
+      const toggle = root.querySelector('#vg-w-canvas-bringup-arc-toggle');
+      const reset = root.querySelector('#vg-w-canvas-bringup-arc-reset');
+      const stageTag = root.querySelector('#vg-w-canvas-bringup-arc-stage');
+      const ctx = canvas.getContext('2d');
+
+      function resize() {
+        const dpr = window.devicePixelRatio || 1;
+        const rect = canvas.getBoundingClientRect();
+        canvas.width = Math.max(1, rect.width * dpr);
+        canvas.height = Math.max(1, rect.height * dpr);
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      }
+      new ResizeObserver(resize).observe(canvas);
+      resize();
+
+      const stages = [
+        { name: 'garbage（FP8 dialect 錯亂）', end: 0, jitter: 0, dur: 60 },
+        { name: 'FP8 校正 + sparse MLA via Triton', end: 800, jitter: 80, dur: 90 },
+        { name: 'HIP graph capture 通過', end: 2485, jitter: 30, dur: 90 },
+        { name: 'Triton launch shape + MXFP4 tile', end: 2699, jitter: 12, dur: 60 },
+      ];
+
+      const T_TOTAL = stages.reduce((a, s) => a + s.dur, 0);
+      const Y_MAX = 2800;
+
+      let running = false;
+      let t = 0;
+      const history = [];
+
+      function tokpsAt(t) {
+        let acc = 0;
+        let prevEnd = 0;
+        for (const s of stages) {
+          if (t < acc + s.dur) {
+            const phase = (t - acc) / s.dur;
+            const smooth = prevEnd + (s.end - prevEnd) * (1 - Math.exp(-phase * 4));
+            const jitter = (Math.sin(t * 7.3) + Math.sin(t * 13.1)) * 0.5 * s.jitter;
+            return Math.max(0, smooth + jitter);
+          }
+          acc += s.dur;
+          prevEnd = s.end;
+        }
+        return stages[stages.length - 1].end;
+      }
+
+      function currentStage(t) {
+        let acc = 0;
+        for (let i = 0; i < stages.length; i++) {
+          if (t < acc + stages[i].dur) return i;
+          acc += stages[i].dur;
+        }
+        return stages.length - 1;
+      }
+
+      function step(dt) {
+        t = Math.min(T_TOTAL, t + dt * 18);
+        history.push([t, tokpsAt(t)]);
+        if (history.length > 1500) history.shift();
+      }
+
+      function draw() {
+        const W = canvas.getBoundingClientRect().width;
+        const H = canvas.getBoundingClientRect().height;
+        if (W < 1 || H < 1) return;
+        ctx.clearRect(0, 0, W, H);
+
+        const ink = getCss('--ink') || '#222';
+        const muted = getCss('--muted') || '#888';
+        const muted2 = getCss('--muted-2') || '#ccc';
+        const accent = getCss('--accent') || '#cb5e3a';
+        const sage = getCss('--sage-deep') || '#5a7a52';
+
+        const padL = 56, padR = 18, padT = 24, padB = 30;
+        const plotW = W - padL - padR;
+        const plotH = H - padT - padB;
+
+        ctx.strokeStyle = muted2;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(padL, padT); ctx.lineTo(padL, padT + plotH);
+        ctx.lineTo(padL + plotW, padT + plotH);
+        ctx.stroke();
+
+        ctx.font = '11px Manrope, sans-serif';
+        ctx.fillStyle = muted;
+        ctx.textAlign = 'right';
+        for (let v = 0; v <= Y_MAX; v += 500) {
+          const y = padT + plotH - (v / Y_MAX) * plotH;
+          ctx.fillText(String(v), padL - 6, y + 4);
+          ctx.strokeStyle = muted2;
+          ctx.beginPath(); ctx.moveTo(padL - 3, y); ctx.lineTo(padL, y); ctx.stroke();
+        }
+
+        let acc = 0;
+        ctx.textAlign = 'left';
+        ctx.font = '10px Manrope, sans-serif';
+        ctx.fillStyle = muted;
+        for (let i = 0; i < stages.length; i++) {
+          const x = padL + (acc / T_TOTAL) * plotW;
+          if (i > 0) {
+            ctx.strokeStyle = muted2;
+            ctx.setLineDash([3, 3]);
+            ctx.beginPath();
+            ctx.moveTo(x, padT); ctx.lineTo(x, padT + plotH);
+            ctx.stroke();
+            ctx.setLineDash([]);
+          }
+          ctx.fillText('s' + (i + 1), x + 4, padT + 12);
+          acc += stages[i].dur;
+        }
+
+        ctx.fillStyle = muted;
+        ctx.textAlign = 'left';
+        ctx.font = '11px EB Garamond, serif';
+        ctx.fillText('tok/s', padL - 50, padT - 8);
+        ctx.textAlign = 'right';
+        ctx.fillText('案場時間 →', padL + plotW, padT + plotH + 22);
+
+        if (history.length > 1) {
+          ctx.strokeStyle = accent;
+          ctx.lineWidth = 1.5;
+          ctx.beginPath();
+          for (let i = 0; i < history.length; i++) {
+            const [tv, y] = history[i];
+            const px = padL + (tv / T_TOTAL) * plotW;
+            const py = padT + plotH - (y / Y_MAX) * plotH;
+            if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+          }
+          ctx.stroke();
+        }
+
+        const cx = padL + (t / T_TOTAL) * plotW;
+        ctx.strokeStyle = sage;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(cx, padT); ctx.lineTo(cx, padT + plotH);
+        ctx.stroke();
+      }
+
+      function getCss(name) {
+        return getComputedStyle(root).getPropertyValue(name).trim();
+      }
+
+      let last = performance.now();
+      function frame(now) {
+        const dt = Math.min(0.1, (now - last) / 1000);
+        last = now;
+        if (running) step(dt);
+        const sIdx = currentStage(Math.min(T_TOTAL - 0.001, t));
+        const cur = stages[sIdx];
+        const cur_tokps = tokpsAt(t);
+        stageTag.textContent = `t=${t.toFixed(0)} · stage ${sIdx + 1}=${cur.name} · ${Math.round(cur_tokps)} tok/s`;
+        draw();
+        if (t >= T_TOTAL && running) {
+          running = false;
+          toggle.textContent = 'play 觀察 bring-up 過程';
+        }
+        requestAnimationFrame(frame);
+      }
+      requestAnimationFrame(frame);
+
+      toggle.addEventListener('click', () => {
+        if (t >= T_TOTAL) {
+          t = 0;
+          history.length = 0;
+        }
+        running = !running;
+        toggle.textContent = running ? 'pause' : 'play 觀察 bring-up 過程';
+        last = performance.now();
+      });
+      reset.addEventListener('click', () => {
+        running = false;
+        t = 0;
+        history.length = 0;
+        toggle.textContent = 'play 觀察 bring-up 過程';
+        stageTag.textContent = 't=0 · stage=尚未開機';
+        draw();
+      });
+    })();
+  </script>
+</figure>
+
+<p>看完曲線之後最值得記的不是「2485」這個數字，而是兩個轉折。</p>
+
+<p>FP8 校正讓 0 變成 800——從 garbage 變成可跑。HIP graph capture 讓 800 變成 2485——從可跑變成可用。前者是 correctness 修補，後者是 launch overhead 在小 batch 上的決定性影響。任何不打開 graph capture 的 vLLM build——無論 H100 還是 MI300X——decode token/s 都會掉到 30% 以下。MoE 加 sparse attention 因為 per-step kernel 數量多，這個 ratio 比 dense model 更慘。</p>
+
+<p>graph capture 走通之後，throughput 從 800 跳到 2485 看起來很乾淨，但實務上還沒結束——量到 2485 之後 quality check 跑出來，有一小撮 token 路由錯了。下一節跳進這個微妙的 quality 退化。</p>
+
+<p>但 graph capture 走通並不是 bring-up 的終點。throughput 上來之後，下一輪 quality check 跑出來，揭出兩個獨立的 routing/padding bug 同時存在——這是第四第五個壞點，也是整個案場裡最微妙的兩條。</p>
+
+<p>到這個階段 throughput 已經接近 2485 tok/s，correctness 卻又出現新的徵兆：在高 concurrency 下，少數 token 偶爾會被 routed 到錯誤的 expert，產生輕微 quality 退化。這種「99% 正確」的失敗模式比 garbage 更難 debug，因為輸出看起來合理——只有用 ground-truth perplexity 跟 reference 比，才會發現分數差了一點點。</p>
+
+<p>追進去之後 Fergus 發現兩個獨立的 root cause 同時在作用。</p>
+
+<p><strong>Cause A：MoE expert-mask 的 shape 算錯。</strong></p>
+
+<p>原本的判斷邏輯是：如果 ROCm AITER 在這個 build 裡是全域啟用的，就用 AITER 慣用的 mask shape；否則用 Triton 慣用的 mask shape。</p>
+
+<p>問題是 AITER「全域啟用」並不代表「這個 matmul 也是 AITER 在做」。</p>
+
+<p>前面 cb8a18556 那段 fallback 邏輯可能已經在這條 path 上把 AITER 換成 Triton。</p>
+
+<p>判斷錯的結果是 mask shape 跟 kernel 期望的 layout 對不上，expert routing 把 token 送錯位址。</p>
+
+<p>commit <code>8b5f7aa2c</code> 把這個判斷改成「detect on the specific kernel about to be called」——按 kernel 為單位決策、不按 build flag 為單位決策。</p>
+
+<p>這條改動在 patch 上很小，10 行內。</p>
+
+<p>但它是 cb8a18556 那條 dispatch 重寫之後的必然 follow-up——你把 dispatch 變成 per-kernel decision，下游所有依賴「全域 flag」的判斷都要回頭跟上。</p>
+
+<p>這類「dispatch decision 從 global flag 變成 per-call decision」之後的下游 cascade，是 backend refactor 常見的 followup 工作。</p>
+
+<p><strong>Cause B：Triton kernel 的 padding mask 算錯。</strong></p>
+
+<p>Triton 寫 kernel 的時候會把 thread block 內超出 logical 邊界的 lane 用 mask 屏蔽，避免 OOB read/write。</p>
+
+<p>一個內部 kernel 寫錯了：mask 算的是「跟 global tensor bound 比較」而不是「跟 logical block size 比較」。</p>
+
+<p>在 small block + low concurrency 下，global bound 跟 logical bound 通常會一致，bug 沒人發現。</p>
+
+<p>在 high concurrency + multi-block 下，padded lane 對的是 global tensor 的尾巴。</p>
+
+<p>Fergus 描述得很傳神：「scribbled across the MoE routing bitmatrix」——padded lane 把 routing 用的 bitmask 也覆蓋掉。</p>
+
+<p>下游的 expert dispatch 就拿到污染過的 routing。</p>
+
+<p>commit <code>c32932bb9</code> 把 mask 改回對 logical block size。</p>
+
+<p>這是一個 5 行的 patch，卻是整個 bring-up 裡花最多時間定位的根因。</p>
+
+<p>它只在特定 batch shape 下觸發、stack trace 完全沒有指向 routing layer、症狀是「expert utilisation 分布偏離預期」。</p>
+
+<p>Fergus 提到這個 bug 是靠在 MoE routing layer 上「埋 invariant assert」才查到。</p>
+
+<p>assert expert assignment 的 bitmask 跟前一層算的 logits top-k 一致。</p>
+
+<p>assert fire 之後反推 bitmask 在哪一個 kernel 之後被污染。</p>
+
+<p>這個 debugging 技巧在 inference backend 上特別有用：用 invariant 把每一層的 expected output 寫成 assertion，跑得通就移除，跑不通就 binary-search 上游。</p>
+
+<p>這兩個 patch 之後，throughput 穩定在 2485 tok/s 並且輸出 quality 跟 H100 reference 對齊。correctness 修補的部分到這裡告一段落。</p>
+
+<p>Fergus 沒有給絕對 watt 或 HBM 使用率數字——他坦白寫的是這篇的範圍只到 bring-up，不到 production tuning：「performance comparison and tuning is the next blog post」。但這個 baseline 已經足以證明 vLLM-on-MI300X-with-DeepSeek-V4-Flash 是可用的 production stack。</p>
+
+<p>接下來的優化是 8.6% 的最後一哩——靜態 Triton launch shape、MXFP4 tile shape 調參、weight materialization caching。這三個都是 inference shape 可預測的前提下做的 specialisation，跟 correctness 無關但會把 token/s 推到 2699。</p>
+
+<p>第一個是<strong>靜態 Triton launch shapes</strong>。Triton kernel 預設會在每次 launch 時根據實際 input shape 算 launch geometry——thread block 數量、warp 數量、shared memory 用量。如果 shape 在 inference 中固定，這個計算每次都得到一樣的結果；把 launch shape 提前固化、dispatch overhead 就被砍掉。production decode 的 shape 確實高度可預測——典型 decode 都是 batch=N、seq=1、context=K——這個固化的回報很大。</p>
+
+<p>第二個是 <strong>MXFP4 tile shape 調參</strong>。MXFP4 是 MoE expert weight 用的 4-bit quant scheme：每個 32-element group 共享一個 scale。dequant + matmul 時，tile shape 直接影響 HBM bandwidth 利用率。在 MI300X 的 HBM3 上，最佳 tile shape 跟 H100 不同，需要單獨 tune。tune 結果是 MoE expert matmul 的 effective HBM utilization 拉到接近 peak。</p>
+
+<p>第三個是 <strong>weight materialization caching</strong>。MoE expert weight 在 forward 時 lazy-materialize 成 BF16 tile；如果某些 expert 在連續 N 個 step 都被啟用，可以快取已經 materialize 的 tile，省掉 dequant 開銷。production traffic 上 expert utilization 不是 uniform——少數熱門 expert 會被頻繁觸發——這個 cache 有可觀的 hit rate。</p>
+
+<p>三條優化的共同特徵都不是「換新 kernel」，是「把現有 kernel 在 inference shape 固定的前提下做特化」。production inference workload 的 shape 確實高度可預測；用這個前提把 dispatch overhead 砍掉，在 MoE + sparse attention 的模型上有特別大的回報，因為每個 step 要 launch 的 kernel 數量本來就多。</p>
+
+<p>2699 tok/s 跟 H100 SXM 上的 reference 還差多少？</p>
+
+<p>Fergus 沒給直接比較數字。</p>
+
+<p>根據 vLLM 公開 benchmark，H100 SXM 上同 model size、同 batch shape 的 decode throughput 大約在 3400-3800 tok/s 範圍。</p>
+
+<p>MI300X 拿到 2699 tok/s 約是 H100 的 71-79%。</p>
+
+<p>考慮 MI300X 的 list price 約是 H100 SXM 的 60-65%，每美元 token/s 的 ROI 已經越過盈虧線。</p>
+
+<p>從 garbage 走到 2699 tok/s 的這條軌跡，把 bring-up 的全部 commits 串起來看到的不是「一個聰明的 patch」。</p>
+
+<p>是六個獨立 root cause 的順序排隊。</p>
+
+<p>下面這節把這條軌跡掛在牆上，看對 AI infra 工程的一般教訓是什麼。</p>
+
+<h2>把這個案場掛在牆上看到什麼</h2>
+
+<p>從硬體發表到 production-ready inference stack 走了 30 個月——其中最後 5 週的密集修補貢獻了從 garbage 到 2699 tok/s 的轉換。把這條軌跡掛在牆上，會看到三個對 AI infra 工程師有用的觀察。</p>
+
+<p><strong>第一，多廠商 kernel library 競爭把「dispatch 層」的設計品質變成 backend 工程的決定性能力。</strong></p>
+
+<p>AITER 跟 Triton 都不是壞的工具，但「在這顆卡的這個 op 上要走哪條路」這個決策必須做得細到 (硬體 ID × kernel ID) 這個粒度——做粗了就掉 throughput 或掉 correctness，做太細了 dispatch 自己變成 hotspot。</p>
+
+<p>Fergus 走的 refuse-and-fallback 是一個值得借鏡的設計姿勢：dispatch 層保持邏輯，個別 kernel 拒絕 dispatch，guard 條件未來可以一條一條退掉。這比「全域 disable AITER」要繁瑣很多，但它保留了其他平台跟其他 op 的 fast path，也保留了未來修補的 staging 空間。</p>
+
+<p>對下次設計 multi-vendor inference backend 的人來說，第一個要釐清的不是 kernel library 怎麼挑，是 dispatch 層的決策粒度怎麼定。「flag-of-flags」這條路看似簡單，扛不住未來 hardware ×  kernel ×  shape 三個維度交叉變大的時候。</p>
+
+<p><strong>第二，FP8 不是一個 dtype，是兩個 dtype，而且 vLLM 跟 model code 兩邊都要正確 dispatch 才不會壞。</strong></p>
+
+<p>fnuz 跟 OCP 的 exponent bias 差一這件事在規格上是已知的；上層 framework 是否把 platform-aware dtype 正確注入到 model code 的每一個 cache write 路徑上，是工程細節。</p>
+
+<p>下次接到 FP8 模型在 ROCm 上輸出 garbage 的 ticket，第一件事查的是 cache write 用的是不是 <code>current_platform.fp8_dtype</code>。第二件事查的是 model code 裡有沒有任何一處 hardcode 了某個 dtype——sliding-window K-cache 就是這樣繞過 platform dispatch 的，需要單獨 patch。</p>
+
+<p>這個教訓在 BF16/FP16 上不存在，因為這兩個 dtype 在所有現代 GPU 上 layout 一致；FP8 之後 dtype 就跟 hardware 綁了，dispatch 不再是 optional。</p>
+
+<p><strong>第三，graph capture 的 capture-safe 約束不是顯而易見的，它經常在「動態 metadata builder」這條路上被打破。</strong></p>
+
+<p>一個用 ragged tensor 表達 sparsity pattern 的 metadata builder 在 eager mode 跑得很好，一進 graph capture 就被拒絕；新模型架構加進來時這條 path 要特別 review。</p>
+
+<p>Fergus 用 static + bitmask 取代 ragged 是標準解法，但這個解法本身對 sparsity 在 batch 內的分布有上限假設，不是所有 sparsity pattern 都能這樣編碼。下一代模型如果引入 unbounded sparsity——譬如 sparsity 上限隨 context 長度動態變化的設計——capture-safe 的設計又要重新走一遍。</p>
+
+<p>這條 bring-up 軸線給我們的最終訊號很簡單：MI300X 是 viable 的 inference 平台，前提是 backend 團隊願意做 dispatch 層的 surgical work。AMD 自己在 ROCm 上要補的，不只是 kernel——是把 dispatch 哲學在 vendor library 跟 community framework 之間談清楚，讓 cb8a18556 這種 guard 不必每張新卡、每個新 model 都重寫一次。</p>
+
+<p>doubleword 把這份案場日誌公開，對其他 ROCm 上要 bring-up 新模型的團隊是直接的時間救援：六個 commit、五個 root cause、三十天的工程時間，能省下別人重踩一遍的兩到三個月。這比任何「MI300X 比 H100 便宜」的 marketing 數字都來得有用。</p>
+
+<p>下一份報告大概會是 Fergus 在文章結尾預告的 performance tuning blog：把 2699 tok/s 拉到接近 H100 的 stretch goal。但那是 production tuning 的故事，bring-up 這條案場已經結束。</p>
+
+<p class="vg-deep-closer"><strong>案場結語</strong>：把 garbage 變成 2699 tok/s 的，不是新 kernel，是一條一條把 dispatch、dtype、graph capture、padding mask 校準到 MI300X 的 fnuz 方言上——這是 inference backend 工程的真正樣貌。</p>
+
+</div>
