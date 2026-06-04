@@ -1,0 +1,689 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">一個歐洲 workspace 在 Notion 裡按下搜尋，背後沒有任何一筆 bytes 飛過大西洋——這不是預設行為，而是一整套資料系統被逐塊改寫之後的結果。客戶資料「不論被索引去做 search、被算進 analytics、還是被轉成 AI 的 embedding，都不會離開它所屬地區的基礎設施」。</p>
+  <h1 class="vg-post-title">把客戶資料釘在它的地區——Notion 跨 search／analytics／AI 的多區域改造</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p>
+    <span class="vg-dropcap">資</span>料落地（data residency）這個詞，在合規簡報裡只有一行：客戶資料必須留在它所屬的地理區域內被處理與儲存。但在一個已經跑了多年、所有後端服務都假設「資料就在身邊、跨服務呼叫不分地區」的系統裡，把這一行字落實到每一條 pipeline，是一場橫跨 search、AI、event logging、analytics 四個子系統、由多個團隊接力的改造。Notion 這篇 engineering blog 講的就是這場改造的順序與取捨——值得記下的不是它用了哪些現成元件（<code>Debezium</code>、<code>Kafka</code>、<code>Spark</code>、<code>Elasticsearch</code>、<code>Snowflake</code> 都不稀奇），而是「怎麼把一個假設單一地區的系統，重構成每個地區各自為政、彼此幾乎不通訊」這件事的工程紀律。
+  </p>
+
+  <p>
+    這篇貼文沒有給任何硬數字——沒有延遲、沒有成本、沒有資料量。它給的是一條敘事線：2025 年先上線 EU data residency 滿足歐洲法規，接著把 data lake、AI embedding、event logging 一個子系統一個子系統地「地區化」，central orchestration 留在美國但被刻意設計成碰不到客戶資料，最後把目標訂在「開到一個新地區，要從幾個月縮成幾天」，並準備擴張到日本與南韓。下面先把這條時間線攤開，再逐個子系統拆。
+  </p>
+
+  <h2>從一行合規條款到一條時間軸</h2>
+
+  <p>
+    這場改造不是一次 big-bang rewrite，而是一條有先後依賴的時間軸。EU residency 先上線——這是合規的硬截止點，逼著團隊先把「地區」這個概念變成一等公民；有了地區這個維度，data lake 才能複製成每地區一套；data lake 一旦地區化，建在它之上的 search index 與 AI embedding 才有條件跟著地區化；等資料流全部釘住地區，剩下的問題就變成「怎麼把開新地區的成本壓下來」，於是日本、南韓才排得上隊。下面這個 scrubber 把這條軸攤平，拖動把手可以檢視每個節點上「哪些系統已經被釘進地區、還剩什麼沒做」。
+  </p>
+
+  <figure class="vg-w-scrub-notion-residency" data-svg-scroll="720">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <polyline points="18 8 22 12 18 16"/><polyline points="6 8 2 12 6 16"/>
+        <line x1="2" y1="12" x2="22" y2="12"/>
+      </svg>
+      <span>拖動把手沿時間軸移動 · 6 個里程碑</span>
+    </p>
+    <style>
+      .vg-w-scrub-notion-residency { display: grid; gap: var(--s-2); margin: var(--s-4) 0; }
+      .vg-w-scrub-notion-residency svg.vg-w-scrub-notion-residency-main { width: 100%; height: auto; }
+      .vg-w-scrub-notion-residency .scrub-state {
+        font-family: var(--serif); font-size: var(--fs-sm);
+        padding: var(--s-2) var(--s-3); background: var(--bg-soft);
+        border-left: 2px solid var(--accent); line-height: 1.7;
+      }
+      .vg-w-scrub-notion-residency .scrub-state .scrub-when {
+        font-family: var(--display); color: var(--accent-text);
+        display: block; margin-bottom: var(--s-1);
+      }
+    </style>
+
+    <svg class="vg-w-scrub-notion-residency-main" viewBox="0 0 720 150" role="img"
+         aria-label="Notion 資料落地改造的六個里程碑時間軸，可拖動把手檢視每個節點的狀態">
+      <line x1="48" y1="70" x2="672" y2="70" stroke="var(--muted-2)" stroke-width="1.5" />
+      <g id="vg-w-scrub-notion-residency-events"></g>
+      <line id="vg-w-scrub-notion-residency-handle-line" x1="48" y1="44" x2="48" y2="96"
+            stroke="var(--accent)" stroke-width="2" />
+      <circle id="vg-w-scrub-notion-residency-handle" cx="48" cy="70" r="10"
+              fill="var(--accent)" cursor="grab"
+              role="slider" tabindex="0" aria-label="時間軸把手"
+              aria-valuemin="0" aria-valuemax="5" aria-valuenow="0" />
+      <text id="vg-w-scrub-notion-residency-clock" x="48" y="34" text-anchor="middle"
+            font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">2025 · EU residency</text>
+    </svg>
+
+    <div class="scrub-state" id="vg-w-scrub-notion-residency-state"></div>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-scrub-notion-residency');
+        const svg = root.querySelector('svg.vg-w-scrub-notion-residency-main');
+        const handle = root.querySelector('#vg-w-scrub-notion-residency-handle');
+        const handleLine = root.querySelector('#vg-w-scrub-notion-residency-handle-line');
+        const clock = root.querySelector('#vg-w-scrub-notion-residency-clock');
+        const stateDiv = root.querySelector('#vg-w-scrub-notion-residency-state');
+        const eventsG = root.querySelector('#vg-w-scrub-notion-residency-events');
+        const NS = 'http://www.w3.org/2000/svg';
+
+        // [step, short label on axis, when-line, full state description]
+        const events = [
+          [0, 'EU residency', '2025 · EU residency 上線',
+           '為了滿足歐洲法規，Notion 先把「地區」變成系統裡的一等概念，建立 workspace → region 的 mapping table。此刻 EU workspace 的資料已被要求留在歐洲，但底層多數 pipeline 仍假設單一地區，改造才剛起步。'],
+          [1, 'data lake', '步驟一 · 每地區一套 data lake',
+           'Debezium 在 Kubernetes 裡對 Postgres 做 CDC，把變更串進地區的 Kafka；地區的 Spark job 轉換後寫進該地區的 data lake；地區的 Elasticsearch cluster 只用本地區資料建 search index。search 這條路徑被完全釘進地區。'],
+          [2, 'AI embedding', '步驟二 · AI embedding 地區化',
+           '每地區一套 vector database 承接 embedding。central mapping table 標記每個 workspace 的 active region，onboarding 時在地區的 vector DB 內把既有內容嵌入，更新走地區 Kafka → Spark → vector DB。region 成為 AI onboarding 與 update 流程的第一級輸入。'],
+          [3, 'event logging', '步驟三 · event logging 依 workspace-ID 路由',
+           'client 事件帶著 workspace-ID header，由 Cloudflare worker 路由到對應地區；server 事件寫進本地 Kafka；Snowpipe 把事件灌進地區專屬的 Snowflake table。每一條事件從產生那一刻就被導向正確地區。'],
+          [4, 'days not months', '目標 · 開新地區「幾天而非幾個月」',
+           'central Airflow（美國）只當 orchestrator，不碰客戶資料；EMR 跑地區的 Spark；Terraform 讓各地區的基礎設施保持一致。EU／US sanitization pipeline 洗淨客戶資料後才進共用 Snowflake，內部團隊維持單一查詢介面。改造目標收斂成：把開新地區從幾個月縮到幾天。'],
+          [5, 'JP / KR', '下一步 · 擴張日本、南韓',
+           '當「開新地區」變成可重複的幾天工作，地理擴張就從工程難題變成排程問題。Notion 表示即將把 data residency 擴到日本與南韓——這正是前面所有地區化工作換來的紅利。'],
+        ];
+        const STEP_MAX = events.length - 1;
+        const X0 = 48, X1 = 672;
+        const xOf = s => X0 + (s / STEP_MAX) * (X1 - X0);
+
+        for (const [s, label] of events) {
+          const c = document.createElementNS(NS, 'circle');
+          c.setAttribute('cx', xOf(s)); c.setAttribute('cy', 70); c.setAttribute('r', 4.5);
+          c.setAttribute('fill', 'var(--muted)');
+          eventsG.appendChild(c);
+          const tx = document.createElementNS(NS, 'text');
+          tx.setAttribute('x', xOf(s)); tx.setAttribute('y', 118);
+          tx.setAttribute('text-anchor', 'middle');
+          tx.setAttribute('font-family', 'Manrope, sans-serif');
+          tx.setAttribute('font-size', 11);
+          tx.setAttribute('fill', 'var(--muted)');
+          tx.textContent = label;
+          eventsG.appendChild(tx);
+        }
+
+        function clamp(x) { return Math.max(X0, Math.min(X1, x)); }
+        function clientToSvgX(clientX) {
+          const pt = svg.createSVGPoint();
+          pt.x = clientX; pt.y = 0;
+          const p = pt.matrixTransform(svg.getScreenCTM().inverse());
+          return clamp(p.x);
+        }
+        function render(step) {
+          const x = xOf(step);
+          handle.setAttribute('cx', x);
+          handle.setAttribute('aria-valuenow', step);
+          handleLine.setAttribute('x1', x); handleLine.setAttribute('x2', x);
+          clock.setAttribute('x', x);
+          const e = events[step];
+          clock.textContent = e[1];
+          stateDiv.innerHTML = '<span class="scrub-when">' + e[2] + '</span>' + e[3];
+        }
+        function updateFromX(x) {
+          const raw = ((x - X0) / (X1 - X0)) * STEP_MAX;
+          render(Math.round(Math.max(0, Math.min(STEP_MAX, raw))));
+        }
+
+        let dragging = false;
+        handle.addEventListener('pointerdown', (e) => {
+          dragging = true; handle.setPointerCapture(e.pointerId);
+        });
+        handle.addEventListener('pointermove', (e) => {
+          if (!dragging) return; updateFromX(clientToSvgX(e.clientX));
+        });
+        handle.addEventListener('pointerup', () => { dragging = false; });
+        svg.addEventListener('pointerdown', (e) => {
+          if (e.target === handle) return;
+          updateFromX(clientToSvgX(e.clientX));
+        });
+        handle.addEventListener('keydown', (e) => {
+          const cur = Number(handle.getAttribute('aria-valuenow'));
+          if (e.key === 'ArrowRight' || e.key === 'ArrowUp') {
+            e.preventDefault(); render(Math.min(STEP_MAX, cur + 1));
+          } else if (e.key === 'ArrowLeft' || e.key === 'ArrowDown') {
+            e.preventDefault(); render(Math.max(0, cur - 1));
+          }
+        });
+
+        render(0);
+      })();
+    </script>
+  </figure>
+
+  <p>
+    這條軸還藏著一個容易被忽略的事實：每一步都是在系統持續服務、上層應用不停機的前提下完成的。data lake 地區化的時候，search 不能掛；AI embedding 地區化的時候，既有的 Q&amp;A 不能斷。這逼著每一次切換都得是可並行、可回退的——新地區的 pipeline 先在旁邊建起來、灌完歷史資料、跟舊路徑比對無誤，才把流量切過去。貼文沒有細講每一步的切換手法，但從「逐子系統」這個節奏本身就能讀出：這不是一次性的資料搬遷，而是一連串各自獨立、各自驗證的小遷移，每一步都把一個子系統的客戶資料釘穩，再進行下一步。
+  </p>
+
+  <p>
+    要理解為什麼這條軸的順序是這樣，得先看清楚改造前的系統長什麼樣。Notion 的後端多年來假設「資料就在某個中心、所有服務就近取用」——CDC 把 Postgres 的變更灌進一條共用 Kafka，一批共用的 Spark job 轉換後寫進一個共用 data lake，search index、analytics、AI embedding 全建在這個共用底座上。這套設計對效能與維護都很省事，唯一的問題是：它把所有地區的客戶資料混在同一條管線裡流動。data residency 一旦變成硬約束，這個「混流」就是非拆不可的核心。
+  </p>
+
+  <p>
+    這裡的關鍵設計選擇，是把 <code>workspace ID</code> 升格成「主要的路由與分割識別碼」（primary routing and partitioning identifier）。在改造前，workspace ID 只是一個業務主鍵；改造後，它變成每一條資料在系統裡該往哪走的依據——查 mapping table 就知道這個 workspace 的 active region，據此決定它的 CDC 串去哪個 Kafka、它的 embedding 寫進哪個 vector DB、它的事件被 Cloudflare worker 路由到哪個地區。整套系統被重構成「一組彼此隔離的 private network，每一組只處理 application data 的一個切片、彼此之間幾乎不通訊」。下面這個 slider 把改造前後的兩種資料流形狀疊在一起。
+  </p>
+
+  <h2>從一條共用管線到每地區各自為政</h2>
+
+  <p>
+    左邊是改造前：所有地區的客戶資料匯進同一條中央管線，search、analytics、AI 都從這個共用底座取用——簡單，但客戶資料跨地區流動。右邊是改造後：每地區一條完整且獨立的管線，從 CDC 到 search index 全在地區內閉環，中央只剩下不碰客戶資料的 orchestration 與洗淨後的 analytics。拖動中間的分隔線在兩者之間切換。
+  </p>
+
+  <figure class="vg-w-ba-notion-pipeline">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <polyline points="18 8 22 12 18 16"/><polyline points="6 8 2 12 6 16"/>
+        <line x1="2" y1="12" x2="22" y2="12"/>
+      </svg>
+      <span>拖動分隔線比較改造前後的資料流 · 單一中央管線 vs 每地區獨立管線</span>
+    </p>
+    <style>
+      .vg-w-ba-notion-pipeline { position: relative; aspect-ratio: 3 / 2; overflow: hidden; margin: var(--s-4) 0; }
+      .vg-w-ba-notion-pipeline .ba-layer { position: absolute; inset: 0; }
+      .vg-w-ba-notion-pipeline .ba-layer svg { width: 100%; height: 100%; }
+      .vg-w-ba-notion-pipeline .after { clip-path: polygon(50% 0, 100% 0, 100% 100%, 50% 100%); }
+      .vg-w-ba-notion-pipeline .ba-divider {
+        position: absolute; top: 0; bottom: 0; left: 50%;
+        width: 32px; transform: translateX(-50%);
+        cursor: ew-resize; touch-action: none; z-index: 3;
+      }
+      .vg-w-ba-notion-pipeline .ba-divider::before {
+        content: ''; position: absolute; left: 50%; top: 0; bottom: 0;
+        width: 2px; transform: translateX(-50%); background: var(--accent);
+      }
+      .vg-w-ba-notion-pipeline .ba-divider::after {
+        content: '↔'; position: absolute; left: 50%; top: 50%;
+        transform: translate(-50%, -50%);
+        background: var(--accent); color: var(--bg);
+        width: 30px; height: 30px; border-radius: 50%;
+        display: grid; place-items: center;
+        font-family: var(--sans); font-size: 15px;
+      }
+      .vg-w-ba-notion-pipeline .ba-tag {
+        font-family: Manrope, sans-serif; font-size: 16px; letter-spacing: 0.04em;
+      }
+    </style>
+
+    <svg class="ba-layer before" viewBox="0 0 480 320" role="img" aria-label="改造前的單一中央管線">
+      <text x="20" y="30" class="ba-tag" fill="var(--muted)">BEFORE · 單一中央管線</text>
+      <rect x="20" y="50" width="90" height="40" rx="3" fill="none" stroke="currentColor" stroke-width="1.5"/>
+      <text x="65" y="75" text-anchor="middle" font-family="EB Garamond, serif" font-size="16" fill="var(--ink)">EU PG</text>
+      <rect x="20" y="110" width="90" height="40" rx="3" fill="none" stroke="currentColor" stroke-width="1.5"/>
+      <text x="65" y="135" text-anchor="middle" font-family="EB Garamond, serif" font-size="16" fill="var(--ink)">US PG</text>
+      <line x1="110" y1="70" x2="180" y2="120" stroke="var(--muted)" stroke-width="1.4"/>
+      <line x1="110" y1="130" x2="180" y2="128" stroke="var(--muted)" stroke-width="1.4"/>
+      <rect x="180" y="100" width="120" height="56" rx="3" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.5"/>
+      <text x="240" y="122" text-anchor="middle" font-family="EB Garamond, serif" font-size="16" fill="var(--ink)">共用 Kafka</text>
+      <text x="240" y="144" text-anchor="middle" font-family="EB Garamond, serif" font-size="16" fill="var(--muted)">+ Spark</text>
+      <line x1="300" y1="128" x2="350" y2="128" stroke="var(--muted)" stroke-width="1.4"/>
+      <rect x="350" y="100" width="110" height="56" rx="3" fill="var(--accent)" fill-opacity="0.14" stroke="var(--accent)" stroke-width="1.5"/>
+      <text x="405" y="122" text-anchor="middle" font-family="EB Garamond, serif" font-size="16" fill="var(--ink)">共用 lake</text>
+      <text x="405" y="144" text-anchor="middle" font-family="EB Garamond, serif" font-size="16" fill="var(--muted)">混流</text>
+      <line x1="405" y1="156" x2="405" y2="200" stroke="var(--muted)" stroke-width="1.4"/>
+      <rect x="290" y="200" width="80" height="36" rx="3" fill="none" stroke="var(--muted-2)" stroke-width="1.4"/>
+      <text x="330" y="224" text-anchor="middle" font-family="EB Garamond, serif" font-size="16" fill="var(--ink)">search</text>
+      <rect x="380" y="200" width="80" height="36" rx="3" fill="none" stroke="var(--muted-2)" stroke-width="1.4"/>
+      <text x="420" y="224" text-anchor="middle" font-family="EB Garamond, serif" font-size="16" fill="var(--ink)">AI</text>
+      <line x1="405" y1="200" x2="330" y2="236" stroke="var(--muted)" stroke-width="1.2"/>
+      <text x="240" y="285" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="16" fill="var(--muted)">所有地區的客戶資料匯進同一條管線</text>
+    </svg>
+
+    <svg class="ba-layer after" viewBox="0 0 480 320" role="img" aria-label="改造後的每地區獨立管線">
+      <text x="20" y="30" class="ba-tag" fill="var(--accent-text)">AFTER · 每地區獨立管線</text>
+      <rect x="250" y="46" width="210" height="120" rx="4" fill="var(--accent)" fill-opacity="0.07" stroke="var(--accent)" stroke-width="1.3" stroke-dasharray="4 3"/>
+      <text x="355" y="62" text-anchor="middle" class="ba-tag" fill="var(--accent-text)">EU region（閉環）</text>
+      <rect x="262" y="74" width="58" height="34" rx="3" fill="none" stroke="currentColor" stroke-width="1.3"/>
+      <text x="291" y="96" text-anchor="middle" font-family="EB Garamond, serif" font-size="16" fill="var(--ink)">Kafka</text>
+      <rect x="330" y="74" width="58" height="34" rx="3" fill="none" stroke="currentColor" stroke-width="1.3"/>
+      <text x="359" y="96" text-anchor="middle" font-family="EB Garamond, serif" font-size="16" fill="var(--ink)">Spark</text>
+      <rect x="398" y="74" width="50" height="34" rx="3" fill="var(--accent)" fill-opacity="0.16" stroke="var(--accent)" stroke-width="1.3"/>
+      <text x="423" y="96" text-anchor="middle" font-family="EB Garamond, serif" font-size="16" fill="var(--ink)">lake</text>
+      <rect x="262" y="120" width="80" height="32" rx="3" fill="none" stroke="var(--muted-2)" stroke-width="1.3"/>
+      <text x="302" y="141" text-anchor="middle" font-family="EB Garamond, serif" font-size="16" fill="var(--ink)">ES search</text>
+      <rect x="352" y="120" width="96" height="32" rx="3" fill="none" stroke="var(--muted-2)" stroke-width="1.3"/>
+      <text x="400" y="141" text-anchor="middle" font-family="EB Garamond, serif" font-size="16" fill="var(--ink)">vector DB</text>
+      <rect x="20" y="78" width="190" height="84" rx="4" fill="var(--sage)" fill-opacity="0.08" stroke="var(--sage-deep)" stroke-width="1.3" stroke-dasharray="4 3"/>
+      <text x="115" y="94" text-anchor="middle" class="ba-tag" fill="var(--sage-deep)">US region（閉環）</text>
+      <text x="115" y="120" text-anchor="middle" font-family="EB Garamond, serif" font-size="16" fill="var(--ink)">Kafka → Spark → lake</text>
+      <text x="115" y="143" text-anchor="middle" font-family="EB Garamond, serif" font-size="16" fill="var(--ink)">ES · vector DB</text>
+      <rect x="120" y="210" width="240" height="44" rx="3" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.4"/>
+      <text x="240" y="228" text-anchor="middle" font-family="EB Garamond, serif" font-size="16" fill="var(--ink)">central Airflow · 不碰資料</text>
+      <text x="240" y="248" text-anchor="middle" font-family="EB Garamond, serif" font-size="16" fill="var(--muted)">sanitized → 共用 Snowflake</text>
+      <line x1="115" y1="162" x2="200" y2="210" stroke="var(--sage-deep)" stroke-width="1.1" stroke-dasharray="3 3"/>
+      <line x1="355" y1="166" x2="280" y2="210" stroke="var(--accent)" stroke-width="1.1" stroke-dasharray="3 3"/>
+      <text x="240" y="290" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="16" fill="var(--muted)">每地區一條閉環，中央只接洗淨後的資料</text>
+    </svg>
+
+    <div class="ba-divider" id="vg-w-ba-notion-pipeline-divider"></div>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-ba-notion-pipeline');
+        const after = root.querySelector('.after');
+        const divider = root.querySelector('#vg-w-ba-notion-pipeline-divider');
+        let dragging = false;
+        function setPct(pct) {
+          const c = Math.max(0, Math.min(100, pct));
+          after.style.clipPath = `polygon(${c}% 0, 100% 0, 100% 100%, ${c}% 100%)`;
+          divider.style.left = `${c}%`;
+        }
+        divider.addEventListener('pointerdown', (e) => {
+          dragging = true; divider.setPointerCapture(e.pointerId);
+        });
+        root.addEventListener('pointermove', (e) => {
+          if (!dragging) return;
+          const rect = root.getBoundingClientRect();
+          setPct(((e.clientX - rect.left) / rect.width) * 100);
+        });
+        root.addEventListener('pointerup', () => { dragging = false; });
+        root.addEventListener('pointercancel', () => { dragging = false; });
+      })();
+    </script>
+  </figure>
+
+  <p>
+    這張對照圖的重點不在「畫了哪些 box」，而在於那條虛線框：改造後每個地區都是一個閉環，CDC、轉換、索引、嵌入全在框內完成，框與框之間沒有客戶資料的箭頭穿過。中央那一塊縮得很小，而且刻意被設計成「只接洗淨後的資料」。接下來把這個閉環裡的四個子系統逐一拆開——它們各自怎麼把客戶資料釘住，又各自付出了什麼代價。
+  </p>
+
+  <p>
+    值得停下來想一下這個「閉環」在工程上代表什麼。改造前那條共用管線之所以好寫，正是因為它允許任意跨服務、跨地區的取用——一個 analytics job 想讀 search index、一個 AI job 想讀原始 CDC 流，都只是一次內部呼叫。改造後，這種隨手取用被切斷了：地區框內的服務只看得到本地區的資料，框外的服務要拿任何東西都得先問「這合不合 residency」。換句話說，改造的本質是把一個「預設互通」的系統改成「預設隔離」的系統，而隔離的粒度正好是地區。這種反轉在程式碼層面看不太出來——元件名稱沒變——但在資料流的拓撲上，是從一張全連通圖變成了幾座彼此用洗淨閘門相連的孤島。
+  </p>
+
+  <p>
+    在拆四個子系統之前，先把單一地區裡那條核心資料管線攤開——這是 search 與 AI 共用的底座，也是整套地區化最先完成的一塊。下面這張圖把 EU region 內從 Postgres 到 search index 與 vector DB 的流程畫出來，點選任一元件可以讀它在這條鏈上負責什麼、又刻意不知道什麼。
+  </p>
+
+  <figure class="vg-w-annotated-notion-pipeline" data-svg-scroll="560">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M9 18l6-6-6-6"/>
+      </svg>
+      <span>點選任一元件讀它的職責 · 5 個元件</span>
+    </p>
+    <style>
+      .vg-w-annotated-notion-pipeline { display: grid; grid-template-columns: 1fr; gap: var(--s-3); align-items: start; margin: var(--s-4) 0; }
+      .vg-w-annotated-notion-pipeline svg.vg-w-annotated-notion-pipeline-main { width: 100%; height: auto; }
+      .vg-w-annotated-notion-pipeline input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-annotated-notion-pipeline .component { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; transition: fill 200ms, stroke 200ms; }
+      .vg-w-annotated-notion-pipeline .component:hover { stroke: var(--accent); }
+      .vg-w-annotated-notion-pipeline .component:focus { outline: none; }
+      .vg-w-annotated-notion-pipeline .component:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+      .vg-w-annotated-notion-pipeline .component-text { pointer-events: none; }
+      .vg-w-annotated-notion-pipeline .detail { padding: var(--s-2) var(--s-3); border-left: 2px solid var(--accent); display: none; }
+      .vg-w-annotated-notion-pipeline .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-annotated-notion-pipeline .detail p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); line-height: 1.7; }
+      .vg-w-annotated-notion-pipeline:has(#vg-w-annotated-notion-pipeline-r1:checked) .component-1,
+      .vg-w-annotated-notion-pipeline:has(#vg-w-annotated-notion-pipeline-r2:checked) .component-2,
+      .vg-w-annotated-notion-pipeline:has(#vg-w-annotated-notion-pipeline-r3:checked) .component-3,
+      .vg-w-annotated-notion-pipeline:has(#vg-w-annotated-notion-pipeline-r4:checked) .component-4,
+      .vg-w-annotated-notion-pipeline:has(#vg-w-annotated-notion-pipeline-r5:checked) .component-5 {
+        fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent);
+      }
+      .vg-w-annotated-notion-pipeline:has(#vg-w-annotated-notion-pipeline-r1:checked) .detail-1,
+      .vg-w-annotated-notion-pipeline:has(#vg-w-annotated-notion-pipeline-r2:checked) .detail-2,
+      .vg-w-annotated-notion-pipeline:has(#vg-w-annotated-notion-pipeline-r3:checked) .detail-3,
+      .vg-w-annotated-notion-pipeline:has(#vg-w-annotated-notion-pipeline-r4:checked) .detail-4,
+      .vg-w-annotated-notion-pipeline:has(#vg-w-annotated-notion-pipeline-r5:checked) .detail-5 {
+        display: block;
+      }
+    </style>
+
+    <input type="radio" id="vg-w-annotated-notion-pipeline-r1" name="vg-w-annotated-notion-pipeline-sel" checked aria-label="Postgres + Debezium" />
+    <input type="radio" id="vg-w-annotated-notion-pipeline-r2" name="vg-w-annotated-notion-pipeline-sel" aria-label="Kafka" />
+    <input type="radio" id="vg-w-annotated-notion-pipeline-r3" name="vg-w-annotated-notion-pipeline-sel" aria-label="Spark" />
+    <input type="radio" id="vg-w-annotated-notion-pipeline-r4" name="vg-w-annotated-notion-pipeline-sel" aria-label="Elasticsearch" />
+    <input type="radio" id="vg-w-annotated-notion-pipeline-r5" name="vg-w-annotated-notion-pipeline-sel" aria-label="vector DB" />
+
+    <svg class="vg-w-annotated-notion-pipeline-main" viewBox="0 0 480 300" role="img"
+         aria-label="EU 地區內從 Postgres 到 search index 與 vector DB 的資料管線">
+      <defs>
+        <marker id="vg-w-annotated-notion-pipeline-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+        </marker>
+      </defs>
+      <text x="20" y="26" font-family="Manrope, sans-serif" font-size="12" letter-spacing="0.04em" fill="var(--accent-text)">EU REGION · 地區內閉環</text>
+
+      <rect class="component component-1" data-target="vg-w-annotated-notion-pipeline-r1" role="button" tabindex="0" aria-label="Postgres + Debezium CDC" x="24" y="48" width="130" height="56" rx="3"/>
+      <text class="component-text" x="89" y="72" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">Postgres</text>
+      <text class="component-text" x="89" y="90" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">+ Debezium CDC</text>
+
+      <rect class="component component-2" data-target="vg-w-annotated-notion-pipeline-r2" role="button" tabindex="0" aria-label="Kafka" x="190" y="48" width="110" height="56" rx="3"/>
+      <text class="component-text" x="245" y="80" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">地區 Kafka</text>
+
+      <rect class="component component-3" data-target="vg-w-annotated-notion-pipeline-r3" role="button" tabindex="0" aria-label="Spark" x="336" y="48" width="120" height="56" rx="3"/>
+      <text class="component-text" x="396" y="74" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">地區 Spark</text>
+      <text class="component-text" x="396" y="92" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">+ lake</text>
+
+      <rect class="component component-4" data-target="vg-w-annotated-notion-pipeline-r4" role="button" tabindex="0" aria-label="Elasticsearch" x="190" y="160" width="120" height="56" rx="3"/>
+      <text class="component-text" x="250" y="186" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">Elasticsearch</text>
+      <text class="component-text" x="250" y="204" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">search index</text>
+
+      <rect class="component component-5" data-target="vg-w-annotated-notion-pipeline-r5" role="button" tabindex="0" aria-label="vector DB" x="336" y="160" width="120" height="56" rx="3"/>
+      <text class="component-text" x="396" y="186" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">vector DB</text>
+      <text class="component-text" x="396" y="204" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">AI embedding</text>
+
+      <line x1="154" y1="76" x2="190" y2="76" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-annotated-notion-pipeline-arrow)"/>
+      <line x1="300" y1="76" x2="336" y2="76" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-annotated-notion-pipeline-arrow)"/>
+      <line x1="396" y1="104" x2="250" y2="160" stroke="currentColor" stroke-width="1.4" marker-end="url(#vg-w-annotated-notion-pipeline-arrow)"/>
+      <line x1="396" y1="104" x2="396" y2="160" stroke="currentColor" stroke-width="1.4" marker-end="url(#vg-w-annotated-notion-pipeline-arrow)"/>
+      <text x="240" y="262" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="13" fill="var(--muted)">同一份 job 定義，套到任一地區的資源</text>
+      <text x="240" y="282" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="13" fill="var(--muted)">沒有任何箭頭穿出 EU region 框</text>
+    </svg>
+
+    <div>
+      <div class="detail detail-1">
+        <h3>Postgres + Debezium · 源頭</h3>
+        <p>應用資料庫，Debezium 在 Kubernetes 內對它做 Change Data Capture，把每一筆變更轉成事件串流。</p>
+        <p><strong>刻意不知道</strong>：下游是 search 還是 AI——它只負責把變更忠實吐出來。</p>
+      </div>
+      <div class="detail detail-2">
+        <h3>地區 Kafka · 傳輸</h3>
+        <p>承接該地區的 CDC 事件流，是地區內所有下游的單一入口。它本來就在地區內，所以 event logging 的 server 事件也直接寫進這裡。</p>
+        <p><strong>刻意不知道</strong>：事件最終會被索引成什麼——它只保證地區內的順序與可重放。</p>
+      </div>
+      <div class="detail detail-3">
+        <h3>地區 Spark · 轉換</h3>
+        <p>消費 Kafka、做轉換、寫進地區 data lake，並生成 AI embedding。靠共用 helper 解析「這個地區的資源在哪」，所以同一份 job 定義能套到任何地區。</p>
+        <p><strong>刻意不知道</strong>：自己跑在哪個地區——地區是注入的參數，不是寫死的分支。</p>
+      </div>
+      <div class="detail detail-4">
+        <h3>Elasticsearch · search 出口</h3>
+        <p>從地區 lake 建 search index，只吃本地區資料。EU workspace 的搜尋永遠打在 EU 的 index 上。</p>
+        <p><strong>刻意不知道</strong>：其他地區的 index 存不存在——它的世界就是本地區。</p>
+      </div>
+      <div class="detail detail-5">
+        <h3>vector DB · AI 出口</h3>
+        <p>承接地區 Spark 生成的 embedding，供 AI 功能檢索。onboarding 時靠 central mapping table 確認 workspace 的 active region，把既有內容嵌入正確地區的 vector DB。</p>
+        <p><strong>刻意不知道</strong>：embedding 的原始內容跨不跨地區——它只存本地區算出的向量。</p>
+      </div>
+    </div>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-annotated-notion-pipeline');
+        root.querySelectorAll('.component').forEach((rect) => {
+          rect.addEventListener('click', () => {
+            const radio = root.querySelector('#' + rect.getAttribute('data-target'));
+            if (radio) radio.checked = true;
+          });
+          rect.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              rect.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            }
+          });
+        });
+      })();
+    </script>
+  </figure>
+
+  <h2>四個子系統，各自怎麼把資料釘住</h2>
+
+  <p>
+    把「客戶資料不離開地區」這個抽象目標落到具體，會發現它在四個子系統裡長得完全不一樣：search 靠的是複製整條 CDC 管線、AI 靠的是把 region 變成 onboarding 的輸入、event logging 靠的是 edge 路由、analytics 靠的是反向操作——先洗淨再集中。下面這個 stack 把四者並排，點選任一個可以讀它的釘法與代價。
+  </p>
+
+  <figure class="vg-w-stack-notion-subsystems">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M9 18l6-6-6-6"/>
+      </svg>
+      <span>點選任一子系統讀它的釘法與代價 · 4 個子系統</span>
+    </p>
+    <style>
+      .vg-w-stack-notion-subsystems { display: flex; flex-direction: column; gap: var(--s-3); align-items: stretch; margin: var(--s-4) 0; }
+      .vg-w-stack-notion-subsystems input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-stack-notion-subsystems .stack-title { font-family: IM Fell English, serif; font-style: italic; font-size: var(--fs-md); margin: 0 0 var(--s-1) 0; color: var(--ink); line-height: 1.4; }
+      .vg-w-stack-notion-subsystems .stack-cards { display: flex; flex-direction: column; gap: var(--s-1); list-style: none; padding: 0; margin: 0; }
+      .vg-w-stack-notion-subsystems .stack-cards label { display: block; padding: var(--s-2); border: 1px solid var(--muted-2); border-radius: 2px; cursor: pointer; transition: border-color 200ms, background 200ms; min-height: 44px; }
+      .vg-w-stack-notion-subsystems .stack-cards label:hover { border-color: var(--accent); }
+      .vg-w-stack-notion-subsystems .stack-cards .card-head { font-family: EB Garamond, serif; font-size: var(--fs-md); margin: 0 0 4px 0; color: var(--ink); display: flex; align-items: baseline; justify-content: space-between; gap: var(--s-2); flex-wrap: wrap; }
+      .vg-w-stack-notion-subsystems .stack-cards .card-sub { font-family: IM Fell English, serif; font-style: italic; font-size: var(--fs-sm); color: var(--muted); margin: 0; line-height: 1.5; }
+      .vg-w-stack-notion-subsystems .stack-cards .card-tag { font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); color: var(--accent-text); font-style: normal; }
+      .vg-w-stack-notion-subsystems:has(#vg-w-stack-notion-subsystems-r1:checked) .card-1,
+      .vg-w-stack-notion-subsystems:has(#vg-w-stack-notion-subsystems-r2:checked) .card-2,
+      .vg-w-stack-notion-subsystems:has(#vg-w-stack-notion-subsystems-r3:checked) .card-3,
+      .vg-w-stack-notion-subsystems:has(#vg-w-stack-notion-subsystems-r4:checked) .card-4 {
+        border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent);
+      }
+
+      .vg-w-stack-notion-subsystems svg.diagram { display: none; }
+      @media (min-width: 720px) {
+        .vg-w-stack-notion-subsystems svg.diagram { display: block; width: 100%; height: auto; max-width: 880px; }
+        .vg-w-stack-notion-subsystems .stack-title { display: none; }
+        .vg-w-stack-notion-subsystems .stack-cards { display: none; }
+      }
+      .vg-w-stack-notion-subsystems .layer { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; }
+      .vg-w-stack-notion-subsystems .layer-text, .vg-w-stack-notion-subsystems .layer-sub, .vg-w-stack-notion-subsystems .head { pointer-events: none; }
+      .vg-w-stack-notion-subsystems:has(#vg-w-stack-notion-subsystems-r1:checked) .layer-1,
+      .vg-w-stack-notion-subsystems:has(#vg-w-stack-notion-subsystems-r2:checked) .layer-2,
+      .vg-w-stack-notion-subsystems:has(#vg-w-stack-notion-subsystems-r3:checked) .layer-3,
+      .vg-w-stack-notion-subsystems:has(#vg-w-stack-notion-subsystems-r4:checked) .layer-4 {
+        fill: var(--accent); fill-opacity: 0.18; stroke: var(--accent);
+      }
+
+      .vg-w-stack-notion-subsystems .detail { padding: var(--s-2) var(--s-3); border-left: 2px solid var(--accent); display: none; }
+      .vg-w-stack-notion-subsystems .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-stack-notion-subsystems .detail p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); line-height: 1.7; }
+      .vg-w-stack-notion-subsystems:has(#vg-w-stack-notion-subsystems-r1:checked) .detail-1,
+      .vg-w-stack-notion-subsystems:has(#vg-w-stack-notion-subsystems-r2:checked) .detail-2,
+      .vg-w-stack-notion-subsystems:has(#vg-w-stack-notion-subsystems-r3:checked) .detail-3,
+      .vg-w-stack-notion-subsystems:has(#vg-w-stack-notion-subsystems-r4:checked) .detail-4 {
+        display: block;
+      }
+    </style>
+
+    <input type="radio" id="vg-w-stack-notion-subsystems-r1" name="vg-w-stack-notion-subsystems-sel" checked aria-label="Regional data lake" />
+    <input type="radio" id="vg-w-stack-notion-subsystems-r2" name="vg-w-stack-notion-subsystems-sel" aria-label="Regional AI" />
+    <input type="radio" id="vg-w-stack-notion-subsystems-r3" name="vg-w-stack-notion-subsystems-sel" aria-label="Event logging" />
+    <input type="radio" id="vg-w-stack-notion-subsystems-r4" name="vg-w-stack-notion-subsystems-sel" aria-label="Analytics" />
+
+    <p class="stack-title" id="vg-w-stack-notion-subsystems-title">四個被釘進地區的子系統</p>
+    <ul class="stack-cards" aria-labelledby="vg-w-stack-notion-subsystems-title">
+      <li class="card-1"><label for="vg-w-stack-notion-subsystems-r1">
+        <p class="card-head"><span>① Regional data lake</span><code class="card-tag">Debezium·Kafka·Spark·ES</code></p>
+        <p class="card-sub">複製整條 CDC 管線到每地區，search index 只吃本地資料</p>
+      </label></li>
+      <li class="card-2"><label for="vg-w-stack-notion-subsystems-r2">
+        <p class="card-head"><span>② Regional AI</span><code class="card-tag">vector DB·mapping</code></p>
+        <p class="card-sub">region 成為 onboarding 第一級輸入，embedding 在地區內生成</p>
+      </label></li>
+      <li class="card-3"><label for="vg-w-stack-notion-subsystems-r3">
+        <p class="card-head"><span>③ Event logging</span><code class="card-tag">Cloudflare·Snowpipe</code></p>
+        <p class="card-sub">依 workspace-ID header 在 edge 路由，灌進地區 Snowflake</p>
+      </label></li>
+      <li class="card-4"><label for="vg-w-stack-notion-subsystems-r4">
+        <p class="card-head"><span>④ Analytics</span><code class="card-tag">sanitize·Snowflake</code></p>
+        <p class="card-sub">反向操作——先洗淨客戶資料，再集中到共用倉庫</p>
+      </label></li>
+    </ul>
+
+    <svg class="diagram" viewBox="0 0 880 360" role="img" aria-label="四個被釘進地區的子系統及其釘法">
+      <text x="40" y="30" class="head" font-family="EB Garamond, serif" font-size="16" fill="var(--ink)">四個被釘進地區的子系統</text>
+
+      <rect class="layer layer-1" data-target="vg-w-stack-notion-subsystems-r1" role="button" tabindex="0" aria-label="Regional data lake" x="40" y="52" width="800" height="64" rx="3"/>
+      <text class="layer-text" x="60" y="80" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">① Regional data lake</text>
+      <text class="layer-sub" x="60" y="102" font-family="IM Fell English, serif" font-style="italic" font-size="13" fill="var(--muted)">Debezium CDC → 地區 Kafka → 地區 Spark → 地區 lake → 地區 Elasticsearch（只吃本地資料）</text>
+
+      <rect class="layer layer-2" data-target="vg-w-stack-notion-subsystems-r2" role="button" tabindex="0" aria-label="Regional AI" x="40" y="128" width="800" height="64" rx="3"/>
+      <text class="layer-text" x="60" y="156" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">② Regional AI</text>
+      <text class="layer-sub" x="60" y="178" font-family="IM Fell English, serif" font-style="italic" font-size="13" fill="var(--muted)">central mapping table 記 active region；地區 vector DB 承接 embedding；region 是 onboarding 的第一級輸入</text>
+
+      <rect class="layer layer-3" data-target="vg-w-stack-notion-subsystems-r3" role="button" tabindex="0" aria-label="Event logging" x="40" y="204" width="800" height="64" rx="3"/>
+      <text class="layer-text" x="60" y="232" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">③ Event logging</text>
+      <text class="layer-sub" x="60" y="254" font-family="IM Fell English, serif" font-style="italic" font-size="13" fill="var(--muted)">client 事件帶 workspace-ID header，Cloudflare worker 在 edge 路由；Snowpipe 灌進地區 Snowflake</text>
+
+      <rect class="layer layer-4" data-target="vg-w-stack-notion-subsystems-r4" role="button" tabindex="0" aria-label="Analytics" x="40" y="280" width="800" height="64" rx="3"/>
+      <text class="layer-text" x="60" y="308" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">④ Analytics（反向）</text>
+      <text class="layer-sub" x="60" y="330" font-family="IM Fell English, serif" font-style="italic" font-size="13" fill="var(--muted)">EU／US sanitization pipeline 洗淨客戶資料 → 共用 Snowflake，內部團隊維持單一查詢介面</text>
+    </svg>
+
+    <div>
+      <div class="detail detail-1">
+        <h3>① Regional data lake · 釘法</h3>
+        <p>Debezium 在 Kubernetes 內對 Postgres 做 Change Data Capture，把變更串進地區的 Kafka；地區的 Spark job 轉換後寫進該地區的 data lake；下游系統只讀自己地區的 lake；Elasticsearch cluster 只用本地區資料建 search index。</p>
+        <p><strong>代價</strong>：同一套 pipeline 邏輯要在每個地區各跑一份——modularity 不能靠 code duplication 撐，否則維護成本隨地區數線性爆炸。</p>
+      </div>
+      <div class="detail detail-2">
+        <h3>② Regional AI · 釘法</h3>
+        <p>一張 central mapping table 標記每個 workspace 的 active region；onboarding 時在該地區的 vector database 內把既有內容嵌入；更新走地區 Kafka → Spark → vector DB。Notion 的說法是「讓 region 成為 AI onboarding 與 update workflow 的 first-class input」，embedding 全程不跨地區搬動。</p>
+        <p><strong>代價</strong>：workspace onboarding 必須先跟 mapping table 協調，多了一個一致性的協調點。</p>
+      </div>
+      <div class="detail detail-3">
+        <h3>③ Event logging · 釘法</h3>
+        <p>client 的 API 呼叫在 header 帶 workspace ID，Cloudflare worker 據此把流量路由到對應地區；server 事件寫進本來就在地區內的 Kafka；事件先做 sanitization 移除意外混入的客戶資料；Snowpipe connector 把事件灌進地區專屬的 Snowflake table；一個下游 view 把各地區的事件資料合併供查詢。</p>
+        <p><strong>代價</strong>：路由判斷被推到 edge，header 一旦缺失或錯誤，事件就可能落錯地區——workspace-ID 的正確性變成關鍵不變量。</p>
+      </div>
+      <div class="detail detail-4">
+        <h3>④ Analytics · 反向釘法</h3>
+        <p>其他三者是「把資料留在地區」，analytics 是反向操作——資料本來就分散在各地區，問題是內部團隊需要一個統一的倉庫來查。解法是 EU 與 US 各有一條 sanitization pipeline，先把客戶資料從事件與指標裡洗掉，洗淨後的資料才進中央共用 Snowflake，於是內部團隊不必改寫任何 analytics、維持單一查詢介面。</p>
+        <p><strong>代價</strong>：sanitization 的正確性是合規邊界——洗不乾淨，客戶資料就跟著進了中央倉庫，前功盡棄。</p>
+      </div>
+    </div>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-stack-notion-subsystems');
+        root.querySelectorAll('.layer').forEach((rect) => {
+          rect.addEventListener('click', () => {
+            const radio = root.querySelector('#' + rect.getAttribute('data-target'));
+            if (radio) radio.checked = true;
+          });
+          rect.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              rect.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            }
+          });
+        });
+      })();
+    </script>
+  </figure>
+
+  <p>
+    四者裡最反直覺的是 event logging 與 analytics 的對比。event logging 把「決定資料去哪」這件事推到了離使用者最近的地方——Cloudflare worker 在 edge 讀 header 就路由，事件還沒進 Notion 的核心服務就已經知道該往哪個地區走。這把路由延遲壓到最低，代價是 workspace-ID header 的正確性成了關鍵不變量：header 缺了或錯了，事件就落錯地區，而這在合規語境裡不是效能問題，是違規問題。
+  </p>
+
+  <p>
+    analytics 則是整套設計裡唯一「允許資料集中」的地方，但它用一個前置條件換來這個許可：sanitization。客戶資料在離開地區之前，先被 EU／US 各自的 sanitization pipeline 洗掉，剩下的非客戶資料（聚合指標、去識別化的事件）才進共用 Snowflake。這個設計的精巧之處在於，它讓內部分析團隊完全無感——他們還是對著同一個 Snowflake 寫同樣的 query，不知道底層資料已經被地區化又重新洗淨集中。把合規的複雜度全部吸收在 pipeline 層，查詢介面保持不變，這正是 Notion 列出的三大難題之一。
+  </p>
+
+  <h2>難在哪：不重複、可查詢、開得快</h2>
+
+  <p>
+    這篇貼文把整場改造的困難收斂成三個問題，每一個都不是「把元件搬一搬」就能解決的，而是「在約束下還要維持某個既有的好性質」。下面這張表把三個難題、它們各自要保住的性質、以及對應的解法並排——點欄位標頭可以排序。
+  </p>
+
+  <figure class="vg-w-table-notion-hardparts">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/><path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+      </svg>
+      <span>點欄位標頭排序 · 3 個難題 × 4 欄</span>
+    </p>
+    <style>
+      .vg-w-table-notion-hardparts { margin: var(--s-4) 0; overflow-x: auto; }
+      .vg-w-table-notion-hardparts table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-notion-hardparts thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; }
+      .vg-w-table-notion-hardparts thead th[data-sort] { color: var(--accent-text); }
+      .vg-w-table-notion-hardparts tbody td { padding: var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; line-height: 1.6; }
+      .vg-w-table-notion-hardparts tbody td:first-child { font-family: var(--display); color: var(--accent-text); white-space: nowrap; }
+    </style>
+    <table>
+      <thead>
+        <tr>
+          <th data-key="problem">難題</th>
+          <th data-key="keep">要保住的性質</th>
+          <th data-key="how">解法</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>multi-region modularity</td>
+          <td>每地區一套 pipeline，但程式碼不能複製貼上</td>
+          <td>共用 helper 解析地區資源、central config 與 shared job 定義，把地區差異收進參數而非分支</td>
+        </tr>
+        <tr>
+          <td>analytics continuity</td>
+          <td>單一可查詢倉庫，但客戶資料不准移動</td>
+          <td>EU／US sanitization pipeline 先洗淨，洗後的非客戶資料才進共用 Snowflake，查詢介面不變</td>
+        </tr>
+        <tr>
+          <td>scaling new regions</td>
+          <td>開新地區的成本要可控、可重複</td>
+          <td>Terraform 管基礎設施一致性、central Airflow 的 DAG 迴圈遍歷各地區，目標「幾天而非幾個月」</td>
+        </tr>
+      </tbody>
+    </table>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-table-notion-hardparts');
+        const headers = root.querySelectorAll('thead th');
+        const tbody = root.querySelector('tbody');
+        let activeKey = null, asc = true;
+        headers.forEach(h => h.addEventListener('click', () => {
+          const key = h.dataset.key;
+          if (activeKey === key) asc = !asc; else { activeKey = key; asc = true; }
+          headers.forEach(x => x.removeAttribute('data-sort'));
+          h.setAttribute('data-sort', asc ? 'asc' : 'desc');
+          const rows = [...tbody.querySelectorAll('tr')];
+          const idx = [...headers].indexOf(h);
+          rows.sort((a, b) => {
+            const av = a.children[idx].textContent.trim();
+            const bv = b.children[idx].textContent.trim();
+            return asc ? av.localeCompare(bv) : bv.localeCompare(av);
+          });
+          rows.forEach(r => tbody.appendChild(r));
+        }));
+      })();
+    </script>
+  </figure>
+
+  <p>
+    第一個難題——multi-region modularity——是最容易做錯也最隱蔽的。最簡單的做法是把整條 EU pipeline 複製一份改成 US，再複製一份改成 JP，但那意味著每次邏輯變更要在 N 個地區各改一遍，地區越多越脆。Notion 的處理是把「地區」變成參數而不是分支：用共用的 code helper 去解析「這個地區的 Kafka 在哪、這個地區的 lake 在哪」，把資源定址這件事抽象掉，於是同一份 job 定義可以套到任何地區。這也是為什麼「開新地區從幾個月縮到幾天」這個目標有機會成立——當地區差異全在 config 裡，開新地區就接近於填一張表，而不是重寫一條 pipeline。
+  </p>
+
+  <p>
+    第二個難題前面已經拆過：用 sanitization 換來 analytics 的查詢連續性。第三個難題其實是前兩個的紅利——當 pipeline 模組化、當客戶資料的流向被 mapping table 與 Terraform 描述清楚，「開新地區」就退化成一套可重複的 provisioning 流程。central Airflow 的 DAG 設計成「迴圈遍歷各地區、每個地區跑帶地區參數的 task」，新增一個地區就是往迴圈裡多塞一個元素。這就是為什麼日本、南韓的擴張，在這篇貼文裡被講得像排程而非攻堅。
+  </p>
+
+  <p>
+    這套架構裡還有一個容易誤讀的點，值得在收尾前釐清：既然客戶資料不能離開地區，為什麼 Apache Airflow 還留在美國的 datacenter？答案是 Notion 把「orchestration」和「data processing」這兩件事徹底分開了。Airflow 在這裡只當一個純粹的 orchestrator——它送請求給各地區的 cluster，告訴它們「該跑哪個 job、用哪些參數」，但 job 的實際執行、客戶資料的實際處理，全發生在地區的 EMR cluster 上跑的 Spark 裡。Airflow 經手的只有 metadata 與排程指令，從不經手客戶資料本身。
+  </p>
+
+  <p>
+    這個分離是整套設計能成立的關鍵抽象。如果 orchestration 也要地區化，那麼每個地區都得維護一套 Airflow，地區間的排程協調會變成噩夢；但如果 Airflow 碰客戶資料，它待在美國就違反了 residency。把這兩個性質拆開——orchestration 中央化、data processing 地區化——讓 Notion 同時拿到「單一控制平面」與「資料不離開地區」兩個看似矛盾的好處。control plane 與 data plane 的分離在分散式系統裡是老概念，這裡是它在合規場景下的一次乾淨應用。
+  </p>
+
+  <p>
+    要讓這個分離站得住，得在 Airflow 的 DAG 設計上劃一條很清楚的線：DAG 只能描述「在哪個地區、用什麼參數、跑哪個 job」，絕不能在 DAG 任務本體裡讀取或轉手任何一筆客戶資料。實務上這意味著任何「把資料拉回中央做一下再送回去」的捷徑都被禁止——哪怕它在效能上更划算。每個地區的 EMR cluster 自己把 Spark job 跑完、把結果寫回自己地區的儲存，central Airflow 收到的只有「成功／失敗」與一些 metadata。這條紀律一旦鬆動，residency 的保證就會從架構性的變成「靠人記得別寫錯」，而合規最怕的就是後者。把保證內建進拓撲、而不是寄望於每個 job 作者的自律，是這套設計值得抄的地方。
+  </p>
+
+  <p>
+    底層由 Terraform 維持各地區基礎設施的一致性，Kubernetes 承載 Debezium 等 CDC 元件。值得注意的是這些都不是新技術——CDC、Kafka、Spark、EMR、Snowpipe、Terraform 全是業界標準件。這場改造的難度不在「發明新東西」，而在「把一套假設單一地區的既有系統，在不停機、不重寫上層應用的前提下，逐塊改成多地區隔離」。前面 timeline 裡那條「一個子系統一個子系統地轉」的軸線，本身就是這場改造最重要的工程決策：沒有 big-bang，只有有序的、每一步都保住既有性質的遷移。
+  </p>
+
+  <h2>從歐洲一個地區，到把地理變成排程</h2>
+
+  <p>
+    把這條軸串起來看，會發現 Notion 真正交付的不是「EU data residency」這個功能，而是「把地理位置變成系統裡一個可參數化的維度」這個能力。2025 年的 EU residency 是這個能力的第一個落地點——它逼著團隊把 region 變成一等概念、建起 mapping table、把第一條 pipeline 地區化。一旦這個維度存在，後面的每一步——data lake、AI embedding、event logging——都是在同一個維度上多複製一份、把 workspace-ID 接到正確的地區資源上。
+  </p>
+
+  <p>
+    對於要做 data residency 的團隊，這篇貼文給的最實用判斷是：不要把它當成「在邊界上加一道牆」，而要當成「在系統裡加一個維度」。加牆的思路會讓你在每條既有管線外面包一層地區檢查，越包越脆；加維度的思路會讓你回頭把 workspace-ID 升格成路由鍵、把地區差異收進 config、把 orchestration 與 data processing 拆開——這些改動更傷筋動骨，但換來的是「開新地區是填表、不是重寫」。Notion 把目標從「幾個月」訂到「幾天」，賭的就是這個維度化抽象的複利。
+  </p>
+
+  <p>
+    這篇貼文沒有給任何硬數字——沒有延遲、成本、資料量，連 EU residency 的精確上線日期都只標到 2025。所以它不能當成「這套架構值不值得」的量化依據，只能當成「一套多地區資料系統可以長成什麼形狀」的結構參考。對正面臨日本、南韓、或任何新法規地區落地需求的後端團隊，值得抄走的不是元件清單，而是那條「先把地區變成一等維度、再逐子系統複製、最後把開新地區壓成可重複流程」的順序。
+  </p>
+
+  <p class="vg-deep-closer"><strong>該記住的那一點</strong>：data residency 的工程本質不是「築一道邊界牆」，而是「在系統裡加一個叫地區的維度」——把 workspace-ID 升格成路由鍵、把地區差異收進 config、把 orchestration 從 data processing 裡拆出來，開新地區才可能從幾個月縮成幾天。
+  </p>
+</div>

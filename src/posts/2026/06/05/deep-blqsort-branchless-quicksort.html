@@ -1,0 +1,774 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">傳統 partition 的那句 <code>if (x &lt; pivot)</code> 在隨機資料上有一半機率猜錯——每次猜錯，CPU 要倒掉十幾級的 pipeline。blqsort 的選擇很反直覺：它乾脆把資料無條件搬兩次，用比較結果的 0/1 去推進指標，連那個 if 都不寫。多搬一倍的 byte，換回被 branch misprediction 吃掉的時間。</p>
+  <h1 class="vg-post-title">用多搬一倍資料換回排序速度——拆 blqsort 的 branchless partition 與 fallback</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p><span class="vg-dropcap">b</span>lqsort 是一份 single-header 的 branchless quicksort，它的整個設計圍繞一個微架構事實打轉：在現代 out-of-order CPU 上，一個被預測錯的條件分支會清空 pipeline、丟掉十幾到二十級的 in-flight 指令，代價遠大於多執行幾條算術指令。quicksort 的 partition 內迴圈裡那個「這個元素比 pivot 小嗎」的判斷，對隨機輸入而言幾乎是擲硬幣——branch predictor 在 50% 命中率的資料上等於沒用。blqsort 把這個 if 整個拆掉，改用「無條件寫入、再用比較結果推進指標」的寫法，對 trivially-copyable 的型別（<code>double</code>、<code>int</code>、POD struct）跑得比 <code>std::sort</code> 與 pdqsort 快不少。代價是它把每個元素都搬了不只一次，但只要省下的 misprediction 成本大於多搬的 copy 成本，這筆帳就划算。本文拆它的五個零件：branchless partition 的核心 trick、1024-element block 的雙向處理、處理 2–12 元素的 sorting network、median-of-medians 的 pivot 選法、以及在壞輸入與非平凡型別上的兩條 fallback。</p>
+
+  <h2>branchless partition：把 if 換成 smlen += (x &lt; pivot)</h2>
+
+  <p>先看最小的那個 trick，因為整份 library 都建立在它上面。一個 textbook 的 partition 內迴圈長這樣：對每個元素判斷它在不在 pivot 的某一側，是的話寫進輸出緩衝、並把長度加一。寫成程式碼就是一個 if：</p>
+
+  <pre data-kind="pseudocode"><code><em>// branchy：每次迭代都要猜一次分支</em>
+if (numbers[i] &lt; 500) {
+    small_numbers[smlen] = numbers[i];
+    smlen += 1;
+}</code></pre>
+
+  <p>這段碼在邏輯上無懈可擊，問題全在 <code>if</code> 這個字。當 <code>numbers[i] &lt; 500</code> 對輸入而言是接近隨機的——例如你在 partition 一段已經被 shuffle 過的資料、pivot 又落在中位數附近——branch predictor 的命中率就會掉到 50% 上下。每一次預測錯，CPU 必須把已經 speculatively 執行進 pipeline 的後續指令全部作廢、從正確的分支重新抓指令。在一條十幾級深的 pipeline 上，這是十幾個 cycle 的純粹浪費，而且 partition 的內迴圈會跑 n 次。blqsort 的改寫只有兩行，關鍵在第二行：</p>
+
+  <pre data-kind="pseudocode"><code><em>// branchless：無條件寫入，用 0/1 推進指標</em>
+small_numbers[smlen] = numbers[i];
+smlen += (numbers[i] &lt; 500);</code></pre>
+
+  <p>差別在哪？第一行<strong>無條件</strong>地把 <code>numbers[i]</code> 寫進 <code>small_numbers[smlen]</code>。如果這個元素其實不該進這個桶，沒關係——下一次迭代 <code>smlen</code> 不會前進，這個位置就會被下一個元素覆寫掉。第二行把布林比較的結果（C/C++ 裡 <code>true</code> 是 1、<code>false</code> 是 0）直接加到 <code>smlen</code> 上。元素該收就 <code>smlen += 1</code>、不該收就 <code>smlen += 0</code> 原地踏步等著被覆寫。整段沒有任何 <code>if</code>，沒有條件跳轉，CPU 不需要猜任何東西，pipeline 永遠不會因為這裡而清空。編譯器通常把 <code>numbers[i] &lt; 500</code> 編成一條 <code>setcc</code>（把比較結果寫成 0/1 的 byte），再用一條 <code>add</code> 加到指標上——兩條無分支的指令，吞吐量是固定的。</p>
+
+  <p>但天下沒有白吃的午餐，這個寫法的代價非常具體：它把每個元素都<strong>無條件搬了一次</strong>，即使該元素根本不屬於這個桶。在最壞情況下，你執行了大約兩倍於「必要 copy」的記憶體寫入——branchy 版只在條件成立時才寫，branchless 版每次都寫。這就是標題說的「多搬一倍資料」。為什麼這還能贏？因為對 <code>double</code> 這種 8 byte、trivially-copyable 的型別，一次 copy 只是一條 store 指令，幾乎免費、而且可以被 CPU 的 store buffer 吸收、跟其他指令重疊執行；而一次 branch misprediction 是十幾個 cycle 的硬停頓，無法被隱藏。把「可隱藏的便宜操作」做兩倍，換掉「不可隱藏的昂貴停頓」，淨值為正。這個 trade 的成立條件很明確——元素要夠便宜搬（trivially-copyable）、分支要夠難預測（隨機輸入）。兩個條件只要有一個不成立，branchless 的優勢就會縮水甚至翻負，這也正是為什麼 blqsort 要準備後面那兩條 fallback。</p>
+
+  <p>下面這個互動小工具把兩種 partition 並排跑給你看。上半是 branchless 版本：元素一個一個流過 pivot 線，write head（<code>smlen</code> 指標）每次只前進 0 或 1 格，無論元素該不該收，那一格永遠先被寫上。下半是 branchy 版本：同樣的資料流，但每個元素都要先過一次「分支預測」——predictor 猜對就順順走，猜錯就觸發一次紅色的 pipeline flush、那一拍整條 pipeline 停住。把資料的「可預測度」滑桿往隨機端拉，看 branchy 版的紅色 flush 怎麼密集起來、而 branchless 版完全不受影響。</p>
+
+  <figure class="vg-w-canvas-blq-partition">
+    <style>
+      .vg-w-canvas-blq-partition { display: grid; grid-template-rows: auto auto 1fr auto; gap: var(--s-2); }
+      .vg-w-canvas-blq-partition .vg-w-affordance { display: flex; align-items: center; gap: var(--s-1); font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin: 0; }
+      .vg-w-canvas-blq-partition .vg-w-affordance svg { width: 14px !important; height: 14px !important; min-width: 14px !important; }
+      .vg-w-canvas-blq-partition .toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+      .vg-w-canvas-blq-partition button { font-family: var(--sans); font-size: var(--fs-sm); padding: 6px 14px; min-height: 44px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); cursor: pointer; }
+      .vg-w-canvas-blq-partition button:hover { border-color: var(--accent); color: var(--accent-text); }
+      .vg-w-canvas-blq-partition .slider { display: flex; align-items: center; gap: var(--s-2); flex: 1; min-width: 220px; }
+      .vg-w-canvas-blq-partition .slider input { flex: 1; accent-color: var(--accent); height: 36px; }
+      .vg-w-canvas-blq-partition .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 5ch; text-align: right; }
+      .vg-w-canvas-blq-partition canvas { width: 100%; height: auto; aspect-ratio: 16 / 9; display: block; }
+      .vg-w-canvas-blq-partition figcaption { font-family: var(--scribed); font-style: italic; font-size: var(--fs-sm); color: var(--muted); }
+      @media (max-width: 720px) {
+        .vg-w-canvas-blq-partition canvas { aspect-ratio: 3 / 4; }
+      }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M5 12h14"/><path d="m12 5 7 7-7 7"/>
+      </svg>
+      <span>play to stream elements · drag the predictability slider · 2 partition variants</span>
+    </p>
+
+    <div class="toolbar">
+      <button id="vg-w-canvas-blq-partition-toggle">▷ play</button>
+      <button id="vg-w-canvas-blq-partition-reset">↺ reset</button>
+      <span class="slider">
+        <label for="vg-w-canvas-blq-partition-pred">predictability</label>
+        <input id="vg-w-canvas-blq-partition-pred" type="range" min="0" max="100" step="1" value="50" />
+        <span class="readout" id="vg-w-canvas-blq-partition-predout">50%</span>
+      </span>
+    </div>
+
+    <canvas id="vg-w-canvas-blq-partition-canvas"></canvas>
+
+    <figcaption>同一段資料流過兩種 partition。上：branchless——write head 每拍前進 0 或 1，永遠不停。下：branchy——predictor 猜錯時整條 pipeline flush（紅閃），那一拍停住。把 predictability 拉低，branchy 的紅閃變密；branchless 不受影響。計數器顯示累積的 mispredict 次數與虛擬 cycle 成本。</figcaption>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-canvas-blq-partition');
+        const canvas = root.querySelector('#vg-w-canvas-blq-partition-canvas');
+        const toggle = root.querySelector('#vg-w-canvas-blq-partition-toggle');
+        const reset = root.querySelector('#vg-w-canvas-blq-partition-reset');
+        const pred = root.querySelector('#vg-w-canvas-blq-partition-pred');
+        const predout = root.querySelector('#vg-w-canvas-blq-partition-predout');
+        const ctx = canvas.getContext('2d');
+
+        function cssVar(name) {
+          return getComputedStyle(root).getPropertyValue(name).trim() || 'currentColor';
+        }
+
+        function resize() {
+          const dpr = window.devicePixelRatio || 1;
+          const rect = canvas.getBoundingClientRect();
+          canvas.width = Math.max(1, rect.width * dpr);
+          canvas.height = Math.max(1, rect.height * dpr);
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        }
+        new ResizeObserver(resize).observe(canvas);
+        resize();
+
+        const PIVOT = 0.5;        // threshold; element value in [0,1)
+        let running = false;
+        let predictability = 0.5; // 0 = pure random, 1 = perfectly predictable
+        // model state
+        let stream = [];          // values waiting / streaming
+        let idx = 0;              // index of element currently at the pivot line
+        let smlen = 0;            // branchless write head
+        let bSmlen = 0;           // branchy write head (logically identical result)
+        let mispredicts = 0;
+        let cycles = 0;           // virtual cost: branchy
+        let flashTimer = 0;       // frames remaining of red flash
+        let lastPredictedSide = 1;
+        let stepAccum = 0;
+
+        function genValue(i) {
+          // predictability blends a sorted ramp (easy) with random (hard)
+          const ramp = (i % 2 === 0) ? 0.25 : 0.75; // alternating but learnable pattern
+          const rnd = Math.random();
+          return predictability * ramp + (1 - predictability) * rnd;
+        }
+
+        function makeStream() {
+          stream = [];
+          for (let i = 0; i < 64; i++) stream.push(genValue(i));
+        }
+        makeStream();
+
+        function doStep() {
+          if (idx >= stream.length) { running = false; toggle.textContent = '▷ play'; return; }
+          const v = stream[idx];
+          const goesSmall = v < PIVOT;
+          // branchless: always write, advance by 0/1, no prediction
+          smlen += goesSmall ? 1 : 0;
+          // branchy: predictor guesses, flush on miss
+          const predicted = lastPredictedSide === 1; // predicted "small"
+          const correct = (predicted === goesSmall);
+          if (!correct) {
+            mispredicts++;
+            cycles += 16;       // pipeline flush penalty
+            flashTimer = 10;
+          } else {
+            cycles += 1;
+          }
+          lastPredictedSide = goesSmall ? 1 : 0; // 1-bit local predictor: predict last outcome
+          bSmlen += goesSmall ? 1 : 0;
+          idx++;
+        }
+
+        function draw() {
+          const W = canvas.getBoundingClientRect().width;
+          const H = canvas.getBoundingClientRect().height;
+          ctx.clearRect(0, 0, W, H);
+          const ink = cssVar('--ink');
+          const muted = cssVar('--muted');
+          const accent = cssVar('--accent');
+          const sage = cssVar('--sage-deep');
+          const line = cssVar('--line');
+
+          const midY = H / 2;
+          const laneH = H * 0.30;
+          const pivotX = W * 0.5;
+          const trackTop = H * 0.10;
+          const trackBot = H * 0.62;
+
+          // pivot line
+          ctx.strokeStyle = accent;
+          ctx.lineWidth = 1.5;
+          ctx.setLineDash([4, 4]);
+          ctx.beginPath();
+          ctx.moveTo(pivotX, trackTop - 8);
+          ctx.lineTo(pivotX, trackBot + 8);
+          ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.font = '13px "EB Garamond", serif';
+          ctx.fillStyle = accent;
+          ctx.fillText('pivot', pivotX + 6, trackTop - 12);
+
+          // lane labels
+          ctx.font = '12px Manrope, sans-serif';
+          ctx.fillStyle = muted;
+          ctx.fillText('BRANCHLESS', 6, trackTop - 4);
+          ctx.fillText('BRANCHY', 6, midY + laneH * 0.5 + 18);
+
+          // draw incoming elements as boxes flowing toward pivot
+          const boxW = Math.max(10, W / 42);
+          const visible = 14;
+          for (let k = 0; k < visible; k++) {
+            const j = idx + k;
+            if (j >= stream.length) break;
+            const v = stream[j];
+            const x = pivotX + k * (boxW + 3) - boxW / 2;
+            const small = v < PIVOT;
+            // top lane (branchless)
+            ctx.globalAlpha = 0.55;
+            ctx.fillStyle = small ? sage : accent;
+            ctx.fillRect(x, trackTop, boxW, laneH * 0.45);
+            // bottom lane (branchy)
+            ctx.fillStyle = small ? sage : accent;
+            ctx.fillRect(x, midY + 6, boxW, laneH * 0.45);
+            ctx.globalAlpha = 1;
+          }
+
+          // write heads
+          ctx.font = '12px "JetBrains Mono", monospace';
+          ctx.fillStyle = sage;
+          // branchless write head marker (left of pivot, advances smoothly)
+          const headX = W * 0.06 + (smlen % 20) * (boxW * 0.5);
+          ctx.fillStyle = ink;
+          ctx.fillText('smlen = ' + smlen, W * 0.04, trackTop + laneH * 0.45 + 22);
+          ctx.fillStyle = ink;
+          ctx.fillText('smlen = ' + bSmlen, W * 0.04, midY + 6 + laneH * 0.45 + 22);
+
+          // pipeline-flush flash on branchy lane
+          if (flashTimer > 0) {
+            ctx.globalAlpha = 0.18 + 0.22 * (flashTimer / 10);
+            ctx.fillStyle = accent;
+            ctx.fillRect(0, midY, W, laneH + 30);
+            ctx.globalAlpha = 1;
+            ctx.font = '13px Manrope, sans-serif';
+            ctx.fillStyle = accent;
+            ctx.fillText('⟲ pipeline flush', pivotX - 50, midY + laneH * 0.5 + 2);
+            flashTimer--;
+          }
+
+          // counters
+          ctx.font = '12px "JetBrains Mono", monospace';
+          ctx.fillStyle = muted;
+          ctx.textAlign = 'right';
+          ctx.fillText('elements: ' + idx + ' / ' + stream.length, W - 8, H - 26);
+          ctx.fillStyle = accent;
+          ctx.fillText('branchy mispredicts: ' + mispredicts + '  ·  ~' + cycles + ' cyc', W - 8, H - 10);
+          ctx.fillStyle = sage;
+          ctx.fillText('branchless: ' + idx + ' steps · ~' + idx + ' cyc', W - 8, H - 42);
+          ctx.textAlign = 'left';
+        }
+
+        let last = performance.now();
+        function frame(now) {
+          const dt = Math.min(0.05, (now - last) / 1000);
+          last = now;
+          if (running) {
+            stepAccum += dt;
+            const interval = 0.14;
+            while (stepAccum >= interval) { doStep(); stepAccum -= interval; }
+          }
+          draw();
+          requestAnimationFrame(frame);
+        }
+        requestAnimationFrame(frame);
+
+        toggle.addEventListener('click', () => {
+          if (idx >= stream.length) { resetState(); }
+          running = !running;
+          toggle.textContent = running ? '⏸ pause' : '▷ play';
+          last = performance.now();
+        });
+        function resetState() {
+          running = false;
+          toggle.textContent = '▷ play';
+          idx = 0; smlen = 0; bSmlen = 0; mispredicts = 0; cycles = 0; flashTimer = 0;
+          lastPredictedSide = 1; stepAccum = 0;
+          makeStream();
+        }
+        reset.addEventListener('click', resetState);
+        pred.addEventListener('input', () => {
+          predictability = Number(pred.value) / 100;
+          predout.textContent = pred.value + '%';
+          // regenerate the not-yet-consumed tail with new predictability
+          for (let i = idx; i < stream.length; i++) stream[i] = genValue(i);
+        });
+      })();
+    </script>
+  </figure>
+
+  <p>有一個容易混淆的點先講清楚：branchless 不等於「沒有比較」。比較還是要做——<code>numbers[i] &lt; 500</code> 那條 <code>cmp</code> 永遠存在。被消掉的是<strong>條件跳轉</strong>（conditional branch），也就是「根據比較結果決定接下來執行哪段碼」的那個 jump。比較本身在現代 CPU 上是一條便宜、可亂序執行的指令；真正貴的是它後面那個會讓 fetch unit 押錯邊的 branch。另一個常見的等價寫法是用 <code>cmov</code>（conditional move）：把「要不要更新某個值」編成一條無分支的條件搬移指令。<code>cmov</code> 跟 <code>setcc + add</code> 是同一個哲學的兩種手段——讓資料相依性取代控制相依性，把「猜測」這件事從 hot path 上拿掉。blqsort 的整個 partition 引擎就是把這個原則推到極致。</p>
+
+  <h2>1024-element block 與 sorting network：partition 引擎的兩個尺度</h2>
+
+  <p>單一個元素的 trick 講完，接下來是怎麼把它組織成一個完整的 partition。blqsort 的做法受 fluxsort 啟發，用固定大小的 block 來分段搬運。它不是一個一個元素掃，而是以 1024 個元素為單位處理：先從一側把 1024 個元素複製進一個輔助緩衝區（auxiliary buffer），騰出空間，接著「交替地把一個 1024-element block 往左、往右 branchlessly 搬」。為什麼要先複製出 1024 個？因為 in-place partition 的麻煩在於：你要往某個位置寫一個元素時，那個位置可能還住著一個你還沒處理的元素。先把一整個 block 搬進旁邊的緩衝區，原地就空出了 1024 個格子可以無條件寫入，branchless 的「永遠先寫、再決定要不要前進指標」才能安全運作而不覆蓋掉未讀資料。</p>
+
+  <p>這個輔助緩衝區的另一個關鍵設計決定是：它是<strong>stack 上的固定陣列</strong>，不是 heap 配置。1024 個元素的緩衝區大小在編譯期就定死，直接吃 stack frame，沒有任何 <code>malloc</code>／<code>new</code>。這省掉的不只是配置本身的時間——堆積配置會引入不可預測的延遲（可能觸發 page fault、可能要走 allocator 的 lock）、會打亂 cache locality、而且在多執行緒情境下 allocator 本身可能成為 contention 點。把緩衝區釘在 stack 上，partition 的每一層遞迴都用同一塊熱的、已經在 L1 裡的記憶體，搬運的 store 幾乎都打在 cache 裡。1024 這個數字也不是隨便挑的：它要夠大，讓 block 內的 branchless 搬運能攤平 setup 成本、也讓 prefetcher 有足夠連續的存取模式可以預取；又要夠小，能整個塞進 stack 緩衝而不溢出、且留在 L1/L2 cache 的容量之內。</p>
+
+  <p>「往左、往右交替搬」是 fluxsort 那套雙向掃描的精神。partition 的本質是把一段資料分成「小於 pivot」與「不小於 pivot」兩塊，雙向處理的意思是同時從緩衝區與目標區的兩端推進，小的往左堆、大的往右堆，兩個 write head 相向而行直到會合。每一個 block 的內部搬運都用前一節那個 <code>smlen += (x &lt; pivot)</code> 的 branchless 寫法，所以整個 partition——不論資料分佈如何——都不會在內迴圈產生任何 data-dependent 的分支。block 邊界的處理（什麼時候換下一個 block、左右會合時剩下的尾巴怎麼收）會有少量分支，但那是 O(n / 1024) 次、不是 O(n) 次，對整體 misprediction 預算可以忽略。</p>
+
+  <p>block 是「大尺度」的搬運單位，但 partition 遞迴到很小的子陣列時需要另一種收尾——這是 partition 引擎的另一個尺度。quicksort 在 partition 到很小的子陣列時會把遞迴停掉、改用別的方法收尾，因為對小陣列而言遞迴的 overhead 跟 pivot 選擇的成本反而主導了。傳統作法是切到 insertion sort，但 insertion sort 的內迴圈也充滿 data-dependent 分支——「這個元素要不要再往前挪一格」每一步都要判斷。blqsort 在 2 到 12 個元素的子集上改用 <strong>sorting network</strong>：一組對固定位置 pair 做「比較並在需要時交換」的操作序列，操作的順序與要比較哪些 index 完全由陣列大小決定，跟資料內容無關。</p>
+
+  <p>sorting network 的好處正是它的「資料無關」性質：一個 size-N 的 network 永遠執行同樣那幾個 compare-exchange，不管輸入是已排序、逆序還是隨機，執行的指令序列一模一樣。這意味著它天生 branchless——每個 compare-exchange 都可以用一個「branchless sort-2 primitive」實作：取兩個元素，無條件算出 <code>min</code> 與 <code>max</code>，把小的寫回前面、大的寫回後面。沒有「如果順序對了就跳過」的分支，就是兩條 <code>cmov</code> 或一組 min/max 指令。代價是當輸入剛好已經有序時，sorting network 仍然執行所有 compare-exchange、不像 insertion sort 那樣可以提早結束——但因為完全沒有 misprediction，固定成本的 sorting network 在小陣列上的實測吞吐反而穩定勝出。</p>
+
+  <p>實作上，2 到 12 每一個大小都有一段專屬的、人工或工具產生的最佳 network——不同大小的最佳 compare-exchange 序列不同，沒辦法用一個通用迴圈涵蓋，所以這部分是分大小展開的程式碼。這是用程式碼體積換速度的典型取捨：十幾段針對固定大小特化、展開的 network，每一段都是直線無分支的指令流，編譯器可以把它們排得很緊、暫存器配置也固定。對只有少數元素的子陣列，這種「全展開、零分支」的收尾比任何帶迴圈帶分支的通用排序都快。</p>
+
+  <figure class="vg-w-annotated-blq-buffer" data-svg-scroll="720">
+    <style>
+      .vg-w-annotated-blq-buffer { display: grid; grid-template-columns: 1fr; gap: var(--s-3); align-items: start; }
+      .vg-w-annotated-blq-buffer figcaption { grid-column: 1 / -1; font-family: var(--scribed); font-style: italic; font-size: var(--fs-sm); color: var(--muted); }
+      .vg-w-annotated-blq-buffer .vg-w-affordance { grid-column: 1 / -1; display: flex; align-items: center; gap: var(--s-1); font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin: 0; }
+      .vg-w-annotated-blq-buffer .vg-w-affordance svg { width: 14px !important; height: 14px !important; min-width: 14px !important; }
+      .vg-w-annotated-blq-buffer svg.vg-w-annotated-blq-buffer-main { width: 100%; height: auto; }
+      .vg-w-annotated-blq-buffer input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-annotated-blq-buffer .part { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; transition: fill 200ms, stroke 200ms; }
+      .vg-w-annotated-blq-buffer .part:hover { stroke: var(--accent); }
+      .vg-w-annotated-blq-buffer .part:focus { outline: none; }
+      .vg-w-annotated-blq-buffer .part:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+      .vg-w-annotated-blq-buffer .part-text { pointer-events: none; }
+      .vg-w-annotated-blq-buffer .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+      .vg-w-annotated-blq-buffer .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-annotated-blq-buffer .detail p { margin: 0; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-annotated-blq-buffer:has(#vg-w-annotated-blq-buffer-r1:checked) .part-1 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-annotated-blq-buffer:has(#vg-w-annotated-blq-buffer-r2:checked) .part-2 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-annotated-blq-buffer:has(#vg-w-annotated-blq-buffer-r3:checked) .part-3 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-annotated-blq-buffer:has(#vg-w-annotated-blq-buffer-r4:checked) .part-4 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-annotated-blq-buffer:has(#vg-w-annotated-blq-buffer-r1:checked) .detail-1 { display: block; }
+      .vg-w-annotated-blq-buffer:has(#vg-w-annotated-blq-buffer-r2:checked) .detail-2 { display: block; }
+      .vg-w-annotated-blq-buffer:has(#vg-w-annotated-blq-buffer-r3:checked) .detail-3 { display: block; }
+      .vg-w-annotated-blq-buffer:has(#vg-w-annotated-blq-buffer-r4:checked) .detail-4 { display: block; }
+      @media (max-width: 720px) {
+        .vg-w-annotated-blq-buffer { grid-template-columns: 1fr; }
+      }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>
+      </svg>
+      <span>click a part to read what it owns · 4 parts of the partition engine</span>
+    </p>
+
+    <input type="radio" id="vg-w-annotated-blq-buffer-r1" name="vg-w-annotated-blq-buffer-sel" aria-label="aux buffer" checked />
+    <input type="radio" id="vg-w-annotated-blq-buffer-r2" name="vg-w-annotated-blq-buffer-sel" aria-label="dual write heads" />
+    <input type="radio" id="vg-w-annotated-blq-buffer-r3" name="vg-w-annotated-blq-buffer-sel" aria-label="sort-2 network" />
+    <input type="radio" id="vg-w-annotated-blq-buffer-r4" name="vg-w-annotated-blq-buffer-sel" aria-label="heapsort fallback" />
+
+    <svg class="vg-w-annotated-blq-buffer-main" viewBox="0 0 720 360" preserveAspectRatio="xMidYMid meet" role="img"
+         aria-label="blqsort partition 引擎的四個零件：1024 元素 stack 輔助緩衝、雙向 write head、sort-2 network、heapsort 後援">
+      <defs>
+        <marker id="vg-w-annotated-blq-buffer-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+        </marker>
+      </defs>
+
+      <!-- Part 1: 1024-element stack aux buffer -->
+      <rect class="part part-1" data-target="vg-w-annotated-blq-buffer-r1" role="button" tabindex="0" aria-label="select aux buffer" x="24" y="40" width="300" height="92" rx="3" />
+      <text class="part-text" x="174" y="70" text-anchor="middle" font-family="Manrope, sans-serif" font-size="15" fill="var(--ink)">stack aux buffer</text>
+      <text class="part-text" x="174" y="92" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--muted)">1024 elements · no malloc</text>
+      <text class="part-text" x="174" y="116" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--muted)">copied off one side first</text>
+
+      <!-- Part 2: dual write heads / 1024-blocks left+right -->
+      <rect class="part part-2" data-target="vg-w-annotated-blq-buffer-r2" role="button" tabindex="0" aria-label="select dual write heads" x="396" y="40" width="300" height="92" rx="3" />
+      <text class="part-text" x="546" y="70" text-anchor="middle" font-family="Manrope, sans-serif" font-size="15" fill="var(--ink)">dual write heads</text>
+      <text class="part-text" x="546" y="92" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--muted)">1024-block · left / right</text>
+      <text class="part-text" x="546" y="116" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--muted)">fluxsort-inspired</text>
+      <!-- left/right arrows beneath part 2 -->
+      <line x1="546" y1="150" x2="430" y2="150" stroke="var(--sage-deep)" stroke-width="1.6" marker-end="url(#vg-w-annotated-blq-buffer-arrow)" />
+      <line x1="546" y1="150" x2="662" y2="150" stroke="var(--accent)" stroke-width="1.6" marker-end="url(#vg-w-annotated-blq-buffer-arrow)" />
+      <text x="436" y="170" text-anchor="start" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--sage-deep)">&lt; pivot</text>
+      <text x="656" y="170" text-anchor="end" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--accent-text)">&#8805; pivot</text>
+
+      <!-- buffer-to-heads flow -->
+      <line x1="324" y1="86" x2="396" y2="86" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-annotated-blq-buffer-arrow)" />
+
+      <!-- Part 3: sort-2 network (2-12) -->
+      <rect class="part part-3" data-target="vg-w-annotated-blq-buffer-r3" role="button" tabindex="0" aria-label="select sort-2 network" x="24" y="216" width="300" height="120" rx="3" />
+      <text class="part-text" x="174" y="244" text-anchor="middle" font-family="Manrope, sans-serif" font-size="15" fill="var(--ink)">sort-2 network</text>
+      <text class="part-text" x="174" y="266" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--muted)">2&#8211;12 elements · branchless</text>
+      <!-- tiny compare-exchange rungs -->
+      <line x1="64" y1="294" x2="284" y2="294" stroke="var(--muted-2)" stroke-width="1" />
+      <line x1="64" y1="316" x2="284" y2="316" stroke="var(--muted-2)" stroke-width="1" />
+      <line x1="110" y1="294" x2="110" y2="316" stroke="var(--accent)" stroke-width="1.6" />
+      <line x1="174" y1="294" x2="174" y2="316" stroke="var(--accent)" stroke-width="1.6" />
+      <line x1="238" y1="294" x2="238" y2="316" stroke="var(--accent)" stroke-width="1.6" />
+      <circle cx="110" cy="294" r="3" fill="var(--accent)" /><circle cx="110" cy="316" r="3" fill="var(--accent)" />
+      <circle cx="174" cy="294" r="3" fill="var(--accent)" /><circle cx="174" cy="316" r="3" fill="var(--accent)" />
+      <circle cx="238" cy="294" r="3" fill="var(--accent)" /><circle cx="238" cy="316" r="3" fill="var(--accent)" />
+
+      <!-- Part 4: heapsort fallback -->
+      <rect class="part part-4" data-target="vg-w-annotated-blq-buffer-r4" role="button" tabindex="0" aria-label="select heapsort fallback" x="396" y="216" width="300" height="120" rx="3" />
+      <text class="part-text" x="546" y="252" text-anchor="middle" font-family="Manrope, sans-serif" font-size="15" fill="var(--ink)">heapsort fallback</text>
+      <text class="part-text" x="546" y="276" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--muted)">on partition imbalance</text>
+      <text class="part-text" x="546" y="300" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--muted)">O(n log n) worst-case</text>
+      <!-- imbalance trigger from heads to heapsort -->
+      <line x1="546" y1="186" x2="546" y2="216" stroke="currentColor" stroke-width="1.5" stroke-dasharray="3,3" marker-end="url(#vg-w-annotated-blq-buffer-arrow)" />
+    </svg>
+
+    <div>
+      <div class="detail detail-1">
+        <h3>stack aux buffer · 職責</h3>
+        <p>先把一側 1024 個元素複製進這塊 stack 固定陣列，原地騰出空格讓 branchless 的「無條件先寫」安全運作。沒有 <code>malloc</code>，整塊熱在 L1。</p>
+      </div>
+      <div class="detail detail-2">
+        <h3>dual write heads · 職責</h3>
+        <p>交替把 1024-element block 往左、往右 branchlessly 搬。小於 pivot 推左指標、否則推右指標，兩 head 相向會合。block 邊界的分支是 O(n/1024)，可忽略。</p>
+      </div>
+      <div class="detail detail-3">
+        <h3>sort-2 network · 職責</h3>
+        <p>遞迴到 2&#8211;12 元素時的收尾。固定序列的 compare-exchange、每步用 branchless sort-2 算 min/max，指令流與資料無關，天生零 misprediction。</p>
+      </div>
+      <div class="detail detail-4">
+        <h3>heapsort fallback · 職責</h3>
+        <p>partition 進行中偵測到嚴重不平衡，就把那一段切給 heapsort，用 O(n log n) 守住最壞情況，堵掉 quicksort 的 O(n²) 退化坑。</p>
+      </div>
+    </div>
+
+    <figcaption>partition 引擎的四個零件與資料流向。緩衝先吃進一個 block，雙 head 往左右 branchless 搬運，小子陣列交給 sort-2 network、偵測到不平衡則切 heapsort。點任一塊讀它的職責。</figcaption>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-annotated-blq-buffer');
+        root.querySelectorAll('.part').forEach((rect) => {
+          rect.addEventListener('click', () => {
+            const targetId = rect.getAttribute('data-target');
+            const radio = root.querySelector('#' + targetId);
+            if (radio) radio.checked = true;
+          });
+          rect.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              rect.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            }
+          });
+        });
+      })();
+    </script>
+  </figure>
+
+  <h2>median-of-medians：大 partition 的 pivot 與壞輸入偵測</h2>
+
+  <p>branchless partition 把「掃過一遍資料」這件事做到了極致，但 quicksort 的整體複雜度仍取決於 pivot 選得好不好。pivot 選得爛——例如每次都挑到接近最小或最大的元素——partition 會極度不平衡，遞迴深度退化到 O(n)、總比較數退化到 O(n²)。blqsort 對較大的 partition 採用 <strong>median-of-medians</strong> 策略來挑 pivot：把資料分組、各組取中位數、再對這些中位數取中位數，得到一個保證落在「不會太偏」區間內的 pivot。這比單純取頭尾中三個值的 median-of-three 更穩健，能擋掉更多刻意構造的壞輸入。配合前面的 branchless 引擎，pivot 計算裡的比較也盡量用展開的、固定次數的迴圈來做，避免在 pivot 選擇這一小段又把分支引回來。</p>
+
+  <p>但再好的 pivot 啟發式都可能被對抗性輸入打穿，所以 blqsort 還有一層即時的壞輸入偵測。它在 partition 進行時觀察兩側的大小：如果偵測到嚴重的不平衡（partition 一面倒），它會<strong>切換到 heapsort</strong> 來處理那一段。heapsort 的最壞情況是 O(n log n)、沒有 quicksort 那種 O(n²) 的退化坑，代價是常數項較大、cache 行為較差——所以它只在偵測到 quicksort 要退化時才被當作保險拉出來用，這正是 introsort 家族的核心思想（pdqsort、libstdc++ 的 <code>std::sort</code> 也都有類似的 heapsort 後援）。除了不平衡偵測，blqsort 還會<strong>檢查 partition 是否已經有序</strong>：如果一段資料本來就排好了，提早辨認出來可以直接跳過、不做無謂的遞迴。對「幾乎有序」這種實務上極常見的輸入（append-only log、時間序列、已排序後小幅更動的資料），這個檢查能把整體成本壓得很低。它還能把相等的元素聚在一起，避免在大量重複 key 的資料上退化——這也是 pdqsort 著名的 strength。</p>
+
+  <figure class="vg-w-table-blq-fallbacks">
+    <style>
+      .vg-w-table-blq-fallbacks table { width: 100%; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-blq-fallbacks thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); }
+      .vg-w-table-blq-fallbacks tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+      .vg-w-table-blq-fallbacks tbody td:first-child { font-family: var(--sans); color: var(--accent-text); white-space: nowrap; }
+      .vg-w-table-blq-fallbacks figcaption { font-family: var(--scribed); font-style: italic; font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-1); }
+      @media (max-width: 720px) { .vg-w-table-blq-fallbacks { overflow-x: auto; } .vg-w-table-blq-fallbacks table { min-width: 480px; } }
+    </style>
+    <table>
+      <thead>
+        <tr><th>偵測到</th><th>觸發</th><th>守住的退化</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>already-sorted</td><td>跳過該段、不遞迴</td><td>幾乎有序輸入的無謂遞迴</td></tr>
+        <tr><td>partition imbalance</td><td>切 heapsort</td><td>對抗性 pivot 的 O(n²)</td></tr>
+        <tr><td>non-trivially-copyable</td><td>切 BlockQuicksort（只搬 index）</td><td>昂貴 copy 被無條件做兩倍</td></tr>
+      </tbody>
+    </table>
+    <figcaption>三條保險各自堵掉一種退化。前兩條看資料形狀（在 partition 途中即時偵測），第三條看型別（C++ 編譯期、C 靠 macro）。</figcaption>
+  </figure>
+
+  <p>把這幾層放在一起，blqsort 的控制流大致是：大 partition 用 median-of-medians 挑 pivot、用 1024-block 的 branchless 引擎切開；偵測到嚴重不平衡就對那段切 heapsort；偵測到已排序就跳過；遞迴到 2–12 元素就交給 sorting network 收尾。下面這個小工具讓你掃一遍「mispredict 機率」這個變數，看 branchless 與 branchy 兩種 partition 的<strong>建模成本</strong>怎麼隨之分岔——關鍵是找到那個 crossover：在多高的 mispredict 率之上，多搬一倍資料才開始划算。</p>
+
+  <figure class="vg-w-range-blq-crossover" data-svg-scroll="720">
+    <style>
+      .vg-w-range-blq-crossover { display: grid; gap: var(--s-2); }
+      .vg-w-range-blq-crossover .vg-w-affordance { display: flex; align-items: center; gap: var(--s-1); font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin: 0; }
+      .vg-w-range-blq-crossover .vg-w-affordance svg { width: 14px !important; height: 14px !important; min-width: 14px !important; }
+      .vg-w-range-blq-crossover .ctl { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+      .vg-w-range-blq-crossover .ctl input { flex: 1; accent-color: var(--accent); height: 36px; min-width: 160px; }
+      .vg-w-range-blq-crossover .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 6ch; text-align: right; }
+      .vg-w-range-blq-crossover svg { width: 100%; height: auto; }
+      .vg-w-range-blq-crossover figcaption { font-family: var(--scribed); font-style: italic; font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m18 8 4 4-4 4"/><path d="m6 8-4 4 4 4"/><path d="M2 12h20"/>
+      </svg>
+      <span>drag to sweep mispredict rate · find the crossover · 2 cost curves</span>
+    </p>
+
+    <div class="ctl">
+      <label for="vg-w-range-blq-crossover-p">mispredict rate p =</label>
+      <input id="vg-w-range-blq-crossover-p" type="range" min="0" max="50" step="1" value="50" />
+      <span class="readout" id="vg-w-range-blq-crossover-pout">50%</span>
+    </div>
+
+    <svg viewBox="0 0 720 320" preserveAspectRatio="xMidYMid meet" role="img"
+         aria-label="branchless 與 branchy partition 的每元素建模成本，隨 mispredict 機率變化的兩條曲線與 crossover 點">
+      <g id="vg-w-range-blq-crossover-axes"></g>
+      <g id="vg-w-range-blq-crossover-curves"></g>
+      <g id="vg-w-range-blq-crossover-marker"></g>
+    </svg>
+
+    <figcaption>每元素的建模成本（cycle）。branchless 成本固定（~2 次 copy + 1 次 compare，與 p 無關，水平線）；branchy 成本 = 1 次 compare + p × flush penalty，隨 mispredict 率線性上升。兩線交點就是 crossover——p 高於它，多搬一倍資料才划算。flush penalty 取 16 cyc（典型深 pipeline 量級）。</figcaption>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-range-blq-crossover');
+        const slider = root.querySelector('#vg-w-range-blq-crossover-p');
+        const pout = root.querySelector('#vg-w-range-blq-crossover-pout');
+        const axesG = root.querySelector('#vg-w-range-blq-crossover-axes');
+        const curvesG = root.querySelector('#vg-w-range-blq-crossover-curves');
+        const markerG = root.querySelector('#vg-w-range-blq-crossover-marker');
+        const NS = 'http://www.w3.org/2000/svg';
+        function el(tag, attrs) {
+          const e = document.createElementNS(NS, tag);
+          for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+          return e;
+        }
+
+        const X0 = 64, X1 = 690, Y0 = 270, Y1 = 30;
+        const FLUSH = 16;          // pipeline flush penalty (cyc)
+        const BRANCHLESS = 3;      // ~2 copies + 1 compare, fixed
+        const BRANCHY_BASE = 1;    // 1 compare when predicted right
+        const pMax = 0.5;          // x axis: 0..50%
+        const maxY = 10;           // y axis cyc
+
+        const xOf = p => X0 + (p / pMax) * (X1 - X0);
+        const yOf = c => Y0 - (c / maxY) * (Y0 - Y1);
+        const branchyCost = p => BRANCHY_BASE + p * FLUSH;
+
+        // static axes (draw once)
+        axesG.appendChild(el('line', { x1: X0, y1: Y0, x2: X1, y2: Y0, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+        axesG.appendChild(el('line', { x1: X0, y1: Y0, x2: X0, y2: Y1, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+        for (let c = 0; c <= maxY; c += 2) {
+          const y = yOf(c);
+          axesG.appendChild(el('line', { x1: X0 - 4, y1: y, x2: X0, y2: y, stroke: 'var(--muted-2)' }));
+          const t = el('text', { x: X0 - 8, y: y + 4, 'text-anchor': 'end', 'font-family': 'JetBrains Mono, monospace', 'font-size': 12, fill: 'var(--muted)' });
+          t.textContent = String(c);
+          axesG.appendChild(t);
+        }
+        for (let pp = 0; pp <= 50; pp += 10) {
+          const x = xOf(pp / 100);
+          axesG.appendChild(el('line', { x1: x, y1: Y0, x2: x, y2: Y0 + 4, stroke: 'var(--muted-2)' }));
+          const t = el('text', { x: x, y: Y0 + 20, 'text-anchor': 'middle', 'font-family': 'JetBrains Mono, monospace', 'font-size': 12, fill: 'var(--muted)' });
+          t.textContent = pp + '%';
+          axesG.appendChild(t);
+        }
+        const xl = el('text', { x: (X0 + X1) / 2, y: Y0 + 42, 'text-anchor': 'middle', 'font-family': 'IM Fell English, serif', 'font-style': 'italic', 'font-size': 14, fill: 'var(--muted)' });
+        xl.textContent = 'branch mispredict rate p';
+        axesG.appendChild(xl);
+        const yl = el('text', { x: 18, y: (Y0 + Y1) / 2, 'text-anchor': 'middle', 'font-family': 'IM Fell English, serif', 'font-style': 'italic', 'font-size': 14, fill: 'var(--muted)', transform: `rotate(-90 18 ${(Y0 + Y1) / 2})` });
+        yl.textContent = 'cost / element (cyc)';
+        axesG.appendChild(yl);
+
+        // branchless: horizontal line
+        curvesG.appendChild(el('line', { x1: X0, y1: yOf(BRANCHLESS), x2: X1, y2: yOf(BRANCHLESS), stroke: 'var(--sage-deep)', 'stroke-width': 2 }));
+        const bl = el('text', { x: X1 - 4, y: yOf(BRANCHLESS) - 8, 'text-anchor': 'end', 'font-family': 'Manrope, sans-serif', 'font-size': 12, fill: 'var(--sage-deep)' });
+        bl.textContent = 'branchless (fixed ~3)';
+        curvesG.appendChild(bl);
+        // branchy: rising line
+        curvesG.appendChild(el('line', { x1: xOf(0), y1: yOf(branchyCost(0)), x2: xOf(pMax), y2: yOf(Math.min(maxY, branchyCost(pMax))), stroke: 'var(--accent)', 'stroke-width': 2 }));
+        const cl = el('text', { x: xOf(0.30), y: yOf(branchyCost(0.30)) - 10, 'text-anchor': 'middle', 'font-family': 'Manrope, sans-serif', 'font-size': 12, fill: 'var(--accent-text)' });
+        cl.textContent = 'branchy (1 + p·16)';
+        curvesG.appendChild(cl);
+
+        // crossover point: BRANCHLESS = 1 + p*FLUSH -> p = (BRANCHLESS-1)/FLUSH
+        const pCross = (BRANCHLESS - BRANCHY_BASE) / FLUSH;
+        curvesG.appendChild(el('line', { x1: xOf(pCross), y1: Y0, x2: xOf(pCross), y2: yOf(BRANCHLESS), stroke: 'var(--ink-deep)', 'stroke-width': 1, 'stroke-dasharray': '3,3' }));
+        curvesG.appendChild(el('circle', { cx: xOf(pCross), cy: yOf(BRANCHLESS), r: 4, fill: 'var(--ink-deep)' }));
+        const xt = el('text', { x: xOf(pCross) + 6, y: yOf(BRANCHLESS) + 18, 'font-family': 'JetBrains Mono, monospace', 'font-size': 12, fill: 'var(--ink-deep)' });
+        xt.textContent = 'crossover ≈ ' + Math.round(pCross * 100) + '%';
+        curvesG.appendChild(xt);
+
+        function update() {
+          const p = Number(slider.value) / 100;
+          pout.textContent = slider.value + '%';
+          while (markerG.firstChild) markerG.removeChild(markerG.firstChild);
+          const cBranchy = Math.min(maxY, branchyCost(p));
+          // vertical at current p
+          markerG.appendChild(el('line', { x1: xOf(p), y1: Y0, x2: xOf(p), y2: Y1, stroke: 'var(--muted)', 'stroke-width': 1, 'stroke-dasharray': '2,4' }));
+          markerG.appendChild(el('circle', { cx: xOf(p), cy: yOf(BRANCHLESS), r: 4, fill: 'var(--sage-deep)' }));
+          markerG.appendChild(el('circle', { cx: xOf(p), cy: yOf(cBranchy), r: 4, fill: 'var(--accent)' }));
+          const verdict = el('text', { x: xOf(p), y: Y1 + 2, 'text-anchor': p > 0.35 ? 'end' : 'start', 'font-family': 'IM Fell English, serif', 'font-style': 'italic', 'font-size': 13, fill: cBranchy > BRANCHLESS ? 'var(--sage-deep)' : 'var(--accent-text)' });
+          verdict.textContent = cBranchy > BRANCHLESS ? 'branchless 勝（多搬划算）' : 'branchy 勝（資料好預測）';
+          markerG.appendChild(verdict);
+        }
+        slider.addEventListener('input', update);
+        update();
+      })();
+    </script>
+  </figure>
+
+  <p>這個模型把問題化約成最乾淨的形式：branchless 的每元素成本是固定的（大約兩次 copy 加一次 compare，與資料無關，所以是一條水平線）；branchy 的成本則是「一次 compare 加上 p 乘以 flush penalty」，隨 mispredict 率線性上升。兩線的交點告訴你：只要 mispredict 率高於某個門檻（在 flush penalty 16 cycle、branchless 固定成本約 3 cycle 的假設下，這個門檻只有百分之十幾），多搬一倍資料就開始划算。而隨機資料的 partition mispredict 率接近 50%——遠在 crossover 右側，所以 branchless 大勝。反過來，對已經有序、分支極好預測的資料（p 接近 0），branchy 反而便宜——這也是為什麼 blqsort 要先做「是否已排序」的檢查，把那種輸入分流到不必要付 branchless copy 成本的快路徑。</p>
+
+  <h2>fallback：非平凡型別切 BlockQuicksort，只搬 index</h2>
+
+  <p>整個 branchless-copy 的論證有一個沒明說的前提：copy 必須便宜。對 <code>double</code>、<code>int</code> 這種 trivially-copyable 的型別，一次 copy 是一條 store，把它做兩倍幾乎無感。但如果元素是一個帶 heap 配置的 <code>std::string</code>、一個有自訂 copy constructor 的物件、或任何 non-trivially-copyable 的型別呢？這時「無條件搬一次，可能還要被覆寫」就不再是一條便宜的 store——它可能是一次記憶體配置、一次深拷貝、一次 constructor 呼叫。把昂貴的 copy 做兩倍，前面那筆「用 copy 換 misprediction」的帳直接翻負。</p>
+
+  <p>blqsort 的解法是：偵測型別是不是 trivially-copyable，不是的話自動切到 <strong>BlockQuicksort 變體</strong>。BlockQuicksort 的關鍵 insight 是——你不需要 branchless 地搬<strong>資料</strong>，你只需要 branchless 地計算出「哪些元素該換到哪邊」這份<strong>排列</strong>。所以它先用 branchless 的方式處理一批元素的<strong>index</strong>：掃過一個 block，把「需要被換到另一側」的元素的 index 無條件寫進一個小的 index 緩衝、用 0/1 推進緩衝長度（跟前面 partition 的 trick 一模一樣，只是寫的是 index 而非資料本身）。index 是 trivially-copyable 的整數，搬兩倍完全沒問題。等到這批 index 算完，才真正去<strong>移動資料</strong>，而且因為已經知道精確的對應關係，可以用最少次數的 swap 完成——「processes only the element indices in a branchless manner and then moves the actual data with fewer swaps」。</p>
+
+  <p>這條 fallback 的精神是把「branchless」這個好處留在便宜的整數運算上，把「昂貴的資料移動」這件事用 swap 次數最小化來保護。對 non-trivially-copyable 的型別，一次 swap（三次 move）仍然比一次「無條件 copy、可能浪費」便宜得多，尤其當 move 語意可以避免深拷貝時。最終結果是：branchless 的分支消除好處還在（在 index 計算階段），但資料移動回到「只動必要次數」的紀律。下面這個 tab 把兩條 path 並排——trivially-copyable 走「branchless copy 整個資料」、non-trivial 走「branchless 算 index、最少 swap 搬資料」——讓你看清楚同一個 branchless 原則在兩種型別上的不同落點。</p>
+
+  <div class="vg-w-tabs-blq-fallback">
+    <style>
+      .vg-w-tabs-blq-fallback { display: grid; gap: var(--s-2); margin: var(--s-4) 0; }
+      .vg-w-tabs-blq-fallback input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-tabs-blq-fallback .tabs { display: flex; flex-wrap: wrap; gap: var(--s-2); border-bottom: 1px solid var(--line); }
+      .vg-w-tabs-blq-fallback .tab { font-family: var(--sans); font-size: var(--fs-sm); padding: var(--s-1) var(--s-2); min-height: 44px; display: flex; align-items: center; cursor: pointer; color: var(--muted); }
+      .vg-w-tabs-blq-fallback .panel { display: none; padding: var(--s-2) 0; }
+      .vg-w-tabs-blq-fallback .panel p { margin: 0 0 var(--s-2) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-tabs-blq-fallback .panel pre { margin: 0; }
+      .vg-w-tabs-blq-fallback:has(#vg-w-tabs-blq-fallback-t1:checked) .panel-1 { display: block; }
+      .vg-w-tabs-blq-fallback:has(#vg-w-tabs-blq-fallback-t1:checked) [for="vg-w-tabs-blq-fallback-t1"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-blq-fallback:has(#vg-w-tabs-blq-fallback-t2:checked) .panel-2 { display: block; }
+      .vg-w-tabs-blq-fallback:has(#vg-w-tabs-blq-fallback-t2:checked) [for="vg-w-tabs-blq-fallback-t2"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    </style>
+    <input type="radio" id="vg-w-tabs-blq-fallback-t1" name="vg-w-tabs-blq-fallback-sel" aria-label="trivially-copyable path" checked />
+    <input type="radio" id="vg-w-tabs-blq-fallback-t2" name="vg-w-tabs-blq-fallback-sel" aria-label="non-trivial BlockQuicksort path" />
+    <div class="tabs">
+      <label class="tab" for="vg-w-tabs-blq-fallback-t1">trivially-copyable · branchless copy</label>
+      <label class="tab" for="vg-w-tabs-blq-fallback-t2">non-trivial · BlockQuicksort（只搬 index）</label>
+    </div>
+    <div class="panel panel-1">
+      <p><strong>條件</strong>：<code>std::is_trivially_copyable&lt;T&gt;</code> 為真——<code>double</code>、<code>int</code>、無自訂 copy/dtor 的 POD struct。一次 copy 就是一條 store，便宜到可以無條件做兩倍。</p>
+      <p><strong>做法</strong>：直接對<strong>資料</strong>做 branchless partition。每個元素無條件寫進輸出位置、用 <code>0/1</code> 推進 write head。不該收的元素留在原地等下一個覆寫。block 化、雙向交替、stack 緩衝全部用上。</p>
+      <pre data-kind="pseudocode"><code><em>// 直接搬資料：write head 用比較結果推進</em>
+out[head] = data[i];          <em>// 無條件 store（便宜）</em>
+head += (data[i] &lt; pivot);    <em>// 0 或 1，無分支</em>
+
+<em>// 代價：~2x copy；收益：零 data-dependent branch</em>
+<em>// 淨值為正，因為 copy 是一條 store、misprediction 是 ~16 cyc</em></code></pre>
+    </div>
+    <div class="panel panel-2">
+      <p><strong>條件</strong>：<code>std::is_trivially_copyable&lt;T&gt;</code> 為假——<code>std::string</code>、帶 heap 配置或自訂 copy constructor 的物件。無條件多搬一次資料可能觸發配置／深拷貝，太貴。</p>
+      <p><strong>做法</strong>：切 <strong>BlockQuicksort</strong> 變體。branchless 的不是資料、是 <strong>index</strong>——掃一個 block，把「該換邊」元素的 index 無條件寫進 index 緩衝、用 <code>0/1</code> 推進。index 是整數、搬兩倍免費。算完 index 才真正移動資料，且用<strong>最少 swap</strong> 完成。</p>
+      <pre data-kind="pseudocode"><code><em>// 階段一：branchless 收集要換邊的 index（便宜的整數運算）</em>
+idx_buf[cnt] = i;
+cnt += (data[i] &gt;= pivot);    <em>// 0/1 推進，無分支</em>
+
+<em>// 階段二：依 idx_buf 配對，用最少次數 swap 真正搬資料</em>
+for each (l, r) in paired offsets:
+    swap(data[l], data[r]);   <em>// move 語意，避免深拷貝</em>
+
+<em>// branchless 好處留在 index 計算；資料只動必要次數</em></code></pre>
+    </div>
+  </div>
+
+  <p>值得強調，這個型別分派在 C++ 版是<strong>編譯期</strong>決定的——<code>blqs::sort</code> 用 <code>std::is_trivially_copyable</code> 之類的 trait 在 compile time 選 path，沒有 runtime 的型別判斷成本。C 版則靠使用者透過 macro 明示型別與比較子。這也意味著對 trivially-copyable 的快路徑，編譯出來的碼裡完全沒有「檢查型別、跳到另一條 path」的分支——分派本身也是 branchless 的。</p>
+
+  <h2>benchmark：50M doubles 與 structs 上的實測</h2>
+
+  <p>論證再漂亮，也要看數字。blqsort 在 50,000,000 個 <code>double</code> 與 50,000,000 個自訂 struct 上、分別在 Apple M1 與 AMD Ryzen 上對照 <code>std::sort</code> 與 pdqsort。先講 doubles：在 M1 上 <code>std::sort</code> 與 pdqsort 都是 1.33 s，blqsort 單執行緒 0.97 s——快約 27%。在 Ryzen 上差距更戲劇化：<code>std::sort</code> 5.56 s、pdqsort 2.81 s、blqsort 2.06 s。注意 pdqsort 在 Ryzen 上就已經把 <code>std::sort</code> 打了快一倍（pdqsort 本身也是 branchless-aware 的設計），blqsort 在 pdqsort 之上再快約 27%。</p>
+
+  <p>struct 的數字更能說明 branchless copy 的威力。50M 個自訂 struct：M1 上 <code>std::sort</code> 與 pdqsort 都是 3.46 s，blqsort 只要 0.96 s——快了三倍多。Ryzen 上 <code>std::sort</code> 4.75 s、pdqsort 4.72 s、blqsort 2.20 s，約兩倍。為什麼 struct 的相對優勢比 double 還大？因為 struct 較大，branchy 版在搬運與比較時的 cache 與分支壓力都更重，而 blqsort 的固定成本搬運模式對這種 workload 的 locality 更友善——只要這個 struct 仍是 trivially-copyable，branchless copy 路徑就成立。下面這張圖把四組情境（doubles／structs × M1／Ryzen）的三方對照畫成 grouped bars，數字直接取自原文。</p>
+
+  <figure class="vg-w-chart-blq-bench" data-svg-scroll="720">
+    <style>
+      .vg-w-chart-blq-bench { display: grid; gap: var(--s-2); }
+      .vg-w-chart-blq-bench svg { width: 100%; height: auto; }
+      .vg-w-chart-blq-bench figcaption { font-family: var(--scribed); font-style: italic; font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+
+    <svg viewBox="0 0 720 360" preserveAspectRatio="xMidYMid meet" role="img"
+         aria-label="blqsort、pdqsort、std::sort 在 50M doubles 與 structs、Apple M1 與 AMD Ryzen 上的排序時間長條圖">
+      <g id="vg-w-chart-blq-bench-axes"></g>
+      <g id="vg-w-chart-blq-bench-bars"></g>
+      <g id="vg-w-chart-blq-bench-legend"></g>
+    </svg>
+
+    <figcaption>50M 元素的單執行緒排序時間（秒，越短越好）。四組情境 × 三個實作。數字取自 blqsort 原文。M1 doubles 上 blqsort 0.97 s vs 兩者 1.33 s；structs 上 0.96 s vs 兩者 3.46 s——struct 的相對優勢最大。</figcaption>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-chart-blq-bench');
+        const axesG = root.querySelector('#vg-w-chart-blq-bench-axes');
+        const barsG = root.querySelector('#vg-w-chart-blq-bench-bars');
+        const legendG = root.querySelector('#vg-w-chart-blq-bench-legend');
+        const NS = 'http://www.w3.org/2000/svg';
+        function el(tag, attrs) {
+          const e = document.createElementNS(NS, tag);
+          for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+          return e;
+        }
+
+        // groups: each [label, std::sort, pdqsort, blqsort] seconds
+        const groups = [
+          ['M1 · doubles', 1.33, 1.33, 0.97],
+          ['M1 · structs', 3.46, 3.46, 0.96],
+          ['Ryzen · doubles', 5.56, 2.81, 2.06],
+          ['Ryzen · structs', 4.75, 4.72, 2.20],
+        ];
+        const series = [
+          { name: 'std::sort', color: 'var(--muted)' },
+          { name: 'pdqsort', color: 'var(--ink-deep)' },
+          { name: 'blqsort', color: 'var(--accent)' },
+        ];
+
+        const X0 = 60, X1 = 700, Y0 = 290, Y1 = 36;
+        const maxY = 6; // seconds
+        const yOf = v => Y0 - (v / maxY) * (Y0 - Y1);
+
+        // axes
+        axesG.appendChild(el('line', { x1: X0, y1: Y0, x2: X1, y2: Y0, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+        axesG.appendChild(el('line', { x1: X0, y1: Y0, x2: X0, y2: Y1, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+        for (let v = 0; v <= maxY; v += 1) {
+          const y = yOf(v);
+          axesG.appendChild(el('line', { x1: X0 - 4, y1: y, x2: X1, y2: y, stroke: 'var(--line)', 'stroke-width': v === 0 ? 0 : 0.6 }));
+          const t = el('text', { x: X0 - 8, y: y + 4, 'text-anchor': 'end', 'font-family': 'JetBrains Mono, monospace', 'font-size': 12, fill: 'var(--muted)' });
+          t.textContent = v + 's';
+          axesG.appendChild(t);
+        }
+        const yl = el('text', { x: 16, y: (Y0 + Y1) / 2, 'text-anchor': 'middle', 'font-family': 'IM Fell English, serif', 'font-style': 'italic', 'font-size': 14, fill: 'var(--muted)', transform: `rotate(-90 16 ${(Y0 + Y1) / 2})` });
+        yl.textContent = 'sort time (s)';
+        axesG.appendChild(yl);
+
+        const gW = (X1 - X0) / groups.length;
+        const barW = gW / (series.length + 1.5);
+        groups.forEach((g, gi) => {
+          const gx = X0 + gi * gW;
+          // group label
+          const lt = el('text', { x: gx + gW / 2, y: Y0 + 20, 'text-anchor': 'middle', 'font-family': 'Manrope, sans-serif', 'font-size': 12, fill: 'var(--muted)' });
+          lt.textContent = g[0];
+          axesG.appendChild(lt);
+          for (let si = 0; si < series.length; si++) {
+            const val = g[si + 1];
+            const bx = gx + (gW - series.length * barW) / 2 + si * barW;
+            const by = yOf(val);
+            barsG.appendChild(el('rect', { x: bx, y: by, width: barW - 4, height: Y0 - by, fill: series[si].color, opacity: si === 2 ? 0.9 : 0.55 }));
+            const vt = el('text', { x: bx + (barW - 4) / 2, y: by - 5, 'text-anchor': 'middle', 'font-family': 'JetBrains Mono, monospace', 'font-size': 11, fill: si === 2 ? 'var(--accent-text)' : 'var(--muted)' });
+            vt.textContent = val.toFixed(2);
+            barsG.appendChild(vt);
+          }
+        });
+
+        // legend
+        series.forEach((s, i) => {
+          const lx = X0 + 8 + i * 150;
+          legendG.appendChild(el('rect', { x: lx, y: 16, width: 14, height: 10, fill: s.color, opacity: i === 2 ? 0.9 : 0.55 }));
+          const t = el('text', { x: lx + 20, y: 25, 'font-family': 'Manrope, sans-serif', 'font-size': 12, fill: 'var(--ink)' });
+          t.textContent = s.name;
+          legendG.appendChild(t);
+        });
+      })();
+    </script>
+  </figure>
+
+  <p>還有兩個面向沒進這張圖。一是多執行緒：blqsort 提供 <code>blqs_thr.h</code>（C++、走 <code>std::thread</code>）與 <code>blqsort_thr.h</code>（C、走 pthreads）兩份多執行緒 header，在 M1 上相對單執行緒版「再快 3 到 4 倍」。quicksort 的遞迴結構天生好平行——partition 完的兩半互不相依，可以丟到不同執行緒——所以這個加速符合預期。二是這些是單一來源的 benchmark，跑在作者的機器上、用作者選的資料分佈；任何排序 benchmark 都對輸入分佈、key 型別、機器的 cache 階層與 branch predictor 實作高度敏感。把這些數字當成「在這類 workload 上 branchless 路線值得一試」的證據，而不是「blqsort 在所有情況都快 N 倍」的保證——尤其在已排序、幾乎有序、或大量重複 key 的資料上，三者的差距會被各自的特化路徑（blqsort 的已排序檢查、pdqsort 的 pattern-defeating 啟發式）重新洗牌。</p>
+
+  <h2>API：四份 single-header 與兩種語言</h2>
+
+  <p>落到實際使用，blqsort 是四份 single-header 檔案，按「語言 × 執行緒模型」分成 2×2：<code>blqs.h</code>（C++ 單執行緒）、<code>blqs_thr.h</code>（C++ 多執行緒，<code>std::thread</code>）、<code>blqsort.h</code>（C 單執行緒）、<code>blqsort_thr.h</code>（C 多執行緒，pthreads）。single-header 的意義是沒有 build 步驟、沒有連結階段——把標頭丟進專案、<code>#include</code> 就能用，跟它要對標的 <code>std::sort</code>、pdqsort 一樣是 header-only 的接入體驗。</p>
+
+  <figure class="vg-w-table-blq-variants">
+    <style>
+      .vg-w-table-blq-variants table { width: 100%; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-blq-variants thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); }
+      .vg-w-table-blq-variants tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+      .vg-w-table-blq-variants tbody td:first-child { font-family: var(--mono); color: var(--accent-text); white-space: nowrap; }
+      .vg-w-table-blq-variants figcaption { font-family: var(--scribed); font-style: italic; font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-1); }
+      @media (max-width: 720px) { .vg-w-table-blq-variants { overflow-x: auto; } .vg-w-table-blq-variants table { min-width: 480px; } }
+    </style>
+    <table>
+      <thead>
+        <tr><th>header</th><th>語言</th><th>執行緒</th><th>何時拿它</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>blqs.h</td><td>C++</td><td>單執行緒</td><td><code>std::sort</code> 的 drop-in、型別自動分派</td></tr>
+        <tr><td>blqs_thr.h</td><td>C++</td><td><code>std::thread</code></td><td>核多、陣列大到值得平行 partition</td></tr>
+        <tr><td>blqsort.h</td><td>C</td><td>單執行緒</td><td>純 C 專案、用 macro 指定型別與比較子</td></tr>
+        <tr><td>blqsort_thr.h</td><td>C</td><td>pthreads</td><td>純 C 又要吃滿多核</td></tr>
+      </tbody>
+    </table>
+    <figcaption>四份 single-header 按「語言 × 執行緒」排成 2×2。先選語言，再按是否值得平行挑單／多執行緒版；M1 上多執行緒版相對單執行緒再快 3 到 4 倍。</figcaption>
+  </figure>
+
+  <p>C++ 端的 API 故意做得跟 <code>std::sort</code> 同形，用 iterator pair：</p>
+
+  <pre><code class="language-cpp">#include "blqs.h"
+
+// 跟 std::sort(data, data + SIZE) 同形
+blqs::sort(data, data + SIZE);
+</code></pre>
+
+  <p>這個同形是刻意的——它讓 blqsort 成為 <code>std::sort</code> 的 drop-in，遷移成本低到只是換一個函式名。型別分派（trivially-copyable 走 branchless copy、否則走 BlockQuicksort）在 <code>blqs::sort</code> 內部用 trait 在編譯期自動完成，使用者不需要知道自己的型別走哪條 path。C 沒有 template，所以 C 版改用 macro 在 <code>#include</code> 之前注入型別與比較子：</p>
+
+  <pre><code class="language-c">#define BLQS_CMP(a, b) ((a) &lt; (b))
+#define BLQS_TYPE double
+#include "blqsort.h"
+
+// 之後直接呼叫
+blqsort(data, SIZE);
+</code></pre>
+
+  <p><code>BLQS_CMP</code> 定義了「小於」的語意、<code>BLQS_TYPE</code> 給定元素型別，header 被 include 時用這兩個 macro 把排序碼針對這個型別<strong>特化展開</strong>。這是 C 世界用 macro 模擬 C++ template 特化的經典手法——把型別與比較邏輯在 preprocess 階段內聯進來，編譯器看到的是針對 <code>double</code> 完全展開、沒有 function pointer 間接呼叫的碼。比起 C 標準庫 <code>qsort</code> 那種「比較子是 function pointer、每次比較都要一次間接呼叫且無法 inline」的設計，macro 特化讓比較被 inline、迴圈被向量化的機會大得多——這本身就是 <code>qsort</code> 在實務上慢的主因之一。</p>
+
+  <p class="vg-deep-closer"><strong>這套零件湊起來解鎖了什麼</strong>：把一個 textbook partition 的 <code>if</code> 改寫成 <code>smlen += (x &lt; pivot)</code>，再用 1024-element 的 stack block 雙向搬運、用 sorting network 收尾、用 median-of-medians 配 heapsort 後援守住最壞情況、最後用 BlockQuicksort 替非平凡型別止血——blqsort 把「branch misprediction 是排序熱路徑上最大的隱形稅」這個微架構觀察，變成一份可以 drop-in 替換 <code>std::sort</code>、對 trivially-copyable 資料實測快 1.3 到 3.6 倍的 single-header library。它沒有發明新的排序演算法；它只是認真對待了一件大多數實作忽略的事——在隨機資料上，CPU 猜分支猜錯的代價，比多搬一倍便宜的 byte 貴得多。</p>
+</div>
+
