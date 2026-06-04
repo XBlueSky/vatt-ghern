@@ -1,0 +1,796 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">在瀏覽器分頁裡打開一份別人寄來的 Jupyter notebook，零點選之後，你那張對所有可存取 repo 都有效的 GitHub OAuth token 已經躺在攻擊者手裡。沒有一道防線被「攻破」——它們各自都正確地做了被設計去做的事。</p>
+  <h1 class="vg-post-title">合成鍵盤事件如何串成一鍵偷 token——拆 github.dev 的 VSCode 信任模型</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p><span class="vg-dropcap">一</span>個合成的 KeyboardEvent 不該有力量。它是 JavaScript 隨手就能 <code>new</code> 出來的物件，瀏覽器在 <code>isTrusted</code> 欄位上明明白白標記它「並非來自真實使用者輸入」。任何把安全決策押在鍵盤事件上的系統，照理都會先檢查這個欄位。然而 2026 年 6 月 2 日公開的這份 full disclosure 裡，研究者只用一連串自己捏造的 keydown，就在 github.dev——也就是跑在瀏覽器分頁裡的那個完整 VSCode——上做到了 1-click 的 GitHub OAuth token 竊取。受害者要做的，僅僅是打開一份 notebook。</p>
+
+  <p>這不是一個「某處有 buffer overflow」式的故事。真正讓人脊背發涼的地方在於，攻擊鏈經過的每一道隔離——webview 的 cross-origin iframe、阻擋任意鍵擊的那條防線、extension 的 publisher trust、整個 workspace trust——單獨拿出來看，設計都合理，甚至可以說周到。它們是被「串」起來才崩的。把 token 偷走的不是某一行有漏洞的程式碼，而是四個正確決策疊在一起後，浮現出來的那條沒人設計過的路徑。</p>
+
+  <p>所以這篇要當成一場 investigation 來寫。先把這個違反直覺的觀察擺在桌上：一個 <code>isTrusted: false</code> 的事件，怎麼會被當成真人按鍵。然後逐一審問四道防線——每一道我們都先假設「它應該能擋住」，再看它為什麼擋不住、為什麼這不是它的錯。最後把崩塌的順序重建出來，看清楚縫隙到底長在哪兩塊磚的接縫上。</p>
+
+  <p>investigation 的紀律在於：先承認自己的第一直覺很可能是錯的。讀到「合成事件偷 token」，工程師的本能反應是「一定是某個地方少檢查了 <code>isTrusted</code>」——把它歸結成一行漏掉的條件判斷。這份 disclosure 的價值，恰恰在於它讓這個本能反應落空：你找不到那一行。沒有哪個函式「忘了」檢查，因為在每一道防線各自的職責邊界內，檢查 <code>isTrusted</code> 都不是它的工作，甚至根本沒有 <code>isTrusted</code> 可檢查。真相比「漏了一行」更難堪，也更有教育意義：它是一個系統性的、由正確局部決策湧現出來的全域漏洞。</p>
+
+  <h2>那個違反直覺的觀察——一個 isTrusted: false 的事件被當成真人按鍵</h2>
+
+  <p>先把舞台講清楚。github.dev 是微軟把 VSCode 整個搬進瀏覽器的產物：你在 GitHub 任意 repo 上把網址的 <code>github.com</code> 改成 <code>github.dev</code>，或者直接按 <code>.</code>，就會在分頁裡開出一個 VSCode。它不是精簡版，而是貨真價實的 workbench——有 command palette、有 extension、有 notebook editor。為了渲染像 notebook 輸出、markdown preview 這類「不可信內容」，VSCode 用的是 webview：一個 cross-origin 的 <code>iframe</code>，跑在獨立的 origin 上，與主視窗之間只能透過 <code>postMessage</code> 溝通。這正是隔離的第一道牆。</p>
+
+  <p>桌面版 VSCode 裡，webview 是個 Electron 的 <code>&lt;webview&gt;</code> 或 <code>&lt;iframe&gt;</code>，跑在沙箱程序裡；瀏覽器版裡，它就是一個普通的跨 origin <code>iframe</code>。無論哪種，主視窗都不信任 iframe 裡的內容能直接觸碰它的 DOM 或 API。可是有一件事主視窗必須替 iframe 做——轉發鍵盤。理由很實際：使用者把游標停在 notebook 輸出區域時，焦點落在 iframe 內，但 <code>Ctrl+Shift+P</code> 這種 command palette 快捷鍵、<code>Ctrl+S</code> 這種存檔快捷鍵，都得由主視窗的 keybinding 系統來處理。如果 iframe 把鍵擊吞掉，整個編輯器的快捷鍵就在 webview 有焦點時失效了。</p>
+
+  <p>這個「鍵盤轉發」的需求並非 VSCode 獨有的怪癖，而是任何把可信 chrome 與不可信內容放進同一個 keybinding 命名空間的編輯器都會遇到的工程現實。想像你在 notebook 的輸出 cell 裡選了一段文字，想按 <code>Ctrl+C</code> 複製——焦點在 iframe 裡，但「複製」這個語意要由 host 的 clipboard 管線來完成；又或者你想在輸出區域對焦時直接按 <code>Ctrl+Shift+P</code> 跳出 command palette，這個視窗級的 UI 只有 host 畫得出來。要讓這些快捷鍵在 webview 有焦點時仍然可用，host 就必須能「看見」iframe 裡發生的按鍵。於是轉發鍵盤是個合理、甚至必要的設計——它服務的是一個真實的可用性需求。可用性與安全在這裡撞了個正著：要讓快捷鍵跨越 origin 邊界生效，就得讓鍵盤事件穿過那道邊界；而穿過邊界，<code>isTrusted</code> 就保不住了。</p>
+
+  <p>於是 VSCode 在 webview 內側裝了一個 listener，把 iframe 裡發生的 keydown 透過 <code>postMessage</code> 回傳給 host，host 再餵進自己的 keybinding dispatcher：</p>
+
+  <pre data-kind="pseudocode"><code><em>// webview 內側（不可信 origin）</em>
+contentWindow.addEventListener('keydown', handleInnerKeydown);
+function handleInnerKeydown(e) {
+  hostMessaging.postMessage('did-keydown', {
+    key: e.key, keyCode: e.keyCode,
+    ctrlKey: e.ctrlKey, shiftKey: e.shiftKey, /* ... */
+  });
+}
+
+<em>// host 主視窗（可信）</em>
+window.addEventListener('message', async event =&gt; {
+  switch (event.data.type) {
+    case 'did-keydown':
+      <em>// 用 data 重建一個 KeyboardEvent，餵進 keybinding 系統</em>
+  }
+});</code></pre>
+
+  <p>看到縫隙了嗎。<code>postMessage</code> 傳過去的只是一個普通物件——<code>{ key, keyCode, ctrlKey, shiftKey }</code>。<code>isTrusted</code> 欄位在序列化的那一刻就消失了，因為它從來不是物件的可列舉屬性，而是瀏覽器掛在原生事件上的一個唯讀保護。host 收到的是一袋資料，它根本無從分辨這袋資料是來自使用者真的按下了 <code>Ctrl+Shift+A</code>，還是來自 iframe 裡某段 JavaScript 呼叫了 <code>window.dispatchEvent(new KeyboardEvent('keydown', { ... }))</code>。對 host 來說，這兩者長得一模一樣。</p>
+
+  <p>值得停下來看清楚 <code>isTrusted</code> 為什麼非遺失不可。這個欄位是 DOM 規格刻意設計的安全屬性：它在原生事件物件上是唯讀的，JavaScript 寫不進去，<code>new KeyboardEvent(...)</code> 造出來的事件 <code>isTrusted</code> 恆為 <code>false</code>。這保證了「真人輸入」與「腳本輸入」在同一個 document 內可被區分。但這個保證的作用範圍，僅限於「事件物件還是事件物件」的時候。一旦你把事件的欄位抄進一個 plain object 拿去 <code>postMessage</code>，傳的就不再是事件，而是一份資料快照——而資料快照不帶 <code>isTrusted</code>，因為 <code>postMessage</code> 的 structured clone 只複製可列舉的自有屬性，<code>isTrusted</code> 兩者都不是。所以這不是哪個工程師「忘了帶上 <code>isTrusted</code>」，而是 web 平台的安全模型在跨 origin 邊界上本來就不打算讓你帶——能跨 origin 偽稱「我是真人按的」會是更糟的漏洞。真正的責任落在接收端：跨過邊界後，host 必須在自己這側重新決定「我要不要信任這袋資料能觸發特權操作」。</p>
+
+  <p>把 <code>did-keydown</code> 那袋資料的欄位逐一點開來看，這件事會更具體。下面每個欄位都可以 hover 或點一下，讀它各自代表什麼、以及——關鍵的——它能不能拿來證明「這是真人按的」。你會發現答案一律是不能：payload 裡每一格都是可由 JavaScript 任意填寫的純量。</p>
+
+  <div class="vg-w-pop-postmessage">
+    <style>
+      .vg-w-pop-postmessage { position: relative; margin: var(--s-4) 0; font-family: var(--mono); font-size: var(--fs-sm); line-height: 2.1; background: var(--bg-soft); border: 1px solid var(--line); padding: var(--s-3); overflow-x: auto; }
+      .vg-w-pop-postmessage .field { anchor-name: var(--anchor); text-decoration: underline dotted var(--accent); cursor: help; color: var(--accent-text); }
+      .vg-w-pop-postmessage .f-key { --anchor: --vgw-pm-key; }
+      .vg-w-pop-postmessage .f-keycode { --anchor: --vgw-pm-keycode; }
+      .vg-w-pop-postmessage .f-ctrl { --anchor: --vgw-pm-ctrl; }
+      .vg-w-pop-postmessage .f-shift { --anchor: --vgw-pm-shift; }
+      .vg-w-pop-postmessage .f-trusted { --anchor: --vgw-pm-trusted; text-decoration-color: var(--muted); color: var(--muted); }
+      .vg-w-pop-postmessage .pop {
+        position-anchor: var(--pa);
+        position: absolute; top: anchor(bottom); left: anchor(center);
+        translate: -50% var(--s-1);
+        padding: var(--s-1) var(--s-2);
+        background: var(--bg); border: 1px solid var(--line);
+        font-family: var(--scribed); font-size: var(--fs-sm); line-height: 1.6;
+        color: var(--ink); max-width: 34ch;
+        opacity: 0; transition: opacity 120ms; pointer-events: none; z-index: 5;
+      }
+      .vg-w-pop-postmessage .p-key { --pa: --vgw-pm-key; }
+      .vg-w-pop-postmessage .p-keycode { --pa: --vgw-pm-keycode; }
+      .vg-w-pop-postmessage .p-ctrl { --pa: --vgw-pm-ctrl; }
+      .vg-w-pop-postmessage .p-shift { --pa: --vgw-pm-shift; }
+      .vg-w-pop-postmessage .p-trusted { --pa: --vgw-pm-trusted; }
+      .vg-w-pop-postmessage .field:hover + .pop,
+      .vg-w-pop-postmessage .field:focus + .pop { opacity: 1; }
+      .vg-w-pop-postmessage .note { display: block; margin-top: var(--s-2); font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+      @supports not (anchor-name: --x) {
+        .vg-w-pop-postmessage .pop { position: static; opacity: 1; pointer-events: auto; display: block; margin: 2px 0 6px 1.5em; max-width: none; }
+      }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/>
+      </svg>
+      <span>hover／點選 payload 的每個欄位 · 讀它能否證明真人輸入</span>
+    </p>
+    <div>postMessage('did-keydown', {</div>
+    <div>&nbsp;&nbsp;<span class="field f-key" tabindex="0">key</span>: 'a',<span class="pop p-key">使用者按下的鍵的字面值。由 <code>e.key</code> 抄來，但合成事件可在建構時直接指定任意值——無法區分來源。</span></div>
+    <div>&nbsp;&nbsp;<span class="field f-keycode" tabindex="0">keyCode</span>: 65,<span class="pop p-keycode">已被規格 deprecate 的數字鍵碼。同樣是純量，<code>dispatchEvent</code> 想填什麼填什麼。</span></div>
+    <div>&nbsp;&nbsp;<span class="field f-ctrl" tabindex="0">ctrlKey</span>: true,<span class="pop p-ctrl">Ctrl 修飾鍵狀態。host 靠它＋key 拼出組合鍵去查 keybinding 表——攻擊者於是能精準命中任意快捷鍵。</span></div>
+    <div>&nbsp;&nbsp;<span class="field f-shift" tabindex="0">shiftKey</span>: true<span class="pop p-shift">Shift 修飾鍵狀態。與 ctrlKey 一起決定最終命中哪個 command，這裡指向 <code>Ctrl+Shift+A</code>。</span></div>
+    <div>&nbsp;&nbsp;<span class="field f-trusted" tabindex="0">/* isTrusted？ */</span><span class="pop p-trusted">不在 payload 裡。<code>isTrusted</code> 是原生事件上的唯讀保護，不可列舉，structured clone 不複製它——能證明真偽的唯一欄位，恰恰是過不了邊界的那一個。</span></div>
+    <div>})</div>
+    <span class="note">每一個可序列化的欄位都能被偽造；唯一不能被偽造的 <code>isTrusted</code>，從不出現在序列化結果中。</span>
+  </div>
+
+  <p>下面這個 canvas 把這趟旅程逐格放慢。你會看到一個攻擊者捏造的 keydown 從 iframe 出發，穿過 origin 邊界變成一則 <code>postMessage</code>，在 host 被重建成一個「可信」的鍵盤事件，最後落進 command dispatcher。沿途請特別盯著 <code>isTrusted</code> 那一格——它在哪一步被丟掉。</p>
+
+  <figure class="vg-w-canvas-keydown-flow">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M5 3v18"/><path d="m19 12-6 6"/><path d="m19 12-6-6"/><path d="M5 12h14"/>
+      </svg>
+      <span>play 觀看一個合成 keydown 穿過四個信任邊界 · 拖 scrubber 逐格檢視</span>
+    </p>
+    <style>
+      .vg-w-canvas-keydown-flow { display: grid; grid-template-rows: auto auto 1fr auto; gap: var(--s-2); margin: var(--s-4) 0; }
+      .vg-w-canvas-keydown-flow .toolbar { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); flex-wrap: wrap; }
+      .vg-w-canvas-keydown-flow button { font-family: var(--sans); font-size: var(--fs-sm); padding: 6px 14px; min-height: 44px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); cursor: pointer; }
+      .vg-w-canvas-keydown-flow button:hover { border-color: var(--accent); color: var(--accent-text); }
+      .vg-w-canvas-keydown-flow input[type="range"] { flex: 1; min-width: 120px; height: 36px; accent-color: var(--accent); touch-action: none; }
+      .vg-w-canvas-keydown-flow canvas { width: 100%; height: auto; aspect-ratio: 16 / 7; display: block; }
+      .vg-w-canvas-keydown-flow figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+      @media (max-width: 720px) {
+        .vg-w-canvas-keydown-flow canvas { aspect-ratio: 4 / 3; }
+      }
+    </style>
+
+    <div class="toolbar">
+      <button id="vg-w-canvas-keydown-flow-toggle">▷ play</button>
+      <button id="vg-w-canvas-keydown-flow-reset">↺ reset</button>
+      <input type="range" id="vg-w-canvas-keydown-flow-scrub" min="0" max="1000" value="0" aria-label="scrub the keydown journey" />
+      <span id="vg-w-canvas-keydown-flow-stage">stage：iframe</span>
+    </div>
+
+    <canvas id="vg-w-canvas-keydown-flow-canvas"></canvas>
+
+    <figcaption>合成事件在 iframe 裡 <code>isTrusted: false</code>；跨過 postMessage 邊界後，<code>isTrusted</code> 這個欄位不存在於序列化資料中，host 重建出的事件再也無從區分真偽。</figcaption>
+
+    <script>
+    (function () {
+      const root = document.querySelector('.vg-w-canvas-keydown-flow');
+      const canvas = root.querySelector('#vg-w-canvas-keydown-flow-canvas');
+      const toggle = root.querySelector('#vg-w-canvas-keydown-flow-toggle');
+      const reset = root.querySelector('#vg-w-canvas-keydown-flow-reset');
+      const scrub = root.querySelector('#vg-w-canvas-keydown-flow-scrub');
+      const stageLabel = root.querySelector('#vg-w-canvas-keydown-flow-stage');
+      const ctx = canvas.getContext('2d');
+
+      function cssVar(name) {
+        return getComputedStyle(root).getPropertyValue(name).trim() || '#888';
+      }
+      function resize() {
+        const dpr = window.devicePixelRatio || 1;
+        const rect = canvas.getBoundingClientRect();
+        canvas.width = Math.max(1, rect.width * dpr);
+        canvas.height = Math.max(1, rect.height * dpr);
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      }
+      new ResizeObserver(resize).observe(canvas);
+      resize();
+
+      // four stations along the path, t in [0,1]
+      const stations = [
+        { t: 0.04, label: 'iframe', sub: 'dispatchEvent', trusted: false },
+        { t: 0.36, label: 'postMessage', sub: 'origin 邊界', trusted: null },
+        { t: 0.66, label: 'host rebuild', sub: 'KeyboardEvent', trusted: '?' },
+        { t: 0.95, label: 'dispatch', sub: 'Ctrl+Shift+A', trusted: '?' }
+      ];
+
+      let running = false;
+      let progress = 0; // 0..1
+      const DURATION = 6.5; // seconds for full traversal
+
+      function stageOf(p) {
+        if (p < 0.30) return 'iframe（合成事件，isTrusted: false）';
+        if (p < 0.55) return 'postMessage（isTrusted 在序列化中遺失）';
+        if (p < 0.85) return 'host（重建事件，無法分辨真偽）';
+        return 'dispatch（接受通知主要動作）';
+      }
+
+      function draw() {
+        const W = canvas.getBoundingClientRect().width;
+        const H = canvas.getBoundingClientRect().height;
+        ctx.clearRect(0, 0, W, H);
+        const padL = 16, padR = 16;
+        const trackY = H * 0.52;
+        const x0 = padL, x1 = W - padR;
+
+        // track line
+        ctx.strokeStyle = cssVar('--line');
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(x0, trackY);
+        ctx.lineTo(x1, trackY);
+        ctx.stroke();
+
+        // origin boundary (dashed vertical) between station 1 and 2
+        const boundaryX = x0 + (x1 - x0) * 0.36;
+        ctx.save();
+        ctx.setLineDash([5, 5]);
+        ctx.strokeStyle = cssVar('--accent');
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(boundaryX, H * 0.16);
+        ctx.lineTo(boundaryX, H * 0.84);
+        ctx.stroke();
+        ctx.restore();
+        ctx.font = '12px "EB Garamond", serif';
+        ctx.fillStyle = cssVar('--accent-text');
+        ctx.textAlign = 'center';
+        ctx.fillText('cross-origin', boundaryX, H * 0.13);
+
+        // stations
+        stations.forEach((s) => {
+          const sx = x0 + (x1 - x0) * s.t;
+          ctx.fillStyle = cssVar('--bg-soft');
+          ctx.strokeStyle = cssVar('--muted-2');
+          ctx.lineWidth = 1.5;
+          ctx.beginPath();
+          ctx.arc(sx, trackY, 9, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.stroke();
+          ctx.fillStyle = cssVar('--ink');
+          ctx.font = '13px "EB Garamond", serif';
+          ctx.textAlign = 'center';
+          ctx.fillText(s.label, sx, trackY - 22);
+          ctx.fillStyle = cssVar('--muted');
+          ctx.font = '11px "EB Garamond", serif';
+          ctx.fillText(s.sub, sx, trackY + 30);
+        });
+
+        // moving packet
+        const px = x0 + (x1 - x0) * progress;
+        const crossed = progress >= 0.36;
+        ctx.fillStyle = crossed ? cssVar('--sage') : cssVar('--accent');
+        ctx.beginPath();
+        ctx.arc(px, trackY, 7, 0, Math.PI * 2);
+        ctx.fill();
+
+        // isTrusted badge above packet
+        ctx.font = '12px "JetBrains Mono", monospace';
+        ctx.textAlign = 'center';
+        let badge, badgeColor;
+        if (progress < 0.34) { badge = 'isTrusted: false'; badgeColor = cssVar('--accent-text'); }
+        else if (progress < 0.5) { badge = 'isTrusted: 遺失'; badgeColor = cssVar('--muted'); }
+        else { badge = 'isTrusted: true（重建）'; badgeColor = cssVar('--sage-deep'); }
+        ctx.fillStyle = badgeColor;
+        ctx.fillText(badge, Math.min(Math.max(px, 70), W - 70), trackY - 48);
+
+        // header
+        ctx.textAlign = 'left';
+        ctx.font = '14px "EB Garamond", serif';
+        ctx.fillStyle = cssVar('--muted');
+        ctx.fillText('合成 keydown 的旅程', padL, H * 0.13);
+      }
+
+      let last = performance.now();
+      function frame(now) {
+        const dt = Math.min(0.05, (now - last) / 1000);
+        last = now;
+        if (running) {
+          progress += dt / DURATION;
+          if (progress >= 1) { progress = 1; running = false; toggle.textContent = '▷ play'; }
+          scrub.value = String(Math.round(progress * 1000));
+        }
+        stageLabel.textContent = 'stage：' + stageOf(progress);
+        draw();
+        requestAnimationFrame(frame);
+      }
+      requestAnimationFrame(frame);
+
+      toggle.addEventListener('click', () => {
+        if (progress >= 1) progress = 0;
+        running = !running;
+        toggle.textContent = running ? '⏸ pause' : '▷ play';
+        last = performance.now();
+      });
+      reset.addEventListener('click', () => {
+        running = false; progress = 0; scrub.value = '0';
+        toggle.textContent = '▷ play';
+      });
+      scrub.addEventListener('input', () => {
+        running = false; toggle.textContent = '▷ play';
+        progress = Number(scrub.value) / 1000;
+      });
+    })();
+    </script>
+  </figure>
+
+  <p>結論先擺這裡：問題的根不是「webview 不該轉發鍵盤」，也不是「<code>postMessage</code> 該帶上 <code>isTrusted</code>」——後者在規格上根本做不到，<code>isTrusted</code> 不可序列化是 web 安全模型刻意的設計。問題在於 host 收到 <code>did-keydown</code> 之後，把它無條件當成了與真人按鍵等價的輸入，並讓它能觸發任意 command。接下來四節，我們把這條「無條件信任」如何串過另外三道防線拆開。</p>
+
+  <h2>第一道防線：cross-origin iframe 應該把惡意內容關在籠子裡</h2>
+
+  <p>第一個直覺式的辯護是：notebook 的內容跑在 cross-origin iframe 裡，它連 host 的 DOM 都碰不到，能造成什麼傷害。這道防線確實做了它該做的——攻擊者的 JavaScript 從頭到尾沒能讀寫 host 的任何物件。但攻擊鏈根本不需要它做到。</p>
+
+  <p>起點是一份惡意 Jupyter notebook 的 markdown cell。VSCode 渲染 markdown 輸出時，會把它放進 webview，並套上 Content-Security-Policy 想擋掉 inline script。但 CSP 對一個老把戲無能為力——HTML 屬性上的事件處理器，搭配一個必然失敗的圖片載入：</p>
+
+  <pre data-kind="config"><code>&lt;img src="data:foobar" onerror="javascript(); goes(); here();"&gt;</code></pre>
+
+  <p><code>src="data:foobar"</code> 不是合法的 data URI，瀏覽器嘗試解碼立刻失敗，於是觸發 <code>onerror</code>。而 <code>onerror</code> 屬性裡的 JavaScript 在許多 CSP 設定下不被 <code>script-src</code> 規則覆蓋——它是 inline event handler，需要的是 <code>unsafe-inline</code> 或 hash/nonce 才擋得住，而 webview 的渲染管線在這一格沒擋住。於是攻擊者拿到了 webview iframe 內的任意 JavaScript 執行權。</p>
+
+  <p>這個 <code>img onerror</code> 把戲老到幾乎成了 XSS 的入門題，但它在這裡能成立，揭露了 markdown 渲染管線的一個常見盲點。VSCode 渲染 notebook 的 markdown 輸出時，會跑一輪 HTML sanitizer 試圖剝掉危險標籤與屬性，再套 CSP 當第二道網。問題是 sanitizer 的 allowlist 與 CSP 的 <code>script-src</code> 處理的是不同維度的東西：sanitizer 管「哪些標籤／屬性允許留下」，CSP 管「哪些來源的 script 允許執行」。一個 <code>onerror</code> 屬性如果僥倖通過了 sanitizer（譬如 <code>&lt;img&gt;</code> 被當成良性標籤、事件屬性的過濾有缺口），它觸發的 inline handler 不會被 <code>script-src 'self'</code> 這類規則擋下——要擋 inline event handler，CSP 得明確不含 <code>unsafe-inline</code>，且實務上多半還要靠 sanitizer 先把 <code>on*</code> 屬性整類刪掉。兩道防護各自留了對方以為對方會補的縫，<code>onerror</code> 就從中間穿了過去。這本身是個獨立的 XSS，但在這條鏈裡它只是入口——真正的戲在後面。</p>
+
+  <p>注意此刻攻擊者擁有的東西有多有限：他在一個 cross-origin 的 iframe 裡，沒有 host 的 token，沒有 host 的 DOM，唯一能做的是對自己這個 <code>window</code> 呼叫 API。第一道牆此刻是完好的——它把攻擊者關在籠子裡了。問題是籠子的鐵欄之間，留了一個專門用來遞鍵盤的孔。攻擊者要做的，就是把手伸過那個孔：</p>
+
+  <pre data-kind="pseudocode"><code><em>// 在 webview iframe 內，攻擊者控制的 JS</em>
+window.dispatchEvent(new KeyboardEvent('keydown', {
+  key: 'a', code: 'KeyA', keyCode: 65,
+  ctrlKey: true, shiftKey: true        <em>// Ctrl+Shift+A</em>
+}));</code></pre>
+
+  <p>這個合成事件被 webview 內側那個 <code>handleInnerKeydown</code> listener 攔到，轉成 <code>postMessage('did-keydown', ...)</code> 送出籠外。籠子的鐵欄沒有任何一根斷裂；攻擊者只是用了那個本來就開著、本來就被信任的孔。第一道防線的辯護成立——它擋住了它被設計去擋的東西（直接 DOM 存取）；它沒有義務去判斷一個鍵盤事件是不是真人按的，那是別人的職責。</p>
+
+  <h2>第二道防線：host 不該讓一則訊息觸發任意 command</h2>
+
+  <p>那麼第二道防線在哪。Host 收到 <code>did-keydown</code> 後，並不是把它丟給「執行任意 command」的入口，而是丟給 keybinding 系統——一個把按鍵組合對應到 command id 的查表器。理論上這是一層收斂：只有被綁定了 keybinding 的 command 才會被觸發，沒綁的碰不到。這就是辯護點：keybinding 系統限制了一個鍵擊能做什麼。</p>
+
+  <p>攻擊者送的第一發是 <code>Ctrl+Shift+A</code>。在 github.dev 的預設 keybinding 表裡，這個組合綁的是一個叫 <code>Notifications: Accept Notification Primary Action</code> 的 command——「接受目前通知的主要動作」。單看這個 command，它一點都不危險：它只是替使用者點下通知右下角那顆主要按鈕。問題在於，攻擊者已經先用 iframe 裡的 JavaScript 製造了一則通知。</p>
+
+  <p>怎麼製造的。VSCode 看到一份 notebook 或一個 workspace 帶有 <code>.vscode/extensions.json</code> 之類的 recommendation 訊號時，會彈出「這個 workspace 推薦你安裝某擴充，要裝嗎」的通知。攻擊者把這則「擴充推薦」通知拉出來，主要動作恰好是「安裝推薦的擴充」。於是 <code>Ctrl+Shift+A</code> 這個無害的 command，在這個被精心佈置的上下文裡，等於替使用者按下了「安裝」。一個合成鍵擊，跨過了「使用者是否同意安裝擴充」這個同意關卡。</p>
+
+  <p>這一步是整條鏈裡最精巧的一環，因為它把兩個各自無害的能力乘在了一起。能力 A：攻擊者能用 iframe 裡的 JS 觸發任意通知，包括「擴充推薦」這種帶主要動作的通知。能力 B：攻擊者能合成任意鍵擊，包括恰好綁定到 <code>Notifications: Accept Notification Primary Action</code> 的 <code>Ctrl+Shift+A</code>。單看 A，使用者本來就可能收到擴充推薦通知，這沒什麼好怕；單看 B，合成鍵擊能觸發的 command 受 keybinding 表約束，看起來也有限。但 A 決定了「當下螢幕上有哪則通知、它的主要動作是什麼」，B 決定了「替使用者按下那個主要動作」——攻擊者同時掌握了上下文與觸發器，於是他能讓一個泛用的「接受通知」command，精準落在他自己擺好的那則「安裝擴充」通知上。command 本身完全沒被誤用，被操弄的是它執行時所在的世界狀態。這是這類 confused-deputy 漏洞的典型形狀：受害的不是 command，是 command 對「現在使用者面前是什麼」的隱含假設。</p>
+
+  <p>下面這個 walkthrough 把整條五步鏈攤開，每一步都標出它呼叫的真實 command id 與它輸出的能力。可以看到沒有任何一步本身是「漏洞」——它們都是 VSCode 公開、有文件的功能。</p>
+
+  <div class="vg-w-tabs-attack-chain">
+    <style>
+      .vg-w-tabs-attack-chain { display: grid; gap: var(--s-2); margin: var(--s-4) 0; }
+      .vg-w-tabs-attack-chain input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-tabs-attack-chain .tabs { display: flex; gap: var(--s-1); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+      .vg-w-tabs-attack-chain .tab { font-family: var(--sans); font-size: var(--fs-sm); padding: var(--s-1) var(--s-2); min-height: 44px; display: flex; align-items: center; cursor: pointer; color: var(--muted); border-bottom: 2px solid transparent; }
+      .vg-w-tabs-attack-chain .panel { display: none; padding: var(--s-2) 0; }
+      .vg-w-tabs-attack-chain .panel h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-tabs-attack-chain .panel p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-md); }
+      .vg-w-tabs-attack-chain:has(#vg-w-tabs-attack-chain-t1:checked) .panel-1 { display: block; }
+      .vg-w-tabs-attack-chain:has(#vg-w-tabs-attack-chain-t2:checked) .panel-2 { display: block; }
+      .vg-w-tabs-attack-chain:has(#vg-w-tabs-attack-chain-t3:checked) .panel-3 { display: block; }
+      .vg-w-tabs-attack-chain:has(#vg-w-tabs-attack-chain-t4:checked) .panel-4 { display: block; }
+      .vg-w-tabs-attack-chain:has(#vg-w-tabs-attack-chain-t5:checked) .panel-5 { display: block; }
+      .vg-w-tabs-attack-chain:has(#vg-w-tabs-attack-chain-t1:checked) [for="vg-w-tabs-attack-chain-t1"],
+      .vg-w-tabs-attack-chain:has(#vg-w-tabs-attack-chain-t2:checked) [for="vg-w-tabs-attack-chain-t2"],
+      .vg-w-tabs-attack-chain:has(#vg-w-tabs-attack-chain-t3:checked) [for="vg-w-tabs-attack-chain-t3"],
+      .vg-w-tabs-attack-chain:has(#vg-w-tabs-attack-chain-t4:checked) [for="vg-w-tabs-attack-chain-t4"],
+      .vg-w-tabs-attack-chain:has(#vg-w-tabs-attack-chain-t5:checked) [for="vg-w-tabs-attack-chain-t5"] { color: var(--accent-text); border-bottom-color: var(--accent); }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18"/>
+      </svg>
+      <span>切換五個分頁，逐步走過攻擊鏈 · 5 steps</span>
+    </p>
+    <input type="radio" id="vg-w-tabs-attack-chain-t1" name="vg-w-tabs-attack-chain-sel" checked />
+    <input type="radio" id="vg-w-tabs-attack-chain-t2" name="vg-w-tabs-attack-chain-sel" />
+    <input type="radio" id="vg-w-tabs-attack-chain-t3" name="vg-w-tabs-attack-chain-sel" />
+    <input type="radio" id="vg-w-tabs-attack-chain-t4" name="vg-w-tabs-attack-chain-sel" />
+    <input type="radio" id="vg-w-tabs-attack-chain-t5" name="vg-w-tabs-attack-chain-sel" />
+    <div class="tabs">
+      <label class="tab" for="vg-w-tabs-attack-chain-t1">1 · 入口</label>
+      <label class="tab" for="vg-w-tabs-attack-chain-t2">2 · 合成鍵擊</label>
+      <label class="tab" for="vg-w-tabs-attack-chain-t3">3 · 本地擴充</label>
+      <label class="tab" for="vg-w-tabs-attack-chain-t4">4 · 任意執行</label>
+      <label class="tab" for="vg-w-tabs-attack-chain-t5">5 · 取 token</label>
+    </div>
+    <div class="panel panel-1">
+      <h3>step 1 · notebook 內的 img onerror</h3>
+      <p>受害者打開惡意 Jupyter notebook。markdown cell 裡的 <code>&lt;img src="data:foobar" onerror="..."&gt;</code> 載入失敗，<code>onerror</code> 裡的 JavaScript 在 webview iframe 內執行，繞過 CSP 對 inline script 的限制。</p>
+      <p><strong>輸出</strong>：webview iframe（cross-origin）內的任意 JS 執行——但還碰不到 host。</p>
+    </div>
+    <div class="panel panel-2">
+      <h3>step 2 · 派發 Ctrl+Shift+A</h3>
+      <p>iframe 裡的 JS 先觸發一則「擴充推薦」通知，再 <code>dispatchEvent</code> 一個合成的 <code>Ctrl+Shift+A</code> keydown。webview 把它 <code>postMessage('did-keydown')</code> 回 host，host 餵進 keybinding 系統，命中 <code>Notifications: Accept Notification Primary Action</code>。</p>
+      <p><strong>輸出</strong>：替使用者按下通知主要動作——「安裝推薦的擴充」。</p>
+    </div>
+    <div class="panel panel-3">
+      <h3>step 3 · 安裝 .vscode/extensions 本地擴充</h3>
+      <p>被安裝的不是 marketplace 擴充，而是放在 workspace <code>.vscode/extensions/</code> 下的本地擴充。因為 github.dev 被當作 trusted workspace，本地擴充得以載入而不觸發 publisher 驗證——workspace trust 在這裡被當成了 publisher trust 的替身。</p>
+      <p><strong>輸出</strong>：一個攻擊者控制、貢獻自訂 keybinding 的擴充進入工作區。</p>
+    </div>
+    <div class="panel panel-4">
+      <h3>step 4 · Ctrl+F1 觸發 installExtension</h3>
+      <p>該擴充的 <code>package.json</code> 把 <code>Ctrl+F1</code> 綁到 <code>workbench.extensions.installExtension</code>，並在參數裡帶上 <code>{ "context": { "skipPublisherTrust": true } }</code>。攻擊者再派發一發合成 <code>Ctrl+F1</code>，跳過 publisher trust dialog，安裝任意擴充——等同任意程式執行。</p>
+      <p><strong>輸出</strong>：完整的 arbitrary extension install，<code>skipPublisherTrust: true</code>。</p>
+    </div>
+    <div class="panel panel-5">
+      <h3>step 5 · 讀 localStorage 裡的 OAuth token</h3>
+      <p>取得執行權後，擴充直接讀 github.dev 的 <code>localStorage</code>。那裡躺著一張 GitHub OAuth token，對使用者所有可存取的 repo 都有效。擴充拿它打 <code>https://api.github.com/user/repos</code>，列舉私有 repo。</p>
+      <p><strong>輸出</strong>：跨全部 repo 的讀寫權與私有 repo 清單，外洩完成。</p>
+    </div>
+  </div>
+
+  <p>第二道防線的辯護到此也成立了——keybinding 系統確實只觸發了被綁定的 command，<code>Notifications: Accept Notification Primary Action</code> 本身也確實只做了一件被良好定義的事。它沒被誤用，它被「正確地用在錯誤的上下文」。一個無害的 command，加上一個攻擊者佈置好的通知，乘出來的結果是一次未經同意的安裝。</p>
+
+  <p>有一件事光看 walkthrough 的分頁不容易感受到：攻擊者手裡的權限不是某一步突然暴漲，而是沿著五步一格一格爬上去的。拖下面這把 scrubber，把鏈的步數從 1 推到 5，看那條「攻擊者此刻能做什麼」的描述如何從「只能對自己這個 iframe 的 window 呼叫 API」一路長成「跨全部 repo 的讀寫 token」。每一步爬升的幅度都很小、都來自一個合理功能——這正是為什麼沒有任何單一一步看起來像「漏洞」。</p>
+
+  <figure class="vg-w-range-privilege-accrual">
+    <style>
+      .vg-w-range-privilege-accrual { display: grid; gap: var(--s-2); margin: var(--s-4) 0; }
+      .vg-w-range-privilege-accrual .control { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+      .vg-w-range-privilege-accrual input[type="range"] { flex: 1; min-width: 120px; height: 36px; accent-color: var(--accent); touch-action: none; }
+      .vg-w-range-privilege-accrual .step-readout { font-variant-numeric: tabular-nums; color: var(--accent-text); min-width: 10ch; text-align: right; }
+      .vg-w-range-privilege-accrual .gauge { display: flex; gap: 4px; }
+      .vg-w-range-privilege-accrual .gauge .seg { flex: 1; height: 12px; border: 1px solid var(--line); background: var(--bg-soft); transition: background 160ms, border-color 160ms; }
+      .vg-w-range-privilege-accrual .gauge .seg.on { background: var(--accent); border-color: var(--accent); }
+      .vg-w-range-privilege-accrual .panel { border-left: 2px solid var(--accent); padding: var(--s-2); background: var(--bg-soft); }
+      .vg-w-range-privilege-accrual .panel h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-range-privilege-accrual .panel .has { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-md); color: var(--ink); }
+      .vg-w-range-privilege-accrual .panel .gain { margin: 0; font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+      .vg-w-range-privilege-accrual figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M4 20h16"/><path d="M4 20v-4l4-1 4-4 4-2 4-5"/>
+      </svg>
+      <span>拖 scrubber 推進步數 · 讀攻擊者每一步累積到的權限</span>
+    </p>
+    <div class="control">
+      <label for="vg-w-range-privilege-accrual-x">step =</label>
+      <input id="vg-w-range-privilege-accrual-x" type="range" min="1" max="5" step="1" value="1" aria-label="exploit chain step" />
+      <span class="step-readout">1 / 5</span>
+    </div>
+    <div class="gauge">
+      <span class="seg on"></span><span class="seg"></span><span class="seg"></span><span class="seg"></span><span class="seg"></span>
+    </div>
+    <div class="panel">
+      <h3 class="ttl">step 1 · iframe 內任意 JS</h3>
+      <p class="has">攻擊者只能對自己這個 cross-origin <code>window</code> 呼叫 API——碰不到 host 的 DOM、token 或任何物件。</p>
+      <p class="gain">爬升來源：<code>img onerror</code> 繞過 CSP 的 inline script 限制。</p>
+    </div>
+    <script>
+    (function () {
+      const root = document.querySelector('.vg-w-range-privilege-accrual');
+      const inp = root.querySelector('input[type="range"]');
+      const out = root.querySelector('.step-readout');
+      const segs = root.querySelectorAll('.gauge .seg');
+      const ttl = root.querySelector('.panel .ttl');
+      const has = root.querySelector('.panel .has');
+      const gain = root.querySelector('.panel .gain');
+      const STEPS = [
+        { t: 'step 1 · iframe 內任意 JS', h: '攻擊者只能對自己這個 cross-origin <code>window</code> 呼叫 API——碰不到 host 的 DOM、token 或任何物件。', g: '爬升來源：<code>img onerror</code> 繞過 CSP 的 inline script 限制。' },
+        { t: 'step 2 · 替使用者按下通知', h: '能合成 <code>Ctrl+Shift+A</code> 並命中 <code>Notifications: Accept Notification Primary Action</code>——替使用者按下自己佈置好的通知主要動作。', g: '爬升來源：postMessage 轉發鍵盤，host 無從分辨真偽。' },
+        { t: 'step 3 · 本地擴充入駐', h: '一個攻擊者控制、貢獻自訂 keybinding 的本地擴充被載入工作區，<code>contributes</code> 已靜態註冊。', g: '爬升來源：workspace trust 被當成 publisher trust 的替身。' },
+        { t: 'step 4 · 任意擴充安裝', h: '合成 <code>Ctrl+F1</code> 觸發帶 <code>skipPublisherTrust: true</code> 的 <code>installExtension</code>——等同任意程式執行。', g: '爬升來源：command 參數可由 keybinding 自由攜帶，短路 publisher dialog。' },
+        { t: 'step 5 · 全域 OAuth token', h: '取得執行權後一行 <code>localStorage.getItem</code> 讀出對「全部可存取 repo」有效的 OAuth token，列舉私有 repo。', g: '爬升來源：token 與被控執行環境同 origin、scope 為全域。' }
+      ];
+      function render() {
+        const n = Number(inp.value);
+        out.textContent = n + ' / 5';
+        segs.forEach((s, i) => s.classList.toggle('on', i < n));
+        const s = STEPS[n - 1];
+        ttl.textContent = s.t;
+        has.innerHTML = s.h;
+        gain.innerHTML = '爬升來源：' + s.g.replace(/^爬升來源：/, '');
+      }
+      inp.addEventListener('input', render);
+      render();
+    })();
+    </script>
+    <figcaption>權限沿五步一格一格累積，每一格的爬升都來自一個獨立、合理的功能——沒有任何單一步看起來像漏洞。</figcaption>
+  </figure>
+
+  <h2>第三道防線：publisher trust 應該擋住沒簽章的擴充</h2>
+
+  <p>到這裡攻擊者裝進了一個擴充。但 VSCode 不是有 publisher trust 嗎——擴充要嘛來自被信任的發行者，要嘛使用者得手動確認。這是第三道防線，理論上它應該擋下任何攻擊者捏造的擴充。它的崩法分兩段，每一段都很值得玩味。</p>
+
+  <p>第一段，攻擊者安裝的是 workspace 本地擴充，放在 <code>.vscode/extensions/</code> 裡。VSCode 的信任模型對「本地檔案」與「marketplace 發行品」採用不同的尺。Marketplace 擴充要過 publisher 簽章；但放在工作區裡的本地擴充，被歸進「workspace trust」的管轄——一旦你信任了這個 workspace，工作區裡的東西就被視為你自己的東西。而 github.dev，作為一個由 GitHub 自家託管、使用者主動打開的環境，被預設當成 trusted workspace。於是判斷的順序變成了：「這個擴充在不在受信任的 workspace 裡？在 → 放行。」publisher trust 這把尺，被 workspace trust 那把尺擋在了前面。</p>
+
+  <p>本地擴充一開始其實會撞上另一道牆——它的 extension worker 期待從 <code>vscode-cdn.net</code> 載入，本地檔案過不了那個 CSP 驗證。這道牆乍看像是擋住了攻擊：擴充的程式碼跑不起來，不就無害了嗎。這正是 investigation 裡最容易被誤導的一刻——你以為找到了「其實它有擋住」的反例。但攻擊者根本不需要讓擴充「正常跑起來」。他只需要擴充裡的一樣東西被 VSCode 讀進去：<code>package.json</code> 裡 <code>contributes.keybindings</code> 宣告的那條快捷鍵。VSCode 的擴充模型把 manifest 解析與程式碼啟動拆成兩個階段：manifest 裡的 <code>contributes</code> 區塊（keybindings、commands、menus）在擴充被「發現」時就靜態註冊進工作台，根本不需要 extension host worker 跑起來；worker 只在某個 activation event 真的觸發、需要執行擴充的 <code>activate()</code> 時才載入。攻擊者要的東西全在 manifest 那一層，於是 worker 過不過 CSP 對他毫無影響。這就是第二段：</p>
+
+  <pre data-kind="config"><code>"contributes": {
+  "keybindings": [{
+    "key": "ctrl+f1",
+    "command": "runCommands",
+    "args": {
+      "commands": [{
+        "command": "workbench.extensions.installExtension",
+        "args": ["AttackerExtension.name",
+                 { "context": { "skipPublisherTrust": true } }]
+      }]
+    }
+  }]
+}</code></pre>
+
+  <p>看清楚這條 keybinding 把 <code>Ctrl+F1</code> 綁到了 <code>workbench.extensions.installExtension</code>，並且在參數裡直接帶上了 <code>skipPublisherTrust: true</code>。這個 flag 是 VSCode 內部本來就有的——某些受信任的內部流程需要繞過 publisher dialog。設計者大概假設「只有可信的程式碼路徑會帶這個 flag」。但 command 的參數是 keybinding 宣告的一部分，而 keybinding 是任何擴充都能貢獻的開放擴充點。攻擊者於是把這個本該內部專用的 flag，寫進了一條由自己定義、自己用合成 <code>Ctrl+F1</code> 觸發的 keybinding 裡。</p>
+
+  <p>第三道防線的辯護同樣站得住——publisher trust 機制本身沒被破解，沒有任何簽章被偽造。它只是被繞過了：一次是被 workspace trust 在邏輯順序上搶先，一次是被一個可由擴充自由攜帶的 command 參數短路。每一處單看都是「合理的例外」；疊起來就成了一條任意程式執行的直通車。</p>
+
+  <h2>第四道防線：workspace trust 應該只在你確實信任時才放行</h2>
+
+  <p>最後一道防線是 workspace trust 自己。它的設計初衷很正當：當你打開一個來路不明的資料夾，VSCode 會問你信不信任它，不信任就進 restricted mode，擴充與 task 都被掐住。問題出在 github.dev 這個特殊環境，把「信任」這件事的語意悄悄換了。</p>
+
+  <p>在桌面，你信任一個 workspace，意思是「我信任這份程式碼倉庫的作者」。在 github.dev，整個環境是 GitHub 託管的、你主動按 <code>.</code> 進來的，所以它被預設為 trusted——這個預設本身合理，畢竟你不會想每開一個自己的 repo 就被問一次信不信任。但這個「信任」實際被消費的地方，是 step 3 那個「本地擴充要不要載入」的判斷。於是語意發生了偷換：你以為自己表達的是「我信任這個 repo 的內容」，系統理解成的卻是「凡是這個 workspace 裡的本地擴充都可載入、且免 publisher 驗證」。而 repo 的內容——那份 notebook、那個 <code>.vscode/extensions/</code>——恰恰是攻擊者可以塞東西進去的地方。</p>
+
+  <p>這個語意偷換值得再咬一層。workspace trust 機制當初被加進 VSCode，是為了回應一個真實威脅：你 clone 了一個陌生 repo，光是打開資料夾，裡面的 <code>tasks.json</code>、debug 設定、某些擴充的 workspace 設定就可能在你沒察覺時執行程式碼。於是 VSCode 引入 restricted mode，讓「打開資料夾」與「執行資料夾裡的程式碼」脫鉤，需要使用者明確點下「我信任此資料夾的作者」才解鎖。這個設計在桌面情境下是對的。但 github.dev 把這個機制移植過來時，必須給「信任」一個預設值——而把使用者自己 GitHub 帳號底下的 repo 預設為 trusted，也完全合理，沒人想每開一個自己的 repo 都被攔一次。錯不在任一個決定，錯在兩個正確決定的組合產生了一個新事實：在 github.dev，repo 內容（含 <code>.vscode/extensions/</code>）被預設信任，而 repo 內容恰好可由任何能讓你打開該 repo 的人控制——包括寄你一個 notebook 連結的攻擊者。</p>
+
+  <p>把這同一個 trusted 布林值在兩個環境的語意攤在一起，偷換的位置就一目了然。下面這張表逐列對照——同樣是「workspace 受信任」，桌面與 github.dev 在「誰設定的」、「指什麼」、「誰能控制 repo 內容」三個維度上分岔，而正是這三處分岔把一個桌面下安全的機制，搬進瀏覽器後變成攻擊面。</p>
+
+  <figure class="vg-w-table-trust-semantics">
+    <style>
+      .vg-w-table-trust-semantics { overflow-x: auto; margin: var(--s-4) 0; }
+      .vg-w-table-trust-semantics table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-trust-semantics caption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); text-align: left; margin-bottom: var(--s-2); }
+      .vg-w-table-trust-semantics thead th { font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.04em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); }
+      .vg-w-table-trust-semantics thead th.desktop { color: var(--accent-text); }
+      .vg-w-table-trust-semantics thead th.web { color: var(--accent-text); }
+      .vg-w-table-trust-semantics tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+      .vg-w-table-trust-semantics tbody td:first-child { font-family: var(--sans); color: var(--ink-soft); white-space: nowrap; }
+      .vg-w-table-trust-semantics code { font-size: 0.85em; }
+    </style>
+    <table>
+      <caption>同一個「workspace 受信任」布林值，在桌面與 github.dev 指的不是同一件事——語意偷換就藏在這三列的分岔裡。</caption>
+      <thead>
+        <tr>
+          <th>維度</th>
+          <th class="desktop">桌面 VSCode</th>
+          <th class="web">github.dev（web）</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>trusted 由誰設定</td>
+          <td>使用者打開陌生資料夾時手動點「我信任作者」。</td>
+          <td>使用者按 <code>.</code> 進入自己 repo，環境<strong>預設</strong> trusted，不另行詢問。</td>
+        </tr>
+        <tr>
+          <td>「信任」指的是</td>
+          <td>「我信任這份倉庫的作者寫的程式碼」。</td>
+          <td>實際被消費成「workspace 內本地擴充可載入、且免 publisher 驗證」。</td>
+        </tr>
+        <tr>
+          <td>repo 內容誰可控</td>
+          <td>通常是你自己 clone 的、你檢視過的程式碼。</td>
+          <td>任何能讓你打開該 repo 的人——包括寄你 notebook 連結的攻擊者。</td>
+        </tr>
+        <tr>
+          <td>本地擴充載入</td>
+          <td>仍受 publisher trust 與 restricted mode 雙重把關。</td>
+          <td>因 trusted 預設，<code>.vscode/extensions/</code> 直接放行。</td>
+        </tr>
+        <tr>
+          <td>淨攻擊面</td>
+          <td>需先社交工程使用者親手點下信任，門檻高。</td>
+          <td>零額外點選——打開連結即落入 trusted，門檻塌陷。</td>
+        </tr>
+      </tbody>
+    </table>
+  </figure>
+
+  <p>把四道防線並排看，才看得清這場 investigation 的結論。每一道我們原本都假設「它應該能擋住」，逐一審問後發現每一道都在做正確的事，沒有一道是 bug。下面這個圖讓你點選每一道防線，讀它各自防住了什麼、又各自假設了什麼——縫隙永遠長在「它防住的」與「它假設的」之間。</p>
+
+  <figure class="vg-w-annotated-trust-layers">
+    <style>
+      .vg-w-annotated-trust-layers { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s-3); align-items: start; margin: var(--s-4) 0; }
+      .vg-w-annotated-trust-layers svg { width: 100%; height: auto; }
+      .vg-w-annotated-trust-layers input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-annotated-trust-layers .layer { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; transition: fill 200ms, stroke 200ms; }
+      .vg-w-annotated-trust-layers .layer:hover { stroke: var(--accent); }
+      .vg-w-annotated-trust-layers .layer:focus { outline: none; }
+      .vg-w-annotated-trust-layers .layer:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+      .vg-w-annotated-trust-layers .layer-text { pointer-events: none; }
+      .vg-w-annotated-trust-layers .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+      .vg-w-annotated-trust-layers .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-annotated-trust-layers .detail p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-annotated-trust-layers:has(#vg-w-annotated-trust-layers-r1:checked) .layer-1,
+      .vg-w-annotated-trust-layers:has(#vg-w-annotated-trust-layers-r2:checked) .layer-2,
+      .vg-w-annotated-trust-layers:has(#vg-w-annotated-trust-layers-r3:checked) .layer-3,
+      .vg-w-annotated-trust-layers:has(#vg-w-annotated-trust-layers-r4:checked) .layer-4 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-annotated-trust-layers:has(#vg-w-annotated-trust-layers-r1:checked) .detail-1,
+      .vg-w-annotated-trust-layers:has(#vg-w-annotated-trust-layers-r2:checked) .detail-2,
+      .vg-w-annotated-trust-layers:has(#vg-w-annotated-trust-layers-r3:checked) .detail-3,
+      .vg-w-annotated-trust-layers:has(#vg-w-annotated-trust-layers-r4:checked) .detail-4 { display: block; }
+      @media (max-width: 720px) {
+        .vg-w-annotated-trust-layers { grid-template-columns: 1fr; }
+      }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m9 9 5 12 1.8-5.2L21 14Z"/><path d="M7.2 2.2 8 5.1"/><path d="m5.1 8-2.9-.8"/><path d="M14 4.1 12 6"/><path d="m6 12-1.9 2"/>
+      </svg>
+      <span>點選每一道防線，讀它防住什麼、假設什麼 · 4 layers</span>
+    </p>
+
+    <input type="radio" id="vg-w-annotated-trust-layers-r1" name="vg-w-annotated-trust-layers-sel" checked />
+    <input type="radio" id="vg-w-annotated-trust-layers-r2" name="vg-w-annotated-trust-layers-sel" />
+    <input type="radio" id="vg-w-annotated-trust-layers-r3" name="vg-w-annotated-trust-layers-sel" />
+    <input type="radio" id="vg-w-annotated-trust-layers-r4" name="vg-w-annotated-trust-layers-sel" />
+
+    <svg viewBox="0 0 360 320">
+      <rect class="layer layer-1" data-target="vg-w-annotated-trust-layers-r1" role="button" tabindex="0" aria-label="選擇 cross-origin iframe 防線" x="30" y="20" width="300" height="60" rx="4" />
+      <text class="layer-text" x="180" y="46" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">L1 · cross-origin iframe</text>
+      <text class="layer-text" x="180" y="66" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">隔離不可信內容</text>
+
+      <rect class="layer layer-2" data-target="vg-w-annotated-trust-layers-r2" role="button" tabindex="0" aria-label="選擇 keystroke 防線" x="30" y="95" width="300" height="60" rx="4" />
+      <text class="layer-text" x="180" y="121" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">L2 · keybinding dispatch</text>
+      <text class="layer-text" x="180" y="141" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">鍵擊只觸發被綁定的 command</text>
+
+      <rect class="layer layer-3" data-target="vg-w-annotated-trust-layers-r3" role="button" tabindex="0" aria-label="選擇 publisher trust 防線" x="30" y="170" width="300" height="60" rx="4" />
+      <text class="layer-text" x="180" y="196" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">L3 · publisher trust</text>
+      <text class="layer-text" x="180" y="216" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">擋下未簽章擴充</text>
+
+      <rect class="layer layer-4" data-target="vg-w-annotated-trust-layers-r4" role="button" tabindex="0" aria-label="選擇 workspace trust 防線" x="30" y="245" width="300" height="60" rx="4" />
+      <text class="layer-text" x="180" y="271" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">L4 · workspace trust</text>
+      <text class="layer-text" x="180" y="291" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">restricted mode 守門</text>
+    </svg>
+
+    <div>
+      <div class="detail detail-1">
+        <h3>L1 · cross-origin iframe</h3>
+        <p><strong>防住</strong>：notebook 內容直接讀寫 host DOM 與 API。攻擊者全程沒碰到 host 物件。</p>
+        <p><strong>假設</strong>：iframe 與 host 之間唯一的橋（<code>postMessage</code> 轉發鍵盤）傳的是良性資料。它無從、也無責去判斷對側的鍵盤事件真偽。</p>
+      </div>
+      <div class="detail detail-2">
+        <h3>L2 · keybinding dispatch</h3>
+        <p><strong>防住</strong>：任意鍵擊觸發任意 command——只有被綁定的 command 會被觸發。</p>
+        <p><strong>假設</strong>：抵達的鍵盤事件是真人按的（<code>isTrusted</code>），且被觸發 command 所在的上下文是使用者預期的。兩個假設都被佈置好的通知推翻。</p>
+      </div>
+      <div class="detail detail-3">
+        <h3>L3 · publisher trust</h3>
+        <p><strong>防住</strong>：marketplace 上未經簽章的發行者的擴充。簽章機制本身沒被破。</p>
+        <p><strong>假設</strong>：只有可信內部路徑會帶 <code>skipPublisherTrust: true</code>；本地 workspace 擴充已由別人驗證過。兩者都被 keybinding 參數與 workspace trust 短路。</p>
+      </div>
+      <div class="detail detail-4">
+        <h3>L4 · workspace trust</h3>
+        <p><strong>防住</strong>：來路不明資料夾裡的擴充與 task 自動執行。</p>
+        <p><strong>假設</strong>：「使用者信任這個 workspace」等於「workspace 內容是安全的」。但在 github.dev，trusted 是預設值，而 repo 內容正是攻擊者可控的部分。</p>
+      </div>
+    </div>
+
+    <script>
+    (function () {
+      const root = document.querySelector('.vg-w-annotated-trust-layers');
+      root.querySelectorAll('.layer').forEach((rect) => {
+        rect.addEventListener('click', () => {
+          const id = rect.getAttribute('data-target');
+          const radio = root.querySelector('#' + id);
+          if (radio) radio.checked = true;
+        });
+        rect.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            rect.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+          }
+        });
+      });
+    })();
+    </script>
+  </figure>
+
+  <h2>真正的根因：四個正確假設疊出一條沒人設計過的路徑，以及微軟的 stopgap</h2>
+
+  <p>把錯誤候選逐一排除後，剩下的就是真相。沒有任何一道防線是壞的——根因是它們各自假設的「別人會負責」彼此並不交集。L1 假設 L2 會判斷鍵盤真偽；L2 假設抵達的事件是真的，且上下文是使用者預期的；L3 假設 workspace 擴充已被別人驗證、且只有內部路徑會帶 <code>skipPublisherTrust</code>；L4 假設「信任 workspace」等於「workspace 內容安全」。四個假設首尾相接，形成一個完整的環，而這個環裡沒有任何一處真的去驗證「這個鍵擊是不是真人按的」。攻擊者要做的，只是順著這四個假設沒覆蓋到的縫隙走一遍。</p>
+
+  <p>那張 token 是這條路徑的終點獎賞，也是為什麼這個漏洞值得當天讀。它存在 github.dev 的 <code>localStorage</code> 裡，是一張對使用者「所有可存取 repo」都有效的 OAuth token——不是 scope 到單一 repo，而是全域有效。任意程式執行一旦達成，讀它只是一句 <code>localStorage.getItem</code>，接著 <code>https://api.github.com/user/repos</code> 就能列舉所有私有 repo。下面這張表把終局事實與時間軸並排，讓你一眼看清這個漏洞的 blast radius 與修補節奏。</p>
+
+  <figure class="vg-w-table-token-facts">
+    <style>
+      .vg-w-table-token-facts { overflow-x: auto; margin: var(--s-4) 0; }
+      .vg-w-table-token-facts table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); }
+      .vg-w-table-token-facts caption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); text-align: left; margin-bottom: var(--s-2); }
+      .vg-w-table-token-facts th { font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.04em; color: var(--accent-text); text-align: left; border-bottom: 1px solid var(--line); padding: var(--s-1) var(--s-2); }
+      .vg-w-table-token-facts td { font-size: var(--fs-sm); border-bottom: 1px solid var(--line); padding: var(--s-1) var(--s-2); vertical-align: top; }
+      .vg-w-table-token-facts td:first-child { font-family: var(--sans); color: var(--ink-soft); white-space: nowrap; }
+      .vg-w-table-token-facts code { font-size: 0.85em; }
+    </style>
+    <table>
+      <caption>OAuth token 的存放、scope 與外洩路徑——blast radius 是「所有可存取 repo」而非單一 repo。</caption>
+      <thead>
+        <tr><th>面向</th><th>事實</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>存放位置</td><td>github.dev 的 <code>localStorage</code>，與被攻擊者控制的執行環境同 origin。</td></tr>
+        <tr><td>token 範圍</td><td>對使用者擁有或可存取的「全部 repo」都有效，不 scope 到單一 repo。</td></tr>
+        <tr><td>讀寫權限</td><td>read + write，可改 repo 內容，非僅讀取。</td></tr>
+        <tr><td>列舉方式</td><td><code>GET https://api.github.com/user/repos</code> 直接列出私有 repo。</td></tr>
+        <tr><td>取得成本</td><td>任意執行達成後一行 <code>localStorage.getItem</code>，無額外彈窗。</td></tr>
+      </tbody>
+    </table>
+  </figure>
+
+  <p>時間軸很短，也說明研究者選擇了 full disclosure：2026 年 6 月 2 日，研究者通報 GitHub Security——據其自述，僅在公開前約一小時——同時把 PoC 與完整寫法貼上部落格與 VSCode issue tracker。隔天，6 月 3 日，微軟就上了 stopgap。下面這條時間軸標出兩個關鍵時點與各自做了什麼。</p>
+
+  <figure class="vg-w-timeline-disclosure" data-svg-scroll="720">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>
+      </svg>
+      <span>通報到 stopgap 的時間軸 · 2 events over 2 days</span>
+    </p>
+    <svg viewBox="0 0 720 200" style="width: 100%; height: auto;">
+      <line x1="60" y1="80" x2="660" y2="80" stroke="var(--line)" stroke-width="2" />
+
+      <circle cx="180" cy="80" r="8" fill="var(--accent)" />
+      <text x="180" y="50" text-anchor="middle" font-family="EB Garamond, serif" font-size="16" fill="var(--ink)">2026-06-02</text>
+      <text x="180" y="112" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink-soft)">通報 GitHub Security</text>
+      <text x="180" y="132" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--muted)">（公開前約 1 小時）</text>
+      <text x="180" y="152" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--muted)">同步公開 PoC 與 issue</text>
+
+      <circle cx="540" cy="80" r="8" fill="var(--sage-deep)" />
+      <text x="540" y="50" text-anchor="middle" font-family="EB Garamond, serif" font-size="16" fill="var(--ink)">2026-06-03</text>
+      <text x="540" y="112" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink-soft)">微軟上 stopgap</text>
+      <text x="540" y="132" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--muted)">web VSCode 開 notebook 需確認對話框</text>
+      <text x="540" y="152" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--muted)">阻擋透過 command 繞過 trusted publisher</text>
+    </svg>
+  </figure>
+
+  <p>注意微軟的 stopgap 補的是哪兩處，這對理解根因是個好註腳。第一處是入口端——在 web VSCode 打開 notebook 時加一個確認對話框，把 step 1 那個「零互動就執行」變成「至少要點一下」。第二處直指 L3 的縫——阻擋透過 command 去繞過 trusted publisher 檢查，也就是堵住 step 4 那條把 <code>skipPublisherTrust: true</code> 塞進 keybinding 參數的路。兩處都是針對「正確假設之間的接縫」打的補丁，而不是修某一道防線本身——因為每一道防線本身都沒壞。這也解釋了為什麼叫 stopgap 而非 fix：真正的修法，是要重新審視這四個假設彼此該如何握手，那是更長的工程。</p>
+
+  <p>把這個入口端改動拉成 before／after 來看，最能體會 stopgap 的著力點在哪。拖動中間的分隔線：左半是補丁前——打開 notebook 即觸發整條鏈，受害者零點選；右半是補丁後——同一份 notebook 先撞上一個確認對話框，攻擊鏈被攔在執行之前。它沒有修任何一道防線，只是在 step 1 的入口插了一個「真人意圖」的關卡。</p>
+
+  <figure class="vg-w-ba-stopgap" data-interactive="drag" data-svg-scroll="720">
+    <style>
+      .vg-w-ba-stopgap { position: relative; aspect-ratio: 16 / 9; overflow: hidden; margin: var(--s-4) 0; border: 1px solid var(--line); }
+      .vg-w-ba-stopgap .layer { position: absolute; inset: 0; }
+      .vg-w-ba-stopgap .after { clip-path: polygon(50% 0, 100% 0, 100% 100%, 50% 100%); }
+      .vg-w-ba-stopgap .divider {
+        position: absolute; top: 0; bottom: 0; left: 50%;
+        width: 32px; transform: translateX(-50%);
+        cursor: ew-resize; touch-action: none; z-index: 3;
+      }
+      .vg-w-ba-stopgap .divider::before {
+        content: ''; position: absolute; left: 50%; top: 0; bottom: 0;
+        width: 2px; transform: translateX(-50%); background: var(--accent);
+      }
+      .vg-w-ba-stopgap .divider::after {
+        content: '↔'; position: absolute; left: 50%; top: 50%;
+        transform: translate(-50%, -50%);
+        background: var(--accent); color: var(--bg);
+        width: 32px; height: 32px; border-radius: 50%;
+        display: grid; place-items: center;
+        font-family: var(--sans); font-size: 16px;
+      }
+      .vg-w-ba-stopgap figcaption { position: absolute; left: 0; right: 0; bottom: 0; }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M8 3v18"/><path d="M16 3v18"/><path d="m5 9-3 3 3 3"/><path d="m19 9 3 3-3 3"/>
+      </svg>
+      <span>拖動分隔線 · 對比 stopgap 前後的入口行為</span>
+    </p>
+
+    <svg class="layer before" viewBox="0 0 400 225">
+      <rect width="400" height="225" fill="var(--bg-soft)" />
+      <text x="200" y="34" text-anchor="middle" font-family="EB Garamond, serif" font-size="17" fill="var(--ink)">補丁前</text>
+      <rect x="40" y="58" width="320" height="44" rx="4" fill="var(--bg)" stroke="var(--muted-2)" />
+      <text x="200" y="85" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink-soft)">打開惡意 notebook</text>
+      <path d="M200 102 L200 124" stroke="var(--accent)" stroke-width="2" marker-end="url(#vg-w-ba-stopgap-arrow)" />
+      <rect x="40" y="126" width="320" height="44" rx="4" fill="var(--accent)" fill-opacity="0.18" stroke="var(--accent)" />
+      <text x="200" y="153" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--accent-text)">攻擊鏈立即執行 · 零點選</text>
+      <text x="200" y="200" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">無「真人意圖」關卡</text>
+      <defs>
+        <marker id="vg-w-ba-stopgap-arrow" markerWidth="8" markerHeight="8" refX="4" refY="6" orient="auto">
+          <path d="M1 1 L4 6 L7 1" fill="none" stroke="var(--accent)" stroke-width="1.5" />
+        </marker>
+      </defs>
+    </svg>
+
+    <svg class="layer after" viewBox="0 0 400 225" id="vg-w-ba-stopgap-after">
+      <rect width="400" height="225" fill="var(--bg)" />
+      <text x="200" y="34" text-anchor="middle" font-family="EB Garamond, serif" font-size="17" fill="var(--ink)">補丁後</text>
+      <rect x="40" y="58" width="320" height="44" rx="4" fill="var(--bg-soft)" stroke="var(--muted-2)" />
+      <text x="200" y="85" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink-soft)">打開同一份 notebook</text>
+      <path d="M200 102 L200 124" stroke="var(--sage-deep)" stroke-width="2" marker-end="url(#vg-w-ba-stopgap-arrow2)" />
+      <rect x="40" y="126" width="320" height="44" rx="4" fill="var(--sage)" fill-opacity="0.22" stroke="var(--sage-deep)" />
+      <text x="200" y="153" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--sage-deep)">確認對話框 · 攔在執行前</text>
+      <text x="200" y="200" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">要求真人點一下才繼續</text>
+      <defs>
+        <marker id="vg-w-ba-stopgap-arrow2" markerWidth="8" markerHeight="8" refX="4" refY="6" orient="auto">
+          <path d="M1 1 L4 6 L7 1" fill="none" stroke="var(--sage-deep)" stroke-width="1.5" />
+        </marker>
+      </defs>
+    </svg>
+
+    <div class="divider" id="vg-w-ba-stopgap-divider"></div>
+
+    <script>
+    (function () {
+      const root = document.querySelector('.vg-w-ba-stopgap');
+      const after = root.querySelector('#vg-w-ba-stopgap-after');
+      const divider = root.querySelector('#vg-w-ba-stopgap-divider');
+      let dragging = false;
+      function setPct(pct) {
+        const clamped = Math.max(0, Math.min(100, pct));
+        after.style.clipPath = `polygon(${clamped}% 0, 100% 0, 100% 100%, ${clamped}% 100%)`;
+        divider.style.left = `${clamped}%`;
+      }
+      divider.addEventListener('pointerdown', (e) => {
+        dragging = true;
+        divider.setPointerCapture(e.pointerId);
+      });
+      root.addEventListener('pointermove', (e) => {
+        if (!dragging) return;
+        const rect = root.getBoundingClientRect();
+        setPct(((e.clientX - rect.left) / rect.width) * 100);
+      });
+      root.addEventListener('pointerup', () => { dragging = false; });
+      root.addEventListener('pointercancel', () => { dragging = false; });
+    })();
+    </script>
+  </figure>
+
+  <p>對下週要出貨的人，這件事的可操作含義有三層。其一，任何把安全決策押在「事件來自真實使用者」上的設計，只要那個事件曾經跨過一道 <code>postMessage</code> 或任何序列化邊界，<code>isTrusted</code> 就已經沒了，你必須在邊界的可信側重新建立來源證明，而不是假設它還在。其二，能力旗標（像 <code>skipPublisherTrust</code>）若會出現在任何使用者或擴充可控的資料結構裡——keybinding 參數、設定檔、URL query——就等於把它變成了公開 API，內部假設立刻失效。其三，「信任」是有語意的，一個 workspace 的 trusted 在桌面與在 github.dev 指的不是同一件事；把同一個布林值跨環境複用，語意偷換往往就藏在那裡。</p>
+
+  <p>把這三層收成一條更普遍的工程原則：信任邊界不是畫在元件之間，而是畫在「假設」之間。L1 與 L2 之間有一條物理邊界（origin），但真正的信任邊界其實落在 L2 內部——在「host 收到 did-keydown」與「host 決定讓它觸發 command」之間。那一刻才是該重新驗證來源的地方，而當初沒人在那裡立一道關卡，因為從每個元件各自的視角看，都覺得來源驗證是上游或下游別人的事。這就是為什麼純靠「把系統拆成隔離良好的元件」並不自動帶來安全：隔離保證了元件 A 動不了元件 B 的內部狀態，但保證不了 A 餵給 B 的資料不會讓 B 在自己的職權內做出 A 想要的事。confused deputy 攻擊永遠是這個形狀——你不需要奪取代理人的權限，你只需要讓握有權限的代理人替你辦事。</p>
+
+  <p>還有一個容易被忽略的元層次教訓，關於 full disclosure 本身。研究者選擇在通報後約一小時就公開 PoC，這在 responsible disclosure 的光譜上偏激進，可辯論之處不少。但從防守方角度看，這個漏洞的特性使得「立即公開」的危害相對可控：它需要受害者主動打開一份惡意 notebook，攻擊面是社交工程觸發而非蠕蟲式自傳播；而微軟能在一天內上 stopgap，也說明這類縫隙的止血點（加確認對話框、堵 command 旁路）是可以快速定位的——前提是有人先把這四道防線如何串接講清楚。一份把「每道防線各自合理、串起來卻崩」說明白的 disclosure，本身就是修補的一半。</p>
+
+  <p class="vg-deep-closer"><strong>Take-away</strong>：當每一道防線單看都無懈可擊、漏洞卻真實存在時，別再追問「哪一道壞了」——去畫出每一道「防住什麼／假設什麼」的清單，縫隙永遠長在某一道的假設與另一道的職責不交集的那條接縫上。</p>
+</div>

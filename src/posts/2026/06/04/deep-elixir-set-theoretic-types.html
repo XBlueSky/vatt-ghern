@@ -1,0 +1,584 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">沒有寫任何一行型別註記，編譯器卻能告訴你第 47 行那個 <code>data.a + data</code> 在 runtime 一定會炸——因為它早已把 <code>data</code> 收斂成一張 map，而你又把整張 map 當數字加。</p>
+  <h1 class="vg-post-title">Elixir 把 set-theoretic 型別變成預設——dynamic()、narrowing 與 verified bug 的編譯期帳本</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p><span class="vg-dropcap">E</span>lixir 1.20 把醞釀自 2022 的 set-theoretic gradual typing 系統推成語言預設。它不是一個你要 opt-in 的外掛工具，也不是一套要你先補滿 spec 才會動的型別檢查器——它對整個程式做推論與檢查，前提是你一個型別都不必寫。這套系統的野心很明確：在不要求 annotation、不破壞既有程式、且把 false positive 壓到極低的前提下，找出那些「執行到就一定會爆」的型別違規。本文拆解它的構造——型別怎麼用 union／intersection／negation 描述、為什麼 <code>dynamic()</code> 不是傳統 gradual typing 的 <code>any()</code>、narrowing 的推論機制長什麼樣、verified bug 與一般 warning 的判準在哪、為什麼 false-positive 率壓得下來，以及它和 Dialyzer 的 success typing 差在哪。</p>
+
+  <h2>用 union、intersection、negation 描述型別</h2>
+
+  <p>set-theoretic typing 的核心很簡單——型別就是值的集合，而集合天生支援三個運算：聯集、交集、補集。把這三個運算當成型別語言的一級公民，整套型別系統就獲得了一種傳統 nominal／structural 型別表達不出來的精確度。</p>
+
+  <p>聯集寫成 <code>integer() or binary()</code>，意思是「這個值要嘛是整數，要嘛是 binary」。這不是某個被人為命名的 sum type，而是兩個型別集合的直接 union——任何兩個型別都能即時 or 起來，不需要先宣告一個 wrapper。Elixir 的函式天生會回傳 <code>{:ok, value}</code> 或 <code>:error</code> 這種形狀，union 正好是描述它們的母語。</p>
+
+  <p>交集多半隱含在 guard 裡。當你寫 <code>is_list(x) and is_integer(y)</code>，型別系統把它讀成兩條約束的交集——<code>x</code> 落在 <code>list()</code>、<code>y</code> 落在 <code>integer()</code>。intersection 也是描述「同時滿足多個形狀」的工具，例如一個既是 map 又必須含某個 key 的值。</p>
+
+  <p>補集（negation）是這套系統最不傳統、也最有威力的一塊。當程式碼裡出現 <code>not is_map_key(x, :foo)</code>，型別系統推得出 <code>x</code> 的型別是 <code>%{..., foo: not_set()}</code>——一張 map，其中 <code>:foo</code> 這個 key 明確「不存在」。negation 讓系統能描述「不是某個東西」，而這正是 case 分支用來剔除可能性的關鍵：走到某個分支，意味著前面的 pattern 都沒中，於是那些型別被 negate 掉了。</p>
+
+  <p>把三個運算組合起來，型別就成了一種代數。leading 的 <code>...</code> 是另一個約定——<code>%{..., a: number()}</code> 表示「一張至少含 <code>a: number()</code> 的 map，其他 key 不限」，相對於封閉的 <code>%{a: number()}</code>（只有這一個 key）。這個開放／封閉的區別在 narrowing 時會反覆出現：每觀察到一次 field access，就往這張 map 上多釘一條約束。</p>
+
+  <h2>narrowing——型別隨變數被使用而精煉</h2>
+
+  <p>傳統 gradual typing 的型別在變數宣告當下就定死了；set-theoretic 系統的型別卻是「邊用邊收斂」。這就是 narrowing——一個變數的型別，會隨著你對它做的每一個操作而被精煉。下面這個 playground 把 narrowing 拆成一條操作流水線：你沿著流水線推進，看 <code>data</code> 的推論型別怎麼一步步收緊。</p>
+
+  <figure class="vg-w-param-narrow-elixir" data-svg-scroll="720">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M5 9l-3 3 3 3"/><path d="M9 5l3-3 3 3"/><path d="M15 19l-3 3-3-3"/><path d="M19 9l3 3-3 3"/><path d="M2 12h20"/><path d="M12 2v20"/>
+      </svg>
+      <span>拖曳滑桿沿操作流水線推進 · 5 個步驟逐步收斂型別</span>
+    </p>
+    <style>
+      .vg-w-param-narrow-elixir { display: grid; grid-template-rows: auto auto auto; gap: var(--s-2); margin: var(--s-4) 0; }
+      .vg-w-param-narrow-elixir .ctl { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+      .vg-w-param-narrow-elixir .ctl input { flex: 1; height: 36px; accent-color: var(--accent); touch-action: none; }
+      .vg-w-param-narrow-elixir .ctl .step-readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 4ch; text-align: right; }
+      .vg-w-param-narrow-elixir svg.vg-w-param-narrow-elixir-main { width: 100%; height: auto; }
+      .vg-w-param-narrow-elixir .panel { border-left: 2px solid var(--accent); padding: var(--s-2); background: var(--bg-soft); }
+      .vg-w-param-narrow-elixir .panel .op { font-family: var(--mono); font-size: var(--fs-sm); color: var(--accent-text); margin: 0 0 var(--s-1) 0; }
+      .vg-w-param-narrow-elixir .panel .ty { font-family: var(--mono); font-size: var(--fs-md); color: var(--ink); margin: 0 0 var(--s-1) 0; word-break: break-word; }
+      .vg-w-param-narrow-elixir .panel .note { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin: 0; line-height: 1.5; }
+    </style>
+
+    <div class="ctl">
+      <label for="vg-w-param-narrow-elixir-x">操作步數</label>
+      <input id="vg-w-param-narrow-elixir-x" type="range" min="0" max="4" step="1" value="0" aria-label="narrowing 操作步數" />
+      <span class="step-readout" id="vg-w-param-narrow-elixir-readout">0 / 4</span>
+    </div>
+
+    <svg class="vg-w-param-narrow-elixir-main" viewBox="0 0 720 200" preserveAspectRatio="xMidYMid meet" role="img" aria-label="narrowing 操作流水線">
+      <line x1="48" y1="60" x2="672" y2="60" stroke="var(--muted-2)" stroke-width="1.5" />
+      <g id="vg-w-param-narrow-elixir-stops"></g>
+      <circle id="vg-w-param-narrow-elixir-cursor" cx="48" cy="60" r="9" fill="var(--accent)" />
+      <text x="360" y="160" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--muted)">每個節點是一次對 data 的觀察；型別只會變窄，不會變寬</text>
+    </svg>
+
+    <div class="panel">
+      <p class="op" id="vg-w-param-narrow-elixir-op">起點</p>
+      <p class="ty" id="vg-w-param-narrow-elixir-ty">data :: dynamic()</p>
+      <p class="note" id="vg-w-param-narrow-elixir-note">尚未對 data 做任何觀察，型別維持在最寬的 dynamic()。</p>
+    </div>
+
+    <script>
+    (function () {
+      const root = document.querySelector('.vg-w-param-narrow-elixir');
+      const input = root.querySelector('#vg-w-param-narrow-elixir-x');
+      const readout = root.querySelector('#vg-w-param-narrow-elixir-readout');
+      const cursor = root.querySelector('#vg-w-param-narrow-elixir-cursor');
+      const stopsG = root.querySelector('#vg-w-param-narrow-elixir-stops');
+      const opEl = root.querySelector('#vg-w-param-narrow-elixir-op');
+      const tyEl = root.querySelector('#vg-w-param-narrow-elixir-ty');
+      const noteEl = root.querySelector('#vg-w-param-narrow-elixir-note');
+
+      const STEPS = [
+        { label: 'start', op: '起點', ty: 'data :: dynamic()',
+          note: '尚未對 data 做任何觀察，型別維持在最寬的 dynamic()。' },
+        { label: 'data.a', op: 'data.a', ty: 'data :: %{..., a: term()}',
+          note: '存取 .a 這個 field，逼出 data 至少是一張含 a 的 open map；其他 key 不限。' },
+        { label: 'data.a + 1', op: 'data.a + 1', ty: 'data :: %{..., a: number()}',
+          note: '把 .a 拿去做算術，a 從 term() 收斂到 number()。' },
+        { label: '+ data.b', op: 'data.a + data.b', ty: 'data :: %{..., a: number(), b: number()}',
+          note: '再存取並相加 .b，map 上多釘一條約束 b: number()。' },
+        { label: 'when is_integer', op: 'when is_integer(data.a)', ty: 'data :: %{..., a: integer(), b: number()}',
+          note: '一道 guard 把 a 從 number()（含 float）再收斂到 integer()。' },
+      ];
+
+      const X0 = 48, X1 = 672, Y = 60;
+      function xOf(i) { return X0 + (i / (STEPS.length - 1)) * (X1 - X0); }
+
+      STEPS.forEach((s, i) => {
+        const c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+        c.setAttribute('cx', xOf(i)); c.setAttribute('cy', Y); c.setAttribute('r', 5);
+        c.setAttribute('fill', 'var(--bg)'); c.setAttribute('stroke', 'var(--muted-2)'); c.setAttribute('stroke-width', '1.5');
+        stopsG.appendChild(c);
+        const t = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+        t.setAttribute('x', xOf(i)); t.setAttribute('y', i % 2 === 0 ? 96 : 110);
+        t.setAttribute('text-anchor', 'middle');
+        t.setAttribute('font-family', 'JetBrains Mono, monospace'); t.setAttribute('font-size', '12');
+        t.setAttribute('fill', 'var(--muted)'); t.textContent = s.label;
+        stopsG.appendChild(t);
+      });
+
+      function update() {
+        const i = Number(input.value);
+        const s = STEPS[i];
+        readout.textContent = i + ' / 4';
+        cursor.setAttribute('cx', xOf(i));
+        opEl.textContent = s.op;
+        tyEl.textContent = s.ty;
+        noteEl.textContent = s.note;
+      }
+      input.addEventListener('input', update);
+      update();
+    })();
+    </script>
+    <figcaption>每一步都是對 data 的一次「使用」；型別只朝著更窄的方向走。最後 <code>data.a + data</code> 之所以會被報違規，正是因為 data 已被推成 map，而你又把整張 map 當 number 加。</figcaption>
+  </figure>
+
+  <p>把這條流水線寫成真正的 Elixir，就是這樣一段函式：</p>
+
+  <pre><code class="language-elixir">def add_a_and_b(data) do
+  data.a + data.b
+end</code></pre>
+
+  <p>在這個函式體裡，<code>data</code> 從進來時的 <code>dynamic()</code>，被 <code>.a</code> 與 <code>.b</code> 兩次 field access 加上算術運算，narrow 成 <code>%{..., a: number(), b: number()}</code>。系統沒有要你寫任何 spec——它純粹從「你怎麼用這個變數」反推出它必須是什麼。一旦推到這裡，後面若再出現 <code>data.a + data</code>（把整張 map 拿去和 number 相加），就成了一個無法調和的矛盾：<code>data</code> 同時被要求是 map（因為 <code>.a</code>）又是 number（因為它被當加數）。這個矛盾不是猜測，是 narrowing 累積出來的結論。</p>
+
+  <p>值得停下來看清楚 narrowing 的單調性——型別只會變窄，不會變寬。每一次對 <code>data</code> 的觀察，都是在它現有的型別上再交集一條新約束：存取 <code>.a</code> 交上 <code>%{..., a: term()}</code>，把 <code>.a</code> 拿去做算術再交上 <code>%{..., a: number()}</code>，多存取一個 <code>.b</code> 又釘上 <code>b: number()</code>。intersection 是這條收斂的底層運算，而 intersection 的結果永遠不會比兩個輸入更寬。這個單調性是整套推論能終止、也能被信任的根本——系統不需要回頭推翻先前的結論，只需要一路把約束疊上去。當這串約束疊到自相矛盾（同一個變數被要求既是 map 又是 number），矛盾就是 narrowing 的自然產物，而不是另外跑一輪分析才湊出來的判斷。</p>
+
+  <p>同一個變數在不同 scope 裡可以 narrow 成不同型別，這一點對理解誤報率很關鍵。一個函式參數進來是 <code>dynamic()</code>，在 case 的某一分支被收斂成 <code>binary()</code>，在另一分支被收斂成 <code>nil</code>——這兩個收斂彼此獨立，互不污染。narrowing 是區域性的、跟著控制流走的，系統不會把某一分支裡學到的約束錯誤地套到另一分支。正因如此，它對 Elixir 那種「同一個變數在不同分支代表不同情形」的慣用寫法貼合得很好，而不會因為一個變數在某處被用成 map 就武斷地認定它到處都是 map。</p>
+
+  <p>narrowing 不只發生在 field access。guard、pattern match、case 分支都是 narrowing 的來源，這正是 1.20 把型別檢查鋪到語言全部控制流的原因。</p>
+
+  <h2>guard、pattern matching、case 都被收進推論</h2>
+
+  <p>1.20 的型別檢查覆蓋了 Elixir 三種最常見的控制流構造，每一種都被當成 narrowing 的訊號源。</p>
+
+  <p><strong>guard</strong> 是最直接的一種。一道 <code>when is_binary(x) or is_integer(x)</code> 直接把 <code>x</code> 收斂成 <code>binary() or integer()</code>。更精巧的是尺寸類 guard——<code>tuple_size(x) &lt; 3</code> 讓系統記住「<code>x</code> 至多兩個元素」，於是之後若出現 <code>elem(x, 3)</code>，系統知道這個 index 必然越界，直接報違規。map／list 的尺寸檢查也被轉成「是否為空」的分析。</p>
+
+  <p><strong>pattern matching</strong> 把解構與型別推論綁在一起：</p>
+
+  <pre><code class="language-elixir">def example({:ok, x} = y) when is_binary(x) or is_integer(x)</code></pre>
+
+  <p>這一行同時做了兩件事：pattern <code>{:ok, x} = y</code> 推得 <code>y :: {:ok, binary() or integer()}</code>，而綁在裡頭的 <code>x</code> 被 guard 收斂成 <code>binary() or integer()</code>。tuple 的形狀、元素的型別、外層 binding 的型別，全在一行裡被推完。</p>
+
+  <p><strong>case</strong> 的威力在於分支之間的型別會互相剔除。看這段幾乎每個 Elixir 程式都會寫的程式：</p>
+
+  <pre><code class="language-elixir">case System.get_env("SOME_VAR") do
+  nil -> :not_found
+  value -> {:ok, String.upcase(value)}
+end</code></pre>
+
+  <p><code>System.get_env/1</code> 回傳 <code>binary() or nil</code>。第一個分支吃掉 <code>nil</code>，於是走到第二個分支時，<code>value</code> 的型別被 narrow 成「不可能是 <code>nil</code>」——也就是 <code>binary()</code>。系統因此知道 <code>String.upcase(value)</code> 是安全的，不會誤報。這是 negation 在 case 上的具體應用：第二分支的型別是「原型別」減去「前面分支已匹配的型別」。下面這個切換器把這套「分支剔除」攤開來看。</p>
+
+  <div class="vg-w-tabs-case-elixir">
+    <style>
+      .vg-w-tabs-case-elixir { display: grid; gap: var(--s-2); margin: var(--s-4) 0; }
+      .vg-w-tabs-case-elixir input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-tabs-case-elixir .tabs { display: flex; gap: var(--s-2); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+      .vg-w-tabs-case-elixir .tab { font-family: var(--sans); font-size: var(--fs-sm); padding: var(--s-1) var(--s-2); cursor: pointer; color: var(--muted); min-height: 44px; display: flex; align-items: center; }
+      .vg-w-tabs-case-elixir .panel { display: none; padding: var(--s-2); border-left: 2px solid var(--accent); background: var(--bg-soft); }
+      .vg-w-tabs-case-elixir .panel .ty { font-family: var(--mono); font-size: var(--fs-md); color: var(--ink); margin: 0 0 var(--s-1) 0; }
+      .vg-w-tabs-case-elixir .panel p.exp { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin: 0; line-height: 1.6; }
+      .vg-w-tabs-case-elixir:has(#vg-w-tabs-case-elixir-t1:checked) .panel-1 { display: block; }
+      .vg-w-tabs-case-elixir:has(#vg-w-tabs-case-elixir-t1:checked) [for="vg-w-tabs-case-elixir-t1"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-case-elixir:has(#vg-w-tabs-case-elixir-t2:checked) .panel-2 { display: block; }
+      .vg-w-tabs-case-elixir:has(#vg-w-tabs-case-elixir-t2:checked) [for="vg-w-tabs-case-elixir-t2"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-case-elixir:has(#vg-w-tabs-case-elixir-t3:checked) .panel-3 { display: block; }
+      .vg-w-tabs-case-elixir:has(#vg-w-tabs-case-elixir-t3:checked) [for="vg-w-tabs-case-elixir-t3"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    </style>
+    <input type="radio" id="vg-w-tabs-case-elixir-t1" name="vg-w-tabs-case-elixir-sel" checked />
+    <input type="radio" id="vg-w-tabs-case-elixir-t2" name="vg-w-tabs-case-elixir-sel" />
+    <input type="radio" id="vg-w-tabs-case-elixir-t3" name="vg-w-tabs-case-elixir-sel" />
+    <div class="tabs">
+      <label class="tab" for="vg-w-tabs-case-elixir-t1">表達式入口</label>
+      <label class="tab" for="vg-w-tabs-case-elixir-t2">nil 分支</label>
+      <label class="tab" for="vg-w-tabs-case-elixir-t3">value 分支</label>
+    </div>
+    <div class="panel panel-1">
+      <p class="ty">System.get_env("SOME_VAR") :: binary() or nil</p>
+      <p class="exp">case 主題的型別是 binary() 與 nil 的 union。每個分支會「吃掉」這個 union 的一部分，並把剩下的傳給下一個分支。</p>
+    </div>
+    <div class="panel panel-2">
+      <p class="ty">nil -&gt; 匹配並移除 nil</p>
+      <p class="exp">第一個 pattern 精確匹配 nil。走進這個分支代表主題就是 nil；同時，從後續分支的視角看，nil 已被 negate 掉。剩餘型別變為 (binary() or nil) and not(nil) = binary()。</p>
+    </div>
+    <div class="panel panel-3">
+      <p class="ty">value :: binary()</p>
+      <p class="exp">value 綁定到「扣掉 nil」後的剩餘型別，也就是 binary()。因此 String.upcase(value) 完全合法——系統不會誤報。這就是 case narrowing 把 false positive 壓低的機制。</p>
+    </div>
+  </div>
+
+  <p>三種構造合起來，narrowing 就不再是 field access 的局部花招，而是貫穿整個函式控制流的推論機制。系統在每個分歧點都重新計算「此處變數還可能是什麼」，並把不可能的情形用 negation 削掉。</p>
+
+  <h2>dynamic() 為什麼不是 any()</h2>
+
+  <p>傳統 gradual typing 的逃生艙是 <code>any()</code>——標成 <code>any()</code> 的值，型別檢查器一律放行，不報任何違規。這讓 gradual typing 在實務上常常退化成「動態型別加一層裝飾」：只要某處塞了 <code>any()</code>，矛盾就被它吸收掉。Elixir 的 <code>dynamic()</code> 走的是完全相反的路——它不是「什麼都行」，而是「在 dynamic 範圍內，仍然套用 set-theoretic 的相容性判準」。差別落在兩個性質上：compatibility 與 narrowing。</p>
+
+  <p><strong>compatibility</strong> 決定何時報違規。把一個 <code>dynamic(integer() or binary())</code> 餵給一個只接受 map 的函式，<code>any()</code> 會默默放行；<code>dynamic()</code> 則檢查供給型別與接受型別是否 disjoint。只有在兩者「完全不相交」時，才算違規。如果兩者有任何 overlap，系統就假設那次呼叫落在交集裡，放行。這是一條刻意保守的規則——它的目的不是抓出所有可疑之處，而是只在「絕無可能成立」時才喊停。</p>
+
+  <p>這條「只在完全 disjoint 時才喊」的規則，避開的正是傳統 gradual typing 最折磨人的那一類 false positive。設想一個函式宣稱接受 <code>integer() or atom()</code>，而你傳進去的值被推成 <code>dynamic(integer() or binary())</code>。這兩個型別有交集——<code>integer()</code> 同時落在供給與接受兩側。一個天真的型別檢查器可能因為 <code>binary()</code> 這一支不被接受就報違規，但這次呼叫在 runtime 完全可能成功（只要實際傳進去的是整數）。<code>dynamic()</code> 的 compatibility 規則因此選擇放行：既然兩集合相交，系統就假設這次呼叫落在交集裡，不喊。它寧可錯過一個「有時會炸」的可疑呼叫，也不願誤殺一個「有時合法」的程式——因為前者頂多漏報，後者卻會教開發者學會無視警告。</p>
+
+  <p>把這件事說得更直白：<code>any()</code> 的問題不在於它太寬，而在於它讓矛盾消失。任何牽涉 <code>any()</code> 的操作，型別檢查器都查不出問題，因為 <code>any()</code> 與一切相容。<code>dynamic()</code> 反過來——它一樣寬，但寬不等於沉默。它保留了 set-theoretic 的全部判準，只是把「報違規」的門檻設在 disjoint 這條最保守的線上。於是你得到一個既不會因為塞了逃生艙就整段失明、又不會對相交型別亂喊的中間地帶。這是 1.20 能對海量無註記程式做出「有用但不吵」分析的關鍵設計取捨。</p>
+
+  <p><strong>narrowing</strong> 則讓 <code>dynamic()</code> 不會永遠停在最寬。前一節那條流水線就是 dynamic 值被 narrow 的過程：即使 <code>data</code> 進來是 <code>dynamic()</code>，一旦你用 <code>.a</code>，它在這個 scope 內就被收斂成含 <code>a</code> 的 map。<code>any()</code> 沒有這個能力——它是一個吸收一切的黑洞，而 <code>dynamic()</code> 是一個會隨上下文收緊的窗。</p>
+
+  <p>下面這個切換器把 compatibility 的判準攤開：拖動讓供給型別與接受型別從 disjoint 滑到 overlapping，看系統的判決如何翻轉。</p>
+
+  <figure class="vg-w-compat-elixir" data-svg-scroll="720">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M5 9l-3 3 3 3"/><path d="M9 5l3-3 3 3"/><path d="M15 19l-3 3-3-3"/><path d="M19 9l3 3-3 3"/><path d="M2 12h20"/><path d="M12 2v20"/>
+      </svg>
+      <span>拖曳滑桿讓兩個型別集合分離或重疊 · 看 disjoint 與 overlap 各自的判決</span>
+    </p>
+    <style>
+      .vg-w-compat-elixir { display: grid; grid-template-rows: auto auto auto; gap: var(--s-2); margin: var(--s-4) 0; }
+      .vg-w-compat-elixir .ctl { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+      .vg-w-compat-elixir .ctl input { flex: 1; height: 36px; accent-color: var(--accent); touch-action: none; }
+      .vg-w-compat-elixir .ctl .ov-readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 7ch; text-align: right; }
+      .vg-w-compat-elixir svg.vg-w-compat-elixir-main { width: 100%; height: auto; }
+      .vg-w-compat-elixir .verdict { font-family: var(--mono); font-size: var(--fs-md); padding: var(--s-2); border-left: 2px solid var(--accent); background: var(--bg-soft); }
+      .vg-w-compat-elixir .verdict .lead { color: var(--ink); margin: 0 0 var(--s-1) 0; }
+      .vg-w-compat-elixir .verdict .sub { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin: 0; line-height: 1.5; }
+    </style>
+
+    <div class="ctl">
+      <label for="vg-w-compat-elixir-x">供給／接受重疊度</label>
+      <input id="vg-w-compat-elixir-x" type="range" min="0" max="100" step="1" value="0" aria-label="供給與接受型別的重疊度" />
+      <span class="ov-readout" id="vg-w-compat-elixir-readout">0%</span>
+    </div>
+
+    <svg class="vg-w-compat-elixir-main" viewBox="0 0 720 240" preserveAspectRatio="xMidYMid meet" role="img" aria-label="供給型別與接受型別的交集">
+      <circle id="vg-w-compat-elixir-supplied" cx="260" cy="120" r="92" fill="var(--accent)" fill-opacity="0.16" stroke="var(--accent)" stroke-width="1.5" />
+      <circle id="vg-w-compat-elixir-accepted" cx="540" cy="120" r="92" fill="var(--sage)" fill-opacity="0.16" stroke="var(--sage-deep)" stroke-width="1.5" />
+      <text id="vg-w-compat-elixir-lbl-s" x="260" y="40" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--accent-text)">supplied</text>
+      <text id="vg-w-compat-elixir-lbl-a" x="540" y="40" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--sage-deep)">accepted</text>
+      <text x="360" y="222" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--muted)">只有當兩集合完全 disjoint，compatibility 才判違規</text>
+    </svg>
+
+    <div class="verdict">
+      <p class="lead" id="vg-w-compat-elixir-lead">disjoint —— 違規</p>
+      <p class="sub" id="vg-w-compat-elixir-sub">供給與接受型別毫無交集，這次呼叫不可能成立，系統報違規。</p>
+    </div>
+
+    <script>
+    (function () {
+      const root = document.querySelector('.vg-w-compat-elixir');
+      const input = root.querySelector('#vg-w-compat-elixir-x');
+      const readout = root.querySelector('#vg-w-compat-elixir-readout');
+      const cS = root.querySelector('#vg-w-compat-elixir-supplied');
+      const cA = root.querySelector('#vg-w-compat-elixir-accepted');
+      const lblS = root.querySelector('#vg-w-compat-elixir-lbl-s');
+      const lblA = root.querySelector('#vg-w-compat-elixir-lbl-a');
+      const lead = root.querySelector('#vg-w-compat-elixir-lead');
+      const sub = root.querySelector('#vg-w-compat-elixir-sub');
+
+      const R = 92, CY = 120;
+      const FAR = 260, NEAR = 460; // supplied cx range; accepted is mirror across 400
+
+      function update() {
+        const ov = Number(input.value); // 0..100 overlap intent
+        readout.textContent = ov + '%';
+        const sx = FAR + (NEAR - FAR) * (ov / 100);
+        const ax = 800 - sx;
+        cS.setAttribute('cx', sx);
+        cA.setAttribute('cx', ax);
+        lblS.setAttribute('x', sx);
+        lblA.setAttribute('x', ax);
+        const dist = ax - sx;
+        const disjoint = dist >= 2 * R; // circles not touching
+        if (disjoint) {
+          lead.textContent = 'disjoint —— 違規';
+          sub.textContent = '供給與接受型別毫無交集，這次呼叫不可能成立，系統報違規。';
+        } else {
+          lead.textContent = 'overlap —— 放行';
+          sub.textContent = '兩型別有交集，系統假設呼叫落在交集裡，不報違規——這正是 dynamic() 與 any() 的不同：保守，但不沉默。';
+        }
+      }
+      input.addEventListener('input', update);
+      update();
+    })();
+    </script>
+    <figcaption>判準只看「是否完全 disjoint」，不看交集多大。這條保守規則是 false-positive 率壓得下來的根本原因——系統寧可漏報一個可疑呼叫，也不誤殺一個可能合法的程式。</figcaption>
+  </figure>
+
+  <h2>verified bug 與 warning 的判準</h2>
+
+  <p>1.20 把它找到的問題分成兩個層級，這個區分是整套系統取信於開發者的關鍵。一般的 warning 是「這裡看起來可疑」；而 verified bug 是「這段程式如果執行到，runtime 保證會失敗」。後者不是推測，是斷言。</p>
+
+  <p>判準回到 compatibility：當供給型別與接受型別 disjoint，那次操作在任何 runtime 路徑下都不可能成功——這就是 verified bug。前面 <code>data.a + data</code> 的例子正是如此：<code>data</code> 已被 narrow 成 map，而 <code>+</code> 的另一個運算元要求 number，map 與 number 是 disjoint 的，這行只要被執行就一定炸。系統因此能拍胸脯說這是 bug，而不只是 code smell。</p>
+
+  <p>這個兩層分級之所以重要，是因為它直接決定了開發者會不會繼續看警告。一般 warning 帶著「可能」的語氣——它指向一處看起來不對勁、但未必會在每條路徑上失敗的地方，開發者讀的時候得自己判斷值不值得理。verified bug 則沒有這層曖昧——它的契約是「這行只要被執行，runtime 一定爆」。系統敢做這個斷言，是因為它背後站著 disjoint 這個不可動搖的數學事實：兩個毫無交集的型別之間，沒有任何一個值能同時屬於兩者，因此沒有任何 runtime 輸入能讓這次操作成功。warning 是啟發式的觀察，verified bug 是邏輯上的證明，兩者的可信度天差地別。把它們分開，開發者就能對 verified bug 給予近乎無條件的信任，而不必每次都退回去人工複查。</p>
+
+  <p>false-positive 率壓得低，根源也在這裡。系統只在能拿出 disjoint 證明時才升級成 verified bug，其餘一切疑點要嘛降級成普通 warning，要嘛乾脆沉默。這條紀律的代價是會漏掉一些「多數路徑會炸、但理論上存在一條僥倖成功路徑」的情形——這些被刻意放過了。但這正是設計者願意付的代價：一個會誤殺合法程式的工具，用不了幾次就會被整個團隊在 CI 裡靜音；而一個只在百分之百確定時才開口、開口就準的工具，才會被人真正信任並據以行動。誤報率不是一個被動的統計結果，而是被 disjoint 這條判準主動鎖住的設計指標。</p>
+
+  <p>同一套 disjoint 分析還順手抓出 <strong>dead code</strong>。當 case 的某個分支，其 pattern 的型別與「走到此處時主題還可能的型別」完全 disjoint，那個分支永遠不會被選中——它是死的。narrowing 跨分支累積出的剩餘型別，讓系統能標出既有 codebase 裡的冗餘分支與不可達程式。verified bug 與 dead code 共用同一個引擎：前者是「該成立卻不可能成立」，後者是「該被選中卻不可能被選中」。</p>
+
+  <p>把 disjoint 當判準的代價是保守——系統只在「百分之百會失敗」時才升級成 verified bug，其餘一律降級或沉默。官方的說法是，1.20 能在既有程式裡有效率地找出 verified bug，不增加開發者負擔，且 false positive 率極低。下面這個 slider 把 success typing 與 set-theoretic 對同一段程式的反應並排——左邊是 Dialyzer 的 success typing，右邊是 1.20。</p>
+
+  <figure class="vg-w-ba-elixir" data-interactive="drag">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M8 7l-5 5 5 5"/><path d="M16 7l5 5-5 5"/>
+      </svg>
+      <span>拖曳中線比較兩套系統對同一段程式的報告</span>
+    </p>
+    <style>
+      .vg-w-ba-elixir { margin: var(--s-4) 0; }
+      .vg-w-ba-elixir .stage { position: relative; aspect-ratio: 16 / 7; overflow: hidden; border: 1px solid var(--line); }
+      .vg-w-ba-elixir .layer { position: absolute; inset: 0; padding: var(--s-3); box-sizing: border-box; }
+      .vg-w-ba-elixir .before { padding-right: 50%; }
+      .vg-w-ba-elixir .after { padding-left: 50%; clip-path: polygon(50% 0, 100% 0, 100% 100%, 50% 100%); }
+      .vg-w-ba-elixir .before { clip-path: polygon(0 0, 50% 0, 50% 100%, 0 100%); }
+      .vg-w-ba-elixir h4 { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; margin: 0 0 var(--s-1) 0; color: var(--muted); }
+      .vg-w-ba-elixir .verdict-s { color: var(--muted); }
+      .vg-w-ba-elixir .verdict-st { color: var(--accent-text); }
+      .vg-w-ba-elixir p { font-family: var(--serif); font-size: var(--fs-sm); margin: 0 0 var(--s-1) 0; line-height: 1.5; }
+      .vg-w-ba-elixir code { font-family: var(--mono); font-size: var(--fs-xs); }
+      .vg-w-ba-elixir .divider { position: absolute; top: 0; bottom: 0; left: 50%; width: 32px; transform: translateX(-50%); cursor: ew-resize; touch-action: none; }
+      .vg-w-ba-elixir .divider::before { content: ''; position: absolute; left: 50%; top: 0; bottom: 0; width: 2px; transform: translateX(-50%); background: var(--accent); }
+      .vg-w-ba-elixir .divider::after { content: '↔'; position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); background: var(--accent); color: var(--bg); width: 32px; height: 32px; border-radius: 50%; display: grid; place-items: center; font-family: var(--sans); font-size: 16px; }
+      @media (max-width: 520px) {
+        .vg-w-ba-elixir .stage { aspect-ratio: auto; overflow: visible; }
+        .vg-w-ba-elixir .layer { position: relative; inset: auto; clip-path: none !important; }
+        .vg-w-ba-elixir .before { padding-right: var(--s-3); border-bottom: 1px solid var(--line); }
+        .vg-w-ba-elixir .after { padding-left: var(--s-3); }
+        .vg-w-ba-elixir .divider { display: none; }
+        .vg-w-ba-elixir .vg-w-affordance { display: none; }
+      }
+    </style>
+
+    <div class="stage">
+    <div class="layer before">
+      <h4>Dialyzer · success typing</h4>
+      <p><code>data.a + data</code></p>
+      <p class="verdict-s">傾向沉默。success typing 的設計哲學是「只報絕對成立的失敗」，且需要靠 inference 與 spec；對未標註程式的覆蓋與精度，常常不足以斷言這一行必敗。</p>
+    </div>
+    <div class="layer after">
+      <h4>Elixir 1.20 · set-theoretic</h4>
+      <p><code>data.a + data</code></p>
+      <p class="verdict-st">verified bug。data 已 narrow 成 map，與 number 的接受型別 disjoint——這行執行到必失敗。零註記、編譯期、極低誤報。</p>
+    </div>
+    <div class="divider" id="vg-w-ba-elixir-divider"></div>
+    </div>
+    <script>
+    (function () {
+      const root = document.querySelector('.vg-w-ba-elixir');
+      const stage = root.querySelector('.stage');
+      const before = root.querySelector('.before');
+      const after = root.querySelector('.after');
+      const divider = root.querySelector('#vg-w-ba-elixir-divider');
+      let dragging = false;
+      function setPct(pct) {
+        const c = Math.max(0, Math.min(100, pct));
+        before.style.clipPath = `polygon(0 0, ${c}% 0, ${c}% 100%, 0 100%)`;
+        after.style.clipPath = `polygon(${c}% 0, 100% 0, 100% 100%, ${c}% 100%)`;
+        divider.style.left = `${c}%`;
+      }
+      divider.addEventListener('pointerdown', (e) => { dragging = true; divider.setPointerCapture(e.pointerId); });
+      stage.addEventListener('pointermove', (e) => {
+        if (!dragging) return;
+        const r = stage.getBoundingClientRect();
+        setPct(((e.clientX - r.left) / r.width) * 100);
+      });
+      stage.addEventListener('pointerup', () => { dragging = false; });
+      stage.addEventListener('pointercancel', () => { dragging = false; });
+    })();
+    </script>
+    <figcaption>兩者哲學相近——都只在有把握時才喊——但實作路徑不同。success typing 是 BEAM 上的 over-approximation；set-theoretic 把 union／intersection／negation 當一級運算，narrowing 讓它在無註記下也能對控制流做精確推論。</figcaption>
+  </figure>
+
+  <p>這個對照值得展開，因為 Elixir 社群對「BEAM 上的型別分析」並不陌生——Dialyzer 的 success typing 早已是 Erlang／Elixir 世界的既有方案。理解 1.20 的價值，最快的路徑是看它和 success typing 在哲學與機制上的異同。</p>
+
+  <p>相同之處在於「保守」這個取向。success typing 的核心信條是寧可漏報、絕不誤殺——它只在能證明某個呼叫必定失敗時才警告。set-theoretic 的 compatibility 規則骨子裡是同一種克制：只有 disjoint 才報違規。兩者都把「不誤殺合法程式」放在「抓出所有 bug」之上，因為一旦誤報多了，開發者就會整體忽略警告，工具的價值歸零。</p>
+
+  <p>差異在於表達力與覆蓋。success typing 在 BEAM 層做 over-approximation，對未標 spec 的程式，其推論精度與對 Elixir 語言構造（pattern、guard、protocol）的貼合度有限。set-theoretic 系統把 union／intersection／negation 設成一級運算，narrowing 機制讓它能在零註記下沿控制流逐步收斂型別，於是對 case 分支剔除、guard 收斂、field access 這類 Elixir 慣用法的推論精度高得多。更關鍵的是定位：1.20 不是一個要你另外跑的工具，而是語言預設的一部分——每次編譯都在做。</p>
+
+  <p>1.20 的另一張底牌是基準成績。它在 If T: Benchmark for Type Narrowing 的 13 個類別裡通過了 12 個——這是一套專門量測 type narrowing 能力的基準。下表把覆蓋面攤開。</p>
+
+  <figure class="vg-w-table-elixir">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/><path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+      </svg>
+      <span>點欄位標題排序 · narrowing 來源 × 機制 × 狀態</span>
+    </p>
+    <style>
+      .vg-w-table-elixir { overflow-x: auto; margin: var(--s-4) 0; }
+      .vg-w-table-elixir table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-elixir thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; }
+      .vg-w-table-elixir thead th[data-sort] { color: var(--accent-text); }
+      .vg-w-table-elixir tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+      .vg-w-table-elixir td.mono { font-family: var(--mono); font-size: var(--fs-xs); color: var(--ink-deep); }
+    </style>
+    <table>
+      <thead>
+        <tr>
+          <th data-key="src">narrowing 來源</th>
+          <th data-key="mech">收斂機制</th>
+          <th data-key="ex">範例構造</th>
+          <th data-key="status">狀態</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>field access</td><td>open map 釘約束</td><td class="mono">data.a</td><td>covered</td></tr>
+        <tr><td>type guard</td><td>union 收斂</td><td class="mono">is_binary(x) or is_integer(x)</td><td>covered</td></tr>
+        <tr><td>size guard</td><td>越界／空性分析</td><td class="mono">tuple_size(x) &lt; 3</td><td>covered</td></tr>
+        <tr><td>key guard</td><td>negation 補集</td><td class="mono">not is_map_key(x, :foo)</td><td>covered</td></tr>
+        <tr><td>pattern match</td><td>解構 + binding 推論</td><td class="mono">{:ok, x} = y</td><td>covered</td></tr>
+        <tr><td>case 分支</td><td>分支剔除 negation</td><td class="mono">nil -&gt; ...; value -&gt; ...</td><td>covered</td></tr>
+        <tr><td>dead code</td><td>disjoint 分支偵測</td><td class="mono">不可達 clause</td><td>covered</td></tr>
+        <tr><td>recursive type</td><td>遞迴展開</td><td class="mono">巢狀自指型別</td><td>roadmap</td></tr>
+        <tr><td>parametric type</td><td>型別參數化</td><td class="mono">泛型容器</td><td>roadmap</td></tr>
+      </tbody>
+    </table>
+    <script>
+    (function () {
+      const root = document.querySelector('.vg-w-table-elixir');
+      const headers = root.querySelectorAll('thead th');
+      const tbody = root.querySelector('tbody');
+      let activeKey = null, asc = true;
+      headers.forEach(h => h.addEventListener('click', () => {
+        const key = h.dataset.key;
+        if (activeKey === key) asc = !asc; else { activeKey = key; asc = true; }
+        headers.forEach(x => x.removeAttribute('data-sort'));
+        h.setAttribute('data-sort', asc ? 'asc' : 'desc');
+        const rows = [...tbody.querySelectorAll('tr')];
+        const idx = [...headers].indexOf(h);
+        rows.sort((a, b) => {
+          const av = a.children[idx].textContent.trim();
+          const bv = b.children[idx].textContent.trim();
+          return asc ? av.localeCompare(bv) : bv.localeCompare(av);
+        });
+        rows.forEach(r => tbody.appendChild(r));
+      }));
+    })();
+    </script>
+    <figcaption>13 個基準類別裡通過 12 個。前七列已被 1.20 覆蓋；recursive 與 parametric 兩類仍在 roadmap 上——它們正是那 13 取 12 裡缺的那一塊的根源。</figcaption>
+  </figure>
+
+  <h2>第一個里程碑，以及 roadmap 上還沒到的站</h2>
+
+  <p>1.20 完成的是「第一個開發里程碑」——對每一個 Elixir 程式做型別推論與 gradual 型別檢查，全程不引入任何型別註記。這個里程碑的具體產出是：自動偵測 dead code、找出 verified bug、極低的 false positive、以及把型別檢查鋪到 guard／pattern matching／case 與大量標準函式庫。但「語言預設」不等於「功能完整」——roadmap 上還有幾站沒到，而它們正是擋在「真正的型別簽章」前面的技術障礙。</p>
+
+  <figure class="vg-w-stack-roadmap-elixir">
+    <style>
+      .vg-w-stack-roadmap-elixir { display: flex; flex-direction: column; gap: var(--s-3); align-items: stretch; margin: var(--s-4) 0; }
+      .vg-w-stack-roadmap-elixir input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-stack-roadmap-elixir .stack-title { font-family: IM Fell English, serif; font-style: italic; font-size: var(--fs-md); margin: 0 0 var(--s-1) 0; color: var(--ink); line-height: 1.4; }
+      .vg-w-stack-roadmap-elixir .stack-cards { display: flex; flex-direction: column; gap: var(--s-1); list-style: none; padding: 0; margin: 0; }
+      .vg-w-stack-roadmap-elixir .stack-cards label { display: block; padding: var(--s-2); border: 1px solid var(--muted-2); border-radius: 2px; cursor: pointer; min-height: 44px; }
+      .vg-w-stack-roadmap-elixir .stack-cards label:hover { border-color: var(--accent); }
+      .vg-w-stack-roadmap-elixir .stack-cards .card-head { font-family: EB Garamond, serif; font-size: var(--fs-md); margin: 0 0 4px 0; color: var(--ink); display: flex; align-items: baseline; justify-content: space-between; gap: var(--s-2); flex-wrap: wrap; }
+      .vg-w-stack-roadmap-elixir .stack-cards .card-sub { font-family: IM Fell English, serif; font-style: italic; font-size: var(--fs-sm); color: var(--muted); margin: 0; line-height: 1.5; }
+      .vg-w-stack-roadmap-elixir .stack-cards .card-tag { font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); font-style: normal; }
+      .vg-w-stack-roadmap-elixir .tag-done { color: var(--sage-deep); }
+      .vg-w-stack-roadmap-elixir .tag-road { color: var(--accent-text); }
+      .vg-w-stack-roadmap-elixir:has(#vg-w-stack-roadmap-elixir-r1:checked) .card-1,
+      .vg-w-stack-roadmap-elixir:has(#vg-w-stack-roadmap-elixir-r2:checked) .card-2,
+      .vg-w-stack-roadmap-elixir:has(#vg-w-stack-roadmap-elixir-r3:checked) .card-3,
+      .vg-w-stack-roadmap-elixir:has(#vg-w-stack-roadmap-elixir-r4:checked) .card-4,
+      .vg-w-stack-roadmap-elixir:has(#vg-w-stack-roadmap-elixir-r5:checked) .card-5,
+      .vg-w-stack-roadmap-elixir:has(#vg-w-stack-roadmap-elixir-r6:checked) .card-6 { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+      .vg-w-stack-roadmap-elixir svg.diagram { display: none; }
+      @media (min-width: 720px) {
+        .vg-w-stack-roadmap-elixir svg.diagram { display: block; width: 100%; height: auto; max-width: 880px; }
+        .vg-w-stack-roadmap-elixir .stack-title { display: none; }
+        .vg-w-stack-roadmap-elixir .stack-cards { display: none; }
+      }
+      .vg-w-stack-roadmap-elixir .row { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; }
+      .vg-w-stack-roadmap-elixir:has(#vg-w-stack-roadmap-elixir-r1:checked) .row-1,
+      .vg-w-stack-roadmap-elixir:has(#vg-w-stack-roadmap-elixir-r2:checked) .row-2,
+      .vg-w-stack-roadmap-elixir:has(#vg-w-stack-roadmap-elixir-r3:checked) .row-3,
+      .vg-w-stack-roadmap-elixir:has(#vg-w-stack-roadmap-elixir-r4:checked) .row-4,
+      .vg-w-stack-roadmap-elixir:has(#vg-w-stack-roadmap-elixir-r5:checked) .row-5,
+      .vg-w-stack-roadmap-elixir:has(#vg-w-stack-roadmap-elixir-r6:checked) .row-6 { fill: var(--accent); fill-opacity: 0.18; stroke: var(--accent); }
+      .vg-w-stack-roadmap-elixir .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+      .vg-w-stack-roadmap-elixir .detail h3 { font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.04em; margin: 0 0 var(--s-1) 0; color: var(--accent-text); }
+      .vg-w-stack-roadmap-elixir .detail p { font-family: var(--serif); font-size: var(--fs-sm); margin: 0; line-height: 1.6; }
+      .vg-w-stack-roadmap-elixir:has(#vg-w-stack-roadmap-elixir-r1:checked) .detail-1,
+      .vg-w-stack-roadmap-elixir:has(#vg-w-stack-roadmap-elixir-r2:checked) .detail-2,
+      .vg-w-stack-roadmap-elixir:has(#vg-w-stack-roadmap-elixir-r3:checked) .detail-3,
+      .vg-w-stack-roadmap-elixir:has(#vg-w-stack-roadmap-elixir-r4:checked) .detail-4,
+      .vg-w-stack-roadmap-elixir:has(#vg-w-stack-roadmap-elixir-r5:checked) .detail-5,
+      .vg-w-stack-roadmap-elixir:has(#vg-w-stack-roadmap-elixir-r6:checked) .detail-6 { display: block; }
+    </style>
+
+    <input type="radio" id="vg-w-stack-roadmap-elixir-r1" name="vg-w-stack-roadmap-elixir-sel" checked aria-label="inference" />
+    <input type="radio" id="vg-w-stack-roadmap-elixir-r2" name="vg-w-stack-roadmap-elixir-sel" aria-label="narrowing" />
+    <input type="radio" id="vg-w-stack-roadmap-elixir-r3" name="vg-w-stack-roadmap-elixir-sel" aria-label="dead code" />
+    <input type="radio" id="vg-w-stack-roadmap-elixir-r4" name="vg-w-stack-roadmap-elixir-sel" aria-label="recursive types" />
+    <input type="radio" id="vg-w-stack-roadmap-elixir-r5" name="vg-w-stack-roadmap-elixir-sel" aria-label="parametric types" />
+    <input type="radio" id="vg-w-stack-roadmap-elixir-r6" name="vg-w-stack-roadmap-elixir-sel" aria-label="map enumeration" />
+
+    <p class="stack-title" id="vg-w-stack-roadmap-elixir-title">1.20 完成的里程碑與 roadmap 上未到的站</p>
+    <ul class="stack-cards" aria-labelledby="vg-w-stack-roadmap-elixir-title">
+      <li class="card-1"><label for="vg-w-stack-roadmap-elixir-r1">
+        <p class="card-head"><span>全程式型別推論</span><code class="card-tag tag-done">done · 1.20</code></p>
+        <p class="card-sub">零註記對每個 Elixir 程式做推論與 gradual 檢查。</p>
+      </label></li>
+      <li class="card-2"><label for="vg-w-stack-roadmap-elixir-r2">
+        <p class="card-head"><span>narrowing 與 verified bug</span><code class="card-tag tag-done">done · 1.20</code></p>
+        <p class="card-sub">沿控制流收斂型別，找出保證 runtime 失敗的違規。</p>
+      </label></li>
+      <li class="card-3"><label for="vg-w-stack-roadmap-elixir-r3">
+        <p class="card-head"><span>dead code 偵測</span><code class="card-tag tag-done">done · 1.20</code></p>
+        <p class="card-sub">用 disjoint 分析標出不可達分支與冗餘 clause。</p>
+      </label></li>
+      <li class="card-4"><label for="vg-w-stack-roadmap-elixir-r4">
+        <p class="card-head"><span>recursive types</span><code class="card-tag tag-road">roadmap</code></p>
+        <p class="card-sub">尚待解決能否「有效率地」實作遞迴型別。</p>
+      </label></li>
+      <li class="card-5"><label for="vg-w-stack-roadmap-elixir-r5">
+        <p class="card-head"><span>parametric types</span><code class="card-tag tag-road">roadmap</code></p>
+        <p class="card-sub">能否高效實作參數化型別仍在研究中。</p>
+      </label></li>
+      <li class="card-6"><label for="vg-w-stack-roadmap-elixir-r6">
+        <p class="card-head"><span>map 列舉</span><code class="card-tag tag-road">roadmap</code></p>
+        <p class="card-sub">把 map 當 enumerable 高效走訪 key-value，解法仍在研究。</p>
+      </label></li>
+    </ul>
+
+    <svg class="diagram" viewBox="0 0 880 380" role="img" aria-label="1.20 里程碑與 roadmap">
+      <text x="40" y="28" font-family="EB Garamond, serif" font-size="18" fill="var(--ink)">已完成（1.20）</text>
+      <rect class="row row-1" x="40" y="44" width="800" height="48" rx="2" role="button" tabindex="0" aria-label="全程式型別推論" />
+      <text x="60" y="66" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">全程式型別推論</text>
+      <text x="60" y="84" font-family="IM Fell English, serif" font-style="italic" font-size="13" fill="var(--muted)">零註記對每個 Elixir 程式做推論與 gradual 檢查</text>
+      <text x="820" y="72" text-anchor="end" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--sage-deep)">done</text>
+
+      <rect class="row row-2" x="40" y="100" width="800" height="48" rx="2" role="button" tabindex="0" aria-label="narrowing 與 verified bug" />
+      <text x="60" y="122" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">narrowing 與 verified bug</text>
+      <text x="60" y="140" font-family="IM Fell English, serif" font-style="italic" font-size="13" fill="var(--muted)">沿控制流收斂型別，找出保證 runtime 失敗的違規</text>
+      <text x="820" y="128" text-anchor="end" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--sage-deep)">done</text>
+
+      <rect class="row row-3" x="40" y="156" width="800" height="48" rx="2" role="button" tabindex="0" aria-label="dead code 偵測" />
+      <text x="60" y="178" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">dead code 偵測</text>
+      <text x="60" y="196" font-family="IM Fell English, serif" font-style="italic" font-size="13" fill="var(--muted)">用 disjoint 分析標出不可達分支與冗餘 clause</text>
+      <text x="820" y="184" text-anchor="end" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--sage-deep)">done</text>
+
+      <text x="40" y="244" font-family="EB Garamond, serif" font-size="18" fill="var(--ink)">roadmap（擋在型別簽章前的障礙）</text>
+      <rect class="row row-4" x="40" y="260" width="800" height="40" rx="2" role="button" tabindex="0" aria-label="recursive types" />
+      <text x="60" y="285" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">recursive types</text>
+      <text x="820" y="285" text-anchor="end" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--accent-text)">roadmap</text>
+
+      <rect class="row row-5" x="40" y="306" width="800" height="40" rx="2" role="button" tabindex="0" aria-label="parametric types" />
+      <text x="60" y="331" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">parametric types</text>
+      <text x="820" y="331" text-anchor="end" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--accent-text)">roadmap</text>
+
+      <rect class="row row-6" x="40" y="352" width="800" height="24" rx="2" role="button" tabindex="0" aria-label="map 列舉" />
+      <text x="60" y="369" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">map 列舉（enumerable 高效走訪）</text>
+      <text x="820" y="369" text-anchor="end" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--accent-text)">roadmap</text>
+    </svg>
+
+    <div>
+      <div class="detail detail-1"><h3>全程式型別推論 · done</h3><p>1.20 對每個 Elixir 程式做型別推論與 gradual 型別檢查，不需任何型別註記。這是「第一個開發里程碑」的核心承諾——把分析做成語言預設，而非 opt-in 工具。</p></div>
+      <div class="detail detail-2"><h3>narrowing 與 verified bug · done</h3><p>型別沿 field access、guard、pattern、case 逐步收斂；當供需型別 disjoint，升級成 verified bug——保證 runtime 失敗的違規。極低的 false positive 率是設計目標。</p></div>
+      <div class="detail detail-3"><h3>dead code 偵測 · done</h3><p>與 verified bug 共用 disjoint 引擎：當某 clause 的型別與「走到此處的剩餘型別」完全 disjoint，那條 clause 永不被選中，被標為不可達。</p></div>
+      <div class="detail detail-4"><h3>recursive types · roadmap</h3><p>能否「有效率地」實作遞迴型別仍待研究。沒有它，自指型別（如樹、鏈表）無法被完整描述，這是型別簽章前的障礙之一。</p></div>
+      <div class="detail detail-5"><h3>parametric types · roadmap</h3><p>參數化（泛型）型別的高效實作同樣未定。它關乎容器型別能否帶著元素型別資訊流動。</p></div>
+      <div class="detail detail-6"><h3>map 列舉 · roadmap</h3><p>把 map 當 enumerable 高效走訪 key-value 的方案仍在研究。這三項都解決後，typed struct 定義與最終的型別簽章才會被引入。</p></div>
+    </div>
+    <script>
+    (function () {
+      const root = document.querySelector('.vg-w-stack-roadmap-elixir');
+      root.querySelectorAll('rect.row').forEach((rect, i) => {
+        rect.addEventListener('click', () => {
+          const radio = root.querySelector('#vg-w-stack-roadmap-elixir-r' + (i + 1));
+          if (radio) radio.checked = true;
+        });
+        rect.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); rect.dispatchEvent(new MouseEvent('click', { bubbles: true })); }
+        });
+      });
+    })();
+    </script>
+    <figcaption>三項 roadmap——recursive、parametric、map 列舉——全部解決後，typed struct 定義與最終的型別簽章才會被引入。今天的 1.20 是地基，不是封頂。</figcaption>
+  </figure>
+
+  <p>把這幾站連起來看，1.20 的定位就清楚了：它先把「無註記也能推論與檢查」這件最難的事做穩——拿到 narrowing、verified bug、dead code 與極低誤報——再回頭處理 recursive、parametric 這些表達力上的缺口。順序是刻意的：先讓系統對既有的、沒人寫過型別的海量 Elixir 程式有用，再談錦上添花的 annotation。</p>
+
+  <p>對下週就要寫 Elixir 的人來說，最實際的影響是：升上 1.20 之後，編譯器會開始對你那些 <code>{:ok, _}</code> 與 <code>case</code> 慣用法做真正的型別推論，並在它「百分之百確定會炸」時告訴你——而且它幾乎不會在不確定時亂喊。這意味著既有 codebase 升級時，你看到的不會是滿屏雜訊，而是一張精挑過的 verified bug 與 dead code 清單。</p>
+
+  <p class="vg-deep-closer"><strong>What this enables</strong>：set-theoretic 型別讓 Elixir 在不要求一行 annotation 的前提下，把「這段程式執行到一定會失敗」從工程師的直覺變成編譯器的斷言——union／intersection／negation 是語法，narrowing 是引擎，而 disjoint 是它敢於開口的底線。</p>
+</div>
