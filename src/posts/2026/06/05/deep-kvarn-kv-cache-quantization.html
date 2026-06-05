@@ -1,0 +1,893 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">一個 agent 跑到第三千個 token，正要寫出推理鏈最後那一步，這條請求的 KV cache 把 GPU 記憶體撐滿，被 scheduler 從 batch 裡踢出去——它不是算錯，是根本沒位子算完。長 context 推論真正的牆，往往不在算力，而在這段一直膨脹、又一步都不能丟的快取。</p>
+  <h1 class="vg-post-title">KV cache 為什麼能壓到 4-bit／2-bit 還不掉準確度——從 variance normalization 講起</h1>
+</header>
+
+<div class="vg-post-prose">
+
+<p><span class="vg-dropcap">讀</span>完這篇，你會知道三件事：第一，KV cache 為什麼是長 context LLM 推論真正的記憶體瓶頸，而不是模型權重；第二，為什麼把它樸素地量化到 2-bit 會在長 decode 裡把準確度吃掉——關鍵詞是 outlier 與 error accumulation；第三，華為 CSL 開源的 KVarN 用哪四個步驟（Hadamard rotation、Sinkhorn 式 variance normalization、非對稱量化、bit-width 指派）把這條路重新鋪平，還能當成 vLLM 的原生 backend，只靠一個 flag。本文針對的讀者是知道 attention、知道 FP16 與 INT4 差別、但沒仔細想過 KV cache 記憶體帳怎麼算的工程師。</p>
+
+<h2>一次 16K context 的推論，記憶體都花到哪去了</h2>
+
+<p>先把帳算清楚，因為整個故事都建立在這筆帳上。</p>
+
+<p>autoregressive decode 的核心是：每生成一個 token，attention 都要拿當前的 query 去跟「前面所有 token 的 key、value」做內積與加權。把這件事拆細一點，因為下面所有壓縮都動在這兩個張量上。每一層 attention 會把當前 token 的隱藏向量投影成三個東西——query、key、value。query 只用一次（算完這一步的 attention 就丟），但 key 與 value 會被未來每一個 token 反覆讀取：第 1000 個 token 在做 attention 時，要跟前面 999 個 token 的 key 各做一次內積、再拿 softmax 權重去加權那 999 個 value。</p>
+
+<p>如果每生成一個 token 都重算前面所有 token 的 key 與 value，計算量是 O(n²) 而且大量重複；所以實務上一定會把算過的 key 與 value 存起來重用，這個快取就是 KV cache。它不是優化選項，是 transformer decode 能跑得動的前提——沒有它，每生成一個 token 的成本會隨序列長度線性增加，長序列直接爆掉。代價是它必須常駐在 GPU 記憶體裡：只要這條序列還在生成，它的整段 KV cache 就不能被釋放。</p>
+
+<p>問題是它會長。KV cache 的大小正比於 context 長度、層數、attention head 數、head 維度，而且 key 跟 value 各存一份。這裡有個常被忽略的細節：現代大模型多半用 GQA（grouped-query attention），讓多個 query head 共用同一組 key／value head，正是為了把 KV cache 縮小——所以下面算的 kv_heads 是 GQA 之後的數字，比 query head 數小得多。即便如此，帳還是很可觀。</p>
+
+<p>把一個常見的數量級攤開：一個 32B 量級、64 層上下、每層 key 與 value 各約 8 個 KV head（GQA 之後）、head 維度 128 的模型，在 FP16 下，每個 token 的 KV cache 大約落在這個量級——</p>
+
+<pre data-kind="pseudocode"><code><em>// 單一 token 的 KV cache bytes（FP16，每元素 2 bytes）</em>
+bytes_per_token
+  = 2 (K 與 V)
+  × layers          (≈ 64)
+  × kv_heads        (≈ 8)
+  × head_dim        (≈ 128)
+  × bytes_per_elem  (FP16 = 2)
+  ≈ 2 × 64 × 8 × 128 × 2
+  = 262144 bytes
+  ≈ 256 KB / token
+
+<em>// 一個 16K context 的 request：</em>
+16384 tokens × 256 KB ≈ 4 GB <em>// 只是一條序列的 KV cache</em></code></pre>
+
+<p>一條 16K 的序列就吃掉數 GB——而 production serving 不是跑一條，是同時跑幾十上百條（concurrent batch）。權重是固定成本，載入一次大家共用；KV cache 是每條請求各自的浮動成本，隨 context 長度與併發數線性疊加。於是在長 context、高併發的場景，真正卡住你的不是「模型放不放得下」，是「KV cache 放不放得下」。KV cache 的容量直接決定了你能開多大的 batch、能服務多長的 context——它是 throughput 的天花板。</p>
+
+<p>這裡有個值得停一下的反直覺點：decode 階段其實是記憶體頻寬綁定（memory-bandwidth bound），不是算力綁定。每生成一個 token，GPU 要把整段 KV cache 從 HBM 讀進來做 attention，而這個讀取量遠大於那一步的浮點運算量。換句話說，KV cache 不只是「佔空間」，它每一步 decode 都要被完整搬一次。這就帶出一個關鍵後果——把 KV cache 壓小，不只是省下容量，還省下每一步要搬運的位元組數，於是壓縮 KV cache 反而可能讓 decode 變快。記住這條，因為後面 KVarN「throughput 高於 FP16」這個看似矛盾的結果，根源就在這裡。</p>
+
+<p>所以 serving 工程師面對的取捨是這樣的：要嘛縮短能服務的 context，要嘛降低併發 batch size，要嘛買更多 GPU。三條路都直接傷 throughput 或成本。KV cache 量化是第四條路——不犧牲 context、不犧牲併發，而是讓每個 token 在記憶體裡佔更少位元組。問題只在於：壓縮能不能不掉準確度。</p>
+
+<p>這就是 KVarN 要打的那個點。它的論文標題寫得很直白：「Variance-Normalized KV-Cache Quantization Mitigates Error Accumulation in Reasoning Tasks」，arXiv:2606.03458。把 KV cache 的每個元素從 16-bit 壓到 4-bit 或 2-bit，記憶體直接砍到 1/4 到 1/8，同樣的 GPU 記憶體就能裝更多 token、開更大的 batch。下面這個 widget 讓你直接拖 bit-width 與 group size，看記憶體帳怎麼跟著動。</p>
+
+<figure class="vg-w-param-demo-kvarn-budget">
+  <style>
+    .vg-w-param-demo-kvarn-budget { display: grid; grid-template-rows: auto auto 1fr auto; gap: var(--s-2); }
+    .vg-w-param-demo-kvarn-budget { grid-template-columns: minmax(0, 1fr); min-width: 0; }
+    .vg-w-param-demo-kvarn-budget .cscroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    .vg-w-param-demo-kvarn-budget .cscroll svg { min-width: 720px; }
+    .vg-w-param-demo-kvarn-budget .controls { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: var(--s-1) var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+    .vg-w-param-demo-kvarn-budget .controls input { height: 36px; accent-color: var(--accent); touch-action: none; width: 100%; }
+    .vg-w-param-demo-kvarn-budget .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 9ch; text-align: right; }
+    .vg-w-param-demo-kvarn-budget svg { width: 100%; height: auto; }
+    .vg-w-param-demo-kvarn-budget figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    @media (max-width: 720px) {
+      .vg-w-param-demo-kvarn-budget .controls { grid-template-columns: 1fr; }
+      .vg-w-param-demo-kvarn-budget .readout { text-align: left; }
+    }
+  </style>
+
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="m18 8 4 4-4 4"/><path d="m6 8-4 4 4 4"/><path d="M8 12h8"/>
+    </svg>
+    <span>拖三個滑桿改 key bits、value bits、group size · 看容量倍率與準確度風險即時變動</span>
+  </p>
+
+  <div class="controls">
+    <label for="vg-w-param-demo-kvarn-budget-k">key bits</label>
+    <input id="vg-w-param-demo-kvarn-budget-k" type="range" min="2" max="16" step="2" value="4" />
+    <span class="readout" id="vg-w-param-demo-kvarn-budget-k-out">4-bit</span>
+    <label for="vg-w-param-demo-kvarn-budget-v">value bits</label>
+    <input id="vg-w-param-demo-kvarn-budget-v" type="range" min="2" max="16" step="2" value="2" />
+    <span class="readout" id="vg-w-param-demo-kvarn-budget-v-out">2-bit</span>
+    <label for="vg-w-param-demo-kvarn-budget-g">group size</label>
+    <input id="vg-w-param-demo-kvarn-budget-g" type="range" min="64" max="256" step="64" value="128" />
+    <span class="readout" id="vg-w-param-demo-kvarn-budget-g-out">128</span>
+  </div>
+
+  <div class="cscroll"><svg viewBox="0 0 720 300" preserveAspectRatio="xMidYMid meet" role="img" aria-label="KV cache memory budget vs bit-width">
+    <line x1="70" y1="250" x2="700" y2="250" stroke="var(--muted-2)" stroke-width="1" />
+    <line x1="70" y1="30"  x2="70"  y2="250" stroke="var(--muted-2)" stroke-width="1" />
+    <text x="385" y="285" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--muted)">每個 token 的 KV cache（相對 FP16）</text>
+
+    <g font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">
+      <text x="62" y="254" text-anchor="end">0×</text>
+      <text x="62" y="195" text-anchor="end">0.25×</text>
+      <text x="62" y="140" text-anchor="end">0.5×</text>
+      <text x="62" y="85" text-anchor="end">0.75×</text>
+      <text x="62" y="34" text-anchor="end">1×</text>
+    </g>
+
+    <line x1="70" y1="30" x2="700" y2="30" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="3 4" />
+    <text x="694" y="24" text-anchor="end" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">FP16 baseline</text>
+
+    <rect id="vg-w-param-demo-kvarn-budget-bar-k" x="160" width="120" fill="var(--accent)" fill-opacity="0.55" stroke="var(--accent)" stroke-width="1.5" />
+    <rect id="vg-w-param-demo-kvarn-budget-bar-v" x="430" width="120" fill="var(--sage-deep)" fill-opacity="0.45" stroke="var(--sage-deep)" stroke-width="1.5" />
+
+    <text x="220" y="270" text-anchor="middle" font-family="Manrope, sans-serif" font-size="12" fill="var(--ink)">KEY</text>
+    <text x="490" y="270" text-anchor="middle" font-family="Manrope, sans-serif" font-size="12" fill="var(--ink)">VALUE</text>
+
+    <text id="vg-w-param-demo-kvarn-budget-cap" x="385" y="55" text-anchor="middle" font-family="EB Garamond, serif" font-size="20" fill="var(--accent-text)">容量 ≈ 4.0× FP16</text>
+    <text id="vg-w-param-demo-kvarn-budget-risk" x="385" y="80" text-anchor="middle" font-family="Manrope, sans-serif" font-size="12" fill="var(--muted)">準確度風險：低（KVarN 已校正）</text>
+  </svg></div>
+
+  <figcaption>橫軸不是時間，是兩條柱：key 與 value 各自的每-token 佔用相對 FP16。group size 進 scale 開銷——越小的 tile 表示越多 scale 要存，壓縮率略降。容量倍率取 key／value 平均的倒數；準確度風險是定性指標，反映「裸量化在這個 bit-width 下會掉多少」，而非 KVarN 校正後的真實掉分。</figcaption>
+
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-param-demo-kvarn-budget');
+      const kIn = root.querySelector('#vg-w-param-demo-kvarn-budget-k');
+      const vIn = root.querySelector('#vg-w-param-demo-kvarn-budget-v');
+      const gIn = root.querySelector('#vg-w-param-demo-kvarn-budget-g');
+      const kOut = root.querySelector('#vg-w-param-demo-kvarn-budget-k-out');
+      const vOut = root.querySelector('#vg-w-param-demo-kvarn-budget-v-out');
+      const gOut = root.querySelector('#vg-w-param-demo-kvarn-budget-g-out');
+      const barK = root.querySelector('#vg-w-param-demo-kvarn-budget-bar-k');
+      const barV = root.querySelector('#vg-w-param-demo-kvarn-budget-bar-v');
+      const capT = root.querySelector('#vg-w-param-demo-kvarn-budget-cap');
+      const riskT = root.querySelector('#vg-w-param-demo-kvarn-budget-risk');
+
+      const Y0 = 250, Y1 = 30; // 1× at Y1
+
+      function frac(bits, group) {
+        // base占用 = bits/16；加上 scale 開銷 ≈ 16-bit scale / group_size（每 tile 一組）
+        const base = bits / 16;
+        const overhead = 16 / (group * 8); // 粗略：每 group 一個 scale，攤到每元素
+        return base + overhead;
+      }
+
+      function update() {
+        const kb = Number(kIn.value), vb = Number(vIn.value), g = Number(gIn.value);
+        kOut.textContent = kb + '-bit';
+        vOut.textContent = vb + '-bit';
+        gOut.textContent = String(g);
+
+        const fk = Math.min(1.05, frac(kb, g));
+        const fv = Math.min(1.05, frac(vb, g));
+        const hk = (Y0 - Y1) * fk, hv = (Y0 - Y1) * fv;
+        barK.setAttribute('y', (Y0 - hk).toFixed(1)); barK.setAttribute('height', hk.toFixed(1));
+        barV.setAttribute('y', (Y0 - hv).toFixed(1)); barV.setAttribute('height', hv.toFixed(1));
+
+        const avg = (fk + fv) / 2;
+        const cap = 1 / avg;
+        capT.textContent = '容量 ≈ ' + cap.toFixed(1) + '× FP16';
+
+        const minBits = Math.min(kb, vb);
+        let risk, fill;
+        if (minBits >= 8) { risk = '準確度風險：可忽略（接近無損）'; fill = 'var(--sage-deep)'; }
+        else if (minBits >= 4) { risk = '準確度風險：低（KVarN 已校正）'; fill = 'var(--ink-deep)'; }
+        else if (minBits >= 2) { risk = '準確度風險：裸量化會明顯掉分／KVarN 靠 variance norm 救回'; fill = 'var(--accent-text)'; }
+        else { risk = '準確度風險：極高'; fill = 'var(--accent-text)'; }
+        riskT.textContent = risk;
+        riskT.setAttribute('fill', fill);
+      }
+      kIn.addEventListener('input', update);
+      vIn.addEventListener('input', update);
+      gIn.addEventListener('input', update);
+      update();
+    })();
+  </script>
+</figure>
+
+<p>拖一下你會發現幾件事。把兩條都拉到 16-bit，容量回到 1×，那就是 FP16——沒省。把 key 拉到 4、value 拉到 2（也就是 KVarN 出貨的預設 <code>kvarn_k4v2_g128</code>），平均不到 0.25×，容量倍率衝到 4× 上下。group size 拉小會看到柱子微微長高——因為每個 tile 要存一組 scale，tile 越小、scale 越多，攤到每個元素的額外開銷越大。這就是為什麼 group size 不能無腦設小：它是壓縮率與量化粒度之間的取捨。</p>
+
+<p>到這裡，記憶體那一半的帳很乾淨。難的是另一半——準確度。</p>
+
+<h2>為什麼樸素的 2-bit 量化會在長 decode 裡掉準</h2>
+
+<p>量化的基本動作很簡單：取一段浮點數，找出它的範圍 [min, max]，把這個範圍均勻切成 2^bits 個格子，每個原始值四捨五入到最近的格子的索引，存那個整數索引；讀取時再用 scale（格子寬度）與 zero-point（min 對應的偏移）把索引還原回近似的浮點值。4-bit 就是 16 個格子，2-bit 只有 4 個格子。格子越少，每個值被「捨入」掉的誤差越大。這是量化的第一性原理：bit 越低、解析度越粗、round-to-nearest 的誤差越大。</p>
+
+<p>這裡藏著一個量化器設計的核心張力——scale 是被整段資料的 [min, max] 決定的，所以「這段資料要切成多大一塊一起量化」這個分組（grouping）選擇至關重要。分組太大，一個 scale 要涵蓋差異很大的數值，浪費解析度；分組太小，每組都要存一份 scale 與 zero-point，metadata 的開銷反而吃掉壓縮率。KVarN 的 group size 128 就是這條張力上的一個取捨點，而它跟 vLLM 的 paging 邊界對齊（後面會講）。</p>
+
+<p>如果 KV cache 裡的數值分布得很均勻，這還好。問題是它不均勻——它有 outlier。</p>
+
+<p>實測上，transformer 的 key／value 在某些 channel（也就是 head 維度的某些座標）上會出現遠大於其他 channel 的數值，這些就是 outlier channel。這不是偶發雜訊，而是 transformer 訓練出來的穩定結構——某些 channel 學會承載大幅度的訊號，這在 LLM 量化文獻裡是反覆被觀察到的現象（也是 weight 量化裡 SmoothQuant、AWQ 等方法要處理的同一類問題）。量化的範圍是被最大值撐開的：只要有一個 channel 飆到別人的 50 倍，整段的 scale 就被它撐大 50 倍，於是其餘 99% 的「正常」數值全部被擠進格子的最低幾格裡，解析度被浪費掉了。</p>
+
+<p>2-bit 只有 4 個格子，一旦被 outlier 撐開，正常值可能全部塌進同一格——資訊直接歸零。這是裸量化掉準的第一個來源：outlier 撐爆 scale。直覺上像這樣：你要用一把只有 4 個刻度的尺去同時量一根頭髮和一棟樓的高度，為了量得到樓，刻度只好是「樓高的 1/4」，於是頭髮在這把尺上永遠是 0。KV cache 裡的「正常 channel」就是那根頭髮。</p>
+
+<p>把這件事用實際數字走一遍，2-bit 的窘境就很具體：</p>
+
+<pre data-kind="pseudocode"><code><em>// 一段含 outlier 的數值，做 2-bit（4 格）量化</em>
+values  = [0.4, -0.3, 0.5, -0.2, 0.6, ... , 28.0]
+<em>//                                          ↑ 一個 outlier channel</em>
+
+min, max = -0.6, 28.0
+scale    = (max - min) / 3      <em>// 2-bit = 4 levels = 3 區間</em>
+         = 28.6 / 3 ≈ 9.53
+
+<em>// 量化：round((v - min) / scale)</em>
+quant(0.4)  = round((0.4  + 0.6) / 9.53) = round(0.10) = 0
+quant(-0.3) = round((-0.3 + 0.6) / 9.53) = round(0.03) = 0
+quant(0.6)  = round((0.6  + 0.6) / 9.53) = round(0.13) = 0
+quant(28.0) = round((28.0 + 0.6) / 9.53) = round(3.00) = 3
+
+<em>// 結果：所有「正常值」都被量化成 0，全擠進同一格</em>
+<em>// 還原後 0.4、-0.3、0.6 全變成同一個值 ≈ -0.6 → 資訊歸零</em></code></pre>
+
+<p>這就是為什麼不能對裸資料直接動 2-bit。Hadamard rotation 把那個 28.0 的能量攤到所有 channel 之後，max 從 28 掉回個位數，scale 跟著縮小一個數量級，正常值才重新落到不同格子裡。</p>
+
+<p>第二個來源更隱蔽，也是這篇論文真正的標題詞：error accumulation。</p>
+
+<p>單看一個 token 的量化誤差，可能只有百分之幾，看起來無害。但 reasoning 與 agentic 的 workload 是長 decode——模型要連續生成幾千個 token，每一步的 attention 都會去讀整段被量化過的 KV cache。論文點出的關鍵機制是：誤差主要由「錯誤的 token scale」驅動，而這些誤差會跨 timestep 累積。</p>
+
+<p>為什麼會累積，而不是平均掉？這裡值得想清楚。autoregressive 是一個閉環回饋系統——這一步生成的 token 會被寫進 KV cache，成為下一步 attention 要讀的輸入之一。如果這一步因為 KV 量化誤差而把 attention 算偏了一點點，生成的 token 就偏一點點；這個偏掉的 token 進了 cache，又讓下一步的輸入帶著這個偏差；下一步在偏差的基礎上再偏一點。誤差不是獨立同分布、可以靠大數法則互相抵銷的雜訊，它是有方向、會沿著生成鏈條傳遞的系統性偏移。前面 step 量化過的 key／value 帶著誤差被後面每一步反覆讀取、反覆加權，於是誤差沿著 decode 鏈條一路放大。</p>
+
+<p>在 reasoning 任務上這特別致命——一個多步推理鏈，前面某一步因為量化誤差選錯了一個 token（比方說一個關鍵的中間數字、一個邏輯轉折詞），後面整條推理就建立在錯的前提上，最終答案直接錯。這跟「生成一段流暢但無所謂對錯的文字」是兩種容錯度。論文強調 mitigates error accumulation in reasoning tasks，瞄準的正是這種「一步錯、步步錯」的脆弱性。</p>
+
+<p>把裸低-bit KV 量化掉準的原因整理成一張清單，後面就能對照 KVarN 的每一步在解哪一條：</p>
+
+<ul>
+<li><strong>outlier 撐爆 scale</strong>：少數 channel 的極端值決定了整段的量化範圍，正常值被擠進最低幾格——對應 Hadamard rotation。</li>
+<li><strong>variance 不均</strong>：不同 row／column 的數值幅度差異大，共用一個 scale 必然有人吃虧——對應 variance normalization。</li>
+<li><strong>對稱量化浪費格子</strong>：強制以 0 為中心的量化範圍，對偏態分布會浪費一半格子——對應非對稱量化。</li>
+<li><strong>誤差跨步累積</strong>：autoregressive 閉環讓單步誤差沿生成鏈放大——這不是單一步驟解，而是前三步合起來把「錯誤 scale」這個累積驅動因子消滅。</li>
+</ul>
+
+<p>論文對這個累積的描述很直接，值得照引：</p>
+
+<blockquote>
+  <p>「quantization errors accumulate across timesteps, driven primarily by incorrect token scales.」誤差跨 timestep 累積，主要由錯誤的 token scale 驅動——所以治本的方向不是用更聰明的捨入，而是先把 token scale 弄對。</p>
+</blockquote>
+
+<p>更微妙的是評測陷阱。在 prefill-like 的評測設定下（一次餵完整段 prompt、量化一次、只看下一個 token 的輸出）這個累積動態根本不會顯現——你只看了鏈條的第一環。論文特別指出，先前許多 KV 量化方法是在這種 prefill-like 設定下評的，於是報出來的「幾乎無損」其實是在誤差還沒開始累積的那一刻量的，誤差的真實累積行為被掩蓋了。換到真實的長 decode，這些方法才現出原形。下面這個 widget 把這條累積曲線拖出來。</p>
+
+<figure class="vg-w-param-demo-error-accum">
+  <style>
+    .vg-w-param-demo-error-accum { display: grid; grid-template-rows: auto auto 1fr auto; gap: var(--s-2); }
+    .vg-w-param-demo-error-accum { grid-template-columns: minmax(0, 1fr); min-width: 0; }
+    .vg-w-param-demo-error-accum .cscroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    .vg-w-param-demo-error-accum .cscroll svg { min-width: 720px; }
+    .vg-w-param-demo-error-accum .controls { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+    .vg-w-param-demo-error-accum .controls input { flex: 1; height: 36px; accent-color: var(--accent); touch-action: none; }
+    .vg-w-param-demo-error-accum .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 11ch; text-align: right; }
+    .vg-w-param-demo-error-accum svg { width: 100%; height: auto; }
+    .vg-w-param-demo-error-accum figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+  </style>
+
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="m18 8 4 4-4 4"/><path d="m6 8-4 4 4 4"/><path d="M8 12h8"/>
+    </svg>
+    <span>拖滑桿延長 decode 步數 · 看裸 2-bit 的誤差怎麼累積、variance norm 怎麼壓平它</span>
+  </p>
+
+  <div class="controls">
+    <label for="vg-w-param-demo-error-accum-x">decode 步數 =</label>
+    <input id="vg-w-param-demo-error-accum-x" type="range" min="50" max="4000" step="50" value="2000" />
+    <span class="readout" id="vg-w-param-demo-error-accum-out">2000 步</span>
+  </div>
+
+  <div class="cscroll"><svg viewBox="0 0 720 300" preserveAspectRatio="xMidYMid meet" role="img" aria-label="error accumulation over decode steps">
+    <line x1="60" y1="250" x2="700" y2="250" stroke="var(--muted-2)" stroke-width="1" />
+    <line x1="60" y1="30"  x2="60"  y2="250" stroke="var(--muted-2)" stroke-width="1" />
+    <text x="380" y="285" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--muted)">decode 步數（生成第 N 個 token）</text>
+    <text x="22"  y="140" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--muted)" transform="rotate(-90 22 140)">累積輸出偏差（相對）</text>
+
+    <path id="vg-w-param-demo-error-accum-naive" fill="none" stroke="var(--accent)" stroke-width="2" />
+    <path id="vg-w-param-demo-error-accum-kvarn" fill="none" stroke="var(--sage-deep)" stroke-width="2" />
+
+    <circle id="vg-w-param-demo-error-accum-dot-n" r="5" fill="var(--accent)" />
+    <circle id="vg-w-param-demo-error-accum-dot-k" r="5" fill="var(--sage-deep)" />
+
+    <g font-family="Manrope, sans-serif" font-size="12">
+      <rect x="430" y="44" width="14" height="2" fill="var(--accent)" />
+      <text x="452" y="48" fill="var(--ink)">裸 2-bit round-to-nearest</text>
+      <rect x="430" y="64" width="14" height="2" fill="var(--sage-deep)" />
+      <text x="452" y="68" fill="var(--ink)">KVarN（variance-normalized）</text>
+    </g>
+  </svg></div>
+
+  <figcaption>定性示意，非實測曲線：橙線是裸 2-bit，誤差被「錯誤 token scale」驅動而隨步數超線性累積；綠線是 variance normalization 把每個 tile 的 variance 拉平後，scale 不再被 outlier 帶歪，誤差被壓在近乎平坦的低檔。論文主張的正是「mitigates error accumulation」這條縫。</figcaption>
+
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-param-demo-error-accum');
+      const input = root.querySelector('input');
+      const readout = root.querySelector('.readout');
+      const pN = root.querySelector('#vg-w-param-demo-error-accum-naive');
+      const pK = root.querySelector('#vg-w-param-demo-error-accum-kvarn');
+      const dN = root.querySelector('#vg-w-param-demo-error-accum-dot-n');
+      const dK = root.querySelector('#vg-w-param-demo-error-accum-dot-k');
+
+      const X0 = 60, X1 = 700, Y0 = 250, Y1 = 30;
+      const N_MAX = 4000;
+      // naive 曲線在 N_MAX 達到頂；做一條超線性（含 compounding）的形狀
+      const naiveMax = Math.pow(N_MAX, 1.35);
+      function xOf(n) { return X0 + (n / N_MAX) * (X1 - X0); }
+      function yNaive(n) { return Y0 - (Math.pow(n, 1.35) / naiveMax) * (Y0 - Y1) * 0.95; }
+      function yKvarn(n) { return Y0 - (Math.log2(1 + n / 40) / Math.log2(1 + N_MAX / 40)) * (Y0 - Y1) * 0.22; }
+
+      const ptsN = [], ptsK = [];
+      for (let n = 0; n <= N_MAX; n += 25) {
+        ptsN.push(`${n === 0 ? 'M' : 'L'} ${xOf(n).toFixed(1)} ${yNaive(n).toFixed(1)}`);
+        ptsK.push(`${n === 0 ? 'M' : 'L'} ${xOf(n).toFixed(1)} ${yKvarn(n).toFixed(1)}`);
+      }
+      pN.setAttribute('d', ptsN.join(' '));
+      pK.setAttribute('d', ptsK.join(' '));
+
+      function update() {
+        const n = Number(input.value);
+        readout.textContent = n + ' 步';
+        dN.setAttribute('cx', xOf(n)); dN.setAttribute('cy', yNaive(n));
+        dK.setAttribute('cx', xOf(n)); dK.setAttribute('cy', yKvarn(n));
+      }
+      input.addEventListener('input', update);
+      update();
+    })();
+  </script>
+</figure>
+
+<p>把滑桿拖到幾百步以前，兩條線幾乎貼在一起——這就是為什麼 prefill-like 的短評測看不出差別，也是為什麼某些只在短 context 上測過的量化方法，搬到真實的長 reasoning workload 上會突然崩。拖過 1000、2000 步，橙線開始翹起來、超線性發散，綠線卻幾乎平。兩條線之間那道張開的縫，就是 KVarN 想填的洞。</p>
+
+<p>所以 KVarN 要解的其實是兩個耦合的問題：把 outlier 壓平，讓 scale 不被少數 channel 撐爆；以及讓量化誤差不要沿著 decode 鏈累積。它的四個步驟，正好是針對這兩件事一刀一刀切下去。</p>
+
+<h2>四個步驟：Hadamard rotation → variance normalization → 非對稱量化 → bit-width 指派</h2>
+
+<p>KVarN 不是單一招式，是一條 pipeline。每個步驟解一個具體的子問題，前一步把資料整理到下一步好處理的形狀。下面這張圖把四階段攤開，點任一階段看它負責什麼、不負責什麼。</p>
+
+<figure class="vg-w-annotated-kvarn-pipeline" data-svg-scroll="560">
+  <style>
+    .vg-w-annotated-kvarn-pipeline { display: grid; grid-template-columns: 1fr; gap: var(--s-3); align-items: start; }
+    .vg-w-annotated-kvarn-pipeline svg { width: 100%; height: auto; }
+    .vg-w-annotated-kvarn-pipeline input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+    .vg-w-annotated-kvarn-pipeline .stage { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; transition: fill 200ms, stroke 200ms; }
+    .vg-w-annotated-kvarn-pipeline .stage:hover { stroke: var(--accent); }
+    .vg-w-annotated-kvarn-pipeline .stage:focus { outline: none; }
+    .vg-w-annotated-kvarn-pipeline .stage:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .vg-w-annotated-kvarn-pipeline .stage-text { pointer-events: none; }
+    .vg-w-annotated-kvarn-pipeline .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+    .vg-w-annotated-kvarn-pipeline .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+    .vg-w-annotated-kvarn-pipeline .detail p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+    .vg-w-annotated-kvarn-pipeline:has(#vg-w-annotated-kvarn-pipeline-r1:checked) .stage-1 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+    .vg-w-annotated-kvarn-pipeline:has(#vg-w-annotated-kvarn-pipeline-r2:checked) .stage-2 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+    .vg-w-annotated-kvarn-pipeline:has(#vg-w-annotated-kvarn-pipeline-r3:checked) .stage-3 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+    .vg-w-annotated-kvarn-pipeline:has(#vg-w-annotated-kvarn-pipeline-r4:checked) .stage-4 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+    .vg-w-annotated-kvarn-pipeline:has(#vg-w-annotated-kvarn-pipeline-r1:checked) .detail-1 { display: block; }
+    .vg-w-annotated-kvarn-pipeline:has(#vg-w-annotated-kvarn-pipeline-r2:checked) .detail-2 { display: block; }
+    .vg-w-annotated-kvarn-pipeline:has(#vg-w-annotated-kvarn-pipeline-r3:checked) .detail-3 { display: block; }
+    .vg-w-annotated-kvarn-pipeline:has(#vg-w-annotated-kvarn-pipeline-r4:checked) .detail-4 { display: block; }
+    @media (max-width: 720px) {
+      .vg-w-annotated-kvarn-pipeline { grid-template-columns: 1fr; }
+    }
+  </style>
+
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M9 9h6v6H9z"/><path d="M3 3h18v18H3z"/>
+    </svg>
+    <span>點任一階段方塊讀它的職責與「不負責什麼」 · 4 階段 pipeline</span>
+  </p>
+
+  <input type="radio" id="vg-w-annotated-kvarn-pipeline-r1" name="vg-w-annotated-kvarn-pipeline-sel" checked />
+  <input type="radio" id="vg-w-annotated-kvarn-pipeline-r2" name="vg-w-annotated-kvarn-pipeline-sel" />
+  <input type="radio" id="vg-w-annotated-kvarn-pipeline-r3" name="vg-w-annotated-kvarn-pipeline-sel" />
+  <input type="radio" id="vg-w-annotated-kvarn-pipeline-r4" name="vg-w-annotated-kvarn-pipeline-sel" />
+
+  <svg viewBox="0 0 480 360" role="img" aria-label="KVarN four-stage pipeline">
+    <rect class="stage stage-1" data-target="vg-w-annotated-kvarn-pipeline-r1" role="button" tabindex="0" aria-label="select Hadamard rotation" x="40" y="20" width="400" height="60" rx="6" />
+    <text class="stage-text" x="240" y="48" text-anchor="middle" font-family="EB Garamond, serif" font-size="16" fill="var(--ink)">1 · Hadamard rotation</text>
+    <text class="stage-text" x="240" y="68" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">把 outlier 沿 channel 攤開</text>
+
+    <rect class="stage stage-2" data-target="vg-w-annotated-kvarn-pipeline-r2" role="button" tabindex="0" aria-label="select variance normalization" x="40" y="105" width="400" height="60" rx="6" />
+    <text class="stage-text" x="240" y="133" text-anchor="middle" font-family="EB Garamond, serif" font-size="16" fill="var(--ink)">2 · iterative variance normalization</text>
+    <text class="stage-text" x="240" y="153" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">Sinkhorn 式 · 對齊 tile 內 variance</text>
+
+    <rect class="stage stage-3" data-target="vg-w-annotated-kvarn-pipeline-r3" role="button" tabindex="0" aria-label="select asymmetric quantization" x="40" y="190" width="400" height="60" rx="6" />
+    <text class="stage-text" x="240" y="218" text-anchor="middle" font-family="EB Garamond, serif" font-size="16" fill="var(--ink)">3 · asymmetric quantization</text>
+    <text class="stage-text" x="240" y="238" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">key 逐 channel · value 逐 token scale</text>
+
+    <rect class="stage stage-4" data-target="vg-w-annotated-kvarn-pipeline-r4" role="button" tabindex="0" aria-label="select bit-width assignment" x="40" y="275" width="400" height="60" rx="6" />
+    <text class="stage-text" x="240" y="303" text-anchor="middle" font-family="EB Garamond, serif" font-size="16" fill="var(--ink)">4 · bit-width assignment</text>
+    <text class="stage-text" x="240" y="323" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">k4v2_g128：key 4-bit · value 2-bit</text>
+
+    <line x1="240" y1="80" x2="240" y2="105" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-annotated-kvarn-pipeline-arrow)" />
+    <line x1="240" y1="165" x2="240" y2="190" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-annotated-kvarn-pipeline-arrow)" />
+    <line x1="240" y1="250" x2="240" y2="275" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-annotated-kvarn-pipeline-arrow)" />
+    <defs>
+      <marker id="vg-w-annotated-kvarn-pipeline-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+      </marker>
+    </defs>
+  </svg>
+
+  <div>
+    <div class="detail detail-1">
+      <h3>Hadamard rotation · 職責</h3>
+      <p>沿 channel 維度做一個正交（orthonormal）旋轉。Hadamard 矩陣把各 channel 線性混合，使原本集中在少數 channel 的 outlier 被攤平到所有 channel 上，分布變得更接近高斯、更好量化。</p>
+      <p>因為旋轉是正交的，attention score 的內積在數學上不變——它保住了模型行為，只改了「資料躺的姿勢」。</p>
+      <p><strong>不負責</strong>：它不縮放、不丟資訊，只旋轉。outlier 被攤開但總能量守恆。</p>
+    </div>
+    <div class="detail detail-2">
+      <h3>iterative variance normalization · 職責</h3>
+      <p>Sinkhorn 式的交替正規化：在 log space 裡輪流對 column 與 row 做標準差正規化，反覆迭代，直到 tile 內每一列、每一行的 variance 都被拉到相近水準。</p>
+      <p>這是對付 error accumulation 的核心——variance 被拉平後，量化 scale 不再被個別 row／column 的離群 variance 帶歪，「錯誤 token scale」這個誤差來源被掐掉。</p>
+      <p><strong>不負責</strong>：它不決定 bit-width，也不做實際捨入；它只把資料的 variance 結構整理成「每塊都差不多」。</p>
+    </div>
+    <div class="detail detail-3">
+      <h3>asymmetric quantization · 職責</h3>
+      <p>低-bit 的非對稱 round-to-nearest。非對稱表示量化範圍不強制以 0 為中心，能更貼合實際分布。關鍵的不對稱在 scale 的擺法：<strong>key 用逐 channel 的 scale，value 用逐 token 的 scale</strong>。</p>
+      <p>這對應 attention 的結構——key 在 channel 維度上 outlier 明顯，逐 channel scale 能各別貼合；value 則在 token 維度上差異大，逐 token scale 更省。scale 在讀取時再折回（fold back）還原。</p>
+      <p><strong>不負責</strong>：它假設輸入已被前兩步整理過；直接對裸資料做非對稱量化救不了 outlier。</p>
+    </div>
+    <div class="detail detail-4">
+      <h3>bit-width assignment · 職責</h3>
+      <p>決定 key 與 value 各用幾個 bit、tile 多大。出貨預設 <code>kvarn_k4v2_g128</code>：key 4-bit、value 2-bit、group size 128 token 一塊 tile。</p>
+      <p>key 給較高的 4-bit、value 壓到 2-bit，是因為 attention score 對 key 的精度更敏感（內積直接進 softmax），value 是被加權求和、誤差較易平均掉，所以可以更激進。</p>
+      <p><strong>不負責</strong>：它不改演算法，只挑配置；其他 preset（不同 k／v bit 組合）走同一條 pipeline。</p>
+    </div>
+  </div>
+
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-annotated-kvarn-pipeline');
+      root.querySelectorAll('.stage').forEach((rect) => {
+        rect.addEventListener('click', () => {
+          const targetId = rect.getAttribute('data-target');
+          const radio = root.querySelector('#' + targetId);
+          if (radio) radio.checked = true;
+        });
+        rect.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            rect.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+          }
+        });
+      });
+    })();
+  </script>
+</figure>
+
+<p>四步驟的邏輯鏈是這樣的：第一步 Hadamard rotation 把 outlier 從「集中在幾根 channel」攤成「均勻分布」，第二步 variance normalization 再把攤開後每個 tile 的 variance 拉到一致，前兩步合起來把資料整理成一個「沒有極端值、各處 variance 均勻」的乾淨形狀；第三步在這個乾淨形狀上做非對稱量化才安全；第四步只是挑配置。前兩步是 KVarN 跟「裸量化」拉開差距的真正所在——它們在量化之前先把資料治理好，而不是事後補救。</p>
+
+<p>第二步那個「Sinkhorn 式」值得多解釋一句，因為它是這套方法最特別的零件。Sinkhorn 演算法原本是在做「矩陣的雙隨機正規化」——給一個矩陣，反覆地先把每一列除以列和、再把每一行除以行和，交替迭代，最後收斂到一個「每列和、每行和都等於 1」的矩陣。KVarN 借用的是同一個交替結構，但對象換成標準差、空間換到 log domain：先沿 column 方向把每欄的 std 正規化，再沿 row 方向把每列的 std 正規化，反覆迭代直到 tile 內的 variance 在兩個方向上都被拉平。為什麼要交替而不是一次搞定？因為你把 column 正規化好之後，row 方向的 std 又被改變了，反之亦然——這是個耦合問題，只能靠交替迭代逼近一個兩邊都平衡的不動點。在 log space 做是因為 std 是乘性的（縮放），取 log 之後乘變加，交替正規化變成穩定的減去平均，數值上好收斂。</p>
+
+<p>這一步之所以能對付 error accumulation，關鍵在它消滅了「異常的 token scale」。回想前面說的——誤差由錯誤的 token scale 驅動。當某個 token（某一 row）的 variance 遠大於其他 token，它的量化 scale 就被撐歪，這個 token 的所有 value 都帶著偏大的誤差進 cache，然後在後續每一步被讀取放大。variance normalization 把每個 row 的 variance 拉到一致之後，就沒有哪個 token 的 scale 特別歪，誤差的源頭被掐在量化之前。Hadamard 處理的是 channel（column）方向的 outlier，Sinkhorn 式正規化處理的是 row 與 column 兩個方向的 variance 不均——兩者互補，不是重複。</p>
+
+<p>第一步特別值得用眼睛看一次，因為「正交旋轉攤平 outlier」這句話抽象，但畫出來非常直觀。下面這個 before／after 把一個 outlier-heavy 的 channel 分布，在 Hadamard rotation 前後並排——拖中間的分隔線。</p>
+
+<figure class="vg-w-ba-hadamard" data-interactive="drag">
+  <style>
+    .vg-w-ba-hadamard { position: relative; aspect-ratio: 2 / 1; overflow: hidden; }
+    .vg-w-ba-hadamard .layer { position: absolute; inset: 0; }
+    .vg-w-ba-hadamard .after { clip-path: polygon(50% 0, 100% 0, 100% 100%, 50% 100%); }
+    .vg-w-ba-hadamard .divider { position: absolute; top: 0; bottom: 0; left: 50%; width: 32px; transform: translateX(-50%); cursor: ew-resize; touch-action: none; z-index: 2; }
+    .vg-w-ba-hadamard .divider::before { content: ''; position: absolute; left: 50%; top: 0; bottom: 0; width: 2px; transform: translateX(-50%); background: var(--accent); }
+    .vg-w-ba-hadamard .divider::after { content: '↔'; position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); background: var(--accent); color: var(--bg); width: 32px; height: 32px; border-radius: 50%; display: grid; place-items: center; font-family: var(--sans); font-size: 16px; }
+  </style>
+
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M18 8L22 12L18 16"/><path d="M6 8L2 12L6 16"/><path d="M2 12H22"/>
+    </svg>
+    <span>拖中間分隔線 · 左：旋轉前的 outlier-heavy 分布／右：Hadamard 旋轉後攤平</span>
+  </p>
+
+  <svg class="layer before" viewBox="0 0 480 240" role="img" aria-label="channel distribution before Hadamard">
+    <line x1="40" y1="200" x2="460" y2="200" stroke="var(--muted-2)" stroke-width="1" />
+    <text x="250" y="228" text-anchor="middle" font-family="EB Garamond, serif" font-size="16" fill="var(--muted)">channel index（旋轉前）</text>
+    <text x="60" y="36" font-family="Manrope, sans-serif" font-size="16" fill="var(--accent-text)">BEFORE · outlier 撐爆</text>
+    <rect x="46"  y="188" width="14" height="12"  fill="var(--ink-soft)" />
+    <rect x="66"  y="184" width="14" height="16"  fill="var(--ink-soft)" />
+    <rect x="86"  y="190" width="14" height="10"  fill="var(--ink-soft)" />
+    <rect x="106" y="186" width="14" height="14"  fill="var(--ink-soft)" />
+    <rect x="126" y="60"  width="14" height="140" fill="var(--accent)" />
+    <rect x="146" y="190" width="14" height="10"  fill="var(--ink-soft)" />
+    <rect x="166" y="187" width="14" height="13"  fill="var(--ink-soft)" />
+    <rect x="186" y="184" width="14" height="16"  fill="var(--ink-soft)" />
+    <rect x="206" y="50"  width="14" height="150" fill="var(--accent)" />
+    <rect x="226" y="191" width="14" height="9"   fill="var(--ink-soft)" />
+    <rect x="246" y="188" width="14" height="12"  fill="var(--ink-soft)" />
+    <rect x="266" y="185" width="14" height="15"  fill="var(--ink-soft)" />
+    <rect x="286" y="189" width="14" height="11"  fill="var(--ink-soft)" />
+    <rect x="306" y="186" width="14" height="14"  fill="var(--ink-soft)" />
+    <rect x="326" y="190" width="14" height="10"  fill="var(--ink-soft)" />
+    <rect x="346" y="183" width="14" height="17"  fill="var(--ink-soft)" />
+    <rect x="366" y="188" width="14" height="12"  fill="var(--ink-soft)" />
+    <rect x="386" y="187" width="14" height="13"  fill="var(--ink-soft)" />
+    <rect x="406" y="190" width="14" height="10"  fill="var(--ink-soft)" />
+    <line x1="40" y1="50" x2="460" y2="50" stroke="var(--accent)" stroke-width="1" stroke-dasharray="3 4" />
+    <text x="455" y="44" text-anchor="end" font-family="JetBrains Mono, monospace" font-size="16" fill="var(--accent-text)">scale 撐到這</text>
+  </svg>
+
+  <svg class="layer after" viewBox="0 0 480 240" role="img" aria-label="channel distribution after Hadamard">
+    <rect width="480" height="240" fill="var(--bg)" />
+    <line x1="40" y1="200" x2="460" y2="200" stroke="var(--muted-2)" stroke-width="1" />
+    <text x="250" y="228" text-anchor="middle" font-family="EB Garamond, serif" font-size="16" fill="var(--muted)">channel index（旋轉後）</text>
+    <text x="250" y="36" font-family="Manrope, sans-serif" font-size="16" fill="var(--sage-deep)">AFTER · 能量攤平</text>
+    <rect x="46"  y="150" width="14" height="50" fill="var(--sage-deep)" />
+    <rect x="66"  y="142" width="14" height="58" fill="var(--sage-deep)" />
+    <rect x="86"  y="156" width="14" height="44" fill="var(--sage-deep)" />
+    <rect x="106" y="138" width="14" height="62" fill="var(--sage-deep)" />
+    <rect x="126" y="148" width="14" height="52" fill="var(--sage-deep)" />
+    <rect x="146" y="144" width="14" height="56" fill="var(--sage-deep)" />
+    <rect x="166" y="152" width="14" height="48" fill="var(--sage-deep)" />
+    <rect x="186" y="140" width="14" height="60" fill="var(--sage-deep)" />
+    <rect x="206" y="146" width="14" height="54" fill="var(--sage-deep)" />
+    <rect x="226" y="150" width="14" height="50" fill="var(--sage-deep)" />
+    <rect x="246" y="143" width="14" height="57" fill="var(--sage-deep)" />
+    <rect x="266" y="155" width="14" height="45" fill="var(--sage-deep)" />
+    <rect x="286" y="141" width="14" height="59" fill="var(--sage-deep)" />
+    <rect x="306" y="148" width="14" height="52" fill="var(--sage-deep)" />
+    <rect x="326" y="145" width="14" height="55" fill="var(--sage-deep)" />
+    <rect x="346" y="139" width="14" height="61" fill="var(--sage-deep)" />
+    <rect x="366" y="152" width="14" height="48" fill="var(--sage-deep)" />
+    <rect x="386" y="147" width="14" height="53" fill="var(--sage-deep)" />
+    <rect x="406" y="150" width="14" height="50" fill="var(--sage-deep)" />
+    <line x1="40" y1="130" x2="460" y2="130" stroke="var(--sage-deep)" stroke-width="1" stroke-dasharray="3 4" />
+    <text x="455" y="124" text-anchor="end" font-family="JetBrains Mono, monospace" font-size="16" fill="var(--sage-deep)">scale 縮回</text>
+  </svg>
+
+  <div class="divider" id="vg-w-ba-hadamard-divider"></div>
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-ba-hadamard');
+      const after = root.querySelector('.after');
+      const divider = root.querySelector('#vg-w-ba-hadamard-divider');
+      let dragging = false;
+      function setPct(pct) {
+        const c = Math.max(0, Math.min(100, pct));
+        after.style.clipPath = `polygon(${c}% 0, 100% 0, 100% 100%, ${c}% 100%)`;
+        divider.style.left = `${c}%`;
+      }
+      divider.addEventListener('pointerdown', (e) => { dragging = true; divider.setPointerCapture(e.pointerId); });
+      root.addEventListener('pointermove', (e) => {
+        if (!dragging) return;
+        const rect = root.getBoundingClientRect();
+        setPct(((e.clientX - rect.left) / rect.width) * 100);
+      });
+      root.addEventListener('pointerup', () => { dragging = false; });
+      root.addEventListener('pointercancel', () => { dragging = false; });
+    })();
+  </script>
+</figure>
+
+<p>左半邊那兩根衝到頂的 channel，就是 outlier。量化 scale 必須涵蓋最高的那根，於是其餘所有 channel 的解析度被壓在最底下幾格。右半邊旋轉之後，同樣的「總能量」被攤平到所有 channel，最高點降下來、scale 縮回，每個 channel 都拿回了該有的格子數。這就是 Hadamard rotation 改善 quantizability 的視覺直覺——它沒有丟掉任何資訊（正交旋轉可逆、attention score 不變），只是換了個讓量化好下手的姿勢。</p>
+
+<p>還有一個容易被當成實作細節、其實是核心設計的點：key 用逐 channel 的 scale，value 用逐 token 的 scale。這個不對稱不是隨意的，它對應 attention 兩個張量在計算裡扮演的不同角色。key 進的是 query · key 的內積，內積會把整個 head 維度（channel）上的誤差加總起來餵進 softmax——softmax 對輸入很敏感，一個被量化歪掉的 channel 可能讓某個 token 的 attention 權重整個錯位。所以 key 需要逐 channel 各自貼合，把每個 channel 的 outlier 結構分別處理掉。value 則不同——它是被 softmax 權重加權求和，誤差在求和裡比較容易彼此平均掉，但不同 token 的 value 幅度差異大，所以逐 token 給 scale 更划算。一句話：key 的 outlier 結構長在 channel 維度，value 的差異結構長在 token 維度，scale 就各自順著那個維度擺。這也呼應了 bit-width 的選擇——key 給較保守的 4-bit、value 敢壓到 2-bit，因為 value 的誤差容忍度天生比 key 高。</p>
+
+<p>這個「scale 各自順著不同維度擺」的幾何，點開看比讀文字清楚。點兩塊看 scale 攤在哪個方向。</p>
+
+<figure class="vg-w-diagram-kvarn-scales" data-svg-scroll="560">
+  <style>
+    .vg-w-diagram-kvarn-scales { display: grid; grid-template-columns: 1fr; gap: var(--s-3); align-items: start; }
+    .vg-w-diagram-kvarn-scales svg { width: 100%; height: auto; }
+    .vg-w-diagram-kvarn-scales input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+    .vg-w-diagram-kvarn-scales .pick { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; transition: fill 200ms, stroke 200ms; }
+    .vg-w-diagram-kvarn-scales .pick:hover { stroke: var(--accent); }
+    .vg-w-diagram-kvarn-scales .pick:focus { outline: none; }
+    .vg-w-diagram-kvarn-scales .pick:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .vg-w-diagram-kvarn-scales .pick-text { pointer-events: none; }
+    .vg-w-diagram-kvarn-scales .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+    .vg-w-diagram-kvarn-scales .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+    .vg-w-diagram-kvarn-scales .detail p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+    .vg-w-diagram-kvarn-scales:has(#vg-w-diagram-kvarn-scales-rk:checked) .pick-k { fill: var(--accent); fill-opacity: 0.15; stroke: var(--accent); }
+    .vg-w-diagram-kvarn-scales:has(#vg-w-diagram-kvarn-scales-rv:checked) .pick-v { fill: var(--accent); fill-opacity: 0.15; stroke: var(--accent); }
+    .vg-w-diagram-kvarn-scales:has(#vg-w-diagram-kvarn-scales-rk:checked) .col-band { opacity: 1; }
+    .vg-w-diagram-kvarn-scales:has(#vg-w-diagram-kvarn-scales-rv:checked) .row-band { opacity: 1; }
+    .vg-w-diagram-kvarn-scales:has(#vg-w-diagram-kvarn-scales-rk:checked) .detail-k { display: block; }
+    .vg-w-diagram-kvarn-scales:has(#vg-w-diagram-kvarn-scales-rv:checked) .detail-v { display: block; }
+    @media (max-width: 720px) {
+      .vg-w-diagram-kvarn-scales { grid-template-columns: 1fr; }
+    }
+  </style>
+
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M9 9h6v6H9z"/><path d="M3 3h18v18H3z"/>
+    </svg>
+    <span>點 KEY 或 VALUE · 看 scale 沿哪個方向切，tile 是 128 token 一塊</span>
+  </p>
+
+  <input type="radio" id="vg-w-diagram-kvarn-scales-rk" name="vg-w-diagram-kvarn-scales-sel" checked />
+  <input type="radio" id="vg-w-diagram-kvarn-scales-rv" name="vg-w-diagram-kvarn-scales-sel" />
+
+  <svg viewBox="0 0 480 320" role="img" aria-label="asymmetric scale geometry: per-channel key scales vs per-token value scales">
+    <g class="col-band" opacity="0">
+      <rect x="60"  y="40" width="60" height="220" fill="var(--accent)" fill-opacity="0.12" />
+      <rect x="180" y="40" width="60" height="220" fill="var(--accent)" fill-opacity="0.12" />
+      <rect x="300" y="40" width="60" height="220" fill="var(--accent)" fill-opacity="0.12" />
+    </g>
+    <g class="row-band" opacity="0">
+      <rect x="60" y="40"  width="360" height="40" fill="var(--accent)" fill-opacity="0.12" />
+      <rect x="60" y="120" width="360" height="40" fill="var(--accent)" fill-opacity="0.12" />
+      <rect x="60" y="200" width="360" height="40" fill="var(--accent)" fill-opacity="0.12" />
+    </g>
+
+    <rect x="60" y="40" width="360" height="220" fill="none" stroke="var(--muted-2)" stroke-width="1" />
+    <g stroke="var(--line)" stroke-width="1">
+      <line x1="120" y1="40" x2="120" y2="260" /><line x1="180" y1="40" x2="180" y2="260" />
+      <line x1="240" y1="40" x2="240" y2="260" /><line x1="300" y1="40" x2="300" y2="260" />
+      <line x1="360" y1="40" x2="360" y2="260" />
+      <line x1="60" y1="80"  x2="420" y2="80"  /><line x1="60" y1="120" x2="420" y2="120" />
+      <line x1="60" y1="160" x2="420" y2="160" /><line x1="60" y1="200" x2="420" y2="200" />
+      <line x1="60" y1="240" x2="420" y2="240" />
+    </g>
+
+    <text x="240" y="28" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">← channel（head 維度）→</text>
+    <text x="44" y="150" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)" transform="rotate(-90 44 150)">← token（tile=128）→</text>
+
+    <rect class="pick pick-k" data-target="vg-w-diagram-kvarn-scales-rk" role="button" tabindex="0" aria-label="select key per-channel scale" x="60" y="280" width="170" height="28" rx="5" />
+    <text class="pick-text" x="145" y="298" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">KEY · 逐 channel scale</text>
+    <rect class="pick pick-v" data-target="vg-w-diagram-kvarn-scales-rv" role="button" tabindex="0" aria-label="select value per-token scale" x="250" y="280" width="170" height="28" rx="5" />
+    <text class="pick-text" x="335" y="298" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">VALUE · 逐 token scale</text>
+  </svg>
+
+  <div>
+    <div class="detail detail-k">
+      <h3>key · 逐 channel scale</h3>
+      <p>每一個 key channel（直條）配一個 scale。outlier 長在 channel 維度，逐 channel 各別貼合才能把每根的範圍各自管好。</p>
+      <p>內積把整個 head 維度的誤差加總餵進 softmax，所以 key 對精度敏感——給較保守的 4-bit。</p>
+    </div>
+    <div class="detail detail-v">
+      <h3>value · 逐 token scale</h3>
+      <p>每一個 token（橫列）配一個 scale。value 的幅度差異長在 token 維度，逐 token 給 scale 更省、更貼合。</p>
+      <p>value 被 softmax 權重加權求和，誤差較易平均掉，容忍度高——可壓到 2-bit。</p>
+    </div>
+  </div>
+
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-diagram-kvarn-scales');
+      root.querySelectorAll('.pick').forEach((rect) => {
+        rect.addEventListener('click', () => {
+          const radio = root.querySelector('#' + rect.getAttribute('data-target'));
+          if (radio) radio.checked = true;
+        });
+        rect.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            rect.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+          }
+        });
+      });
+    })();
+  </script>
+</figure>
+
+<p>把 key 與 value 的處理差異收成一張對照表，整套不對稱一眼看完。</p>
+
+<figure class="vg-w-table-kvarn-presets">
+  <style>
+    .vg-w-table-kvarn-presets { display: grid; gap: var(--s-2); }
+    .vg-w-table-kvarn-presets .scroll { overflow-x: auto; }
+    .vg-w-table-kvarn-presets table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+    .vg-w-table-kvarn-presets thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); }
+    .vg-w-table-kvarn-presets tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+    .vg-w-table-kvarn-presets tbody td code { font-family: var(--mono); font-size: var(--fs-xs); }
+    .vg-w-table-kvarn-presets tbody th { font-family: var(--sans); font-size: var(--fs-xs); text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); color: var(--accent-text); white-space: nowrap; }
+    .vg-w-table-kvarn-presets figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+  </style>
+  <div class="scroll">
+    <table>
+      <thead>
+        <tr><th>面向</th><th>KEY</th><th>VALUE</th></tr>
+      </thead>
+      <tbody>
+        <tr><th>scale 沿哪軸</th><td>逐 channel（head 維度）</td><td>逐 token（tile 維度）</td></tr>
+        <tr><th>outlier／差異長在</th><td>channel 維度</td><td>token 維度</td></tr>
+        <tr><th>bit-width</th><td><code>4-bit</code></td><td><code>2-bit</code></td></tr>
+        <tr><th>進 attention 的角色</th><td>內積 → softmax，敏感</td><td>被加權求和，誤差易平均</td></tr>
+        <tr><th>為什麼這個精度</th><td>softmax 對輸入敏感，給較保守的 4-bit</td><td>容忍度高，敢壓到 2-bit</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <figcaption>不對稱不是隨意：scale 各自順著自己那個張量的「結構維度」擺，bit-width 跟著誤差容忍度走。兩欄合起來就是 <code>kvarn_k4v2_g128</code> 的 k4／v2。</figcaption>
+</figure>
+
+<h2>怎麼用：一個 flag，跑進 vLLM 的 PagedAttention</h2>
+
+<p>方法再漂亮，落不進 serving stack 就沒人用。KVarN 在這一點上做得相當克制——它是一個 vLLM fork（基於 v0.22.0），不改模型、不需要 calibration data，啟用只要一個 flag。</p>
+
+<pre data-kind="shell"><code><em># 安裝（Triton kernel 在 runtime JIT 編譯，不需預編譯）</em>
+VLLM_USE_PRECOMPILED=1 pip install -e .
+
+<em># 啟用 KVarN：只動 kv-cache-dtype 一個旗標</em>
+vllm serve Qwen/Qwen3-32B \
+  --kv-cache-dtype kvarn_k4v2_g128 \
+  --block-size 128 \
+  --dtype float16 \
+  --tensor-parallel-size 2</code></pre>
+
+<p>這個 flag 背後其實鎖死了一整組部署旋鈕。把它們列成一張表，對照每一項「為什麼是這個值」。</p>
+
+<figure class="vg-w-table-kvarn-config">
+  <style>
+    .vg-w-table-kvarn-config { display: grid; gap: var(--s-2); }
+    .vg-w-table-kvarn-config .scroll { overflow-x: auto; }
+    .vg-w-table-kvarn-config table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+    .vg-w-table-kvarn-config thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); }
+    .vg-w-table-kvarn-config tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+    .vg-w-table-kvarn-config tbody td code { font-family: var(--mono); font-size: var(--fs-xs); }
+    .vg-w-table-kvarn-config tbody th { font-family: var(--sans); font-size: var(--fs-xs); text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); color: var(--accent-text); white-space: nowrap; }
+    .vg-w-table-kvarn-config figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+  </style>
+  <div class="scroll">
+    <table>
+      <thead>
+        <tr><th>旋鈕</th><th>值</th><th>為什麼</th></tr>
+      </thead>
+      <tbody>
+        <tr><th>出貨 preset</th><td><code>kvarn_k4v2_g128</code></td><td>key 4-bit、value 2-bit、group size 128 token／tile</td></tr>
+        <tr><th>啟用方式</th><td><code>--kv-cache-dtype kvarn_k4v2_g128</code></td><td>不需 calibration、不改模型權重</td></tr>
+        <tr><th>tile 大小</th><td><code>--block-size 128</code></td><td>tile=128＝一個 PagedAttention block，邊界對齊</td></tr>
+        <tr><th>compute dtype</th><td><code>float16</code></td><td>量化的是存進 cache 的格式，attention 仍在 float16 算</td></tr>
+        <tr><th>緊預算容量</th><td><code>VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0</code></td><td>單 GPU 記憶體緊時，把 CUDA graph 估算佔走的容量要回來</td></tr>
+        <tr><th>base</th><td>vLLM v0.22.0 fork</td><td>綁定上游版本，新功能要自己跟</td></tr>
+        <tr><th>kernel</th><td>Triton JIT</td><td>runtime 編譯，不需預編譯二進位</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <figcaption>七個旋鈕裡只有第一、二項是你日常會碰的；其餘多半鎖死。<code>--block-size 128</code> 不是調效能的旋鈕，是 tile 與 paging 對齊的正確性前提。</figcaption>
+</figure>
+
+<p>幾個工程細節值得留意，因為它們解釋了為什麼這個 fork 不會跟 vLLM 的記憶體管理打架。</p>
+
+<p><strong>tile size 固定在 128，對齊 PagedAttention。</strong> vLLM 用 PagedAttention 把 KV cache 切成固定大小的 block 來管理記憶體——這正是 vLLM 當初拿下 serving 市場的招牌特性：像作業系統的虛擬記憶體分頁一樣管理 KV cache，避免長短不一的序列把顯存切得到處是碎片。但這對量化方案是個約束：你的量化分組必須跟 paging 的分頁邊界協調，否則一個量化 tile 跨在兩個 block 之間，paging 一搬動 block，tile 的 scale 就對不上了。</p>
+
+<p>KVarN 的解法乾淨利落——把量化 tile 大小直接固定在 128，並讓「一個 vLLM block ＝ 一個 KVarN tile」。量化的分組邊界跟 paging 的分頁邊界完全重合，量化 scale 就能乾淨地掛在每個 block 的 metadata 上，block 被搬到哪、它的 scale 跟到哪，paging 與量化彼此不打架。這也是為什麼 <code>--block-size 128</code> 是固定值而非可調參數——它不是效能調校的旋鈕，是正確性的前提。前面 group size 滑桿能拖到 64 或 256 純粹是讓你體會壓縮率取捨，真實出貨的 <code>kvarn_k4v2_g128</code> 鎖死在 128。</p>
+
+<p><strong>Triton kernel，runtime JIT 編譯。</strong> KVarN 的量化／反量化與 attention kernel 用 Triton 寫，在 runtime JIT 編譯，不需要事先 precompile 一套二進位。compute dtype 是 float16——量化的是「存進 cache 的格式」，實際算 attention 時還是在 float16 精度上做，scale 在讀取時折回。倉庫的語言組成也透露了這點：84.5% Python、5.6% CUDA、4.5% Rust、3.9% C++——以 Python／Triton 為主，重 kernel 部分才下到 CUDA。</p>
+
+<p><strong>一個容量小細節。</strong> 文件提到，KVarN「在有空間攤平一塊固定的 decode workspace 時」才能實現完整的 KV cache 容量；在單 GPU、記憶體很緊的場景，可以設 <code>VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0</code> 把那塊被 CUDA graph 估算佔走的容量要回來。這是個誠實的註腳——4× 容量不是無條件成立，它需要足夠的記憶體預算去攤平固定開銷。</p>
+
+<p>最後看數字。在 Qwen3-32B、AIME25、16K-context burst、TP=2 的設定下，KVarN 的賣點是「三個指標一起贏」——容量約 4× FP16、throughput 還高於 FP16（最高約 1.3×）、準確度維持 FP16 水準。在量化做法的層次上，KVarN、TurboQuant、以及最樸素的 RTN 是三條不同的路。先點開看三者各自的取捨，再用下面那張圖把它們放到同一組軸上量。</p>
+
+<figure class="vg-w-tabs-kvarn-vs">
+  <style>
+    .vg-w-tabs-kvarn-vs { display: grid; gap: var(--s-2); }
+    .vg-w-tabs-kvarn-vs input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+    .vg-w-tabs-kvarn-vs .tabs { display: flex; flex-wrap: wrap; gap: var(--s-1); border-bottom: 1px solid var(--line); }
+    .vg-w-tabs-kvarn-vs .tab { font-family: var(--sans); font-size: var(--fs-sm); min-height: 44px; display: inline-flex; align-items: center; padding: var(--s-1) var(--s-2); cursor: pointer; color: var(--muted); }
+    .vg-w-tabs-kvarn-vs .panel { display: none; }
+    .vg-w-tabs-kvarn-vs .panel dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: var(--s-1) var(--s-2); }
+    .vg-w-tabs-kvarn-vs .panel dt { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); white-space: nowrap; }
+    .vg-w-tabs-kvarn-vs .panel dd { margin: 0; font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink); }
+    .vg-w-tabs-kvarn-vs figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    .vg-w-tabs-kvarn-vs:has(#vg-w-tabs-kvarn-vs-t1:checked) .panel-1,
+    .vg-w-tabs-kvarn-vs:has(#vg-w-tabs-kvarn-vs-t2:checked) .panel-2,
+    .vg-w-tabs-kvarn-vs:has(#vg-w-tabs-kvarn-vs-t3:checked) .panel-3 { display: block; }
+    .vg-w-tabs-kvarn-vs:has(#vg-w-tabs-kvarn-vs-t1:checked) [for="vg-w-tabs-kvarn-vs-t1"],
+    .vg-w-tabs-kvarn-vs:has(#vg-w-tabs-kvarn-vs-t2:checked) [for="vg-w-tabs-kvarn-vs-t2"],
+    .vg-w-tabs-kvarn-vs:has(#vg-w-tabs-kvarn-vs-t3:checked) [for="vg-w-tabs-kvarn-vs-t3"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+  </style>
+
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M9 9h6v6H9z"/><path d="M3 3h18v18H3z"/>
+    </svg>
+    <span>點頁籤切三種 KV 量化做法 · 比量化做法、throughput、accuracy</span>
+  </p>
+
+  <input type="radio" id="vg-w-tabs-kvarn-vs-t1" name="vg-w-tabs-kvarn-vs-sel" checked />
+  <input type="radio" id="vg-w-tabs-kvarn-vs-t2" name="vg-w-tabs-kvarn-vs-sel" />
+  <input type="radio" id="vg-w-tabs-kvarn-vs-t3" name="vg-w-tabs-kvarn-vs-sel" />
+
+  <div class="tabs">
+    <label class="tab" for="vg-w-tabs-kvarn-vs-t1">naive RTN 2-bit</label>
+    <label class="tab" for="vg-w-tabs-kvarn-vs-t2">TurboQuant</label>
+    <label class="tab" for="vg-w-tabs-kvarn-vs-t3">KVarN</label>
+  </div>
+
+  <div class="panel panel-1">
+    <dl>
+      <dt>量化做法</dt><dd>逐 token 直接 round-to-nearest，不治理 outlier。</dd>
+      <dt>throughput</dt><dd>cache 變小、頻寬壓力降，名義上快——但準確度先崩。</dd>
+      <dt>accuracy</dt><dd>outlier 撐爆 scale、誤差跨步累積，長 decode 直接掉分。</dd>
+    </dl>
+  </div>
+  <div class="panel panel-2">
+    <dl>
+      <dt>量化做法</dt><dd>另一套低-bit KV 量化，容量壓到約 4×。</dd>
+      <dt>throughput</dt><dd>比 FP16 低 40–52%——省了記憶體，賠了速度。</dd>
+      <dt>accuracy</dt><dd>可用，但略低於 FP16。</dd>
+    </dl>
+  </div>
+  <div class="panel panel-3">
+    <dl>
+      <dt>量化做法</dt><dd>Hadamard rotation ＋ variance normalization 先治理資料，再非對稱量化。</dd>
+      <dt>throughput</dt><dd>約 1.3× FP16、約 2.4× TurboQuant——壓了容量反而更快。</dd>
+      <dt>accuracy</dt><dd>維持 FP16 水準。</dd>
+    </dl>
+  </div>
+
+  <figcaption>三條路的容量都能做到約 4×；分野在另外兩軸。TurboQuant 拿容量換速度，KVarN 靠「量化前先治理資料」把速度與準確度一起保住。數字取自 KVarN 倉庫宣稱值（Qwen3-32B／AIME25／TP=2）。</figcaption>
+</figure>
+
+<p>三張頁籤把定性的取捨講清楚了，下面這張圖再把三者放到同一組軸上量。</p>
+
+<figure class="vg-w-chart-kvarn-tradeoff" data-svg-scroll="800">
+  <style>
+    .vg-w-chart-kvarn-tradeoff { display: grid; gap: var(--s-2); }
+    .vg-w-chart-kvarn-tradeoff svg { width: 100%; height: auto; }
+    .vg-w-chart-kvarn-tradeoff figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+  </style>
+
+  <svg viewBox="0 0 720 340" preserveAspectRatio="xMidYMid meet" role="img" aria-label="FP16 vs TurboQuant vs KVarN across three axes">
+    <g id="vg-w-chart-kvarn-tradeoff-axes"></g>
+    <g id="vg-w-chart-kvarn-tradeoff-series"></g>
+  </svg>
+
+  <figcaption>三組指標：KV-cache 容量（相對 FP16）、throughput（相對 FP16）、準確度（相對 FP16，FP16=1.0）。數字取自 KVarN 倉庫與論文宣稱值（Qwen3-32B / AIME25 / 16K / TP=2）；TurboQuant throughput 取其宣稱掉幅 40–52% 的中點 ≈0.54×。準確度為定性對齊（KVarN 與 FP16 持平，TurboQuant 略低），非逐點實測。</figcaption>
+
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-chart-kvarn-tradeoff');
+      const axesG = root.querySelector('#vg-w-chart-kvarn-tradeoff-axes');
+      const seriesG = root.querySelector('#vg-w-chart-kvarn-tradeoff-series');
+      const NS = 'http://www.w3.org/2000/svg';
+      function el(tag, attrs) { const e = document.createElementNS(NS, tag); for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v); return e; }
+
+      // groups: 三個指標軸；每軸三個方案
+      const groups = [
+        { label: 'KV-cache 容量', vals: [['FP16', 1.0], ['TurboQuant', 4.0], ['KVarN', 4.0]] },
+        { label: 'throughput',   vals: [['FP16', 1.0], ['TurboQuant', 0.54], ['KVarN', 1.3]] },
+        { label: '準確度',        vals: [['FP16', 1.0], ['TurboQuant', 0.93], ['KVarN', 1.0]] },
+      ];
+      const colors = { 'FP16': 'var(--muted)', 'TurboQuant': 'var(--ink-deep)', 'KVarN': 'var(--accent)' };
+      const X0 = 70, X1 = 690, Y0 = 270, Y1 = 40;
+      const maxY = 4.0;
+      const yOf = v => Y0 - (v / maxY) * (Y0 - Y1);
+
+      axesG.appendChild(el('line', { x1: X0, y1: Y0, x2: X1, y2: Y0, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+      axesG.appendChild(el('line', { x1: X0, y1: Y0, x2: X0, y2: Y1, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+      for (let v = 0; v <= maxY; v += 1) {
+        const y = yOf(v);
+        axesG.appendChild(el('line', { x1: X0 - 4, y1: y, x2: X1, y2: y, stroke: 'var(--muted-2)', 'stroke-opacity': v === 0 ? 1 : 0.3 }));
+        const t = el('text', { x: X0 - 8, y: y + 4, 'text-anchor': 'end', 'font-family': 'JetBrains Mono, monospace', 'font-size': 11, fill: 'var(--muted)' });
+        t.textContent = v + '×'; axesG.appendChild(t);
+      }
+      const yl = el('text', { x: 18, y: (Y0 + Y1) / 2, 'text-anchor': 'middle', 'font-family': 'EB Garamond, serif', 'font-size': 13, fill: 'var(--muted)', transform: `rotate(-90 18 ${(Y0 + Y1) / 2})` });
+      yl.textContent = '相對 FP16'; axesG.appendChild(yl);
+
+      const groupW = (X1 - X0) / groups.length;
+      const barW = 34, gap = 8;
+      groups.forEach((g, gi) => {
+        const gx = X0 + gi * groupW + 40;
+        g.vals.forEach((pair, bi) => {
+          const [name, val] = pair;
+          const x = gx + bi * (barW + gap);
+          const y = yOf(val), h = Y0 - y;
+          seriesG.appendChild(el('rect', { x, y, width: barW, height: h, fill: colors[name], 'fill-opacity': name === 'KVarN' ? 0.6 : 0.4, stroke: colors[name], 'stroke-width': 1.5, rx: 2 }));
+          const vt = el('text', { x: x + barW / 2, y: y - 6, 'text-anchor': 'middle', 'font-family': 'JetBrains Mono, monospace', 'font-size': 10, fill: 'var(--ink)' });
+          vt.textContent = (val % 1 === 0 ? val.toFixed(1) : val.toFixed(2)) + '×';
+          seriesG.appendChild(vt);
+        });
+        const lt = el('text', { x: gx + (3 * (barW + gap) - gap) / 2, y: Y0 + 20, 'text-anchor': 'middle', 'font-family': 'EB Garamond, serif', 'font-size': 13, fill: 'var(--muted)' });
+        lt.textContent = g.label; seriesG.appendChild(lt);
+      });
+
+      // legend
+      const lg = el('g', { 'font-family': 'Manrope, sans-serif', 'font-size': 12 });
+      const names = ['FP16', 'TurboQuant', 'KVarN'];
+      let lx = 360;
+      names.forEach((n) => {
+        lg.appendChild(el('rect', { x: lx, y: 308, width: 14, height: 10, fill: colors[n], 'fill-opacity': 0.5, stroke: colors[n], 'stroke-width': 1.2, rx: 2 }));
+        const t = el('text', { x: lx + 20, y: 317, fill: 'var(--ink)' }); t.textContent = n; lg.appendChild(t);
+        lx += 30 + n.length * 9 + 24;
+      });
+      seriesG.appendChild(lg);
+    })();
+  </script>
+</figure>
+
+<p>三軸一起看，故事就清楚了。容量上 KVarN 與 TurboQuant 都做到 4×——壓 bit 這件事本身不難。差別在另外兩軸：TurboQuant 的 throughput 掉到 0.54× 左右（為了省記憶體犧牲了速度），KVarN 卻反而把 throughput 推到 1.0× 之上。這個「壓了容量還變快」的反直覺結果，正是前面埋的伏筆——decode 是記憶體頻寬綁定的，KV cache 變小後，每一步要從 HBM 搬進來的位元組數變少，頻寬壓力下降；再加上容量變大能塞進更大 batch、攤平固定開銷，兩個效益疊起來就是「壓了容量還變快」。當然，量化／反量化的 kernel 本身有額外計算成本，所以這個淨增益是兩股力量相減的結果——KVarN 的 Triton kernel 寫得夠好，搬運省下的時間蓋過了反量化多花的時間。</p>
+
+<p>準確度那軸更是 KVarN 整套方法的存在理由——前面 variance normalization 那條平掉的綠線，在這裡兌現成「跟 FP16 持平」的那根柱子。把它跟 TurboQuant 對照特別有意思：兩者容量一樣、KVarN 速度約 2.4× 而且準確度還更高。這說明壓縮率不是唯一指標，甚至不是最難的指標——難的是在壓縮的同時把速度和準確度都保住，而這正是「量化前先治理資料」那兩步換來的。</p>
+
+<h2>這套方法值不值得你按下那個 flag</h2>
+
+<p>把整條線收攏：KV cache 是長 context、高併發 serving 的記憶體天花板；把它量化能換容量，但裸量化會被 outlier 撐爆 scale、被 error accumulation 在長 decode 裡吃掉準確度；KVarN 用 Hadamard rotation 攤平 outlier、用 Sinkhorn 式 variance normalization 拉齊 tile variance，把「量化前先治理資料」這件事做在前兩步，後面的非對稱量化與 bit-width 指派才安全。</p>
+
+<p>那它值不值得用？把判斷拆成幾條：</p>
+
+<ul>
+<li><strong>短 prompt、短輸出的 workload</strong>：KV cache 根本不是瓶頸，這套方法省不到你的痛點——別為了 4× 容量去動一個本來就夠用的 stack。</li>
+<li><strong>長 context reasoning／agentic（幾千 token decode、高併發）</strong>：error accumulation 正是你會撞上的牆，KVarN 針對的就是這個場景，而且「不改模型、不需 calibration、一個 flag」的部署成本低到值得試。</li>
+<li><strong>已經在用 vLLM</strong>：整合幾乎零摩擦——換 <code>--kv-cache-dtype</code> 一個值。但要接受它是個 fork。</li>
+</ul>
+
+<p>要注意的代價也列清楚：</p>
+
+<ul>
+<li><strong>fork 的維護負擔</strong>：它綁在 vLLM v0.22.0，上游 vLLM 持續往前跑，新功能與安全修補要不要跟、怎麼跟，得自己權衡。這是所有「serving stack fork」共同的長期成本。</li>
+<li><strong>容量有條件</strong>：4× 不是無條件成立，它需要足夠記憶體去攤平固定的 decode workspace；單 GPU 緊預算下要靠 <code>VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0</code> 把被 CUDA graph 估算佔走的容量要回來。</li>
+<li><strong>數字尚待獨立複現</strong>：宣稱的 throughput（約 1.3× FP16、2.4× TurboQuant）與準確度（FP16 持平）目前主要來自 KVarN 自家在 Qwen3-32B／AIME25 上的測量；跨模型、跨 benchmark 的獨立複現還值得等一等再下定論。</li>
+</ul>
+
+<p>但方法本身的直覺是穩的，也是這篇最值得帶走的一句：低-bit 量化掉準，很多時候不是 bit 不夠，是資料的形狀沒整理好。先把 outlier 攤平、把 variance 拉齊，再下手量化——同樣的 2-bit，結果可以天差地別。</p>
+
+<p class="vg-deep-closer"><strong>一句話帶走</strong>：下次看到某個 KV 量化方法宣稱「2-bit 幾乎無損」，先問一句它是在多長的 decode 上量的——如果只測了 prefill 或前幾十個 token，那個無損是在誤差還沒開始累積的那一刻拍的快照，搬到上千步的 reasoning 鏈上才見真章。</p>
+
+</div>
