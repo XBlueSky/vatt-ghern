@@ -1,0 +1,903 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">沒有預演、沒有事前優雅地把寫入排乾——工程師走到配電盤前注入一個「電源故障」，讓整個資料中心 region 在同一瞬間斷電。這個 region 是平常故障域的 50 到 60 倍大，而 Meta 想知道的只有一件事：當電在毫秒之間消失，再乾淨地接回來，伺服器、儲存、網路設備到底能不能自己站回原位。</p>
+  <h1 class="vg-post-title">{{ title }}</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p>
+    <span class="vg-dropcap">把</span>「斷電」當成一個可以排進測試計劃的項目，聽起來像在拿生產環境開玩笑。但 Meta 在 2026 年 6 月公布的這篇工程文章講的正是這件事——他們把「瞬時斷電就緒度（instant power loss readiness）」當作一個要主動驗證、而不是被動等它發生的屬性。驗證的方式不是寫一份 runbook、不是在 staging 模擬，而是對運轉中的整個 region 注入電源故障、讓它立刻 de-energize，然後觀察整套系統——從機械電氣設施、到機櫃、到 compute 與 storage——能不能在電力瞬間消失時安全落地、再從零乾淨地開回來。
+  </p>
+
+  <p>
+    文章沒有揭露伺服器型號、電容容量或 hold-up 的毫秒數，所以下面凡涉及時間尺度與能量預算的細節都標記為「工程推理」。但它把兩個最值錢的東西講得很清楚：第一，為什麼模擬不夠、非得真的拔電；第二，真的拔電之後，<em>恢復供電那一刻</em>暴露的故障比斷電那一刻更難對付。這兩件事構成一條清楚的時間線，下面就按它走。
+  </p>
+
+  <h2>為什麼「真的拔電」非得排進測試項目</h2>
+
+  <p>
+    先界定「瞬時斷電就緒度」在驗證什麼。資料中心當然有 UPS、備援電源、發電機；正常斷電時這些裝置會撐住負載、把市電切到發電機，伺服器根本感覺不到。真正可怕的不是這種「有人接手」的斷電，而是<strong>瞬時、全域、無人接手</strong>的那種——保護機制本身也跟著掉、整個 region 在同一個時間切片裡失去電力。這正是 Meta 注入的場景：「a power supply fault being injected to cause immediate de-energization of the entire region」。
+  </p>
+
+  <p>
+    為什麼模擬不夠？因為這類故障的殺傷力來自「未知的未知（unknown unknowns）」。任何模擬都只驗證你已想到的失敗；真實系統裡致命的，恰恰是不在任何人模型裡的隱性依賴——一個被遺忘的硬編 IP、一個假設 DNS 永遠可達的健康檢查、一個在冷啟時把後端重試到打垮的指數退避。這些只在物理電力真的消失、所有元件以各自真實時序反應時才同時現形。Meta 自己說這是「chicken-and-egg problem of needing to take risk to address risk」——要消除風險，得先承擔風險。
+  </p>
+
+  <p>
+    這裡有個尺度上的關鍵數字：被測 region 是「50-60x the size of the typical fault domains」。平常的故障注入作用範圍是一個 fault domain——一排機櫃、一個 cell、一組副本。把整個 region 一次斷掉，等於把 50 到 60 個故障域同時點著。這個尺度下，平常「另一個故障域會接手」的假設全部失效：沒有別的 region 分流、沒有健康副本路由、沒有一個還活著的控制平面協調恢復。就緒度要驗證的，正是「當這些假設全部不成立時，系統能不能自己爬起來」。
+  </p>
+
+  <p>
+    「就緒度」其實有兩個彼此獨立卻常被混為一談的層面。<strong>硬體層</strong>是機電設施、配電、機櫃供電、儲能裝置承受瞬時 de-energization 與隨後 re-energization 的衝擊時能不能不壞、不起火、不留下永久損傷；<strong>軟體層</strong>是當所有機器同時冷啟，控制平面、服務發現、排程、儲存的恢復邏輯能不能把歸零的 region 重新組裝回可服務的系統。Meta 把這兩層綁在同一個動作裡驗證，因為真實災難不會好心地只考你一層——而文章後半暴露的故障幾乎全落在第二層：硬體扛得住，軟體的隱性依賴卻沒有。
+  </p>
+
+  <p>
+    這也回答了「為什麼非得對整個 region、而不是先放大一排機櫃」。有一整類故障的觸發條件就是「規模本身」：一排機櫃斷電時，控制平面在別處好端端地跑著、隨時可協調恢復；只有當控制平面自己也在斷電範圍內，「誰來協調恢復」才變成真的問題。小規模測試在定義上就驗證不了「協調者也死了」這個最關鍵的場景——這是 region 尺度不可繞過的根本原因。
+  </p>
+
+  <p>
+    斷電瞬間本身相對「乾淨」——電消失，東西停下。真正的工程難點分布在兩個時刻：拔電當下（in-memory 資料來不來得及落地）、與恢復供電當下（一個沒有任何東西在跑的 region 怎麼從零 bootstrap）。先看拔電那一刻。
+  </p>
+
+  <h2>拔電那一刻——hold-up 能量、PLS、與 in-memory 的最後窗口</h2>
+
+  <p>
+    當市電瞬間消失，機櫃並不是立刻歸零。Meta 提到兩個關鍵裝置：「batteries and Power Loss Siren (PLS)」，讓機櫃可以「persist in-memory data when racks have lost power」。斷電不是離散事件，而是一段<em>有預算的倒數</em>：電池（這個語境下更像機櫃級的 BBU 或 hold-up 儲能）提供一小段續命時間，PLS——斷電警報器——則是在電力消失的第一時間廣播「準備落地」的訊號源。
+  </p>
+
+  <p>
+    這段窗口要做的事，是把還停在記憶體裡、尚未安全寫入持久層的髒資料（dirty pages、未 flush 的 write buffer、in-flight 交易）盡可能落地——但它是有限的能量預算，誰先做、做多少、來不來得及，是一個排程問題。下面這個 canvas 把這段倒數攤開：電軌電壓在斷電後衰減，PLS 在 t0 觸發，續命能量像一條燃燒的預算條往下掉，幾個關鍵動作各需時間才能完成；拖動 hold-up 預算，看哪些動作能在電歸零前完成、哪些被截斷。（時間尺度與能量曲線為<strong>工程推理下的示意</strong>，非 Meta 公布數字。）
+  </p>
+
+  <figure class="vg-w-canvas-pls-discharge">
+    <style>
+      .vg-w-canvas-pls-discharge { display: grid; grid-template-rows: auto auto auto; gap: var(--s-2); margin: var(--s-4) 0; }
+      .vg-w-canvas-pls-discharge .vg-w-affordance { display: flex; align-items: center; gap: 8px; margin: 0; font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+      .vg-w-canvas-pls-discharge .vg-w-affordance svg { width: 14px !important; height: 14px !important; min-width: 14px !important; }
+      .vg-w-canvas-pls-discharge .toolbar { display: flex; align-items: center; gap: var(--s-2); flex-wrap: wrap; font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+      .vg-w-canvas-pls-discharge button { font-family: var(--sans); font-size: var(--fs-sm); padding: 6px 14px; min-height: 44px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); cursor: pointer; }
+      .vg-w-canvas-pls-discharge button:hover { border-color: var(--accent); color: var(--accent-text); }
+      .vg-w-canvas-pls-discharge label.slider { display: flex; align-items: center; gap: 8px; flex: 1 1 240px; min-width: 220px; }
+      .vg-w-canvas-pls-discharge input[type="range"] { flex: 1; height: 36px; accent-color: var(--accent); touch-action: none; }
+      .vg-w-canvas-pls-discharge .readout { font-family: var(--mono); font-size: var(--fs-sm); color: var(--accent-text); margin-left: auto; }
+      .vg-w-canvas-pls-discharge canvas { width: 100%; height: auto; aspect-ratio: 16 / 9; display: block; }
+      .vg-w-canvas-pls-discharge figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+      @media (max-width: 720px) {
+        .vg-w-canvas-pls-discharge canvas { aspect-ratio: 4 / 3; }
+        .vg-w-canvas-pls-discharge .readout { margin-left: 0; }
+      }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/><path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+      </svg>
+      <span>play 看續命窗口倒數 · 拖 slider 調 hold-up 能量預算 · 3 個落地動作賽跑</span>
+    </p>
+
+    <div class="toolbar">
+      <button id="vg-w-canvas-pls-discharge-toggle">▷ 拔電</button>
+      <button id="vg-w-canvas-pls-discharge-reset">↺ reset</button>
+      <label class="slider">
+        hold-up 預算
+        <input type="range" id="vg-w-canvas-pls-discharge-budget" min="40" max="220" step="10" value="120" />
+      </label>
+      <span class="readout" id="vg-w-canvas-pls-discharge-readout">budget = 120u · t = 0</span>
+    </div>
+
+    <canvas id="vg-w-canvas-pls-discharge-canvas"></canvas>
+
+    <figcaption>
+      斷電後的續命窗口（示意，非 Meta 實測值）。上半是電軌電壓衰減曲線與 PLS 觸發點，下半三條工作棒是 flush 髒記憶體、fsync 落盤、quiesce 網路——綠色表示在電歸零前完成，紅色表示被截斷。
+    </figcaption>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-canvas-pls-discharge');
+        if (!root) return;
+        const canvas = root.querySelector('#vg-w-canvas-pls-discharge-canvas');
+        const toggle = root.querySelector('#vg-w-canvas-pls-discharge-toggle');
+        const reset = root.querySelector('#vg-w-canvas-pls-discharge-reset');
+        const budgetIn = root.querySelector('#vg-w-canvas-pls-discharge-budget');
+        const readout = root.querySelector('#vg-w-canvas-pls-discharge-readout');
+        const ctx = canvas.getContext('2d');
+
+        function cssVar(name) {
+          return getComputedStyle(root).getPropertyValue(name).trim() || '#888';
+        }
+
+        function resize() {
+          const dpr = window.devicePixelRatio || 1;
+          const rect = canvas.getBoundingClientRect();
+          canvas.width = Math.max(1, rect.width * dpr);
+          canvas.height = Math.max(1, rect.height * dpr);
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        }
+        new ResizeObserver(resize).observe(canvas);
+        resize();
+
+        // Model: hold-up budget burns down linearly once power is cut.
+        // Three landing tasks each need a fixed amount of "budget-time" and
+        // start in priority order. A task completes only if the running
+        // budget clock reaches its finish before the budget hits zero.
+        let running = false;
+        let t = 0;          // elapsed budget-time units since the cut
+        let budget = 120;   // total hold-up budget units (slider)
+        const tasks = [
+          { name: 'flush 髒記憶體', start: 0,  need: 55 },
+          { name: 'fsync 落盤',     start: 30, need: 70 },
+          { name: 'quiesce 網路',   start: 70, need: 45 },
+        ];
+
+        function reflectBudget() {
+          budget = parseInt(budgetIn.value, 10);
+          readout.textContent = `budget = ${budget}u · t = ${Math.min(t, budget).toFixed(0)}`;
+        }
+        budgetIn.addEventListener('input', () => { reflectBudget(); if (!running) draw(); });
+
+        function draw() {
+          const W = canvas.getBoundingClientRect().width;
+          const H = canvas.getBoundingClientRect().height;
+          ctx.clearRect(0, 0, W, H);
+
+          const padL = 54, padR = 18, padT = 16;
+          const plotW = W - padL - padR;
+          const T_MAX = 240; // full axis span in budget units
+          const xOf = u => padL + (Math.min(u, T_MAX) / T_MAX) * plotW;
+
+          // ---- top panel: rail voltage decay + budget marker ----
+          const railTop = padT, railH = H * 0.42;
+          ctx.font = '13px "EB Garamond", serif';
+          ctx.fillStyle = cssVar('--muted');
+          ctx.fillText('電軌電壓', padL, railTop + 4);
+
+          // voltage decays exponentially after the cut; floor at 0 when budget exhausted
+          ctx.beginPath();
+          for (let u = 0; u <= T_MAX; u += 4) {
+            const frac = Math.max(0, 1 - u / budget);
+            const v = Math.pow(frac, 0.9); // 0..1
+            const x = xOf(u);
+            const y = railTop + 18 + (1 - v) * (railH - 24);
+            if (u === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+          }
+          ctx.strokeStyle = cssVar('--accent');
+          ctx.lineWidth = 2;
+          ctx.stroke();
+
+          // PLS trigger marker at t0
+          ctx.strokeStyle = cssVar('--ink-deep');
+          ctx.lineWidth = 1.5;
+          ctx.setLineDash([4, 3]);
+          ctx.beginPath();
+          ctx.moveTo(xOf(0), railTop + 14);
+          ctx.lineTo(xOf(0), railTop + railH);
+          ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.fillStyle = cssVar('--ink-deep');
+          ctx.font = '12px "Manrope", sans-serif';
+          ctx.fillText('PLS 觸發', xOf(0) + 4, railTop + 14);
+
+          // budget-zero marker
+          const xZero = xOf(budget);
+          ctx.strokeStyle = cssVar('--muted');
+          ctx.setLineDash([2, 3]);
+          ctx.beginPath();
+          ctx.moveTo(xZero, railTop + 14);
+          ctx.lineTo(xZero, H - 10);
+          ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.fillStyle = cssVar('--muted');
+          ctx.fillText('電歸零', xZero + 4, railTop + railH + 2);
+
+          // current time cursor
+          const xNow = xOf(Math.min(t, budget));
+          ctx.strokeStyle = cssVar('--ink');
+          ctx.lineWidth = 1.5;
+          ctx.beginPath();
+          ctx.moveTo(xNow, railTop + 14);
+          ctx.lineTo(xNow, H - 10);
+          ctx.stroke();
+
+          // ---- bottom panel: task bars ----
+          const barTop = railTop + railH + 22;
+          const barH = 16, barGap = 14;
+          ctx.font = '12px "Manrope", sans-serif';
+          tasks.forEach((task, i) => {
+            const y = barTop + i * (barH + barGap);
+            const x0 = xOf(task.start);
+            const xFull = xOf(task.start + task.need);
+            // track (planned extent)
+            ctx.fillStyle = cssVar('--bg-soft');
+            ctx.fillRect(x0, y, xFull - x0, barH);
+            ctx.strokeStyle = cssVar('--muted-2');
+            ctx.lineWidth = 1;
+            ctx.strokeRect(x0, y, xFull - x0, barH);
+            // progress fill
+            const reached = Math.max(task.start, Math.min(t, task.start + task.need, budget));
+            const completed = (task.start + task.need) <= budget && t >= task.start + task.need;
+            const truncated = t >= budget && !completed && t >= task.start;
+            const xReached = xOf(reached);
+            ctx.fillStyle = truncated ? cssVar('--accent') : cssVar('--sage');
+            ctx.globalAlpha = truncated ? 0.5 : 0.75;
+            ctx.fillRect(x0, y, Math.max(0, xReached - x0), barH);
+            ctx.globalAlpha = 1;
+            // label
+            ctx.fillStyle = cssVar('--ink');
+            ctx.fillText(task.name, padL, y + barH - 3);
+            // status tag
+            if (t > 0) {
+              let tag = '…';
+              let col = cssVar('--muted');
+              if (completed) { tag = '落地 ✓'; col = cssVar('--sage-deep'); }
+              else if (truncated) { tag = '截斷 ✗'; col = cssVar('--accent-text'); }
+              ctx.fillStyle = col;
+              ctx.fillText(tag, Math.min(xFull + 6, W - 60), y + barH - 3);
+            }
+          });
+        }
+
+        let lastClock = null;
+        function frame(now) {
+          if (running) {
+            if (lastClock == null) lastClock = now;
+            const dt = Math.min(60, (now - lastClock)) / 1000 * 90; // ~90 units/sec
+            lastClock = now;
+            t += dt;
+            if (t >= budget) { t = budget; running = false; toggle.textContent = '▷ 拔電'; }
+            readout.textContent = `budget = ${budget}u · t = ${Math.min(t, budget).toFixed(0)}`;
+          }
+          draw();
+          requestAnimationFrame(frame);
+        }
+        requestAnimationFrame(frame);
+
+        toggle.addEventListener('click', () => {
+          if (t >= budget) { t = 0; }
+          running = !running;
+          lastClock = null;
+          toggle.textContent = running ? '⏸ pause' : '▷ 拔電';
+        });
+        reset.addEventListener('click', () => {
+          running = false; t = 0; lastClock = null;
+          toggle.textContent = '▷ 拔電';
+          reflectBudget();
+          draw();
+        });
+
+        reflectBudget();
+        draw();
+      })();
+    </script>
+  </figure>
+
+  <p>
+    canvas 裡那三條工作棒的<em>順序</em>並非任意。flush 髒記憶體排最前，因為記憶體裡的東西一旦斷電就徹底消失、無可補救；fsync 落盤次之，把寫到 page cache 但還沒落到持久媒介的東西推下去；quiesce 網路最後，因為網路狀態多半可在恢復後重建。這個排序本身就是風險工程——能量預算有限時先保最不可逆的東西。把 hold-up 預算往下拖，會看到系統按這個優先級「丟車保帥」：先犧牲可重建的網路 quiesce，再犧牲落盤，最後連最關鍵的記憶體 flush 都來不及——那一刻 table-stake 的資料遺失紅線就被觸碰了。
+  </p>
+
+  <p>
+    一個值得停下來的細節：續命窗口不是用來「繼續服務」的，是用來「乾淨地停下」的。電池與 PLS 買到的時間，目標不是讓查詢繼續跑，而是讓所有「進行一半」的狀態抵達一個可安全恢復的點——交易要麼提交、要麼回滾，write buffer 要麼落盤、要麼丟棄但有跡可循。Meta 把「data loss in storage/databases」列為 table-stake 第一條，續命窗口存在的全部理由就是守住它。
+  </p>
+
+  <p>
+    所以拔電當下暴露的故障，本質上都是「落地賽跑輸了」的變體：某服務 flush 比預期慢、某儲存層在收到斷電訊號到真正停止寫入之間有一段沒算進預算的延遲、某元件根本沒訂閱 PLS 所以不知道要落地。這些在模擬裡看不出來——模擬的「斷電」是程式碼裡一個乾淨的事件，真實世界裡斷電是物理過程，每個元件感知、反應它的時序都不一樣。但拔電那一刻再難，也是「一次性、單向」的：東西停下就停下了。真正讓 Meta 反覆踩雷的是另一個時刻——把電接回來。
+  </p>
+
+  <h2>開回來才是真考驗——Ouroboros 與 Boomerang</h2>
+
+  <p>
+    一個被瞬間斷電的 region，恢復供電時面對的是一個極端狀態：<strong>什麼都沒在跑</strong>。沒有控制平面、沒有排程器、沒有服務發現、沒有路由表——全是冷的。Meta 用來編排容器的是 Twine，控制平面包含 Scheduler、Allocator、Broker，以及一個叫 Zelos 的協調器。正常運作下這些服務彼此依賴、互相提供能力；但在「全冷啟動」時，這種互相依賴會變成致命的死結。
+  </p>
+
+  <div class="vg-w-glossary-twine">
+    <style>
+      .vg-w-glossary-twine { margin: var(--s-4) 0; padding: var(--s-3); border: 1px solid var(--line); background: var(--bg-soft); border-radius: 2px; position: relative; }
+      .vg-w-glossary-twine .vg-w-affordance { display: flex; align-items: center; gap: 8px; margin: 0 0 var(--s-2) 0; font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+      .vg-w-glossary-twine .vg-w-affordance svg { width: 14px !important; height: 14px !important; min-width: 14px !important; }
+      .vg-w-glossary-twine .terms { display: flex; flex-wrap: wrap; gap: var(--s-1) var(--s-3); margin: 0; font-family: var(--serif); font-size: var(--fs-md); line-height: 2.1; }
+      .vg-w-glossary-twine .gitem { position: relative; }
+      .vg-w-glossary-twine .term { anchor-name: var(--vgw-a); text-decoration: underline dotted var(--accent); text-underline-offset: 3px; cursor: help; padding: 4px 2px; min-height: 32px; display: inline-block; color: var(--ink); }
+      .vg-w-glossary-twine .gitem:nth-child(1) .term { --vgw-a: --vgw-twine-1; }
+      .vg-w-glossary-twine .gitem:nth-child(2) .term { --vgw-a: --vgw-twine-2; }
+      .vg-w-glossary-twine .gitem:nth-child(3) .term { --vgw-a: --vgw-twine-3; }
+      .vg-w-glossary-twine .gitem:nth-child(4) .term { --vgw-a: --vgw-twine-4; }
+      .vg-w-glossary-twine .gitem:nth-child(5) .term { --vgw-a: --vgw-twine-5; }
+      .vg-w-glossary-twine .gitem:nth-child(6) .term { --vgw-a: --vgw-twine-6; }
+      .vg-w-glossary-twine .gitem:nth-child(1) .pop { position-anchor: --vgw-twine-1; }
+      .vg-w-glossary-twine .gitem:nth-child(2) .pop { position-anchor: --vgw-twine-2; }
+      .vg-w-glossary-twine .gitem:nth-child(3) .pop { position-anchor: --vgw-twine-3; }
+      .vg-w-glossary-twine .gitem:nth-child(4) .pop { position-anchor: --vgw-twine-4; }
+      .vg-w-glossary-twine .gitem:nth-child(5) .pop { position-anchor: --vgw-twine-5; }
+      .vg-w-glossary-twine .gitem:nth-child(6) .pop { position-anchor: --vgw-twine-6; }
+      .vg-w-glossary-twine .pop {
+        position: absolute; top: anchor(bottom); left: anchor(center); translate: -50% var(--s-1);
+        padding: var(--s-1) var(--s-2); background: var(--bg); border: 1px solid var(--accent);
+        font-family: var(--scribed); font-size: var(--fs-sm); line-height: 1.5; color: var(--ink);
+        width: max-content; max-width: 30ch; z-index: 3; opacity: 0; transition: opacity 100ms; pointer-events: none;
+      }
+      .vg-w-glossary-twine .term:hover + .pop,
+      .vg-w-glossary-twine .term:focus + .pop { opacity: 1; }
+      @supports not (anchor-name: --x) {
+        .vg-w-glossary-twine .terms { flex-direction: column; align-items: flex-start; }
+        .vg-w-glossary-twine .pop { position: static; opacity: 1; pointer-events: auto; translate: none; max-width: none; border-color: var(--line); margin-top: 2px; }
+      }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/>
+      </svg>
+      <span>hover／tap 任一名詞看它在這套機制裡負責什麼 · Twine 控制平面與斷電訊號的角色表</span>
+    </p>
+
+    <p class="terms">
+      <span class="gitem"><span class="term" tabindex="0">Twine</span><span class="pop" role="tooltip">Meta 的容器編排系統，把工作負載放上機器並管理生命週期。控制平面由下面幾個服務組成。</span></span>
+      <span class="gitem"><span class="term" tabindex="0">Scheduler</span><span class="pop" role="tooltip">決定哪個工作負載放到哪台機器——容器放置的決策層。冷啟時得在沒有完整叢集視圖下重建這些決策。</span></span>
+      <span class="gitem"><span class="term" tabindex="0">Allocator</span><span class="pop" role="tooltip">把機器資源（CPU、記憶體、容量）配給排程出來的工作負載，是 Scheduler 決策的落地執行者。</span></span>
+      <span class="gitem"><span class="term" tabindex="0">Broker</span><span class="pop" role="tooltip">控制平面與被管理工作負載之間的中介層，傳遞指令與狀態。它既發協調訊號、也在全斷時被同一訊號波及。</span></span>
+      <span class="gitem"><span class="term" tabindex="0">Zelos</span><span class="pop" role="tooltip">控制平面裡的協調器，讓上述服務在分散環境下達成一致。它的存活直接決定 region 能否被重新組裝。</span></span>
+      <span class="gitem"><span class="term" tabindex="0">PLS</span><span class="pop" role="tooltip">Power Loss Siren，斷電警報器。在電力消失的第一時間廣播訊號，讓機櫃啟動把 in-memory 資料落地的續命程序。</span></span>
+      <span class="gitem"><span class="term" tabindex="0">UE</span><span class="pop" role="tooltip">unavailability events，region 範圍的非同步訊號，標記「某物不可用」並編排關機與恢復。Boomerang 正源於它的作用域在全斷時失控膨脹。</span></span>
+    </p>
+  </div>
+
+  <p>
+    這個「全是冷的」狀態，是任何長年運行的線上系統幾乎從不經歷的。控制平面服務通常被一個個重啟，很少全部同時死、再全部同時從空白起；久而久之「啟動順序」的正確性就沒人持續驗證。隱性依賴於是悄悄累積：某服務在 init 時直接去讀另一服務的 endpoint、某元件假設配置中心已可達。這些假設在熱系統裡永遠成立、永遠不報錯，是一種只在「全冷啟動」邊界條件下才會引爆的技術債。
+  </p>
+
+  <p>
+    第一類死結，Meta 借了神話意象命名：<strong>Ouroboros</strong>，咬住自己尾巴的蛇。控制平面服務啟動時需要另一個控制平面服務已經在跑，而那個又需要第一個——「control plane services cannot start without themselves」。熱系統裡這從不是問題，因為它們一直都在；只有把一切歸零、要求它們從虛空中同時長出來時，循環依賴才會把整個 bootstrap 卡死。Meta 的解法是用 Belljar CI 把循環依賴在上線前就抓出來，再配一套「Twine recovery kit」在恢復時主動「break any circular dependencies」——給冷啟動一條不依賴完整控制平面的引導路徑。
+  </p>
+
+  <p>
+    這套解法跟作業系統的 bootstrap 同構。機器開機時，CPU 不可能等「完整的 OS 已經在跑」才開始——它先跑一段最小、不依賴任何高層服務的引導程式（bootloader）把核心拉起來，再逐層喚醒其餘子系統。recovery kit 扮演的就是這個 bootloader：提供一條不依賴完整控制平面的最小引導路徑，把「先有雞還是先有蛋」的循環用一顆人工放進去的蛋打破。Belljar CI 則把這件事左移——讓循環依賴在 commit 階段就被抓到，而非等到某次真實斷電才在 region 規模上爆出來。下面這張圖把依賴環、以及 recovery kit 在哪裡剪斷它畫出來——點任一節點看它在環裡的位置。
+  </p>
+
+  <figure class="vg-w-arch-ouroboros-break" data-svg-scroll="880">
+    <style>
+      .vg-w-arch-ouroboros-break { display: grid; gap: var(--s-2); margin: var(--s-4) 0; }
+      .vg-w-arch-ouroboros-break .vg-w-affordance { display: flex; align-items: center; gap: 8px; margin: 0; font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+      .vg-w-arch-ouroboros-break .vg-w-affordance svg { width: 14px !important; height: 14px !important; min-width: 14px !important; }
+      .vg-w-arch-ouroboros-break svg.diagram { width: 100%; height: auto; max-width: 880px; }
+      .vg-w-arch-ouroboros-break svg.diagram text { font-family: EB Garamond, serif; }
+      .vg-w-arch-ouroboros-break .node { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; }
+      .vg-w-arch-ouroboros-break .node:hover { stroke: var(--accent); }
+      .vg-w-arch-ouroboros-break:has(#vg-w-arch-ouroboros-break-r1:checked) .onode-1,
+      .vg-w-arch-ouroboros-break:has(#vg-w-arch-ouroboros-break-r2:checked) .onode-2,
+      .vg-w-arch-ouroboros-break:has(#vg-w-arch-ouroboros-break-r3:checked) .onode-3 {
+        fill: color-mix(in srgb, var(--accent) 16%, transparent); stroke: var(--accent);
+      }
+      .vg-w-arch-ouroboros-break input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-arch-ouroboros-break .detail { padding: var(--s-2); border-left: 2px solid var(--accent); background: var(--bg-soft); display: none; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-arch-ouroboros-break:has(#vg-w-arch-ouroboros-break-r1:checked) .odetail-1,
+      .vg-w-arch-ouroboros-break:has(#vg-w-arch-ouroboros-break-r2:checked) .odetail-2,
+      .vg-w-arch-ouroboros-break:has(#vg-w-arch-ouroboros-break-r3:checked) .odetail-3 { display: block; }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 3v6h-6"/>
+      </svg>
+      <span>click 任一節點看它在依賴環裡的位置 · recovery kit 在哪裡剪斷循環</span>
+    </p>
+
+    <input type="radio" id="vg-w-arch-ouroboros-break-r1" name="vg-w-arch-ouroboros-break-sel" checked aria-label="服務 A" />
+    <input type="radio" id="vg-w-arch-ouroboros-break-r2" name="vg-w-arch-ouroboros-break-sel" aria-label="服務 B" />
+    <input type="radio" id="vg-w-arch-ouroboros-break-r3" name="vg-w-arch-ouroboros-break-sel" aria-label="recovery kit" />
+
+    <svg class="diagram" viewBox="0 0 880 380" role="img"
+         aria-label="Ouroboros 循環依賴：服務 A 與 B 互相等待，Twine recovery kit 像 bootloader 一樣注入一顆人工的蛋剪斷循環">
+      <defs>
+        <marker id="vg-w-arch-ouroboros-break-arr" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+          <path d="M0,0 L7,3.5 L0,7 Z" fill="var(--muted)"/>
+        </marker>
+        <marker id="vg-w-arch-ouroboros-break-arr-a" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+          <path d="M0,0 L7,3.5 L0,7 Z" fill="var(--accent)"/>
+        </marker>
+      </defs>
+
+      <text x="440" y="30" text-anchor="middle" fill="var(--ink)" font-size="16">Ouroboros——控制平面服務無法在沒有自己的情況下啟動</text>
+
+      <rect class="node onode-1" x="120" y="120" width="200" height="110" rx="8" role="button" tabindex="0" aria-label="control plane service A" />
+      <text x="220" y="160" text-anchor="middle" fill="var(--ink)" font-size="15">控制平面服務 A</text>
+      <text x="220" y="184" text-anchor="middle" fill="var(--muted)" font-size="12">啟動前要先讀 B</text>
+
+      <rect class="node onode-2" x="560" y="120" width="200" height="110" rx="8" role="button" tabindex="0" aria-label="control plane service B" />
+      <text x="660" y="160" text-anchor="middle" fill="var(--ink)" font-size="15">控制平面服務 B</text>
+      <text x="660" y="184" text-anchor="middle" fill="var(--muted)" font-size="12">啟動前要先讀 A</text>
+
+      <rect class="node onode-3" x="340" y="290" width="200" height="70" rx="8" role="button" tabindex="0" aria-label="twine recovery kit" />
+      <text x="440" y="318" text-anchor="middle" fill="var(--ink)" font-size="14">Twine recovery kit</text>
+      <text x="440" y="338" text-anchor="middle" fill="var(--accent-text)" font-size="12">注入人工的蛋 · bootloader</text>
+
+      <path d="M320 158 L 556 158" fill="none" stroke="var(--muted)" stroke-width="1.6" marker-end="url(#vg-w-arch-ouroboros-break-arr)"/>
+      <text x="438" y="148" text-anchor="middle" fill="var(--muted)" font-size="12">A 等 B</text>
+      <path d="M556 200 L 324 200" fill="none" stroke="var(--muted)" stroke-width="1.6" marker-end="url(#vg-w-arch-ouroboros-break-arr)"/>
+      <text x="438" y="220" text-anchor="middle" fill="var(--muted)" font-size="12">B 等 A · 死結</text>
+
+      <path d="M420 290 Q 360 250 300 232" fill="none" stroke="var(--accent)" stroke-width="2" stroke-dasharray="6,4" marker-end="url(#vg-w-arch-ouroboros-break-arr-a)"/>
+      <path d="M460 290 Q 540 250 588 232" fill="none" stroke="var(--accent)" stroke-width="2" stroke-dasharray="6,4" marker-end="url(#vg-w-arch-ouroboros-break-arr-a)"/>
+      <text x="440" y="268" text-anchor="middle" fill="var(--accent-text)" font-size="12">recovery kit 先給 A、B 一個最小可用態，剪斷互等</text>
+    </svg>
+
+    <div class="detail odetail-1">
+      <strong>控制平面服務 A</strong>：熱系統裡 A 早就在跑，「啟動 A 要先有 B」從不被執行。只有全冷啟動時，A 第一次真的得在「B 還不存在」時啟動——隱性依賴才從假設變成阻塞。
+    </div>
+    <div class="detail odetail-2">
+      <strong>控制平面服務 B</strong>：與 A 對稱。B 啟動時去讀 A 的 endpoint，而 A 此刻也正卡在等 B。兩者互為前置，誰都先動不了——這就是 Belljar CI 要在 commit 階段用依賴圖抓出來的循環。
+    </div>
+    <div class="detail odetail-3">
+      <strong>Twine recovery kit（注入的蛋）</strong>：只在恢復時登場——像 bootloader 一樣，先給 A 與 B 各一個不依賴對方的最小可用態，讓其中一個先站起來，循環就被從外部剪斷。這條路徑必須獨立於完整控制平面，否則它自己也會掉進同一個環。
+    </div>
+  </figure>
+
+  <p>
+    第二類更微妙，叫 <strong>Boomerang effect</strong>：「the generator of a critical signal being impacted by the same signal」。Meta 用一種 region 範圍的非同步訊號——「unavailability events (UE)」——協調整個 region 的關機與恢復。問題是，發出這些 UE 的正是 Twine 控制平面服務本身；而 UE 在傳播時，「ended up shutting down the orchestrator control plane services themselves」。協調者發訊號去關別人，訊號繞一圈回來把協調者自己關掉了——迴力鏢。
+  </p>
+
+  <p>
+    Boomerang 之所以難，是它在熱系統的任何測試裡都不會出現。平常 UE 是標記「某物不可用」的局部訊號，作用域小、協調者永遠在訊號的作用域之外；只有當斷電讓「整個 region」都進入 UE 的作用域，協調者才第一次落進自己廣播的訊號半徑裡。下面這張圖把這個迴圈畫出來——點任一節點看它在迴圈裡的角色。
+  </p>
+
+  <figure class="vg-w-arch-meta-boomerang" data-svg-scroll="880">
+    <style>
+      .vg-w-arch-meta-boomerang { display: grid; gap: var(--s-2); margin: var(--s-4) 0; }
+      .vg-w-arch-meta-boomerang .vg-w-affordance { display: flex; align-items: center; gap: 8px; margin: 0; font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+      .vg-w-arch-meta-boomerang .vg-w-affordance svg { width: 14px !important; height: 14px !important; min-width: 14px !important; }
+      .vg-w-arch-meta-boomerang svg.diagram { width: 100%; height: auto; max-width: 880px; }
+      .vg-w-arch-meta-boomerang svg.diagram text { font-family: EB Garamond, serif; }
+      .vg-w-arch-meta-boomerang .node { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; }
+      .vg-w-arch-meta-boomerang .node:hover { stroke: var(--accent); }
+      .vg-w-arch-meta-boomerang:has(#vg-w-arch-meta-boomerang-r1:checked) .node-1,
+      .vg-w-arch-meta-boomerang:has(#vg-w-arch-meta-boomerang-r2:checked) .node-2,
+      .vg-w-arch-meta-boomerang:has(#vg-w-arch-meta-boomerang-r3:checked) .node-3 {
+        fill: color-mix(in srgb, var(--accent) 16%, transparent); stroke: var(--accent);
+      }
+      .vg-w-arch-meta-boomerang input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-arch-meta-boomerang .detail { padding: var(--s-2); border-left: 2px solid var(--accent); background: var(--bg-soft); display: none; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-arch-meta-boomerang:has(#vg-w-arch-meta-boomerang-r1:checked) .detail-1,
+      .vg-w-arch-meta-boomerang:has(#vg-w-arch-meta-boomerang-r2:checked) .detail-2,
+      .vg-w-arch-meta-boomerang:has(#vg-w-arch-meta-boomerang-r3:checked) .detail-3 { display: block; }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m9 9 5 12 1.8-5.2L21 14Z"/><path d="M7.2 2.2 8 5.1"/><path d="m5.1 8-2.9-.8"/><path d="M14 4.1 12 6"/><path d="m6 12-1.9 2"/>
+      </svg>
+      <span>click 任一節點看它在迴圈裡的角色 · 3 個環節 · UE 訊號的自噬路徑</span>
+    </p>
+
+    <input type="radio" id="vg-w-arch-meta-boomerang-r1" name="vg-w-arch-meta-boomerang-sel" checked aria-label="orchestrator" />
+    <input type="radio" id="vg-w-arch-meta-boomerang-r2" name="vg-w-arch-meta-boomerang-sel" aria-label="UE bus" />
+    <input type="radio" id="vg-w-arch-meta-boomerang-r3" name="vg-w-arch-meta-boomerang-sel" aria-label="targets" />
+
+    <svg class="diagram" viewBox="0 0 880 360" role="img"
+         aria-label="Boomerang effect 的迴圈：控制平面發出 UE 去關閉目標，UE 繞回來把控制平面自己關掉">
+      <defs>
+        <marker id="vg-w-arch-meta-boomerang-arr" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+          <path d="M0,0 L7,3.5 L0,7 Z" fill="var(--accent)"/>
+        </marker>
+        <marker id="vg-w-arch-meta-boomerang-arr-muted" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+          <path d="M0,0 L7,3.5 L0,7 Z" fill="var(--muted)"/>
+        </marker>
+      </defs>
+
+      <text x="440" y="28" text-anchor="middle" fill="var(--ink)" font-size="16">Boomerang——協調者落進了自己廣播的訊號半徑</text>
+
+      <!-- node 1: orchestrator -->
+      <rect class="node node-1" x="60" y="120" width="220" height="120" rx="8" role="button" tabindex="0" aria-label="orchestrator control plane" />
+      <text x="170" y="150" text-anchor="middle" fill="var(--ink)" font-size="15">Twine 控制平面</text>
+      <text x="170" y="174" text-anchor="middle" fill="var(--muted)" font-size="12">Scheduler · Allocator</text>
+      <text x="170" y="192" text-anchor="middle" fill="var(--muted)" font-size="12">Broker · Zelos</text>
+      <text x="170" y="220" text-anchor="middle" fill="var(--accent-text)" font-size="12">UE 的產生者</text>
+
+      <!-- node 2: UE bus -->
+      <rect class="node node-2" x="600" y="60" width="220" height="80" rx="8" role="button" tabindex="0" aria-label="UE signaling bus" />
+      <text x="710" y="92" text-anchor="middle" fill="var(--ink)" font-size="15">UE 訊號匯流排</text>
+      <text x="710" y="114" text-anchor="middle" fill="var(--muted)" font-size="12">region-wide async</text>
+
+      <!-- node 3: targets -->
+      <rect class="node node-3" x="600" y="220" width="220" height="80" rx="8" role="button" tabindex="0" aria-label="shutdown targets" />
+      <text x="710" y="252" text-anchor="middle" fill="var(--ink)" font-size="15">關機目標服務</text>
+      <text x="710" y="274" text-anchor="middle" fill="var(--muted)" font-size="12">原本預期的作用域</text>
+
+      <!-- arrow: orchestrator -> UE bus (emit) -->
+      <path d="M280 150 Q 460 90 596 100" fill="none" stroke="var(--accent)" stroke-width="2"
+            marker-end="url(#vg-w-arch-meta-boomerang-arr)"/>
+      <text x="450" y="92" text-anchor="middle" fill="var(--accent-text)" font-size="12">① 發出 UE 編排關機</text>
+
+      <!-- arrow: UE bus -> targets (intended) -->
+      <path d="M710 140 L 710 216" fill="none" stroke="var(--muted)" stroke-width="1.6"
+            marker-end="url(#vg-w-arch-meta-boomerang-arr-muted)"/>
+      <text x="724" y="184" text-anchor="start" fill="var(--muted)" font-size="12">② 預期：只打到目標</text>
+
+      <!-- arrow: UE bus -> orchestrator (boomerang) -->
+      <path d="M620 110 Q 420 250 282 220" fill="none" stroke="var(--accent)" stroke-width="2" stroke-dasharray="6,4"
+            marker-end="url(#vg-w-arch-meta-boomerang-arr)"/>
+      <text x="440" y="270" text-anchor="middle" fill="var(--accent-text)" font-size="12">③ 全 region 斷電時，UE 也打回協調者自己</text>
+
+      <text x="170" y="290" text-anchor="middle" fill="var(--muted)" font-size="12">熱系統裡協調者在作用域外；全斷時它落進了作用域內</text>
+    </svg>
+
+    <div class="detail detail-1">
+      <strong>Twine 控制平面（UE 的產生者）</strong>：Scheduler、Allocator、Broker、Zelos 協調整個 region 的容器放置與生命週期。它們既是「發出關機 UE 的人」，也在全斷時變成「被關機 UE 波及的人」——Ouroboros 與 Boomerang 都源自這個雙重身分。
+    </div>
+    <div class="detail detail-2">
+      <strong>UE 訊號匯流排（region-wide async）</strong>：unavailability events 非同步、跨 region 廣播。設計時假設它的作用域是局部的——標記「某物不可用」讓人繞開。這個非同步性正是 Boomerang 的溫床：訊號發出後協調者無法保證自己不在接收端。
+    </div>
+    <div class="detail detail-3">
+      <strong>關機目標服務（原本預期的作用域）</strong>：UE 本來只該打到這裡。但「作用域只含目標、不含協調者」只在局部故障時成立；當斷電讓整個 region 都進入「不可用」，目標集合膨脹到把協調者也吞了進去。
+    </div>
+  </figure>
+
+  <p>
+    Ouroboros 與 Boomerang 其實是同一結構缺陷的兩面：控制平面既是協調的主體、又是被協調的客體。Ouroboros 是這個雙重身分在<em>啟動</em>時的表現（要啟動 A 得先有 A），Boomerang 是它在<em>關機編排</em>時的表現（A 發出的關機令把 A 自己關了）。兩者都只在「全域同時歸零」時才浮現——這正是為什麼非得真的拔整個 region 的電。
+  </p>
+
+  <pre data-kind="pseudocode"><code><em>// 為什麼只有「全 region 斷電」才暴露 Boomerang</em>
+def emit_unavailability(scope):
+    targets = services_in(scope)
+    for s in targets:
+        send_UE(s)        <em>// 預期：orchestrator 不在 targets 裡</em>
+
+<em>// 局部故障：scope = 一排機櫃 / 一個 cell</em>
+<em>//   orchestrator 在 scope 之外 → 安全</em>
+emit_unavailability(scope = one_fault_domain)
+
+<em>// 全 region 斷電：scope = 整個 region（50-60 個故障域）</em>
+<em>//   orchestrator 也在 scope 之內 → UE 繞回來把它自己關掉</em>
+emit_unavailability(scope = entire_region)   <em># Boomerang</em>
+</code></pre>
+
+  <p>
+    Boomerang 的修法文章沒展開，但從結構可推出形狀（工程推理）：要讓協調者不被自己發的 UE 關掉，要麼把它排除在 UE 作用域外、給一個「免疫」標記，要麼讓恢復路徑上的協調者改走不經過 UE 匯流排的帶外（out-of-band）通道自我引導。兩種做法都是把「協調控制平面」與「被協調的資料平面」在訊號層面解耦——讓協調者站回訊號半徑之外。這跟 Ouroboros 的修法是同一思路的兩種投影：在恢復這個特殊階段，協調者必須有一條不把自己捲進去的獨立通道。下面這張表把兩類死結並排——點欄位標頭可依該欄重排。
+  </p>
+
+  <figure class="vg-w-table-failure-class">
+    <style>
+      .vg-w-table-failure-class { margin: var(--s-4) 0; overflow-x: auto; }
+      .vg-w-table-failure-class .vg-w-affordance { display: flex; align-items: center; gap: 8px; margin: 0 0 var(--s-2) 0; font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+      .vg-w-table-failure-class .vg-w-affordance svg { width: 14px !important; height: 14px !important; min-width: 14px !important; }
+      .vg-w-table-failure-class table { width: 100%; min-width: 520px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-failure-class thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; }
+      .vg-w-table-failure-class thead th[data-sort] { color: var(--accent-text); }
+      .vg-w-table-failure-class tbody th { font-family: EB Garamond, serif; font-weight: 600; text-align: left; padding: var(--s-2); border-bottom: 1px solid var(--line); color: var(--ink); white-space: nowrap; }
+      .vg-w-table-failure-class tbody td { padding: var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; line-height: 1.5; }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M3 6h18"/><path d="M3 12h18"/><path d="M3 18h18"/>
+      </svg>
+      <span>click 欄位標頭依該欄重排 · 兩類復電死結的觸發、機制與修法並排</span>
+    </p>
+
+    <table>
+      <thead>
+        <tr>
+          <th data-key="name">失敗類別</th>
+          <th data-key="phase">出現階段</th>
+          <th data-key="trigger">觸發條件</th>
+          <th data-key="mech">核心機制</th>
+          <th data-key="fix">修法形狀</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <th>Ouroboros</th>
+          <td>冷啟動</td>
+          <td>全域歸零、控制平面要從虛空同時長出</td>
+          <td>A 要先有 B、B 又要先有 A 的循環依賴卡住 bootstrap</td>
+          <td>Belljar CI 提前抓循環＋recovery kit 注入最小引導路徑</td>
+        </tr>
+        <tr>
+          <th>Boomerang</th>
+          <td>關機編排</td>
+          <td>斷電讓整個 region 落進 UE 作用域</td>
+          <td>協調者發出的 UE 繞回來把它自己關掉，訊號自噬</td>
+          <td>協調者排除在 UE 作用域外，或改走帶外通道引導</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-table-failure-class');
+        if (!root) return;
+        const headers = root.querySelectorAll('thead th');
+        const tbody = root.querySelector('tbody');
+        let activeKey = null, asc = true;
+        headers.forEach((h, idx) => h.addEventListener('click', () => {
+          const key = h.dataset.key;
+          if (activeKey === key) asc = !asc; else { activeKey = key; asc = true; }
+          headers.forEach(x => x.removeAttribute('data-sort'));
+          h.setAttribute('data-sort', asc ? 'asc' : 'desc');
+          const rows = [...tbody.querySelectorAll('tr')];
+          rows.sort((a, b) => {
+            const av = a.children[idx].textContent.trim();
+            const bv = b.children[idx].textContent.trim();
+            return asc ? av.localeCompare(bv, 'zh-Hant') : bv.localeCompare(av, 'zh-Hant');
+          });
+          rows.forEach(r => tbody.appendChild(r));
+        }));
+      })();
+    </script>
+  </figure>
+
+  <p>
+    這類「保護機制反噬」並非 Meta 獨有，而是大規模系統的通病。電網就有同構現象——保護電驛為隔離故障而跳脫，連鎖跳脫卻把更大範圍一起拖黑（2003 年北美大停電即經典案例）。軟體層的 Boomerang 是同一範式的化身：一個本意「縮小爆炸半徑」的訊號，在規模夠大時反成了擴大爆炸半徑的媒介。它告訴你該下功夫的地方——不是讓保護機制更敏感，而是確保它的觸發不會把自己也包含進去。
+  </p>
+
+  <p>
+    恢復供電當下還有一層 Meta 點到但沒展開的事：MTTR（mean time to recovery）。文章說這次測試觀察到的 MTTR「mirrored typical MTTR seen during real incident scenarios」——刻意製造的斷電，恢復時間跟真實事故差不多。這既證明測試逼真到接近真實災難，也意味著「從零 bootstrap 一個 region」本來就慢，慢本身就是要持續壓縮的指標。下面這條時間線把驗證計劃從第一次小規模拔電、到對 production region 拔電的推進攤開。
+  </p>
+
+  <figure class="vg-w-scrub-meta-rollout" data-svg-scroll="720">
+    <style>
+      .vg-w-scrub-meta-rollout { display: grid; gap: var(--s-2); margin: var(--s-4) 0; }
+      .vg-w-scrub-meta-rollout .vg-w-affordance { display: flex; align-items: center; gap: 8px; margin: 0; font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+      .vg-w-scrub-meta-rollout .vg-w-affordance svg { width: 14px !important; height: 14px !important; min-width: 14px !important; }
+      .vg-w-scrub-meta-rollout svg.track { width: 100%; height: auto; touch-action: none; }
+      .vg-w-scrub-meta-rollout .state { font-family: var(--serif); font-size: var(--fs-sm); padding: var(--s-2); background: var(--bg-soft); border-left: 2px solid var(--accent); }
+      .vg-w-scrub-meta-rollout .state strong { font-family: var(--sans); text-transform: uppercase; letter-spacing: 0.04em; font-size: var(--fs-sm); color: var(--accent-text); }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M18 8 22 12 18 16"/><path d="M2 12h20"/><path d="m6 8-4 4 4 4"/>
+      </svg>
+      <span>drag 把手沿時間線移動 · 4 個推進階段 · 從 pre-prod 拔到 production region</span>
+    </p>
+
+    <svg class="track" viewBox="0 0 720 130" role="img" aria-label="Meta 瞬時斷電驗證的分階段推進時間線">
+      <line x1="48" y1="56" x2="672" y2="56" stroke="var(--muted-2)" stroke-width="1.5" />
+      <g id="vg-w-scrub-meta-rollout-events"></g>
+      <line id="vg-w-scrub-meta-rollout-handle-line" x1="48" y1="34" x2="48" y2="78" stroke="var(--accent)" stroke-width="2" />
+      <circle id="vg-w-scrub-meta-rollout-handle" cx="48" cy="56" r="10" fill="var(--accent)" cursor="grab"
+              role="slider" tabindex="0" aria-label="時間線把手" aria-valuemin="0" aria-valuemax="3" aria-valuenow="0" />
+      <text id="vg-w-scrub-meta-rollout-clock" x="48" y="26" text-anchor="middle"
+            font-family="Manrope, sans-serif" font-size="12" fill="var(--ink)">階段 1</text>
+    </svg>
+
+    <div class="state" id="vg-w-scrub-meta-rollout-state">拖把手以檢視每個推進階段的風險邊界與目標。</div>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-scrub-meta-rollout');
+        if (!root) return;
+        const svg = root.querySelector('svg.track');
+        const handle = root.querySelector('#vg-w-scrub-meta-rollout-handle');
+        const handleLine = root.querySelector('#vg-w-scrub-meta-rollout-handle-line');
+        const clock = root.querySelector('#vg-w-scrub-meta-rollout-clock');
+        const stateDiv = root.querySelector('#vg-w-scrub-meta-rollout-state');
+        const eventsG = root.querySelector('#vg-w-scrub-meta-rollout-events');
+        const NS = 'http://www.w3.org/2000/svg';
+
+        const stages = [
+          { label: 'pre-prod', title: '新／未上線 region',
+            body: '從風險最低的地方開刀：對尚未承載生產流量的新建 region 或 pre-production region 注入斷電。known unknowns 在這裡先被一輪輪掃出來，且即便整區起不來也不影響任何客戶。' },
+          { label: 'shadow', title: 'shadow region',
+            body: '推進到「shadow」region——複製生產環境的形狀但不承載真實客戶請求。這一階段把「規模接近生產但後果可控」的場景拿來練，Ouroboros 與 Boomerang 這類只在大尺度下才現形的死結，多半在這裡第一次被逼出來。' },
+          { label: 'first prod', title: '首次對 production region 拔電',
+            body: '第一次對真正的 production region 注入斷電，且刻意「avoid undertaking any preemptive actions」——不事先優雅排乾、不預先遷移。可接受的代價被預先界定：transient service errors、預定門檻內的 rack failures、routing 表的 bounded staleness。' },
+          { label: 'scaled prod', title: '常態化於大型 production region',
+            body: '把驗證擴展到大型 production region（50-60 倍於典型故障域）。MTTR 與真實事故相當，證明測試逼真；table-stake 紅線（資料遺失、設施永久損壞、跨 region 擴散）全程不得觸碰。下一步是帶 live client traffic 的版本。' },
+        ];
+
+        const X0 = 48, X1 = 672, Y = 56;
+        const N = stages.length;
+        const xOf = i => X0 + (i / (N - 1)) * (X1 - X0);
+
+        stages.forEach((s, i) => {
+          const c = document.createElementNS(NS, 'circle');
+          c.setAttribute('cx', xOf(i)); c.setAttribute('cy', Y); c.setAttribute('r', 5);
+          c.setAttribute('fill', 'var(--muted)');
+          eventsG.appendChild(c);
+          const tx = document.createElementNS(NS, 'text');
+          tx.setAttribute('x', xOf(i)); tx.setAttribute('y', 96);
+          tx.setAttribute('text-anchor', 'middle');
+          tx.setAttribute('font-family', 'Manrope, sans-serif');
+          tx.setAttribute('font-size', 12);
+          tx.setAttribute('fill', 'var(--muted)');
+          tx.textContent = s.label;
+          eventsG.appendChild(tx);
+        });
+
+        function clamp(x) { return Math.max(X0, Math.min(X1, x)); }
+        function clientToSvgX(clientX) {
+          const pt = svg.createSVGPoint();
+          pt.x = clientX; pt.y = 0;
+          const sp = pt.matrixTransform(svg.getScreenCTM().inverse());
+          return clamp(sp.x);
+        }
+        function nearestIndex(x) {
+          let best = 0, bestD = Infinity;
+          for (let i = 0; i < N; i++) {
+            const d = Math.abs(x - xOf(i));
+            if (d < bestD) { bestD = d; best = i; }
+          }
+          return best;
+        }
+        function snap(i) {
+          const x = xOf(i);
+          handle.setAttribute('cx', x);
+          handleLine.setAttribute('x1', x); handleLine.setAttribute('x2', x);
+          clock.setAttribute('x', x);
+          clock.textContent = '階段 ' + (i + 1);
+          handle.setAttribute('aria-valuenow', i);
+          const s = stages[i];
+          stateDiv.innerHTML = '<strong>' + s.label + ' · ' + s.title + '</strong><br>' + s.body;
+        }
+
+        let dragging = false;
+        handle.addEventListener('pointerdown', (e) => { dragging = true; handle.setPointerCapture(e.pointerId); handle.style.cursor = 'grabbing'; });
+        handle.addEventListener('pointermove', (e) => { if (!dragging) return; snap(nearestIndex(clientToSvgX(e.clientX))); });
+        handle.addEventListener('pointerup', (e) => { dragging = false; handle.style.cursor = 'grab'; handle.releasePointerCapture(e.pointerId); });
+        svg.addEventListener('pointerdown', (e) => { if (e.target === handle) return; snap(nearestIndex(clientToSvgX(e.clientX))); });
+        handle.addEventListener('keydown', (e) => {
+          const cur = parseInt(handle.getAttribute('aria-valuenow'), 10);
+          if (e.key === 'ArrowRight' || e.key === 'ArrowUp') { e.preventDefault(); snap(Math.min(N - 1, cur + 1)); }
+          else if (e.key === 'ArrowLeft' || e.key === 'ArrowDown') { e.preventDefault(); snap(Math.max(0, cur - 1)); }
+        });
+
+        snap(0);
+      })();
+    </script>
+  </figure>
+
+  <h2>從一次性實驗變成常態：表決定範圍，而非僥倖</h2>
+
+  <p>
+    把「對整個 region 拔電」變成可重複的測試項目，靠的不是膽量，而是把<strong>什麼後果可接受、什麼絕對不行</strong>事先寫死。Meta 把失敗分成兩堆：一堆是 table-stake——絕對不能發生，發生了就是測試失敗；另一堆是可接受的代價——它們會發生、也被預期發生，只要落在預先界定的門檻內就算過關。這個劃分是整個計劃能跑起來的前提：沒有它，「真的拔電」就只是一次無法評分的賭博。下面這組卡片把紅線兩側並排。
+  </p>
+
+  <figure class="vg-w-stack-meta-impact">
+    <style>
+      .vg-w-stack-meta-impact { display: flex; flex-direction: column; gap: var(--s-3); align-items: stretch; margin: var(--s-4) 0; }
+      .vg-w-stack-meta-impact .vg-w-affordance { display: flex; align-items: center; gap: 8px; margin: 0; font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+      .vg-w-stack-meta-impact .vg-w-affordance svg { width: 14px !important; height: 14px !important; min-width: 14px !important; }
+      .vg-w-stack-meta-impact input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-stack-meta-impact .stack-title { font-family: IM Fell English, serif; font-style: italic; font-size: var(--fs-md); margin: 0; color: var(--ink); line-height: 1.4; }
+      .vg-w-stack-meta-impact .stack-cards { display: flex; flex-direction: column; gap: var(--s-1); list-style: none; padding: 0; margin: 0; }
+      .vg-w-stack-meta-impact .stack-cards label { display: block; padding: var(--s-2); border: 1px solid var(--muted-2); border-radius: 2px; cursor: pointer; min-height: 44px; }
+      .vg-w-stack-meta-impact .stack-cards label:hover { border-color: var(--accent); }
+      .vg-w-stack-meta-impact .stack-cards .card-head { font-family: EB Garamond, serif; font-size: var(--fs-md); margin: 0 0 4px 0; color: var(--ink); display: flex; align-items: baseline; justify-content: space-between; gap: var(--s-2); flex-wrap: wrap; }
+      .vg-w-stack-meta-impact .stack-cards .card-sub { font-family: IM Fell English, serif; font-style: italic; font-size: var(--fs-sm); color: var(--muted); margin: 0; line-height: 1.5; }
+      .vg-w-stack-meta-impact .stack-cards .card-tag { font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); font-style: normal; }
+      .vg-w-stack-meta-impact .card-tag.block { color: var(--accent-text); }
+      .vg-w-stack-meta-impact .card-tag.ok { color: var(--sage-deep); }
+      .vg-w-stack-meta-impact:has(#vg-w-stack-meta-impact-r1:checked) .card-1,
+      .vg-w-stack-meta-impact:has(#vg-w-stack-meta-impact-r2:checked) .card-2,
+      .vg-w-stack-meta-impact:has(#vg-w-stack-meta-impact-r3:checked) .card-3,
+      .vg-w-stack-meta-impact:has(#vg-w-stack-meta-impact-r4:checked) .card-4,
+      .vg-w-stack-meta-impact:has(#vg-w-stack-meta-impact-r5:checked) .card-5,
+      .vg-w-stack-meta-impact:has(#vg-w-stack-meta-impact-r6:checked) .card-6 {
+        border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent);
+      }
+
+      .vg-w-stack-meta-impact svg.diagram { display: none; }
+      @media (min-width: 720px) {
+        .vg-w-stack-meta-impact svg.diagram { display: block; width: 100%; height: auto; max-width: 880px; }
+        .vg-w-stack-meta-impact svg.diagram text { font-family: EB Garamond, serif; }
+        .vg-w-stack-meta-impact .stack-title { display: none; }
+        .vg-w-stack-meta-impact .stack-cards { display: none; }
+      }
+      .vg-w-stack-meta-impact .layer { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; }
+      .vg-w-stack-meta-impact:has(#vg-w-stack-meta-impact-r1:checked) .layer-1,
+      .vg-w-stack-meta-impact:has(#vg-w-stack-meta-impact-r2:checked) .layer-2,
+      .vg-w-stack-meta-impact:has(#vg-w-stack-meta-impact-r3:checked) .layer-3 {
+        fill: color-mix(in srgb, var(--accent) 20%, transparent); stroke: var(--accent);
+      }
+      .vg-w-stack-meta-impact:has(#vg-w-stack-meta-impact-r4:checked) .layer-4,
+      .vg-w-stack-meta-impact:has(#vg-w-stack-meta-impact-r5:checked) .layer-5,
+      .vg-w-stack-meta-impact:has(#vg-w-stack-meta-impact-r6:checked) .layer-6 {
+        fill: color-mix(in srgb, var(--sage) 26%, transparent); stroke: var(--sage-deep);
+      }
+      .vg-w-stack-meta-impact .detail { padding: var(--s-2); border-left: 2px solid var(--accent); background: var(--bg-soft); display: none; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-stack-meta-impact:has(#vg-w-stack-meta-impact-r1:checked) .detail-1,
+      .vg-w-stack-meta-impact:has(#vg-w-stack-meta-impact-r2:checked) .detail-2,
+      .vg-w-stack-meta-impact:has(#vg-w-stack-meta-impact-r3:checked) .detail-3,
+      .vg-w-stack-meta-impact:has(#vg-w-stack-meta-impact-r4:checked) .detail-4,
+      .vg-w-stack-meta-impact:has(#vg-w-stack-meta-impact-r5:checked) .detail-5,
+      .vg-w-stack-meta-impact:has(#vg-w-stack-meta-impact-r6:checked) .detail-6 { display: block; }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>
+      </svg>
+      <span>click 任一項看它落在紅線哪一側 · 3 條 table-stake + 3 項可接受代價</span>
+    </p>
+
+    <input type="radio" id="vg-w-stack-meta-impact-r1" name="vg-w-stack-meta-impact-sel" checked aria-label="資料遺失" />
+    <input type="radio" id="vg-w-stack-meta-impact-r2" name="vg-w-stack-meta-impact-sel" aria-label="設施損壞" />
+    <input type="radio" id="vg-w-stack-meta-impact-r3" name="vg-w-stack-meta-impact-sel" aria-label="跨 region 擴散" />
+    <input type="radio" id="vg-w-stack-meta-impact-r4" name="vg-w-stack-meta-impact-sel" aria-label="瞬時錯誤" />
+    <input type="radio" id="vg-w-stack-meta-impact-r5" name="vg-w-stack-meta-impact-sel" aria-label="機櫃故障" />
+    <input type="radio" id="vg-w-stack-meta-impact-r6" name="vg-w-stack-meta-impact-sel" aria-label="routing 過時" />
+
+    <p class="stack-title" id="vg-w-stack-meta-impact-title">紅線兩側——哪些是 table-stake，哪些是可接受代價</p>
+    <ul class="stack-cards" aria-labelledby="vg-w-stack-meta-impact-title">
+      <li class="card-1"><label for="vg-w-stack-meta-impact-r1">
+        <p class="card-head"><span>儲存／資料庫的資料遺失</span><code class="card-tag block">TABLE-STAKE</code></p>
+        <p class="card-sub">絕對不能發生。續命窗口（電池 + PLS）存在的全部理由就是守住這條。</p>
+      </label></li>
+      <li class="card-2"><label for="vg-w-stack-meta-impact-r2">
+        <p class="card-head"><span>資料中心設施永久損壞</span><code class="card-tag block">TABLE-STAKE</code></p>
+        <p class="card-sub">機電設施不得因斷電／復電的瞬態而實體受損。</p>
+      </label></li>
+      <li class="card-3"><label for="vg-w-stack-meta-impact-r3">
+        <p class="card-head"><span>影響溢出到單一 region 之外</span><code class="card-tag block">TABLE-STAKE</code></p>
+        <p class="card-sub">爆炸半徑必須被框在這一個 region 內，不得擴散。</p>
+      </label></li>
+      <li class="card-4"><label for="vg-w-stack-meta-impact-r4">
+        <p class="card-head"><span>瞬時服務錯誤（transient errors）</span><code class="card-tag ok">可接受</code></p>
+        <p class="card-sub">會發生、被預期發生。系統恢復後自行收斂即可。</p>
+      </label></li>
+      <li class="card-5"><label for="vg-w-stack-meta-impact-r5">
+        <p class="card-head"><span>機櫃故障（門檻內）</span><code class="card-tag ok">可接受</code></p>
+        <p class="card-sub">只要落在預定門檻（predefined threshold）內，部分機櫃起不來是被容忍的。</p>
+      </label></li>
+      <li class="card-6"><label for="vg-w-stack-meta-impact-r6">
+        <p class="card-head"><span>routing 表的 bounded staleness</span><code class="card-tag ok">可接受</code></p>
+        <p class="card-sub">服務路由表短暫過時、有界陳舊是可接受的，最終會收斂。</p>
+      </label></li>
+    </ul>
+
+    <svg class="diagram" viewBox="0 0 880 320" role="img"
+         aria-label="斷電測試的成敗判準：三條 table-stake 紅線與三項可接受代價並排">
+      <text x="220" y="34" text-anchor="middle" fill="var(--accent-text)" font-size="15">TABLE-STAKE · 觸碰即失敗</text>
+      <text x="660" y="34" text-anchor="middle" fill="var(--sage-deep)" font-size="15">可接受代價 · 門檻內過關</text>
+      <line x1="440" y1="50" x2="440" y2="300" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="5,4"/>
+
+      <rect class="layer layer-1" x="40" y="56" width="360" height="68" rx="6" role="button" tabindex="0" aria-label="資料遺失" />
+      <text x="60" y="84" fill="var(--ink)" font-size="14">儲存／資料庫的資料遺失</text>
+      <text x="60" y="106" fill="var(--muted)" font-size="12">續命窗口守的就是這條紅線</text>
+
+      <rect class="layer layer-2" x="40" y="132" width="360" height="68" rx="6" role="button" tabindex="0" aria-label="設施損壞" />
+      <text x="60" y="160" fill="var(--ink)" font-size="14">資料中心設施永久損壞</text>
+      <text x="60" y="182" fill="var(--muted)" font-size="12">機電不得因瞬態實體受損</text>
+
+      <rect class="layer layer-3" x="40" y="208" width="360" height="68" rx="6" role="button" tabindex="0" aria-label="跨 region 擴散" />
+      <text x="60" y="236" fill="var(--ink)" font-size="14">影響溢出到 region 之外</text>
+      <text x="60" y="258" fill="var(--muted)" font-size="12">爆炸半徑須框在單一 region</text>
+
+      <rect class="layer layer-4" x="480" y="56" width="360" height="68" rx="6" role="button" tabindex="0" aria-label="瞬時錯誤" />
+      <text x="500" y="84" fill="var(--ink)" font-size="14">瞬時服務錯誤</text>
+      <text x="500" y="106" fill="var(--muted)" font-size="12">恢復後自行收斂</text>
+
+      <rect class="layer layer-5" x="480" y="132" width="360" height="68" rx="6" role="button" tabindex="0" aria-label="機櫃故障" />
+      <text x="500" y="160" fill="var(--ink)" font-size="14">機櫃故障（門檻內）</text>
+      <text x="500" y="182" fill="var(--muted)" font-size="12">predefined threshold 內可容忍</text>
+
+      <rect class="layer layer-6" x="480" y="208" width="360" height="68" rx="6" role="button" tabindex="0" aria-label="routing 過時" />
+      <text x="500" y="236" fill="var(--ink)" font-size="14">routing 表 bounded staleness</text>
+      <text x="500" y="258" fill="var(--muted)" font-size="12">短暫過時、最終收斂</text>
+    </svg>
+
+    <div>
+      <div class="detail detail-1"><strong>資料遺失（table-stake）</strong>：第一條紅線。續命窗口、PLS、in-memory 落地的整套機制都是為了讓它不被觸碰；一旦真的遺失，這次測試就不是「學到東西」而是「造成事故」。</div>
+      <div class="detail detail-2"><strong>設施永久損壞（table-stake）</strong>：機電設施承受瞬時 de-energization 與隨後 re-energization 的衝擊時不得有任何永久性實體損傷。這也是為什麼第一波測試從 pre-prod 開始——先確認硬體扛得住。</div>
+      <div class="detail detail-3"><strong>跨 region 擴散（table-stake）</strong>：整個驗證的安全假設是「爆炸半徑等於一個 region」。若斷電把鄰近 region 也拖下水，這個測試本身就成了跨區事故——正是要事先擋死的。</div>
+      <div class="detail detail-4"><strong>瞬時服務錯誤（可接受）</strong>：斷電期間請求失敗、復電初期錯誤率升高都被預期會發生。判準不是「零錯誤」，而是「恢復後錯誤自行消退」——這才讓「不做事前優雅排乾」的逼真前提成立。</div>
+      <div class="detail detail-5"><strong>機櫃故障（可接受，有門檻）</strong>：復電時部分機櫃起不來是正常的，只要落在 predefined threshold 內。關鍵是「有界」：超過門檻就翻轉成失敗訊號。</div>
+      <div class="detail detail-6"><strong>routing 表 bounded staleness（可接受）</strong>：路由表在恢復期間會短暫過時，被明確列為可接受。重點同樣是「有界」——過時是暫時的、最終會收斂。</div>
+    </div>
+  </figure>
+
+  <p>
+    這張紅線表的工程價值遠超出這一次測試。多數團隊的 chaos experiment 失敗在同一步：注入故障後憑感覺判斷「還行吧」。Meta 把判準前置成兩堆明確的桶，每一次拔電就產生一個二元的、可記錄的結論，而不是一段模糊的體感。而把它變成常態的最後一塊，是「incremental」：Meta 不是某天直接對最大的 production region 拔電，而是沿 pre-prod → shadow → production 的階梯往上爬，每一級都先把上一級暴露的死結（Ouroboros、Boomerang）修掉、把 Belljar CI 與 recovery kit 補強，再往高風險的下一級推。這正是對「chicken-and-egg：要承擔風險才能消除風險」的回應——不是一次性吞下全部風險，而是把它切成可逐級消化的份量。
+  </p>
+
+  <p>
+    把瞬時錯誤、門檻內機櫃故障、bounded staleness 劃進可接受，並不等於它們不重要——而是它們被刻意換成了「能換到逼真度」的籌碼。如果為了讓測試零干擾而事先把流量遷走、把寫入排乾，那這場斷電就不再逼真，暴露不出真正的故障模式。Meta 選擇承擔有界的瞬時損害，去買「測試結果等同真實災難」的可信度。這個取捨對任何做生產環境混沌工程的團隊都是核心問題：你願意付多少真實代價，去換一個真實的答案——而把「可接受」這一側量化成有門檻的桶，正是為了確保這筆交易不會在某次測試裡悄悄超支。
+  </p>
+
+  <p>
+    MTTR 與真實事故相當，最大的價值是把這個指標從「事後統計」變成「可實驗的變數」。你不能為了量測恢復時間而製造事故，但你可以隨時重做這場斷電——於是每一次拔電都是一個量測 region 從零恢復要花多久的機會，把恢復路徑裡的瓶頸（哪個服務冷啟最慢、哪段引導序列化得不必要）逐次找出來壓縮，MTTR 就能從「跟真實事故一樣慢」往「比真實事故快」推進。
+  </p>
+
+  <p>
+    文章結尾留了一個鉤子：下一步是「validating regions with live client traffic against instantaneous failures」——目前這套驗證雖對 production region 拔了電，但還沒在「同時承載真實客戶請求」的條件下做。帶上 live traffic 後，續命窗口要守的就不只是靜態 in-memory 資料，還有 in-flight 的客戶請求，而 Boomerang 之外可能還有與真實流量耦合的新故障模式等著被逼出來。Meta 說會用「同樣的 incremental 策略」推進——這句話本身，就是這篇文章最該被記住的方法論。
+  </p>
+
+  <p class="vg-deep-closer"><strong>The lesson</strong>：就緒度不是寫在 runbook 裡的承諾，而是要真的拔一次電才知道有沒有的事實——前提是你得先把「什麼後果絕對不行、什麼後果可接受」量化到能當場評分，再把這場高風險實驗切成 pre-prod 到 production 的階梯逐級吞下。</p>
+</div>

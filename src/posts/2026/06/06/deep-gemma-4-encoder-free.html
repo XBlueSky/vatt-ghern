@@ -1,0 +1,700 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">傳統 vision-language 模型裡，影像要先過一座獨立的 vision transformer——Gemma 4 的中型版本就有 27 層 ViT；audio 還要再過 12 層 conformer。Gemma 4 12B 把這兩座 encoder 整個拆掉，換成一個 35M 參數的 vision embedder 跟一次線性投影：48×48 的 pixel patch 用一個 matmul 就送進 LLM backbone，audio 直接切成 40 ms 的 frame 投影進去。整個多模態的 token loop 從此只剩一個 backbone。</p>
+  <h1 class="vg-post-title">{{ title }}</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p><span class="vg-dropcap">G</span>oogle 釋出的 Gemma 4 12B 是一個 11.95B 參數、decoder-only 的密集模型，真正的結構新聞不是參數量，而是它把影像與音訊的處理路徑從「獨立 encoder + projector」改成 encoder-free——所有 modality 在很淺的一層就被 tokenize 成跟文字共用的 embedding，之後完全由同一個 backbone 處理。同時 Google 同步釋出了 QAT（quantization-aware training）版本，把這個 12B 模型壓到能在 16 GB 記憶體的筆電、甚至手機上跑本地 agentic workflow。這篇拆四件事：encoder-free 的 token 化怎麼做、它相對於傳統 vision-encoder 路線的取捨在哪、QAT 為什麼能在低位元下守住品質、以及這對本地部署實際意味著什麼。先看這個 12B 在各條評測軸上落在哪裡——因為「拆掉 encoder 會不會掉品質」是讀者第一個會問的問題。</p>
+
+  <figure class="vg-w-chart-gemma4-bench" data-svg-scroll="720">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/>
+        <path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+      </svg>
+      <span>click a bar to read what that axis measures · 6 axes</span>
+    </p>
+    <style>
+      .vg-w-chart-gemma4-bench { display: grid; gap: var(--s-2); }
+      .vg-w-chart-gemma4-bench svg { width: 100%; height: auto; }
+      .vg-w-chart-gemma4-bench .bar { cursor: pointer; }
+      .vg-w-chart-gemma4-bench .note { padding: var(--s-2); border-left: 2px solid var(--accent); background: var(--bg-soft); font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink-soft); min-height: 3.4em; }
+      .vg-w-chart-gemma4-bench .note strong { font-family: var(--sans); text-transform: uppercase; letter-spacing: 0.05em; font-size: var(--fs-xs); color: var(--accent-text); }
+      .vg-w-chart-gemma4-bench figcaption { font-family: var(--scribed); font-style: italic; font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+
+    <svg viewBox="0 0 720 360" preserveAspectRatio="xMidYMid meet" role="img"
+         aria-label="Gemma 4 12B instruction-tuned 六條評測軸分數長條圖">
+      <g id="vg-w-chart-gemma4-bench-axes"></g>
+      <g id="vg-w-chart-gemma4-bench-series"></g>
+    </svg>
+
+    <div class="note" id="vg-w-chart-gemma4-bench-note">
+      <strong>點任一長條</strong>讀那條軸測的是什麼——六條軸由高到低排，最右的 MRCR v2 是長文脈軸。
+    </div>
+
+    <figcaption>Gemma 4 12B-it 的官方評測數字（取自 HuggingFace model card）。長條按分數高低排序，最右的 MRCR v2 是長文脈軸——明顯比其它軸低，這是 12B 量級在 256K context 上的已知弱點，不是 encoder-free 帶來的。</figcaption>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-chart-gemma4-bench');
+        const axesG = root.querySelector('#vg-w-chart-gemma4-bench-axes');
+        const seriesG = root.querySelector('#vg-w-chart-gemma4-bench-series');
+        const note = root.querySelector('#vg-w-chart-gemma4-bench-note');
+        const NS = 'http://www.w3.org/2000/svg';
+        function el(tag, attrs) {
+          const e = document.createElementNS(NS, tag);
+          for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+          return e;
+        }
+        // [label, score, blurb]
+        const data = [
+          ['GPQA Diamond', 78.8, 'GPQA Diamond · 78.8%——研究所等級的物理／化學／生物推理，標準的 hard-reasoning 軸。'],
+          ['AIME 2026', 77.5, 'AIME 2026 (no tools) · 77.5%——競賽數學，不准用工具的純推理。對 12B 量級這分數相當高。'],
+          ['MMLU Pro', 77.2, 'MMLU Pro · 77.2%——比原 MMLU 更難、選項更多的廣域學科知識與推理。'],
+          ['LiveCodeBench v6', 72.0, 'LiveCodeBench v6 · 72.0%——抓真實題庫、用發布日期切割避免污染的 coding 評測。'],
+          ['MMMU Pro', 69.1, 'MMMU Pro · 69.1%——多模態的大學等級推理，影像＋文字一起。encoder-free 路線在這條軸上沒有崩。'],
+          ['MRCR v2', 43.4, 'MRCR v2 (long ctx) · 43.4%——256K 長文脈的多目標檢索。明顯偏低，是 12B 量級的長文脈天花板，與 encoder-free 無關。'],
+        ];
+        const X0 = 70, X1 = 700, Y0 = 300, Y1 = 36;
+        const maxY = 100;
+        const yOf = v => Y0 - (v / maxY) * (Y0 - Y1);
+        const bw = (X1 - X0) / data.length;
+        // axes
+        axesG.appendChild(el('line', { x1: X0, y1: Y0, x2: X1, y2: Y0, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+        axesG.appendChild(el('line', { x1: X0, y1: Y0, x2: X0, y2: Y1, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+        for (let v = 0; v <= maxY; v += 20) {
+          const y = yOf(v);
+          axesG.appendChild(el('line', { x1: X0 - 4, y1: y, x2: X1, y2: y, stroke: 'var(--muted-2)', 'stroke-opacity': v === 0 ? 1 : 0.3 }));
+          const t = el('text', { x: X0 - 8, y: y + 4, 'text-anchor': 'end', 'font-family': 'JetBrains Mono, monospace', 'font-size': 12, fill: 'var(--muted)' });
+          t.textContent = String(v);
+          axesG.appendChild(t);
+        }
+        const yl = el('text', { x: 20, y: (Y0 + Y1) / 2, 'text-anchor': 'middle', 'font-family': 'IM Fell English, serif', 'font-style': 'italic', 'font-size': 13, fill: 'var(--muted)', transform: `rotate(-90 20 ${(Y0 + Y1) / 2})` });
+        yl.textContent = 'score (%)';
+        axesG.appendChild(yl);
+        // bars
+        data.forEach((d, i) => {
+          const x = X0 + i * bw + bw * 0.18;
+          const w = bw * 0.64;
+          const y = yOf(d[1]);
+          const g = el('g', { class: 'bar', role: 'button', tabindex: '0', 'aria-label': d[0] + ' ' + d[1] + ' percent' });
+          const rect = el('rect', { x, y, width: w, height: Y0 - y, fill: i === data.length - 1 ? 'var(--muted)' : 'var(--accent)', 'fill-opacity': 0.78 });
+          g.appendChild(rect);
+          const vt = el('text', { x: x + w / 2, y: y - 8, 'text-anchor': 'middle', 'font-family': 'JetBrains Mono, monospace', 'font-size': 13, fill: 'var(--ink)' });
+          vt.textContent = d[1].toFixed(1);
+          g.appendChild(vt);
+          const lt = el('text', { x: x + w / 2, y: Y0 + 18, 'text-anchor': 'middle', 'font-family': 'Manrope, sans-serif', 'font-size': 11, fill: 'var(--muted)' });
+          lt.textContent = d[0];
+          g.appendChild(lt);
+          function select() {
+            seriesG.querySelectorAll('rect').forEach(r => r.setAttribute('fill-opacity', '0.45'));
+            rect.setAttribute('fill-opacity', '1');
+            note.innerHTML = '<strong>' + d[0] + ' · ' + d[1] + '%</strong>——' + d[2].split('——')[1];
+          }
+          g.addEventListener('click', select);
+          g.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); select(); } });
+          seriesG.appendChild(g);
+        });
+      })();
+    </script>
+  </figure>
+
+  <p>讀這張圖的方式不是看絕對高低，而是看軸與軸之間的落差。GPQA Diamond 78.8%、AIME 2026 77.5%、MMLU Pro 77.2% 這幾條 hard-reasoning 軸都在 77% 以上，對一個 12B 密集模型是相當前段的數字；LiveCodeBench v6 72.0% 的 coding 也站得住。關鍵在 MMMU Pro 69.1%——這是多模態（影像＋文字）的大學等級推理，如果 encoder-free 真的會傷害視覺理解，這條軸應該塌掉，但它只比純文字軸低 8 個百分點，落在「多模態本來就比純文字難」的合理範圍內。</p>
+
+  <p>唯一明顯偏低的 MRCR v2 43.4% 是 256K 長文脈的多目標檢索，那是 12B 量級在超長 context 上的已知天花板，跟 encoder-free 沒有因果關係。MRCR（Multi-Round Co-reference Resolution）這類測試刻意在很長的上下文裡塞入多個相互指涉的目標，逼模型在 needle-in-haystack 之上再做指代消解——12B 的 attention 容量在 256K token 的尺度上本來就會稀釋，這條軸對任何同量級模型都偏低。把它跟視覺軸混為一談會誤判 encoder-free 的代價。</p>
+
+  <p>還有一個容易忽略的對照點：AIME 2026 的 77.5% 是「no tools」的純推理數字——不准呼叫 code interpreter、不准外部計算。對一個能塞進筆電的 12B 模型，在不借工具的前提下解到接近八成競賽數學題，本身就說明 instruction-tuning 把 reasoning 收斂得相當紮實。換句話說，這張圖真正想講的不是「Gemma 4 多強」，而是「拆掉 vision encoder 沒有在任何一條軸上留下可歸因的傷口」。接下來看這個「拆掉」具體拆掉了什麼。</p>
+
+  <h2>encoder-free：三種 modality 投影進同一個 backbone</h2>
+
+  <p>傳統的 vision-language 模型走的是「encoder + projector」兩段式：影像先過一座獨立、通常凍結的 vision encoder（CLIP-style 的 ViT，幾億參數、幾十層 transformer），輸出一串視覺特徵，再經一個 projector（MLP 或 cross-attention）把特徵維度對齊到 LLM 的 hidden dimension，最後才餵進語言模型。Gemma 4 自家的中型版本就是這條路——27 層的 vision transformer；audio 版本（E2B / E4B）還另外掛了 12 層 conformer。這套設計的問題是：encoder 是獨立訓練、通常凍結的，跟 LLM backbone 之間隔著一道 projector，fine-tune 時你只能調 projector 或解凍部分 encoder，整個多模態的學習訊號被切成兩段。</p>
+
+  <p>Gemma 4 12B 的 encoder-free 路線把這道牆拆了。影像不再過 ViT——原始影像切成 48×48 的 pixel patch，每個 patch 用「一個 matmul」直接投影到 LLM 的 hidden dimension；負責這件事的 vision embedder 只有 35M 參數，相對於一座完整 ViT 是兩個數量級的縮減。一座 CLIP-style 的 ViT 動輒三億到十億參數、幾十層 self-attention，這裡換成的是一個單層線性投影加一張查表——這就是「embedder」與「encoder」的字面差別：embedder 只把輸入映射到向量空間，不在內部做多層特徵抽取。</p>
+
+  <p>空間位置資訊的處理也跟著簡化。傳統 ViT 用一整套 learned positional embedding 或 2D rotary 去編碼每個 patch 的位置；Gemma 4 用的是「factorized coordinate lookup」——X 與 Y 兩個獨立的座標矩陣，給每個 patch 各自查 row 座標與 column 座標再相加。好處是參數量隨「邊長」線性成長而非隨「patch 總數」平方成長：一張 32×32 patch 的圖只需要 32 個 X 向量加 32 個 Y 向量，而不是 1024 個獨立的 2D position 向量。這也讓變解析度變得自然——換一個解析度只是換一組座標索引範圍，不需要重新內插 position table。</p>
+
+  <p>Audio 更直接：16 kHz 的波形切成 40 ms 的 frame（每個 frame 640 個 float，正好是 16000 × 0.04），線性投影進 backbone，完全跳過那 12 層 conformer。Gemma 4 自家的 audio 版本 E2B / E4B 仍掛著 conformer 堆疊去做時序特徵抽取；12B 這版直接把「原始波形 → 線性層 → token」一步到位，把時序建模的責任也丟回 backbone 的 self-attention。三種 modality 投影完之後就是同一種東西——一串送進同一個 backbone 的 token，沒有任何 modality-specific 的多層子網路橫亙在中間。</p>
+
+  <figure>
+    <svg class="vg-w-flow-gemma4-tokenize" viewBox="0 0 880 360" role="img"
+         aria-label="Gemma 4 encoder-free token 化：text / image 48x48 patch / audio 40ms frame 三條路徑各自一次淺投影進同一個 LLM backbone"
+         style="width: 100%; height: auto; max-width: 880px;">
+      <style>
+        .vg-w-flow-gemma4-tokenize text { font-family: EB Garamond, serif; font-size: 13px; }
+        .vg-w-flow-gemma4-tokenize .label { font-family: IM Fell English, serif; font-style: italic; }
+        .vg-w-flow-gemma4-tokenize .num { font-family: JetBrains Mono, monospace; font-size: 11px; }
+        .vg-w-flow-gemma4-tokenize .head { font-family: IM Fell English, serif; font-style: italic; font-size: 13px; }
+      </style>
+      <defs>
+        <marker id="vg-w-flow-gemma4-tokenize-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--muted)"/>
+        </marker>
+      </defs>
+
+      <text x="440" y="24" text-anchor="middle" fill="var(--ink)" class="head">三種 modality，一層淺投影，同一個 backbone</text>
+
+      <!-- TEXT path -->
+      <rect x="30" y="56" width="150" height="46" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.2"/>
+      <text x="105" y="78" text-anchor="middle" fill="var(--ink)" class="label">text</text>
+      <text x="105" y="94" text-anchor="middle" fill="var(--muted)" class="num">262K vocab</text>
+      <text x="245" y="74" text-anchor="middle" fill="var(--muted)" class="num">tokenizer</text>
+      <line x1="180" y1="79" x2="320" y2="79" stroke="var(--muted)" stroke-width="1.4" marker-end="url(#vg-w-flow-gemma4-tokenize-arrow)"/>
+
+      <!-- IMAGE path -->
+      <rect x="30" y="146" width="150" height="46" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.2"/>
+      <text x="105" y="168" text-anchor="middle" fill="var(--ink)" class="label">image</text>
+      <text x="105" y="184" text-anchor="middle" fill="var(--muted)" class="num">48×48 patch</text>
+      <rect x="200" y="148" width="120" height="42" fill="var(--accent)" fill-opacity="0.16" stroke="var(--accent)" stroke-width="1.2"/>
+      <text x="260" y="166" text-anchor="middle" fill="var(--accent-text)" class="label">embedder</text>
+      <text x="260" y="182" text-anchor="middle" fill="var(--accent-text)" class="num">35M · 1 matmul</text>
+      <line x1="180" y1="169" x2="200" y2="169" stroke="var(--muted)" stroke-width="1.4" marker-end="url(#vg-w-flow-gemma4-tokenize-arrow)"/>
+      <line x1="320" y1="169" x2="360" y2="169" stroke="var(--muted)" stroke-width="1.4" marker-end="url(#vg-w-flow-gemma4-tokenize-arrow)"/>
+
+      <!-- AUDIO path -->
+      <rect x="30" y="236" width="150" height="46" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.2"/>
+      <text x="105" y="258" text-anchor="middle" fill="var(--ink)" class="label">audio</text>
+      <text x="105" y="274" text-anchor="middle" fill="var(--muted)" class="num">40ms / 640 float</text>
+      <rect x="200" y="238" width="120" height="42" fill="var(--accent)" fill-opacity="0.16" stroke="var(--accent)" stroke-width="1.2"/>
+      <text x="260" y="256" text-anchor="middle" fill="var(--accent-text)" class="label">linear proj</text>
+      <text x="260" y="272" text-anchor="middle" fill="var(--accent-text)" class="num">no conformer</text>
+      <line x1="180" y1="259" x2="200" y2="259" stroke="var(--muted)" stroke-width="1.4" marker-end="url(#vg-w-flow-gemma4-tokenize-arrow)"/>
+      <line x1="320" y1="259" x2="360" y2="259" stroke="var(--muted)" stroke-width="1.4" marker-end="url(#vg-w-flow-gemma4-tokenize-arrow)"/>
+
+      <!-- merged token stream -->
+      <rect x="360" y="146" width="120" height="96" fill="var(--ink-deep)" fill-opacity="0.12" stroke="var(--ink-deep)" stroke-width="1.2"/>
+      <text x="420" y="186" text-anchor="middle" fill="var(--ink)" class="label">unified</text>
+      <text x="420" y="204" text-anchor="middle" fill="var(--ink)" class="label">token stream</text>
+      <line x1="320" y1="79" x2="360" y2="160" stroke="var(--muted)" stroke-width="1.4" marker-end="url(#vg-w-flow-gemma4-tokenize-arrow)"/>
+
+      <!-- backbone -->
+      <rect x="520" y="100" width="200" height="160" fill="var(--bg-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+      <text x="620" y="150" text-anchor="middle" fill="var(--ink)" class="head">LLM backbone</text>
+      <text x="620" y="174" text-anchor="middle" fill="var(--muted)" class="num">48 layers</text>
+      <text x="620" y="192" text-anchor="middle" fill="var(--muted)" class="num">decoder-only</text>
+      <text x="620" y="210" text-anchor="middle" fill="var(--muted)" class="num">11.95B params</text>
+      <text x="620" y="228" text-anchor="middle" fill="var(--muted)" class="num">256K context</text>
+      <line x1="480" y1="194" x2="520" y2="180" stroke="var(--muted)" stroke-width="1.4" marker-end="url(#vg-w-flow-gemma4-tokenize-arrow)"/>
+
+      <!-- caps box -->
+      <rect x="760" y="100" width="100" height="160" fill="none" stroke="var(--muted-2)" stroke-dasharray="3,3"/>
+      <text x="810" y="124" text-anchor="middle" fill="var(--muted)" class="num">ASR</text>
+      <text x="810" y="146" text-anchor="middle" fill="var(--muted)" class="num">diariz.</text>
+      <text x="810" y="168" text-anchor="middle" fill="var(--muted)" class="num">video</text>
+      <text x="810" y="190" text-anchor="middle" fill="var(--muted)" class="num">agentic</text>
+      <text x="810" y="212" text-anchor="middle" fill="var(--muted)" class="num">coding</text>
+      <text x="810" y="248" text-anchor="middle" fill="var(--muted)" class="label">outputs</text>
+      <line x1="720" y1="180" x2="760" y2="180" stroke="var(--muted)" stroke-width="1.4" marker-end="url(#vg-w-flow-gemma4-tokenize-arrow)"/>
+
+      <text x="440" y="320" text-anchor="middle" fill="var(--muted)" class="label">沒有獨立 vision encoder（27 層 ViT）、沒有 audio conformer（12 層）——只有淺投影</text>
+      <text x="440" y="342" text-anchor="middle" fill="var(--muted)" class="num">image 變解析度：70 – 1120 token / 圖 · audio ≤ 30 s · video ≤ 60 s @ 1 fps</text>
+    </svg>
+    <figcaption>三條 modality 路徑在很淺的一層收斂成同一串 token，後面只有一個 48 層 backbone。image 用 35M embedder 的單 matmul、audio 用線性投影——對照傳統路線的 27 層 ViT 與 12 層 conformer，這是 encoder-free 的字面意思。</figcaption>
+  </figure>
+
+  <p>把這串數字攤成一張表，對照就跳出來：負責全部視覺輸入的 embedder 只有 35M，相對於 11.95B 的 backbone 連 0.3% 都不到——這就是「embedder 不是 encoder」在帳面上的意思。點欄頭依「佔總參數」排序，看 encoder-free 把多模態前端壓得多薄：</p>
+
+  <figure class="vg-w-table-gemma4-params">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M3 6h18"/><path d="M7 12h10"/><path d="M10 18h4"/>
+      </svg>
+      <span>click a column header to sort · 5 rows</span>
+    </p>
+    <style>
+      .vg-w-table-gemma4-params { overflow-x: auto; }
+      .vg-w-table-gemma4-params table { width: 100%; min-width: 520px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-gemma4-params thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; min-height: 44px; }
+      .vg-w-table-gemma4-params thead th[data-sort] { color: var(--accent-text); }
+      .vg-w-table-gemma4-params tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); color: var(--ink-soft); vertical-align: top; }
+      .vg-w-table-gemma4-params td.num { font-variant-numeric: tabular-nums; text-align: right; font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); color: var(--ink); }
+      .vg-w-table-gemma4-params figcaption { font-family: var(--scribed); font-style: italic; font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-2); }
+    </style>
+    <table>
+      <thead>
+        <tr>
+          <th data-key="comp">結構元件</th>
+          <th data-key="role">負責</th>
+          <th data-key="param" class="num">參數量</th>
+          <th data-key="share" class="num">佔總參數</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>LLM backbone</td><td>語言＋多模態推理</td><td class="num" data-v="11950000000">≈ 11.95B</td><td class="num" data-v="99.7">≈ 99.7%</td></tr>
+        <tr><td>vision embedder</td><td>影像 48×48 patch 投影</td><td class="num" data-v="35000000">35M</td><td class="num" data-v="0.29">≈ 0.29%</td></tr>
+        <tr><td>audio 線性投影</td><td>40ms frame 投影</td><td class="num" data-v="2000000">&lt; 一層線性</td><td class="num" data-v="0.02">微乎其微</td></tr>
+        <tr><td>傳統 ViT（對照）</td><td>被拆掉的視覺 encoder</td><td class="num" data-v="300000000">300M–1B＋</td><td class="num" data-v="9999">不在 12B 內</td></tr>
+        <tr><td>傳統 conformer（對照）</td><td>被拆掉的音訊 encoder</td><td class="num" data-v="100000000">12 層堆疊</td><td class="num" data-v="9999">不在 12B 內</td></tr>
+      </tbody>
+    </table>
+    <figcaption>Gemma 4 12B 的結構參數攤平。上兩列是模型內真正存在的多模態前端——加起來不到 backbone 的 0.3%；下兩列是傳統路線會外掛、但這版整個拆掉的 encoder，列出來作為「省掉了多大一塊」的對照。backbone 與 embedder 數字取自 model card；ViT／conformer 規模為 CLIP-style 與 Gemma 自家 audio 版的典型量級。</figcaption>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-table-gemma4-params');
+        const headers = root.querySelectorAll('thead th');
+        const tbody = root.querySelector('tbody');
+        let activeKey = null, asc = true;
+        headers.forEach(h => h.addEventListener('click', () => {
+          const key = h.dataset.key;
+          if (activeKey === key) asc = !asc; else { activeKey = key; asc = true; }
+          headers.forEach(x => x.removeAttribute('data-sort'));
+          h.setAttribute('data-sort', asc ? 'asc' : 'desc');
+          const rows = [...tbody.querySelectorAll('tr')];
+          const idx = [...headers].indexOf(h);
+          rows.sort((a, b) => {
+            const ac = a.children[idx], bc = b.children[idx];
+            const av = ac.dataset.v != null ? ac.dataset.v : ac.textContent.trim();
+            const bv = bc.dataset.v != null ? bc.dataset.v : bc.textContent.trim();
+            const an = Number(av), bn = Number(bv);
+            const cmp = !Number.isNaN(an) && !Number.isNaN(bn) ? an - bn : String(av).localeCompare(String(bv));
+            return asc ? cmp : -cmp;
+          });
+          rows.forEach(r => tbody.appendChild(r));
+        }));
+      })();
+    </script>
+  </figure>
+
+  <p>把 encoder 拆掉的好處不只是省參數。Google 在 developer guide 裡點出的工程後果是：你「不再需要 co-tune 兩座凍結的 encoder」。在 encoder + projector 的世界裡，下游 fine-tune 是一件麻煩事——encoder 的權重該不該動、projector 要訓多久、語言模型那端能不能跟著調，每一個都是 hyperparameter。實務上多數團隊選擇凍結 encoder、只訓 projector，因為解凍 encoder 很容易在小資料集上 catastrophic forgetting，把 CLIP 預訓練的視覺先驗給洗掉；但凍結又意味著視覺特徵空間是固定的，無法為你的領域（醫療影像、衛星圖、UI 截圖）重新對齊。這是一個沒有好答案的取捨。</p>
+
+  <p>encoder-free 之後，這個取捨消失了。LoRA 或 full fine-tune 一次 backward pass 就更新了整條「投影 + backbone」的 token loop——影像怎麼被理解、文字怎麼接續、輸出怎麼生成，全部在同一個 gradient 裡共同優化。你不必再決定「解凍幾層 encoder」，因為根本沒有 encoder；視覺投影層跟語言層在同一個 optimizer step 裡一起被 loss 拉動。對要拿 Gemma 4 去 fine-tune 自家多模態任務的團隊，這是「兩個 optimizer、兩套 learning rate、一道 projector 的梯度斷層」變成「一條連續的 token loop」的差別。Gemma 4 走 Apache 2.0 授權，full fine-tune 與商用都沒有授權層面的阻礙，這個簡化才有實際意義。</p>
+
+  <p>那代價在哪？傳統 vision encoder 的存在不是冗餘——CLIP-style 的 ViT 是在數十億影像-文字對上對比學習出來的，它把「視覺語意」預先壓進一個很好的特徵空間，LLM 只要學會「讀」這個空間就好。encoder-free 等於要求 backbone 自己從 48×48 patch 的原始投影裡長出視覺理解，沒有預訓練好的視覺特徵當拐杖。這是一個真實的賭注，不是免費的午餐。</p>
+
+  <p>這條路能成立，靠的是兩個前提。其一，backbone 本身夠大——12B 的容量足以在預訓練裡同時長出語言能力與視覺理解，這在 1B、2B 量級可能就撐不住，這也是為什麼 encoder-free 的激進版本先出現在中大型模型上。其二，預訓練資料裡影像夠多：Gemma 4 的訓練資料明確包含影像，跨 140 多種語言的 web 文件、程式碼、數學，cutoff 2025 年 1 月。沒有足量的影像-文字共現，backbone 學不出 CLIP 那種視覺語意對齊。</p>
+
+  <p>換句話說，encoder-free 是「把視覺學習的負擔從專用 encoder 轉嫁到 backbone」的賭注——你用 backbone 的容量與預訓練資料，去換掉一座外掛 encoder 的參數與工程複雜度。MMMU Pro 69.1% 說明在 12B 這個量級，這個賭注付得起：視覺軸只比純文字軸低 8 個百分點，沒有出現「拆掉 encoder 就崩盤」的災難。下面把兩條路線並排，拖動分隔線看 encoder-free 到底刪掉了 pipeline 的哪幾段。</p>
+
+  <figure class="vg-w-ba-gemma4-pipeline" data-svg-scroll="880">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M18 8L22 12L18 16"/><path d="M6 8L2 12L6 16"/><path d="M2 12H22"/>
+      </svg>
+      <span>drag the divider · left = encoder+projector, right = encoder-free</span>
+    </p>
+    <style>
+      .vg-w-ba-gemma4-pipeline { position: relative; aspect-ratio: 880 / 300; overflow: hidden; }
+      .vg-w-ba-gemma4-pipeline .layer { position: absolute; inset: 0; }
+      .vg-w-ba-gemma4-pipeline .after { clip-path: polygon(50% 0, 100% 0, 100% 100%, 50% 100%); }
+      .vg-w-ba-gemma4-pipeline .divider {
+        position: absolute; top: 0; bottom: 0; left: 50%;
+        width: 32px; transform: translateX(-50%);
+        cursor: ew-resize; touch-action: none; z-index: 2;
+      }
+      .vg-w-ba-gemma4-pipeline .divider::before {
+        content: ''; position: absolute; left: 50%; top: 0; bottom: 0;
+        width: 2px; transform: translateX(-50%); background: var(--accent);
+      }
+      .vg-w-ba-gemma4-pipeline .divider::after {
+        content: '↔'; position: absolute; left: 50%; top: 50%;
+        transform: translate(-50%, -50%);
+        background: var(--accent); color: var(--bg);
+        width: 30px; height: 30px; border-radius: 50%;
+        display: grid; place-items: center;
+        font-family: var(--sans); font-size: 15px;
+      }
+    </style>
+
+    <svg class="layer before" viewBox="0 0 880 300" preserveAspectRatio="xMidYMid meet">
+      <rect width="880" height="300" fill="var(--bg-soft)"/>
+      <text x="30" y="40" fill="var(--muted)" font-family="IM Fell English, serif" font-style="italic" font-size="15">傳統 · encoder + projector</text>
+      <rect x="30" y="64" width="150" height="50" fill="none" stroke="var(--muted-2)" stroke-width="1.4"/>
+      <text x="105" y="94" text-anchor="middle" fill="var(--ink)" font-family="EB Garamond, serif" font-size="14">image</text>
+      <rect x="210" y="64" width="200" height="50" fill="var(--ink-deep)" fill-opacity="0.18" stroke="var(--ink-deep)" stroke-width="1.4"/>
+      <text x="310" y="88" text-anchor="middle" fill="var(--ink)" font-family="EB Garamond, serif" font-size="14">vision encoder</text>
+      <text x="310" y="106" text-anchor="middle" fill="var(--ink-deep)" font-family="JetBrains Mono, monospace" font-size="11">27-layer ViT · frozen</text>
+      <rect x="440" y="64" width="160" height="50" fill="var(--ink-deep)" fill-opacity="0.12" stroke="var(--ink-deep)" stroke-width="1.4"/>
+      <text x="520" y="88" text-anchor="middle" fill="var(--ink)" font-family="EB Garamond, serif" font-size="14">projector</text>
+      <text x="520" y="106" text-anchor="middle" fill="var(--ink-deep)" font-family="JetBrains Mono, monospace" font-size="11">MLP / x-attn</text>
+      <rect x="630" y="64" width="220" height="50" fill="var(--bg)" stroke="var(--muted-2)" stroke-width="1.4"/>
+      <text x="740" y="94" text-anchor="middle" fill="var(--ink)" font-family="EB Garamond, serif" font-size="14">LLM backbone</text>
+      <line x1="180" y1="89" x2="210" y2="89" stroke="var(--muted)" stroke-width="1.4"/>
+      <line x1="410" y1="89" x2="440" y2="89" stroke="var(--muted)" stroke-width="1.4"/>
+      <line x1="600" y1="89" x2="630" y2="89" stroke="var(--muted)" stroke-width="1.4"/>
+      <text x="30" y="170" fill="var(--ink-soft)" font-family="EB Garamond, serif" font-size="13">audio → 12-layer conformer → projector → backbone</text>
+      <text x="30" y="210" fill="var(--muted)" font-family="EB Garamond, serif" font-size="13">fine-tune 要 co-tune 凍結 encoder、調 projector、決定解凍多少層</text>
+      <text x="30" y="240" fill="var(--muted)" font-family="EB Garamond, serif" font-size="13">兩套 optimizer、兩組 learning rate、視覺學習訊號被 projector 切成兩段</text>
+    </svg>
+
+    <svg class="layer after" viewBox="0 0 880 300" preserveAspectRatio="xMidYMid meet" id="vg-w-ba-gemma4-pipeline-after">
+      <rect width="880" height="300" fill="var(--accent)" fill-opacity="0.06"/>
+      <text x="450" y="40" fill="var(--accent-text)" font-family="IM Fell English, serif" font-style="italic" font-size="15">Gemma 4 12B · encoder-free</text>
+      <rect x="450" y="64" width="150" height="50" fill="none" stroke="var(--muted-2)" stroke-width="1.4"/>
+      <text x="525" y="94" text-anchor="middle" fill="var(--ink)" font-family="EB Garamond, serif" font-size="14">image</text>
+      <rect x="630" y="64" width="150" height="50" fill="var(--accent)" fill-opacity="0.18" stroke="var(--accent)" stroke-width="1.4"/>
+      <text x="705" y="88" text-anchor="middle" fill="var(--accent-text)" font-family="EB Garamond, serif" font-size="14">embedder</text>
+      <text x="705" y="106" text-anchor="middle" fill="var(--accent-text)" font-family="JetBrains Mono, monospace" font-size="11">35M · 1 matmul</text>
+      <rect x="810" y="64" width="60" height="50" fill="var(--bg)" stroke="var(--accent)" stroke-width="1.4"/>
+      <text x="840" y="94" text-anchor="middle" fill="var(--ink)" font-family="EB Garamond, serif" font-size="12">LLM</text>
+      <line x1="600" y1="89" x2="630" y2="89" stroke="var(--accent)" stroke-width="1.4"/>
+      <line x1="780" y1="89" x2="810" y2="89" stroke="var(--accent)" stroke-width="1.4"/>
+      <text x="450" y="170" fill="var(--ink-soft)" font-family="EB Garamond, serif" font-size="13">audio → 40ms 線性投影 → backbone（無 conformer）</text>
+      <text x="450" y="210" fill="var(--accent-text)" font-family="EB Garamond, serif" font-size="13">fine-tune 一次 backward pass 更新整條 token loop</text>
+      <text x="450" y="240" fill="var(--muted)" font-family="EB Garamond, serif" font-size="13">一個 optimizer、一組 learning rate、視覺學習負擔轉嫁給 backbone</text>
+    </svg>
+
+    <div class="divider" id="vg-w-ba-gemma4-pipeline-divider"></div>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-ba-gemma4-pipeline');
+        const after = root.querySelector('#vg-w-ba-gemma4-pipeline-after');
+        const divider = root.querySelector('#vg-w-ba-gemma4-pipeline-divider');
+        let dragging = false;
+        function setPct(pct) {
+          const c = Math.max(0, Math.min(100, pct));
+          after.style.clipPath = `polygon(${c}% 0, 100% 0, 100% 100%, ${c}% 100%)`;
+          divider.style.left = `${c}%`;
+        }
+        divider.addEventListener('pointerdown', (e) => { dragging = true; divider.setPointerCapture(e.pointerId); });
+        root.addEventListener('pointermove', (e) => {
+          if (!dragging) return;
+          const rect = root.getBoundingClientRect();
+          setPct(((e.clientX - rect.left) / rect.width) * 100);
+        });
+        root.addEventListener('pointerup', () => { dragging = false; });
+        root.addEventListener('pointercancel', () => { dragging = false; });
+      })();
+    </script>
+    <figcaption>左邊是傳統 encoder + projector 路線、右邊是 encoder-free。拖動分隔線——右半邊整段消失的就是 27 層 ViT 與 12 層 conformer，換成 35M embedder 的單次 matmul 與 audio 的線性投影。</figcaption>
+  </figure>
+
+  <h2>變解析度 token 預算：一張圖值多少 token</h2>
+
+  <p>encoder-free 還改變了一件容易被忽略的事——影像消耗多少 token，是可變的。model card 寫得很明確：image 採變解析度，token 預算落在 70 到 1120 之間；audio 最長 30 秒；video 最長 60 秒、以 1 fps 取樣。這幾個數字直接決定你的多模態 prompt 會吃掉多少 context。一段 60 秒的影片就是 60 個 frame，每個 frame 又按影像複雜度展開成 70–1120 個 token——最壞情況一段短片可以輕鬆吃掉幾萬個 token。好在 backbone 的 context window 是 256K，加上 1024 的 sliding window 機制，這個預算撐得住，但「丟一段影片進去」在 token 計費上絕不是免費的。</p>
+
+  <p>把三種 modality 的限制並排看更清楚——下表把每條路徑的輸入單位、token 預算、長度上限、以及 encoder-free 拆掉了多少「前端」攤開。點欄頭可依該欄排序：</p>
+
+  <figure class="vg-w-table-gemma4-modality">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M3 6h18"/><path d="M7 12h10"/><path d="M10 18h4"/>
+      </svg>
+      <span>click a column header to sort · 4 rows</span>
+    </p>
+    <style>
+      .vg-w-table-gemma4-modality { overflow-x: auto; }
+      .vg-w-table-gemma4-modality table { width: 100%; min-width: 540px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-gemma4-modality thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; min-height: 44px; }
+      .vg-w-table-gemma4-modality thead th[data-sort] { color: var(--accent-text); }
+      .vg-w-table-gemma4-modality tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); color: var(--ink-soft); vertical-align: top; }
+      .vg-w-table-gemma4-modality td.num { font-variant-numeric: tabular-nums; text-align: right; font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); color: var(--ink); }
+      .vg-w-table-gemma4-modality figcaption { font-family: var(--scribed); font-style: italic; font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-2); }
+    </style>
+    <table>
+      <thead>
+        <tr>
+          <th data-key="mod">modality</th>
+          <th data-key="unit">輸入單位</th>
+          <th data-key="tok" class="num">token / 單位</th>
+          <th data-key="cap">長度上限</th>
+          <th data-key="enc">傳統前端（已拆）</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>text</td><td>subword</td><td class="num" data-v="1">1</td><td>256K context</td><td>tokenizer（保留）</td></tr>
+        <tr><td>image</td><td>48×48 patch</td><td class="num" data-v="1120">70–1120</td><td>變解析度</td><td>27 層 ViT → 35M embedder</td></tr>
+        <tr><td>audio</td><td>40 ms frame</td><td class="num" data-v="1">1</td><td>≤ 30 s</td><td>12 層 conformer → 線性投影</td></tr>
+        <tr><td>video</td><td>frame @ 1 fps</td><td class="num" data-v="1120">70–1120 / frame</td><td>≤ 60 s（60 frame）</td><td>同 image 路徑</td></tr>
+      </tbody>
+    </table>
+    <figcaption>四條 modality 的 token 預算與已拆掉的前端。image 與 video 的「token / 單位」用區間上界（1120）參與排序——它們是唯二會把 context 大口吃掉的路徑。數字取自 model card。</figcaption>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-table-gemma4-modality');
+        const headers = root.querySelectorAll('thead th');
+        const tbody = root.querySelector('tbody');
+        let activeKey = null, asc = true;
+        headers.forEach(h => h.addEventListener('click', () => {
+          const key = h.dataset.key;
+          if (activeKey === key) asc = !asc; else { activeKey = key; asc = true; }
+          headers.forEach(x => x.removeAttribute('data-sort'));
+          h.setAttribute('data-sort', asc ? 'asc' : 'desc');
+          const rows = [...tbody.querySelectorAll('tr')];
+          const idx = [...headers].indexOf(h);
+          rows.sort((a, b) => {
+            const ac = a.children[idx], bc = b.children[idx];
+            const av = ac.dataset.v != null ? ac.dataset.v : ac.textContent.trim();
+            const bv = bc.dataset.v != null ? bc.dataset.v : bc.textContent.trim();
+            const an = Number(av), bn = Number(bv);
+            const cmp = !Number.isNaN(an) && !Number.isNaN(bn) ? an - bn : String(av).localeCompare(String(bv));
+            return asc ? cmp : -cmp;
+          });
+          rows.forEach(r => tbody.appendChild(r));
+        }));
+      })();
+    </script>
+  </figure>
+
+  <p>變解析度的設計呼應 encoder-free 的本質：既然影像只是「patch 投影成 token」，那一張資訊量低的圖（大片留白、單色背景）就該用少一點 patch、少一點 token；一張密集的圖（文件掃描、圖表）就值得多花 token。傳統 ViT 通常是固定 patch 數（一張圖固定 256 或 576 個 visual token），不管圖裡有沒有東西。encoder-free 把 token 預算變成一個可以隨內容調整的旋鈕。</p>
+
+  <p>這對本地部署特別有意義，因為 KV cache 的大小直接正比於 token 數。一段多模態 prompt 在筆電上要跟 12B 的權重、加上整段對話歷史的 KV cache 共擠 16 GB 記憶體——每張圖多花的幾百個 token，都會在 KV cache 上等比例放大。在資料中心，這只是 token 計費的差別；在筆電上，這直接決定你能不能在記憶體用罄之前跑完一個多輪 agent。一張省下來的圖等於省下來的 GB。256K 的 context window 與 1024 的 sliding window 在這裡互補：sliding window 讓注意力的計算成本不隨 context 線性爆炸，256K 的上限則給長對話與長文件留出空間。</p>
+
+  <p>token 預算的另一個含義是計費可預測性差。固定 patch 數的模型，你可以事先算出「一張圖 = N token」；變解析度模型的 70–1120 區間意味著同一張圖在不同解析度設定下成本可以差到 16 倍。要做容量規劃的團隊得實測自己的影像分佈落在這個區間的哪裡，不能用單一常數估算。下面這個旋鈕讓你直接感受這件事——拖動「每張圖 token」與「張數／影格數」，看一個多模態 prompt 在 256K context 上吃掉多少：</p>
+
+  <div class="vg-w-range-gemma4-budget">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M4 21v-7"/><path d="M4 10V3"/><path d="M12 21v-9"/><path d="M12 8V3"/>
+        <path d="M20 21v-5"/><path d="M20 12V3"/><path d="M1 14h6"/><path d="M9 8h6"/><path d="M17 16h6"/>
+      </svg>
+      <span>drag both knobs · total tokens vs 256K context</span>
+    </p>
+    <style>
+      .vg-w-range-gemma4-budget { display: grid; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); }
+      .vg-w-range-gemma4-budget .ctl { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: var(--s-2); }
+      .vg-w-range-gemma4-budget label { color: var(--muted); }
+      .vg-w-range-gemma4-budget input[type="range"] { width: 100%; height: 36px; accent-color: var(--accent); touch-action: none; }
+      .vg-w-range-gemma4-budget .readout { font-variant-numeric: tabular-nums; font-family: JetBrains Mono, monospace; color: var(--ink); min-width: 8ch; text-align: right; }
+      .vg-w-range-gemma4-budget .out { padding: var(--s-2); border-left: 2px solid var(--accent); background: var(--bg-soft); }
+      .vg-w-range-gemma4-budget .big { font-family: JetBrains Mono, monospace; font-size: 1.4rem; color: var(--ink); font-variant-numeric: tabular-nums; }
+      .vg-w-range-gemma4-budget .bar { height: 14px; background: var(--bg); border: 1px solid var(--muted-2); position: relative; overflow: hidden; margin-top: var(--s-1); }
+      .vg-w-range-gemma4-budget .fill { position: absolute; inset: 0 auto 0 0; background: var(--accent); opacity: 0.7; }
+      .vg-w-range-gemma4-budget .sub { color: var(--muted); font-size: var(--fs-xs); margin-top: var(--s-1); }
+      .vg-w-range-gemma4-budget .warn { color: var(--accent-text); }
+    </style>
+    <div class="ctl">
+      <label for="vg-w-range-gemma4-budget-tok">每張圖 token</label>
+      <input id="vg-w-range-gemma4-budget-tok" type="range" min="70" max="1120" step="10" value="700" />
+      <span class="readout" id="vg-w-range-gemma4-budget-tok-out">700</span>
+    </div>
+    <div class="ctl">
+      <label for="vg-w-range-gemma4-budget-n">張數／影格</label>
+      <input id="vg-w-range-gemma4-budget-n" type="range" min="1" max="120" step="1" value="12" />
+      <span class="readout" id="vg-w-range-gemma4-budget-n-out">12</span>
+    </div>
+    <div class="out">
+      <div>多模態 token 小計　<span class="big" id="vg-w-range-gemma4-budget-total">8,400</span></div>
+      <div class="bar"><div class="fill" id="vg-w-range-gemma4-budget-fill"></div></div>
+      <div class="sub" id="vg-w-range-gemma4-budget-sub">佔 256K context 的 3.2%——還剩 254,144 token 給文字與對話歷史</div>
+    </div>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-range-gemma4-budget');
+        const tok = root.querySelector('#vg-w-range-gemma4-budget-tok');
+        const n = root.querySelector('#vg-w-range-gemma4-budget-n');
+        const tokOut = root.querySelector('#vg-w-range-gemma4-budget-tok-out');
+        const nOut = root.querySelector('#vg-w-range-gemma4-budget-n-out');
+        const totalOut = root.querySelector('#vg-w-range-gemma4-budget-total');
+        const fill = root.querySelector('#vg-w-range-gemma4-budget-fill');
+        const sub = root.querySelector('#vg-w-range-gemma4-budget-sub');
+        const CTX = 256 * 1024;
+        function fmt(x) { return x.toLocaleString('en-US'); }
+        function update() {
+          const t = Number(tok.value), c = Number(n.value);
+          tokOut.textContent = String(t);
+          nOut.textContent = String(c);
+          const total = t * c;
+          totalOut.textContent = fmt(total);
+          const pct = total / CTX * 100;
+          fill.style.width = Math.min(100, pct) + '%';
+          const left = CTX - total;
+          if (left <= 0) {
+            sub.className = 'sub warn';
+            sub.textContent = '超過 256K context——' + fmt(total) + ' token 已塞不下，得降解析度或減張數';
+          } else {
+            sub.className = 'sub';
+            sub.textContent = '佔 256K context 的 ' + pct.toFixed(1) + '%——還剩 ' + fmt(left) + ' token 給文字與對話歷史';
+          }
+        }
+        tok.addEventListener('input', update);
+        n.addEventListener('input', update);
+        update();
+      })();
+    </script>
+  </div>
+
+  <p>採樣設定上 Gemma 4 12B-it 給的預設是 temperature 1.0、top_p 0.95、top_k 64，跨所有用途統一——這跟很多模型「不同任務調不同溫度」的習慣不一樣，也是 instruction-tuned 模型已經把行為收斂得夠好的訊號。prompt 格式延續 Gemma 系列的 turn 標記慣例，tokenizer 是 262K 詞表的大 vocab（涵蓋 140 多種語言所需的 subword 覆蓋）。多模態 token 直接內嵌在文字 turn 裡，不需要另一條 API 通道——這又是 encoder-free 的副產品：影像跟文字本來就是同一串 token，自然就在同一個 turn 裡。在 Transformers 裡這代表你用同一個 <code>processor</code> 把圖跟字一起餵，不必再維護一條獨立的 image preprocessing pipeline。</p>
+
+  <h2>QAT：把量化放進訓練 loop，而不是事後</h2>
+
+  <p>第二條新聞線是 QAT。一個 11.95B、BF16 的模型權重大約 24 GB（每參數 2 bytes），要塞進 16 GB 記憶體的筆電必須量化。最常見的做法是 PTQ（post-training quantization）——模型訓練完成後，把 FP16 權重事後映射到 int4 / int8 的低位元表示。PTQ 快、不需要重訓，但它的問題是模型在訓練時從不知道自己將被量化，低位元帶來的 rounding error 是訓練後才硬塞進去的擾動，位元數越低（特別是到 4-bit 以下）品質掉得越明顯。</p>
+
+  <p>位元數與權重足跡之間是一條乾淨的正比線：11.95B 參數乘每參數 bit 數、除以 8 就是純權重的 byte 數。BF16 的 2 bytes 給出約 24 GB，正好塞不進 16 GB。拖這個旋鈕，看足跡怎麼隨位元數縮放、在哪個位元數才跌進 16 GB 的筆電包絡：</p>
+
+  <div class="vg-w-range-gemma4-vram">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M4 21v-7"/><path d="M4 10V3"/><path d="M12 21v-9"/><path d="M12 8V3"/>
+        <path d="M20 21v-5"/><path d="M20 12V3"/><path d="M1 14h6"/><path d="M9 8h6"/><path d="M17 16h6"/>
+      </svg>
+      <span>drag the bit-width knob · weight footprint vs 16 GB line</span>
+    </p>
+    <style>
+      .vg-w-range-gemma4-vram { display: grid; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); }
+      .vg-w-range-gemma4-vram .ctl { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: var(--s-2); }
+      .vg-w-range-gemma4-vram label { color: var(--muted); }
+      .vg-w-range-gemma4-vram input[type="range"] { width: 100%; height: 36px; accent-color: var(--accent); touch-action: none; }
+      .vg-w-range-gemma4-vram .readout { font-variant-numeric: tabular-nums; font-family: JetBrains Mono, monospace; color: var(--ink); min-width: 7ch; text-align: right; }
+      .vg-w-range-gemma4-vram .out { padding: var(--s-2); border-left: 2px solid var(--accent); background: var(--bg-soft); }
+      .vg-w-range-gemma4-vram .big { font-family: JetBrains Mono, monospace; font-size: 1.4rem; color: var(--ink); font-variant-numeric: tabular-nums; }
+      .vg-w-range-gemma4-vram .bar { height: 16px; background: var(--bg); border: 1px solid var(--muted-2); position: relative; overflow: hidden; margin-top: var(--s-1); }
+      .vg-w-range-gemma4-vram .fill { position: absolute; inset: 0 auto 0 0; background: var(--accent); opacity: 0.7; }
+      .vg-w-range-gemma4-vram .line16 { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--ink); }
+      .vg-w-range-gemma4-vram .sub { color: var(--muted); font-size: var(--fs-xs); margin-top: var(--s-1); }
+      .vg-w-range-gemma4-vram .ok { color: var(--accent-text); }
+      .vg-w-range-gemma4-vram .over { color: var(--ink); }
+    </style>
+    <div class="ctl">
+      <label for="vg-w-range-gemma4-vram-bits">每參數位元</label>
+      <input id="vg-w-range-gemma4-vram-bits" type="range" min="2" max="16" step="1" value="16" />
+      <span class="readout" id="vg-w-range-gemma4-vram-bits-out">16 bit</span>
+    </div>
+    <div class="out">
+      <div>純權重足跡　<span class="big" id="vg-w-range-gemma4-vram-gb">24.0 GB</span></div>
+      <div class="bar">
+        <div class="fill" id="vg-w-range-gemma4-vram-fill"></div>
+        <div class="line16" id="vg-w-range-gemma4-vram-line"></div>
+      </div>
+      <div class="sub" id="vg-w-range-gemma4-vram-sub">16 bit（BF16）約 24.0 GB——超過 16 GB 那條線，塞不進筆電</div>
+    </div>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-range-gemma4-vram');
+        const bits = root.querySelector('#vg-w-range-gemma4-vram-bits');
+        const bitsOut = root.querySelector('#vg-w-range-gemma4-vram-bits-out');
+        const gbOut = root.querySelector('#vg-w-range-gemma4-vram-gb');
+        const fill = root.querySelector('#vg-w-range-gemma4-vram-fill');
+        const line = root.querySelector('#vg-w-range-gemma4-vram-line');
+        const sub = root.querySelector('#vg-w-range-gemma4-vram-sub');
+        const PARAMS = 11.95e9;        // model card 參數量
+        const ENVELOPE = 16;           // GB · developer guide 給的筆電門檻
+        const AXIS_MAX = 28;           // bar 的滿格刻度（GB），略大於 BF16 的 24
+        line.style.left = (ENVELOPE / AXIS_MAX * 100) + '%';
+        function fmtBits(b) {
+          if (b === 16) return '16 bit';
+          if (b === 8) return '8 bit';
+          if (b === 4) return '4 bit';
+          if (b === 2) return '2 bit';
+          return b + ' bit';
+        }
+        function update() {
+          const b = Number(bits.value);
+          const gb = PARAMS * b / 8 / 1e9;
+          bitsOut.textContent = fmtBits(b);
+          gbOut.textContent = gb.toFixed(1) + ' GB';
+          fill.style.width = Math.min(100, gb / AXIS_MAX * 100) + '%';
+          if (gb <= ENVELOPE) {
+            sub.className = 'sub ok';
+            sub.textContent = fmtBits(b) + ' 約 ' + gb.toFixed(1) + ' GB——跌進 16 GB 包絡，筆電跑得動（還要再扣 KV cache 與 activation）';
+          } else {
+            sub.className = 'sub over';
+            sub.textContent = fmtBits(b) + ' 約 ' + gb.toFixed(1) + ' GB——超過 16 GB 那條線，得再往下壓位元';
+          }
+        }
+        bits.addEventListener('input', update);
+        update();
+      })();
+    </script>
+  </div>
+
+  <p>這條正比線解釋了 QAT 為什麼非做不可：4-bit 把 24 GB 砍到約 6 GB，是把 12B 搬上筆電的唯一辦法，但 4-bit 以下的 PTQ 會崩。掉品質的機制具體是這樣：權重分佈裡有少數 outlier，把整個 quantization range 撐大，於是大多數靠近零的權重被擠進很粗的網格格子裡，rounding error 累積起來在多層之後放大成可見的 perplexity 上升。PTQ 只能事後用 per-channel scale、outlier 隔離這類技巧補救，但補救的空間有限——因為模型的權重分佈是在「以為自己是 FP16」的前提下訓出來的，本來就沒有為量化做任何讓步。</p>
+
+  <p>QAT 反過來：把量化這件事直接放進訓練 loop。前向傳播時模擬低位元的 rounding（fake quantization）——權重先被 round 到目標網格、再 round 回 FP 去算 loss，所以 loss 看到的就是「量化後的權重」會犯的錯。反向傳播則用 straight-through estimator 繞過量化算子不可微的問題：round 這個操作的梯度幾乎處處為零，STE 直接假裝它是 identity、讓梯度照常穿過去更新 FP 主權重。結果是模型在訓練過程中就學會「在量化網格上也要表現好」——它會主動把權重分佈往對量化友善的方向擠，壓掉那些會撐大 range 的 outlier。</p>
+
+  <p>Google 的說法是 QAT 的整體品質甚至高過標準 PTQ baseline——這個「高過」不是廢話：它意味著 QAT 4-bit 模型不只是「比 PTQ 4-bit 好」，而是在某些評測上接近原始 FP16 的水準，等於把 4-bit 的記憶體紅利幾乎免費拿到。對 Gemma 4 這代，QAT checkpoint 涵蓋 E2B、E4B、12B 與 26B MoE 全系列——不是只給最小的 edge 模型，連 26B 的 MoE 都有 QAT 版。下面三個分頁拆開 QAT 釋出的三種量化 schema——它們不是同一種 4-bit，而是按部署目標分裂的。</p>
+
+  <div class="vg-w-tabs-gemma4-qat">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/>
+      </svg>
+      <span>switch tabs to compare 3 QAT schemas · 3 tabs</span>
+    </p>
+    <style>
+      .vg-w-tabs-gemma4-qat { display: grid; gap: var(--s-2); }
+      .vg-w-tabs-gemma4-qat input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-tabs-gemma4-qat .tabs { display: flex; flex-wrap: wrap; gap: var(--s-2); border-bottom: 1px solid var(--line); }
+      .vg-w-tabs-gemma4-qat .tab { font-family: var(--sans); font-size: var(--fs-sm); padding: var(--s-1) var(--s-2); cursor: pointer; color: var(--muted); min-height: 44px; display: flex; align-items: center; }
+      .vg-w-tabs-gemma4-qat .panel { display: none; padding: var(--s-2) 0; }
+      .vg-w-tabs-gemma4-qat .panel h3 { margin: 0 0 var(--s-1) 0; font-family: var(--display); font-size: 1.25rem; color: var(--ink); }
+      .vg-w-tabs-gemma4-qat .panel p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink-soft); }
+      .vg-w-tabs-gemma4-qat .panel .tag { font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); color: var(--accent-text); }
+      .vg-w-tabs-gemma4-qat:has(#vg-w-tabs-gemma4-qat-t1:checked) .panel-1 { display: block; }
+      .vg-w-tabs-gemma4-qat:has(#vg-w-tabs-gemma4-qat-t1:checked) [for="vg-w-tabs-gemma4-qat-t1"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-gemma4-qat:has(#vg-w-tabs-gemma4-qat-t2:checked) .panel-2 { display: block; }
+      .vg-w-tabs-gemma4-qat:has(#vg-w-tabs-gemma4-qat-t2:checked) [for="vg-w-tabs-gemma4-qat-t2"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-gemma4-qat:has(#vg-w-tabs-gemma4-qat-t3:checked) .panel-3 { display: block; }
+      .vg-w-tabs-gemma4-qat:has(#vg-w-tabs-gemma4-qat-t3:checked) [for="vg-w-tabs-gemma4-qat-t3"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    </style>
+    <input type="radio" id="vg-w-tabs-gemma4-qat-t1" name="vg-w-tabs-gemma4-qat-sel" checked />
+    <input type="radio" id="vg-w-tabs-gemma4-qat-t2" name="vg-w-tabs-gemma4-qat-sel" />
+    <input type="radio" id="vg-w-tabs-gemma4-qat-t3" name="vg-w-tabs-gemma4-qat-sel" />
+    <div class="tabs">
+      <label class="tab" for="vg-w-tabs-gemma4-qat-t1">Q4_0 · 通用 4-bit</label>
+      <label class="tab" for="vg-w-tabs-gemma4-qat-t2">mobile · 混合精度</label>
+      <label class="tab" for="vg-w-tabs-gemma4-qat-t3">記憶體足跡</label>
+    </div>
+    <div class="panel panel-1">
+      <h3>Q4_0——跨全系列的標準 4-bit</h3>
+      <p><span class="tag">format: Q4_0 · 全模型統一 4-bit</span></p>
+      <p>最直接的一種 QAT checkpoint：整個模型用 Q4_0（llama.cpp 生態最通用的 4-bit block 量化格式）。因為量化是在訓練裡學進去的，這份 4-bit checkpoint 的品質高於拿同一個模型事後做 PTQ。對筆電部署這是 default 選項——llama.cpp、MLX、Unsloth 都直接吃 Q4_0。</p>
+      <p>關鍵在「為什麼 4-bit 不掉品質」：QAT 在訓練前向就模擬了 4-bit 的網格 rounding，模型已經學會在這個粗網格上分配權重，PTQ 那種「事後硬塞」的擾動不存在。</p>
+    </div>
+    <div class="panel panel-2">
+      <h3>mobile——按層分裂的混合精度</h3>
+      <p><span class="tag">format: 自訂 schema · 2-bit 生成層 + 高精度推理層</span></p>
+      <p>手機這條路用的不是統一 4-bit，而是混合精度：對 token 生成層做 targeted 2-bit 量化，同時讓負責推理的層維持較高精度。這呼應一個經驗——不是所有層對量化一樣敏感。生成層可以壓得更狠，推理層碰不得。</p>
+      <p>配套技巧包含 static activation 預計算、為 mobile accelerator 設計的 channel-wise 量化、以及 embedding 與 KV cache 的優化。這些都是為了把 12B 級的模型擠進手機的記憶體與算力包絡。</p>
+    </div>
+    <div class="panel panel-3">
+      <h3>記憶體足跡——量化到底省下多少</h3>
+      <p><span class="tag">E2B（無 Per-Layer Embeddings）&lt; 1 GB</span></p>
+      <p>最有說服力的數字來自小模型：Gemma 4 E2B 純文字版（拿掉 Per-Layer Embeddings）在 QAT 後記憶體需求低於 1 GB。這是「能不能在手機上常駐」的分界線。</p>
+      <p>對 12B：BF16 約 24 GB，4-bit QAT 後落進 16 GB 的 VRAM 或 unified memory 包絡——這正是 developer guide 給的硬體門檻，也是「筆電能跑」與「不能跑」的那條線。量化省下的不只是權重，連帶 KV cache 的精度也一起壓低。</p>
+    </div>
+  </div>
+
+  <p>三種 schema 的共同邏輯是「不是所有東西都該用同一個位元數」。Q4_0 是統一網格的省事版；mobile 的混合精度承認「生成層耐壓、推理層敏感」，把 2-bit 留給扛得住的層、把精度留給扛不住的層；記憶體足跡那一面則說明這一切的終點——把 12B 壓進 16 GB、把 E2B 壓進 1 GB 以下。</p>
+
+  <p>mobile schema 的「按層分配」值得多看一眼，因為它跟 QAT 是相互依存的。你不可能對一個 PTQ 模型做 2-bit 的生成層——2-bit 只有四個量化階，事後硬壓必然崩。但 QAT 在訓練裡就讓那些層適應 2-bit 網格，配合 static activation 預計算（把 activation 的量化 scale 預先固定，避免 runtime 動態求 range）與 channel-wise 量化（每個輸出通道一組獨立 scale，吸收通道間的數值差異），2-bit 才有機會站住。embedding 與 KV cache 也一起被優化，因為在手機上這兩者佔的記憶體比例不容忽視——一個大 vocab 的 embedding table 本身就是好幾 GB。</p>
+
+  <p>QAT 之所以能撐住這種激進的位元分配，正是因為「量化網格在訓練時就在 loss 裡」——模型不是被動接受量化，而是主動學會在量化下生存。這也是為什麼 Google 願意把 2-bit 這種在 PTQ 世界近乎禁忌的位元數，放進正式釋出的 mobile checkpoint。</p>
+
+  <h2>本地 agentic：LiteRT-LM 與 drop-in server</h2>
+
+  <p>QAT 把 12B 壓進 16 GB 之後，真正的應用面是本地 agentic workflow。Google 這一側的入口是 Google AI Edge 與 LiteRT-LM。LiteRT-LM 被描述成一個「lightweight、zero-code」的本地語言模型執行工具——你不寫推論程式碼，直接跑 CLI 把模型起起來。模型以 <code>litert-community/gemma-4-12B-it-litert-lm</code> 的形式發布，針對 LiteRT runtime 做了優化。配套的還有 Google AI Edge Gallery（本地 AI 展示 app，現已上 macOS）與 Eloquent（100% 端上跑的語音聽寫與編輯 app）。</p>
+
+  <p>除了 LiteRT 這條 Google 自家路線，Gemma 4 在開放生態裡的入口也鋪得很齊：inference 與 fine-tune 支援 Hugging Face Transformers、llama.cpp、MLX、SGLang、vLLM 與 Unsloth。這份清單本身就是訊號——llama.cpp 與 MLX 是筆電本地推論的兩大主力（前者跨平台、後者吃 Apple Silicon 的 unified memory），SGLang 與 vLLM 是資料中心 serving，Unsloth 則是低資源 fine-tune。同一個 Apache 2.0 模型在這六個 runtime 上都能跑，意味著「筆電原型 → 資料中心量產」可以是同一份權重的不同載入路徑。</p>
+
+  <p>對工程上最有意思的是 LiteRT-LM 的 <code>serve</code> 模式——它把本地模型包成一個 drop-in 的本地 LLM server，講 OpenAI 相容的 chat completions 協定。換句話說，你既有的工具鏈（Continue、Aider 這類編輯器外掛，或任何打 <code>/v1/chat/completions</code> 的 SDK）只要把 endpoint 指到 localhost 就能換成本地 Gemma 4，不用改程式碼。「zero-code」在這裡是字面意思：你不寫一行 Python，CLI 起 server、client 照舊打 HTTP。</p>
+
+  <pre data-kind="shell"><code><em># LiteRT-LM 起一個本地 OpenAI 相容 server</em>
+litert-lm serve litert-community/gemma-4-12B-it-litert-lm \
+          --port 9379
+
+<em># 任何 OpenAI 相容 client 直接打 localhost——包含多模態 turn</em>
+curl http://localhost:9379/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+        "model": "gemma-4-12B-it",
+        "messages": [
+          {"role": "user", "content": "把這張截圖裡的表格轉成 CSV"}
+        ]
+      }'</code></pre>
+
+  <p>把這幾件事接起來看，本地 agentic 的價值就清楚了：encoder-free 讓影像、音訊跟文字共用同一串 token、同一個 turn，所以一個本地 agent 可以「看截圖、聽語音命令、讀文件、寫程式」全在一個模型裡，不需要再串接一座外部 vision API；QAT 讓這個 12B 在筆電的 16 GB 包絡裡跑得動，所以這些 token 完全不離開本機；drop-in server 讓既有的 agent 框架（程式碼裡寫的還是 OpenAI client）一行 endpoint 就切過來。能力清單裡列的 automatic speech recognition、diarization、video understanding、agentic reasoning、coding——全部是同一個 backbone 的輸出口，不是五個拼接的子系統。</p>
+
+  <p>當然有現實的邊界要記住。MRCR v2 的 43.4% 提醒：12B 在 256K 長文脈的多目標檢索上不強，本地 agent 如果要在超長上下文裡精準翻找（例如讓 agent 讀完整個 codebase 再回答跨檔案問題），這條軸會是瓶頸——你可能還是得靠 retrieval 把相關片段先撈出來，而不是把全部塞進 context。</p>
+
+  <p>混合精度的 mobile schema 也意味著手機版跟筆電的 Q4_0 版不是同一份權重，行為會有差異——那 2-bit 的生成層在某些任務上會比 4-bit 版更容易在邊角案例失準。做端上部署前要實測自己的任務，不能假設 benchmark 數字（那是在 BF16 上跑的）直接搬得到量化版上，更不能假設 4-bit 版的數字搬得到 2-bit mobile 版上。每降一個位元都要重新量一次自己的關鍵指標。</p>
+
+  <p>還有 encoder-free 自身的尾巴：把視覺學習負擔轉嫁給 backbone，代價是這個能力跟 backbone 的規模綁死。你不能像換 vision encoder 那樣，獨立升級視覺前端而不動語言模型——視覺與語言在同一個 token loop 裡，要強化視覺就得重訓整個 backbone。對想針對特定視覺領域深度客製的團隊，這是 encoder-free 真正的 trade-off：簡化了 fine-tune 的工程，但拿走了「模組化替換視覺前端」的彈性。</p>
+
+  <p>但這些都是 deployment 的調校問題，不動搖核心：Gemma 4 12B 把「多模態理解」這件事從「LLM 外掛一座 encoder」收回成「LLM 自己的一層淺投影」，再用 QAT 把整包搬上筆電。這兩件事在同一次釋出裡出現不是巧合——encoder-free 讓模型結構足夠精簡到值得做 QAT，QAT 又讓這個精簡後的多模態模型真的進得了 16 GB 的記憶體包絡。</p>
+
+  <p class="vg-deep-closer"><strong>What this enables</strong>：把 vision／audio 的理解收進 backbone 自身的 token loop、再用 QAT 壓進 16 GB，意味著一個能看截圖、聽語音、讀文件、寫程式的多模態 agent 可以完全跑在你的筆電上、講 OpenAI 相容協定、token 一個都不離開本機。</p>
+</div>
