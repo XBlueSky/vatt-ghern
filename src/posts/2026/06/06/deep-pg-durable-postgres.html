@@ -1,0 +1,631 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">一個跑了三步的批次匯入工作流，在 embed API 回應到一半時 process 被 OOM killer 收掉。重啟之後，它沒有從頭把前三步重跑一遍——它讀了一張 PostgreSQL 的資料表，發現第三步的 output 已經 checkpoint 過了，於是直接從第四步接上去。沒有 Redis，沒有 Temporal，那張接住 crash 的表就坐在你平常 SELECT 的同一個 schema 裡。</p>
+  <h1 class="vg-post-title">durable execution 搬進 PostgreSQL——pg_durable 用一張 schema 接住 crash</h1>
+</header>
+
+<div class="vg-post-prose">
+
+<p><span class="vg-dropcap">看</span>完這篇，你會知道 durable execution 這個詞到底在講什麼、它解決哪一類「重跑代價很高」的問題，以及 Microsoft 開源的 pg_durable 怎麼只靠 PostgreSQL 的資料表加一個 background worker，就把「crash 後從上次進度接續」這件事做成擴充。如果你知道 Temporal 或 DBOS 在做什麼、但沒看過把這套東西塞進資料庫內部的版本，這篇從零把 in-database durable execution 的機制拆給你看：狀態存在哪、checkpoint 在哪一刻發生、它跟外部 orchestrator 的取捨在哪、以及哪些場景千萬別碰。</p>
+
+<h2>那個跑到一半被 kill 的批次工作——重跑代價為什麼是個真問題</h2>
+
+<p>先把案發現場攤平。假設你要做一個常見到不行的後端任務——把一批文件 embed 進向量庫。流程大概是這樣：撈一批還沒處理的文件 ID、對每份文件呼叫一個 embedding API、把回傳的向量 upsert 進 pgvector、最後把那批文件標記成已處理。四個步驟，串成一條。</p>
+
+<p>單跑一次沒什麼。問題出在「一批」可能是十萬份文件，embedding API 每次往返一兩百毫秒，整條工作流要跑好幾個小時。在這幾個小時裡，任何一件平凡的事都可能發生——deploy 重啟了那個 worker process、Kubernetes 把 pod evict 掉、機器 OOM、上游 API 限流回 429 讓你的 retry 邏輯卡住、或者單純就是有人 Ctrl-C 了那個 script。</p>
+
+<p>現在的關鍵問題是：重啟之後，你站在哪？</p>
+
+<p>如果你的工作流沒有把進度持久化，答案是「回到原點」。你已經花掉三小時、燒掉幾萬次 embedding API 呼叫（那是要付錢的），但因為 process 死掉時記憶體裡的進度也跟著沒了，你只能從第一份文件重新撈、重新 embed、重新 upsert。更糟的是，如果 upsert 不是 idempotent 的，重跑還會製造重複資料。</p>
+
+<p>工程師對這個問題不是沒有對策——對策恰恰是問題所在。傳統做法是手動把進度寫進一張 status 表：每處理完一批就 UPDATE 一下 processed 旗標，重啟時先 SELECT 出「還沒處理的」再繼續。這能動，但它把一個本來是「一條工作流」的東西拆散成好幾塊——工作流邏輯散落在 SQL、worker、queue、dashboard、status 表之間。pg_durable 的 README 用一句話點出這種碎裂：「the workflow logic ends up spread across SQL, workers, queues, dashboards, and status tables。」你要自己想清楚哪些 state 要存、什麼時候存、重啟時怎麼從存下的 state 重建記憶體裡的執行進度。這套手工容錯，每個團隊都重寫一遍，每次都漏掉一兩個 edge case。</p>
+
+<p>這套手工容錯還有個更隱蔽的問題：它把「正確性」綁在工程師的記憶力上。哪些 state 該存、存的時機在 commit 之前還是之後、重啟時 SELECT 的條件要不要考慮「上次 crash 剛好卡在 UPDATE 與 COMMIT 之間」這種 race——每一條都是一個可能寫錯的判斷。寫對了，下一個接手的人改了 status 表的某個欄位語意，又可能默默破壞 recovery 的假設。這種「散落且互相依賴」的容錯邏輯，是後端系統裡最難測、最容易在半夜噴掉的那一類程式碼。</p>
+
+<p>durable execution 就是在回答這個問題：能不能讓「容錯地接續執行」變成 runtime 的內建能力，而不是每個工作流各自手刻的 status 表？讓「切 step、存進度、重啟接續」這套機制只實作一次、被驗證一次，然後所有工作流共用——而不是每個團隊在每個專案裡各自重新發明、各自踩同一批坑。</p>
+
+<p>下面這個 widget 先把「重跑代價」這件事量化給你看。一條六步的工作流，假設它在第 N 步 crash。把滑桿拖到不同的 N，看兩種世界的差別：沒有 durable execution 時，crash 等於整條重跑（浪費掉 N 步已完成的工作）；有 durable execution 時，每步之間都 checkpoint，重啟只從上一個 checkpoint 接續，浪費趨近於零。</p>
+
+<figure class="vg-w-param-demo-crash-resume" data-svg-scroll="880">
+  <style>
+    .vg-w-param-demo-crash-resume { display: grid; grid-template-rows: auto auto 1fr auto; gap: var(--s-2); }
+    .vg-w-param-demo-crash-resume .controls { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+    .vg-w-param-demo-crash-resume .controls input[type="range"] { flex: 1; height: 36px; accent-color: var(--accent); touch-action: none; }
+    .vg-w-param-demo-crash-resume .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 6ch; text-align: right; }
+    .vg-w-param-demo-crash-resume .stats { display: flex; gap: var(--s-3); font-family: var(--sans); font-size: var(--fs-sm); flex-wrap: wrap; }
+    .vg-w-param-demo-crash-resume .stat-num { font-variant-numeric: tabular-nums; font-size: var(--fs-md); }
+    .vg-w-param-demo-crash-resume svg { width: 100%; height: auto; }
+    .vg-w-param-demo-crash-resume figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    .vg-w-param-demo-crash-resume .vg-w-affordance { display: flex; align-items: center; gap: 8px; margin: 0; font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+    .vg-w-param-demo-crash-resume .vg-w-affordance svg { width: 14px !important; height: 14px !important; min-width: 14px !important; }
+  </style>
+
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="m18 8 4 4-4 4"/><path d="M2 12h20"/><path d="m6 8-4 4 4 4"/>
+    </svg>
+    <span>拖動滑桿改變 crash 發生的步數 · 6 步工作流</span>
+  </p>
+
+  <div class="controls">
+    <label for="vg-w-param-demo-crash-resume-x">crash 發生在第 N 步</label>
+    <input id="vg-w-param-demo-crash-resume-x" type="range" min="1" max="6" value="4" step="1" />
+    <span class="readout" id="vg-w-param-demo-crash-resume-readout">N = 4</span>
+  </div>
+
+  <div class="stats">
+    <span>non-durable 重跑浪費：<strong class="stat-num" id="vg-w-param-demo-crash-resume-waste-nd">4</strong> 步</span>
+    <span>durable 接續浪費：<strong class="stat-num" id="vg-w-param-demo-crash-resume-waste-d">0</strong> 步</span>
+  </div>
+
+  <svg viewBox="0 0 720 300" preserveAspectRatio="xMidYMid meet" role="img" aria-label="crash at step N, durable vs non-durable resume">
+    <text x="30" y="40" font-family="Manrope, sans-serif" font-size="12" letter-spacing="0.06em" fill="var(--muted)">六步工作流</text>
+
+    <g id="vg-w-param-demo-crash-resume-pipeline"></g>
+
+    <line id="vg-w-param-demo-crash-resume-crashline" x1="0" y1="56" x2="0" y2="120" stroke="var(--accent)" stroke-width="2" stroke-dasharray="4 3" />
+    <text id="vg-w-param-demo-crash-resume-crashlabel" x="0" y="50" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--accent-text)">crash</text>
+
+    <g font-family="Manrope, sans-serif" font-size="12">
+      <text x="30" y="180" fill="var(--muted)" letter-spacing="0.06em">NON-DURABLE</text>
+      <rect id="vg-w-param-demo-crash-resume-nd-bar" x="120" y="168" height="16" width="0" fill="var(--accent)" fill-opacity="0.55" rx="2" />
+      <text id="vg-w-param-demo-crash-resume-nd-text" x="124" y="181" fill="var(--ink)" font-size="11">從頭重跑</text>
+    </g>
+
+    <g font-family="Manrope, sans-serif" font-size="12">
+      <text x="30" y="230" fill="var(--muted)" letter-spacing="0.06em">DURABLE</text>
+      <rect id="vg-w-param-demo-crash-resume-d-bar" x="120" y="218" height="16" width="0" fill="var(--sage-deep)" fill-opacity="0.55" rx="2" />
+      <text id="vg-w-param-demo-crash-resume-d-text" x="124" y="231" fill="var(--ink)" font-size="11">從上個 checkpoint 接續</text>
+    </g>
+
+    <text x="30" y="278" font-family="EB Garamond, serif" font-size="13" font-style="italic" fill="var(--muted)">橙色長度＝白做的工作；durable 的橙色幾乎為零，因為每步之間都已 checkpoint。</text>
+  </svg>
+
+  <figcaption>六步各佔 100 個 viewBox 單位。non-durable 重跑浪費＝crash 前已完成的步數；durable 浪費＝0（最多重跑當前那一步未 checkpoint 的部分）。</figcaption>
+
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-param-demo-crash-resume');
+      const input = root.querySelector('#vg-w-param-demo-crash-resume-x');
+      const readout = root.querySelector('#vg-w-param-demo-crash-resume-readout');
+      const wasteND = root.querySelector('#vg-w-param-demo-crash-resume-waste-nd');
+      const wasteD = root.querySelector('#vg-w-param-demo-crash-resume-waste-d');
+      const pipeline = root.querySelector('#vg-w-param-demo-crash-resume-pipeline');
+      const crashLine = root.querySelector('#vg-w-param-demo-crash-resume-crashline');
+      const crashLabel = root.querySelector('#vg-w-param-demo-crash-resume-crashlabel');
+      const ndBar = root.querySelector('#vg-w-param-demo-crash-resume-nd-bar');
+      const dBar = root.querySelector('#vg-w-param-demo-crash-resume-d-bar');
+      const ndText = root.querySelector('#vg-w-param-demo-crash-resume-nd-text');
+      const dText = root.querySelector('#vg-w-param-demo-crash-resume-d-text');
+
+      const STEPS = 6;
+      const X0 = 30, X1 = 690;
+      const stepW = (X1 - X0) / STEPS;
+      const TOP = 64, H = 44;
+      const NS = 'http://www.w3.org/2000/svg';
+      const names = ['撈批次', 'embed', 'upsert', '標記', '通知', '收尾'];
+
+      function draw(n) {
+        while (pipeline.firstChild) pipeline.removeChild(pipeline.firstChild);
+        for (let i = 0; i < STEPS; i++) {
+          const x = X0 + i * stepW;
+          const done = (i + 1) < n;            // 已完成且已 checkpoint
+          const crashing = (i + 1) === n;      // crash 落在這一步
+          const rect = document.createElementNS(NS, 'rect');
+          rect.setAttribute('x', x + 4); rect.setAttribute('y', TOP);
+          rect.setAttribute('width', stepW - 8); rect.setAttribute('height', H);
+          rect.setAttribute('rx', '3');
+          rect.setAttribute('fill', crashing ? 'color-mix(in srgb, var(--accent) 22%, transparent)' : (done ? 'color-mix(in srgb, var(--sage-deep) 20%, transparent)' : 'var(--bg-soft)'));
+          rect.setAttribute('stroke', crashing ? 'var(--accent)' : (done ? 'var(--sage-deep)' : 'var(--muted-2)'));
+          rect.setAttribute('stroke-width', '1.5');
+          pipeline.appendChild(rect);
+
+          const label = document.createElementNS(NS, 'text');
+          label.setAttribute('x', x + stepW / 2); label.setAttribute('y', TOP + 20);
+          label.setAttribute('text-anchor', 'middle');
+          label.setAttribute('font-family', 'EB Garamond, serif');
+          label.setAttribute('font-size', '13');
+          label.setAttribute('fill', 'var(--ink)');
+          label.textContent = (i + 1) + '. ' + names[i];
+          pipeline.appendChild(label);
+
+          const sub = document.createElementNS(NS, 'text');
+          sub.setAttribute('x', x + stepW / 2); sub.setAttribute('y', TOP + 36);
+          sub.setAttribute('text-anchor', 'middle');
+          sub.setAttribute('font-family', 'Manrope, sans-serif');
+          sub.setAttribute('font-size', '9.5');
+          sub.setAttribute('fill', 'var(--muted)');
+          sub.textContent = done ? 'checkpointed' : (crashing ? 'crash' : '未執行');
+          pipeline.appendChild(sub);
+
+          // checkpoint tick between steps
+          if (done) {
+            const tick = document.createElementNS(NS, 'circle');
+            tick.setAttribute('cx', x + stepW - 4); tick.setAttribute('cy', TOP + H + 8);
+            tick.setAttribute('r', '3'); tick.setAttribute('fill', 'var(--sage-deep)');
+            pipeline.appendChild(tick);
+          }
+        }
+        // crash marker
+        const cx = X0 + (n - 0.5) * stepW;
+        crashLine.setAttribute('x1', cx); crashLine.setAttribute('x2', cx);
+        crashLabel.setAttribute('x', cx);
+
+        const wND = n - 1 + 1;  // crash 前完成 (n-1) 步皆白做，加上當前步重做 = n
+        const wNDsteps = n;     // non-durable 從頭重跑 n 步（含當前）
+        const wDsteps = 0;
+        wasteND.textContent = String(wNDsteps);
+        wasteD.textContent = String(wDsteps);
+        readout.textContent = 'N = ' + n;
+
+        const fullW = X1 - 120;
+        ndBar.setAttribute('width', (wNDsteps / STEPS) * fullW);
+        dBar.setAttribute('width', 6);
+        ndText.textContent = '從頭重跑 ' + wNDsteps + ' 步';
+        dText.textContent = '只重做第 ' + n + ' 步未 checkpoint 的部分';
+      }
+
+      input.addEventListener('input', () => draw(Number(input.value)));
+      draw(Number(input.value));
+    })();
+  </script>
+</figure>
+
+<p>把滑桿拖到 N=6 最能說明問題：在沒有 durable execution 的世界，一條跑到第六步才掛掉的工作流要從第一步整條重來，前五步全部白做。durable execution 把這個 N 壓成 0——這就是它存在的理由。接下來我們把「durable execution」這個概念本身拆開。</p>
+
+<h2>durable execution 是什麼——把工作流的進度當成可持久化的狀態</h2>
+
+<p>放下 pg_durable 一下，先把概念講清楚，因為下面所有東西都建立在它上面。</p>
+
+<p>一個普通的 function 跑起來，它的執行進度——目前跑到第幾行、local 變數的值、call stack——全部活在記憶體裡。process 一死，這些進度跟著蒸發，沒有任何辦法「從中間接回去」，你只能重新呼叫一次，從頭跑。</p>
+
+<p><strong>durable execution 的核心想法</strong>是：把這個「執行進度」從易失的記憶體搬到持久化的儲存上。具體做法是把工作流切成一連串明確的 step，每完成一個 step，就把「這個 step 完成了、它的 output 是什麼」寫進持久化儲存——這個寫入動作就叫 checkpoint。當 process 死掉重啟，runtime 不從頭跑，而是先去讀那份持久化的執行紀錄，看到「step 1、2、3 已經完成，output 分別是這些」，於是直接跳到 step 4 接續。</p>
+
+<p>用一句話講：<strong>durable execution＝把工作流的進度做成 durable state，重啟時 replay 已存的進度而不是重跑。</strong></p>
+
+<p>這裡有兩個容易混淆的點要先標記清楚。</p>
+
+<p>第一，durable execution 不是「把整個工作流包進一個資料庫 transaction」。一條跑好幾小時、中間還要呼叫外部 API 的工作流，根本不可能塞進一個 transaction——你不會想 hold 一個 lock 三小時，外部 API 呼叫也不在資料庫的 transaction 邊界裡。durable execution 的粒度是 per-step：每個 step 各自完成、各自 checkpoint，step 與 step 之間是獨立的持久化邊界，不是一個大 transaction。</p>
+
+<p>第二，durable execution 要求 step 之間的執行是<strong>可重放的（replayable）</strong>。重啟時 runtime 要能根據已存的 output「重建」到 crash 前的執行位置。這要求 step 的結果是確定性的，或者把不確定的部分（時間戳、隨機數、外部 API 回應）本身也 checkpoint 起來，replay 時讀回存下的值而不是重新求值。pg_durable 底層的 duroxide runtime 提供的正是「deterministic replay」——這四個字是整套機制能成立的地基。</p>
+
+<p>還有一個工程後果值得先放進腦子：因為 step 之間是 replay 邊界，step 應該盡量設計成 idempotent。replay 的本質是「已 checkpoint 的 step 不重做、未 checkpoint 的 step 從頭重做」，但「未 checkpoint」可能意味著那個 step 其實已經對外造成了副作用——例如 embedding API 已經被呼叫、錢已經付了，只是回應還沒寫進 checkpoint 就 crash 了。runtime 重啟時會把這個 step 當成「沒做過」再跑一次。如果這個 step 是 idempotent 的（重複呼叫結果一樣、不會重複扣款），重做沒問題；如果不是，你會得到重複的副作用。durable execution 幫你接住了「進度」，但「副作用的 exactly-once」仍然要靠 step 本身的設計，這是任何 durable execution 系統都共有的邊界，不是 pg_durable 獨有的。</p>
+
+<p>這套想法不是 pg_durable 發明的。Temporal、DBOS、AWS Step Functions、Azure Durable Functions 都是 durable execution 的實作。它們的共通點是：有一個 runtime 負責切 step、checkpoint、replay；有一個持久化後端存執行紀錄。它們的差異，在於那個持久化後端跟你的應用資料的關係——這正是 pg_durable 切進來的角度。</p>
+
+<h2>狀態存在哪——duroxide.* 與 df.* 兩層 schema</h2>
+
+<p>傳統的 durable execution 平台（以 Temporal 為代表）是一個獨立的服務：你的應用透過 SDK 連到 Temporal server，Temporal 把工作流狀態存在它自己的後端（通常是 Cassandra 或一個專屬的 PostgreSQL/MySQL 實例）。你的業務資料在你的資料庫，工作流狀態在 Temporal 的資料庫，兩邊是分開的。</p>
+
+<p>pg_durable 的選擇剛好相反：它把工作流狀態存進<strong>你已經在用的那個 PostgreSQL</strong>，跟業務資料同一個資料庫實例。它用 pgrx——一個讓你用 Rust 寫 PostgreSQL 擴充的框架——把整套 runtime 編譯成 extension，跑在資料庫 process 內部。執行狀態就活在資料表裡，分成兩層 schema。</p>
+
+<p><strong>df.* schema</strong> 是給你用的那一層。`CREATE EXTENSION pg_durable` 之後，你會看到 `df.instances`（每一筆是一個正在跑或已完成的工作流實例）、`df.nodes`（每一筆是工作流裡的一個 step / 執行圖上的一個節點）、`df.vars`（step 之間傳遞的具名變數，例如 `|=>` 命名出來的那些）。重點是這些是<strong>普通的 PostgreSQL 資料表</strong>——你可以在工作流跑到一半或跑完之後，直接 `SELECT` 出它的狀態與結果，不需要連到任何外部 dashboard。</p>
+
+<p><strong>duroxide.* schema</strong> 是 runtime 自己的內部記帳，由底層的 duroxide-pg 這個 state provider 擁有，存的是 orchestration runtime 的低階狀態——history、work queue、sub-orchestration 的關聯等等。一般情況下你不會直接碰它，但它跟 df.* 一樣只是 PostgreSQL 的表。</p>
+
+<p>下面這張圖把「一個 crash 之後 runtime 靠哪幾張表把自己拼回來」攤開——這是理解 in-database durable execution 的核心：所有重啟需要的 state，都是同一個資料庫裡的 row。</p>
+
+<figure class="vg-w-schema-duroxide" data-svg-scroll="720">
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18"/><path d="M9 21V9"/>
+    </svg>
+    <span>durable 狀態分布的五張表 · 2 層 schema</span>
+  </p>
+  <svg viewBox="0 0 720 380" preserveAspectRatio="xMidYMid meet" role="img" aria-label="duroxide and df schema tables">
+    <style>
+      .vg-w-schema-duroxide-th { font-family: JetBrains Mono, monospace; font-size: 13px; fill: var(--accent-text); }
+      .vg-w-schema-duroxide-row { font-family: Manrope, sans-serif; font-size: 11.5px; fill: var(--ink); }
+      .vg-w-schema-duroxide-cap { font-family: Manrope, sans-serif; font-size: 11px; fill: var(--muted); letter-spacing: 0.06em; }
+    </style>
+
+    <text x="30" y="30" class="vg-w-schema-duroxide-cap">SCHEMA: df.*  ——  你 SELECT 得到的那層</text>
+    <rect x="30" y="44" width="640" height="1.5" fill="var(--accent)" />
+
+    <rect x="30" y="58" width="200" height="86" rx="4" fill="var(--bg-soft)" stroke="var(--accent)" stroke-width="1.5" />
+    <text x="44" y="80" class="vg-w-schema-duroxide-th">df.instances</text>
+    <text x="44" y="102" class="vg-w-schema-duroxide-row">一列＝一個工作流實例</text>
+    <text x="44" y="120" class="vg-w-schema-duroxide-row">instance_id · status</text>
+    <text x="44" y="136" class="vg-w-schema-duroxide-row">running / completed / failed</text>
+
+    <rect x="250" y="58" width="200" height="86" rx="4" fill="var(--bg-soft)" stroke="var(--accent)" stroke-width="1.5" />
+    <text x="264" y="80" class="vg-w-schema-duroxide-th">df.nodes</text>
+    <text x="264" y="102" class="vg-w-schema-duroxide-row">一列＝執行圖一個 step</text>
+    <text x="264" y="120" class="vg-w-schema-duroxide-row">已完成的 step + 其 output</text>
+    <text x="264" y="136" class="vg-w-schema-duroxide-row">replay 從這裡接續</text>
+
+    <rect x="470" y="58" width="200" height="86" rx="4" fill="var(--bg-soft)" stroke="var(--accent)" stroke-width="1.5" />
+    <text x="484" y="80" class="vg-w-schema-duroxide-th">df.vars</text>
+    <text x="484" y="102" class="vg-w-schema-duroxide-row">step 之間傳遞的具名變數</text>
+    <text x="484" y="120" class="vg-w-schema-duroxide-row">|=&gt; 命名出來的 $batch 等</text>
+    <text x="484" y="136" class="vg-w-schema-duroxide-row">受 RLS 保護</text>
+
+    <text x="30" y="200" class="vg-w-schema-duroxide-cap">SCHEMA: duroxide.*  ——  runtime 內部記帳（duroxide-pg 擁有）</text>
+    <rect x="30" y="214" width="640" height="1.5" fill="var(--sage-deep)" />
+
+    <rect x="30" y="228" width="310" height="80" rx="4" fill="var(--bg-soft)" stroke="var(--sage-deep)" stroke-width="1.5" />
+    <text x="44" y="250" class="vg-w-schema-duroxide-th">duroxide history</text>
+    <text x="44" y="272" class="vg-w-schema-duroxide-row">orchestration 的低階事件序列</text>
+    <text x="44" y="290" class="vg-w-schema-duroxide-row">deterministic replay 的依據</text>
+
+    <rect x="360" y="228" width="310" height="80" rx="4" fill="var(--bg-soft)" stroke="var(--sage-deep)" stroke-width="1.5" />
+    <text x="374" y="250" class="vg-w-schema-duroxide-th">duroxide work queue</text>
+    <text x="374" y="272" class="vg-w-schema-duroxide-row">background worker 撿工作的佇列</text>
+    <text x="374" y="290" class="vg-w-schema-duroxide-row">timers / sub-orchestration</text>
+
+    <path d="M130 144 L130 228" fill="none" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="3 3" marker-end="url(#vg-w-schema-duroxide-arr)" />
+    <defs>
+      <marker id="vg-w-schema-duroxide-arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+        <path d="M0 0 L6 3 L0 6 z" fill="var(--muted-2)" />
+      </marker>
+    </defs>
+
+    <text x="30" y="345" class="vg-w-schema-duroxide-cap" font-style="italic">crash 重啟＝SELECT 這五張表，拼回上次的執行位置——全部在同一個資料庫實例內。</text>
+    <text x="30" y="366" class="vg-w-schema-duroxide-cap">df.* 上的 RLS 讓每個 user 只看得到自己的 instances 與 nodes；worker 角色須為 superuser 以 bypass RLS。</text>
+  </svg>
+  <figcaption>df.* 是面向使用者的 DSL 表，duroxide.* 是 runtime 自己的底層狀態。兩層都是普通 PostgreSQL 表，這是 in-database 路線跟外部 orchestrator 最根本的差別。</figcaption>
+</figure>
+
+<p>這個設計帶來一個外部 orchestrator 很難給的東西：工作流狀態跟你的業務資料在<strong>同一個 transaction 邊界與同一份備份</strong>裡。你 pg_dump 一次，工作流的進度跟業務資料一起被備份；你做 point-in-time recovery，兩者一起回到同一個時間點。工作流的 output 你可以直接 JOIN 業務表去查，不用跨服務對帳。「close to data」這四個字是這整個路線的賣點。</p>
+
+<p>順帶把「為什麼 checkpoint 要落在每一步之間、而不是更細或更粗」也想清楚。checkpoint 太粗（例如整條工作流跑完才寫一次）等於沒有 durable execution——crash 就全沒了。太細（例如每個 SQL row 都 checkpoint 一次）則 checkpoint 的寫入開銷會吃掉工作流大半的時間，因為每次 checkpoint 都是一次資料庫寫入。pg_durable 選的粒度是「一個 DSL step」——這是個務實的折衷：step 是工作流裡語意上的最小可重做單位，也通常是外部副作用（一次 API 呼叫、一批 UPDATE）的自然邊界。你切 step 的方式，直接決定了 crash 時最多浪費多少工作、以及平時要付多少 checkpoint 開銷，這是用 pg_durable 時最該想清楚的設計決定。</p>
+
+<p>權限模型值得提一句，因為它影響你怎麼把 pg_durable 接進 multi-user 的應用。`CREATE EXTENSION` 之後不會自動把權限授給 `PUBLIC`，admin 要顯式呼叫 `SELECT df.grant_usage('app_role')` 才開放。df.* 上掛了 row-level security，每個 user 只能看到並管理自己的 durable function instance 與 node。而那個在背景跑工作的 worker 角色（由 GUC `pg_durable.worker_role` 設定，預設 `azuresu`）必須是 superuser——因為它得 bypass RLS 才能管理所有 user 的 instance。</p>
+
+<h2>怎麼用——|=&gt; 命名、~&gt; 串接，與 background worker 的 checkpoint 迴圈</h2>
+
+<p>到這裡你知道狀態存在哪了。現在看 pg_durable 實際長什麼樣，以及那個 background worker 在每一步之間做了什麼。</p>
+
+<p>pg_durable 的 DSL 不是另開一個檔案寫 YAML，而是用 SQL 字串加上幾個 operator 把 step 串起來，整條餵給 `df.start()`。最小的例子就是開頭那個批次匯入：</p>
+
+<pre><code class="language-sql">SELECT df.start(
+    'SELECT id FROM documents WHERE processed = false LIMIT 100' |=&gt; 'batch'
+    ~&gt; 'UPDATE documents SET processed = true WHERE id = ANY($batch)'
+);</code></pre>
+
+<p>拆開看這幾個 operator——它們是這套 DSL 的全部語法重心：</p>
+
+<ul>
+<li><code>|=&gt;</code>（named step）：把左邊那個 SQL step 的結果命名。上例把 `SELECT id ...` 的結果命名成 `batch`，後面就能用 `$batch` 引用。命名出來的變數存進 `df.vars`。</li>
+<li><code>~&gt;</code>（sequencing）：把兩個 step 串成「先做這個、再做那個」的順序。上例是先撈出 batch、再用 `$batch` 去 UPDATE。每個 `~&gt;` 之間，就是一個 checkpoint 邊界。</li>
+<li><code>df.if()</code> / <code>df.join()</code> / <code>df.loop()</code>：控制流。`df.if()` 做條件分支、`df.join()` 把 fan-out 出去的多個獨立 step 結果合併（例如平行跑幾個 query 再 join）、`df.loop()` 做重複。這三個讓工作流不只是直線，而是真的執行圖。</li>
+</ul>
+
+<p>`df.start()` 回傳一個 instance ID，並開始執行。注意它「開始執行」的方式不是同步把整條跑完才 return——它在 `df.instances` 寫一筆 running 的 row，把工作丟進 duroxide 的 work queue，然後立刻 return 那個 instance ID。真正的執行交給 background worker。</p>
+
+<p>這個 background worker 是 pgrx 註冊的一個常駐 process（這也是為什麼要把 `pg_durable` 加進 `shared_preload_libraries` 並重啟資料庫——background worker 必須在資料庫啟動時就掛上去）。它的迴圈大致是：從 work queue 撿一個待執行的 instance、執行下一個 step、把 step 的 output 與「這個 node 完成了」寫進 `df.nodes`（這就是 checkpoint）、更新 instance 狀態、再撿下一個。關鍵在於 checkpoint 落在<strong>每一步之間</strong>——README 的講法是 runtime「executes and checkpoints as it goes」。</p>
+
+<p>於是 crash recovery 的故事變得很簡單：worker process（或整個資料庫）掛掉重啟後，新的 worker 從 work queue 撿回那些還沒做完的 instance，去 `df.nodes` 看哪些 step 已經 checkpoint 過、output 是什麼，replay 到 crash 前的位置，然後從下一個還沒做的 step 接續——「execution resumes from the last durable checkpoint instead of making you reconstruct state by hand」。你不用手刻 status 表、不用想 replay 邏輯，這些是 runtime 的內建行為。</p>
+
+<p>這裡有個常被忽略但很關鍵的細節：work queue 與 checkpoint 都是 PostgreSQL 的 row，意味著 worker 撿工作、執行 step、寫 checkpoint 這一連串動作，可以包在資料庫的 transaction 語意裡。「step 的業務寫入」與「這個 step 已完成的 checkpoint 記號」能在同一個 commit 裡落地——這正是手刻 status 表最容易出錯的地方（業務寫入 commit 了、status 旗標還沒更新就 crash，重啟後分不清這步到底做完沒）。把工作流狀態跟業務資料放進同一個資料庫，讓「進度記號」與「實際效果」能原子地一起持久化，是 in-database 路線在正確性上一個不明顯但實在的好處。</p>
+
+<p>對於要跨出 SQL 的 step，pg_durable 留了逃生口：`df.http()` 讓一個 step 去呼叫外部 HTTP endpoint。這是它接住「向量 pipeline 要呼叫 embedding API」「維運任務要打 Slack 通知」這類需求的方式——把外部呼叫包成一個 step，它的回應一樣被 checkpoint，replay 時讀回存下的回應而不是重打一次。但這也劃出了表達力的天花板：能自然表達成 SQL step 或 HTTP 呼叫的工作流它接得住，要跑一段任意 Rust/Go/Python 業務邏輯的，就得想辦法包成 SQL function 或自架一個 HTTP endpoint 給它打——這個扭曲程度，後面談取捨時會再回來。</p>
+
+<p>稍微完整一點的工作流會用上控制流。下面這段把「撈批次、平行 embed 兩個來源、join 起來、條件性通知」寫出來，讓你看到 `df.if` / `df.join` / `df.loop` 在語法裡的位置（這是示意寫法，operator 是真的，欄位是編出來的）：</p>
+
+<pre data-kind="pseudocode"><code>SELECT df.start(
+  'SELECT id FROM documents WHERE processed = false LIMIT 100' |=&gt; 'batch'
+  ~&gt; df.loop('batch',
+       'SELECT embed($item) AS vec'  |=&gt; 'embedding'
+       ~&gt; 'INSERT INTO vectors(doc_id, vec) VALUES ($item, $embedding)'
+     )
+  ~&gt; df.join(
+       'SELECT count(*) FROM vectors'       |=&gt; 'n_vec',
+       'SELECT count(*) FROM documents'     |=&gt; 'n_doc'
+     )
+  ~&gt; df.if('$n_vec = $n_doc',
+       <em>// then：全部完成，標記並通知</em>
+       'UPDATE documents SET processed = true WHERE id = ANY($batch)'
+       ~&gt; 'SELECT notify_done($n_vec)',
+       <em>// else：有缺口，留給下一輪 retry</em>
+       'SELECT log_gap($n_doc - $n_vec)'
+     )
+);</code></pre>
+
+<p>這段每一個 <code>~&gt;</code> 都是一道 checkpoint 邊界。`df.loop` 裡每跑完一個 item 也 checkpoint，所以一條 embed 十萬份文件的迴圈跑到第八萬份掛掉，重啟是從第八萬份接，不是從第一份。下面這個 tab widget 把一個 instance 的生命週期攤成四個階段，讓你看 `df.nodes` 與 `df.instances` 的 row 在 start、checkpoint、crash-resume、complete 各階段怎麼變。</p>
+
+<div class="vg-w-tabs-lifecycle">
+  <style>
+    .vg-w-tabs-lifecycle { display: grid; gap: var(--s-2); margin: var(--s-3) 0; }
+    .vg-w-tabs-lifecycle input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+    .vg-w-tabs-lifecycle .tabs { display: flex; gap: var(--s-1); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+    .vg-w-tabs-lifecycle .tab { font-family: var(--sans); font-size: var(--fs-sm); padding: var(--s-1) var(--s-2); cursor: pointer; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; min-height: 44px; display: flex; align-items: center; }
+    .vg-w-tabs-lifecycle .panel { display: none; padding: var(--s-2) 0; }
+    .vg-w-tabs-lifecycle .panel p.note { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin: 0 0 var(--s-2) 0; }
+    .vg-w-tabs-lifecycle:has(#vg-w-tabs-lifecycle-t1:checked) .panel-1 { display: block; }
+    .vg-w-tabs-lifecycle:has(#vg-w-tabs-lifecycle-t1:checked) [for="vg-w-tabs-lifecycle-t1"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    .vg-w-tabs-lifecycle:has(#vg-w-tabs-lifecycle-t2:checked) .panel-2 { display: block; }
+    .vg-w-tabs-lifecycle:has(#vg-w-tabs-lifecycle-t2:checked) [for="vg-w-tabs-lifecycle-t2"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    .vg-w-tabs-lifecycle:has(#vg-w-tabs-lifecycle-t3:checked) .panel-3 { display: block; }
+    .vg-w-tabs-lifecycle:has(#vg-w-tabs-lifecycle-t3:checked) [for="vg-w-tabs-lifecycle-t3"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    .vg-w-tabs-lifecycle:has(#vg-w-tabs-lifecycle-t4:checked) .panel-4 { display: block; }
+    .vg-w-tabs-lifecycle:has(#vg-w-tabs-lifecycle-t4:checked) [for="vg-w-tabs-lifecycle-t4"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+  </style>
+  <input type="radio" id="vg-w-tabs-lifecycle-t1" name="vg-w-tabs-lifecycle-sel" checked />
+  <input type="radio" id="vg-w-tabs-lifecycle-t2" name="vg-w-tabs-lifecycle-sel" />
+  <input type="radio" id="vg-w-tabs-lifecycle-t3" name="vg-w-tabs-lifecycle-sel" />
+  <input type="radio" id="vg-w-tabs-lifecycle-t4" name="vg-w-tabs-lifecycle-sel" />
+  <div class="tabs">
+    <label class="tab" for="vg-w-tabs-lifecycle-t1">1 · start</label>
+    <label class="tab" for="vg-w-tabs-lifecycle-t2">2 · checkpoint</label>
+    <label class="tab" for="vg-w-tabs-lifecycle-t3">3 · crash + resume</label>
+    <label class="tab" for="vg-w-tabs-lifecycle-t4">4 · complete</label>
+  </div>
+
+  <div class="panel panel-1">
+    <p class="note">df.start() 寫一筆 running 的 instance，丟進 work queue 後立刻 return instance_id。此刻 df.nodes 還是空的。</p>
+<pre data-kind="output"><code>df.instances
+ instance_id | status   | created_at
+ a1f3...     | running  | 12:00:01
+
+df.nodes
+ (空——還沒有任何 step checkpoint)</code></pre>
+  </div>
+
+  <div class="panel panel-2">
+    <p class="note">background worker 撿起 instance，跑完 step 1（撈批次），把 output 寫進 df.nodes——這一行就是 checkpoint。</p>
+<pre data-kind="output"><code>df.nodes
+ node_id | instance_id | step    | status | output
+ n1      | a1f3...     | batch   | done   | {12,17,23,...}
+
+df.vars
+ instance_id | name  | value
+ a1f3...     | batch | {12,17,23,...}</code></pre>
+  </div>
+
+  <div class="panel panel-3">
+    <p class="note">step 2 跑到一半 process 被 kill。重啟後新 worker 撿回 instance，SELECT df.nodes 看到 n1 已 done，於是 replay 到 step 2 重做，不碰 step 1。</p>
+<pre data-kind="output"><code><em>// 重啟後 worker 讀回的狀態</em>
+df.nodes
+ node_id | step  | status   <em>// n1 已 checkpoint，跳過</em>
+ n1      | batch | done
+
+<em>// 從 step 2 接續，沒有重撈 batch</em>
+ n2      | update| running</code></pre>
+  </div>
+
+  <div class="panel panel-4">
+    <p class="note">所有 step checkpoint 完成，instance 狀態翻成 completed。你直接 SELECT 就拿到結果，不需要外部 dashboard。</p>
+<pre data-kind="output"><code>df.instances
+ instance_id | status    | completed_at
+ a1f3...     | completed | 12:08:44
+
+df.nodes
+ node_id | step   | status
+ n1      | batch  | done
+ n2      | update | done</code></pre>
+  </div>
+</div>
+
+<p>四個階段看下來，重點就一句：每一刻的「執行進度」都不是記憶體裡的東西，而是 `df.nodes` 裡可以 SELECT 出來的 row。階段 3 的 crash-resume 之所以不重做 step 1，純粹是因為 `df.nodes` 裡 n1 那行寫著 done——recovery 不是魔法，是一次 SELECT。</p>
+
+<h2>跟外部 orchestrator 的取捨——in-database 換掉了什麼基礎設施</h2>
+
+<p>講完機制，該談取捨了。pg_durable 不是要取代 Temporal——它是在一個特定的軸線上做了相反的選擇，這個軸線值得你親眼看一下。把下面的分隔線從左拖到右，左邊是用外部 orchestrator 跑 durable execution 通常要養的那一堆東西，右邊是 in-database 版本剩下的東西。</p>
+
+<figure class="vg-w-ba-orchestrator" data-interactive="drag" data-svg-scroll="560">
+  <style>
+    .vg-w-ba-orchestrator { position: relative; aspect-ratio: 16 / 10; overflow: hidden; border: 1px solid var(--line); border-radius: 4px; }
+    .vg-w-ba-orchestrator .layer { position: absolute; inset: 0; }
+    .vg-w-ba-orchestrator .after { clip-path: polygon(50% 0, 100% 0, 100% 100%, 50% 100%); }
+    .vg-w-ba-orchestrator .divider {
+      position: absolute; top: 0; bottom: 0; left: 50%;
+      width: 32px; transform: translateX(-50%);
+      cursor: ew-resize; touch-action: none; z-index: 3;
+    }
+    .vg-w-ba-orchestrator .divider::before {
+      content: ''; position: absolute; left: 50%; top: 0; bottom: 0;
+      width: 2px; transform: translateX(-50%); background: var(--accent);
+    }
+    .vg-w-ba-orchestrator .divider::after {
+      content: '↔'; position: absolute; left: 50%; top: 50%;
+      transform: translate(-50%, -50%);
+      background: var(--accent); color: var(--bg);
+      width: 32px; height: 32px; border-radius: 50%;
+      display: grid; place-items: center;
+      font-family: var(--sans); font-size: 16px;
+    }
+  </style>
+
+  <svg class="layer before" viewBox="0 0 480 300" preserveAspectRatio="xMidYMid meet" role="img" aria-label="external orchestrator stack">
+    <rect width="480" height="300" fill="var(--bg-soft)" />
+    <text x="24" y="34" font-family="Manrope, sans-serif" font-size="13" letter-spacing="0.06em" fill="var(--muted)">外部 ORCHESTRATOR 路線</text>
+    <g font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">
+      <rect x="24" y="52" width="190" height="40" rx="4" fill="none" stroke="var(--accent)" stroke-width="1.5" /><text x="36" y="77">你的應用 + SDK</text>
+      <rect x="24" y="102" width="190" height="40" rx="4" fill="none" stroke="var(--accent)" stroke-width="1.5" /><text x="36" y="127">Temporal server</text>
+      <rect x="24" y="152" width="190" height="40" rx="4" fill="none" stroke="var(--accent)" stroke-width="1.5" /><text x="36" y="177">專屬狀態後端 (C*/PG)</text>
+      <rect x="24" y="202" width="190" height="40" rx="4" fill="none" stroke="var(--accent)" stroke-width="1.5" /><text x="36" y="227">worker fleet</text>
+      <rect x="24" y="252" width="190" height="34" rx="4" fill="none" stroke="var(--accent)" stroke-width="1.5" /><text x="36" y="274">你的業務 PostgreSQL</text>
+    </g>
+    <text x="240" y="296" font-family="EB Garamond, serif" font-size="12" font-style="italic" fill="var(--muted)">五個要部署、監控、對帳的元件</text>
+  </svg>
+
+  <svg class="layer after" viewBox="0 0 480 300" preserveAspectRatio="xMidYMid meet" id="vg-w-ba-orchestrator-after" role="img" aria-label="in-database stack">
+    <rect width="480" height="300" fill="var(--bg)" />
+    <text x="256" y="34" font-family="Manrope, sans-serif" font-size="13" letter-spacing="0.06em" fill="var(--sage-deep)">IN-DATABASE 路線</text>
+    <rect x="256" y="60" width="200" height="200" rx="6" fill="color-mix(in srgb, var(--sage-deep) 12%, transparent)" stroke="var(--sage-deep)" stroke-width="1.5" />
+    <g font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">
+      <text x="276" y="92">一個 PostgreSQL</text>
+      <text x="276" y="122" font-size="12" fill="var(--muted)">+ pg_durable 擴充</text>
+      <text x="276" y="158" font-size="12">· 業務資料</text>
+      <text x="276" y="180" font-size="12">· df.* / duroxide.* 狀態</text>
+      <text x="276" y="202" font-size="12">· background worker</text>
+      <text x="276" y="224" font-size="12">· DSL 工作流定義</text>
+    </g>
+    <text x="356" y="284" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" font-style="italic" fill="var(--muted)">no Redis · no Temporal · no 外部服務</text>
+  </svg>
+
+  <div class="divider" id="vg-w-ba-orchestrator-divider"></div>
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-ba-orchestrator');
+      const after = root.querySelector('#vg-w-ba-orchestrator-after');
+      const divider = root.querySelector('#vg-w-ba-orchestrator-divider');
+      let dragging = false;
+      function setPct(pct) {
+        const c = Math.max(0, Math.min(100, pct));
+        after.style.clipPath = `polygon(${c}% 0, 100% 0, 100% 100%, ${c}% 100%)`;
+        divider.style.left = `${c}%`;
+      }
+      divider.addEventListener('pointerdown', (e) => { dragging = true; divider.setPointerCapture(e.pointerId); });
+      root.addEventListener('pointermove', (e) => {
+        if (!dragging) return;
+        const rect = root.getBoundingClientRect();
+        setPct(((e.clientX - rect.left) / rect.width) * 100);
+      });
+      root.addEventListener('pointerup', () => { dragging = false; });
+      root.addEventListener('pointercancel', () => { dragging = false; });
+    })();
+  </script>
+</figure>
+
+<p>這張圖把 in-database 的賣點講白了：少了一整層獨立服務的部署、監控、版本升級與跨服務對帳。對一個團隊規模不大、本來就跑著 PostgreSQL、工作流量不到需要獨立 orchestrator 的應用來說，這個減法很有吸引力——README 直接點名「no Redis, no Temporal, no external services」。</p>
+
+<p>但減法是有代價的，而且代價就藏在「跑在資料庫內部」這件事本身。外部 orchestrator 的存在不只是歷史包袱——它把工作流的計算負載隔離在資料庫之外。pg_durable 的 background worker 跟你的 OLTP query 共享同一個資料庫實例的 CPU、記憶體、connection、I/O。一條 CPU 密集或大量 fan-out 的工作流，會跟你的線上交易搶資源。外部 orchestrator 用「多一層基礎設施」換來的，正是這層隔離與獨立 scale 的能力。pg_durable 用「省掉那層基礎設施」換來的，是放棄這層隔離。</p>
+
+<p>另一個取捨在 step 的表達能力。pg_durable 的 step 是 SQL（外加 `df.http()` 之類的逃生口呼叫外部 HTTP）。Temporal 的 activity 是任意程式碼——你的 Go / Java / Python function。如果你的工作流每一步都是「呼叫這個微服務、跑這段業務邏輯、再呼叫那個」，那些邏輯不會自然地表達成 SQL step，硬塞進 SQL function 或 HTTP endpoint 反而比用一個吃任意程式碼的 orchestrator 更扭曲。</p>
+
+<p>第三個取捨是版本演進。長時間執行的工作流有個經典難題：一個實例可能跑好幾天，期間你部署了新版本，改了工作流的 step 順序或某個 step 的邏輯。對一個正在 replay 舊實例的 runtime 來說，「已 checkpoint 的舊 step」與「新版本定義的 step」對不上，replay 可能失敗或行為錯亂。Temporal 這類成熟平台為此發展出整套 versioning 與 determinism 檢查的機制。pg_durable 把工作流定義寫在 SQL DSL 裡、狀態寫在表裡，這個演進問題不會因為搬進資料庫就消失——你仍然要想清楚「正在飛的實例」遇到工作流定義變更時怎麼辦。評估任何 durable execution 方案時，這條長尾的維運成本，往往比第一天的部署便利更決定它能不能長期跑得住。</p>
+
+<p>把三個取捨擺在一起看，它們其實指向同一個權衡軸：pg_durable 用「貼著資料、少一層基礎設施」換掉了「計算隔離、任意程式碼、以及成熟平台累積的 versioning 工具」。這不是優劣，是定位——它把 durable execution 的入門成本壓到「裝個擴充」的等級，代價是把一部分原本由獨立服務承擔的複雜度，搬回到你的資料庫與你的工作流設計裡。</p>
+
+<h2>哪些場景不該用——in-database durable execution 的邊界</h2>
+
+<p>最後把「不適合」的場景講清楚，因為一個工具的價值，一半在於知道什麼時候別用它。README 自己列了一組 non-goals，下面這四個是最常見的誤用方向。點任一張卡片看為什麼。</p>
+
+<figure class="vg-w-stack-notfit">
+  <style>
+    .vg-w-stack-notfit { display: flex; flex-direction: column; gap: var(--s-3); align-items: stretch; }
+    .vg-w-stack-notfit input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+    .vg-w-stack-notfit .stack-title { font-family: IM Fell English, serif; font-style: italic; font-size: var(--fs-md); margin: 0 0 var(--s-1) 0; color: var(--ink); line-height: 1.4; }
+    .vg-w-stack-notfit .stack-cards { display: flex; flex-direction: column; gap: var(--s-1); list-style: none; padding: 0; margin: 0; }
+    .vg-w-stack-notfit .stack-cards label { display: block; padding: var(--s-2); border: 1px solid var(--muted-2); border-radius: 2px; cursor: pointer; transition: border-color 200ms, background 200ms; min-height: 44px; }
+    .vg-w-stack-notfit .stack-cards label:hover { border-color: var(--accent); }
+    .vg-w-stack-notfit .stack-cards .card-head { font-family: EB Garamond, serif; font-size: var(--fs-md); margin: 0 0 4px 0; color: var(--ink); display: flex; align-items: baseline; justify-content: space-between; gap: var(--s-2); flex-wrap: wrap; }
+    .vg-w-stack-notfit .stack-cards .card-sub { font-family: IM Fell English, serif; font-style: italic; font-size: var(--fs-sm); color: var(--muted); margin: 0; line-height: 1.5; }
+    .vg-w-stack-notfit .stack-cards .card-tag { font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); color: var(--accent-text); font-style: normal; }
+    .vg-w-stack-notfit:has(#vg-w-stack-notfit-r1:checked) .card-1 { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+    .vg-w-stack-notfit:has(#vg-w-stack-notfit-r2:checked) .card-2 { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+    .vg-w-stack-notfit:has(#vg-w-stack-notfit-r3:checked) .card-3 { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+    .vg-w-stack-notfit:has(#vg-w-stack-notfit-r4:checked) .card-4 { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+
+    .vg-w-stack-notfit svg.diagram { display: none; }
+    @media (min-width: 720px) {
+      .vg-w-stack-notfit svg.diagram { display: block; width: 100%; height: auto; max-width: 880px; }
+      .vg-w-stack-notfit .stack-title { display: none; }
+      .vg-w-stack-notfit .stack-cards { display: none; }
+    }
+    .vg-w-stack-notfit .layer { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; }
+    .vg-w-stack-notfit:has(#vg-w-stack-notfit-r1:checked) .layer-1 { fill: color-mix(in srgb, var(--accent) 18%, transparent); stroke: var(--accent); }
+    .vg-w-stack-notfit:has(#vg-w-stack-notfit-r2:checked) .layer-2 { fill: color-mix(in srgb, var(--accent) 18%, transparent); stroke: var(--accent); }
+    .vg-w-stack-notfit:has(#vg-w-stack-notfit-r3:checked) .layer-3 { fill: color-mix(in srgb, var(--accent) 18%, transparent); stroke: var(--accent); }
+    .vg-w-stack-notfit:has(#vg-w-stack-notfit-r4:checked) .layer-4 { fill: color-mix(in srgb, var(--accent) 18%, transparent); stroke: var(--accent); }
+
+    .vg-w-stack-notfit .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink-soft); }
+    .vg-w-stack-notfit .detail h3 { font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); margin: 0 0 var(--s-1) 0; }
+    .vg-w-stack-notfit .detail p { margin: 0; line-height: 1.6; }
+    .vg-w-stack-notfit:has(#vg-w-stack-notfit-r1:checked) .detail-1 { display: block; }
+    .vg-w-stack-notfit:has(#vg-w-stack-notfit-r2:checked) .detail-2 { display: block; }
+    .vg-w-stack-notfit:has(#vg-w-stack-notfit-r3:checked) .detail-3 { display: block; }
+    .vg-w-stack-notfit:has(#vg-w-stack-notfit-r4:checked) .detail-4 { display: block; }
+    .vg-w-stack-notfit .hint { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin: 0 0 var(--s-1) 0; }
+  </style>
+
+  <input type="radio" id="vg-w-stack-notfit-r1" name="vg-w-stack-notfit-sel" checked aria-label="single INSERT SELECT" />
+  <input type="radio" id="vg-w-stack-notfit-r2" name="vg-w-stack-notfit-sel" aria-label="sub-millisecond sync" />
+  <input type="radio" id="vg-w-stack-notfit-r3" name="vg-w-stack-notfit-sel" aria-label="no extension env" />
+  <input type="radio" id="vg-w-stack-notfit-r4" name="vg-w-stack-notfit-sel" aria-label="heterogeneous systems" />
+
+  <p class="stack-title" id="vg-w-stack-notfit-title">四種不該套 pg_durable 的場景</p>
+  <ul class="stack-cards" aria-labelledby="vg-w-stack-notfit-title">
+    <li class="card-1"><label for="vg-w-stack-notfit-r1">
+      <p class="card-head"><span>已是單一 INSERT ... SELECT</span><code class="card-tag">no-benefit</code></p>
+      <p class="card-sub">工作本身就是一條原子 SQL，沒有多步、沒有外部呼叫，沒有可 checkpoint 的中間進度。</p>
+    </label></li>
+    <li class="card-2"><label for="vg-w-stack-notfit-r2">
+      <p class="card-head"><span>次毫秒同步請求</span><code class="card-tag">latency</code></p>
+      <p class="card-sub">pg_durable 為背景執行而設計，checkpoint 與 worker 排程的 overhead 不適合走在同步熱路徑上。</p>
+    </label></li>
+    <li class="card-3"><label for="vg-w-stack-notfit-r3">
+      <p class="card-head"><span>禁裝擴充的環境</span><code class="card-tag">no-ext</code></p>
+      <p class="card-sub">部分託管環境不允許安裝擴充或註冊 background worker，整套機制無從掛上。</p>
+    </label></li>
+    <li class="card-4"><label for="vg-w-stack-notfit-r4">
+      <p class="card-head"><span>跨異質系統的工作流</span><code class="card-tag">spread</code></p>
+      <p class="card-sub">工作流大部分活在 Postgres 之外、橫跨多個異質系統時，把編排塞進資料庫反而是錯位。</p>
+    </label></li>
+  </ul>
+
+  <svg class="diagram" viewBox="0 0 880 230" role="img" aria-label="four scenarios where pg_durable does not fit">
+    <text x="40" y="28" font-family="Manrope, sans-serif" font-size="13" letter-spacing="0.05em" fill="var(--muted)">四種不該套 pg_durable 的場景</text>
+    <g font-family="EB Garamond, serif" font-size="15">
+      <rect class="layer layer-1" x="40" y="50" width="190" height="150" rx="4" role="button" tabindex="0" aria-label="single INSERT SELECT" />
+      <text x="56" y="78" fill="var(--ink)">單一 INSERT</text>
+      <text x="56" y="98" fill="var(--ink)">... SELECT</text>
+      <text x="56" y="124" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">no-benefit</text>
+
+      <rect class="layer layer-2" x="245" y="50" width="190" height="150" rx="4" role="button" tabindex="0" aria-label="sub millisecond sync" />
+      <text x="261" y="78" fill="var(--ink)">次毫秒</text>
+      <text x="261" y="98" fill="var(--ink)">同步請求</text>
+      <text x="261" y="124" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">latency</text>
+
+      <rect class="layer layer-3" x="450" y="50" width="190" height="150" rx="4" role="button" tabindex="0" aria-label="no extension env" />
+      <text x="466" y="78" fill="var(--ink)">禁裝擴充</text>
+      <text x="466" y="98" fill="var(--ink)">的環境</text>
+      <text x="466" y="124" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">no-ext</text>
+
+      <rect class="layer layer-4" x="655" y="50" width="190" height="150" rx="4" role="button" tabindex="0" aria-label="heterogeneous systems" />
+      <text x="671" y="78" fill="var(--ink)">跨異質</text>
+      <text x="671" y="98" fill="var(--ink)">系統工作流</text>
+      <text x="671" y="124" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">spread</text>
+    </g>
+  </svg>
+
+  <div>
+    <p class="hint">點任一場景看為什麼不適合</p>
+    <div class="detail detail-1">
+      <h3>單一 INSERT ... SELECT</h3>
+      <p>durable execution 的價值來自「多步之間可 checkpoint」。如果整個工作本身就是一條原子 SQL——撈出來、轉換、寫回去全在一個 statement——它要嘛成功要嘛 rollback，沒有「跑到一半」的中間狀態需要被接住。套上 pg_durable 只是多一層記帳開銷，買不到任何容錯。</p>
+    </div>
+    <div class="detail detail-2">
+      <h3>次毫秒同步請求</h3>
+      <p>pg_durable 明確為背景、長時間執行設計。df.start() 把工作丟進 work queue 交給 background worker，這套排程加上每步 checkpoint 的寫入，本身就有毫秒級 overhead。放在一個要求次毫秒回應的同步 API 熱路徑上，這層 overhead 是淨損失——這類請求要的是快，不是可重啟。</p>
+    </div>
+    <div class="detail detail-3">
+      <h3>禁裝擴充的環境</h3>
+      <p>pg_durable 是用 pgrx 寫的擴充，且需要把自己加進 shared_preload_libraries 註冊 background worker。部分託管 PostgreSQL 不允許安裝任意擴充，或不開放 background worker——在這些環境整套機制根本掛不上去，你只能回到外部 orchestrator 或自己手刻 status 表。</p>
+    </div>
+    <div class="detail detail-4">
+      <h3>跨異質系統的工作流</h3>
+      <p>當工作流的大部分其實活在 Postgres 之外——橫跨多個微服務、message broker、第三方 API、各種異質系統——把編排中樞塞進其中一個資料庫是錯位的。這種拓樸正是外部 orchestrator 的主場：它本來就站在所有系統之外做協調，不偏袒任何一個資料庫。</p>
+    </div>
+  </div>
+
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-stack-notfit');
+      const map = [
+        ['#vg-w-stack-notfit-r1', '[aria-label="single INSERT SELECT"]'],
+        ['#vg-w-stack-notfit-r2', '[aria-label="sub millisecond sync"]'],
+        ['#vg-w-stack-notfit-r3', '[aria-label="no extension env"]'],
+        ['#vg-w-stack-notfit-r4', '[aria-label="heterogeneous systems"]'],
+      ];
+      map.forEach(([radioSel, rectSel]) => {
+        const radio = root.querySelector(radioSel);
+        const rect = root.querySelector('svg.diagram ' + rectSel);
+        if (!radio || !rect) return;
+        rect.addEventListener('click', () => { radio.checked = true; });
+        rect.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); radio.checked = true; }
+        });
+      });
+    })();
+  </script>
+</figure>
+
+<p>把這四個場景反過來讀，就是 pg_durable 的甜蜜點：多步、會跑一段時間、中間有外部呼叫或可能 crash、而且工作流的資料重心本來就在這個 PostgreSQL 裡。README 點名的幾類正好落在這裡——向量 pipeline（chunk、embed、upsert）、ingest 工作流（stage、dedup、transform、publish）、需要等人核可的維運任務、fan-out 後 join 的平行聚合。這些任務的共通特徵，就是「重跑代價高」與「資料已經在庫裡」同時成立。</p>
+
+<p>也別把 pg_durable 讀成「Temporal 殺手」。它是 durable execution 光譜上一個刻意偏向 in-database 的點：用放棄計算隔離與任意程式碼表達力，換掉一整層獨立基礎設施。當你的工作流剛好落在它的甜蜜點，這個交換非常划算；當它落在四個 non-goal 任何一個附近，這個交換就開始虧。工程判斷不在於哪個工具比較強，而在於你的工作流站在這條光譜的哪一段。</p>
+
+<p class="vg-deep-closer"><strong>Take-away</strong>：durable execution 就是把工作流的進度做成可 SELECT 的 durable state；pg_durable 把那份 state 直接放進你的 PostgreSQL，crash recovery 不是魔法，是 background worker 對 df.nodes 的一次 SELECT。</p>
+
+</div>
