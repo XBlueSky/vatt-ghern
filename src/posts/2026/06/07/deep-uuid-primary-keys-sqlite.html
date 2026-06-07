@@ -1,0 +1,563 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">同一張表、同一筆資料、同一台機器——只是把主鍵從 integer 換成隨機 UUID4，每百萬列的插入時間從穩定的 700ms 一路惡化到 12,586ms。慢掉的那 11 秒，profiler 說全花在「平衡一棵樹」。</p>
+  <h1 class="vg-post-title">{{ title }}</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p><span class="vg-dropcap">在</span>大多數資料庫的腦內模型裡，主鍵是個唯一性約束——保證沒有兩列共用同一個 id，順帶提供一個查找入口。在 SQLite，這個模型是錯的。SQLite 的每一張表本身就是一棵以主鍵為 key 的 B-tree，主鍵決定的不是「能不能重複」，而是「這列資料實際躺在磁碟的哪個位置」。換句話說，主鍵就是 clustered index，而 clustered index 的定義是「決定表中資料列實體儲存順序的索引」。一張表只能有一個 clustered index，因為資料在實體上只能照一種順序排。當你把主鍵設成隨機產生的 UUID4，你等於要求 SQLite 把每一筆新資料插進一個隨機的實體位置——而 B-tree 在隨機位置插入的代價，就是這篇要拆解的東西。Anders Murphy 跑了一組基準：integer 主鍵、UUID4、UUID7，各跑到 1 億列，數字落差大到不像同一個引擎。</p>
+
+  <p>這不是「UUID 比較大所以比較慢」那種一句話可以打發的事。UUID blob 是 16 bytes，integer 主鍵是 8 bytes，大一倍——但大一倍解釋不了 14 到 16 倍的落差。落差的真正來源是<strong>順序</strong>：integer 主鍵與時間有序的 UUID7 都是遞增的，新資料永遠接在 B-tree 的尾端；隨機的 UUID4 則把新資料撒進樹的任意位置，逼出大量頁面分裂（page split）與重新平衡（rebalancing）。下面四節，我們依序拆開 SQLite 的 clustered B-tree 儲存模型、rowid 的角色、WITH 與 WITHOUT ROWID 的差異，以及隨機 vs 時間有序鍵如何在頁面層級造成寫放大（write amplification）。每一步都用基準數字釘住。</p>
+
+  <h2>主鍵即實體儲存順序——SQLite 的表是一棵 clustered B-tree</h2>
+
+  <p>先把這件事說清楚，因為它是後面所有現象的根。在 SQLite，「rowid 表」（也就是預設的、沒有寫 WITHOUT ROWID 的表）的資料儲存在一棵 B-tree 裡，這棵樹「每一列對應一個 entry，用 rowid 的值當作 key」。這句話的關鍵是：表的內容不是另外存在某個 heap，再由索引指過去——表的內容<strong>就是</strong>這棵 B-tree。樹的 key 決定 entry 的排列順序，而 entry 的排列順序就是磁碟頁面（page）上的實體順序。</p>
+
+  <p>這跟 Postgres 之類以 heap table 為主的引擎根本不同。在 Postgres，資料列丟進 heap 裡大致按到達順序堆放，主鍵是另一棵 B-tree 索引，索引的葉節點存的是指向 heap tuple 的指標（ctid）。主鍵在 Postgres 不決定實體順序，所以隨機 UUID 主鍵在 Postgres 造成的痛苦遠小於 SQLite——它頂多讓那一棵索引 B-tree 變得分散，heap 本身照樣 append。<strong>本文討論的代價是 SQLite 特有的</strong>，因為 SQLite 把表本身做成了 clustered index。把這篇的結論直接套到 Postgres 上會得到錯誤的結論。</p>
+
+  <p>那麼一棵 B-tree 在「尾端插入」與「隨機位置插入」的差別在哪？B-tree 由固定大小的 page 組成（SQLite 預設 page 4096 bytes）。每個 leaf page 裝得下若干 entry。當資料照 key 遞增到達，新 entry 永遠落在當前「最右邊」那個 leaf page；這個 page 填滿後，開一個新的 page 接在後面，舊 page 不必動。這是近乎 append-only 的行為，幾乎沒有資料搬移。但若新 entry 的 key 落在某個已經填滿的 page 中間，這個 page 容不下，就必須<strong>分裂</strong>：配置一個新 page，把原 page 約一半的 entry 搬過去，再更新父節點的指標——若父節點也滿了，分裂往上傳遞，最壞情況一路傳到 root。隨機 key 把每一次插入都變成一場「賭這次會不會踩到滿的 page」的賭局，而當表長到上億列、樹有幾百萬個 page 時，這個賭局幾乎場場都輸。</p>
+
+  <p>下面這個互動圖把四種組合的真實基準數字攤開：拖動 row 數、切換主鍵類型，讀出對應的每百萬列插入時間。曲線不是示意——點全部來自 Anders Murphy 跑到 1 億列的實測。</p>
+
+  <figure class="vg-w-param-demo-uuid-keys" data-svg-scroll="800">
+    <style>
+      .vg-w-param-demo-uuid-keys { display: grid; grid-template-rows: auto auto 1fr auto; gap: var(--s-2); }
+      .vg-w-param-demo-uuid-keys .vg-w-affordance { display: flex; align-items: center; gap: var(--s-1); font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin: 0; }
+      .vg-w-param-demo-uuid-keys .vg-w-affordance svg { width: 14px !important; height: 14px !important; min-width: 14px; }
+      .vg-w-param-demo-uuid-keys .keys { display: flex; flex-wrap: wrap; gap: var(--s-1) var(--s-3); font-family: var(--sans); font-size: var(--fs-sm); }
+      .vg-w-param-demo-uuid-keys .keys label { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; min-height: 32px; }
+      .vg-w-param-demo-uuid-keys .keys input { accent-color: var(--accent); width: 16px; height: 16px; }
+      .vg-w-param-demo-uuid-keys .swatch { width: 14px; height: 3px; display: inline-block; }
+      .vg-w-param-demo-uuid-keys .controls { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+      .vg-w-param-demo-uuid-keys .controls input[type="range"] { flex: 1; height: 36px; accent-color: var(--accent); touch-action: none; }
+      .vg-w-param-demo-uuid-keys .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 16ch; text-align: right; }
+      .vg-w-param-demo-uuid-keys svg.vg-w-param-demo-uuid-keys-main { width: 100%; height: auto; }
+      .vg-w-param-demo-uuid-keys figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/><path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+      </svg>
+      <span>切換主鍵類型、拖動 row 數，讀出每百萬列插入時間 · 4 種組合 × 10 個量測點</span>
+    </p>
+
+    <div class="keys" role="radiogroup" aria-label="primary key type">
+      <label><input type="radio" name="vg-w-param-demo-uuid-keys-type" value="int" checked /><span class="swatch" style="background: var(--ink-deep)"></span>integer PRIMARY KEY</label>
+      <label><input type="radio" name="vg-w-param-demo-uuid-keys-type" value="u4now" /><span class="swatch" style="background: var(--accent)"></span>UUID4 WITHOUT ROWID</label>
+      <label><input type="radio" name="vg-w-param-demo-uuid-keys-type" value="u4with" /><span class="swatch" style="background: var(--sage-deep)"></span>UUID4 WITH ROWID</label>
+      <label><input type="radio" name="vg-w-param-demo-uuid-keys-type" value="u7" /><span class="swatch" style="background: var(--sage)"></span>UUID7 WITHOUT ROWID</label>
+    </div>
+
+    <div class="controls">
+      <label for="vg-w-param-demo-uuid-keys-rows">rows =</label>
+      <input id="vg-w-param-demo-uuid-keys-rows" type="range" min="10" max="100" step="10" value="100" />
+      <span class="readout" id="vg-w-param-demo-uuid-keys-readout">100M → 12,586 ms</span>
+    </div>
+
+    <svg class="vg-w-param-demo-uuid-keys-main" viewBox="0 0 720 360" preserveAspectRatio="xMidYMid meet" role="img" aria-label="四種主鍵組合每百萬列插入時間隨總列數變化的折線圖">
+      <!-- gridlines + axes -->
+      <line x1="70" y1="320" x2="700" y2="320" stroke="var(--muted-2)" stroke-width="1" />
+      <line x1="70" y1="30"  x2="70"  y2="320" stroke="var(--muted-2)" stroke-width="1" />
+      <!-- y ticks: 0, 4000, 8000, 12000 ms -->
+      <g font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)" text-anchor="end">
+        <line x1="66" y1="320" x2="700" y2="320" stroke="var(--line)" stroke-width="0.5" /><text x="62" y="324">0</text>
+        <line x1="66" y1="247" x2="700" y2="247" stroke="var(--line)" stroke-width="0.5" /><text x="62" y="251">4,000</text>
+        <line x1="66" y1="174" x2="700" y2="174" stroke="var(--line)" stroke-width="0.5" /><text x="62" y="178">8,000</text>
+        <line x1="66" y1="101" x2="700" y2="101" stroke="var(--line)" stroke-width="0.5" /><text x="62" y="105">12,000</text>
+      </g>
+      <text x="385" y="350" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--muted)">總列數（百萬）</text>
+      <text x="20" y="175" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--muted)" transform="rotate(-90 20 175)">每百萬列插入時間（ms）</text>
+
+      <!-- x tick labels 10..100 -->
+      <g font-family="JetBrains Mono, monospace" font-size="10" fill="var(--muted)" text-anchor="middle">
+        <text x="70"  y="336">10</text><text x="140" y="336">20</text><text x="210" y="336">30</text>
+        <text x="280" y="336">40</text><text x="350" y="336">50</text><text x="420" y="336">60</text>
+        <text x="490" y="336">70</text><text x="560" y="336">80</text><text x="630" y="336">90</text>
+        <text x="700" y="336">100</text>
+      </g>
+
+      <!-- four polylines, drawn by JS -->
+      <polyline id="vg-w-param-demo-uuid-keys-line-int"    fill="none" stroke="var(--ink-deep)"  stroke-width="2" opacity="0.45" />
+      <polyline id="vg-w-param-demo-uuid-keys-line-u4now"  fill="none" stroke="var(--accent)"    stroke-width="2" opacity="0.45" />
+      <polyline id="vg-w-param-demo-uuid-keys-line-u4with" fill="none" stroke="var(--sage-deep)" stroke-width="2" opacity="0.45" />
+      <polyline id="vg-w-param-demo-uuid-keys-line-u7"     fill="none" stroke="var(--sage)"      stroke-width="2" opacity="0.45" />
+
+      <!-- active marker -->
+      <circle id="vg-w-param-demo-uuid-keys-dot" r="5" fill="var(--accent)" stroke="var(--bg)" stroke-width="1.5" />
+      <text id="vg-w-param-demo-uuid-keys-tag" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--ink)" text-anchor="middle"></text>
+    </svg>
+
+    <figcaption>四條線同軸——integer 與 UUID7 幾乎貼在底部（亞 1,400ms），UUID4 WITHOUT ROWID 一路爬升不收斂。選中的線會被點亮並標出當前 row 數的精確值。資料：Anders Murphy 2026 基準。</figcaption>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-param-demo-uuid-keys');
+        // real benchmark data: ms per million inserts at total rows 10M..100M (step 10M)
+        const DATA = {
+          int:    [838, 762, 819, 713, 721, 757, 692, 702, 696, 715],
+          u4now:  [2649, 5644, 7137, 8352, 9359, 9817, 10490, 11130, 11668, 12586],
+          u4with: [2003, 2324, 3285, 4399, 5194, 5659, 6215, 6467, 6924, 7119],
+          u7:     [1372, 1280, 1365, 1250, 1256, 1270, 1246, 1257, 1245, 1258]
+        };
+        const COLORVAR = { int: '--ink-deep', u4now: '--accent', u4with: '--sage-deep', u7: '--sage' };
+        const NAME = { int: 'integer', u4now: 'UUID4 WITHOUT ROWID', u4with: 'UUID4 WITH ROWID', u7: 'UUID7' };
+        const X0 = 70, X1 = 700, Y0 = 320, MS_MAX = 13000, Y_RANGE = 290; // y at 0ms = 320, span maps to MS_MAX
+
+        function xOf(i) { return X0 + (i / 9) * (X1 - X0); }      // i = 0..9
+        function yOf(ms) { return Y0 - (ms / MS_MAX) * Y_RANGE; }
+
+        // build all four polylines once
+        Object.keys(DATA).forEach(k => {
+          const pts = DATA[k].map((ms, i) => xOf(i).toFixed(1) + ',' + yOf(ms).toFixed(1)).join(' ');
+          root.querySelector('#vg-w-param-demo-uuid-keys-line-' + k).setAttribute('points', pts);
+        });
+
+        const radios = root.querySelectorAll('input[type=radio]');
+        const slider = root.querySelector('#vg-w-param-demo-uuid-keys-rows');
+        const readout = root.querySelector('#vg-w-param-demo-uuid-keys-readout');
+        const dot = root.querySelector('#vg-w-param-demo-uuid-keys-dot');
+        const tag = root.querySelector('#vg-w-param-demo-uuid-keys-tag');
+
+        function activeType() {
+          return [...radios].find(r => r.checked).value;
+        }
+        function update() {
+          const k = activeType();
+          // highlight selected polyline, dim others
+          Object.keys(DATA).forEach(t => {
+            root.querySelector('#vg-w-param-demo-uuid-keys-line-' + t)
+                .setAttribute('opacity', t === k ? '1' : '0.28');
+          });
+          const idx = Math.round(Number(slider.value) / 10) - 1; // 10M -> 0, 100M -> 9
+          const rows = (idx + 1) * 10;
+          const ms = DATA[k][idx];
+          const cx = xOf(idx), cy = yOf(ms);
+          dot.setAttribute('cx', cx); dot.setAttribute('cy', cy);
+          dot.setAttribute('fill', 'var(' + COLORVAR[k] + ')');
+          tag.setAttribute('x', cx); tag.setAttribute('y', cy - 12 < 22 ? cy + 22 : cy - 12);
+          tag.textContent = ms.toLocaleString() + ' ms';
+          readout.textContent = rows + 'M → ' + ms.toLocaleString() + ' ms（' + NAME[k] + '）';
+        }
+        radios.forEach(r => r.addEventListener('change', update));
+        slider.addEventListener('input', update);
+        update();
+      })();
+    </script>
+  </figure>
+
+  <p>把任一條曲線滑到底（100M），落差就攤在眼前：integer 基線 715ms、UUID7 1,258ms、UUID4 WITH ROWID 7,119ms、UUID4 WITHOUT ROWID 12,586ms。integer 大約「每秒一百萬筆插入」，而 UUID4 WITHOUT ROWID 在同一規模慢了 16 倍以上。更值得注意的是<strong>曲線的形狀</strong>：integer 與 UUID7 是水平線（表長大、單位插入成本不變），UUID4 WITHOUT ROWID 卻是一條不收斂的爬升曲線——表愈大，每一筆插入愈貴。形狀本身就是診斷：水平線代表 append-friendly，爬升線代表「樹愈大，隨機插入踩到的重平衡愈深」。</p>
+
+  <h2>rowid 是什麼——那個你沒宣告卻一直在維護的隱藏 clustered key</h2>
+
+  <p>要理解 UUID4 WITH ROWID 為什麼卡在中間（2,003ms 到 7,119ms），得先認識 rowid 這個你通常看不見的東西。SQLite 的每一張預設表都有一個隱含的 64-bit 帶符號整數欄位叫 rowid。你沒宣告它，但它在那裡，而且它就是這張表 clustered B-tree 的 key——資料的實體順序由 rowid 決定。當你寫 <code>INTEGER PRIMARY KEY</code>，SQLite 做了一個特別的優化：讓你宣告的那個欄位<strong>變成</strong> rowid 的別名，於是你的主鍵直接就是 clustered key，沒有第二棵樹要維護。這就是為什麼 integer 主鍵這麼快——一棵樹、遞增 key、純 append。</p>
+
+  <p>但如果你把主鍵宣告成 UUID（一個 blob），而<strong>沒有</strong>加 WITHOUT ROWID，事情就分岔了。這時 SQLite 仍然偷偷維護那個隱藏的、單調遞增的整數 rowid 當作 clustered key（表照 rowid 排，所以實體寫入仍是 append，便宜）；但它<strong>同時</strong>得為你的 UUID 主鍵建一棵獨立的索引 B-tree，好讓 <code>WHERE id = ?</code> 查得到。於是每插入一列要寫兩棵樹：rowid clustered B-tree（循序、便宜）＋ UUID4 index B-tree（隨機、會分裂）。第二棵樹付的就是隨機插入的代價，這就是寫放大。</p>
+
+  <pre data-kind="config"><code>-- 預設 rowid 表：你的 INTEGER PK 直接成為隱藏 rowid 的別名（一棵樹）
+CREATE TABLE IF NOT EXISTS event(id INTEGER PRIMARY KEY, data BLOB);
+
+-- UUID4 + 隱藏 rowid：clustered rowid 樹（循序）＋ UUID4 index 樹（隨機）
+-- 兩棵樹都要維護 —— 寫放大來源
+CREATE TABLE IF NOT EXISTS event(id BLOB PRIMARY KEY, data BLOB);
+
+-- WITHOUT ROWID：取消隱藏 rowid，UUID4 直接當 clustered key（一棵樹，但隨機）
+CREATE TABLE IF NOT EXISTS event(id BLOB PRIMARY KEY, data BLOB) WITHOUT ROWID;</code></pre>
+
+  <p>看出對稱性了嗎？UUID4 WITH ROWID 慢，是因為要維護<strong>兩</strong>棵樹，其中一棵隨機。UUID4 WITHOUT ROWID 慢得更兇，是因為只剩<strong>一</strong>棵樹、但那唯一一棵樹的 key 就是隨機的 UUID4，整棵 clustered 樹都在隨機位置被插——而且如下一節所述，WITHOUT ROWID 把內容也塞進中間節點，分裂搬的資料更多。WITH ROWID 之所以「沒那麼慘」，弔詭地正因為它多維護了一棵樹：那棵 clustered rowid 樹是循序的，扛住了實體寫入；隨機的代價被隔離在較瘦的 index 樹裡。</p>
+
+  <p>這個寫放大不只是 CPU 上多搬幾個 byte 而已，它最終要落到磁碟的 fsync 與 WAL 成本上。SQLite 在 WAL 模式下，每一筆 transaction 提交都要把這次改動過的<strong>整個 page</strong>追加進 WAL 檔，然後在 checkpoint 時刷回主資料庫——代價的計價單位是 page，不是 byte。隨機 UUID4 key 的麻煩正在於它<strong>放大了「被改動的 page 數」</strong>：循序 append 一筆通常只弄髒最右邊那一個 leaf page，而隨機插入碰到分裂時，一次要弄髒原 page、新配置的 page、再加上一路往上更新的父節點 page，全部都得進 WAL、全部都得在 fsync 時落盤。換句話說，那條從 2,649ms 爬到 12,586ms 的曲線，底層是「每筆插入弄髒的 page 數隨樹變大而上升」，而每一個多弄髒的 page 都是一次額外的 WAL 寫入與最終的 fsync 負擔——這才是 11 秒落差真正花掉的地方。</p>
+
+  <h2>WITH 對 WITHOUT ROWID——內容存在葉節點，還是葉加中間節點</h2>
+
+  <p>這一節是兩種表在 B-tree 結構上的根本差異，也是 WITHOUT ROWID 在隨機 key 下分裂特別痛的原因。SQLite 官方文件講得很精準：rowid 表「以 B-tree 實作，所有內容都存在樹的葉節點」；WITHOUT ROWID 表則「以一般 B-tree 實作，內容同時存在葉節點與中間節點」。</p>
+
+  <p>差別的後果是這樣。在 rowid 表（內容只在葉），中間節點（interior node）只存 key 與指向子節點的指標——非常瘦，一個 interior page 能塞進大量 key，所以樹很矮、扇出（fan-out）很高，而且資料列本體只住在葉子。當某個葉 page 分裂，只有那一層的 row 內容要搬。在 WITHOUT ROWID 表（內容存在葉與中間節點），row 的內容會出現在路徑上的中間節點，這讓中間節點變胖、扇出下降、樹變高；更糟的是當一個含內容的節點分裂，要搬移的 byte 數更多。把這個結構差異疊在隨機 UUID4 key 上——隨機 key 本來就到處戳破滿的 page，而 WITHOUT ROWID 讓每次戳破要搬的東西更重——就得到了那條從 2,649ms 爬到 12,586ms 的曲線。</p>
+
+  <p>下面把兩種儲存模型並排：點任一種，看內容（深色塊）落在 B-tree 的哪一層。手機上是可垂直閱讀的卡片，桌機是寬版 B-tree 示意。</p>
+
+  <figure class="vg-w-stack-rowid-storage">
+    <style>
+      .vg-w-stack-rowid-storage { display: flex; flex-direction: column; gap: var(--s-3); align-items: stretch; }
+      .vg-w-stack-rowid-storage .vg-w-affordance { display: flex; align-items: center; gap: var(--s-1); font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin: 0; }
+      .vg-w-stack-rowid-storage .vg-w-affordance svg { width: 14px !important; height: 14px !important; min-width: 14px; }
+      .vg-w-stack-rowid-storage input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-stack-rowid-storage .stack-cards { display: flex; flex-direction: column; gap: var(--s-2); list-style: none; padding: 0; margin: 0; }
+      .vg-w-stack-rowid-storage .stack-cards label { display: block; padding: var(--s-2); border: 1px solid var(--muted-2); border-radius: 2px; cursor: pointer; min-height: 44px; }
+      .vg-w-stack-rowid-storage .stack-cards label:hover { border-color: var(--accent); }
+      .vg-w-stack-rowid-storage .card-head { font-family: EB Garamond, serif; font-size: var(--fs-md); margin: 0 0 4px 0; color: var(--ink); display: flex; align-items: baseline; justify-content: space-between; gap: var(--s-2); flex-wrap: wrap; }
+      .vg-w-stack-rowid-storage .card-tag { font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); color: var(--accent-text); }
+      .vg-w-stack-rowid-storage .card-sub { font-family: IM Fell English, serif; font-style: italic; font-size: var(--fs-sm); color: var(--muted); margin: 0; line-height: 1.5; }
+      .vg-w-stack-rowid-storage:has(#vg-w-stack-rowid-storage-r1:checked) .card-1 { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+      .vg-w-stack-rowid-storage:has(#vg-w-stack-rowid-storage-r2:checked) .card-2 { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+      .vg-w-stack-rowid-storage svg.diagram { display: none; }
+      @media (min-width: 720px) {
+        .vg-w-stack-rowid-storage svg.diagram { display: block; width: 100%; height: auto; max-width: 880px; }
+        .vg-w-stack-rowid-storage .stack-cards { display: none; }
+      }
+      .vg-w-stack-rowid-storage .node { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; }
+      .vg-w-stack-rowid-storage .content { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); stroke-width: 1.2; }
+      .vg-w-stack-rowid-storage .nlabel { font-family: JetBrains Mono, monospace; font-size: 11px; fill: var(--ink); }
+      .vg-w-stack-rowid-storage .slabel { font-family: IM Fell English, serif; font-style: italic; font-size: 12px; fill: var(--muted); }
+      .vg-w-stack-rowid-storage .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+      .vg-w-stack-rowid-storage .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-stack-rowid-storage .detail p { margin: 0; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-stack-rowid-storage:has(#vg-w-stack-rowid-storage-r1:checked) .detail-1 { display: block; }
+      .vg-w-stack-rowid-storage:has(#vg-w-stack-rowid-storage-r2:checked) .detail-2 { display: block; }
+      .vg-w-stack-rowid-storage:has(#vg-w-stack-rowid-storage-r1:checked) .g-rowid { opacity: 1; }
+      .vg-w-stack-rowid-storage:has(#vg-w-stack-rowid-storage-r2:checked) .g-rowid { opacity: 0.18; }
+      .vg-w-stack-rowid-storage:has(#vg-w-stack-rowid-storage-r1:checked) .g-without { opacity: 0.18; }
+      .vg-w-stack-rowid-storage:has(#vg-w-stack-rowid-storage-r2:checked) .g-without { opacity: 1; }
+      .vg-w-stack-rowid-storage .hint { font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin: 0 0 var(--s-1) 0; }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>
+      </svg>
+      <span>選一種儲存模型，看內容（深色）落在 B-tree 哪一層 · 2 種模型</span>
+    </p>
+
+    <input type="radio" id="vg-w-stack-rowid-storage-r1" name="vg-w-stack-rowid-storage-sel" checked aria-label="rowid table" />
+    <input type="radio" id="vg-w-stack-rowid-storage-r2" name="vg-w-stack-rowid-storage-sel" aria-label="without rowid table" />
+
+    <ul class="stack-cards">
+      <li class="card-1"><label for="vg-w-stack-rowid-storage-r1">
+        <p class="card-head"><span>rowid 表（預設）</span><code class="card-tag">content @ leaves</code></p>
+        <p class="card-sub">中間節點只存 key 與指標，瘦、扇出高、樹矮。row 本體只住葉子，分裂只搬葉層資料。</p>
+      </label></li>
+      <li class="card-2"><label for="vg-w-stack-rowid-storage-r2">
+        <p class="card-head"><span>WITHOUT ROWID 表</span><code class="card-tag">content @ leaves + interior</code></p>
+        <p class="card-sub">內容也住中間節點，節點變胖、扇出降、樹變高。含內容的節點分裂時搬的 byte 更多。</p>
+      </label></li>
+    </ul>
+
+    <svg class="diagram" viewBox="0 0 880 320" role="img" aria-label="rowid 表與 WITHOUT ROWID 表的 B-tree 內容分佈對照">
+      <!-- LEFT: rowid table, content only in leaves -->
+      <g class="g-rowid">
+        <text x="40" y="28" font-family="IM Fell English, serif" font-style="italic" font-size="14" fill="var(--ink)">rowid 表：內容只在葉節點</text>
+        <!-- root -->
+        <rect class="node" x="180" y="44" width="100" height="30" rx="2"/>
+        <text class="nlabel" x="195" y="63">k k k</text>
+        <!-- interior level -->
+        <rect class="node" x="70"  y="120" width="90" height="28" rx="2"/><text class="nlabel" x="84" y="138">k k k</text>
+        <rect class="node" x="300" y="120" width="90" height="28" rx="2"/><text class="nlabel" x="314" y="138">k k k</text>
+        <line x1="220" y1="74" x2="115" y2="120" stroke="var(--muted-2)"/>
+        <line x1="240" y1="74" x2="345" y2="120" stroke="var(--muted-2)"/>
+        <!-- leaves with content -->
+        <rect class="content" x="40"  y="196" width="72" height="40" rx="2"/><text class="slabel" x="48" y="220">rows</text>
+        <rect class="content" x="124" y="196" width="72" height="40" rx="2"/><text class="slabel" x="132" y="220">rows</text>
+        <rect class="content" x="280" y="196" width="72" height="40" rx="2"/><text class="slabel" x="288" y="220">rows</text>
+        <rect class="content" x="364" y="196" width="72" height="40" rx="2"/><text class="slabel" x="372" y="220">rows</text>
+        <line x1="100" y1="148" x2="76"  y2="196" stroke="var(--muted-2)"/>
+        <line x1="130" y1="148" x2="160" y2="196" stroke="var(--muted-2)"/>
+        <line x1="330" y1="148" x2="316" y2="196" stroke="var(--muted-2)"/>
+        <line x1="360" y1="148" x2="400" y2="196" stroke="var(--muted-2)"/>
+        <text class="slabel" x="40" y="262" fill="var(--sage-deep)">interior 瘦 ⇒ 扇出高 ⇒ 樹矮，分裂只搬葉層</text>
+      </g>
+      <!-- RIGHT: WITHOUT ROWID, content in interior + leaves -->
+      <g class="g-without">
+        <text x="470" y="28" font-family="IM Fell English, serif" font-style="italic" font-size="14" fill="var(--ink)">WITHOUT ROWID：內容在葉＋中間</text>
+        <rect class="node" x="600" y="44" width="120" height="44" rx="2"/>
+        <rect class="content" x="606" y="50" width="108" height="14" rx="1"/>
+        <text class="nlabel" x="614" y="82">k+row</text>
+        <rect class="node" x="490" y="130" width="110" height="42" rx="2"/>
+        <rect class="content" x="496" y="136" width="98" height="12" rx="1"/>
+        <text class="nlabel" x="502" y="166">k+row</text>
+        <rect class="node" x="720" y="130" width="110" height="42" rx="2"/>
+        <rect class="content" x="726" y="136" width="98" height="12" rx="1"/>
+        <text class="nlabel" x="732" y="166">k+row</text>
+        <line x1="640" y1="88" x2="535" y2="130" stroke="var(--muted-2)"/>
+        <line x1="680" y1="88" x2="775" y2="130" stroke="var(--muted-2)"/>
+        <rect class="content" x="470" y="214" width="76" height="40" rx="2"/><text class="slabel" x="478" y="238">rows</text>
+        <rect class="content" x="556" y="214" width="76" height="40" rx="2"/><text class="slabel" x="564" y="238">rows</text>
+        <rect class="content" x="720" y="214" width="76" height="40" rx="2"/><text class="slabel" x="728" y="238">rows</text>
+        <rect class="content" x="806" y="214" width="68" height="40" rx="2"/><text class="slabel" x="814" y="238">rows</text>
+        <line x1="520" y1="172" x2="508" y2="214" stroke="var(--muted-2)"/>
+        <line x1="560" y1="172" x2="594" y2="214" stroke="var(--muted-2)"/>
+        <line x1="760" y1="172" x2="758" y2="214" stroke="var(--muted-2)"/>
+        <line x1="800" y1="172" x2="840" y2="214" stroke="var(--muted-2)"/>
+        <text class="slabel" x="470" y="280" fill="var(--accent-text)">interior 含內容 ⇒ 胖、扇出低、樹高，分裂搬更多 byte</text>
+      </g>
+    </svg>
+
+    <div>
+      <p class="hint">點上方任一儲存模型</p>
+      <div class="detail detail-1">
+        <h3>rowid 表 · content @ leaves</h3>
+        <p>SQLite 官方原文：「rowid 表以 B-tree 實作，所有內容都存在樹的葉節點。」中間節點只是導航——存 key 與子指標，所以一個 4KB interior page 能容納大量 key，扇出高、樹矮、查找路徑短。葉 page 分裂時，要搬的只有葉層的 row 內容。</p>
+      </div>
+      <div class="detail detail-2">
+        <h3>WITHOUT ROWID 表 · content @ leaves + interior</h3>
+        <p>官方原文：「WITHOUT ROWID 表以一般 B-tree 實作，內容同時存在葉節點與中間節點。」row 內容散佈到導航層，使 interior 節點變胖、單頁能放的 key 變少、扇出下降、樹變高。當隨機 UUID4 key 戳破一個含內容的節點，分裂要搬移的 byte 數遠多於 rowid 表——這放大了隨機鍵的懲罰。</p>
+      </div>
+    </div>
+  </figure>
+
+  <p>這也解釋了一個容易被忽略的細節：WITHOUT ROWID 不是「比較省」的選項。它省掉了隱藏 rowid 那 8 bytes 與第二棵索引樹，理論上更緊湊；但一旦 key 是隨機的，把內容塞進中間節點的設計反而讓每次分裂更貴。WITHOUT ROWID 真正適合的是「主鍵本身就是天然 clustered、且查詢多半照主鍵範圍掃描」的場景——例如時間有序的 key。這正好把我們帶到最後一節。</p>
+
+  <h2>隨機對時間有序——UUID7 如何讓那條爬升曲線變回水平線</h2>
+
+  <p>UUID4 與 UUID7 都是 128-bit、都存成 16-byte blob、都用 WITHOUT ROWID、跑同一段插入程式。唯一的差別是 bit 的排列：UUID4 幾乎全是隨機 bit，相鄰兩次產生的值在排序上毫無關聯；UUID7 把<strong>毫秒級 Unix 時間戳放在最高位</strong>，低位才是隨機。結果是 UUID7 近乎單調遞增——後產生的值排序上幾乎總是大於先產生的值。對 clustered B-tree 來說，這等於把「隨機位置插入」變回了「尾端 append」，頁面分裂的賭局消失了。</p>
+
+  <p>值得把 UUID7 的 bit 預算拆開看，因為它解釋了為什麼時間有序與全域唯一可以同時成立、不必二選一。128 bit 裡，最高的 48 bit 給毫秒級 Unix 時間戳——這 48 bit 足夠表達到西元一萬年以後的時間，且因為它在最高位，<strong>排序時時間戳優先、自然形成遞增前綴</strong>，這就是插入局部性的來源。接著 4 bit 是版本號、2 bit 是 variant 標記，剩下約<strong>74 bit 是隨機熵</strong>，專門用來區分「同一毫秒內產生的多筆 key」。74 bit 的隨機空間大到在單一毫秒內碰撞的機率可以忽略，所以即使多台機器同時併發產生 key，也幾乎不可能撞號——這正是 ULID 與 UUIDv7 共享的設計哲學：用高位時間前綴買插入局部性，用低位隨機尾碼買分散式唯一性，兩者各管一段 bit、互不犧牲。UUID4 把全部 122 bit 都拿去當隨機熵，唯一性更寬裕，但完全放棄了排序局部性——而在 SQLite 這個「主鍵即實體順序」的世界裡，那段被放棄的局部性正是最貴的東西。</p>
+
+  <p>順帶釐清一個常見混淆：ULID 與 UUIDv7 解決的是同一個問題、走的也是同一條「時間前綴加隨機尾碼」的路，差別主要在外觀與位元配置而非排序行為。ULID 同樣把 48 bit 毫秒時間戳放在最高位、後面接 80 bit 隨機，並用 Crockford Base32 編成 26 個字元的字串；UUIDv7 則塞進標準 16-byte UUID 的版本與 variant 欄位框架裡。對 SQLite 的 clustered B-tree 來說，這兩者帶來的是一模一樣的好處——高位時間前綴讓排序近乎單調遞增，於是插入重新貼回樹的尾端。要注意的是「近乎」這個詞：同一毫秒內產生的多筆 key，其相對順序由低位隨機 bit 決定，是亂的；但這種亂只發生在單一 page 的尺度內（同毫秒的 key 彼此相鄰），不會像 UUID4 那樣把插入點撒到整棵樹的隨機位置。換句話說，時間有序鍵把隨機性從「全樹尺度」收斂到「單頁尺度」，而單頁內的亂序對頁面分裂幾乎沒有影響——這就是為什麼它能拿到接近 integer 主鍵的曲線形狀。</p>
+
+  <p>數字證實了這個機制。UUID7 WITHOUT ROWID 從 10M 的 1,372ms 到 100M 的 1,258ms——基本上一條水平線，跟 integer 主鍵同一個量級（只因 16 bytes vs 8 bytes 略慢一點）。對照 UUID4 WITHOUT ROWID 那條從 2,649ms 爬到 12,586ms 的線，差別純粹來自 key 的時間有序性。<strong>同樣是 UUID、同樣是 WITHOUT ROWID，把隨機換成時間有序，14 倍的懲罰直接歸零。</strong>這也是為什麼 ULID、UUIDv7 這類「時間前綴 + 隨機尾碼」的設計近年在資料庫主鍵場景全面取代 UUID4——它們保留了 UUID 的分散式產生與全域唯一，卻不犧牲 clustered 插入的局部性。</p>
+
+  <p>把這個機制接回前面講過的 WAL 與 fsync 帳本，時間有序的好處就更具體了。UUID7 近乎遞增，意味著連續幾筆插入幾乎都落在 clustered B-tree 同一個最右 leaf page 上——同一個 page 在一次 transaction 裡被反覆改寫，最終只需把這<strong>一個</strong>髒 page 追加進 WAL、在 checkpoint 時 fsync 一次。隨機的 UUID4 則相反：相鄰兩筆插入大概率落在樹的兩個遙遠角落，各自弄髒一個（或因分裂而連帶弄髒數個）互不相鄰的 page，於是每筆插入要進 WAL 的 page 數更多、checkpoint 要刷回的 page 也更分散。fsync 的成本本質上是「等磁碟確認落盤」，而落盤的計價單位是 page——所以時間有序鍵不只是讓 CPU 少搬幾次 entry，它從根本上壓低了每筆寫入要持久化的 page 數，這才是 UUID7 那條水平線在 I/O 層面真正省下的東西。換個角度說，UUID4 的隨機性把「邏輯上一筆小插入」放大成「物理上散落多頁的寫入」，而 WAL 與 fsync 只認物理頁。</p>
+
+  <p>下面的 canvas 把這個機制動起來：左邊餵循序 key、右邊餵隨機 key，逐筆插入同一棵 B-tree，看分裂在哪邊爆發。按 play 觀察，或拖 reset 重來。</p>
+
+  <figure class="vg-w-canvas-btree-splits">
+    <style>
+      .vg-w-canvas-btree-splits { display: grid; grid-template-rows: auto 1fr auto; gap: var(--s-2); }
+      .vg-w-canvas-btree-splits .vg-w-affordance { display: flex; align-items: center; gap: var(--s-1); font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin: 0; }
+      .vg-w-canvas-btree-splits .vg-w-affordance svg { width: 14px !important; height: 14px !important; min-width: 14px; }
+      .vg-w-canvas-btree-splits .toolbar { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); }
+      .vg-w-canvas-btree-splits button { min-height: 44px; min-width: 44px; padding: var(--s-1) var(--s-2); border: 1px solid var(--line); background: var(--bg); color: var(--ink); cursor: pointer; font-family: var(--sans); }
+      .vg-w-canvas-btree-splits button:hover { border-color: var(--accent); }
+      .vg-w-canvas-btree-splits .stat { margin-left: auto; font-variant-numeric: tabular-nums; color: var(--muted); }
+      .vg-w-canvas-btree-splits canvas { width: 100%; height: auto; aspect-ratio: 2 / 1; display: block; }
+      @media (max-width: 720px) { .vg-w-canvas-btree-splits canvas { aspect-ratio: 3 / 4; } }
+      .vg-w-canvas-btree-splits figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <polygon points="6 3 20 12 6 21 6 3"/>
+      </svg>
+      <span>按 play，循序 vs 隨機逐筆插入同一棵 B-tree，數頁面分裂 · 動畫</span>
+    </p>
+
+    <div class="toolbar">
+      <button data-act="toggle">▷ play</button>
+      <button data-act="reset">↺ reset</button>
+      <span class="stat" data-stat>循序 splits 0 · 隨機 splits 0</span>
+    </div>
+
+    <canvas></canvas>
+
+    <figcaption>每個 page 容量 6 筆。循序插入永遠落在最右 page，填滿才新增——零搬移；隨機插入持續戳破已滿的 page，每次分裂把半個 page 的 entry 搬走。分裂計數差距就是那 14 倍的微觀來源。</figcaption>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-canvas-btree-splits');
+        const canvas = root.querySelector('canvas');
+        const ctx = canvas.getContext('2d');
+        const toggleBtn = root.querySelector('[data-act=toggle]');
+        const resetBtn = root.querySelector('[data-act=reset]');
+        const statEl = root.querySelector('[data-stat]');
+
+        const CAP = 6;          // entries per leaf page
+        const MAX_KEYS = 60;     // how many inserts per run
+        function css(name) { return getComputedStyle(root).getPropertyValue(name).trim() || '#888'; }
+
+        // two independent trees: seq (ordered keys 1,2,3...) and rnd (random keys)
+        function makeState() {
+          return { pages: [[]], splits: 0, n: 0 };
+        }
+        let seq, rnd, running, acc;
+        function reset() {
+          seq = makeState(); rnd = makeState();
+          running = false; acc = 0; toggleBtn.textContent = '▷ play';
+          draw();
+          updateStat();
+        }
+
+        function insertSeq(st) {
+          // sequential key: always append to last page
+          const last = st.pages[st.pages.length - 1];
+          if (last.length >= CAP) { st.pages.push([st.n]); st.splits++; }
+          else last.push(st.n);
+          st.n++;
+        }
+        function insertRnd(st) {
+          // random key: pick a random page; if full, split it
+          const key = Math.random();
+          const idx = Math.floor(Math.random() * st.pages.length);
+          const page = st.pages[idx];
+          if (page.length >= CAP) {
+            // split: move half into a new page inserted after idx
+            const half = page.splice(Math.floor(page.length / 2));
+            st.pages.splice(idx + 1, 0, half);
+            st.splits++;
+            (Math.random() < 0.5 ? page : half).push(key);
+          } else {
+            page.push(key);
+          }
+          st.n++;
+        }
+        function updateStat() {
+          statEl.textContent = '循序 splits ' + seq.splits + ' · 隨機 splits ' + rnd.splits;
+        }
+
+        function drawTree(st, x, y, w, h, label, color) {
+          const ink = css('--ink'), muted = css('--muted'), line = css('--line');
+          ctx.font = '13px "IM Fell English", serif';
+          ctx.fillStyle = ink;
+          ctx.fillText(label, x, y - 6);
+          const cols = st.pages.length;
+          const pw = Math.max(8, Math.min(26, (w - (cols - 1) * 3) / Math.max(1, cols)));
+          const cellH = Math.max(5, Math.min(12, (h - 24) / CAP));
+          let px = x;
+          for (let p = 0; p < cols; p++) {
+            const page = st.pages[p];
+            for (let c = 0; c < CAP; c++) {
+              const cy = y + (CAP - 1 - c) * cellH;
+              ctx.strokeStyle = line; ctx.lineWidth = 0.5;
+              ctx.strokeRect(px, cy, pw - 1, cellH - 1);
+              if (c < page.length) {
+                ctx.fillStyle = color;
+                ctx.globalAlpha = 0.75;
+                ctx.fillRect(px, cy, pw - 1, cellH - 1);
+                ctx.globalAlpha = 1;
+              }
+            }
+            px += pw + 3;
+            if (px > x + w) break;
+          }
+          ctx.fillStyle = muted;
+          ctx.font = '11px "JetBrains Mono", monospace';
+          ctx.fillText(st.pages.length + ' pages · ' + st.splits + ' splits', x, y + h + 4);
+        }
+
+        let cssW = 0, cssH = 0;
+        function resize() {
+          const dpr = window.devicePixelRatio || 1;
+          const rect = canvas.getBoundingClientRect();
+          cssW = rect.width; cssH = rect.height;
+          canvas.width = cssW * dpr; canvas.height = cssH * dpr;
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+          draw();
+        }
+        new ResizeObserver(resize).observe(canvas);
+
+        function draw() {
+          if (!cssW) return;
+          ctx.clearRect(0, 0, cssW, cssH);
+          const portrait = cssW < 520;
+          if (portrait) {
+            const th = (cssH - 60) / 2;
+            drawTree(seq, 8, 26, cssW - 16, th, '循序 key（append-only）', css('--ink-deep'));
+            drawTree(rnd, 8, 26 + th + 36, cssW - 16, th, '隨機 key（page splits）', css('--accent'));
+          } else {
+            const tw = (cssW - 32) / 2;
+            drawTree(seq, 8, 30, tw, cssH - 60, '循序 key（append-only）', css('--ink-deep'));
+            drawTree(rnd, 24 + tw, 30, tw, cssH - 60, '隨機 key（page splits）', css('--accent'));
+          }
+        }
+
+        let last = performance.now();
+        function frame(now) {
+          const dt = Math.min(0.1, (now - last) / 1000); last = now;
+          if (running) {
+            acc += dt;
+            const tick = 0.10; // one insert per 100ms
+            while (acc >= tick) {
+              acc -= tick;
+              if (seq.n < MAX_KEYS) insertSeq(seq);
+              if (rnd.n < MAX_KEYS) insertRnd(rnd);
+              if (seq.n >= MAX_KEYS && rnd.n >= MAX_KEYS) {
+                running = false; toggleBtn.textContent = '▷ replay';
+              }
+            }
+            updateStat();
+            draw();
+          }
+          requestAnimationFrame(frame);
+        }
+        requestAnimationFrame(frame);
+
+        toggleBtn.addEventListener('click', () => {
+          if (seq.n >= MAX_KEYS && rnd.n >= MAX_KEYS) reset();
+          running = !running;
+          toggleBtn.textContent = running ? '⏸ pause' : '▷ play';
+          last = performance.now();
+        });
+        resetBtn.addEventListener('click', reset);
+
+        reset();
+      })();
+    </script>
+  </figure>
+
+  <p>跑完 60 筆插入，循序那棵樹的分裂數通常是個位數（每填滿一個 page 才新增一個，沒有搬移），隨機那棵的分裂數往往是它的好幾倍——而且每次分裂都伴隨半個 page 的資料搬移與父節點指標更新。把 60 筆放大到 1 億筆，page 從十幾個變成幾百萬個，這個分裂率的差距就是 profiler 報告「時間花在平衡樹、讀寫節點」的微觀解釋，也是那條不收斂爬升曲線的成因。</p>
+
+  <p>最後把四種組合的完整數字並排，方便你按任一欄排序、直接對照 1 億列規模下的代價。</p>
+
+  <figure class="vg-w-table-uuid-bench">
+    <style>
+      .vg-w-table-uuid-bench { overflow-x: auto; }
+      .vg-w-table-uuid-bench .vg-w-affordance { display: flex; align-items: center; gap: var(--s-1); font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin: 0 0 var(--s-1) 0; }
+      .vg-w-table-uuid-bench .vg-w-affordance svg { width: 14px !important; height: 14px !important; min-width: 14px; }
+      .vg-w-table-uuid-bench table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-uuid-bench thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; }
+      .vg-w-table-uuid-bench thead th[data-sort] { color: var(--accent-text); }
+      .vg-w-table-uuid-bench tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); }
+      .vg-w-table-uuid-bench td.num { font-variant-numeric: tabular-nums; text-align: right; }
+      .vg-w-table-uuid-bench figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-1); }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/><path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+      </svg>
+      <span>點欄位標題排序 · 4 列 × 4 欄</span>
+    </p>
+
+    <table>
+      <thead>
+        <tr>
+          <th data-key="cfg">主鍵組合</th>
+          <th data-key="m10" class="num">10M（ms）</th>
+          <th data-key="m100" class="num">100M（ms）</th>
+          <th data-key="ratio" class="num">vs integer</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>integer PRIMARY KEY</td><td class="num">838</td><td class="num">715</td><td class="num">1.0×</td></tr>
+        <tr><td>UUID7 WITHOUT ROWID</td><td class="num">1372</td><td class="num">1258</td><td class="num">1.8×</td></tr>
+        <tr><td>UUID4 WITH ROWID</td><td class="num">2003</td><td class="num">7119</td><td class="num">10.0×</td></tr>
+        <tr><td>UUID4 WITHOUT ROWID</td><td class="num">2649</td><td class="num">12586</td><td class="num">17.6×</td></tr>
+      </tbody>
+    </table>
+
+    <figcaption>「vs integer」一欄以 100M 規模的時間對 integer 基線（715ms）取比值。資料：Anders Murphy，每列為「每百萬列插入時間」。點任一欄標題重新排序。</figcaption>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-table-uuid-bench');
+        const headers = root.querySelectorAll('thead th');
+        const tbody = root.querySelector('tbody');
+        let activeKey = null, asc = true;
+        headers.forEach(h => h.addEventListener('click', () => {
+          const key = h.dataset.key;
+          if (activeKey === key) asc = !asc; else { activeKey = key; asc = true; }
+          headers.forEach(x => x.removeAttribute('data-sort'));
+          h.setAttribute('data-sort', asc ? 'asc' : 'desc');
+          const rows = [...tbody.querySelectorAll('tr')];
+          const idx = [...headers].indexOf(h);
+          rows.sort((a, b) => {
+            const av = a.children[idx].textContent.trim().replace(/[×,]/g, '');
+            const bv = b.children[idx].textContent.trim().replace(/[×,]/g, '');
+            const an = Number(av), bn = Number(bv);
+            const cmp = !Number.isNaN(an) && !Number.isNaN(bn) ? an - bn : av.localeCompare(bv);
+            return asc ? cmp : -cmp;
+          });
+          rows.forEach(r => tbody.appendChild(r));
+        }));
+      })();
+    </script>
+  </figure>
+
+  <p>所以該怎麼決策？把 UUID 主鍵全面打成反模式是過度反應——這篇的代價有明確的適用邊界。如果你的表很小（幾萬、幾十萬列，整棵 B-tree 連同分裂成本都在記憶體裡攤平），或者寫入稀疏、讀取為主，那 UUID4 主鍵的插入懲罰小到不值得在意，分散式產生、不洩漏序號、不可預測這些好處反而是淨賺。代價真正咬人的是<strong>高頻寫入、會長到千萬列以上、且跑在 SQLite（或其他以表為 clustered index 的引擎）</strong>的場景——append-heavy 的 event log、time-series、audit trail 正是重災區。</p>
+
+  <p>真要在這種場景用 UUID，兩個動作幾乎免費地把懲罰拿掉：一，<strong>用時間有序的 UUID7 或 ULID 取代 UUID4</strong>，把那條 12,586ms 的爬升曲線換回 1,258ms 的水平線；二，<strong>用 blob(16) 存而不是 text(36)</strong>，省掉每列 20 bytes 的字串膨脹與比較成本（128 bit 存成 16-byte blob，而非 36 字元的破折號字串）。兩者疊加，你能保住 UUID 的分散式語意，又把插入成本壓回 integer 主鍵的同一個數量級。</p>
+
+  <p>還有第三條路，在你必須沿用既有 UUID4、又不想吞下隨機 clustered 插入的場合特別實用：<strong>不要讓 UUID 當主鍵，讓它只當一個次要索引</strong>。具體做法是把表宣告成普通的 <code>INTEGER PRIMARY KEY</code>（也就是讓單調遞增的隱藏 rowid 繼續扛 clustered 順序、保住純 append 的循序寫入），再把 UUID4 放進一個獨立的 <code>CREATE INDEX</code>。這跟 Postgres 用 heap table 加一棵 UUID 索引的形態幾乎一樣——clustered 樹照 rowid 循序長，隨機的代價被隔離在那一棵較瘦的次要索引裡，而非整張表。當然這條路不是沒有成本：那棵次要索引本身仍是隨機插入、仍會分裂，且查 <code>WHERE uuid = ?</code> 要先過索引拿到 rowid、再回主樹取資料列，多一次間接跳轉。但對「對外只認 UUID、對內可以接受一個整數 rowid」的系統而言，這個取捨通常划算——把隨機懲罰從整張 clustered 表縮小到一棵不含 row 內容的索引樹，正是 UUID4 WITH ROWID 那條 7,119ms 線之所以遠優於 WITHOUT ROWID 那條 12,586ms 線的同一個道理。</p>
+
+  <p>儲存表示法這件事值得多說一句，因為它放大的正是前面講過的扇出問題。一個 UUID 的標準文字形式是 36 個字元——32 個十六進位數字加上 4 個破折號——以 SQLite 的 TEXT 儲存，這是 36 bytes；同一個值轉成 BLOB 只要 16 bytes。對主鍵欄位來說，這個差別不是只多吃一點磁碟那麼簡單：在 SQLite 的 clustered B-tree 裡，key 同時是<strong>每一個 interior 節點導航時要存與比較的東西</strong>。把 key 從 16 bytes 撐到 36 bytes，等於把每個 interior page 能塞進的 key 數量砍掉一半多，扇出隨之腰斬、樹被迫長高、查找路徑變長——這正是上一節談 WITHOUT ROWID 時的同一個機制，只是這次的胖來源是「文字 key 本身」而非「節點裡的 row 內容」。粗略說，TEXT(36) 的索引體積大約是 BLOB(16) 的兩倍以上，而每一次 key 比較也從比 16 bytes 變成逐字元比 36 bytes 的字串。換句話說，選 TEXT 存 UUID，你是在已經吃了隨機鍵懲罰的傷口上，再額外加一層扇出懲罰——兩個都用 BLOB(16) 一行 schema 就能避開。</p>
+
+  <p class="vg-deep-closer"><strong>WHAT THIS ENABLES</strong>：一旦你接受「在 SQLite，主鍵就是實體儲存順序」這條公理，主鍵選擇就從一個唯一性決策升級成一個 I/O 決策——隨機鍵買的是隨機 I/O 加頁面分裂，時間有序鍵買的是循序 append，而這個選擇能在你的表長到一億列之前、用一行 DDL 就定生死。</p>
+</div>
