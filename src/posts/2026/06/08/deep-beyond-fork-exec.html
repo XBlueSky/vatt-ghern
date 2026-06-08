@@ -1,0 +1,547 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">fork() 先把父 process 整個位址空間複製一份，然後下一行的 exec() 立刻把它丟掉——你付了搬家費，只為了搬進門就放火燒掉。Mateusz Guzik 的結論很乾脆：「The entire fork + exec idiom is terrible and needs to be retired。」問題是，要拿什麼換它，社群桌上攤了四份草圖。</p>
+  <h1 class="vg-post-title">{{ title }}</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p><span class="vg-dropcap">fork</span>()+exec() 是 Unix 最古老的程序建立慣用法，老到它的設計前提——「process 是 single-threaded、位址空間很小、複製很便宜」——在今天幾乎條條都不成立。LWN 這篇整理把 Linux 社群想退役這個 idiom 的動機與四條替代路線攤開來談：spawn templates、原生 posix_spawn()、Christian Brauner 的 pidfd builder、Josh Poimboeuf 的 io_uring spawn。它們不是彼此競爭的同一個 API 的四種寫法，而是把「建立一個全新 process」這件事拆在不同抽象層、各自換掉一段機制。這篇要做的事是把每條路線換掉哪一段、API 長什麼形狀、代價落在哪裡講清楚。</p>
+
+  <p>先把問題定位精準。Guzik 點出一個容易被忽略的事實：「the focus of the patch set was a bit strange in that it left the fork() part of the problem untouched. That is where most of the cost lies。」也就是說，大家直覺以為「建立 process 慢是因為 exec 要載入新執行檔」，但實測下成本大頭在 fork 階段——複製 page table、複製 VMA、複製 fd table、跑 pthread_atfork handler。exec 反而相對便宜。任何只優化 exec 而不碰 fork 的方案，都在優化錯的那一半。下面這張圖把這個成本不對稱畫出來。</p>
+
+  <figure class="vg-w-chart-fork-cost" data-svg-scroll="720">
+    <style>
+      .vg-w-chart-fork-cost { display: grid; gap: var(--s-2); }
+      .vg-w-chart-fork-cost svg { width: 100%; height: auto; }
+      .vg-w-chart-fork-cost .controls { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s-2); padding: var(--s-2); background: var(--bg-soft); border-left: 2px solid var(--accent); }
+      .vg-w-chart-fork-cost .controls label { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+      .vg-w-chart-fork-cost input[type="range"] { flex: 1 1 180px; height: 36px; accent-color: var(--accent); touch-action: none; }
+      .vg-w-chart-fork-cost .readout { font-family: JetBrains Mono, monospace; font-size: var(--fs-sm); color: var(--ink); font-variant-numeric: tabular-nums; }
+      .vg-w-chart-fork-cost .readout em { color: var(--accent-text); font-style: normal; }
+      .vg-w-chart-fork-cost figcaption { font-family: var(--scribed); font-style: italic; font-size: var(--fs-sm); color: var(--muted); }
+      @media (max-width: 720px) { .vg-w-chart-fork-cost svg { min-height: 240px; } }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M5 12h14"/><path d="m12 5 7 7-7 7"/>
+      </svg>
+      <span>drag the slider to set parent VMA/fd count · 2 cost curves</span>
+    </p>
+
+    <div class="controls">
+      <label for="vg-w-chart-fork-cost-range">parent VMA + fd count</label>
+      <input type="range" id="vg-w-chart-fork-cost-range" min="0" max="6" step="1" value="3" aria-label="parent VMA and fd count" />
+      <span class="readout" id="vg-w-chart-fork-cost-readout"></span>
+    </div>
+
+    <svg class="vg-w-chart-fork-cost-main" viewBox="0 0 720 340" preserveAspectRatio="xMidYMid meet" role="img"
+         aria-label="fork 成本隨 VMA/fd 數量線性放大，exec 成本幾乎平坦——拖動滑桿改變父 process 規模">
+      <g id="vg-w-chart-fork-cost-axes"></g>
+      <g id="vg-w-chart-fork-cost-series"></g>
+    </svg>
+
+    <figcaption>fork 階段（複製 page table / VMA / fd table）的成本隨父 process 的 VMA 與 fd 數量線性放大；exec 階段（載入新執行檔、重設位址空間）幾乎平坦。曲線形狀取自 fork/exec 成本模型的定性結構；橫軸刻度對應典型 process 規模（一個重型多執行緒服務輕易就到 10⁴ 個 VMA）。</figcaption>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-chart-fork-cost');
+        const axesG = root.querySelector('#vg-w-chart-fork-cost-axes');
+        const seriesG = root.querySelector('#vg-w-chart-fork-cost-series');
+        const range = root.querySelector('#vg-w-chart-fork-cost-range');
+        const readout = root.querySelector('#vg-w-chart-fork-cost-readout');
+        const NS = 'http://www.w3.org/2000/svg';
+        function el(tag, attrs) {
+          const e = document.createElementNS(NS, tag);
+          for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+          return e;
+        }
+
+        // X axis: log10 of parent VMA+fd count, from 10^1 .. 10^7 (7 ticks, slider 0..6).
+        const X0 = 80, X1 = 690, Y0 = 280, Y1 = 36;
+        const N = 6; // exponent max
+        const xOf = e => X0 + (e / N) * (X1 - X0);
+        // Cost is in arbitrary "relative work units"; max for axis = 100.
+        const maxY = 100;
+        const yOf = v => Y0 - (v / maxY) * (Y0 - Y1);
+        // fork cost: dominated by per-VMA/per-fd copy → linear in count → exponential in exponent.
+        // fork(e) = base + slope * 10^e, normalised so 10^6 ≈ 100 units.
+        const forkOf = e => Math.min(maxY, 1 + 99 * (Math.pow(10, e) - 10) / (Math.pow(10, N) - 10));
+        // exec cost: ~constant, only depends on the NEW binary, not parent size.
+        const execOf = () => 6;
+
+        function drawStatic() {
+          axesG.replaceChildren();
+          // axes
+          axesG.appendChild(el('line', { x1: X0, y1: Y0, x2: X1, y2: Y0, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+          axesG.appendChild(el('line', { x1: X0, y1: Y0, x2: X0, y2: Y1, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+          // X ticks: 10^1 .. 10^6
+          for (let e = 0; e <= N; e++) {
+            const x = xOf(e);
+            axesG.appendChild(el('line', { x1: x, y1: Y0, x2: x, y2: Y0 + 4, stroke: 'var(--muted-2)' }));
+            const t = el('text', { x: x, y: Y0 + 20, 'text-anchor': 'middle', 'font-family': 'JetBrains Mono, monospace', 'font-size': 11, fill: 'var(--muted)' });
+            t.textContent = '10' + ['¹', '²', '³', '⁴', '⁵', '⁶', '⁷'][e];
+            axesG.appendChild(t);
+          }
+          const xl = el('text', { x: (X0 + X1) / 2, y: Y0 + 38, 'text-anchor': 'middle', 'font-family': 'IM Fell English, serif', 'font-style': 'italic', 'font-size': 13, fill: 'var(--muted)' });
+          xl.textContent = 'parent VMA + fd count';
+          axesG.appendChild(xl);
+          const yl = el('text', { x: 22, y: (Y0 + Y1) / 2, 'text-anchor': 'middle', 'font-family': 'IM Fell English, serif', 'font-style': 'italic', 'font-size': 13, fill: 'var(--muted)', transform: `rotate(-90 22 ${(Y0 + Y1) / 2})` });
+          yl.textContent = 'process-create cost (relative)';
+          axesG.appendChild(yl);
+          // curves
+          const forkPath = [];
+          const execPath = [];
+          for (let e = 0; e <= N; e += 0.1) {
+            forkPath.push((e === 0 ? 'M' : 'L') + ' ' + xOf(e).toFixed(1) + ' ' + yOf(forkOf(e)).toFixed(1));
+            execPath.push((e === 0 ? 'M' : 'L') + ' ' + xOf(e).toFixed(1) + ' ' + yOf(execOf()).toFixed(1));
+          }
+          seriesG.appendChild(el('path', { id: 'vg-w-chart-fork-cost-execline', d: execPath.join(' '), fill: 'none', stroke: 'var(--sage-deep)', 'stroke-width': 1.5, 'stroke-dasharray': '5,4' }));
+          seriesG.appendChild(el('path', { id: 'vg-w-chart-fork-cost-forkline', d: forkPath.join(' '), fill: 'none', stroke: 'var(--accent)', 'stroke-width': 2 }));
+          // legend
+          const lg = el('g', { 'font-family': 'Manrope, sans-serif', 'font-size': 12 });
+          lg.appendChild(el('rect', { x: 470, y: 48, width: 16, height: 2, fill: 'var(--accent)' }));
+          const l1 = el('text', { x: 492, y: 52, fill: 'var(--ink)' }); l1.textContent = 'fork 階段（複製成本）'; lg.appendChild(l1);
+          lg.appendChild(el('rect', { x: 470, y: 68, width: 16, height: 2, fill: 'var(--sage-deep)' }));
+          const l2 = el('text', { x: 492, y: 72, fill: 'var(--ink)' }); l2.textContent = 'exec 階段（載入新檔）'; lg.appendChild(l2);
+          seriesG.appendChild(lg);
+          // marker group (updated live)
+          seriesG.appendChild(el('line', { id: 'vg-w-chart-fork-cost-vline', x1: X0, y1: Y0, x2: X0, y2: Y1, stroke: 'var(--muted-2)', 'stroke-dasharray': '2,3', 'stroke-width': 1 }));
+          seriesG.appendChild(el('circle', { id: 'vg-w-chart-fork-cost-dotfork', cx: X0, cy: Y0, r: 4.5, fill: 'var(--accent)' }));
+          seriesG.appendChild(el('circle', { id: 'vg-w-chart-fork-cost-dotexec', cx: X0, cy: Y0, r: 4.5, fill: 'var(--sage-deep)' }));
+        }
+
+        const vline = () => root.querySelector('#vg-w-chart-fork-cost-vline');
+        const dotF = () => root.querySelector('#vg-w-chart-fork-cost-dotfork');
+        const dotE = () => root.querySelector('#vg-w-chart-fork-cost-dotexec');
+
+        function update() {
+          const e = Number(range.value);
+          const x = xOf(e);
+          const fc = forkOf(e), ec = execOf();
+          vline().setAttribute('x1', x); vline().setAttribute('x2', x);
+          vline().setAttribute('y1', Y0); vline().setAttribute('y2', Math.min(yOf(fc), yOf(ec)));
+          dotF().setAttribute('cx', x); dotF().setAttribute('cy', yOf(fc));
+          dotE().setAttribute('cx', x); dotE().setAttribute('cy', yOf(ec));
+          const count = Math.round(Math.pow(10, e));
+          const ratio = (fc / ec);
+          readout.innerHTML = '≈ ' + count.toLocaleString() + ' VMA/fd　fork:exec ≈ <em>' + ratio.toFixed(1) + '×</em>';
+        }
+
+        drawStatic();
+        range.addEventListener('input', update);
+        update();
+      })();
+    </script>
+  </figure>
+
+  <p>圖裡那條陡峭上揚的是 fork 成本：父 process 每多一個 VMA、每多一個 open fd，fork 就要多複製一份 metadata，成本線性放大。一個重型多執行緒服務——比方一個 JVM、一個載了上千個動態模組的 Python 程序——位址空間裡輕易就有上萬個 VMA、幾千個 fd。對這種 process，「fork 自己再 exec」要付的複製成本可以遠超過新執行檔本身的載入成本。而 exec 那條線幾乎是平的：載入新執行檔的成本只跟新執行檔有關，跟父 process 多大無關。這就是 Guzik 說「成本大頭在 fork」的具體意思。</p>
+
+  <h2>fork() 在多執行緒下的根本崩壞</h2>
+
+  <p>傳統上 fork 的高成本由 copy-on-write（COW）緩解：fork 不真的複製記憶體頁，只把父子的 page table 都標成 read-only，等任一方寫入時才複製那一頁。問題是 COW 緩解的是「資料頁複製」，沒緩解「page table 與 VMA metadata 複製」——後者必須在 fork 當下就全部建好，這正是隨 VMA 數量線性放大的那一段。而且如果你 fork 完馬上 exec，連 COW 都是浪費：你建好了整套 read-only 映射，一頁都還沒寫，exec 就把它全部拆掉。</p>
+
+  <p>vfork() 是針對「fork 後立刻 exec」設計的逃生口：它用 CLONE_VFORK | CLONE_VM 建立子 process，子與父<em>共用</em>同一個位址空間（不複製 page table），並把父執行緒掛起，直到子 exec 或 exit 才喚醒。這省掉了位址空間複製，但它是個 footgun——子在 exec 之前跑在父的記憶體上，任何對 stack 或 global 的寫入都會污染父 process。posix_spawn() 的 glibc 實作正是建立在 vfork+exec 之上，把這段危險窗口包在標準庫裡，使用者看不到。但 Guzik 的批評是：vfork「leaves the fork() performance problem untouched」——它繞過了複製，卻沒解決「為什麼要從一個既有 process 複製狀態」這個根本問題。他主張「creating a pristine process is the way to go」——直接建一個乾淨的空 process，而不是從父 process 拷貝再丟掉。</p>
+
+  <p>多執行緒讓事情更糟。POSIX 規定 fork 只複製<em>呼叫 fork 的那一條執行緒</em>到子 process，其他執行緒全部消失。如果某個消失的執行緒當時正持有一把 malloc 內部的鎖，子 process 就繼承了一把永遠不會被釋放的鎖——子裡任何 malloc 呼叫直接死鎖。這不是理論上的角落案例：glibc 的 allocator、log 函式庫、許多 C++ runtime 都在內部用鎖，子 process 在 fork 與 exec 之間如果碰到任何一個，就可能整個卡住。標準對這段的規定本身就很嚴苛——fork 之後在子 process 裡，你只能呼叫 async-signal-safe 的函式，連 printf 都不在白名單上。這正是為什麼「fork 完盡快 exec、中間什麼都別做」是唯一安全的寫法，而這個寫法又恰好證明了 fork 把整個位址空間複製過來毫無意義。</p>
+
+  <p>pthread_atfork() 提供 prepare / parent / child 三段 handler 想救這個局面：fork 前依序取得所有相關鎖、fork 後在父子兩邊依序釋放，讓子 process 繼承的是一組「已知處於一致狀態」的鎖。但 Guzik 指出，當一個程序連結了上千個各自註冊 atfork handler 的模組，handler 之間的鎖序（lock ordering）幾乎不可能保證無環——一個模組的 prepare handler 拿鎖 A 再拿鎖 B，另一個拿 B 再拿 A，fork 就 deadlock 在 prepare 階段，連 exec 都還沒走到。更糟的是這個 deadlock 跟註冊順序、跟當下哪些執行緒在跑哪段程式碼有關，是典型「在 CI 跑不出來、上 production 偶發」的那種 bug。「mixing threading and fork」在實務上被視為不受支援，但現實是幾乎每個非平凡的程式都同時用了執行緒與某種「叫一個外部命令」的需求。下面這個 scrubber 把 vfork 那段「借來的位址空間」窗口逐刻拆開看——注意它要在這麼受限的條件下完成 fd、signal、cwd 全部設定。</p>
+
+  <figure class="vg-w-scrub-vfork-window" data-svg-scroll="720">
+    <style>
+      .vg-w-scrub-vfork-window { display: grid; gap: var(--s-2); }
+      .vg-w-scrub-vfork-window svg { width: 100%; height: auto; }
+      .vg-w-scrub-vfork-window .state { font-family: var(--serif); font-size: var(--fs-sm); padding: var(--s-2); background: var(--bg-soft); border-left: 2px solid var(--accent); line-height: 1.6; }
+      .vg-w-scrub-vfork-window .state strong { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); display: block; margin-bottom: 4px; }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M5 9v6"/><path d="M19 9v6"/><path d="M5 12h14"/>
+      </svg>
+      <span>drag the handle along the vfork window · 5 phases</span>
+    </p>
+
+    <svg class="vg-w-scrub-vfork-window-main" viewBox="0 0 720 110" role="img"
+         aria-label="vfork 視窗時間軸：clone(CLONE_VFORK|CLONE_VM) 起、子借用父位址空間、父執行緒掛起、子 exec、父喚醒——拖動把手檢視每一刻的狀態">
+      <text x="40" y="20" fill="var(--muted)" font-family="IM Fell English, serif" font-style="italic" font-size="12">child runs on the PARENT's address space (borrowed)</text>
+      <line x1="40" y1="56" x2="680" y2="56" stroke="var(--muted-2)" stroke-width="1.5" />
+      <g id="vg-w-scrub-vfork-window-events"></g>
+      <line id="vg-w-scrub-vfork-window-handle-line" x1="40" y1="38" x2="40" y2="74" stroke="var(--accent)" stroke-width="2" />
+      <circle id="vg-w-scrub-vfork-window-handle" cx="40" cy="56" r="9" fill="var(--accent)" cursor="grab" />
+    </svg>
+
+    <div class="state" id="vg-w-scrub-vfork-window-state"></div>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-scrub-vfork-window');
+        const svg = root.querySelector('svg.vg-w-scrub-vfork-window-main');
+        const handle = root.querySelector('#vg-w-scrub-vfork-window-handle');
+        const handleLine = root.querySelector('#vg-w-scrub-vfork-window-handle-line');
+        const stateDiv = root.querySelector('#vg-w-scrub-vfork-window-state');
+        const eventsG = root.querySelector('#vg-w-scrub-vfork-window-events');
+        const NS = 'http://www.w3.org/2000/svg';
+
+        const phases = [
+          [0,   'clone',  'clone(CLONE_VFORK | CLONE_VM)', '子 process 建立。CLONE_VM 表示子不複製位址空間、直接共用父的；CLONE_VFORK 表示父執行緒在此掛起。沒有 page table 複製、沒有 VMA 複製——這正是 vfork 比 fork 快的原因。'],
+          [25,  'borrow', '子跑在父的記憶體上', '子 process 現在執行於父的位址空間。它能呼叫的東西被嚴格限制：任何對 stack 或 global 變數的寫入都會直接污染父的記憶體。連 return 出當前函式都不安全——會破壞父之後要用的 stack frame。'],
+          [50,  'config', '設定 fd / signal / cwd', 'posix_spawn 在這個窗口內做 file action：dup2、close、open，重設 signal disposition、改 cwd。每一步都只能用不碰 process 記憶體的 syscall——這是 posix_spawn 實作最難的部分。'],
+          [75,  'exec',   'execve() 替換映像', 'exec 用新執行檔徹底替換位址空間。借來的共用映射在這一刻被拆掉，子終於有了自己的乾淨位址空間。從這裡開始子與父再無記憶體關聯。'],
+          [100, 'wake',   '父執行緒喚醒', '子已 exec（或 exit），CLONE_VFORK 的掛起解除，父執行緒繼續跑。整段窗口期間父被凍結——這是 vfork 換取「不複製位址空間」所付的同步代價。'],
+        ];
+        const X0 = 40, X1 = 680;
+        const xOf = p => X0 + (p / 100) * (X1 - X0);
+
+        phases.forEach(([p, key]) => {
+          const c = document.createElementNS(NS, 'circle');
+          c.setAttribute('cx', xOf(p)); c.setAttribute('cy', 56); c.setAttribute('r', 4);
+          c.setAttribute('fill', 'var(--muted)');
+          eventsG.appendChild(c);
+          const tx = document.createElementNS(NS, 'text');
+          tx.setAttribute('x', xOf(p)); tx.setAttribute('y', 92);
+          tx.setAttribute('text-anchor', p === 0 ? 'start' : p === 100 ? 'end' : 'middle');
+          tx.setAttribute('font-family', 'JetBrains Mono, monospace');
+          tx.setAttribute('font-size', 11);
+          tx.setAttribute('fill', 'var(--muted)');
+          tx.textContent = key;
+          eventsG.appendChild(tx);
+        });
+
+        function clamp(x) { return Math.max(X0, Math.min(X1, x)); }
+        function clientToSvgX(clientX) {
+          const pt = svg.createSVGPoint();
+          pt.x = clientX; pt.y = 0;
+          const sp = pt.matrixTransform(svg.getScreenCTM().inverse());
+          return clamp(sp.x);
+        }
+        function render(x) {
+          handle.setAttribute('cx', x);
+          handleLine.setAttribute('x1', x); handleLine.setAttribute('x2', x);
+          const p = ((x - X0) / (X1 - X0)) * 100;
+          let active = phases[0];
+          for (const e of phases) if (e[0] <= p + 0.001) active = e;
+          stateDiv.innerHTML = '<strong>' + active[2] + '</strong>' + active[3];
+        }
+
+        let dragging = false;
+        function start(e) { dragging = true; handle.setPointerCapture(e.pointerId); }
+        handle.addEventListener('pointerdown', start);
+        svg.addEventListener('pointerdown', (e) => { if (e.target === handle) return; render(clientToSvgX(e.clientX)); });
+        handle.addEventListener('pointermove', (e) => { if (dragging) render(clientToSvgX(e.clientX)); });
+        handle.addEventListener('pointerup', () => { dragging = false; });
+        handle.addEventListener('keydown', (e) => {
+          const cur = Number(handle.getAttribute('cx'));
+          if (e.key === 'ArrowRight') { e.preventDefault(); render(clamp(cur + (X1 - X0) / 4)); }
+          if (e.key === 'ArrowLeft') { e.preventDefault(); render(clamp(cur - (X1 - X0) / 4)); }
+        });
+        handle.setAttribute('tabindex', '0');
+        handle.setAttribute('role', 'slider');
+        handle.setAttribute('aria-label', 'vfork window phase');
+
+        render(X0);
+      })();
+    </script>
+  </figure>
+
+  <h2>spawn templates：被拒的「快取一份模板」路線</h2>
+
+  <p>Li Chen 提的 spawn templates 是四條路線裡唯一已經寫成補丁、又被明確拒絕的一條。它的觀察很實際：很多程式會反覆 spawn 同一個執行檔——Git 在一次操作裡可能 spawn 同一個 helper 上百次、build 系統反覆叫同一個 compiler。如果每次都從頭走 fork+exec，那些「對同一執行檔每次都一樣」的設定就被重做了無數遍。template 的想法是把這些設定預先打包成一個可重用的物件。</p>
+
+  <p>API 是兩個新 syscall：spawn_template_create() 接受一個 spawn_template_create_args 結構（欄位含 flags、execfd、exec_flags、filename），建立一個快取的模板；spawn_template_spawn() 用這個模板反覆啟動 process。模板上可以掛一串 spawn_template_action——CLOSE、檔案 dup、open、改 directory、signal 處理——描述每次 spawn 要做的 file action。實測效能提升「approximately 2%」。這個數字本身就是它被拒的一部分原因：~2% 對「需要新增兩個 syscall 與一整套 template lifecycle 管理」的複雜度來說太薄。Christian Brauner 的評語是留了餘地的——「The idea of having a builder api for exec isn't all that crazy」——但他不認為 template 是對的形狀。更要命的是，spawn templates 跟前面那張圖指出的問題正面撞上：它優化的是 exec 那一段（重用執行檔載入設定），而成本大頭在 fork。Li Chen 最後也同意 Brauner 的 pidfd 路線「seemed better」，並表示未來會往那個方向走。</p>
+
+  <p>下面把四條路線並排——每條換掉的是 process 建立流程裡的哪一段機制、API 入口在哪、致命弱點是什麼。</p>
+
+  <figure class="vg-w-stack-fork-routes">
+    <style>
+      .vg-w-stack-fork-routes { display: flex; flex-direction: column; gap: var(--s-3); align-items: stretch; }
+      .vg-w-stack-fork-routes input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-stack-fork-routes .stack-title { font-family: IM Fell English, serif; font-style: italic; font-size: var(--fs-md); margin: 0 0 var(--s-1) 0; color: var(--ink); line-height: 1.4; }
+      .vg-w-stack-fork-routes .stack-cards { display: flex; flex-direction: column; gap: var(--s-1); list-style: none; padding: 0; margin: 0; }
+      .vg-w-stack-fork-routes .stack-cards label { display: block; padding: var(--s-2); border: 1px solid var(--muted-2); border-radius: 2px; cursor: pointer; transition: border-color 200ms, background 200ms; min-height: 44px; }
+      .vg-w-stack-fork-routes .stack-cards label:hover { border-color: var(--accent); }
+      .vg-w-stack-fork-routes .stack-cards .card-head { font-family: EB Garamond, serif; font-size: var(--fs-md); margin: 0 0 4px 0; color: var(--ink); display: flex; align-items: baseline; justify-content: space-between; gap: var(--s-2); flex-wrap: wrap; }
+      .vg-w-stack-fork-routes .stack-cards .card-sub { font-family: IM Fell English, serif; font-style: italic; font-size: var(--fs-sm); color: var(--muted); margin: 0; line-height: 1.5; }
+      .vg-w-stack-fork-routes .stack-cards .card-tag { font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); color: var(--accent-text); font-style: normal; }
+      .vg-w-stack-fork-routes:has(#vg-w-stack-fork-routes-r1:checked) .card-1,
+      .vg-w-stack-fork-routes:has(#vg-w-stack-fork-routes-r2:checked) .card-2,
+      .vg-w-stack-fork-routes:has(#vg-w-stack-fork-routes-r3:checked) .card-3,
+      .vg-w-stack-fork-routes:has(#vg-w-stack-fork-routes-r4:checked) .card-4 { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+
+      .vg-w-stack-fork-routes svg.diagram { display: none; }
+      @media (min-width: 720px) {
+        .vg-w-stack-fork-routes svg.diagram { display: block; width: 100%; height: auto; max-width: 880px; }
+        .vg-w-stack-fork-routes .stack-title { display: none; }
+        .vg-w-stack-fork-routes .stack-cards { display: none; }
+      }
+      .vg-w-stack-fork-routes .layer { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; transition: fill 200ms, stroke 200ms; }
+      .vg-w-stack-fork-routes .layer:hover { stroke: var(--accent); }
+      .vg-w-stack-fork-routes .layer-text { pointer-events: none; font-family: EB Garamond, serif; font-size: 14px; }
+      .vg-w-stack-fork-routes .layer-sub { pointer-events: none; font-family: IM Fell English, serif; font-style: italic; font-size: 12px; fill: var(--muted); }
+      .vg-w-stack-fork-routes .layer-tag { pointer-events: none; font-family: JetBrains Mono, monospace; font-size: 11px; }
+      .vg-w-stack-fork-routes .head { font-family: IM Fell English, serif; font-style: italic; font-size: 13px; }
+      .vg-w-stack-fork-routes:has(#vg-w-stack-fork-routes-r1:checked) .layer-1,
+      .vg-w-stack-fork-routes:has(#vg-w-stack-fork-routes-r2:checked) .layer-2,
+      .vg-w-stack-fork-routes:has(#vg-w-stack-fork-routes-r3:checked) .layer-3,
+      .vg-w-stack-fork-routes:has(#vg-w-stack-fork-routes-r4:checked) .layer-4 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+
+      .vg-w-stack-fork-routes .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+      .vg-w-stack-fork-routes .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-stack-fork-routes .detail p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); line-height: 1.6; }
+      .vg-w-stack-fork-routes:has(#vg-w-stack-fork-routes-r1:checked) .detail-1,
+      .vg-w-stack-fork-routes:has(#vg-w-stack-fork-routes-r2:checked) .detail-2,
+      .vg-w-stack-fork-routes:has(#vg-w-stack-fork-routes-r3:checked) .detail-3,
+      .vg-w-stack-fork-routes:has(#vg-w-stack-fork-routes-r4:checked) .detail-4 { display: block; }
+      .vg-w-stack-fork-routes .hint { font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin: var(--s-2) 0 var(--s-1) 0; }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M9 11.5 11 13.5 15 9.5"/><rect x="3" y="3" width="18" height="18" rx="2"/>
+      </svg>
+      <span>click any route to read its mechanism + weakness · 4 routes</span>
+    </p>
+
+    <input type="radio" id="vg-w-stack-fork-routes-r1" name="vg-w-stack-fork-routes-sel" checked aria-label="spawn templates" />
+    <input type="radio" id="vg-w-stack-fork-routes-r2" name="vg-w-stack-fork-routes-sel" aria-label="native posix_spawn" />
+    <input type="radio" id="vg-w-stack-fork-routes-r3" name="vg-w-stack-fork-routes-sel" aria-label="pidfd builder" />
+    <input type="radio" id="vg-w-stack-fork-routes-r4" name="vg-w-stack-fork-routes-sel" aria-label="io_uring spawn" />
+
+    <p class="stack-title" id="vg-w-stack-fork-routes-title">四條取代 fork+exec 的路線——各自換掉哪一段機制</p>
+    <ul class="stack-cards" aria-labelledby="vg-w-stack-fork-routes-title">
+      <li class="card-1"><label for="vg-w-stack-fork-routes-r1">
+        <p class="card-head"><span>① spawn templates</span><code class="card-tag">~2% · rejected</code></p>
+        <p class="card-sub">快取一份可重用的 exec 設定模板，反覆 spawn 同一執行檔。優化 exec 段、不碰 fork——已被拒。</p>
+      </label></li>
+      <li class="card-2"><label for="vg-w-stack-fork-routes-r2">
+        <p class="card-head"><span>② native posix_spawn()</span><code class="card-tag">vfork+exec</code></p>
+        <p class="card-sub">把 POSIX 標準 API 變成真正的 kernel 原生 syscall，不再靠 glibc 的 vfork+exec 拼裝。</p>
+      </label></li>
+      <li class="card-3"><label for="vg-w-stack-fork-routes-r3">
+        <p class="card-head"><span>③ pidfd builder</span><code class="card-tag">pidfd_config()</code></p>
+        <p class="card-sub">pidfd_open 建空 process，再用 pidfd_config() 逐步配置——類比 fsconfig() 的 builder 模式。社群偏好。</p>
+      </label></li>
+      <li class="card-4"><label for="vg-w-stack-fork-routes-r4">
+        <p class="card-head"><span>④ io_uring spawn</span><code class="card-tag">ring sqe</code></p>
+        <p class="card-sub">執行檔載入一次，後續 spawn 動作用 ring 下 sqe——install fd、最後 exec，ring 結束未 exec 則 SIGKILL。</p>
+      </label></li>
+    </ul>
+
+    <svg class="diagram" viewBox="0 0 880 360" role="img"
+         aria-label="四條路線並排：spawn templates / native posix_spawn / pidfd builder / io_uring spawn，各自的機制與弱點">
+      <text x="40" y="24" fill="var(--ink)" class="head">四條取代 fork+exec 的路線——點任一條看機制與弱點</text>
+
+      <rect class="layer layer-1" data-target="vg-w-stack-fork-routes-r1" x="40" y="44" width="800" height="64" role="button" tabindex="0" aria-label="spawn templates" />
+      <text x="58" y="72" fill="var(--ink)" class="layer-text">① spawn templates</text>
+      <text x="58" y="94" fill="var(--muted)" class="layer-sub">快取一份可重用的 exec 設定模板，反覆 spawn 同一執行檔——優化 exec 段、不碰 fork</text>
+      <text x="828" y="72" text-anchor="end" fill="var(--accent-text)" class="layer-tag">~2% · rejected</text>
+
+      <rect class="layer layer-2" data-target="vg-w-stack-fork-routes-r2" x="40" y="120" width="800" height="64" role="button" tabindex="0" aria-label="native posix_spawn" />
+      <text x="58" y="148" fill="var(--ink)" class="layer-text">② native posix_spawn()</text>
+      <text x="58" y="170" fill="var(--muted)" class="layer-sub">把 POSIX 標準 API 變成真正的 kernel 原生 syscall，不再靠 glibc 的 vfork+exec 拼裝</text>
+      <text x="828" y="148" text-anchor="end" fill="var(--accent-text)" class="layer-tag">currently vfork+exec</text>
+
+      <rect class="layer layer-3" data-target="vg-w-stack-fork-routes-r3" x="40" y="196" width="800" height="64" role="button" tabindex="0" aria-label="pidfd builder" />
+      <text x="58" y="224" fill="var(--ink)" class="layer-text">③ pidfd builder（Brauner）</text>
+      <text x="58" y="246" fill="var(--muted)" class="layer-sub">pidfd_open 建空 process，再用 pidfd_config() 逐步配置——類比 fsconfig() 的 builder 模式</text>
+      <text x="828" y="224" text-anchor="end" fill="var(--accent-text)" class="layer-tag">pidfd_config()</text>
+
+      <rect class="layer layer-4" data-target="vg-w-stack-fork-routes-r4" x="40" y="272" width="800" height="64" role="button" tabindex="0" aria-label="io_uring spawn" />
+      <text x="58" y="300" fill="var(--ink)" class="layer-text">④ io_uring spawn（Poimboeuf）</text>
+      <text x="58" y="322" fill="var(--muted)" class="layer-sub">執行檔載入一次，後續用 ring 下 sqe——install fd、最後 exec，ring 未 exec 結束則 SIGKILL</text>
+      <text x="828" y="300" text-anchor="end" fill="var(--accent-text)" class="layer-tag">ring sqe</text>
+    </svg>
+
+    <div>
+      <p class="hint">click any route above</p>
+      <div class="detail detail-1">
+        <h3>① spawn templates · Li Chen（已拒）</h3>
+        <p><strong>機制</strong>：spawn_template_create() 接 spawn_template_create_args（flags / execfd / exec_flags / filename）建快取模板，spawn_template_spawn() 反覆啟動。模板掛一串 spawn_template_action（CLOSE / dup / open / chdir / signal）。</p>
+        <p><strong>弱點</strong>：實測僅約 2% 提升，卻要兩個新 syscall 加整套 template lifecycle。且它優化的是 exec 段，成本大頭在 fork——優化錯了那一半。Li Chen 最終同意 pidfd 路線更好。</p>
+      </div>
+      <div class="detail detail-2">
+        <h3>② native posix_spawn() · 社群偏好的形狀</h3>
+        <p><strong>機制</strong>：posix_spawn() 是 POSIX 標準的 fork+exec 合一 API，目前 glibc 用 vfork+exec 在 userspace 實作。把它變成 kernel 原生 syscall，就不再有 vfork 那個共用位址空間的危險窗口藏在標準庫裡。</p>
+        <p><strong>弱點</strong>：反方意見問——現有 vfork+posix_spawn 是否已經夠用？要證明原生版本值得，需要具體 benchmark，而不只是「fork 很糟」的直覺。</p>
+      </div>
+      <div class="detail detail-3">
+        <h3>③ pidfd builder · Christian Brauner（社群偏好）</h3>
+        <p><strong>機制</strong>：擴充 pidfd_open() 建立一個空 process（pidfd 在手但還沒「成形」），再用新的 pidfd_config() syscall 一步步配置它——設 fd、signal、cwd、執行檔。形狀類比 fsconfig()：先 fsopen 拿 fd、再用一串 fsconfig 設 mount 選項、最後 fsmount。是 Guzik「建乾淨 process」主張的 API 化身。</p>
+        <p><strong>弱點</strong>：全新的 syscall 表面與 lifecycle 語意，要把「半成形 process」的所有狀態轉換定義清楚——比 template 大得多的設計工程。</p>
+      </div>
+      <div class="detail detail-4">
+        <h3>④ io_uring spawn · Josh Poimboeuf</h3>
+        <p><strong>機制</strong>：用一個 syscall 把執行檔載入一次，後續的 spawn 動作全部用 io_uring 的 ring 下達——sqe 描述「收下這些 fd、把它們裝好」，整串以 exec 收尾。若 ring 在沒 exec 的情況下結束，那個半成形 process 被 SIGKILL。</p>
+        <p><strong>弱點</strong>：把 process 建立綁進 io_uring 的 sqe 模型，語意新穎但偏離傳統 process API 直覺；錯誤處理（ring 中途失敗）的清理路徑要很小心。</p>
+      </div>
+    </div>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-stack-fork-routes');
+        root.querySelectorAll('.layer').forEach((rect) => {
+          rect.addEventListener('click', () => {
+            const t = rect.getAttribute('data-target');
+            const radio = root.querySelector('#' + t);
+            if (radio) radio.checked = true;
+          });
+          rect.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); rect.dispatchEvent(new MouseEvent('click', { bubbles: true })); }
+          });
+        });
+      })();
+    </script>
+  </figure>
+
+  <h2>native posix_spawn()：把標準 API 沉進 kernel</h2>
+
+  <p>第二條路線最保守，也是社群裡阻力最小的方向：與其發明新 API，不如把已經存在的 POSIX 標準 posix_spawn() 變成 kernel 真正的原生 syscall。今天 posix_spawn() 不是 syscall——它是 glibc 在 userspace 用 vfork+exec 拼出來的 library function。前面那個 scrubber 拆開的危險窗口，就是這個拼裝藏在標準庫裡的東西。把它沉進 kernel 的好處是：kernel 可以在自己的位址空間裡安全地建立子 process 的 fd table、signal mask、cwd，完全不需要「子在父的記憶體上小心翼翼地不寫任何東西」那段表演。</p>
+
+  <p>posix_spawn() 的 API 形狀對使用者來說已經定義好了：一個 spawn 呼叫，加上兩組描述子——file actions（一串 dup2 / close / open）與 spawn attributes（signal mask、process group、scheduling）。把它原生化，是把這兩組描述子直接交給 kernel 解釋，而不是在 userspace 翻譯成一連串「在 vfork 窗口裡能安全執行的 syscall」。值得注意的是，glibc 內部正是用 clone3() 配上 CLONE_VFORK | CLONE_VM 來實作 posix_spawn 的——它已經盡力避開了 full fork，並在那個共用位址空間的窗口裡小心地完成所有 file action。換句話說，posix_spawn 今天就已經是「最不糟」的選項，這也是為什麼有人會問：把它再往下推進 kernel，邊際收益到底有多大？</p>
+
+  <p>這條路線於是遇到最直接的反方意見：現有的 vfork+posix_spawn 真的不夠用嗎？如果 glibc 已經把危險窗口包得夠好、效能也可接受，那麼「原生化」要證明自己值得，需要拿出具體的 benchmark 數字——展示原生 syscall 在多執行緒、大位址空間的情境下比 vfork 拼裝快多少，而且要快到值得新增 kernel 維護面。這個質疑跟 spawn templates 那 ~2% 的命運是同一條規則在作用：kernel 社群對「新增 syscall 表面」的門檻很高，任何提案都得先證明既有路徑的瓶頸是真的、而且新路徑能顯著拉開差距。在那個數字出現之前，原生 posix_spawn 停在「聽起來合理、但還沒被需求逼出來」。</p>
+
+  <h2>pidfd builder：Brauner 的 fsconfig 式組裝</h2>
+
+  <p>Brauner 的路線是四條裡最有結構野心的，也是 Li Chen 最終認同的方向。它的核心是把「建立 process」變成一個 builder pattern：不是一個原子的大呼叫，而是「先拿到一個 handle、再一步步往上配置、最後敲定」。具體三步——擴充 pidfd_open() 建立一個空的 process（你拿到一個 pidfd，但這個 process 還沒成形、還沒跑任何程式碼），用一個全新的 pidfd_config() syscall 逐步配置它（這個 fd 給它、那個 signal disposition、cwd 設成這個、執行檔指這個），最後敲定讓它開始跑。</p>
+
+  <p>Brauner 自己給的類比是 fsconfig()。檔案系統掛載在新 API 下正是這個形狀：fsopen() 拿到一個 fs context 的 fd，一連串 fsconfig() 設定 source、設定各種 mount option，最後 fsmount() 把它變成真正的 mount。pidfd builder 把同一個 idiom 搬到 process 建立上——pidfd 就是那個 context fd，pidfd_config() 就是那一串設定呼叫。這個形狀直接體現了 Guzik「creating a pristine process is the way to go」的主張：你不是從父 process 拷貝一份再修改，你是從一個乾淨的空 process 開始，只把你真正要的東西加上去。fork 那段線性放大的複製成本——複製父的所有 VMA、所有 fd——從根本上消失了，因為根本沒有「父的狀態」被拷貝過來。下面把 fsconfig 與 pidfd_config 的 builder 對應關係畫出來。</p>
+
+  <figure class="vg-w-arch-pidfd-config" data-svg-scroll="880">
+    <svg class="vg-w-arch-pidfd-config-main" viewBox="0 0 880 260" role="img"
+         aria-label="pidfd builder 與 fsconfig 的對應：open 拿 context fd、一串 config 呼叫設定、最後敲定"
+         style="width: 100%; height: auto; max-width: 880px;">
+      <style>
+        .vg-w-arch-pidfd-config-main text { font-family: EB Garamond, serif; }
+        .vg-w-arch-pidfd-config-main .label { font-family: IM Fell English, serif; font-style: italic; font-size: 13px; }
+        .vg-w-arch-pidfd-config-main .mono { font-family: JetBrains Mono, monospace; font-size: 13px; }
+        .vg-w-arch-pidfd-config-main .small { font-family: IM Fell English, serif; font-style: italic; font-size: 11px; }
+        .vg-w-arch-pidfd-config-main .head { font-family: IM Fell English, serif; font-style: italic; font-size: 13px; }
+      </style>
+
+      <text x="40" y="24" fill="var(--ink)" class="head">同一個 builder idiom——上排：mount；下排：process</text>
+
+      <text x="40" y="66" fill="var(--muted)" class="label">filesystem</text>
+      <rect x="40" y="78" width="150" height="44" fill="var(--sage)" opacity="0.5" stroke="var(--muted-2)"/>
+      <text x="115" y="100" text-anchor="middle" fill="var(--ink)" class="mono">fsopen()</text>
+      <text x="115" y="116" text-anchor="middle" fill="var(--muted)" class="small">→ fs context fd</text>
+      <line x1="190" y1="100" x2="240" y2="100" stroke="var(--muted-2)" stroke-width="1.5" marker-end="url(#vg-w-arch-pidfd-config-arrow)"/>
+      <rect x="240" y="78" width="330" height="44" fill="var(--sage)" opacity="0.35" stroke="var(--muted-2)"/>
+      <text x="405" y="100" text-anchor="middle" fill="var(--ink)" class="mono">fsconfig() × N</text>
+      <text x="405" y="116" text-anchor="middle" fill="var(--muted)" class="small">set source / set options …逐步配置</text>
+      <line x1="570" y1="100" x2="620" y2="100" stroke="var(--muted-2)" stroke-width="1.5" marker-end="url(#vg-w-arch-pidfd-config-arrow)"/>
+      <rect x="620" y="78" width="200" height="44" fill="var(--sage-deep)" opacity="0.4" stroke="var(--muted-2)"/>
+      <text x="720" y="100" text-anchor="middle" fill="var(--ink)" class="mono">fsmount()</text>
+      <text x="720" y="116" text-anchor="middle" fill="var(--muted)" class="small">敲定 → real mount</text>
+
+      <text x="40" y="176" fill="var(--muted)" class="label">process</text>
+      <rect x="40" y="188" width="150" height="44" fill="var(--accent)" opacity="0.42" stroke="var(--muted-2)"/>
+      <text x="115" y="210" text-anchor="middle" fill="var(--ink)" class="mono">pidfd_open()</text>
+      <text x="115" y="226" text-anchor="middle" fill="var(--muted)" class="small">→ 空 process 的 pidfd</text>
+      <line x1="190" y1="210" x2="240" y2="210" stroke="var(--muted-2)" stroke-width="1.5" marker-end="url(#vg-w-arch-pidfd-config-arrow)"/>
+      <rect x="240" y="188" width="330" height="44" fill="var(--accent)" opacity="0.28" stroke="var(--muted-2)"/>
+      <text x="405" y="210" text-anchor="middle" fill="var(--ink)" class="mono">pidfd_config() × N</text>
+      <text x="405" y="226" text-anchor="middle" fill="var(--muted)" class="small">set fd / signal / cwd / exec …逐步配置</text>
+      <line x1="570" y1="210" x2="620" y2="210" stroke="var(--muted-2)" stroke-width="1.5" marker-end="url(#vg-w-arch-pidfd-config-arrow)"/>
+      <rect x="620" y="188" width="200" height="44" fill="var(--accent)" opacity="0.55" stroke="var(--muted-2)"/>
+      <text x="720" y="210" text-anchor="middle" fill="var(--ink)" class="mono">敲定 → running</text>
+      <text x="720" y="226" text-anchor="middle" fill="var(--muted)" class="small">乾淨 process，無父狀態拷貝</text>
+
+      <defs>
+        <marker id="vg-w-arch-pidfd-config-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0 0 L10 5 L0 10 z" fill="var(--muted-2)"/>
+        </marker>
+      </defs>
+    </svg>
+    <figcaption>pidfd builder 借用 fsconfig() 已經建立的 idiom：open 拿 context fd、一串 config 呼叫逐步配置、最後敲定。關鍵差別在於「乾淨 process」——沒有父 process 的 VMA 或 fd 被拷貝過來，fork 那段線性成本從根上消失。</figcaption>
+  </figure>
+
+  <p>對開發者來說，這條路線的成本不在使用端而在 kernel 設計端。「半成形 process」是一個全新的核心物件：它在 pidfd_open 之後、敲定之前處於什麼狀態？這段期間它佔不佔 pid、出不出現在 <code>/proc</code>？收到 signal 怎麼辦？被 ptrace attach 會怎樣？父 process 在敲定之前就死掉，這個半成形物件由誰回收？pidfd_config() 的每一個配置動作都要定義在這個半成形狀態上的語意，而且要把所有非法轉換（例如敲定之後又想改 fd）擋掉。這比 spawn template「快取幾個欄位」要重得多——但它換來的是真正解決 Guzik 指出的根本問題，而不是在 exec 段邊緣擠出 2%。pidfd 本身在近幾年已經逐步成為 Linux 管理 process 的正統 handle（取代容易被 race 的裸 pid），把建立流程也收進 pidfd 體系，方向上是連貫的。</p>
+
+  <h2>io_uring spawn：把建立動作下成 ring 上的 sqe</h2>
+
+  <p>Poimboeuf 的路線從一個完全不同的方向切入：既然 io_uring 已經是 Linux 下「把一串操作批次下達給 kernel、非同步完成」的通用機制，為什麼不把 process 建立也表達成 ring 上的一串 sqe？想法是——用一個 syscall 把執行檔載入一次，之後每次要 spawn，就往 ring 裡塞 sqe：收下這些 fd、把它們裝進新 process 的 fd table、做這些設定，整串以 exec 收尾。建立動作變成 ring 上的資料，而不是一連串同步 syscall。</p>
+
+  <p>這條路線有個漂亮的安全語意：如果 ring 在沒有 exec 的情況下結束——比方中途某個 sqe 失敗、或程式邏輯錯誤忘了下 exec——那個半成形的 process 直接被 SIGKILL。它不會以一個「配置到一半、不知道該跑什麼」的殭屍狀態洩漏出來。這跟 pidfd builder 共享同一個哲學內核：process 從一個乾淨狀態開始，逐步配置，只是 pidfd 用 syscall 序列配置、io_uring 用 sqe 序列配置。對已經重度使用 io_uring 的高效能服務——那些把 accept、read、write 全下進 ring 的服務——把 spawn 也納進同一個提交路徑，意味著建立 worker process 不再需要跳出 ring 的非同步模型去做一次阻塞的 fork。代價是語意新穎：把 process lifecycle 綁進 ring 的提交/完成模型，偏離了三十年來「fork 回傳兩次」的直覺，錯誤處理路徑（ring 中途失敗時誰負責清理那個半成形 process）需要被非常小心地定義。下面把三條「活著的」路線的 API 形狀並排，看它們在程式碼層面長什麼樣。</p>
+
+  <figure class="vg-w-tabs-spawn-api">
+    <style>
+      .vg-w-tabs-spawn-api { display: grid; gap: var(--s-2); }
+      .vg-w-tabs-spawn-api input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-tabs-spawn-api .tabs { display: flex; flex-wrap: wrap; gap: var(--s-2); border-bottom: 1px solid var(--line); }
+      .vg-w-tabs-spawn-api .tab { font-family: var(--sans); font-size: var(--fs-sm); padding: var(--s-1) var(--s-2); cursor: pointer; color: var(--muted); min-height: 44px; display: flex; align-items: center; }
+      .vg-w-tabs-spawn-api .panel { display: none; }
+      .vg-w-tabs-spawn-api .panel p { font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink-soft); margin: var(--s-1) 0 0 0; }
+      .vg-w-tabs-spawn-api:has(#vg-w-tabs-spawn-api-t1:checked) .panel-1,
+      .vg-w-tabs-spawn-api:has(#vg-w-tabs-spawn-api-t2:checked) .panel-2,
+      .vg-w-tabs-spawn-api:has(#vg-w-tabs-spawn-api-t3:checked) .panel-3 { display: block; }
+      .vg-w-tabs-spawn-api:has(#vg-w-tabs-spawn-api-t1:checked) [for="vg-w-tabs-spawn-api-t1"],
+      .vg-w-tabs-spawn-api:has(#vg-w-tabs-spawn-api-t2:checked) [for="vg-w-tabs-spawn-api-t2"],
+      .vg-w-tabs-spawn-api:has(#vg-w-tabs-spawn-api-t3:checked) [for="vg-w-tabs-spawn-api-t3"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18"/><path d="M9 21V9"/>
+      </svg>
+      <span>switch tabs to compare 3 API shapes · 3 tabs</span>
+    </p>
+
+    <input type="radio" id="vg-w-tabs-spawn-api-t1" name="vg-w-tabs-spawn-api-sel" checked aria-label="posix_spawn shape" />
+    <input type="radio" id="vg-w-tabs-spawn-api-t2" name="vg-w-tabs-spawn-api-sel" aria-label="pidfd builder shape" />
+    <input type="radio" id="vg-w-tabs-spawn-api-t3" name="vg-w-tabs-spawn-api-sel" aria-label="io_uring shape" />
+
+    <div class="tabs" role="tablist">
+      <label class="tab" for="vg-w-tabs-spawn-api-t1">posix_spawn</label>
+      <label class="tab" for="vg-w-tabs-spawn-api-t2">pidfd builder</label>
+      <label class="tab" for="vg-w-tabs-spawn-api-t3">io_uring spawn</label>
+    </div>
+
+    <div class="panel panel-1">
+      <pre data-kind="pseudocode"><code><em>// 原子呼叫 + 兩組描述子（今天在 glibc 是 vfork+exec；原生化後直接交 kernel）</em>
+posix_spawn_file_actions_t fa;
+posix_spawn_file_actions_addclose(&amp;fa, child_log_fd);
+posix_spawn_file_actions_adddup2(&amp;fa, pipe_w, STDOUT_FILENO);
+
+posix_spawnattr_t attr;
+posix_spawnattr_setsigmask(&amp;attr, &amp;clean_mask);
+
+posix_spawn(&amp;pid, "/usr/bin/git", &amp;fa, &amp;attr, argv, envp);
+<em>// kernel 一次拿到 file actions + attrs，不需要 vfork 窗口表演</em></code></pre>
+      <p>形狀是「一個呼叫，外加事先打包好的 file actions 與 attributes」。原生化的賣點是把這兩組描述子直接交 kernel 解釋，消掉中間那層 vfork 翻譯。</p>
+    </div>
+    <div class="panel panel-2">
+      <pre data-kind="pseudocode"><code><em>// builder：open 拿 handle、一串 config 配置、最後敲定（類比 fsconfig）</em>
+int pidfd = pidfd_open(PIDFD_EMPTY, 0);        <em>// 空 process，尚未成形</em>
+
+pidfd_config(pidfd, PIDFD_SET_EXEC, "/usr/bin/git", 0);
+pidfd_config(pidfd, PIDFD_DUP_FD, pipe_w, STDOUT_FILENO);
+pidfd_config(pidfd, PIDFD_CLOSE_FD, child_log_fd, 0);
+pidfd_config(pidfd, PIDFD_SET_SIGMASK, &amp;clean_mask, 0);
+
+pidfd_config(pidfd, PIDFD_FINALIZE, 0, 0);     <em>// 敲定 → 開始跑</em>
+<em>// 全程沒有「父 process 狀態」被拷貝——pristine process</em></code></pre>
+      <p>形狀對應 fsopen → fsconfig×N → fsmount。沒有任何父 process 的 VMA 或 fd 被拷貝，fork 那段線性成本從根上消失。（syscall 常數為示意，標準化前 API 未定。）</p>
+    </div>
+    <div class="panel panel-3">
+      <pre data-kind="pseudocode"><code><em>// 執行檔載入一次，spawn 動作下成 ring 上一串 sqe，以 exec 收尾</em>
+int exec_handle = io_uring_register_exec(ring, "/usr/bin/git");
+
+sqe = io_uring_get_sqe(ring);
+io_uring_prep_spawn_install_fd(sqe, pipe_w, STDOUT_FILENO);
+sqe = io_uring_get_sqe(ring);
+io_uring_prep_spawn_close_fd(sqe, child_log_fd);
+sqe = io_uring_get_sqe(ring);
+io_uring_prep_spawn_exec(sqe, exec_handle, argv, envp);   <em>// 收尾</em>
+
+io_uring_submit(ring);
+<em>// 若 ring 結束時沒有 exec → 半成形 process 被 SIGKILL</em></code></pre>
+      <p>形狀把 process 建立融進 io_uring 的提交/完成模型。對已重度使用 ring 的服務，建立 worker 不必跳出非同步路徑去做阻塞 fork。（prep 函式名為示意。）</p>
+    </div>
+  </figure>
+
+  <p>把三條形狀並排，會看出一個共同的方向感：它們都在離開「從既有 process 複製狀態」這個前提。posix_spawn 原生化把危險的 vfork 窗口從標準庫收進 kernel；pidfd builder 與 io_uring spawn 則更激進，直接從一個乾淨的空 process 開始逐步配置。差別只在配置的提交介面——一組描述子、一串 syscall、還是一串 sqe。Guzik 那句「creating a pristine process is the way to go」是這三條路線共享的設計北極星，而被拒的 spawn templates 之所以出局，正因為它停在 exec 段做模板快取、沒有觸碰「為什麼要從父 process 拷貝」這個真正昂貴的前提。</p>
+
+  <p>這場討論的當下結論是收斂而非定案：spawn templates 不會合併，社群把焦點移到「讓 posix_spawn 能在 userspace 用 kernel 原語乾淨地實作，而不是把 fork+exec 的複雜度藏起來」。但反方那句質疑仍懸在桌上——現有 vfork+posix_spawn 是否已經夠用，需要具體 benchmark 才能定奪。在那個數字出現之前，四條草圖裡沒有任何一條被正式刻進 kernel。對下週要寫程式的人，務實的讀法是：今天繼續用 posix_spawn() 而非手寫 fork+exec（你已經免費拿到 vfork 的好處），同時知道你呼叫的那個函式底層正準備換引擎。</p>
+
+  <p class="vg-deep-closer"><strong>What this enables</strong>：當「建立 process」不再等於「複製一個 process 再丟掉」，那條隨 VMA 與 fd 數量線性放大的 fork 成本曲線就從多執行緒大型服務的 hot path 上消失——重型 server spawn 子程序這件事，第一次有機會跟父 process 有多大脫鉤。</p>
+</div>
