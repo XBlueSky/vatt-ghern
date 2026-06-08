@@ -1,0 +1,769 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">水龍頭比排水管出水快的時候，把浴缸換大一點，並不會讓水不淹出來——它只是讓淹出來的那一刻晚一點到，而且到的時候會更猛。軟體系統前面那條 queue，就是那個更大的浴缸。</p>
+  <h1 class="vg-post-title">加 queue 救不了過載——為什麼緩衝只是把崩潰往後延，以及該做什麼</h1>
+</header>
+
+<div class="vg-post-prose">
+
+<p><span class="vg-dropcap">服</span>務開始變慢的時候，最直覺的反應是「在前面加一條 queue 把尖峰吸收掉」。這篇文章會說明，為什麼這個直覺在「過載」這個特定情境下不只是沒用，而是有害——它把一個會立刻暴露的容量問題，換成一個會在最糟的時間點、以最糟的方式爆炸的延遲炸彈。讀完之後你會有三樣東西：一條能用紙筆驗證「queue 為什麼一定發散」的公式（Little's Law），一個能解釋「為什麼變慢會自己加速」的回饋模型（latency death spiral），以及一套真正解決問題的機制（load shedding 與 backpressure），最後用 pmbanugo 的 actor 框架 Tina 的 bounded mailbox 把這套機制落到具體的 API 上——<code>.ok</code> / <code>.mailbox_full</code> / <code>.pool_exhausted</code> 三種 send 結果各代表什麼、什麼時候該讓系統 crash。</p>
+
+<p>先把用詞對齊。本文講的「過載」（overload）指的是一個很具體的狀態：到達率（arrival rate，記作 λ）持續地、不是瞬間地，超過系統的處理能力（service rate，記作 μ）。注意「持續地」這三個字——如果只是一秒鐘的尖峰，queue 確實能吸收，那是 queue 的正當用途。問題出在當 λ &gt; μ 不是一個尖峰、而是一個趨勢的時候。這兩種情況看起來在 dashboard 上很像（都是 queue 變長），但物理本質天差地別。把它們混為一談，正是「加 queue」這個錯誤決策的源頭。</p>
+
+<h2>浴缸不會因為變大就不溢出——流入大於流出時，緩衝只是延後溢出</h2>
+
+<p>原文用了一個非常乾淨的類比，值得逐字引用：「If water is coming out of the tap (faucet) faster than it can go down the drain, making the bathtub bigger does not prevent a flood. It just delays it.」水龍頭出水比排水管排水快的時候，把浴缸換大不會避免淹水，只是延後。</p>
+
+<p>把這個類比的三個角色對到系統上。水龍頭是到達率 λ——進來的 request；排水管是處理能力 μ——你的 worker 把 request 做完的速率；浴缸是 buffer，也就是那條 queue。原文的圖說把這件事釘死：「When arrival rate (the faucet) exceeds processing rate (the narrow pipe), the buffer (the bathtub) eventually overflows.」</p>
+
+<p>這個類比之所以重要，是因為它把一個關於「容量」的迷思戳破了。直覺上我們以為 queue 是容量——「我有一條十萬深的 queue，所以我能撐十萬個 request」。錯。queue 不是容量，queue 是時間。一條深度 D 的 queue，在到達率 λ、處理速率 μ 的情況下，能撐的時間大約是 <code>D / (λ − μ)</code> 秒。只要 λ &gt; μ，這個時間是有限的——把 D 加倍，撐的時間加倍，但終究是有限。你買到的不是「不會崩」，是「晚幾分鐘崩」。而且那幾分鐘裡，每一個進到 queue 的 request 都在累積延遲，所以崩的時候，整缸水是滾燙的。</p>
+
+<p>下面這個 widget 把浴缸實際模擬出來。你可以調水龍頭（流入）與排水管（流出，有上限——這就是 μ）的速率，按 play 看水位怎麼變。當流入持續大於流出時，無論你把浴缸（buffer 容量）設多大，水位都會單調爬升到溢出；只有把流入壓回流出以下，水位才會回落。這就是 queue 在過載下的全部故事，沒有別的。</p>
+
+<figure class="vg-w-loop-bathtub">
+  <style>
+    .vg-w-loop-bathtub { display: grid; gap: var(--s-2); margin: var(--s-4) 0; }
+    .vg-w-loop-bathtub .controls { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s-2) var(--s-3); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+    .vg-w-loop-bathtub .ctl { display: flex; align-items: center; gap: var(--s-1); flex: 1 1 240px; }
+    .vg-w-loop-bathtub .ctl input[type="range"] { flex: 1; height: 36px; accent-color: var(--accent); touch-action: none; }
+    .vg-w-loop-bathtub .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 5ch; text-align: right; }
+    .vg-w-loop-bathtub .toolbar { display: flex; gap: var(--s-2); align-items: center; font-family: var(--sans); font-size: var(--fs-sm); }
+    .vg-w-loop-bathtub button { min-height: 44px; min-width: 44px; padding: var(--s-1) var(--s-2); border: 1px solid var(--line); background: var(--bg); color: var(--ink); cursor: pointer; font-family: var(--sans); }
+    .vg-w-loop-bathtub button:hover { border-color: var(--accent); }
+    .vg-w-loop-bathtub .status { margin-left: auto; font-variant-numeric: tabular-nums; color: var(--muted); }
+    .vg-w-loop-bathtub canvas { width: 100%; height: auto; aspect-ratio: 16 / 9; display: block; }
+    .vg-w-loop-bathtub figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    @media (max-width: 720px) {
+      .vg-w-loop-bathtub canvas { aspect-ratio: 4 / 3; }
+    }
+  </style>
+
+  <svg class="vg-w-loop-bathtub-legend" viewBox="0 0 360 60" role="img" aria-label="inflow lambda into tub, outflow mu out" style="width: 100%; max-width: 360px; height: auto;">
+    <text x="6" y="20" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--accent-text)">λ 流入</text>
+    <path d="M58 16 H150" stroke="var(--accent)" stroke-width="2" fill="none" marker-end="url(#vg-w-loop-bathtub-arrow)"/>
+    <rect x="150" y="8" width="60" height="44" rx="4" fill="none" stroke="var(--ink)" stroke-width="1.5"/>
+    <text x="180" y="34" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--muted)">buffer</text>
+    <path d="M210 44 H300" stroke="var(--sage-deep)" stroke-width="2" fill="none" marker-end="url(#vg-w-loop-bathtub-arrow)"/>
+    <text x="306" y="48" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--sage-deep)">μ 流出</text>
+    <defs>
+      <marker id="vg-w-loop-bathtub-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+        <path d="M0 0 L10 5 L0 10 z" fill="currentColor"/>
+      </marker>
+    </defs>
+  </svg>
+
+  <div class="controls">
+    <span class="ctl">
+      <label for="vg-w-loop-bathtub-in">水龍頭 λ</label>
+      <input id="vg-w-loop-bathtub-in" type="range" min="0" max="200" value="140" />
+      <span class="readout" id="vg-w-loop-bathtub-in-out">140</span>
+    </span>
+    <span class="ctl">
+      <label for="vg-w-loop-bathtub-out">排水管 μ</label>
+      <input id="vg-w-loop-bathtub-out" type="range" min="0" max="200" value="100" />
+      <span class="readout" id="vg-w-loop-bathtub-out-out">100</span>
+    </span>
+  </div>
+
+  <div class="toolbar">
+    <button data-act="toggle" aria-label="play or pause">▷ play</button>
+    <button data-act="reset" aria-label="reset">↺ reset</button>
+    <span class="status" data-status>水位 0% · 穩定</span>
+  </div>
+
+  <canvas role="img" aria-label="bathtub overflow simulation with adjustable inflow and outflow"></canvas>
+
+  <figcaption>排水管 μ 有實體上限，水龍頭 λ 沒有。當 λ &gt; μ，水位（queue depth）以斜率 λ−μ 線性爬升；浴缸再大也只是延後溢出的時刻。把 λ 拉回 μ 以下，水位才會回落——這是唯一能阻止溢出的操作。</figcaption>
+
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-loop-bathtub');
+      const canvas = root.querySelector('canvas');
+      const inIn = root.querySelector('#vg-w-loop-bathtub-in');
+      const outIn = root.querySelector('#vg-w-loop-bathtub-out');
+      const inOut = root.querySelector('#vg-w-loop-bathtub-in-out');
+      const outOut = root.querySelector('#vg-w-loop-bathtub-out-out');
+      const toggleBtn = root.querySelector('[data-act=toggle]');
+      const resetBtn = root.querySelector('[data-act=reset]');
+      const statusEl = root.querySelector('[data-status]');
+      const ctx = canvas.getContext('2d');
+
+      let cssW = 0, cssH = 0;
+      function resize() {
+        const dpr = window.devicePixelRatio || 1;
+        const rect = canvas.getBoundingClientRect();
+        cssW = rect.width; cssH = rect.height;
+        canvas.width = Math.max(1, cssW * dpr);
+        canvas.height = Math.max(1, cssH * dpr);
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      }
+      new ResizeObserver(resize).observe(canvas);
+
+      const CAP = 100; // 浴缸容量百分比
+      let running = false, level = 0, overflowed = 0;
+
+      function readColor(name, fallback) {
+        return getComputedStyle(root).getPropertyValue(name).trim() || fallback;
+      }
+
+      function step(dt) {
+        const lambda = Number(inIn.value);
+        const muReq = Number(outIn.value);
+        // 排水有上限：排出速率 = min(μ, 目前有水可排)
+        const mu = level > 0 ? muReq : Math.min(muReq, lambda);
+        const dLevel = (lambda - mu) * dt * 0.6;
+        level += dLevel;
+        if (level < 0) level = 0;
+        if (level > CAP) { overflowed += (level - CAP); level = CAP; }
+      }
+
+      function draw() {
+        ctx.clearRect(0, 0, cssW, cssH);
+        const accent = readColor('--accent', '#c4622d');
+        const ink = readColor('--ink', '#222');
+        const muted = readColor('--muted', '#888');
+        const line = readColor('--line', '#ccc');
+        const sage = readColor('--sage-deep', '#5f7a52');
+
+        const tubX = cssW * 0.18, tubW = cssW * 0.5;
+        const tubTop = cssH * 0.22, tubH = cssH * 0.6;
+
+        // 浴缸外框
+        ctx.strokeStyle = line; ctx.lineWidth = 2;
+        ctx.strokeRect(tubX, tubTop, tubW, tubH);
+
+        // 水位
+        const fillH = (level / CAP) * tubH;
+        ctx.fillStyle = level >= CAP ? accent : sage;
+        ctx.globalAlpha = 0.35;
+        ctx.fillRect(tubX, tubTop + tubH - fillH, tubW, fillH);
+        ctx.globalAlpha = 1;
+
+        // 水龍頭（流入）箭頭
+        const lambda = Number(inIn.value), muReq = Number(outIn.value);
+        ctx.fillStyle = ink; ctx.font = '13px Manrope, sans-serif';
+        ctx.fillText('λ 流入 = ' + lambda, tubX, tubTop - 8);
+        ctx.strokeStyle = accent; ctx.lineWidth = Math.max(1, lambda / 30);
+        ctx.beginPath();
+        ctx.moveTo(tubX + tubW * 0.5, tubTop - 4);
+        ctx.lineTo(tubX + tubW * 0.5, tubTop + 6);
+        ctx.stroke();
+
+        // 排水管（流出）箭頭
+        ctx.fillStyle = ink;
+        ctx.fillText('μ 流出 = ' + muReq, tubX + tubW + 14, tubTop + tubH);
+        ctx.strokeStyle = sage; ctx.lineWidth = Math.max(1, muReq / 30);
+        ctx.beginPath();
+        ctx.moveTo(tubX + tubW, tubTop + tubH - 6);
+        ctx.lineTo(tubX + tubW + 10, tubTop + tubH - 6);
+        ctx.stroke();
+
+        // 溢出標記
+        if (level >= CAP) {
+          ctx.fillStyle = accent; ctx.font = '14px Manrope, sans-serif';
+          ctx.fillText('OVERFLOW', tubX + tubW * 0.5 - 30, tubTop + tubH + 22);
+        }
+
+        // 水位刻度文字
+        ctx.fillStyle = muted; ctx.font = '12px JetBrains Mono, monospace';
+        ctx.fillText('queue depth ' + level.toFixed(0) + '%', tubX, tubTop + tubH + 22);
+      }
+
+      let last = performance.now();
+      function frame(now) {
+        const dt = Math.min(0.05, (now - last) / 1000); last = now;
+        if (running) step(dt);
+        draw();
+        const lambda = Number(inIn.value), mu = Number(outIn.value);
+        let state = lambda > mu ? '溢出中（λ>μ）' : (lambda < mu ? '回落（λ<μ）' : '臨界（λ=μ）');
+        if (level >= CAP) state = '已溢出';
+        statusEl.textContent = '水位 ' + level.toFixed(0) + '% · ' + state;
+        requestAnimationFrame(frame);
+      }
+      requestAnimationFrame(frame);
+
+      function syncReadouts() { inOut.textContent = inIn.value; outOut.textContent = outIn.value; }
+      inIn.addEventListener('input', syncReadouts);
+      outIn.addEventListener('input', syncReadouts);
+      syncReadouts();
+
+      toggleBtn.addEventListener('click', () => {
+        running = !running;
+        toggleBtn.textContent = running ? '⏸ pause' : '▷ play';
+        last = performance.now();
+      });
+      resetBtn.addEventListener('click', () => {
+        running = false; toggleBtn.textContent = '▷ play'; level = 0; overflowed = 0; last = performance.now();
+      });
+    })();
+  </script>
+</figure>
+
+<p>玩過一輪你會發現一件反直覺的事：當 λ 只比 μ 高一點點（比如 110 對 100），水位爬得慢，慢到你會以為「再撐一下就過去了」。這正是過載最危險的地方——它不是斷崖，是緩坡，而緩坡會騙你不去處理它。等到你發現的時候，水位已經逼近缸頂，而且後面那一整缸水的延遲已經高到沒救。下一節我們用 Little's Law 把這個「水位一定會爬到無限」的直覺變成一個可以算的不等式。</p>
+
+<h2>Little's Law——L = λW 怎麼證明 queue 深度會趨向無限</h2>
+
+<p>排隊理論裡有一條極其簡單、卻被低估的恆等式，叫 Little's Law。它的形式只有三個字母：</p>
+
+<pre data-kind="pseudocode"><code>L = λ × W
+
+L  = 系統裡的平均項目數（queue 深度 + 正在處理的）
+λ  = 平均到達率（requests per second）
+W  = 平均每個項目待在系統裡的時間（seconds）</code></pre>
+
+<p>這條定律的美在於它幾乎不需要假設——它對任何穩定的排隊系統都成立，不管到達分布是 Poisson 還是別的、不管服務時間是固定還是隨機、不管你有幾個 worker。它是個會計恆等式：穩態下「系統裡有多少東西」等於「東西進來的速率」乘上「每個東西待多久」。</p>
+
+<p>關鍵字是「穩定」（stable）。Little's Law 成立的前提是系統達到 steady state——進出平衡，L 收斂到一個有限值。而系統能達到 steady state 的條件，正是 λ &lt; μ。當 λ &lt; μ，每個進來的 request 平均等待時間 W 是有限的，於是 L = λW 是有限的，queue 有個穩定的深度。</p>
+
+<p>現在把 λ 推過 μ。原文講得很直白：當每秒有 5,000 個 request 進來、但只有 1,000 個能被處理時，「Little's Law dictates that the number of items in your queue (L) must grow toward infinity」——queue 裡的項目數 L 必須趨向無限。為什麼？因為當 λ &gt; μ，系統不再有 steady state。每個新進的 request 前面排的人比上一個更多，所以它的 W 比上一個更長；W 沒有上界，於是 L = λW 也沒有上界。L 不是「變大」，是「發散」——它沒有收斂的終點，只有 buffer 容量這個人為的天花板。撞到天花板那一刻，就是溢出。</p>
+
+<p>下面這個 widget 讓你直接操弄 λ 與 W，看 L = λW 在 utilization ρ = λ/μ 跨過 1 的時候怎麼從一條溫和的曲線變成一面牆。把 λ 拉到 μ 以下，L 是個矮矮的有限值；把 λ 推過 μ，曲線在 ρ=1 附近垂直起飛——這就是排隊理論裡著名的「knee」，p99 latency 在系統利用率逼近 100% 時爆炸的數學根源。</p>
+
+<figure class="vg-w-param-demo-littles-law" data-svg-scroll="800">
+  <style>
+    .vg-w-param-demo-littles-law { display: grid; grid-template-rows: auto 1fr auto; gap: var(--s-2); margin: var(--s-4) 0; }
+    .vg-w-param-demo-littles-law .controls { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s-2) var(--s-3); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+    .vg-w-param-demo-littles-law .ctl { display: flex; align-items: center; gap: var(--s-1); flex: 1 1 240px; }
+    .vg-w-param-demo-littles-law .ctl input { flex: 1; height: 36px; accent-color: var(--accent); touch-action: none; }
+    .vg-w-param-demo-littles-law .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 6ch; text-align: right; }
+    .vg-w-param-demo-littles-law .verdict { font-family: var(--sans); font-size: var(--fs-sm); font-variant-numeric: tabular-nums; }
+    .vg-w-param-demo-littles-law svg { width: 100%; height: auto; }
+    .vg-w-param-demo-littles-law figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+  </style>
+
+  <div class="controls">
+    <span class="ctl">
+      <label for="vg-w-param-demo-littles-law-lambda">到達率 λ</label>
+      <input id="vg-w-param-demo-littles-law-lambda" type="range" min="100" max="2000" step="20" value="700" />
+      <span class="readout" id="vg-w-param-demo-littles-law-lambda-out">700</span>
+    </span>
+    <span class="ctl">
+      <label for="vg-w-param-demo-littles-law-w">基礎處理時間 W₀(ms)</label>
+      <input id="vg-w-param-demo-littles-law-w" type="range" min="1" max="20" step="1" value="8" />
+      <span class="readout" id="vg-w-param-demo-littles-law-w-out">8</span>
+    </span>
+  </div>
+
+  <svg viewBox="0 0 720 320" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Little's Law queue depth vs utilization">
+    <line x1="64" y1="280" x2="700" y2="280" stroke="var(--muted-2)" stroke-width="1" />
+    <line x1="64" y1="20"  x2="64"  y2="280" stroke="var(--muted-2)" stroke-width="1" />
+    <text x="382" y="310" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--muted)">utilization ρ = λ / μ</text>
+    <text x="22" y="150" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--muted)" transform="rotate(-90 22 150)">queue depth L</text>
+
+    <!-- ρ=1 stability boundary -->
+    <line id="vg-w-param-demo-littles-law-rho1" x1="382" y1="20" x2="382" y2="280" stroke="var(--accent)" stroke-width="1" stroke-dasharray="4 4" />
+    <text x="388" y="36" font-family="Manrope, sans-serif" font-size="11" fill="var(--accent-text)">ρ = 1 穩定邊界</text>
+
+    <g font-family="JetBrains Mono, monospace" font-size="10" fill="var(--muted)">
+      <text x="60" y="284" text-anchor="end">0</text>
+      <text x="223" y="296" text-anchor="middle">0.5</text>
+      <text x="382" y="296" text-anchor="middle">1.0</text>
+      <text x="541" y="296" text-anchor="middle">1.5</text>
+      <text x="700" y="296" text-anchor="middle">2.0</text>
+    </g>
+
+    <!-- L curve (rendered by JS) -->
+    <path id="vg-w-param-demo-littles-law-curve" fill="none" stroke="var(--sage-deep)" stroke-width="2.5" />
+    <!-- current operating point -->
+    <circle id="vg-w-param-demo-littles-law-dot" r="5" fill="var(--accent)" stroke="var(--bg)" stroke-width="1.5" />
+  </svg>
+
+  <figcaption id="vg-w-param-demo-littles-law-cap">
+    μ（單一 worker 處理能力）固定為 1000 req/s。當 ρ &lt; 1，L = λW 收斂；ρ → 1 時 L 隨 1/(1−ρ) 沿牆面起飛；ρ ≥ 1 系統不再有 steady state，L 在現實中只被 buffer 容量截斷。
+  </figcaption>
+
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-param-demo-littles-law');
+      const lam = root.querySelector('#vg-w-param-demo-littles-law-lambda');
+      const w0 = root.querySelector('#vg-w-param-demo-littles-law-w');
+      const lamOut = root.querySelector('#vg-w-param-demo-littles-law-lambda-out');
+      const w0Out = root.querySelector('#vg-w-param-demo-littles-law-w-out');
+      const curve = root.querySelector('#vg-w-param-demo-littles-law-curve');
+      const dot = root.querySelector('#vg-w-param-demo-littles-law-dot');
+      const cap = root.querySelector('#vg-w-param-demo-littles-law-cap');
+
+      const X0 = 64, X1 = 700, Y0 = 280, Y1 = 20;
+      const MU = 1000;           // 固定 service rate
+      const RHO_MAX = 2;         // x 軸到 2.0
+      const L_MAX = 60;          // y 軸上界（深度），超過視為撞牆
+
+      function xOfRho(rho) { return X0 + (rho / RHO_MAX) * (X1 - X0); }
+      function yOfL(L) { return Y0 - (Math.min(L_MAX, L) / L_MAX) * (Y0 - Y1); }
+
+      // M/M/1 近似：L = ρ / (1 − ρ)，ρ<1；ρ>=1 視為發散（截到 L_MAX）
+      function Lof(rho) {
+        if (rho >= 0.999) return L_MAX * 2;
+        return rho / (1 - rho);
+      }
+
+      function redraw() {
+        const lambda = Number(lam.value);
+        const w0ms = Number(w0.value);
+        lamOut.textContent = lambda;
+        w0Out.textContent = w0ms;
+
+        // 重畫曲線（與 slider 無關，但每次同步重畫便於閱讀）
+        const pts = [];
+        for (let i = 0; i <= 200; i++) {
+          const rho = (i / 200) * RHO_MAX;
+          const L = Lof(rho);
+          pts.push(`${i === 0 ? 'M' : 'L'} ${xOfRho(rho).toFixed(1)} ${yOfL(L).toFixed(1)}`);
+        }
+        curve.setAttribute('d', pts.join(' '));
+
+        const rho = lambda / MU;
+        const L = Lof(rho);
+        dot.setAttribute('cx', xOfRho(Math.min(RHO_MAX, rho)));
+        dot.setAttribute('cy', yOfL(L));
+
+        let verdict;
+        if (rho < 1) {
+          const Lfin = (rho / (1 - rho)).toFixed(1);
+          const Wms = (w0ms / (1 - rho)).toFixed(1);
+          verdict = `ρ = ${rho.toFixed(2)} · 穩定 · L ≈ ${Lfin} · 有效 W ≈ ${Wms}ms`;
+        } else {
+          verdict = `ρ = ${rho.toFixed(2)} ≥ 1 · 發散 · L → ∞（只被 buffer 容量截斷）· W 無上界`;
+        }
+        cap.textContent = `μ 固定 1000 req/s。${verdict}`;
+      }
+
+      lam.addEventListener('input', redraw);
+      w0.addEventListener('input', redraw);
+      redraw();
+    })();
+  </script>
+</figure>
+
+<p>這裡有個容易被忽略的細節：曲線在 ρ=0.8、ρ=0.9 的時候已經開始翹了，不是等到 ρ=1 才爆。M/M/1 排隊的 L = ρ/(1−ρ) 告訴你，利用率 80% 時 L=4、90% 時 L=9、95% 時 L=19、99% 時 L=99。也就是說，你以為「還有 20% 餘裕」的系統，延遲其實已經是低負載時的好幾倍。這就是為什麼 SRE 圈子有「別讓系統跑到 80% 利用率以上」這條經驗法則——不是 80% 之後就會炸，而是 80% 之後每多 1% 的利用率，p99 latency 的代價急速上升。Little's Law 是這條法則背後的數學。</p>
+
+<p>到這裡，「為什麼 queue 救不了過載」已經有了靜態的答案：因為 λ &gt; μ 時 L 在數學上發散，buffer 只決定撞牆的時間點，不決定撞不撞。但真實系統比這更糟——它不只是被動地等水位爬到溢出，它會主動地把 λ 推得更高、把 μ 壓得更低，自己加速自己的死亡。這個正回饋迴圈，就是下一節的主角。</p>
+
+<h2>latency death spiral——變慢為什麼會自己加速</h2>
+
+<p>前兩節假設 λ 與 μ 是你給定的外部參數。真實系統不是這樣。當 queue 開始變長、延遲開始上升，這件事本身會改變 λ 與 μ——而且是往更糟的方向改。原文把這條鏈描述得很完整，我把它拆成六個環節，每一環都餵養下一環。</p>
+
+<p>第一環：queue 累積。如同原文所說，當「arrival rate (λ) exceeds your processing capacity」，queue 開始堆積。第二環：等到你的 worker 終於處理到某個 request 時，「the client who sent it most likely timed out」——送這個 request 的 client 早就 timeout 了。第三環：client timeout 之後做什麼？它「refreshed the page」，而「That refresh just added another request to the back of the queue」——重整或自動 retry，等於在 queue 尾巴又塞一個 request 進去。</p>
+
+<p>第四環是整條鏈裡最惡毒的一段：系統現在「spending expensive CPU cycles processing dead requests」——花昂貴的 CPU 週期在處理已經死掉的 request（client 已經不在等了）。每處理一個死掉的 request，就是把 μ 浪費掉一份；原文說「your effective processing time (W) worsens. The queue grows faster because of the retries」——有效處理時間 W 惡化，queue 因為 retry 長得更快。第五環：記憶體壓力。queue 越長佔的記憶體越多，「memory pressure triggers garbage collection pauses, which slows down your processing rate」——記憶體壓力觸發 GC 暫停，進一步壓低處理速率 μ。</p>
+
+<p>第六環是迴圈閉合：μ 被 GC 拖慢、被死 request 浪費，同時 λ 被 retry 推高。回到 Little's Law，分子 λ 變大、分母（μ 隱含在 W 裡）變小，L 發散得比沒有回饋時更快。原文那句總結最傳神：「the drain gets clogged while the faucet opens wider」——排水管被堵住的同時，水龍頭開得更大。這就是 latency death spiral：它不是線性惡化，是指數惡化，因為每一環都在放大下一環。</p>
+
+<p>下面把這六環攤成一個鏈。在桌機看是一條帶箭頭的回饋環，在手機看是可點開的卡片——點任一環看它具體怎麼餵養下一環、以及它對 λ 還是 μ 下手。注意最後一條箭頭從第六環指回第一環：這是一個閉合的正回饋迴圈，不是一條有終點的鏈。</p>
+
+<figure class="vg-w-stack-death-spiral">
+  <style>
+    .vg-w-stack-death-spiral { display: flex; flex-direction: column; gap: var(--s-3); align-items: stretch; margin: var(--s-4) 0; }
+    .vg-w-stack-death-spiral input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+    .vg-w-stack-death-spiral .stack-title { font-family: IM Fell English, serif; font-style: italic; font-size: var(--fs-md); margin: 0; color: var(--ink); line-height: 1.4; }
+    .vg-w-stack-death-spiral .stack-cards { display: flex; flex-direction: column; gap: var(--s-1); list-style: none; padding: 0; margin: 0; }
+    .vg-w-stack-death-spiral .stack-cards label { display: block; padding: var(--s-2); border: 1px solid var(--muted-2); border-radius: 2px; cursor: pointer; transition: border-color 200ms, background 200ms; min-height: 44px; }
+    .vg-w-stack-death-spiral .stack-cards label:hover { border-color: var(--accent); }
+    .vg-w-stack-death-spiral .stack-cards .card-head { font-family: EB Garamond, serif; font-size: var(--fs-md); margin: 0 0 4px 0; color: var(--ink); display: flex; align-items: baseline; justify-content: space-between; gap: var(--s-2); flex-wrap: wrap; }
+    .vg-w-stack-death-spiral .stack-cards .card-sub { font-family: IM Fell English, serif; font-style: italic; font-size: var(--fs-sm); color: var(--muted); margin: 0; line-height: 1.5; }
+    .vg-w-stack-death-spiral .stack-cards .card-tag { font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); color: var(--accent-text); font-style: normal; }
+    .vg-w-stack-death-spiral:has(#vg-w-stack-death-spiral-r1:checked) .card-1,
+    .vg-w-stack-death-spiral:has(#vg-w-stack-death-spiral-r2:checked) .card-2,
+    .vg-w-stack-death-spiral:has(#vg-w-stack-death-spiral-r3:checked) .card-3,
+    .vg-w-stack-death-spiral:has(#vg-w-stack-death-spiral-r4:checked) .card-4,
+    .vg-w-stack-death-spiral:has(#vg-w-stack-death-spiral-r5:checked) .card-5,
+    .vg-w-stack-death-spiral:has(#vg-w-stack-death-spiral-r6:checked) .card-6 { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+
+    .vg-w-stack-death-spiral .affordance { font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); display: flex; align-items: center; gap: 6px; margin: 0; }
+    .vg-w-stack-death-spiral .affordance svg { width: 14px !important; height: 14px !important; min-width: 14px; }
+
+    .vg-w-stack-death-spiral svg.diagram { display: none; }
+    @media (min-width: 720px) {
+      .vg-w-stack-death-spiral svg.diagram { display: block; width: 100%; height: auto; max-width: 880px; }
+      .vg-w-stack-death-spiral .stack-title { display: none; }
+      .vg-w-stack-death-spiral .stack-cards { display: none; }
+    }
+    .vg-w-stack-death-spiral .node { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; }
+    .vg-w-stack-death-spiral:has(#vg-w-stack-death-spiral-r1:checked) .node-1,
+    .vg-w-stack-death-spiral:has(#vg-w-stack-death-spiral-r2:checked) .node-2,
+    .vg-w-stack-death-spiral:has(#vg-w-stack-death-spiral-r3:checked) .node-3,
+    .vg-w-stack-death-spiral:has(#vg-w-stack-death-spiral-r4:checked) .node-4,
+    .vg-w-stack-death-spiral:has(#vg-w-stack-death-spiral-r5:checked) .node-5,
+    .vg-w-stack-death-spiral:has(#vg-w-stack-death-spiral-r6:checked) .node-6 { fill: var(--accent); fill-opacity: 0.18; stroke: var(--accent); }
+
+    .vg-w-stack-death-spiral .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; font-family: var(--serif); font-size: var(--fs-sm); line-height: 1.6; }
+    .vg-w-stack-death-spiral:has(#vg-w-stack-death-spiral-r1:checked) .detail-1,
+    .vg-w-stack-death-spiral:has(#vg-w-stack-death-spiral-r2:checked) .detail-2,
+    .vg-w-stack-death-spiral:has(#vg-w-stack-death-spiral-r3:checked) .detail-3,
+    .vg-w-stack-death-spiral:has(#vg-w-stack-death-spiral-r4:checked) .detail-4,
+    .vg-w-stack-death-spiral:has(#vg-w-stack-death-spiral-r5:checked) .detail-5,
+    .vg-w-stack-death-spiral:has(#vg-w-stack-death-spiral-r6:checked) .detail-6 { display: block; }
+    .vg-w-stack-death-spiral .detail strong { color: var(--accent-text); }
+    .vg-w-stack-death-spiral figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-2); }
+  </style>
+
+  <p class="affordance">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M9 18l6-6-6-6"/>
+    </svg>
+    <span>點任一環看它怎麼餵養下一環 · 6 環閉合迴圈</span>
+  </p>
+
+  <input type="radio" id="vg-w-stack-death-spiral-r1" name="vg-w-stack-death-spiral-sel" checked aria-label="環 1 queue 累積" />
+  <input type="radio" id="vg-w-stack-death-spiral-r2" name="vg-w-stack-death-spiral-sel" aria-label="環 2 client timeout" />
+  <input type="radio" id="vg-w-stack-death-spiral-r3" name="vg-w-stack-death-spiral-sel" aria-label="環 3 retry" />
+  <input type="radio" id="vg-w-stack-death-spiral-r4" name="vg-w-stack-death-spiral-sel" aria-label="環 4 處理死 request" />
+  <input type="radio" id="vg-w-stack-death-spiral-r5" name="vg-w-stack-death-spiral-sel" aria-label="環 5 GC 暫停" />
+  <input type="radio" id="vg-w-stack-death-spiral-r6" name="vg-w-stack-death-spiral-sel" aria-label="環 6 迴圈閉合" />
+
+  <p class="stack-title" id="vg-w-stack-death-spiral-title">latency death spiral——六環正回饋，每一環餵養下一環</p>
+  <ul class="stack-cards" aria-labelledby="vg-w-stack-death-spiral-title">
+    <li class="card-1"><label for="vg-w-stack-death-spiral-r1">
+      <p class="card-head"><span>1 · queue 累積</span><code class="card-tag">λ &gt; μ</code></p>
+      <p class="card-sub">到達率超過處理能力，queue 開始堆積，每個 request 的等待時間單調上升。</p>
+    </label></li>
+    <li class="card-2"><label for="vg-w-stack-death-spiral-r2">
+      <p class="card-head"><span>2 · client 已 timeout</span><code class="card-tag">W↑</code></p>
+      <p class="card-sub">worker 終於處理到時，送出的 client 早已 timeout——這份工作的結果沒人在等了。</p>
+    </label></li>
+    <li class="card-3"><label for="vg-w-stack-death-spiral-r3">
+      <p class="card-head"><span>3 · retry 推高 λ</span><code class="card-tag">λ↑↑</code></p>
+      <p class="card-sub">client 重整／自動 retry，在 queue 尾巴再塞一個 request——到達率不降反升。</p>
+    </label></li>
+    <li class="card-4"><label for="vg-w-stack-death-spiral-r4">
+      <p class="card-head"><span>4 · 處理死 request</span><code class="card-tag">μ 浪費</code></p>
+      <p class="card-sub">CPU 花在處理沒人等的死 request，有效吞吐被白白消耗，effective W 進一步惡化。</p>
+    </label></li>
+    <li class="card-5"><label for="vg-w-stack-death-spiral-r5">
+      <p class="card-head"><span>5 · GC 暫停</span><code class="card-tag">μ↓</code></p>
+      <p class="card-sub">超長 queue 佔滿記憶體，記憶體壓力觸發 garbage collection 暫停，處理速率 μ 被拖慢。</p>
+    </label></li>
+    <li class="card-6"><label for="vg-w-stack-death-spiral-r6">
+      <p class="card-head"><span>6 · 迴圈閉合</span><code class="card-tag">↺</code></p>
+      <p class="card-sub">μ 變小、λ 變大，L 發散得更快，回到環 1——drain 被堵住的同時 faucet 開得更大。</p>
+    </label></li>
+  </ul>
+
+  <svg class="diagram" viewBox="0 0 880 360" role="img" aria-label="latency death spiral feedback loop">
+    <defs>
+      <marker id="vg-w-stack-death-spiral-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0 0 L10 5 L0 10 z" fill="var(--accent)" />
+      </marker>
+    </defs>
+
+    <text x="40" y="30" font-family="Manrope, sans-serif" font-size="12" fill="var(--muted)" letter-spacing="0.08em">LATENCY DEATH SPIRAL · 正回饋迴圈</text>
+
+    <!-- 六個節點環狀排列 -->
+    <g font-family="EB Garamond, serif">
+      <rect class="node node-1" x="60"  y="60"  width="220" height="64" rx="6" role="button" tabindex="0" aria-label="環 1" />
+      <text x="74" y="86" font-size="14" fill="var(--ink)">1 · queue 累積</text>
+      <text x="74" y="108" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">λ &gt; μ，深度上升</text>
+
+      <rect class="node node-2" x="330" y="60"  width="220" height="64" rx="6" role="button" tabindex="0" aria-label="環 2" />
+      <text x="344" y="86" font-size="14" fill="var(--ink)">2 · client 已 timeout</text>
+      <text x="344" y="108" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">結果沒人在等</text>
+
+      <rect class="node node-3" x="600" y="60"  width="220" height="64" rx="6" role="button" tabindex="0" aria-label="環 3" />
+      <text x="614" y="86" font-size="14" fill="var(--ink)">3 · retry 推高 λ</text>
+      <text x="614" y="108" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">queue 尾巴再 +1</text>
+
+      <rect class="node node-4" x="600" y="240" width="220" height="64" rx="6" role="button" tabindex="0" aria-label="環 4" />
+      <text x="614" y="266" font-size="14" fill="var(--ink)">4 · 處理死 request</text>
+      <text x="614" y="288" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">μ 被白白浪費</text>
+
+      <rect class="node node-5" x="330" y="240" width="220" height="64" rx="6" role="button" tabindex="0" aria-label="環 5" />
+      <text x="344" y="266" font-size="14" fill="var(--ink)">5 · GC 暫停</text>
+      <text x="344" y="288" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">記憶體壓力 → μ↓</text>
+
+      <rect class="node node-6" x="60"  y="240" width="220" height="64" rx="6" role="button" tabindex="0" aria-label="環 6" />
+      <text x="74" y="266" font-size="14" fill="var(--ink)">6 · 迴圈閉合</text>
+      <text x="74" y="288" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">回到環 1，更快</text>
+    </g>
+
+    <!-- 箭頭 1→2→3→4→5→6→1 -->
+    <line x1="280" y1="92"  x2="326" y2="92"  stroke="var(--accent)" stroke-width="1.5" marker-end="url(#vg-w-stack-death-spiral-arrow)" />
+    <line x1="550" y1="92"  x2="596" y2="92"  stroke="var(--accent)" stroke-width="1.5" marker-end="url(#vg-w-stack-death-spiral-arrow)" />
+    <line x1="710" y1="124" x2="710" y2="236" stroke="var(--accent)" stroke-width="1.5" marker-end="url(#vg-w-stack-death-spiral-arrow)" />
+    <line x1="600" y1="272" x2="554" y2="272" stroke="var(--accent)" stroke-width="1.5" marker-end="url(#vg-w-stack-death-spiral-arrow)" />
+    <line x1="330" y1="272" x2="284" y2="272" stroke="var(--accent)" stroke-width="1.5" marker-end="url(#vg-w-stack-death-spiral-arrow)" />
+    <line x1="170" y1="240" x2="170" y2="128" stroke="var(--accent)" stroke-width="2" stroke-dasharray="5 3" marker-end="url(#vg-w-stack-death-spiral-arrow)" />
+    <text x="184" y="190" font-family="IM Fell English, serif" font-style="italic" font-size="13" fill="var(--accent-text)">正回饋閉合</text>
+  </svg>
+
+  <div>
+    <div class="detail detail-1"><strong>環 1 · queue 累積</strong>：起點。λ &gt; μ 持續存在，queue 深度開始爬升，這還只是「浴缸節」講的線性溢出，尚未進入回饋。</div>
+    <div class="detail detail-2"><strong>環 2 · client 已 timeout</strong>：因為 queue 變長，worker 處理到某 request 時，其 client 早已 timeout 放棄。這份工作此刻起變成「死 request」——做完也沒人收。</div>
+    <div class="detail detail-3"><strong>環 3 · retry 推高 λ</strong>：timeout 的 client 通常會自動 retry 或被使用者重整。每次 retry 在 queue 尾巴再加一個 request，到達率 λ 不降反升——這是回饋的第一個放大器。</div>
+    <div class="detail detail-4"><strong>環 4 · 處理死 request</strong>：系統把昂貴 CPU 花在處理沒人等的死 request 上，等於把 μ 的一部分丟進水裡。原文：effective processing time W worsens，queue grows faster because of the retries。</div>
+    <div class="detail detail-5"><strong>環 5 · GC 暫停</strong>：超長 queue 佔滿 heap，memory pressure 觸發 garbage collection 暫停，這些 stop-the-world 暫停直接壓低 μ——回饋的第二個放大器，這次打的是分母。</div>
+    <div class="detail detail-6"><strong>環 6 · 迴圈閉合</strong>：λ 被 retry 推高、μ 被死 request 與 GC 壓低，L = λW 發散得比無回饋時更快，系統回到環 1 但起點更糟。指數惡化直到完全飽和。</div>
+  </div>
+  <figcaption>六環構成閉合正回饋。注意環 3 打的是分子 λ、環 4 與環 5 打的是分母（μ 隱含在 W 裡）——兩端同時惡化，所以 death spiral 是指數而非線性。</figcaption>
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-stack-death-spiral');
+      const nodes = root.querySelectorAll('svg.diagram .node');
+      function select(n) {
+        const radio = root.querySelector('#vg-w-stack-death-spiral-r' + n);
+        if (radio) radio.checked = true;
+      }
+      nodes.forEach((rect, i) => {
+        const n = i + 1;
+        rect.addEventListener('click', () => select(n));
+        rect.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); select(n); }
+        });
+      });
+    })();
+  </script>
+</figure>
+
+<p>環 3 那個「retry 推高 λ」值得單獨量化，因為它的放大效果比直覺強得多。假設真實到達率是 λ，每個失敗的 request 會以機率 r 觸發一次 retry（client 自動重試、或使用者重整）。在穩態下，有效到達率不是 λ，而是一個幾何級數的和：λ_eff = λ·(1 + r + r² + r³ + …) = λ / (1 − r)。下面的 widget 讓你拖動 retry 機率 r，看有效到達率怎麼被放大——r=0.5 時 λ 直接翻倍，r=0.8 時放大五倍。原本只是「略微超載」的系統，會被 retry 放大成「嚴重超載」，這就是 death spiral 在環 3 把線性問題變成爆炸問題的數學。</p>
+
+<figure class="vg-w-range-retry-amp" data-svg-scroll="720">
+  <style>
+    .vg-w-range-retry-amp { display: grid; gap: var(--s-2); margin: var(--s-4) 0; }
+    .vg-w-range-retry-amp .ctl { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+    .vg-w-range-retry-amp .ctl input { flex: 1; height: 36px; accent-color: var(--accent); touch-action: none; }
+    .vg-w-range-retry-amp .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 5ch; text-align: right; }
+    .vg-w-range-retry-amp svg { width: 100%; height: auto; }
+    .vg-w-range-retry-amp figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+  </style>
+  <div class="ctl">
+    <label for="vg-w-range-retry-amp-r">retry 機率 r =</label>
+    <input id="vg-w-range-retry-amp-r" type="range" min="0" max="0.95" step="0.01" value="0.5" />
+    <span class="readout" id="vg-w-range-retry-amp-r-out">0.50</span>
+  </div>
+  <svg viewBox="0 0 720 200" preserveAspectRatio="xMidYMid meet" role="img" aria-label="retry amplification of effective arrival rate">
+    <text x="40" y="40" font-family="EB Garamond, serif" font-size="14" fill="var(--muted)">真實到達率 λ</text>
+    <rect x="40" y="52" width="120" height="36" rx="4" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.5" />
+    <text x="100" y="75" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--ink)">λ = 1.0×</text>
+
+    <line x1="170" y1="70" x2="240" y2="70" stroke="var(--accent)" stroke-width="1.5" marker-end="url(#vg-w-range-retry-amp-arrow)" />
+    <defs>
+      <marker id="vg-w-range-retry-amp-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="var(--accent)" /></marker>
+    </defs>
+    <text x="205" y="60" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="12" fill="var(--accent-text)">×retry</text>
+
+    <text x="250" y="40" font-family="EB Garamond, serif" font-size="14" fill="var(--muted)">有效到達率 λ_eff = λ / (1 − r)</text>
+    <rect x="250" y="52" width="430" height="36" rx="4" fill="none" stroke="var(--muted-2)" stroke-width="1" />
+    <rect id="vg-w-range-retry-amp-bar" x="250" y="52" width="86" height="36" rx="4" fill="var(--accent)" fill-opacity="0.3" stroke="var(--accent)" stroke-width="1.5" />
+    <text id="vg-w-range-retry-amp-label" x="465" y="75" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--ink)">λ_eff = 2.0×</text>
+
+    <text x="40" y="140" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">幾何級數：λ·(1 + r + r² + r³ + …) = λ/(1−r)</text>
+    <text id="vg-w-range-retry-amp-warn" x="40" y="166" font-family="Manrope, sans-serif" font-size="12" fill="var(--muted)">r 越接近 1，放大倍數趨向無限</text>
+  </svg>
+  <figcaption>retry 把「想用服務的人數」放大成「實際打到後端的 request 數」。系統一旦開始拒絕／timeout，r 上升，λ_eff 沿 1/(1−r) 起飛——這是 death spiral 環 3 的放大器，與 Little's Law 的 1/(1−ρ) 同一個數學形狀。</figcaption>
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-range-retry-amp');
+      const inp = root.querySelector('#vg-w-range-retry-amp-r');
+      const out = root.querySelector('#vg-w-range-retry-amp-r-out');
+      const bar = root.querySelector('#vg-w-range-retry-amp-bar');
+      const label = root.querySelector('#vg-w-range-retry-amp-label');
+      const warn = root.querySelector('#vg-w-range-retry-amp-warn');
+      const X0 = 250, W_MAX = 430, AMP_CAP = 10;
+      function update() {
+        const r = Number(inp.value);
+        out.textContent = r.toFixed(2);
+        const amp = 1 / (1 - r);
+        const shown = Math.min(amp, AMP_CAP);
+        const w = (shown / AMP_CAP) * W_MAX;
+        bar.setAttribute('width', Math.max(6, w).toFixed(1));
+        label.textContent = `λ_eff = ${amp.toFixed(1)}×`;
+        label.setAttribute('x', (X0 + Math.max(6, w) / 2).toFixed(1));
+        warn.textContent = r >= 0.85
+          ? `放大 ${amp.toFixed(1)} 倍——已遠超後端容量，必然進入螺旋`
+          : 'r 越接近 1，放大倍數趨向無限';
+        warn.setAttribute('fill', r >= 0.85 ? 'var(--accent-text)' : 'var(--muted)');
+      }
+      inp.addEventListener('input', update);
+      update();
+    })();
+  </script>
+</figure>
+
+<p>death spiral 最殘酷的性質是它的不可逆性。一旦進入螺旋，就算外部的真實負載（真正想用你服務的人）已經回到正常，系統也不會自己恢復——因為此刻 queue 裡塞滿的是 retry 產生的死 request，系統忙著處理它們、忙著 GC，自己餵自己。要打破螺旋，往往得手動把 queue 清空（drop 掉所有積壓）、重啟服務、或暫時拒絕所有流量讓系統喘口氣。這就是為什麼「加更大的 queue」是反解——它讓螺旋啟動前能積累的死 request 更多，螺旋一旦啟動就更難打破。</p>
+
+<h2>load shedding 與 backpressure——立刻、明確地拒絕，把容量限制同步告訴送方</h2>
+
+<p>既然問題是 λ 持續大於 μ，而你無法增加 μ（worker 就那麼快），唯一能做的就是控制 λ——在源頭把多出來的工作擋下來。這有兩個互補的機制：load shedding（卸載）與 backpressure（背壓）。</p>
+
+<p>load shedding 的核心原則，原文一句話：「when capacity is exceeded, excess is shed immediately」——容量被超過時，多出來的工作立刻被丟棄。注意「immediately」。關鍵不是「拒絕」這件事，而是「立刻」這個時間性質。一個 request 進來，系統若已滿載，必須在 O(1) 時間內回一個明確的「我滿了」，而不是把它收進一條無界 queue 裡讓它慢慢爛、最後讓 client timeout。原文：「If the system is at capacity, it must reject new work immediately.」</p>
+
+<p>backpressure 是 load shedding 的「溝通」面。光是丟棄不夠——你得讓送方知道你丟了，而且要立刻知道。原文：「The sender must be told instantly so it can make a policy decision.」送方被同步告知「我滿了」之後，它能做出明智的決定：稍後 retry（帶 backoff）、優雅降級（degraded mode，回快取的舊資料）、或 fail fast（直接告訴使用者現在不行）。這三條都比「讓下游 timeout」好得多——因為 timeout 是最壞的失敗模式：送方等了整整 timeout 的時間才知道失敗，這段時間它的資源也被佔著，而且它沒有任何資訊能判斷該怎麼反應。</p>
+
+<p>把這兩個機制對照「往 queue 塞」這個反模式，差別是「明確 vs. 沉默」。無界 queue 是沉默地接受——它對送方說「收到了」，但其實這個 request 永遠不會被及時處理。Backpressure 是明確地拒絕——它對送方說「我滿了，你自己決定怎麼辦」。沉默的接受製造了容量的假象（illusion of capacity），明確的拒絕保留了送方的決策權。一個系統在過載下最有價值的行為，不是假裝還能吃，而是誠實地說不。</p>
+
+<p>下面這個 before/after 把同一個過載瞬間並排：左邊是無界 queue 的「沉默接受」，右邊是 bounded mailbox + backpressure 的「明確拒絕」。拖動中間的分隔線，看同一波超過容量的流量在兩種設計下的下場——左邊全部收下、queue 無限長大、最終所有 client timeout；右邊收到容量為止、其餘立刻回 <code>.mailbox_full</code>，送方拿到訊號去做 retry／降級／fail-fast。</p>
+
+<figure class="vg-w-ba-queue-vs-backpressure">
+  <style>
+    .vg-w-ba-queue-vs-backpressure { position: relative; aspect-ratio: 16 / 9; overflow: hidden; margin: var(--s-4) 0; border: 1px solid var(--line); border-radius: 4px; }
+    .vg-w-ba-queue-vs-backpressure .layer { position: absolute; inset: 0; }
+    .vg-w-ba-queue-vs-backpressure .after { clip-path: polygon(50% 0, 100% 0, 100% 100%, 50% 100%); }
+    .vg-w-ba-queue-vs-backpressure .divider { position: absolute; top: 0; bottom: 0; left: 50%; width: 32px; transform: translateX(-50%); cursor: ew-resize; touch-action: none; z-index: 2; }
+    .vg-w-ba-queue-vs-backpressure .divider::before { content: ''; position: absolute; left: 50%; top: 0; bottom: 0; width: 2px; transform: translateX(-50%); background: var(--accent); }
+    .vg-w-ba-queue-vs-backpressure .divider::after { content: '↔'; position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); background: var(--accent); color: var(--bg); width: 32px; height: 32px; border-radius: 50%; display: grid; place-items: center; font-family: var(--sans); font-size: 16px; }
+    .vg-w-ba-queue-vs-backpressure .affordance { position: absolute; top: 6px; left: 8px; z-index: 3; font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); display: flex; align-items: center; gap: 6px; margin: 0; }
+    .vg-w-ba-queue-vs-backpressure .affordance svg { width: 14px !important; height: 14px !important; min-width: 14px; }
+  </style>
+
+  <p class="affordance">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <polyline points="8 18 2 12 8 6"/><polyline points="16 6 22 12 16 18"/>
+    </svg>
+    <span>拖分隔線 · 無界 queue vs bounded mailbox</span>
+  </p>
+
+  <svg class="layer before" viewBox="0 0 640 360" preserveAspectRatio="xMidYMid meet" role="img" aria-label="unbounded queue silently accepts">
+    <rect width="640" height="360" fill="var(--bg-soft)" />
+    <text x="32" y="48" font-family="Manrope, sans-serif" font-size="22" fill="var(--muted)" letter-spacing="0.04em">UNBOUNDED QUEUE · 沉默接受</text>
+    <g>
+      <rect x="32" y="116" width="40" height="32" rx="3" fill="var(--accent)" fill-opacity="0.25" stroke="var(--muted-2)" />
+      <rect x="80" y="116" width="40" height="32" rx="3" fill="var(--accent)" fill-opacity="0.25" stroke="var(--muted-2)" />
+      <rect x="128" y="116" width="40" height="32" rx="3" fill="var(--accent)" fill-opacity="0.25" stroke="var(--muted-2)" />
+      <rect x="176" y="116" width="40" height="32" rx="3" fill="var(--accent)" fill-opacity="0.25" stroke="var(--muted-2)" />
+      <text x="232" y="138" font-family="JetBrains Mono, monospace" font-size="22" fill="var(--accent-text)">… 無限長大 →</text>
+    </g>
+    <text x="32" y="212" font-family="EB Garamond, serif" font-size="22" fill="var(--ink)">每個 request 都回「收到了」</text>
+    <text x="32" y="248" font-family="EB Garamond, serif" font-size="22" fill="var(--ink)">queue 深度 L → ∞，記憶體爆掉</text>
+    <text x="32" y="306" font-family="IM Fell English, serif" font-style="italic" font-size="22" fill="var(--accent-text)">下場：client 全 timeout，死 request 觸發螺旋</text>
+  </svg>
+
+  <svg class="layer after" viewBox="0 0 640 360" preserveAspectRatio="xMidYMid meet" id="vg-w-ba-queue-vs-backpressure-after" role="img" aria-label="bounded mailbox explicitly rejects">
+    <rect width="640" height="360" fill="var(--bg)" />
+    <text x="32" y="48" font-family="Manrope, sans-serif" font-size="22" fill="var(--sage-deep)" letter-spacing="0.04em">BOUNDED MAILBOX · 明確拒絕</text>
+    <g>
+      <rect x="32" y="116" width="40" height="32" rx="3" fill="var(--sage)" fill-opacity="0.3" stroke="var(--sage-deep)" />
+      <rect x="80" y="116" width="40" height="32" rx="3" fill="var(--sage)" fill-opacity="0.3" stroke="var(--sage-deep)" />
+      <rect x="128" y="116" width="40" height="32" rx="3" fill="var(--sage)" fill-opacity="0.3" stroke="var(--sage-deep)" />
+      <line x1="180" y1="108" x2="180" y2="156" stroke="var(--accent)" stroke-width="2" />
+      <text x="192" y="138" font-family="JetBrains Mono, monospace" font-size="22" fill="var(--accent-text)">256 滿</text>
+    </g>
+    <text x="32" y="212" font-family="EB Garamond, serif" font-size="22" fill="var(--ink)">收到容量為止，其餘回 .mailbox_full</text>
+    <text x="32" y="248" font-family="EB Garamond, serif" font-size="22" fill="var(--ink)">送方同步拿到「我滿了」訊號</text>
+    <text x="32" y="306" font-family="IM Fell English, serif" font-style="italic" font-size="22" fill="var(--sage-deep)">下場：retry／降級／fail-fast，不發散</text>
+  </svg>
+
+  <div class="divider" id="vg-w-ba-queue-vs-backpressure-divider"></div>
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-ba-queue-vs-backpressure');
+      const after = root.querySelector('#vg-w-ba-queue-vs-backpressure-after');
+      const divider = root.querySelector('#vg-w-ba-queue-vs-backpressure-divider');
+      let dragging = false;
+      function setPct(pct) {
+        const c = Math.max(0, Math.min(100, pct));
+        after.style.clipPath = `polygon(${c}% 0, 100% 0, 100% 100%, ${c}% 100%)`;
+        divider.style.left = `${c}%`;
+      }
+      divider.addEventListener('pointerdown', (e) => { dragging = true; divider.setPointerCapture(e.pointerId); });
+      root.addEventListener('pointermove', (e) => {
+        if (!dragging) return;
+        const rect = root.getBoundingClientRect();
+        setPct(((e.clientX - rect.left) / rect.width) * 100);
+      });
+      root.addEventListener('pointerup', () => { dragging = false; });
+      root.addEventListener('pointercancel', () => { dragging = false; });
+    })();
+  </script>
+</figure>
+
+<p>具體怎麼落地？答案是 bounded queue 加 timeout。把每條 queue（mailbox）設一個嚴格的上限，滿了就同步回拒；對可靠性關鍵的操作，強制設一個毫秒級 timeout，避免無限等待。下一節我們看 pmbanugo 的 actor 框架 Tina 怎麼把這套原則變成具體的 API——三種 send 結果、強制 timeout 的 Effect_Call。</p>
+
+<h2>Tina 的 bounded mailbox——把「立刻拒絕」變成型別系統強制的三種 send 結果</h2>
+
+<p>Tina 是一個 actor 模型框架（Isolate 是它的 actor 單位，Shard 是承載 Isolate 的記憶體池）。它把上一節的原則做成了一個不給你犯錯空間的設計：mailbox 嚴格有界，沒有「unbounded 模式」這個選項。</p>
+
+<p>原文對 mailbox 的描述很具體：「A standard Isolate mailbox holds exactly 256 messages by default (a configurable value)」——標準 mailbox 預設正好容納 256 則訊息，可設定。更關鍵的是它的記憶體承諾：「no dynamic allocation (or malloc) during operation, and there is no 'unbounded' mode」——運作期間沒有動態配置、沒有 malloc、沒有無界模式。這一句把「無界 queue 製造容量假象」這個問題從根上拔掉了：你不可能不小心做出一條會無限長大的 queue，因為框架根本不提供那個選項。</p>
+
+<p>當有人想往一個滿的 mailbox 送訊息，會發生什麼？原文：「the system does not allocate a hidden buffer... It rejects the message in O(1) time」——系統不會偷偷配一個 buffer，它在 O(1) 時間內拒絕。這就是「load shedding immediately」的字面實作。而拒絕的方式，是透過 <code>ctx_send</code> 的同步回傳值——三種結果，每一種對應一個明確的語意，逼著你在 call site 就處理掉它：</p>
+
+<figure class="vg-w-table-send-results">
+  <style>
+    .vg-w-table-send-results { margin: var(--s-4) 0; overflow-x: auto; }
+    .vg-w-table-send-results table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+    .vg-w-table-send-results thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; }
+    .vg-w-table-send-results thead th[data-sort] { color: var(--accent-text); }
+    .vg-w-table-send-results tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+    .vg-w-table-send-results td code { font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); color: var(--accent-text); }
+    .vg-w-table-send-results .affordance { font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); display: flex; align-items: center; gap: 6px; margin: 0 0 var(--s-2) 0; }
+    .vg-w-table-send-results .affordance svg { width: 14px !important; height: 14px !important; min-width: 14px; }
+    .vg-w-table-send-results figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-2); }
+  </style>
+
+  <p class="affordance">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/><path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+    </svg>
+    <span>點欄位 header 排序 · 3 種 send 結果 × 3 欄</span>
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th data-key="result">send 結果</th>
+        <th data-key="meaning">語意（原文）</th>
+        <th data-key="action">送方該做什麼</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>.ok</code></td>
+        <td>Message successfully enqueued——訊息成功入列。</td>
+        <td>正常路徑，繼續。mailbox 還有空間。</td>
+      </tr>
+      <tr>
+        <td><code>.mailbox_full</code></td>
+        <td>The destination is overwhelmed——目的地已飽和，必須 shed load。</td>
+        <td>backpressure 觸發。送方自己決定：retry with backoff、降級、或 fail fast。不要硬塞。</td>
+      </tr>
+      <tr>
+        <td><code>.pool_exhausted</code></td>
+        <td>The Shard's memory pool is fully saturated——整個記憶體池飽和。Let it crash.</td>
+        <td>系統級飽和，不是單一 mailbox 的問題。放手讓它 crash，由 supervisor 重啟。</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <figcaption>三種結果的層級不同：<code>.mailbox_full</code> 是「這個收件人忙」（局部背壓，可恢復）；<code>.pool_exhausted</code> 是「整台機器的記憶體池滿了」（全局飽和，crash 比硬撐安全）。把兩者分開，讓你對局部過載做優雅降級、對全局飽和做 fail-fast crash。</figcaption>
+</figure>
+
+<p>注意這個設計的哲學。最戲劇性的是 <code>.pool_exhausted</code> 對應的「Let it crash」——這是 Erlang/OTP 一脈相承的 supervisor 哲學：當系統進入一個它無法安全處理的狀態（記憶體池整個飽和），最安全的反應不是硬撐（硬撐會進 death spiral），而是讓這個 process crash，由上層 supervisor 在一個乾淨的 state 重啟。crash 是一種 backpressure——它是對整個系統最強烈、最不容忽視的「我滿了」。把它跟 <code>.mailbox_full</code> 分開，等於把「局部忙」與「全局垮」這兩件本質不同的事，在型別層面就區分開，逼你分別處理。</p>
+
+<p>send 結果處理的是「往別人的 mailbox 塞」這個方向。但還有另一個方向的問題：你呼叫別人、等別人回，這個等待本身可能無限長。Tina 對此的答案是強制 timeout 的 <code>Effect_Call</code>。原文給的形狀是這樣：</p>
+
+<pre data-kind="pseudocode"><code><em>// 對可靠性關鍵的操作，timeout 是必填欄位，不是 optional</em>
+return tina.Effect_Call{
+    to = billing_handle,
+    message = transform_request_to_message(request),
+    timeout = 5000, <em>// Mandatory timeout in milliseconds</em>
+}</code></pre>
+
+<p>關鍵字是「Mandatory」。timeout 不是一個你可以忘記設、忘記設就退化成「等到天荒地老」的 optional 欄位——它是必填的。原文描述 timeout 到期時的行為：「you do not wait forever. The mandatory timeout fires, the scheduler wakes your Isolate with a TAG_CALL_TIMEOUT message, and you handle the failure.」——你不會永遠等下去；強制 timeout 觸發，scheduler 用一個 <code>TAG_CALL_TIMEOUT</code> 訊息喚醒你的 Isolate，你處理這個失敗。</p>
+
+<p>把這兩個機制放回 Little's Law 的框架看，它們各自關掉了 death spiral 的一個放大器。bounded mailbox + <code>.mailbox_full</code> 同步回拒，從源頭壓住 λ——多出來的 request 不進 queue，所以 retry 沒有累積的地方，環 3 的放大器失效。強制 timeout 則砍掉 W 的尾巴——一個 call 最多等 5000ms，不會有 request 在 queue 裡爛到 client 早就走了的程度，環 2 與環 4 的「死 request」無從產生。兩個機制合起來，把一個會發散的系統，按回到 ρ &lt; 1 的穩定區。</p>
+
+<p>下面用偽碼把「收到 <code>.mailbox_full</code> 該怎麼反應」收束成一個能直接套用的決策骨架——這就是 backpressure 從原則變成程式碼的樣子：</p>
+
+<pre data-kind="pseudocode"><code><em>// backpressure 的決策骨架：拿到拒絕後，由送方做 policy decision</em>
+result = ctx_send(downstream, msg)
+
+match result {
+    .ok =&gt; continue,                <em>// 正常路徑</em>
+
+    .mailbox_full =&gt; {              <em>// 局部背壓——三選一，別硬塞</em>
+        if request.is_idempotent {
+            schedule_retry(msg, backoff_ms)   <em>// 稍後重試</em>
+        } else if has_cached_fallback {
+            return degraded(cached_value)     <em>// 優雅降級</em>
+        } else {
+            return fail_fast(503)             <em>// 快速失敗，告訴使用者現在不行</em>
+        }
+    }
+
+    .pool_exhausted =&gt; panic(),     <em>// 全局飽和——let it crash，由 supervisor 重啟</em>
+}</code></pre>
+
+<p>這段骨架裡沒有一條路徑是「把 msg 收進一條更大的 queue 然後祈禱」。每一條都是立刻、明確的決定。這正是過載處理與「加 queue」的根本分野：前者承認容量有限並誠實地把限制傳回去，後者用一層緩衝假裝限制不存在，直到限制以最暴力的方式重新出現。</p>
+
+<p>最後值得一提的是這套設計的可組合性。當每一層都用 bounded mailbox + backpressure，背壓會沿著呼叫鏈自然地往上游傳播：最底層的 worker 滿了回 <code>.mailbox_full</code>，它的上游收到後也會更快地滿、也回 <code>.mailbox_full</code>，一路傳到最前端的 load balancer，後者直接回 503 給真正的 client。整條鏈在過載下不是某一點崩潰、其餘還在傻傻接收，而是協調一致地、立刻地把「我滿了」這個訊號傳到能做決定的地方——也就是最前端，那個唯一知道「這個 request 對使用者到底重不重要」的地方。這才是過載時你要的行為：不是更大的浴缸，是一個會在水龍頭那端就把水關小的系統。</p>
+
+<p class="vg-deep-closer"><strong>Take-away</strong>：queue 不是容量，是時間——λ &gt; μ 時 Little's Law 保證 L 發散，buffer 只決定撞牆的時刻而非撞不撞；過載下唯一有效的動作是 load shedding 與 backpressure，立刻、明確地拒絕多出來的工作，把容量限制同步告訴送方，讓它在還有選擇的時候做選擇——而不是讓它 timeout。</p>
+
+</div>
