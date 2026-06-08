@@ -1,0 +1,700 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">同一把 CA 私鑰、同一條簽章數學、
+  同一段 commonName 文字「Root CA」——兩張憑證唯一的差別是 Subject 裡那個字串用 ASN.1 的哪一種型別編碼：
+  一張用 PrintableString（tag 0x13），一張用 UTF8String（tag 0x0c）。
+  OpenSSL 兩張都驗得過；
+  Go 的 crypto/x509 只認其中一張，另一張回你一句 certificate signed by unknown authority。
+  </p>
+  <h1 class="vg-post-title">{{ title }}</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p>
+    <span class="vg-dropcap">這</span>是那種讓人一開始懷疑自己眼睛、最後懷疑整個 PKI 工具鏈的 bug。
+    你有一個自簽的 Root CA，用它簽出一張 leaf 憑證，把 CA 丟進 <code>x509.CertPool</code>，
+    呼叫 <code>leaf.Verify(opts)</code>——回傳 <code>certificate signed by unknown authority</code>。
+    可是 <code>openssl verify -CAfile ca.pem leaf.pem</code> 印出乾淨的 <code>leaf.pem: OK</code>。
+    簽章本身沒問題，到期時間沒問題，basicConstraints 沒問題。
+    把兩張憑證 dump 成 DER，用 <code>openssl asn1parse</code> 逐欄位比對，
+    差異只有兩個 byte——而且不在簽章、不在公鑰、不在任何「安全相關」的欄位，而在 Distinguished Name 裡那個 commonName 字串的 ASN.1 型別 tag。
+  </p>
+
+  <p>
+    這篇用 investigation 的方式重走一次追查：從「明明合法卻驗不過」的謎題出發，
+    先排除幾個直覺上的嫌疑（簽章壞了？信任錨沒裝對？DN 真的不一樣？），再逐步收斂到 Go <code>crypto/x509</code> 內部一行 map lookup——
+    <code>findPotentialParents()</code> 拿 <code>cert.RawIssuer</code> 的原始 DER bytes 當 key，
+    去 <code>byName map[string][]int</code> 裡做 byte-for-byte 比對，
+    而不是語意（DN）比對。
+    只要 leaf 的 Issuer 與 CA 的 Subject 編碼 tag 不同，這個查找就回 0 筆，候選父憑證一張都湊不出來，鏈根本建不起來。
+    值得先講清楚的是：這是 fail-closed 行為——它不會放行一張惡意憑證，它只會擋掉一張本來合法的；
+    危險不在「被攻破」，而在「升級工具鏈之後，新 leaf 被舊 CA 簽，無聲失敗」。
+  </p>
+
+  <h2>謎題：兩張數學上都合法的憑證，Go 只認一張</h2>
+
+  <p>
+    先把現象釘死，釘到讀者能感覺到那股「不對勁」。我們手上有兩條鏈，結構完全對稱：
+  </p>
+
+  <pre data-kind="output"><code>chain A:  leaf_A  ←signed by←  RootCA_utf8   (CA commonName 用 UTF8String 0x0c)
+chain B:  leaf_B  ←signed by←  RootCA_print  (CA commonName 用 PrintableString 0x13)
+
+go:   leaf_A.Verify(poolA)  →  OK
+go:   leaf_B.Verify(poolB)  →  x509: certificate signed by unknown authority
+
+openssl verify:  兩條都  OK</code></pre>
+
+  <p>
+    兩條鏈的差別，只在 Root CA 的 Subject 把「Root CA」這串字用哪一種 ASN.1 字串型別來裝。
+    leaf 那一端，Issuer 欄位都用 UTF8String 編碼（這是現代 cert 工具的預設）。
+    於是 chain A 的 leaf Issuer（UTF8String）對上 CA Subject（UTF8String）——bytes 一致；
+    chain B 的 leaf Issuer（UTF8String）對上 CA Subject（PrintableString）——bytes 不一致。
+    問題就藏在這個「一致 / 不一致」是怎麼被判斷出來的。
+  </p>
+
+  <p>
+    要把這個謎題重現出來其實只需要幾行：用同一份 key material、同一段「Root CA」commonName、
+    同一組 basicConstraints（<code>CA:TRUE</code>）產生兩張自簽 root，
+    唯一的差別是在編碼 Subject 時，一張選 PrintableString、一張選 UTF8String。
+    很多 cert 函式庫會「自動」幫你選——若 commonName 全是可列印字元，舊版工具傾向選 PrintableString 以求最小編碼，新版工具則一律選 UTF8String。
+    這個「自動選型別」的行為，正是讓兩張看似一模一樣的 CA 在 byte 層悄悄分岔的源頭：你在程式碼裡寫的是同一個字串，產出的 DER 卻不同。
+  </p>
+
+  <p>
+    最容易被誤導的地方在於：<strong>從人的角度看，兩張 CA 的 Subject「是同一個 DN」</strong>。
+    RFC 5280 與 RFC 4518 都規定 DN 比對應該先做字串正規化（normalization）再比，PrintableString 與 UTF8String 表示同一串可列印字元時語意等價。
+    RFC 5280 §4.1.2.4 甚至明文「推薦」新憑證一律用 UTF8String 來編碼 DirectoryString，但它沒有、也不能回頭強制既存的 PrintableString CA 重編——於是兩種編碼在真實世界長期並存。
+    OpenSSL 照語意走，所以它驗得過。
+    Go 沒有——但這不是 Go「做錯了」那麼簡單，下面會看到這是一個刻意的取捨。
+    先讓你親手把那個 tag 翻過來，看 byte 比對與鏈建立如何連動。
+  </p>
+
+  <figure class="vg-w-tagflip-x509" data-svg-scroll="640">
+    <style>
+      .vg-w-tagflip-x509 { display: grid; grid-template-rows: auto auto auto; gap: var(--s-3); margin: var(--s-4) 0; }
+      .vg-w-tagflip-x509 .controls { display: flex; align-items: center; gap: var(--s-2); flex-wrap: wrap; font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+      .vg-w-tagflip-x509 .controls .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 4px; overflow: hidden; }
+      .vg-w-tagflip-x509 .controls .seg button { min-height: 44px; padding: var(--s-1) var(--s-3); background: var(--bg); color: var(--ink-soft); border: none; font-family: var(--mono); font-size: var(--fs-sm); cursor: pointer; }
+      .vg-w-tagflip-x509 .controls .seg button[aria-pressed="true"] { background: var(--accent); color: var(--bg); }
+      .vg-w-tagflip-x509 .controls .label { color: var(--ink); }
+      .vg-w-tagflip-x509 svg { width: 100%; height: auto; }
+      .vg-w-tagflip-x509 .verdict { font-family: var(--sans); font-size: var(--fs-sm); display: flex; align-items: center; gap: var(--s-2); }
+      .vg-w-tagflip-x509 .verdict .pill { font-family: var(--mono); padding: 2px 8px; border-radius: 4px; }
+      .vg-w-tagflip-x509 figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+      @media (max-width: 720px) { .vg-w-tagflip-x509 .controls { gap: var(--s-1); } }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/><path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+      </svg>
+      <span>切換 CA Subject 的字串 tag，觀察 byte 比對與鏈建立結果 · 2 種編碼</span>
+    </p>
+
+    <div class="controls">
+      <span class="label">CA Subject commonName 編碼 =</span>
+      <span class="seg" role="group" aria-label="CA commonName ASN.1 string tag">
+        <button type="button" data-tag="0c" aria-pressed="true">UTF8String 0x0c</button>
+        <button type="button" data-tag="13" aria-pressed="false">PrintableString 0x13</button>
+      </span>
+    </div>
+
+    <svg class="vg-w-tagflip-x509-main" viewBox="0 0 720 300" preserveAspectRatio="xMidYMid meet" role="img" aria-label="leaf RawIssuer 與 CA RawSubject 的 byte 比對">
+      <text x="16" y="30" font-family="Manrope, sans-serif" font-size="13" fill="var(--muted)">leaf.RawIssuer  (固定 UTF8String 0x0c)</text>
+      <g id="vg-w-tagflip-x509-leaf" font-family="JetBrains Mono, monospace" font-size="15"></g>
+
+      <text x="16" y="150" font-family="Manrope, sans-serif" font-size="13" fill="var(--muted)">CA.RawSubject  (可切換)</text>
+      <g id="vg-w-tagflip-x509-ca" font-family="JetBrains Mono, monospace" font-size="15"></g>
+
+      <line x1="16" y1="195" x2="704" y2="195" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="3 3" />
+      <text x="16" y="225" font-family="Manrope, sans-serif" font-size="13" fill="var(--muted)">byName[string(leaf.RawIssuer)]  查找結果</text>
+      <text id="vg-w-tagflip-x509-lookup" x="16" y="252" font-family="JetBrains Mono, monospace" font-size="15" fill="var(--ink)"></text>
+      <text id="vg-w-tagflip-x509-chain" x="16" y="284" font-family="Manrope, sans-serif" font-size="15"></text>
+    </svg>
+
+    <p class="verdict">
+      <span class="pill" id="vg-w-tagflip-x509-verdict"></span>
+      <span id="vg-w-tagflip-x509-note"></span>
+    </p>
+
+    <figcaption>兩排 byte 是 commonName 屬性 value 的前段 TLV：<code>tag · length · value</code>。
+    leaf 那排固定，CA 那排隨你切換 tag 而第一個 byte 改變。
+    byName map 用整段 RawSubject / RawIssuer bytes 當 key，所以只要任何一個 byte 不同，查找就 0 match。
+    </figcaption>
+
+    <script>
+      (function () {
+        var root = document.querySelector('.vg-w-tagflip-x509');
+        var svg = root.querySelector('svg.vg-w-tagflip-x509-main');
+        var leafG = root.querySelector('#vg-w-tagflip-x509-leaf');
+        var caG = root.querySelector('#vg-w-tagflip-x509-ca');
+        var lookup = root.querySelector('#vg-w-tagflip-x509-lookup');
+        var chain = root.querySelector('#vg-w-tagflip-x509-chain');
+        var verdict = root.querySelector('#vg-w-tagflip-x509-verdict');
+        var note = root.querySelector('#vg-w-tagflip-x509-note');
+        var buttons = Array.prototype.slice.call(root.querySelectorAll('.seg button'));
+        var SVGNS = 'http://www.w3.org/2000/svg';
+
+        // commonName value "Root CA" => 7 ASCII bytes. TLV: tag, len(07), value...
+        var VALUE = [0x52, 0x6f, 0x6f, 0x74, 0x20, 0x43, 0x41]; // R o o t SP C A
+        // leaf Issuer is always UTF8String (0x0c)
+        var LEAF = [0x0c, 0x07].concat(VALUE);
+
+        var X0 = 16, CELL = 44, Y_TAG = 70;
+
+        function draw(g, bytes, refBytes, y) {
+          while (g.firstChild) g.removeChild(g.firstChild);
+          bytes.forEach(function (b, i) {
+            var x = X0 + i * CELL;
+            var rect = document.createElementNS(SVGNS, 'rect');
+            rect.setAttribute('x', x);
+            rect.setAttribute('y', y - 26);
+            rect.setAttribute('width', CELL - 6);
+            rect.setAttribute('height', 36);
+            rect.setAttribute('rx', 3);
+            var differs = refBytes && refBytes[i] !== b;
+            rect.setAttribute('fill', differs ? 'var(--accent)' : 'var(--bg-soft)');
+            rect.setAttribute('fill-opacity', differs ? '0.22' : '1');
+            rect.setAttribute('stroke', differs ? 'var(--accent)' : 'var(--line)');
+            rect.setAttribute('stroke-width', differs ? '1.5' : '1');
+            g.appendChild(rect);
+            var t = document.createElementNS(SVGNS, 'text');
+            t.setAttribute('x', x + (CELL - 6) / 2);
+            t.setAttribute('y', y - 2);
+            t.setAttribute('text-anchor', 'middle');
+            t.setAttribute('font-family', 'JetBrains Mono, monospace');
+            t.setAttribute('font-size', '15');
+            t.setAttribute('fill', differs ? 'var(--accent-text)' : 'var(--ink)');
+            t.textContent = b.toString(16).padStart(2, '0');
+            g.appendChild(t);
+          });
+        }
+
+        function render(tag) {
+          var caTag = tag === '13' ? 0x13 : 0x0c;
+          var CA = [caTag, 0x07].concat(VALUE);
+          // leaf drawn against CA so the differing tag highlights on leaf too
+          draw(leafG, LEAF, CA, Y_TAG);
+          draw(caG, CA, LEAF, Y_TAG + 120);
+
+          var match = LEAF.every(function (b, i) { return b === CA[i]; });
+          if (match) {
+            lookup.textContent = '→ [0]  (CA 的 lazyCerts index = 0，1 筆候選父憑證)';
+            lookup.setAttribute('fill', 'var(--sage-deep)');
+            chain.textContent = 'buildChains 找到父憑證 → 鏈建立成功 → Verify() = nil';
+            chain.setAttribute('fill', 'var(--sage-deep)');
+            verdict.textContent = 'VERIFIED';
+            verdict.style.background = 'var(--sage)';
+            verdict.style.color = 'var(--bg)';
+            note.textContent = 'leaf.RawIssuer 與 CA.RawSubject byte-for-byte 相等，map 命中。';
+          } else {
+            lookup.textContent = '→ []   (0 筆候選父憑證)';
+            lookup.setAttribute('fill', 'var(--accent-text)');
+            chain.textContent = 'buildChains 找不到父憑證 → certificate signed by unknown authority';
+            chain.setAttribute('fill', 'var(--accent-text)');
+            verdict.textContent = 'UNKNOWN AUTHORITY';
+            verdict.style.background = 'var(--accent)';
+            verdict.style.color = 'var(--bg)';
+            note.textContent = '第一個 byte（tag）就不同——map key 是整段 DER bytes，一個 byte 之差即 0 match。';
+          }
+        }
+
+        buttons.forEach(function (btn) {
+          btn.addEventListener('click', function () {
+            buttons.forEach(function (b) { b.setAttribute('aria-pressed', b === btn ? 'true' : 'false'); });
+            render(btn.getAttribute('data-tag'));
+          });
+        });
+
+        render('0c');
+      })();
+    </script>
+  </figure>
+
+  <p>
+    翻到 <code>PrintableString 0x13</code> 那一刻，
+    CA Subject 的第一個 byte 從 <code>0c</code> 變成 <code>13</code>，
+    整段 RawSubject 的 bytes 就跟 leaf 的 RawIssuer 不再相等，
+    查找直接掉到空陣列，鏈斷在第一步。
+    注意：value bytes（<code>52 6f 6f 74 20 43 41</code>，也就是 ASCII 的 <code>Root CA</code>）一個都沒變——「Root CA」這三個可見字元在兩種編碼下逐 byte 相同，差的純粹是外層那個型別宣告。
+    這正是讓人最初百思不解的點：肉眼看 DN「明明一樣」。
+  </p>
+
+  <h2>嫌疑一：是不是簽章本身壞了？</h2>
+
+  <p>
+    第一個直覺嫌疑是密碼學層面的東西。
+    <code>certificate signed by unknown authority</code> 這句話字面上指向「找不到能信任的簽章者」，很容易讓人往「簽章驗不過」的方向想——是不是 leaf 的 signature 對不上 CA 的公鑰？是不是雜湊演算法不一致、是不是 key 用錯了？
+  </p>
+
+  <p>
+    這條線很快就能排除，而且排除的方式本身就很說明問題。把同一張被拒的 leaf_B 與它的 CA 一起餵給 OpenSSL：
+  </p>
+
+  <pre data-kind="shell"><code>$ openssl verify -CAfile rootca_print.pem leaf_b.pem
+leaf_b.pem: OK</code></pre>
+
+  <p>
+    OpenSSL 用的是同一把 CA 公鑰、同一段簽章 bytes、同一個 RSA/ECDSA 驗證演算法，結果是 <code>OK</code>。
+    如果簽章數學壞了，OpenSSL 也應該拒絕。
+    它沒有。
+    這就把嫌疑從「密碼學」完全切掉了——簽章是好的，公鑰是對的，問題出在「Go 根本還沒走到驗簽那一步」。
+    <code>unknown authority</code> 這句錯誤訊息有誤導性：它不是說「簽章驗不過」，而是說「我在 pool 裡找不到任何一張憑證，其 Subject 能對得上這張 leaf 的 Issuer」——也就是 chain building 階段就失敗了，連簽章驗證的程式碼都沒進去。
+  </p>
+
+  <p>
+    這是 investigation 裡很典型的一步：錯誤訊息把你往 A 方向帶，但對照組（OpenSSL）證明 A 不是病灶。真正有用的資訊是「同樣的輸入，另一個實作驗得過」——這幾乎一定意味著問題出在 Go 的某個比直覺更早、更語法層的地方。
+  </p>
+
+  <p>
+    順帶把另一個常被牽連的嫌疑也釘死：是不是 <code>AuthorityKeyIdentifier</code> 與 <code>SubjectKeyIdentifier</code> 對不上？X.509 的鏈建立其實有兩條線索可以配對父子——
+    一是「leaf 的 Issuer DN == CA 的 Subject DN」，二是「leaf 的 AKI == CA 的 SKI」。
+    如果是 AKI/SKI 那條對不上，也會找不到父。
+    但在我們的重現裡兩張 CA 用的是同一把 key，SKI（公鑰雜湊）完全相同，leaf 的 AKI 也指向同一個值——這條線索是吻合的。
+    問題純粹卡在 DN 那條線索上，而且卡在 DN 的 byte 表示、不是 key 的身分。
+    把 AKI/SKI 排除掉，嫌疑就被進一步逼向「DN 到底怎麼比」這個唯一的出口。
+  </p>
+
+  <h2>嫌疑二：是不是 DN 真的不一樣，只是我沒看出來？</h2>
+
+  <p>
+    第二個嫌疑更細：也許兩張 CA 的 Subject 真的不是同一個 DN，只是我粗看以為一樣。
+    畢竟 DN 是個結構化的東西——RDN 順序、屬性型別 OID、有沒有多餘空白、大小寫，任何一處不同都會讓它們在嚴格比對下不相等。
+    要排除這條，得把 DN 攤到 byte 層級看。
+    用 <code>openssl asn1parse</code> dump 兩張 CA 的 Subject，逐 TLV 對齊：
+  </p>
+
+  <pre data-kind="output"><code>RootCA_utf8  Subject CN:   0c 07  52 6f 6f 74 20 43 41      <em>// UTF8String,    len 7, "Root CA"</em>
+RootCA_print Subject CN:   13 07  52 6f 6f 74 20 43 41      <em>// PrintableString,len 7, "Root CA"</em>
+                          ^^
+                       唯一的差異：tag byte（0x0c vs 0x13），長度與 value 完全相同</code></pre>
+
+  <p>
+    答案是：DN 的「語意」一樣，但「編碼」不一樣，而差異被精確地框在一個 byte 上。
+    RDN 結構相同、OID（commonName 是 <code>2.5.4.3</code>）相同、長度 byte 都是 <code>07</code>、value 的 7 個 byte 逐一相同。
+    唯一不同的是最前面那個 ASN.1 tag：<code>0x0c</code>（UTF8String）對 <code>0x13</code>（PrintableString）。
+    下面這個 widget 把這段 TLV 攤開，點任一格看它在 DER 結構裡的角色。
+  </p>
+
+  <figure class="vg-w-derbytes-x509">
+    <style>
+      .vg-w-derbytes-x509 { position: relative; margin: var(--s-4) 0; font-family: var(--sans); }
+      .vg-w-derbytes-x509 .row { display: flex; align-items: center; gap: var(--s-2); margin-bottom: var(--s-2); flex-wrap: wrap; }
+      .vg-w-derbytes-x509 .rowlabel { font-size: var(--fs-sm); color: var(--muted); min-width: 16ch; }
+      .vg-w-derbytes-x509 .strip { display: flex; gap: 4px; flex-wrap: wrap; }
+      .vg-w-derbytes-x509 .cell { font-family: var(--mono); font-size: var(--fs-sm); padding: 6px 8px; min-width: 32px; min-height: 32px; display: grid; place-items: center; border: 1px solid var(--line); background: var(--bg-soft); cursor: help; anchor-name: var(--vgw-cn); }
+      .vg-w-derbytes-x509 .cell.tag { border-color: var(--accent); background: color-mix(in oklch, var(--accent) 14%, var(--bg)); color: var(--accent-text); }
+      .vg-w-derbytes-x509 .cell.len { border-color: var(--ink-deep); color: var(--ink-deep); }
+      .vg-w-derbytes-x509 .cell:focus-visible { outline: 2px solid var(--accent); }
+      .vg-w-derbytes-x509 .pop {
+        position: absolute; opacity: 0; pointer-events: none; transition: opacity 100ms;
+        background: var(--bg); border: 1px solid var(--line); padding: var(--s-1) var(--s-2);
+        font-family: var(--scribed); font-size: var(--fs-sm); color: var(--ink); max-width: 34ch; z-index: 2;
+        box-shadow: 0 2px 8px color-mix(in oklch, var(--ink) 12%, transparent);
+      }
+      .vg-w-derbytes-x509 .cell:hover + .pop, .vg-w-derbytes-x509 .cell:focus + .pop { opacity: 1; }
+      .vg-w-derbytes-x509 .legend { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-1); }
+      .vg-w-derbytes-x509 .legend b { font-family: var(--mono); font-style: normal; }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z"/><path d="M12 8v4"/><path d="M12 16h.01"/>
+      </svg>
+      <span>把指標停在 / 鍵盤聚焦任一 byte 看它的 TLV 角色 · 兩種編碼各 9 byte</span>
+    </p>
+
+    <div class="row">
+      <span class="rowlabel">UTF8String（0x0c）</span>
+      <span class="strip">
+        <span class="cell tag" tabindex="0">0c</span><span class="pop">tag = 0x0c：UTF8String。這是兩張憑證唯一不同的 byte，也是 byName map 比對失敗的源頭。</span>
+        <span class="cell len" tabindex="0">07</span><span class="pop">length = 7 個 byte，DER 短格式長度。兩種編碼這裡都是 07。</span>
+        <span class="cell" tabindex="0">52</span><span class="pop">value[0] = 'R'（ASCII 0x52）。value 的 7 個 byte 在兩種編碼下逐一相同。</span>
+        <span class="cell" tabindex="0">6f</span><span class="pop">value[1] = 'o'（0x6f）。</span>
+        <span class="cell" tabindex="0">6f</span><span class="pop">value[2] = 'o'（0x6f）。</span>
+        <span class="cell" tabindex="0">74</span><span class="pop">value[3] = 't'（0x74）。</span>
+        <span class="cell" tabindex="0">20</span><span class="pop">value[4] = 空白（0x20）。</span>
+        <span class="cell" tabindex="0">43</span><span class="pop">value[5] = 'C'（0x43）。</span>
+        <span class="cell" tabindex="0">41</span><span class="pop">value[6] = 'A'（0x41）。</span>
+      </span>
+    </div>
+
+    <div class="row">
+      <span class="rowlabel">PrintableString（0x13）</span>
+      <span class="strip">
+        <span class="cell tag" tabindex="0">13</span><span class="pop">tag = 0x13：PrintableString，只能裝 A–Z a–z 0–9 與少數標點。語意上與上面那張的「Root CA」等價，但 byte 不同。</span>
+        <span class="cell len" tabindex="0">07</span><span class="pop">length = 7，與 UTF8String 版完全相同。</span>
+        <span class="cell" tabindex="0">52</span><span class="pop">value[0] = 'R'。可列印字元在兩種編碼下 byte 一致——這正是「肉眼看 DN 一樣」的原因。</span>
+        <span class="cell" tabindex="0">6f</span><span class="pop">value[1] = 'o'。</span>
+        <span class="cell" tabindex="0">6f</span><span class="pop">value[2] = 'o'。</span>
+        <span class="cell" tabindex="0">74</span><span class="pop">value[3] = 't'。</span>
+        <span class="cell" tabindex="0">20</span><span class="pop">value[4] = 空白。</span>
+        <span class="cell" tabindex="0">43</span><span class="pop">value[5] = 'C'。</span>
+        <span class="cell" tabindex="0">41</span><span class="pop">value[6] = 'A'。</span>
+      </span>
+    </div>
+
+    <p class="legend">紅框 = <b>tag</b>（型別宣告，差異所在）；
+    藍字 = <b>length</b>；
+    其餘 = <b>value</b>（兩排逐 byte 相同）。
+    整段 9 byte 是 commonName 屬性 value 的 TLV，會被原封不動裝進 <b>RawSubject</b> / <b>RawIssuer</b>。
+    </p>
+  </figure>
+
+  <p>
+    所以嫌疑二的結論是：DN 在「人類語意」上一樣，在「DER bytes」上差一個 tag byte。
+    這把問題逼到一個很尖的位置——Go 在比對 Issuer 與 Subject 時，到底是比「語意」還是比「bytes」？如果比語意，這兩張該當作同一個發行者；
+    如果比 bytes，那一個 tag 之差就足以讓它們互不相認。
+    OpenSSL 顯然走前者。
+    那 Go 呢？
+  </p>
+
+  <h2>真正的病灶：findPotentialParents 拿 RawIssuer 的 bytes 當 map key</h2>
+
+  <p>
+    把 <code>leaf.Verify()</code> 的呼叫鏈拆開，可以看到鏈建立發生在 <code>buildChains()</code> 裡，
+    而它要找「誰可能是這張憑證的父」時，呼叫的是 <code>CertPool</code> 的 <code>findPotentialParents()</code>。
+    <code>CertPool</code> 內部維護一個索引欄位：
+  </p>
+
+  <pre><code class="language-go">type CertPool struct {
+    byName    map[string][]int // cert.RawSubject =&gt; index into lazyCerts
+    lazyCerts []lazyCert
+    // ...
+}</code></pre>
+
+  <p>
+    這個 <code>byName</code> 的 key 型別是 <code>string</code>，
+    但它裝的不是人類可讀的 DN 字串，而是 <code>cert.RawSubject</code>——
+    也就是 Subject 那段 DER 編碼的<strong>原始 bytes</strong>，
+    直接被 <code>string(...)</code> 轉成 Go string 當 map key。
+    當你把一張 CA 加進 pool，它的 RawSubject bytes 就被登錄成一個 key，指向它在 <code>lazyCerts</code> 裡的 index。
+    查找父憑證時，<code>findPotentialParents()</code> 反過來拿 leaf 的 <code>RawIssuer</code> bytes 去查這個 map：
+  </p>
+
+  <pre><code class="language-go">// 概念上等同於 crypto/x509 內部的查找
+for _, c := range s.byName[string(cert.RawIssuer)] {
+    candidates = append(candidates, s.cert(c))
+}</code></pre>
+
+  <p>
+    關鍵就在這一行。
+    <code>s.byName[string(cert.RawIssuer)]</code> 是一個 Go map 查找，而 Go map 的 key 比對是 byte-for-byte 的字串相等比對——它不知道也不在乎這段 bytes 是 ASN.1 DN，更不會去做 PrintableString 與 UTF8String 的語意正規化。
+    leaf 的 RawIssuer 是 <code>...0c 07 52...</code>（UTF8String），
+    CA 的 RawSubject 是 <code>...13 07 52...</code>（PrintableString），
+    這兩個 string 在 Go 看來就是不同的 key。
+    map 查找回傳零值——空的 <code>[]int</code>。
+    <code>findPotentialParents()</code> 拿到 0 筆候選，<code>buildChains()</code> 無父可接，整條鏈建不起來，最終 <code>Verify()</code> 回 <code>certificate signed by unknown authority</code>。
+  </p>
+
+  <p>
+    換句話說：<strong>Go 在 chain building 階段用的是 byte 相等，
+    而不是 DN 語意相等</strong>。這不是驗簽邏輯的問題，是「怎麼從一堆 CA 裡挑出可能的父」這個索引機制的問題。把這條呼叫路徑攤平看，
+    每一步點開可以讀它做了什麼、以及病灶卡在哪一格。
+  </p>
+
+  <figure class="vg-w-chainflow-x509" data-svg-scroll="800">
+    <style>
+      .vg-w-chainflow-x509 { margin: var(--s-4) 0; }
+      .vg-w-chainflow-x509 svg { width: 100%; height: auto; }
+      .vg-w-chainflow-x509 .stage-box { cursor: pointer; }
+      .vg-w-chainflow-x509 input { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-chainflow-x509 .panel { display: none; }
+      .vg-w-chainflow-x509:has(#vg-w-chainflow-x509-r1:checked) .panel-1,
+      .vg-w-chainflow-x509:has(#vg-w-chainflow-x509-r2:checked) .panel-2,
+      .vg-w-chainflow-x509:has(#vg-w-chainflow-x509-r3:checked) .panel-3,
+      .vg-w-chainflow-x509:has(#vg-w-chainflow-x509-r4:checked) .panel-4,
+      .vg-w-chainflow-x509:has(#vg-w-chainflow-x509-r5:checked) .panel-5 { display: block; }
+      .vg-w-chainflow-x509 .detail { margin-top: var(--s-2); padding: var(--s-2) var(--s-3); border-left: 2px solid var(--accent); background: var(--bg-soft); font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-chainflow-x509 .detail code { font-size: 0.95em; }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M9 11.2 7.1 9.3a1 1 0 0 0-1.4 0l-.6.6a1 1 0 0 0 0 1.4l1.9 1.9"/><path d="m13 13 6 6"/><path d="m16 10 3-3a2.8 2.8 0 0 0-4-4l-3 3"/><path d="m9 11 3 3"/>
+      </svg>
+      <span>點任一步看它做什麼、病灶卡在哪 · 5 步呼叫路徑</span>
+    </p>
+
+    <input type="radio" name="vg-w-chainflow-x509-r" id="vg-w-chainflow-x509-r1" checked>
+    <input type="radio" name="vg-w-chainflow-x509-r" id="vg-w-chainflow-x509-r2">
+    <input type="radio" name="vg-w-chainflow-x509-r" id="vg-w-chainflow-x509-r3">
+    <input type="radio" name="vg-w-chainflow-x509-r" id="vg-w-chainflow-x509-r4">
+    <input type="radio" name="vg-w-chainflow-x509-r" id="vg-w-chainflow-x509-r5">
+
+    <svg viewBox="0 0 720 130" preserveAspectRatio="xMidYMid meet" role="img" aria-label="crypto/x509 驗證呼叫路徑">
+      <defs>
+        <marker id="vg-w-chainflow-x509-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0 0 L10 5 L0 10 z" fill="var(--muted-2)" />
+        </marker>
+      </defs>
+      <g font-family="JetBrains Mono, monospace" font-size="12.5">
+        <g class="stage-box" role="button" tabindex="0" aria-label="Verify" data-r="1">
+          <rect x="6" y="40" width="120" height="46" rx="4" fill="var(--bg-soft)" stroke="var(--line)" />
+          <text x="66" y="62" text-anchor="middle" fill="var(--ink)">leaf.Verify</text>
+          <text x="66" y="78" text-anchor="middle" fill="var(--muted)" font-size="11">(opts)</text>
+        </g>
+        <line x1="128" y1="63" x2="158" y2="63" stroke="var(--muted-2)" marker-end="url(#vg-w-chainflow-x509-arrow)" />
+        <g class="stage-box" role="button" tabindex="0" aria-label="buildChains" data-r="2">
+          <rect x="160" y="40" width="124" height="46" rx="4" fill="var(--bg-soft)" stroke="var(--line)" />
+          <text x="222" y="67" text-anchor="middle" fill="var(--ink)">buildChains</text>
+        </g>
+        <line x1="286" y1="63" x2="316" y2="63" stroke="var(--muted-2)" marker-end="url(#vg-w-chainflow-x509-arrow)" />
+        <g class="stage-box" role="button" tabindex="0" aria-label="findPotentialParents" data-r="3">
+          <rect x="318" y="34" width="150" height="58" rx="4" fill="color-mix(in oklch, var(--accent) 12%, var(--bg))" stroke="var(--accent)" stroke-width="1.5" />
+          <text x="393" y="58" text-anchor="middle" fill="var(--accent-text)">findPotential</text>
+          <text x="393" y="74" text-anchor="middle" fill="var(--accent-text)">Parents</text>
+        </g>
+        <line x1="470" y1="63" x2="500" y2="63" stroke="var(--muted-2)" marker-end="url(#vg-w-chainflow-x509-arrow)" />
+        <g class="stage-box" role="button" tabindex="0" aria-label="byName lookup" data-r="4">
+          <rect x="502" y="34" width="118" height="58" rx="4" fill="color-mix(in oklch, var(--accent) 12%, var(--bg))" stroke="var(--accent)" stroke-width="1.5" />
+          <text x="561" y="58" text-anchor="middle" fill="var(--accent-text)">byName[</text>
+          <text x="561" y="74" text-anchor="middle" fill="var(--accent-text)">RawIssuer]</text>
+        </g>
+        <line x1="622" y1="63" x2="652" y2="63" stroke="var(--muted-2)" marker-end="url(#vg-w-chainflow-x509-arrow)" />
+        <g class="stage-box" role="button" tabindex="0" aria-label="result" data-r="5">
+          <rect x="654" y="40" width="60" height="46" rx="4" fill="var(--bg-soft)" stroke="var(--line)" />
+          <text x="684" y="62" text-anchor="middle" fill="var(--accent-text)">[]</text>
+          <text x="684" y="78" text-anchor="middle" fill="var(--muted)" font-size="11">0 筆</text>
+        </g>
+        <text x="16" y="24" font-family="Manrope, sans-serif" font-size="12" fill="var(--muted)">紅框 = byte 比對發生處</text>
+      </g>
+    </svg>
+
+    <div class="panel panel-1"><p class="detail"><code>leaf.Verify(opts)</code>：入口。
+    設定信任錨（<code>opts.Roots</code> 指向我們的 <code>CertPool</code>）、檢查時間與用途，然後委派給 <code>buildChains()</code> 去湊出一條從 leaf 通到 root 的鏈。
+    簽章驗證排在鏈建立<em>之後</em>，所以這裡還沒走到驗簽。
+    </p></div>
+    <div class="panel panel-2"><p class="detail"><code>buildChains()</code>：遞迴地往上找父憑證。
+    對當前這張 cert，它要問 pool：「有沒有哪張憑證的 Subject 等於我的 Issuer？」這個「等於」的定義，就是整個 bug 的關鍵——它把問題轉交給 <code>findPotentialParents()</code>。
+    </p></div>
+    <div class="panel panel-3"><p class="detail"><code>findPotentialParents()</code><strong>（病灶所在）</strong>：拿 <code>cert.RawIssuer</code>（leaf 的 Issuer DER bytes）去查 pool 的 <code>byName</code> 索引。
+    它<em>沒有</em>先把 DN 做語意正規化，而是直接用原始 bytes 當查找 key。
+    </p></div>
+    <div class="panel panel-4"><p class="detail"><code>byName[string(cert.RawIssuer)]</code>：Go map 查找，key 是 <code>string</code>，比對是 byte-for-byte。
+    leaf 的 RawIssuer 是 <code>0c...</code>，CA 註冊進來的 RawSubject 是 <code>13...</code>，兩個 string 不相等，map 命中失敗。
+    </p></div>
+    <div class="panel panel-5"><p class="detail">回傳空的 <code>[]int</code>——0 筆候選父憑證。
+    <code>buildChains()</code> 無父可接，鏈建立失敗，<code>Verify()</code> 最終回 <code>certificate signed by unknown authority</code>。
+    注意：value bytes（<code>Root CA</code>）完全相同，差的只有最前面的 tag。
+    </p></div>
+  </figure>
+
+  <p>
+    為什麼 Go 選擇用 <code>byName</code> 這種預先索引、而不是每次線性掃過全 pool 做語意比對？答案是效能與可預測性。
+    一個 trust pool 動輒上百張 root，每建一條鏈都要為每張中間憑證找父；
+    若每次都對每張候選做完整的 DN 正規化＋語意比對，成本是 O(鏈深度 × pool 大小 × DN 比對成本)，而 DN 比對本身又牽涉字串正規化這種非平凡操作。
+    把 RawSubject 的 bytes 直接 hash 進一個 map，查找攤平成接近 O(1)，代價是「只認 byte 相等」。
+    這是一個典型的「拿語意精確度換查找速度與實作簡單」的取捨——而它能成立的隱含前提是：<em>正確簽出的 leaf，其 Issuer 應該逐 byte 複製自 CA 的 Subject</em>。
+    這個前提在「同一套工具一條龍簽出整條鏈」時成立，在「跨世代工具」時就破了。
+  </p>
+
+  <p>
+    這就完整解釋了謎題。
+    chain A 之所以驗得過，不是因為它「比較正確」，純粹是因為它的 leaf Issuer 與 CA Subject 剛好用了相同的字串編碼（都 UTF8String），bytes 對得上、map 命中。
+    chain B 兩端編碼不同，bytes 對不上、map 落空。
+    Go 整個驗證流程，卡在「索引查找」這一步，連簽章那段密碼學程式碼都沒機會執行。
+    值得記住的因果方向是：<strong>不是簽章被拒，而是根本沒湊出能驗簽的鏈</strong>——錯誤訊息裡的 authority 指的是「找不到發行者這個實體」，不是「發行者的簽章不可信」。
+  </p>
+
+  <h2>對照組：為什麼 OpenSSL 兩張都驗得過</h2>
+
+  <p>
+    把 Go 的行為跟 OpenSSL 並排，差異的本質就清楚了。
+    OpenSSL 在比對 Issuer 與 Subject 時，走的是 <code>X509_NAME_cmp()</code> 這條路——它會把 DN 拆成一個個 RDN，逐屬性比 OID 與正規化後的值，把不同的字串編碼當作可互換的表示形式。
+    也就是說，它比的是「DN 的語意」，PrintableString 的「Root CA」與 UTF8String 的「Root CA」在它眼裡是同一個名字。
+    Go 比的是「DER bytes 的相等」。
+    同一組輸入，兩個實作給出相反結論，根因就在這條「語意 vs bytes」的分歧線上。
+    下面這個對照可以拖動分界，左半是 Go 的判定路徑，右半是 OpenSSL 的。
+  </p>
+
+  <figure class="vg-w-ba-x509" data-interactive="drag">
+    <style>
+      .vg-w-ba-x509 { position: relative; aspect-ratio: 16 / 9; overflow: hidden; margin: var(--s-4) 0; border: 1px solid var(--line); }
+      .vg-w-ba-x509 .layer { position: absolute; inset: 0; }
+      .vg-w-ba-x509 .after { clip-path: polygon(50% 0, 100% 0, 100% 100%, 50% 100%); }
+      .vg-w-ba-x509 .divider { position: absolute; top: 0; bottom: 0; left: 50%; width: 32px; transform: translateX(-50%); cursor: ew-resize; touch-action: none; z-index: 3; }
+      .vg-w-ba-x509 .divider::before { content: ''; position: absolute; left: 50%; top: 0; bottom: 0; width: 2px; transform: translateX(-50%); background: var(--accent); }
+      .vg-w-ba-x509 .divider::after { content: '↔'; position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); background: var(--accent); color: var(--bg); width: 32px; height: 32px; border-radius: 50%; display: grid; place-items: center; font-family: var(--sans); font-size: 16px; }
+      @media (max-width: 720px) { .vg-w-ba-x509 { aspect-ratio: 4 / 3; } }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M18 8 22 12 18 16"/><path d="M6 8 2 12 6 16"/><path d="M2 12h20"/>
+      </svg>
+      <span>拖動分界比較 Go 與 OpenSSL 的判定路徑 · 同一張 PrintableString CA</span>
+    </p>
+
+    <svg class="layer before" viewBox="0 0 480 270" role="img" aria-label="Go 的 byte 比對路徑">
+      <rect width="480" height="270" fill="var(--bg-soft)" />
+      <text x="24" y="40" font-family="Manrope, sans-serif" font-size="16" fill="var(--accent-text)">Go crypto/x509</text>
+      <text x="24" y="72" font-family="JetBrains Mono, monospace" font-size="16" fill="var(--ink)">byName[string(RawIssuer)]</text>
+      <text x="24" y="100" font-family="JetBrains Mono, monospace" font-size="16" fill="var(--muted)">0c 07 52..  ≠  13 07 52..</text>
+      <text x="24" y="138" font-family="EB Garamond, serif" font-size="16" fill="var(--ink-soft)">比的是 DER bytes 的相等</text>
+      <text x="24" y="162" font-family="EB Garamond, serif" font-size="16" fill="var(--ink-soft)">tag 不同 → key 不同 → 0 match</text>
+      <rect x="24" y="200" width="220" height="40" rx="4" fill="var(--accent)" fill-opacity="0.18" stroke="var(--accent)" />
+      <text x="134" y="225" text-anchor="middle" font-family="Manrope, sans-serif" font-size="16" fill="var(--accent-text)">unknown authority</text>
+    </svg>
+
+    <svg class="layer after" viewBox="0 0 480 270" id="vg-w-ba-x509-after" role="img" aria-label="OpenSSL 的語意比對路徑">
+      <rect width="480" height="270" fill="color-mix(in oklch, var(--sage) 12%, var(--bg))" />
+      <text x="256" y="40" font-family="Manrope, sans-serif" font-size="16" fill="var(--sage-deep)">OpenSSL</text>
+      <text x="256" y="72" font-family="JetBrains Mono, monospace" font-size="16" fill="var(--ink)">X509_NAME_cmp()</text>
+      <text x="256" y="100" font-family="JetBrains Mono, monospace" font-size="16" fill="var(--muted)">"Root CA"  ==  "Root CA"</text>
+      <text x="256" y="138" font-family="EB Garamond, serif" font-size="16" fill="var(--ink-soft)">比的是 DN 的語意</text>
+      <text x="256" y="162" font-family="EB Garamond, serif" font-size="16" fill="var(--ink-soft)">編碼可互換 → 同一個名字</text>
+      <rect x="256" y="200" width="200" height="40" rx="4" fill="var(--sage)" fill-opacity="0.22" stroke="var(--sage-deep)" />
+      <text x="356" y="225" text-anchor="middle" font-family="Manrope, sans-serif" font-size="16" fill="var(--sage-deep)">verify: OK</text>
+    </svg>
+
+    <div class="divider" id="vg-w-ba-x509-divider"></div>
+
+    <script>
+      (function () {
+        var root = document.querySelector('.vg-w-ba-x509');
+        var after = root.querySelector('#vg-w-ba-x509-after');
+        var divider = root.querySelector('#vg-w-ba-x509-divider');
+        var dragging = false;
+        function setPct(pct) {
+          var c = Math.max(0, Math.min(100, pct));
+          after.style.clipPath = 'polygon(' + c + '% 0, 100% 0, 100% 100%, ' + c + '% 100%)';
+          divider.style.left = c + '%';
+        }
+        divider.addEventListener('pointerdown', function (e) { dragging = true; divider.setPointerCapture(e.pointerId); });
+        root.addEventListener('pointermove', function (e) {
+          if (!dragging) return;
+          var rect = root.getBoundingClientRect();
+          setPct(((e.clientX - rect.left) / rect.width) * 100);
+        });
+        root.addEventListener('pointerup', function () { dragging = false; });
+        root.addEventListener('pointercancel', function () { dragging = false; });
+      })();
+    </script>
+  </figure>
+
+  <p>
+    要強調的一點：<strong>Go 的這個選擇是 fail-closed，不是 fail-open</strong>。
+    byte 比對比語意比對更嚴格——它只會把「本來該接得上的鏈」拒掉，不會把「本來不該接的鏈」放行。
+    沒有攻擊者能靠製造編碼差異去繞過驗證、讓一張惡意憑證被當成可信；
+    最壞的結果是合法憑證被誤拒。
+    從安全角度，這是保守的一邊。
+    Go 團隊在 <code>golang/go#31440</code> 這個 issue 裡有一段長期討論，這個行為更接近一個刻意的設計取捨（嚴格、可預測、避免在 DN 正規化這個歷史上充滿坑的地方引入複雜度），而不是一個會被分配 CVE 的漏洞。
+    本文也不替它編一個 CVE 號——它沒有。
+  </p>
+
+  <p>
+    為什麼語意正規化「歷史上充滿坑」值得多說一句：DN 比對的正規化規則（RFC 4518 string preparation、case folding、空白壓縮、各種字串型別的等價類）本身就是攻擊面的常客。
+    憑證界出過好幾次因為「兩個實作對『同一個名字』的判定不一致」而被利用的問題（典型如 null-byte、Unicode 同形字、大小寫處理差異）。
+    當兩個實作對「這兩個名字是不是同一個」給出不同答案，攻擊者就能在「簽發端看到的名字」與「驗證端看到的名字」之間鑽縫隙。
+    Go 選擇在 chain building 這一層只信任 byte 相等，等於把這整片沼澤從熱路徑上挪走——它寧可在「兩個語意相同的名字」上誤判為「不同」（誤拒、fail-closed），也不願冒「兩個語意不同的名字」被正規化成「相同」（誤放、fail-open）的風險。
+    代價就是今天這個誤拒。
+  </p>
+
+  <p>
+    把這個取捨講透一點：fail-closed 的成本是「可用性」，fail-open 的成本是「安全性」。
+    在 TLS 驗證這種場景，安全性遠比可用性貴——一次誤放可能讓中間人冒充服務、攔截整條連線，一次誤拒最多讓某條鏈建不起來、被人發現後修掉。
+    所以「嚴格到偶爾誤傷自己」在這個位置是合理的預設姿態。
+    真正的問題不在於 Go 太嚴格，而在於這個嚴格<em>沒有訊號</em>：它不會在你升級工具鏈時警告你「嘿，你新簽的 leaf 用了跟 CA 不同的 DN 編碼」，只會在某個 runtime 的某次 handshake 默默回一句 unknown authority。
+    沉默，才是這個 quirk 最貴的部分。
+  </p>
+
+  <h2>實務風險：升級 cert 工具鏈之後，舊 CA 簽的新 leaf 無聲失敗</h2>
+
+  <p>
+    這個 quirk 之所以值得一條 deep-story，不是因為它能被攻擊，而是因為它會在一個非常具體、非常常見的維運情境下無聲地咬人。
+    CA 憑證的生命週期通常以年計，leaf 憑證則短得多——幾個月、幾週、甚至幾天就輪換一次。
+    這意味著：<strong>簽出 leaf 的工具鏈，會在 CA 的有效期內被升級好幾輪</strong>。
+  </p>
+
+  <p>
+    把時間軸拉開想：三年前你用當年的工具產生了 Root CA，那版工具把 commonName 編成 PrintableString（<code>0x13</code>）。
+    CA 進了你的 trust store，一切正常。
+    今年你升級了憑證簽發工具（或換了一套 PKI 框架、或某個函式庫改了預設），新版把 leaf 的 Issuer 與 Subject 都編成 UTF8String（<code>0x0c</code>）——這是現在的主流預設。
+    新 leaf 的 Issuer 欄位忠實地<em>複製自 CA 的 Subject 的語意</em>，但用了新編碼。
+    於是：
+  </p>
+
+  <pre data-kind="output"><code>舊 CA  (PrintableString 0x13)  ──簽──>  新 leaf  (Issuer 用 UTF8String 0x0c)
+
+OpenSSL / 瀏覽器 / 多數 TLS stack：  鏈正常，OK
+Go 服務（用 crypto/x509 驗對方憑證）： certificate signed by unknown authority</code></pre>
+
+  <p>
+    沒有人改過信任設定，沒有人撤銷過憑證，CA 還在有效期內，簽章也對。
+    失敗的觸發點藏在「換了簽發工具」這個跟 Go 服務八竿子打不著的動作裡。
+    更糟的是它的分布特性：因為只有 Go 客戶端（或任何 byte-compare DN 的實作）會中招，
+    你的 OpenSSL-based 監控、你的瀏覽器健檢、你的 <code>curl</code> smoke test 全部顯示綠燈，
+    唯獨某個 Go 寫的服務在連對方時開始報 unknown authority。
+    排查的人第一反應幾乎一定是「憑證過期了？」「trust store 沒更新？」，而不會想到「兩個 byte 的 ASN.1 tag」。
+  </p>
+
+  <p>
+    最容易踩到的具體場景，可以歸成幾類：mTLS 環境裡，client 與 server 各自用不同世代的工具簽發憑證，其中一端跑 Go；
+    內部 PKI 升級簽發 pipeline 後，舊的長命 intermediate / root 仍在線上簽新 leaf；
+    或是把一套既有的、用舊工具產生的 CA 匯入 Go 服務的 trust pool，而對端的 leaf 是新工具簽的。
+    共同特徵都是：<em>CA 是舊的、leaf 是新的、編碼世代跨越了 PrintableString → UTF8String 的切換點、而驗證端是 Go</em>。
+    下面這張表把幾種 ASN.1 字串型別的 tag 與用途列出來，方便你在 dump 憑證時對號入座——看到 commonName 前面是 <code>0x13</code> 還是 <code>0x0c</code>，就知道落在切換線的哪一邊。
+  </p>
+
+  <figure class="vg-w-asn1table-x509">
+    <style>
+      .vg-w-asn1table-x509 { margin: var(--s-4) 0; overflow-x: auto; }
+      .vg-w-asn1table-x509 table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-asn1table-x509 th { text-align: left; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); border-bottom: 1px solid var(--ink-soft); padding: var(--s-1) var(--s-2); }
+      .vg-w-asn1table-x509 td { border-bottom: 1px solid var(--line); padding: var(--s-1) var(--s-2); vertical-align: top; }
+      .vg-w-asn1table-x509 td.hex { font-family: var(--mono); font-variant-numeric: tabular-nums; color: var(--accent-text); white-space: nowrap; }
+      .vg-w-asn1table-x509 tr.hot td { background: color-mix(in oklch, var(--accent) 8%, var(--bg)); }
+      .vg-w-asn1table-x509 caption { caption-side: bottom; font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); text-align: left; margin-top: var(--s-1); }
+    </style>
+    <table>
+      <caption>標紅兩列就是本案的主角：同一串可列印字元在這兩種型別下 value bytes 相同、tag 不同。Go 的 byName 比對會把它們當成兩個不同的名字。</caption>
+      <thead>
+        <tr><th>ASN.1 型別</th><th>tag (hex)</th><th>可裝的字元</th><th>在 DN 裡的角色</th></tr>
+      </thead>
+      <tbody>
+        <tr class="hot"><td>PrintableString</td><td class="hex">0x13</td><td>A–Z a–z 0–9 與少數標點（無底線、無 @）</td><td>舊工具對 commonName / O / OU 的常見預設</td></tr>
+        <tr class="hot"><td>UTF8String</td><td class="hex">0x0c</td><td>任意 Unicode</td><td>RFC 5280 之後新工具的主流預設</td></tr>
+        <tr><td>IA5String</td><td class="hex">0x16</td><td>ASCII</td><td>emailAddress、DNS 名等</td></tr>
+        <tr><td>TeletexString (T61)</td><td class="hex">0x14</td><td>傳統 T.61 字集</td><td>非常老的憑證裡偶見，已棄用</td></tr>
+        <tr><td>BMPString</td><td class="hex">0x1e</td><td>UCS-2</td><td>少數 Windows 系工具產出</td></tr>
+      </tbody>
+    </table>
+  </figure>
+
+  <p>
+    診斷起來其實不難，難的是「想到要往這裡看」。
+    一旦懷疑到編碼，把出問題的 leaf 與它的 CA 都 dump 成 DER，
+    用 <code>openssl asn1parse -in cert.pem</code>（或 <code>-inform DER</code>）逐欄位看 Subject / Issuer 的 commonName 是 <code>PRINTABLESTRING</code> 還是 <code>UTF8STRING</code>。
+    若兩端不一致，病灶就確認了。
+    幾條可行的處置：
+  </p>
+
+  <ul>
+    <li><strong>讓兩端編碼一致</strong>——理想解是重簽，
+    讓 CA 與 leaf 在 DN 字串型別上對齊（通常是把舊 CA 那一側統一成 UTF8String，
+    或反過來讓簽發工具沿用 CA 的編碼）。但 CA 是長命的，重簽 root 成本高，
+    多半不可行。</li>
+    <li><strong>調整簽發工具，讓新 leaf 的 Issuer 沿用 CA Subject 的原始編碼</strong>——
+    好的 cert 工具會直接把 CA 的 Subject DER 原封不動複製進 leaf 的 Issuer，
+    而不是「重新編碼一個語意相同的 DN」。
+    能做到這點，bytes 就天然對得上。
+    </li>
+    <li><strong>把 leaf 用的 CA 換成編碼相符的那一份</strong>——
+    若你同時有 PrintableString 與 UTF8String 兩種編碼的同一張 CA（語意相同、
+    僅 tag 不同），在 Go 的 pool 裡放對應 leaf Issuer 編碼的那一份即可命中。</li>
+  </ul>
+
+  <p>
+    最不該做的，是因為「OpenSSL 都過了，一定是 Go 太龜毛」就去關掉驗證或塞 <code>InsecureSkipVerify</code>——那是把一個 fail-closed 的誤拒，換成一個 fail-open 的真漏洞。
+    這個 quirk 整件事最諷刺的地方就在這裡：它本身嚴格到誤傷自己人，但解法若選錯方向，反而會在原本最穩的那一邊開個洞。
+  </p>
+
+  <p class="vg-deep-closer"><strong>Take-away</strong>：
+  當一張憑證「OpenSSL 過、Go 不過」、錯誤又是 <code>certificate signed by unknown authority</code> 時，
+  先別查信任錨與到期——直接 <code>openssl asn1parse</code> dump 出 leaf 的 Issuer 與 CA 的 Subject，
+  比對 commonName 的 ASN.1 tag 是 <code>0x13</code>（PrintableString）還是 <code>0x0c</code>（UTF8String）。
+  Go 在 chain building 用的是 RawIssuer / RawSubject 的 byte 相等，不是 DN 語意相等；
+  兩個 byte 的編碼差異，就足以讓一條數學上完全合法的鏈在 map 查找那一步無聲斷掉。
+  </p>
+</div>

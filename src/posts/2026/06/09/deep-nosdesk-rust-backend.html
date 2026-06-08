@@ -1,0 +1,650 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">一個 12 萬行的 Rust 後端，260 個模組，ships 成單一 binary、一句 docker compose up 就起得來。但真正值得偷的不是規模，而是作者反覆把「不該發生的事」從 runtime 的祈禱挪進 compile time 的事實——「插入一個沒簽名的 plugin」這句話，在他的型別系統裡根本寫不出來。</p>
+  <h1 class="vg-post-title">120k 行 Rust 後端的一趟導覽——把多租戶、同步引擎與外掛安全都交給型別系統</h1>
+</header>
+
+<div class="vg-post-prose">
+<p><span class="vg-dropcap">N</span>osdesk 的作者把一個生產級後端攤開來寫了一篇導覽：120,000 行 Rust、約 260 個模組、約 1,030 個測試，stack 是 Actix-web 跑 HTTP、Diesel 打 Postgres、Redis 做 fan-out、Tokio 當 runtime。這篇文章不是線性教學，而是「值得學的設計決策」的散點集合——他自己挑了一連串決策，攤開來講為什麼這樣設計。本文也不打算複述全部，而是挑其中五條我認為最有遷移價值的主軸，織成一趟導覽：同步引擎的 single-write log、Postgres LISTEN/NOTIFY 的去重喚醒、把多租戶與外掛安全壓進型別層、email 子系統裡那套手寫韌性機制，以及一套用 lint 當測試逼著每個 write 函式發事件的紀律。</p>
+
+<p>挑這五條的理由很簡單：它們都不是 Rust 特有的炫技，而是「任何後端遲早會碰到、但大多數人會用 runtime check 草草帶過」的問題，被這個 codebase 用更狠的方式解掉了。每一段都會落到具體的 crate 名與機制——Actix-web、Tokio、Diesel、tokio-postgres、yrs、ring——因為脫離了具體機制，這種文章只剩雞湯。</p>
+
+<h2>sync_actions：一次寫入，三個 consumer 讀同一行</h2>
+
+<p>先講整篇文章我認為最值得偷的一招。Nosdesk 是一個協作型產品，意味著「有人改了東西」這件事要同時餵給好幾個下游：正在連線的 client 要即時收到 push、剛上線在追進度的 client 要 HTTP delta sync 把落後補回來、合規面要一條 audit trail。樸素做法是每個下游各自監聽、各自從業務表撈差異——三條讀路徑，三種「我以為的最新狀態」，遲早 diverge。</p>
+
+<p>Nosdesk 的做法是一張 append-only 的 <code>sync_actions</code> log：每一個業務變更，除了寫進它自己的表，還在 <code>sync_actions</code> append 一列，描述「發生了什麼、順序是多少」。然後三個 consumer——HTTP delta sync、live push channel、audit trail——全部只從這一張 log 讀。作者那句話點破了全部：「If the write landed, every consumer sees the same canonical event in the same order.」只要寫進去了，每個 consumer 看到的就是同一個 canonical event、同一個順序。</p>
+
+<p>這個轉換的威力在於它把「三個下游一致性」這個分散式問題，降維成「三個 reader 讀同一張單調遞增的表」這個單機問題。順序由 <code>sync_id</code> 這個單調遞增的欄位定義，consumer 之間不需要互相協調，各自記住自己讀到哪、下次從那之後撈即可。下面這張可點擊的架構圖是這一段的單一入口——點任一個 box，看它負責什麼、以及它刻意不知道什麼。</p>
+
+<figure class="vg-w-arch-nosdesk-sync" data-svg-scroll="800">
+  <style>
+    .vg-w-arch-nosdesk-sync { display: grid; grid-template-columns: 1fr; gap: var(--s-3); align-items: start; margin: var(--s-4) 0; }
+    .vg-w-arch-nosdesk-sync svg { width: 100%; height: auto; }
+    .vg-w-arch-nosdesk-sync input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+    .vg-w-arch-nosdesk-sync .component { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; transition: fill 200ms, stroke 200ms; }
+    .vg-w-arch-nosdesk-sync .component:hover { stroke: var(--accent); }
+    .vg-w-arch-nosdesk-sync .component:focus { outline: none; }
+    .vg-w-arch-nosdesk-sync .component:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .vg-w-arch-nosdesk-sync .component-text { pointer-events: none; }
+    .vg-w-arch-nosdesk-sync .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+    .vg-w-arch-nosdesk-sync .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+    .vg-w-arch-nosdesk-sync .detail p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+    .vg-w-arch-nosdesk-sync .hint { font-family: var(--scribed); color: var(--muted); font-size: var(--fs-xs); margin-top: var(--s-1); }
+    .vg-w-arch-nosdesk-sync:has(#vg-w-arch-nosdesk-sync-r1:checked) .component-1 { fill: var(--accent); fill-opacity: 0.18; stroke: var(--accent); }
+    .vg-w-arch-nosdesk-sync:has(#vg-w-arch-nosdesk-sync-r2:checked) .component-2 { fill: var(--accent); fill-opacity: 0.18; stroke: var(--accent); }
+    .vg-w-arch-nosdesk-sync:has(#vg-w-arch-nosdesk-sync-r3:checked) .component-3 { fill: var(--accent); fill-opacity: 0.18; stroke: var(--accent); }
+    .vg-w-arch-nosdesk-sync:has(#vg-w-arch-nosdesk-sync-r4:checked) .component-4 { fill: var(--accent); fill-opacity: 0.18; stroke: var(--accent); }
+    .vg-w-arch-nosdesk-sync:has(#vg-w-arch-nosdesk-sync-r5:checked) .component-5 { fill: var(--accent); fill-opacity: 0.18; stroke: var(--accent); }
+    .vg-w-arch-nosdesk-sync:has(#vg-w-arch-nosdesk-sync-r1:checked) .detail-1 { display: block; }
+    .vg-w-arch-nosdesk-sync:has(#vg-w-arch-nosdesk-sync-r2:checked) .detail-2 { display: block; }
+    .vg-w-arch-nosdesk-sync:has(#vg-w-arch-nosdesk-sync-r3:checked) .detail-3 { display: block; }
+    .vg-w-arch-nosdesk-sync:has(#vg-w-arch-nosdesk-sync-r4:checked) .detail-4 { display: block; }
+    .vg-w-arch-nosdesk-sync:has(#vg-w-arch-nosdesk-sync-r5:checked) .detail-5 { display: block; }
+  </style>
+
+  <input type="radio" id="vg-w-arch-nosdesk-sync-r1" aria-label="select write handler" name="vg-w-arch-nosdesk-sync-sel" checked />
+  <input type="radio" id="vg-w-arch-nosdesk-sync-r2" aria-label="select sync_actions log" name="vg-w-arch-nosdesk-sync-sel" />
+  <input type="radio" id="vg-w-arch-nosdesk-sync-r3" aria-label="select http delta sync" name="vg-w-arch-nosdesk-sync-sel" />
+  <input type="radio" id="vg-w-arch-nosdesk-sync-r4" aria-label="select live push" name="vg-w-arch-nosdesk-sync-sel" />
+  <input type="radio" id="vg-w-arch-nosdesk-sync-r5" aria-label="select audit trail" name="vg-w-arch-nosdesk-sync-sel" />
+
+  <svg viewBox="0 0 720 360" role="img" aria-label="sync_actions single-write fan-out to three consumers">
+    <defs>
+      <marker id="vg-w-arch-nosdesk-sync-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+      </marker>
+    </defs>
+
+    <text x="360" y="22" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--muted)" font-style="italic">one write · one canonical order · three independent readers</text>
+
+    <rect class="component component-1" data-target="vg-w-arch-nosdesk-sync-r1" x="40" y="50" width="200" height="80" rx="4" role="button" tabindex="0" />
+    <text class="component-text" x="140" y="84" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">write handler</text>
+    <text class="component-text" x="140" y="106" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">業務表 + append 一列</text>
+
+    <rect class="component component-2" data-target="vg-w-arch-nosdesk-sync-r2" x="290" y="40" width="170" height="100" rx="4" role="button" tabindex="0" />
+    <text class="component-text" x="375" y="78" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">sync_actions</text>
+    <text class="component-text" x="375" y="100" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">append-only log</text>
+    <text class="component-text" x="375" y="120" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)" font-style="italic">sync_id 單調遞增</text>
+
+    <rect class="component component-3" data-target="vg-w-arch-nosdesk-sync-r3" x="510" y="30" width="180" height="74" rx="4" role="button" tabindex="0" />
+    <text class="component-text" x="600" y="62" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">HTTP delta sync</text>
+    <text class="component-text" x="600" y="82" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">catch-up client</text>
+
+    <rect class="component component-4" data-target="vg-w-arch-nosdesk-sync-r4" x="510" y="120" width="180" height="74" rx="4" role="button" tabindex="0" />
+    <text class="component-text" x="600" y="152" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">live push</text>
+    <text class="component-text" x="600" y="172" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">connected client</text>
+
+    <rect class="component component-5" data-target="vg-w-arch-nosdesk-sync-r5" x="510" y="210" width="180" height="74" rx="4" role="button" tabindex="0" />
+    <text class="component-text" x="600" y="242" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">audit trail</text>
+    <text class="component-text" x="600" y="262" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">compliance</text>
+
+    <line x1="240" y1="90" x2="290" y2="90" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-arch-nosdesk-sync-arrow)" />
+    <line x1="460" y1="80" x2="510" y2="67" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-arch-nosdesk-sync-arrow)" />
+    <line x1="460" y1="95" x2="510" y2="157" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-arch-nosdesk-sync-arrow)" />
+    <line x1="460" y1="110" x2="510" y2="247" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-arch-nosdesk-sync-arrow)" />
+
+    <text x="375" y="330" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)" font-style="italic">三個 reader 各記各的 last_seen，互不協調</text>
+  </svg>
+
+  <div>
+    <div class="detail detail-1">
+      <h3>write handler · responsibility</h3>
+      <p>執行一個業務變更，寫進它自己的表的同時，在 <code>sync_actions</code> append 一列 canonical event。兩件事在同一個 transaction 裡——要嘛都成立，要嘛都不成立。</p>
+      <p><strong>Does not know</strong>：誰會消費這個 event、有幾個 consumer、它們各自讀到哪。</p>
+      <p class="hint">「emit 一個 sync event」這件事後面會被一條 lint-as-test 強制檢查。</p>
+    </div>
+    <div class="detail detail-2">
+      <h3>sync_actions · responsibility</h3>
+      <p>append-only，永不就地修改。<code>sync_id</code> 單調遞增，定義了全 workspace 的 canonical order。它是三條讀路徑唯一的事實來源。</p>
+      <p><strong>Does not know</strong>：event 的業務語意。它只保證「順序」與「不可變」。</p>
+      <p class="hint">把「三個下游一致」降維成「三個 reader 讀同一張單調表」。</p>
+    </div>
+    <div class="detail detail-3">
+      <h3>HTTP delta sync · responsibility</h3>
+      <p>給剛上線、落後的 client 補進度。client 帶上自己的 <code>last_seen</code>，server 用 <code>WHERE sync_id &gt; last_seen</code> 撈出之後的所有 event 回放。</p>
+      <p><strong>Does not know</strong>：live push 推了什麼、audit 記了什麼。它只認 sync_id 區間。</p>
+      <p class="hint">catch-up 與 live 共用同一份 event，不會出現「補進度補到跟即時推的不一致」。</p>
+    </div>
+    <div class="detail detail-4">
+      <h3>live push · responsibility</h3>
+      <p>把新 event 即時推給連線中的 client，走 Redis fan-out。被喚醒後一樣用 <code>sync_id &gt; last_seen</code> 撈，而不是信任喚醒訊號本身帶來的內容。</p>
+      <p><strong>Does not know</strong>：哪些 client 在 catch-up、audit 何時讀。</p>
+      <p class="hint">喚醒只是「去看一下」的訊號，真相永遠回 log 撈。</p>
+    </div>
+    <div class="detail detail-5">
+      <h3>audit trail · responsibility</h3>
+      <p>合規面的完整歷史。因為 log 本身 append-only 且有序，audit 不需要另一條寫路徑——它就是同一張 log 的第三個 reader。</p>
+      <p><strong>Does not know</strong>：sync 的即時性需求。它在意的是「不漏、有序、不可改」。</p>
+      <p class="hint">audit 與 sync 共用同一份 canonical event，意味著「審計看到的」永遠等於「使用者同步到的」。</p>
+    </div>
+  </div>
+
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-arch-nosdesk-sync');
+      root.querySelectorAll('.component').forEach((rect) => {
+        rect.addEventListener('click', () => {
+          const targetId = rect.getAttribute('data-target');
+          const radio = root.querySelector('#' + targetId);
+          if (radio) radio.checked = true;
+        });
+        rect.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            rect.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+          }
+        });
+      });
+    })();
+  </script>
+</figure>
+
+<p>這個設計有一個容易被忽略的副作用：它讓「正確性」與「即時性」解耦。catch-up 走 HTTP、live 走 Redis push，兩條傳輸機制完全不同，但它們讀的是同一份 event、同一個順序，所以一個剛上線的 client 透過 delta sync 補到的狀態，跟一個全程連線的 client 透過 live push 收到的狀態，必然收斂到同一個結果。如果這三條是各自從業務表撈差異，光是「delta sync 撈的 cut-off 時間點」跟「live push 開始監聽的時間點」之間那道縫，就足以讓兩個 client 對「現在是什麼狀態」產生永久分歧。</p>
+
+<p>值得強調的是 append-only 這個約束本身。一旦 <code>sync_actions</code> 允許就地修改或刪除，sync_id 的單調性就失去意義，consumer 的 <code>last_seen</code> watermark 也就不再可信。append-only 不是為了節省什麼，而是為了讓「順序」這個性質變成 structural invariant——資料結構本身保證的，而不是靠程式紀律維持的。</p>
+
+<h2>LISTEN/NOTIFY：通知不帶 payload，50 筆 commit 收斂成 1 次喚醒</h2>
+
+<p>有了 log，live push 還缺一件事：怎麼知道「有新東西寫進來了」。Nosdesk 用 Postgres 的 LISTEN/NOTIFY，但做法有兩個刻意的反直覺選擇，都值得學。</p>
+
+<p>第一，監聽走一條獨立的 <code>tokio-postgres</code> 連線，跟主 connection pool 完全分開。Diesel 是同步驅動，主 pool 上的連線隨時可能被 <code>spawn_blocking</code> 的重查詢佔住；如果 LISTEN 也擠在這個 pool 裡，喚醒延遲就會被慢查詢綁架。所以監聽自己一條 async 連線，作者用 <code>stream::poll_fn(move |cx| conn.poll_message(cx))</code> 把 tokio-postgres 的底層 poll 介面橋成一個 Rust async stream，喚醒就是這個 stream 吐出一個 item。</p>
+
+<p>第二，也是更關鍵的：NOTIFY 刻意不帶 payload。作者寫得很白——它「carries no payload, no row id, no hint at what changed」。通知就是一個空的「有事發生」訊號，收到之後 consumer 不去解讀通知內容，而是回 <code>sync_actions</code> 跑一次 <code>WHERE sync_id &gt; last_seen</code> 把自己落後的部分撈出來。</p>
+
+<p>為什麼要這樣自廢武功、不在 NOTIFY 裡塞 row id？因為「不帶 payload」換來兩個性質。其一是 correctness under concurrent writers：作者點出，一個信任 payload 的 handler「would silently miss the rows everyone else committed」——如果你信通知帶來的那個 row id，那麼在你處理它的同時、別人 commit 進來的那些 row 你就漏了，而且是無聲地漏。回 log 撈 watermark 區間則永遠撈得乾淨，不管期間有多少並發寫入。</p>
+
+<p>其二，也是最漂亮的一個性質：去重。NOTIFY 不帶內容，意味著「收到 N 個通知」跟「收到 1 個通知」在 consumer 眼裡是一樣的——反正都是「回去撈 last_seen 之後的全部」。作者那句話是整段的核心：「Fifty rows committed in one transaction collapse to one wakeup instead of fifty. A burst of writes debounces on its own.」一個 transaction 裡 commit 50 列，不是觸發 50 次喚醒、各自撈一列，而是收斂成 1 次喚醒、一次撈完 50 列。一陣寫入的爆量，自己就 debounce 掉了。下面這個 slider 把這個收斂算給你看。</p>
+
+<figure class="vg-w-range-notify-coalesce" data-svg-scroll="720">
+  <style>
+    .vg-w-range-notify-coalesce { margin: var(--s-4) 0; padding: var(--s-3); border: 1px solid var(--line); background: var(--bg-soft); }
+    .vg-w-range-notify-coalesce .controls { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s-3); margin-bottom: var(--s-3); }
+    @media (max-width: 520px) { .vg-w-range-notify-coalesce .controls { grid-template-columns: 1fr; } }
+    .vg-w-range-notify-coalesce label.knob { display: grid; gap: var(--s-1); font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+    .vg-w-range-notify-coalesce .val { font-family: var(--sans); font-variant-numeric: tabular-nums; font-size: var(--fs-md); color: var(--accent-text); }
+    .vg-w-range-notify-coalesce input[type=range] { width: 100%; accent-color: var(--accent); min-height: 36px; touch-action: none; }
+    .vg-w-range-notify-coalesce svg { width: 100%; height: auto; display: block; margin-top: var(--s-2); }
+    .vg-w-range-notify-coalesce .reading { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--s-2); margin-top: var(--s-2); font-family: var(--serif); font-size: var(--fs-sm); }
+    @media (max-width: 520px) { .vg-w-range-notify-coalesce .reading { grid-template-columns: 1fr; } }
+    .vg-w-range-notify-coalesce .reading .cell { padding: var(--s-1) var(--s-2); border-left: 2px solid var(--muted-2); }
+    .vg-w-range-notify-coalesce .reading .cell strong { display: block; font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin-bottom: 2px; }
+    .vg-w-range-notify-coalesce .reading .cell.good { border-left-color: var(--accent); color: var(--accent-text); }
+    .vg-w-range-notify-coalesce .cap { font-family: var(--scribed); color: var(--muted); font-size: var(--fs-xs); display: block; margin-bottom: var(--s-2); }
+  </style>
+  <span class="cap">拖左 slider 調一個 transaction 裡 commit 的列數，右 slider 調這個 burst 含幾個 transaction。空 payload 的設計讓「喚醒次數」只跟 transaction 數綁，跟列數無關——因為每次喚醒都是回 log 一次撈完區間。</span>
+  <div class="controls">
+    <label class="knob">rows per transaction <span class="val" id="vg-w-range-notify-coalesce-rows-val">50</span>
+      <input type="range" id="vg-w-range-notify-coalesce-rows" min="1" max="200" step="1" value="50" />
+    </label>
+    <label class="knob">transactions in burst <span class="val" id="vg-w-range-notify-coalesce-tx-val">1</span>
+      <input type="range" id="vg-w-range-notify-coalesce-tx" min="1" max="20" step="1" value="1" />
+    </label>
+  </div>
+  <svg viewBox="0 0 640 150" role="img" aria-label="rows committed collapse into wakeups proportional to transactions, not rows">
+    <text x="20" y="28" font-family="EB Garamond, serif" font-size="13" fill="var(--muted)">naïve（每列一通知，payload 帶 row id）</text>
+    <g id="vg-w-range-notify-coalesce-naive"></g>
+    <text x="20" y="78" font-family="EB Garamond, serif" font-size="13" fill="var(--accent-text)">coalesced（空 payload，每 tx 一喚醒）</text>
+    <g id="vg-w-range-notify-coalesce-coal"></g>
+    <line x1="20" y1="118" x2="620" y2="118" stroke="var(--line)" />
+    <text x="20" y="140" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">每個刻度 = 一次把 consumer 喚醒（context switch + log 撈一次）</text>
+  </svg>
+  <div class="reading">
+    <div class="cell"><strong>rows committed</strong><span id="vg-w-range-notify-coalesce-total">50</span></div>
+    <div class="cell"><strong>naïve wakeups</strong><span id="vg-w-range-notify-coalesce-naive-n">50</span></div>
+    <div class="cell good"><strong>coalesced wakeups</strong><span id="vg-w-range-notify-coalesce-coal-n">1</span></div>
+  </div>
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-range-notify-coalesce');
+      const rowsIn = root.querySelector('#vg-w-range-notify-coalesce-rows');
+      const txIn = root.querySelector('#vg-w-range-notify-coalesce-tx');
+      const rowsVal = root.querySelector('#vg-w-range-notify-coalesce-rows-val');
+      const txVal = root.querySelector('#vg-w-range-notify-coalesce-tx-val');
+      const naiveG = root.querySelector('#vg-w-range-notify-coalesce-naive');
+      const coalG = root.querySelector('#vg-w-range-notify-coalesce-coal');
+      const total = root.querySelector('#vg-w-range-notify-coalesce-total');
+      const naiveN = root.querySelector('#vg-w-range-notify-coalesce-naive-n');
+      const coalN = root.querySelector('#vg-w-range-notify-coalesce-coal-n');
+      const NS = 'http://www.w3.org/2000/svg';
+      function ticks(g, count, y, color) {
+        while (g.firstChild) g.removeChild(g.firstChild);
+        const shown = Math.min(count, 120);
+        const x0 = 20, x1 = 620, span = x1 - x0;
+        for (let i = 0; i < shown; i++) {
+          const x = x0 + (shown === 1 ? span / 2 : (i / (shown - 1)) * span);
+          const l = document.createElementNS(NS, 'line');
+          l.setAttribute('x1', x.toFixed(1)); l.setAttribute('x2', x.toFixed(1));
+          l.setAttribute('y1', y - 12); l.setAttribute('y2', y + 6);
+          l.setAttribute('stroke', color); l.setAttribute('stroke-width', '2');
+          g.appendChild(l);
+        }
+        if (count > shown) {
+          const t = document.createElementNS(NS, 'text');
+          t.setAttribute('x', x1); t.setAttribute('y', y + 2);
+          t.setAttribute('text-anchor', 'end');
+          t.setAttribute('font-family', 'EB Garamond, serif');
+          t.setAttribute('font-size', '11'); t.setAttribute('fill', color);
+          t.textContent = '… ' + count + ' 總計';
+          g.appendChild(t);
+        }
+      }
+      function update() {
+        const rows = +rowsIn.value, tx = +txIn.value;
+        rowsVal.textContent = rows; txVal.textContent = tx;
+        const totalRows = rows * tx;
+        total.textContent = totalRows;
+        naiveN.textContent = totalRows;
+        coalN.textContent = tx;
+        ticks(naiveG, totalRows, 44, 'var(--ink)');
+        ticks(coalG, tx, 94, 'var(--accent)');
+      }
+      rowsIn.addEventListener('input', update);
+      txIn.addEventListener('input', update);
+      update();
+    })();
+  </script>
+</figure>
+
+<p>把 rows 拖到 50、transaction 留 1，naïve 路徑是 50 次喚醒，coalesced 是 1 次——這正是作者那句話的數字。把 transaction 數拉高，你會看到 coalesced 的喚醒次數只跟 transaction 數成正比，完全不理會每個 transaction 裡塞了多少列。這就是「空 payload」這個看似自廢武功的決定真正買到的東西：在寫入爆量時，喚醒成本與 context switch 次數被天然壓到 transaction 的數量級，而不是 row 的數量級。一個重寫的 batch job 一次 commit 上千列，consumer 只被叫醒一次。</p>
+
+<p>這裡有一個微妙的取捨值得點出：空 payload 換來去重與正確性，代價是每次喚醒都要回 Postgres 跑一次查詢，而不是直接從通知裡讀內容。但這個代價在 <code>sync_id &gt; last_seen</code> 有索引的前提下極小——它是一次有界的索引掃描——而它換來的「並發寫入下不漏、爆量自動 debounce」兩個性質，是 payload-carrying 設計用任何補丁都補不回來的。這是一個典型的「用一次便宜的查詢，換掉一整類 race condition」的交易。</p>
+
+<h2>spawn_blocking + ReceiverStream：同步 Diesel 怎麼餵 async 串流</h2>
+
+<p>Nosdesk 一個有意思的選擇是 async runtime 用 Tokio，但 ORM 用同步的 Diesel。這不是矛盾，而是一個務實的接縫設計：Diesel 的型別安全與成熟度作者要，async runtime 的並發他也要，於是中間用 <code>spawn_blocking</code> 把同步查詢丟到 blocking thread pool，不去阻塞 async executor。</p>
+
+<p>真正精彩的是 bootstrap sync——新 client 上線要把整個 workspace 的初始快照拉下來。樸素做法是把所有 row 撈進一個 <code>Vec</code> 序列化後回傳，但作者點明這會造成「workspace-sized memory spike on every connection」：每一條新連線都在 server 記憶體裡堆起一份整個 workspace 大小的緩衝。對一個多租戶系統，這是一條等著被大客戶引爆的路。</p>
+
+<p>他的解法是串流 + back-pressure。row 被序列化成 newline-delimited JSON（NDJSON），透過一個 <code>mpsc::channel(64)</code> 推出去，Diesel 查詢跑在 <code>spawn_blocking</code> 上，產出的 bytes 用 <code>ReceiverStream</code> 包成一個 HTTP response body 串回 client。channel 容量 64 是關鍵：當 client 讀得慢，channel 填滿，producer 就被 back-pressure 卡住，「a slow reader back-pressures the producer instead of pinning the whole result set in RAM」——慢的 reader 反壓 producer，而不是把整個結果集釘在 RAM 裡。整段 bootstrap 跑在單一 transaction 內，所以 client 拿到的是一個一致的 point-in-time 視圖，不會撈一半被別人的寫入插隊。</p>
+
+<pre><code class="language-rust">// bootstrap：同步 Diesel 查詢丟到 blocking pool，
+// NDJSON 透過 bounded channel 串回，慢 reader 自動 back-pressure
+let (tx, rx) = mpsc::channel::&lt;Bytes&gt;(64);
+tokio::task::spawn_blocking(move || {
+    conn.transaction(|conn| {
+        for row in stream_workspace_rows(conn)? {
+            let line = to_ndjson(&amp;row);
+            // channel 滿時 blocking_send 卡住 → 反壓到查詢游標
+            if tx.blocking_send(line).is_err() {
+                break; // client 斷線，停止掃描
+            }
+        }
+        Ok(())
+    })
+});
+// ReceiverStream 把 rx 包成 HTTP response body
+HttpResponse::Ok().streaming(ReceiverStream::new(rx))</code></pre>
+
+<p>這個 channel(64) 的數字本身就是一個 back-pressure 旋鈕：太小，producer 與 consumer 頻繁 ping-pong，throughput 受損；太大，慢 client 能在你被卡住前先讓你緩衝大量資料，記憶體保護就鬆了。64 是一個「足以吸收抖動、又不至於讓記憶體無界成長」的折衷。重點不在這個數字，而在「有界 channel」這個結構本身——它把 memory safety 從「希望 client 讀得夠快」變成「channel 容量數學上保證的上界」。下面這張示意圖把這條串流路徑的四個環節攤開，並把那條從慢 reader 一路反推回查詢游標的 back-pressure 回饋線畫出來。</p>
+
+<figure class="vg-w-ndjson-stream-backpressure" data-svg-scroll="720">
+  <style>
+    .vg-w-ndjson-stream-backpressure { margin: var(--s-4) 0; }
+    .vg-w-ndjson-stream-backpressure svg { width: 100%; height: auto; display: block; }
+    .vg-w-ndjson-stream-backpressure .cap { font-family: var(--scribed); color: var(--muted); font-size: var(--fs-xs); display: block; margin-bottom: var(--s-2); }
+    .vg-w-ndjson-stream-backpressure .stage { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; }
+    .vg-w-ndjson-stream-backpressure .chan { fill: var(--accent); fill-opacity: 0.12; stroke: var(--accent); stroke-width: 1.5; }
+  </style>
+  <span class="cap">四環一路：spawn_blocking 跑同步 Diesel 查詢 → 序列化成 NDJSON → 推進 mpsc::channel(64) → ReceiverStream 包成 HTTP body。channel 滿時，blocking_send 卡住 producer，反壓沿紅線一路推回查詢游標——記憶體上界由 channel 容量保證，而非祈禱 client 讀得快。</span>
+  <svg viewBox="0 0 720 280" role="img" aria-label="NDJSON bootstrap streaming path: spawn_blocking Diesel query serialized to NDJSON pushed through a bounded mpsc channel of 64 and wrapped by ReceiverStream into an HTTP response body, with back-pressure propagating from a slow client back to the query cursor">
+    <defs>
+      <marker id="vg-w-ndjson-stream-backpressure-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+      </marker>
+      <marker id="vg-w-ndjson-stream-backpressure-bp" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--accent)" />
+      </marker>
+    </defs>
+
+    <text x="360" y="22" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--muted)" font-style="italic">一個 transaction 內的 point-in-time 串流，記憶體不堆整份 workspace</text>
+
+    <rect class="stage" x="18" y="56" width="150" height="78" rx="4" />
+    <text x="93" y="86" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">spawn_blocking</text>
+    <text x="93" y="106" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">同步 Diesel 查詢</text>
+    <text x="93" y="123" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">逐列吐，不收進 Vec</text>
+
+    <rect class="stage" x="198" y="56" width="150" height="78" rx="4" />
+    <text x="273" y="86" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">to_ndjson</text>
+    <text x="273" y="106" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">每列序列化成一行</text>
+    <text x="273" y="123" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">newline-delimited</text>
+
+    <rect class="chan" x="378" y="56" width="160" height="78" rx="4" />
+    <text x="458" y="84" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">mpsc::channel(64)</text>
+    <text x="458" y="104" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">bounded buffer</text>
+    <text x="458" y="121" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--accent-text)" font-style="italic">滿了就卡住 producer</text>
+
+    <rect class="stage" x="568" y="56" width="134" height="78" rx="4" />
+    <text x="635" y="86" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--ink)">ReceiverStream</text>
+    <text x="635" y="106" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">→ HTTP body</text>
+    <text x="635" y="123" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">串給慢 client</text>
+
+    <line x1="168" y1="95" x2="198" y2="95" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-ndjson-stream-backpressure-arrow)" />
+    <line x1="348" y1="95" x2="378" y2="95" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-ndjson-stream-backpressure-arrow)" />
+    <line x1="538" y1="95" x2="568" y2="95" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-ndjson-stream-backpressure-arrow)" />
+
+    <text x="360" y="172" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--accent-text)">back-pressure：慢 reader 反壓 producer</text>
+    <path d="M 635 200 L 635 224 L 93 224 L 93 134" fill="none" stroke="var(--accent)" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#vg-w-ndjson-stream-backpressure-bp)" />
+    <text x="360" y="244" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)" font-style="italic">channel 填滿 → blocking_send 卡住 → 反壓回查詢游標，停止掃描</text>
+    <text x="360" y="266" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">記憶體上界 = channel 容量（64），不隨 workspace 大小膨脹</text>
+  </svg>
+</figure>
+
+<p>而 bounded mpsc 只是這個子系統挑用的並發原語之一。作者那段話把整套挑選邏輯講得極乾淨——「<code>DashMap</code> for the lazily-populated topic map. <code>tokio::broadcast</code> for fan-out with built-in lag detection. Bounded <code>mpsc</code> where I want back-pressure. <code>std::sync::RwLock</code> where no <code>await</code> crosses the critical section; <code>tokio::sync::RwLock</code> only where one does.」每一個選擇都掛在兩條問題上：critical section 裡有沒有 <code>.await</code>？要不要 back-pressure 或 lag detection？下面這張決策圖把這五個原語照這兩條軸攤開——它不是教你某個 API，而是把「該用哪個」這個每天都要做的判斷，定成一棵可以照著走的樹。</p>
+
+<figure class="vg-w-concurrency-primitive-map" data-svg-scroll="800">
+  <style>
+    .vg-w-concurrency-primitive-map { margin: var(--s-4) 0; }
+    .vg-w-concurrency-primitive-map svg { width: 100%; height: auto; display: block; }
+    .vg-w-concurrency-primitive-map .cap { font-family: var(--scribed); color: var(--muted); font-size: var(--fs-xs); display: block; margin-bottom: var(--s-2); }
+    .vg-w-concurrency-primitive-map .q { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; }
+    .vg-w-concurrency-primitive-map .leaf { fill: var(--accent); fill-opacity: 0.12; stroke: var(--accent); stroke-width: 1.5; }
+  </style>
+  <span class="cap">兩條軸定一切：critical section 裡是否有 .await，以及你要的是 back-pressure 還是 lag detection。照著樹走，落到的葉子就是該用的原語。</span>
+  <svg viewBox="0 0 760 360" role="img" aria-label="concurrency primitive decision map: choosing between DashMap, tokio::broadcast, bounded mpsc, std::sync::RwLock and tokio::sync::RwLock by whether an await crosses the critical section and whether back-pressure or lag detection is wanted">
+    <defs>
+      <marker id="vg-w-concurrency-primitive-map-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+      </marker>
+    </defs>
+
+    <text x="380" y="22" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--muted)" font-style="italic">問兩個問題，落到一個原語</text>
+
+    <rect class="q" x="300" y="34" width="160" height="50" rx="4" />
+    <text x="380" y="56" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">你要的是什麼？</text>
+    <text x="380" y="74" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">共享 map / 傳值 / 鎖狀態</text>
+
+    <line x1="320" y1="84" x2="160" y2="118" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-concurrency-primitive-map-arrow)" />
+    <text x="205" y="104" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)" font-style="italic">並發共享 map</text>
+
+    <line x1="380" y1="84" x2="380" y2="118" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-concurrency-primitive-map-arrow)" />
+    <text x="392" y="104" text-anchor="start" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)" font-style="italic">傳值（channel）</text>
+
+    <line x1="440" y1="84" x2="600" y2="118" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-concurrency-primitive-map-arrow)" />
+    <text x="558" y="104" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)" font-style="italic">鎖共享狀態</text>
+
+    <rect class="leaf" x="40" y="122" width="190" height="54" rx="4" />
+    <text x="135" y="146" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">DashMap</text>
+    <text x="135" y="164" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">lazily-populated topic map</text>
+
+    <rect class="q" x="280" y="122" width="200" height="54" rx="4" />
+    <text x="380" y="146" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">要 back-pressure，</text>
+    <text x="380" y="164" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">還是 fan-out + lag detection？</text>
+
+    <rect class="q" x="530" y="122" width="200" height="54" rx="4" />
+    <text x="630" y="146" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">critical section 裡</text>
+    <text x="630" y="164" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">有 .await 嗎？</text>
+
+    <line x1="330" y1="176" x2="250" y2="244" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-concurrency-primitive-map-arrow)" />
+    <text x="262" y="214" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--accent-text)" font-style="italic">要 back-pressure</text>
+
+    <rect class="leaf" x="60" y="248" width="220" height="54" rx="4" />
+    <text x="170" y="272" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">bounded mpsc</text>
+    <text x="170" y="290" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">慢 reader 反壓 producer</text>
+
+    <line x1="420" y1="176" x2="400" y2="244" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-concurrency-primitive-map-arrow)" />
+    <text x="430" y="214" text-anchor="start" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)" font-style="italic">要 fan-out + lag detection</text>
+
+    <rect class="leaf" x="300" y="248" width="200" height="54" rx="4" />
+    <text x="400" y="272" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">tokio::broadcast</text>
+    <text x="400" y="290" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">內建 lag detection</text>
+
+    <line x1="590" y1="176" x2="560" y2="244" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-concurrency-primitive-map-arrow)" />
+    <text x="540" y="214" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)" font-style="italic">無 .await</text>
+
+    <rect class="leaf" x="510" y="248" width="120" height="54" rx="4" />
+    <text x="570" y="272" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--ink)">std::sync::</text>
+    <text x="570" y="290" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--ink)">RwLock</text>
+
+    <line x1="670" y1="176" x2="700" y2="244" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-concurrency-primitive-map-arrow)" />
+    <text x="710" y="214" text-anchor="end" font-family="EB Garamond, serif" font-size="11" fill="var(--accent-text)" font-style="italic">有 .await 跨越</text>
+
+    <rect class="leaf" x="650" y="248" width="120" height="54" rx="4" />
+    <text x="710" y="272" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--ink)">tokio::sync::</text>
+    <text x="710" y="290" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--ink)">RwLock</text>
+
+    <text x="380" y="332" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)" font-style="italic">同一個 vocabulary，五個原語各有唯一一條進來的路</text>
+  </svg>
+</figure>
+
+<h2>型別層安全：illegal states 寫不出來</h2>
+
+<p>這是整篇文章我認為最有 Rust 味、也最值得搬到任何強型別語言的一段。Nosdesk 把兩類「絕對不能出錯」的事——跨租戶資料隔離、未簽名 plugin 安裝——從 runtime check 挪進了型別系統，讓錯誤的程式根本編不過。</p>
+
+<p>先講多租戶。作者的第一句話就很狠：「Handlers don't get a raw database connection at all.」handler 拿不到裸的資料庫連線。能碰 connection pool 的只有兩個 extractor：<code>TenantConn</code> 與 <code>PlatformConn</code>。<code>TenantConn</code> 會把每個查詢包在一個設好 workspace context 的 transaction 裡，讓 Postgres 的 Row-Level Security（RLS）自動過濾掉不屬於這個 workspace 的 row；<code>PlatformConn</code> 則 elevate 到一個特殊 role，做那種罕見的跨租戶操作。關鍵在於：一個 handler 的簽名只要寫了 <code>PlatformConn</code>，它就在型別上公開宣告「我會跨越租戶邊界」——「announces 'I cross tenant boundaries' right there in its type」。code review 與 audit 不再需要逐行讀 SQL 找有沒有人漏了 workspace filter，只要 grep 函式簽名裡的 <code>PlatformConn</code> 就鎖定了所有跨租戶的 surface。</p>
+
+<p>plugin 那一段更是型別技巧的教科書範例。插入一筆 plugin row 的函式，要求一個 <code>InstallToken</code> 當參數——「the function that inserts a plugin row requires one as an argument」。而 <code>InstallToken</code> 唯一的建構路徑，是 private 在「verified-install 模組」裡的。模組外的任何程式碼都拿不出一個 <code>InstallToken</code>，於是「插入未簽名 plugin」這件事，在型別系統裡表達不出來——你想呼叫 insert 函式，就得先有 token；想有 token，就得走過驗證模組裡的簽名檢查。簽名本身是 Ed25519 over「a length-prefixed canonical digest with a domain-separation prefix」。下面這張圖把這兩條建構路徑並排：一條編得過，一條從根本上拼不出來。</p>
+
+<figure class="vg-w-types-install-token" data-svg-scroll="800">
+  <style>
+    .vg-w-types-install-token { margin: var(--s-4) 0; }
+    .vg-w-types-install-token svg { width: 100%; height: auto; display: block; }
+    .vg-w-types-install-token .cap { font-family: var(--scribed); color: var(--muted); font-size: var(--fs-xs); display: block; margin-bottom: var(--s-2); }
+  </style>
+  <span class="cap">左：唯一合法路徑——簽名驗過 → verified-install 模組構造 InstallToken → insert。右：任何想跳過驗證的程式碼，缺一個它構造不出來的 token，編譯器在 call site 就擋住。</span>
+  <svg viewBox="0 0 720 320" role="img" aria-label="InstallToken can only be constructed inside the verified-install module, making unsigned insert uncompilable">
+    <defs>
+      <marker id="vg-w-types-install-token-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+      </marker>
+    </defs>
+
+    <text x="180" y="26" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--accent-text)">合法路徑 · compiles</text>
+    <rect x="40" y="44" width="280" height="52" rx="4" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.5" />
+    <text x="180" y="68" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">plugin bytes + Ed25519 signature</text>
+    <text x="180" y="86" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">length-prefixed canonical digest</text>
+
+    <line x1="180" y1="96" x2="180" y2="118" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-types-install-token-arrow)" />
+
+    <rect x="40" y="120" width="280" height="58" rx="4" fill="var(--bg-soft)" stroke="var(--accent)" stroke-width="1.5" />
+    <text x="180" y="143" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">verified-install 模組</text>
+    <text x="180" y="162" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">驗簽通過 → 構造 InstallToken（private）</text>
+
+    <line x1="180" y1="178" x2="180" y2="200" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-types-install-token-arrow)" />
+
+    <rect x="40" y="202" width="280" height="58" rx="4" fill="var(--accent)" fill-opacity="0.14" stroke="var(--accent)" stroke-width="1.5" />
+    <text x="180" y="225" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">insert_plugin(token: InstallToken)</text>
+    <text x="180" y="244" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">row 進 DB ✓</text>
+
+    <line x1="360" y1="40" x2="360" y2="280" stroke="var(--line)" stroke-dasharray="3 4" />
+
+    <text x="540" y="26" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--muted)">繞過路徑 · does not compile</text>
+    <rect x="400" y="44" width="280" height="52" rx="4" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.5" stroke-dasharray="4 3" />
+    <text x="540" y="68" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--muted)">某 handler 想直接塞 plugin</text>
+    <text x="540" y="86" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">沒驗簽、想抄捷徑</text>
+
+    <line x1="540" y1="96" x2="540" y2="200" stroke="var(--muted-2)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#vg-w-types-install-token-arrow)" />
+    <text x="556" y="150" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)" font-style="italic">要 InstallToken</text>
+    <text x="556" y="168" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)" font-style="italic">但構造子 private</text>
+
+    <rect x="400" y="202" width="280" height="58" rx="4" fill="none" stroke="var(--accent)" stroke-width="1.5" stroke-dasharray="4 3" />
+    <text x="540" y="227" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--accent-text)">E0603: constructor is private</text>
+    <text x="540" y="246" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">編譯器在 call site 就擋下</text>
+
+    <text x="360" y="300" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)" font-style="italic">「插入未簽 plugin」在型別系統裡是一個寫不出來的句子</text>
+  </svg>
+</figure>
+
+<p>這個 pattern 在 Rust 圈有個名字：把不變式編碼進建構子可見性（也常被叫做 witness type 或 capability token）。<code>InstallToken</code> 不是一個帶資料的物件，它是一個「我已經通過驗證」的型別層證明——持有它本身就是證據。把這個證明設成「只有驗證模組能簽發」，等於把整條簽名檢查管線，變成 plugin 進資料庫的唯一道路：「the type system makes the signing-checked install pipeline the single path that can get a plugin into the database」。沒有第二條路可以漏掉，因為第二條路在型別上不存在。</p>
+
+<p>對照 runtime 的做法你就懂這招的價值：runtime check 是「在 insert 前記得呼叫 verify()」——而「記得」是人類紀律，會在某個 1am 的 hotfix 裡被某個趕時間的人略過。型別層的做法把這個紀律變成編譯器強制：你不是「應該」先驗證，而是「不先驗證就生不出能呼叫 insert 的參數」。這正是 opener 那句話的意思——「插入一個沒簽名的 plugin」這個句子，在這個 codebase 裡根本造不出來。</p>
+
+<h2>email 子系統：手寫的韌性機制</h2>
+
+<p>整個 codebase 裡，email 是最大的單一子系統——約 14,000 行。理由不難猜：email 要對接外部 SMTP/IMAP 伺服器，而外部世界是不可靠的，於是這 14k 行裡塞滿了各種「對抗不確定性」的機制，每一個都手寫、每一個都值得學。</p>
+
+<p>第一個是 circuit breaker。作者手刻了一個 closed / open / half-open 的狀態機，建在「a rolling window of recent failures」上——一個滾動視窗統計最近的失敗。最聰明的細節是狀態轉換「computed lazily when the state is next read, not from a background timer」：不是開一個背景 timer 去定時把 open 轉回 half-open，而是在下次讀取狀態時才惰性計算該不該轉。這省掉了一整類「timer 與狀態 race」的併發 bug，也省掉了背景 task 的資源。下面這張圖是這個狀態機的形狀。</p>
+
+<figure class="vg-w-circuit-breaker-states" data-svg-scroll="800">
+  <style>
+    .vg-w-circuit-breaker-states { margin: var(--s-4) 0; }
+    .vg-w-circuit-breaker-states svg { width: 100%; height: auto; display: block; }
+    .vg-w-circuit-breaker-states .cap { font-family: var(--scribed); color: var(--muted); font-size: var(--fs-xs); display: block; margin-bottom: var(--s-2); }
+    .vg-w-circuit-breaker-states .state { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; }
+    .vg-w-circuit-breaker-states .state-open { stroke: var(--accent); }
+  </style>
+  <span class="cap">三態加上「lazy transition」這個關鍵：open → half-open 不是 timer 推的，而是下次讀狀態時才算 cooldown 過了沒。沒有背景 timer，就沒有 timer 與狀態的 race。</span>
+  <svg viewBox="0 0 720 260" role="img" aria-label="circuit breaker closed open half-open state machine with lazy transition">
+    <defs>
+      <marker id="vg-w-circuit-breaker-states-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+      </marker>
+    </defs>
+
+    <circle class="state" cx="120" cy="130" r="62" />
+    <text x="120" y="124" text-anchor="middle" font-family="EB Garamond, serif" font-size="17" fill="var(--ink)">CLOSED</text>
+    <text x="120" y="146" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">正常放行</text>
+
+    <circle class="state state-open" cx="360" cy="130" r="62" />
+    <text x="360" y="124" text-anchor="middle" font-family="EB Garamond, serif" font-size="17" fill="var(--accent-text)">OPEN</text>
+    <text x="360" y="146" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">直接拒絕</text>
+
+    <circle class="state" cx="600" cy="130" r="62" />
+    <text x="600" y="118" text-anchor="middle" font-family="EB Garamond, serif" font-size="16" fill="var(--ink)">HALF-OPEN</text>
+    <text x="600" y="140" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">放一個試探</text>
+
+    <path d="M 182 110 Q 240 70 298 110" fill="none" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-circuit-breaker-states-arrow)" />
+    <text x="240" y="64" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">rolling window 失敗率超標</text>
+
+    <path d="M 422 110 Q 510 70 538 110" fill="none" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-circuit-breaker-states-arrow)" />
+    <text x="490" y="64" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--accent-text)" font-style="italic">下次讀狀態時才算：cooldown 過了 → lazy 轉</text>
+
+    <path d="M 560 186 Q 360 250 160 186" fill="none" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-circuit-breaker-states-arrow)" />
+    <text x="360" y="244" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">試探成功 → 回 CLOSED</text>
+
+    <path d="M 588 192 Q 480 232 432 178" fill="none" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-circuit-breaker-states-arrow)" />
+    <text x="500" y="222" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">試探失敗 → 退回 OPEN</text>
+  </svg>
+</figure>
+
+<p>第二個是退避：full-jitter backoff，作者照搬 AWS Builders' Library 那條公式，寫成一個帶小心 overflow 處理的純函式。full-jitter 的重點不是「指數退避」這件事本身，而是那個 jitter——在 <code>[0, base × 2^n]</code> 這個區間裡均勻取一個隨機值，而不是退避到 <code>base × 2^n</code> 這個確定值。為什麼？因為當一批 client 同時撞到失敗、同時開始退避，純指數退避會讓它們在同一個時間點同時重試，形成 retry storm 的同步尖峰；full-jitter 把每個 client 的下次重試打散到整個區間裡，把尖峰抹平成均勻分布。下面這個可拖的 widget 讓你比較兩者。</p>
+
+<figure class="vg-w-drag-jitter-backoff" data-svg-scroll="800">
+  <style>
+    .vg-w-drag-jitter-backoff { margin: var(--s-4) 0; padding: var(--s-3); border: 1px solid var(--line); background: var(--bg-soft); }
+    .vg-w-drag-jitter-backoff svg { width: 100%; height: auto; display: block; touch-action: none; }
+    .vg-w-drag-jitter-backoff .readout { font-family: var(--sans); font-size: var(--fs-sm); margin-top: var(--s-2); display: flex; gap: var(--s-3); flex-wrap: wrap; }
+    .vg-w-drag-jitter-backoff .readout b { font-variant-numeric: tabular-nums; color: var(--accent-text); }
+    .vg-w-drag-jitter-backoff .cap { font-family: var(--scribed); color: var(--muted); font-size: var(--fs-xs); display: block; margin-bottom: var(--s-2); }
+  </style>
+  <span class="cap">拖圓點調 retry attempt n。上排是純 exponential（所有 client 退到同一點，尖峰）；下排是 full-jitter（退避散布在 0 到 cap 之間，每個刻度是一個 client 的下次重試時刻）。</span>
+  <svg viewBox="0 0 640 240" role="img" aria-label="full jitter spreads retry times across the window while pure exponential clusters them">
+    <line x1="40" y1="60" x2="600" y2="60" stroke="var(--line)" stroke-width="1" />
+    <text x="40" y="40" font-family="EB Garamond, serif" font-size="13" fill="var(--muted)">pure exponential · base × 2ⁿ（同步尖峰）</text>
+    <g id="vg-w-drag-jitter-backoff-exp"></g>
+
+    <line x1="40" y1="150" x2="600" y2="150" stroke="var(--line)" stroke-width="1" />
+    <text x="40" y="130" font-family="EB Garamond, serif" font-size="13" fill="var(--accent-text)">full jitter · random(0, base × 2ⁿ)（攤平）</text>
+    <g id="vg-w-drag-jitter-backoff-jit"></g>
+
+    <line x1="40" y1="200" x2="600" y2="200" stroke="var(--ink)" stroke-width="1" />
+    <line id="vg-w-drag-jitter-backoff-track" x1="40" y1="218" x2="600" y2="218" stroke="var(--muted-2)" stroke-width="2" />
+    <circle id="vg-w-drag-jitter-backoff-handle" cx="180" cy="218" r="11" fill="var(--accent)" cursor="grab" />
+    <text x="40" y="236" font-family="EB Garamond, serif" font-size="10" fill="var(--muted)">n = 1</text>
+    <text x="600" y="236" text-anchor="end" font-family="EB Garamond, serif" font-size="10" fill="var(--muted)">n = 8</text>
+  </svg>
+  <div class="readout">
+    <span>attempt n = <b id="vg-w-drag-jitter-backoff-n">3</b></span>
+    <span>backoff cap = <b id="vg-w-drag-jitter-backoff-cap">800</b> ms</span>
+    <span>exponential：<b id="vg-w-drag-jitter-backoff-expv">800</b> ms（全部撞同一點）</span>
+  </div>
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-drag-jitter-backoff');
+      const svg = root.querySelector('svg');
+      const handle = root.querySelector('#vg-w-drag-jitter-backoff-handle');
+      const expG = root.querySelector('#vg-w-drag-jitter-backoff-exp');
+      const jitG = root.querySelector('#vg-w-drag-jitter-backoff-jit');
+      const nOut = root.querySelector('#vg-w-drag-jitter-backoff-n');
+      const capOut = root.querySelector('#vg-w-drag-jitter-backoff-cap');
+      const expvOut = root.querySelector('#vg-w-drag-jitter-backoff-expv');
+      const NS = 'http://www.w3.org/2000/svg';
+      const X_MIN = 40, X_MAX = 600, BASE = 100, NCLIENTS = 18;
+      // deterministic pseudo-random so the figure is reproducible
+      let seed = 1337;
+      function rnd() { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; }
+      function clientToSvgX(clientX) {
+        const pt = svg.createSVGPoint(); pt.x = clientX; pt.y = 0;
+        const p = pt.matrixTransform(svg.getScreenCTM().inverse());
+        return Math.max(X_MIN, Math.min(X_MAX, p.x));
+      }
+      function tick(g, x, y, color) {
+        const l = document.createElementNS(NS, 'line');
+        l.setAttribute('x1', x.toFixed(1)); l.setAttribute('x2', x.toFixed(1));
+        l.setAttribute('y1', y - 14); l.setAttribute('y2', y + 6);
+        l.setAttribute('stroke', color); l.setAttribute('stroke-width', '2');
+        l.setAttribute('stroke-opacity', '0.7');
+        g.appendChild(l);
+      }
+      function render(n) {
+        while (expG.firstChild) expG.removeChild(expG.firstChild);
+        while (jitG.firstChild) jitG.removeChild(jitG.firstChild);
+        const cap = BASE * Math.pow(2, n - 1);
+        nOut.textContent = n; capOut.textContent = cap; expvOut.textContent = cap;
+        seed = 1337 + n; // reseed per n so jitter changes visibly
+        // exponential: all NCLIENTS land at the same x (cap), stacked
+        const expX = X_MIN + (X_MAX - X_MIN) * 0.92; // cap normalised to right edge band
+        for (let i = 0; i < NCLIENTS; i++) tick(expG, expX, 60, 'var(--ink)');
+        // jitter: each client gets random(0, cap) → spread across 0..right edge
+        for (let i = 0; i < NCLIENTS; i++) {
+          const frac = rnd(); // in [0,1) → fraction of cap
+          const x = X_MIN + (X_MAX - X_MIN) * frac * 0.92;
+          tick(jitG, x, 150, 'var(--accent)');
+        }
+      }
+      function setFromX(x) {
+        const frac = (x - X_MIN) / (X_MAX - X_MIN);
+        const n = Math.max(1, Math.min(8, Math.round(1 + frac * 7)));
+        handle.setAttribute('cx', X_MIN + (n - 1) / 7 * (X_MAX - X_MIN));
+        render(n);
+      }
+      let dragging = false;
+      handle.addEventListener('pointerdown', (e) => { dragging = true; handle.setPointerCapture(e.pointerId); handle.setAttribute('cursor', 'grabbing'); });
+      handle.addEventListener('pointermove', (e) => { if (dragging) setFromX(clientToSvgX(e.clientX)); });
+      handle.addEventListener('pointerup', (e) => { dragging = false; handle.setAttribute('cursor', 'grab'); });
+      setFromX(X_MIN + 2 / 7 * (X_MAX - X_MIN));
+    })();
+  </script>
+</figure>
+
+<p>第三個是 email 投遞的 at-least-once 保證，用 <code>FOR UPDATE SKIP LOCKED</code> 配上五分鐘的 lease。多個 worker 同時搶待送的 email row，<code>FOR UPDATE SKIP LOCKED</code> 讓每個 worker 只鎖到自己搶到的那批、跳過別人鎖住的，天然做到無協調的工作分配。lease 是五分鐘——一個 worker 拿走一封信但中途掛了，五分鐘後 lease 過期，別的 worker 可以重新領走。這意味著同一封信可能被送兩次，所以 Message-ID 在 enqueue 時就被決定性地戳上去，靠接收端伺服器用 Message-ID 去重。作者把這個取捨講得很白：「I'd rather send twice than drop once.」寧可送兩次，不要漏一次。</p>
+
+<p>這三個機制疊在一起，構成一套很清楚的失敗哲學：circuit breaker 在對方掛掉時快速止血、不浪費資源去撞一面死牆；full-jitter 在重試時不製造同步尖峰；SKIP LOCKED + lease + Message-ID 則在 worker 自己掛掉時保證信不丟、最多重送。每一條都是「假設一切都會壞」之後的具體設計，而不是「希望一切正常」的樂觀路徑。</p>
+
+<h2>幾個值得單獨記住的細節</h2>
+
+<p>除了上面五條主軸，文章還散落著幾個短而利的招式，列出來當作工具箱。</p>
+
+<p><strong>CRDT 的 client id 推導。</strong>協作編輯用 yrs（Yjs 的 Rust 實作）的 CRDT。一個容易踩的坑是：server 自己也是 CRDT 的一個參與者，需要一個 client ID。如果 server 每次重啟都隨機選一個新 ID，那麼「每次後端重啟」在 CRDT 眼裡都像「一個全新的參與者加入」，狀態會無限膨脹。Nosdesk 的解法是把 server 的 client ID 從 document ID 的 hash 決定性地推導出來，再 mask 到 53 bits 以塞進 JavaScript 的 safe integer 範圍。重啟之後同一個 document 推導出同一個 ID，CRDT 認得它是同一個老參與者。</p>
+
+<p><strong>不信任的程式碼用 catch_unwind 圍起來。</strong>yrs 在遇到 malformed UTF-8 時可能在 library 深處 panic。Nosdesk 對它的每一次呼叫都包一層 <code>catch_unwind</code>，把 panic 攔在 call site，不讓它炸穿整個 worker。作者把這上升成一條通則：「I treat anything I don't own the same way」——任何不是我自己寫的東西，都當成可能 panic 的，在呼叫點就攔住。</p>
+
+<p><strong>SSRF 防護的 custom DNS resolver。</strong>當後端要對使用者給的 URL 發請求時，SSRF 的經典繞法是「DNS 解析出來是公網 IP、實際連線時卻指向內網」。Nosdesk 把過濾做在 DNS resolver 層、跟連線用的是同一次解析結果，枚舉所有 non-routable 範圍，包含 CGNAT 與那個 IPv4-mapped-IPv6 的把戲——<code>::ffff:127.0.0.1</code> 這種把 loopback 偽裝成 v6 位址、想騙過只檢查 v6 的過濾的招數。把過濾釘在「連線真正會用的那次解析」上，是這招的關鍵：在別的層檢查都可能被 TOCTOU 繞過。</p>
+
+<p><strong>登入的 timing 防護。</strong>每一條登入失敗路徑——不管是帳號不存在還是密碼錯——都統一走一次對 dummy hash 的 bcrypt 驗證，讓「帳號不存在」與「密碼錯」兩種失敗耗時一致，堵住 user-enumeration-via-timing。作者甚至 prewarm 這條路徑，免得第一次真實登入付出一次性的冷啟動成本、反而從 timing 上洩漏出「這是第一次」。</p>
+
+<p><strong>AES-256-GCM 把 context 綁進 auth tag。</strong>加密走 <code>ring</code> 的 AES-256-GCM，並把一個 context 字串綁進 auth tag（也就是 AEAD 的 associated data）。效果是「為某個用途封的 ciphertext，不能被當成另一個用途解開」——換了 context，auth tag 驗證就失敗。plaintext buffer 在用完後 zeroize。這擋住的是「把 A 場景加密的東西餵進 B 場景的 decrypt」這類 confused-deputy。</p>
+
+<h2>~1030 個純函式測試，與 lint-as-tests</h2>
+
+<p>最後一條主軸是測試策略，它跟前面所有設計決策互為表裡。約 1,030 個測試，但作者刻意不追求均勻覆蓋率——測試「cluster where the code is most likely to be wrong」，集中在最容易錯的地方：manifest 驗證、IMAP 解析、email threading、HTML sanitisation、plugin 的型別層。這些幾乎全是純函式，不碰資料庫、不碰 socket，所以跑得快、好寫、不 flaky。需要碰資料庫的測試則跑在一個「drop 時 rollback 的 transaction」裡，不留痕跡、可以並行對同一個 dedicated test DB 跑。</p>
+
+<p>但全文最讓我印象深刻的，是那條把架構決策變成測試的 lint-as-test。還記得開頭 <code>sync_actions</code> 那一段嗎？整套 sync 引擎的正確性，建立在「每一個 write 函式都有 append 一個 sync event」這個前提上。漏掉一個，那個變更就不會被任何 consumer 看到——一個無聲的、極難 debug 的資料同步 bug。Nosdesk 怎麼保證沒人會漏？一條測試「walks the repository layer, finds every write function」，然後「fails the build unless that function emits a sync event or carries an explicit marker saying it doesn't」——走遍 repository 層、找出每一個 write 函式，除非它發了 sync event、或帶了一個明確標記說「我故意不發」，否則直接讓 build 失敗。</p>
+
+<pre><code class="language-rust">// lint-as-test：把架構不變式變成編譯/測試強制
+#[test]
+fn every_write_emits_a_sync_event() {
+    for f in repository_layer::write_functions() {
+        assert!(
+            f.emits_sync_event() || f.has_marker("intentionally_silent"),
+            "write fn `{}` 既沒發 sync event 也沒標記豁免——build 失敗",
+            f.name()
+        );
+    }
+}</code></pre>
+
+<p>作者點破了這條測試的真正目的：「how the rule survives me forgetting about it at 1am six months from now」——讓這條規則能在六個月後某個凌晨一點、當我自己都忘了它存在的時候，依然活著。這跟 <code>InstallToken</code> 是同一個哲學的兩種實作：把「人類必須記得做的事」轉成「機器強制檢查的事」。<code>InstallToken</code> 用型別系統強制，lint-as-test 用測試套件強制——目標都是把正確性從紀律問題降級成 build 問題。</p>
+
+<p>當然，這個 codebase 不是完美的，作者自己也誠實列了 pre-v1 的待辦：<code>main.rs</code> 還是個約 1,900 行的 monolith 待拆、graceful shutdown 接好了但還沒接到 SIGTERM、search service 上有一個「在現代 Tantivy 上幾乎確定不必要」的 <code>unsafe impl Send/Sync</code>、plugin proxy 與 SMTP 處理那邊的 error type 還在退化。把這些攤出來寫，反而讓前面那些漂亮的設計更可信——它們不是事後美化的 architecture diagram，而是一個還在演進、有債也有亮點的真實系統。</p>
+
+<p class="vg-deep-closer"><strong>The model</strong>：這篇文章真正的主題只有一句——把「不該發生的事」從 runtime 的祈禱，往 compile time 或 build time 挪。<code>TenantConn</code>/<code>PlatformConn</code> 把「跨租戶」變成簽名上看得見的事；<code>InstallToken</code> 把「未簽 plugin 安裝」變成寫不出來的句子；<code>sync_actions</code> 把「三個下游一致」變成「讀同一張單調表」；空 payload 的 NOTIFY 把「並發漏寫」變成不可能；lint-as-test 把「記得發事件」變成 build gate。每一招都在做同一件事：把一個本來要靠人類紀律維持的不變式，焊進機器會替你檢查的地方。值得搬走的不是 Rust，是這個習慣。</p>
+</div>
