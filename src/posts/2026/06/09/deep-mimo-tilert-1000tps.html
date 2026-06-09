@@ -1,0 +1,664 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">傳統 speculative decoding 一次猜一個 token，猜對了往前一步、猜錯了回頭重來——本質還是自回歸。MiMo 的 DFlash 直接把 8 個草稿位置 block-level 並行猜出來，coding 場景平均一輪接受 6.30 個。但這個演算法只有在 FP4 模型與常駐 kernel 同時就位時才跑得動。</p>
+  <h1 class="vg-post-title">{{ title }}</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p><span class="vg-dropcap">小</span>米 TileRT 團隊把一個 1T 參數的 MoE 模型（MiMo-V2.5-Pro 的 UltraSpeed 版本）在一台標準 8 卡 commodity node 上推到每秒 1000+ token、尖峰約 1200 token/s。這個數字本身不稀奇——稀奇的是它沒有靠換更貴的硬體，而是把推理棧拆成三層同時改：模型側只把 MoE expert 量化到 FP4、演算法側用 DFlash 取代自回歸 speculative decoding、系統側用 persistent engine kernel 把整條 pipeline 常駐在 GPU 上。這三層不是各做各的優化疊加，而是互為前提——任何一層單獨上線，另外兩層的收益都會被它自己的瓶頸吃掉。這篇拆解這三層各自換掉了傳統推理棧的哪一段，以及它們為什麼必須一起設計。</p>
+
+  <p>先把問題定位清楚。在 1000 token/s 這個工作頻率下，每生出一個 token 的時間預算是 1 毫秒。一個 1T MoE 模型即使每個 token 只啟用一小部分 expert，單次 forward 的計算量也遠超 1 毫秒能塞下的範圍——所以「每個 token 跑一次完整 forward」這條路從一開始就走不通。唯一的出路是讓一次昂貴的 forward 同時驗證多個 token，這就是 speculative decoding 的核心動機。但傳統 speculative decoding 的草稿階段本身是自回歸的：draft model 一個一個吐 token，吐 8 個就要 8 次 draft forward，草稿階段的延遲又把驗證階段省下的時間吃回去。MiMo 的三層 co-design，本質是把這條「猜得快、驗得省、跑得不卡」的鏈條上的三個瓶頸分別拆掉。</p>
+
+  <p>在進入細節之前，先看三層各自負責什麼、又換掉了傳統推理棧的哪一段瓶頸。點任一層展開它的責任邊界——三層的關係是互為前提，不是疊加。</p>
+
+  <figure class="vg-w-stack-mimo-codesign">
+    <style>
+      .vg-w-stack-mimo-codesign { display: flex; flex-direction: column; gap: var(--s-3); align-items: stretch; }
+      .vg-w-stack-mimo-codesign input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-stack-mimo-codesign .vg-w-affordance { display: flex; align-items: center; gap: var(--s-1); font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin: 0; }
+      .vg-w-stack-mimo-codesign .vg-w-affordance svg { width: 14px !important; height: 14px !important; min-width: 14px; }
+      .vg-w-stack-mimo-codesign .stack-title { font-family: IM Fell English, serif; font-style: italic; font-size: var(--fs-md); margin: 0; color: var(--ink); line-height: 1.4; }
+      .vg-w-stack-mimo-codesign .stack-cards { display: flex; flex-direction: column; gap: var(--s-1); list-style: none; padding: 0; margin: 0; }
+      .vg-w-stack-mimo-codesign .stack-cards label { display: block; padding: var(--s-2); border: 1px solid var(--muted-2); border-radius: 2px; cursor: pointer; transition: border-color 200ms, background 200ms; min-height: 44px; }
+      .vg-w-stack-mimo-codesign .stack-cards label:hover { border-color: var(--accent); }
+      .vg-w-stack-mimo-codesign .stack-cards .card-head { font-family: EB Garamond, serif; font-size: var(--fs-md); margin: 0 0 4px 0; color: var(--ink); display: flex; align-items: baseline; justify-content: space-between; gap: var(--s-2); flex-wrap: wrap; }
+      .vg-w-stack-mimo-codesign .stack-cards .card-sub { font-family: IM Fell English, serif; font-style: italic; font-size: var(--fs-sm); color: var(--muted); margin: 0; line-height: 1.5; }
+      .vg-w-stack-mimo-codesign .stack-cards .card-tag { font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); color: var(--accent-text); font-style: normal; }
+      .vg-w-stack-mimo-codesign:has(#vg-w-stack-mimo-codesign-r1:checked) .card-1,
+      .vg-w-stack-mimo-codesign:has(#vg-w-stack-mimo-codesign-r2:checked) .card-2,
+      .vg-w-stack-mimo-codesign:has(#vg-w-stack-mimo-codesign-r3:checked) .card-3 { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+      .vg-w-stack-mimo-codesign svg.diagram { display: none; }
+      @media (min-width: 720px) {
+        .vg-w-stack-mimo-codesign svg.diagram { display: block; width: 100%; height: auto; max-width: 880px; }
+        .vg-w-stack-mimo-codesign .stack-title, .vg-w-stack-mimo-codesign .stack-cards { display: none; }
+      }
+      .vg-w-stack-mimo-codesign .layer { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; transition: fill 200ms, stroke 200ms; }
+      .vg-w-stack-mimo-codesign .layer:hover { stroke: var(--accent); }
+      .vg-w-stack-mimo-codesign .layer-text { pointer-events: none; font-family: EB Garamond, serif; font-size: 15px; }
+      .vg-w-stack-mimo-codesign .layer-sub { pointer-events: none; font-family: IM Fell English, serif; font-style: italic; font-size: 12px; fill: var(--muted); }
+      .vg-w-stack-mimo-codesign .layer-tag { pointer-events: none; font-family: JetBrains Mono, monospace; font-size: 11px; fill: var(--accent-text); }
+      .vg-w-stack-mimo-codesign .head { font-family: IM Fell English, serif; font-style: italic; font-size: 13px; }
+      .vg-w-stack-mimo-codesign:has(#vg-w-stack-mimo-codesign-r1:checked) .layer-1,
+      .vg-w-stack-mimo-codesign:has(#vg-w-stack-mimo-codesign-r2:checked) .layer-2,
+      .vg-w-stack-mimo-codesign:has(#vg-w-stack-mimo-codesign-r3:checked) .layer-3 { fill: var(--accent); fill-opacity: 0.20; stroke: var(--accent); }
+      .vg-w-stack-mimo-codesign .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+      .vg-w-stack-mimo-codesign .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-stack-mimo-codesign .detail p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-stack-mimo-codesign:has(#vg-w-stack-mimo-codesign-r1:checked) .detail-1,
+      .vg-w-stack-mimo-codesign:has(#vg-w-stack-mimo-codesign-r2:checked) .detail-2,
+      .vg-w-stack-mimo-codesign:has(#vg-w-stack-mimo-codesign-r3:checked) .detail-3 { display: block; }
+      .vg-w-stack-mimo-codesign .hint { font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin: 0 0 var(--s-1) 0; }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M9 9h6v6H9z"/><path d="M3 9h2M3 15h2M19 9h2M19 15h2M9 3v2M15 3v2M9 19v2M15 19v2"/>
+      </svg>
+      <span>點任一層展開它換掉的瓶頸 · 3 層 co-design</span>
+    </p>
+
+    <input type="radio" id="vg-w-stack-mimo-codesign-r1" name="vg-w-stack-mimo-codesign-sel" checked aria-label="模型側 FP4" />
+    <input type="radio" id="vg-w-stack-mimo-codesign-r2" name="vg-w-stack-mimo-codesign-sel" aria-label="演算法側 DFlash" />
+    <input type="radio" id="vg-w-stack-mimo-codesign-r3" name="vg-w-stack-mimo-codesign-sel" aria-label="系統側 persistent kernel" />
+
+    <p class="stack-title" id="vg-w-stack-mimo-codesign-title">三層 co-design——各自換掉傳統推理棧的一段瓶頸</p>
+    <ul class="stack-cards" aria-labelledby="vg-w-stack-mimo-codesign-title">
+      <li class="card-1"><label for="vg-w-stack-mimo-codesign-r1">
+        <p class="card-head"><span>模型側 · FP4</span><code class="card-tag">MXFP4 QAT</code></p>
+        <p class="card-sub">只把 MoE expert 量化到 FP4、其餘維持原精度——換掉 memory bandwidth 瓶頸，騰出並行驗證的空間。</p>
+      </label></li>
+      <li class="card-2"><label for="vg-w-stack-mimo-codesign-r2">
+        <p class="card-head"><span>演算法側 · DFlash</span><code class="card-tag">block-level masked</code></p>
+        <p class="card-sub">block-level 並行草稿取代自回歸 speculative decoding——換掉草稿階段的序列延遲。</p>
+      </label></li>
+      <li class="card-3"><label for="vg-w-stack-mimo-codesign-r3">
+        <p class="card-head"><span>系統側 · TileRT</span><code class="card-tag">persistent kernel</code></p>
+        <p class="card-sub">常駐 engine kernel + warp specialization——換掉 operator 邊界的 launch / 同步 overhead。</p>
+      </label></li>
+    </ul>
+
+    <svg class="diagram" viewBox="0 0 880 320" role="img"
+         aria-label="MiMo 三層 co-design：模型側 FP4、演算法側 DFlash、系統側 persistent kernel，各自換掉一段推理棧瓶頸">
+      <text x="40" y="26" fill="var(--ink)" class="head">三層 co-design——各自換掉傳統推理棧的一段瓶頸，互為前提而非疊加</text>
+
+      <rect class="layer layer-1" x="40" y="48" width="800" height="76" role="button" tabindex="0" data-target="vg-w-stack-mimo-codesign-r1" />
+      <text x="60" y="78" fill="var(--ink)" class="layer-text">模型側 · FP4 選擇性量化</text>
+      <text x="60" y="100" fill="var(--muted)" class="layer-sub">只把 MoE expert 量化到 MXFP4、attn / router / embed 維持原精度——換掉 memory bandwidth 瓶頸</text>
+      <text x="820" y="78" text-anchor="end" class="layer-tag">MXFP4 QAT</text>
+
+      <rect class="layer layer-2" x="40" y="136" width="800" height="76" role="button" tabindex="0" data-target="vg-w-stack-mimo-codesign-r2" />
+      <text x="60" y="166" fill="var(--ink)" class="layer-text">演算法側 · DFlash 並行草稿</text>
+      <text x="60" y="188" fill="var(--muted)" class="layer-sub">block-level masked 一次猜 8 個草稿 token，取代自回歸——換掉草稿階段的序列延遲</text>
+      <text x="820" y="166" text-anchor="end" class="layer-tag">block-level masked</text>
+
+      <rect class="layer layer-3" x="40" y="224" width="800" height="76" role="button" tabindex="0" data-target="vg-w-stack-mimo-codesign-r3" />
+      <text x="60" y="254" fill="var(--ink)" class="layer-text">系統側 · TileRT 常駐 kernel</text>
+      <text x="60" y="276" fill="var(--muted)" class="layer-sub">persistent engine kernel + warp specialization——換掉 operator 邊界的 launch / 同步 overhead</text>
+      <text x="820" y="254" text-anchor="end" class="layer-tag">persistent kernel</text>
+    </svg>
+
+    <div>
+      <p class="hint">click a layer above</p>
+      <div class="detail detail-1">
+        <h3>模型側 · FP4 · 責任邊界</h3>
+        <p>把 1T MoE 裡佔絕大多數參數的 expert 權重降到 MXFP4，attention、router、embedding 維持原精度。它換掉的是 memory bandwidth 瓶頸——在 1 毫秒 token 預算裡，搬權重往往比算力先見底。</p>
+        <p><strong>不負責的事</strong>：草稿怎麼猜、kernel 怎麼跑。它只保證模型小到一次 forward 跑得動、並騰出並行驗證的 memory headroom。</p>
+      </div>
+      <div class="detail detail-2">
+        <h3>演算法側 · DFlash · 責任邊界</h3>
+        <p>用 block-level masked parallel prediction 一次並行猜 8 個草稿 token，取代「一次猜一個」的自回歸 draft。它換掉的是草稿階段隨長度線性增長的序列延遲。coding 場景平均接受 6.30 個。</p>
+        <p><strong>不負責的事</strong>：模型精度、kernel 執行。它假設一次 target forward 跑得動、且驗證 8 個位置的 batch 效率發揮得出來。</p>
+      </div>
+      <div class="detail detail-3">
+        <h3>系統側 · TileRT · 責任邊界</h3>
+        <p>把整條 pipeline 常駐 GPU（persistent engine kernel），用 warp specialization 讓通訊 / 搬資料 / tensor 運算的 warp 各司其職、overlap 執行。它換掉的是 operator 邊界的 launch / 同步 / memory round-trip overhead。</p>
+        <p><strong>不負責的事</strong>：模型大小、草稿命中率。它只保證上面兩層省下的時間不在 operator 邊界上漏掉。</p>
+      </div>
+    </div>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-stack-mimo-codesign');
+        root.querySelectorAll('.layer').forEach((rect) => {
+          rect.addEventListener('click', () => {
+            const radio = root.querySelector('#' + rect.getAttribute('data-target'));
+            if (radio) radio.checked = true;
+          });
+          rect.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); rect.dispatchEvent(new MouseEvent('click', { bubbles: true })); }
+          });
+        });
+      })();
+    </script>
+  </figure>
+
+  <p>下面這個互動模擬是這篇的主軸：它把 DFlash 的 draft→verify 循環一輪一輪跑出來，讓你看到「並行猜 8 個、驗證後只接受前 k 個」這個動作隨時間如何累積成 throughput。切換任務類型（coding / math / agent），接受長度會跟著 MiMo 公布的實測值改變——接受長度越長，同樣一次驗證 forward 換到的有效 token 越多，這正是 1000 token/s 的算術來源。</p>
+
+  <figure class="vg-w-sim-mimo-draft-verify">
+    <style>
+      .vg-w-sim-mimo-draft-verify { display: grid; grid-template-rows: auto auto 1fr auto; gap: var(--s-2); }
+      .vg-w-sim-mimo-draft-verify .vg-w-affordance { display: flex; align-items: center; gap: var(--s-1); font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin: 0; }
+      .vg-w-sim-mimo-draft-verify .vg-w-affordance svg { width: 14px !important; height: 14px !important; min-width: 14px; }
+      .vg-w-sim-mimo-draft-verify .toolbar { display: flex; align-items: center; gap: var(--s-2); flex-wrap: wrap; font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+      .vg-w-sim-mimo-draft-verify button { font-family: var(--sans); font-size: var(--fs-sm); padding: 6px 14px; min-height: 44px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); cursor: pointer; }
+      .vg-w-sim-mimo-draft-verify button:hover { border-color: var(--accent); color: var(--accent-text); }
+      .vg-w-sim-mimo-draft-verify .tasks { display: flex; gap: var(--s-1); flex-wrap: wrap; }
+      .vg-w-sim-mimo-draft-verify .task { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; padding: 6px 12px; min-height: 36px; border: 1px solid var(--muted-2); background: var(--bg); color: var(--muted); cursor: pointer; }
+      .vg-w-sim-mimo-draft-verify .task.active { border-color: var(--accent); color: var(--accent-text); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+      .vg-w-sim-mimo-draft-verify canvas { width: 100%; height: auto; aspect-ratio: 16 / 7; display: block; }
+      .vg-w-sim-mimo-draft-verify .clock { margin-left: auto; font-family: JetBrains Mono, monospace; font-variant-numeric: tabular-nums; }
+      .vg-w-sim-mimo-draft-verify figcaption { font-family: var(--scribed); font-style: italic; font-size: var(--fs-sm); color: var(--muted); }
+      @media (max-width: 720px) {
+        .vg-w-sim-mimo-draft-verify canvas { aspect-ratio: 4 / 3; }
+        .vg-w-sim-mimo-draft-verify .clock { margin-left: 0; }
+      }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <polygon points="6 3 20 12 6 21 6 3"/>
+      </svg>
+      <span>play 觀察 draft→verify 一輪一輪推進 · 切換任務改變接受長度 · 3 種任務</span>
+    </p>
+
+    <div class="toolbar">
+      <button data-act="toggle">&#9655; play</button>
+      <button data-act="reset">&#8634; reset</button>
+      <div class="tasks" role="group" aria-label="任務類型">
+        <button class="task active" data-task="coding">coding · 6.30</button>
+        <button class="task" data-task="math">math · 5.56</button>
+        <button class="task" data-task="agent">agent · 4.29</button>
+      </div>
+      <span class="clock" data-clock>round 0 · 0 tok</span>
+    </div>
+
+    <canvas data-canvas></canvas>
+
+    <figcaption>每一輪 draft model 並行吐 8 個草稿 token（block-level masked parallel），target model 一次 forward 驗證，接受前 k 個、丟掉其餘；k 的期望值就是 MiMo 公布的接受長度。throughput ≈ 接受長度 × 驗證輪頻率——接受長度越長，同一次驗證 forward 換到的有效 token 越多。</figcaption>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-sim-mimo-draft-verify');
+        const canvas = root.querySelector('[data-canvas]');
+        const clock = root.querySelector('[data-clock]');
+        const toggleBtn = root.querySelector('[data-act="toggle"]');
+        const resetBtn = root.querySelector('[data-act="reset"]');
+        const taskBtns = root.querySelectorAll('.task');
+        const ctx = canvas.getContext('2d');
+
+        const TASKS = {
+          coding: { accept: 6.30, label: 'coding' },
+          math:   { accept: 5.56, label: 'math / reasoning' },
+          agent:  { accept: 4.29, label: 'agent' }
+        };
+        const BLOCK = 8;          // draft tokens per round
+        const ROUND_MS = 1100;    // ms of one draft→verify cycle in the animation
+
+        let task = 'coding';
+        let running = false;
+        let phase = 'draft';      // 'draft' | 'verify' | 'commit'
+        let phaseT = 0;
+        let round = 0;
+        let totalTokens = 0;
+        let acceptedThisRound = 0;
+        let drafted = 0;
+
+        function getVar(name) { return getComputedStyle(root).getPropertyValue(name).trim() || '#888'; }
+        function sampleAccept() {
+          // expected acceptance = TASKS[task].accept; jitter ±1 clamped to [1, BLOCK]
+          const base = TASKS[task].accept;
+          const v = Math.round(base + (Math.random() - 0.5) * 1.6);
+          return Math.max(1, Math.min(BLOCK, v));
+        }
+
+        function resize() {
+          const dpr = window.devicePixelRatio || 1;
+          const rect = canvas.getBoundingClientRect();
+          canvas.width = rect.width * dpr;
+          canvas.height = rect.height * dpr;
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        }
+        new ResizeObserver(resize).observe(canvas);
+        resize();
+
+        function draw() {
+          const W = canvas.getBoundingClientRect().width;
+          const H = canvas.getBoundingClientRect().height;
+          ctx.clearRect(0, 0, W, H);
+
+          const pad = 16;
+          const slotN = BLOCK;
+          const gap = 6;
+          const slotW = Math.min(48, (W - pad * 2 - gap * (slotN - 1)) / slotN);
+          const totalW = slotN * slotW + (slotN - 1) * gap;
+          const x0 = (W - totalW) / 2;
+          const slotY = H * 0.34;
+          const slotH = Math.min(46, H * 0.22);
+
+          // phase label
+          ctx.font = '600 14px Manrope, sans-serif';
+          ctx.fillStyle = getVar('--muted');
+          const phaseLabel = phase === 'draft' ? 'DRAFT · 並行吐 8 個草稿 token'
+                           : phase === 'verify' ? 'VERIFY · target model 單次 forward'
+                           : 'COMMIT · 接受前 k 個、丟掉其餘';
+          ctx.fillText(phaseLabel, pad, 24);
+
+          // draft model row label
+          ctx.font = '12px "EB Garamond", serif';
+          ctx.fillStyle = getVar('--muted');
+          ctx.fillText('draft (SWA)', pad, slotY - 8);
+
+          // how many drafted so far this round (during draft phase tokens appear progressively)
+          const shownDraft = phase === 'draft' ? Math.min(BLOCK, Math.ceil(phaseT / (ROUND_MS) * BLOCK * 1.4)) : BLOCK;
+
+          for (let i = 0; i < slotN; i++) {
+            const x = x0 + i * (slotW + gap);
+            const drawn = i < shownDraft;
+            // box
+            ctx.lineWidth = 1.5;
+            ctx.strokeStyle = getVar('--muted-2');
+            ctx.strokeRect(x, slotY, slotW, slotH);
+            if (!drawn) continue;
+            // fill: accepted (sage) vs rejected (faint accent) decided at commit
+            let fill = getVar('--bg-soft');
+            let alpha = 1;
+            if (phase === 'commit' || phase === 'verify') {
+              if (i < acceptedThisRound) { fill = getVar('--sage-deep'); alpha = 0.78; }
+              else { fill = getVar('--accent'); alpha = 0.22; }
+            } else {
+              fill = getVar('--accent'); alpha = 0.30;
+            }
+            ctx.globalAlpha = alpha;
+            ctx.fillStyle = fill;
+            ctx.fillRect(x + 1.5, slotY + 1.5, slotW - 3, slotH - 3);
+            ctx.globalAlpha = 1;
+            // token index
+            ctx.font = '11px "JetBrains Mono", monospace';
+            ctx.fillStyle = getVar('--ink');
+            ctx.fillText('t' + (i + 1), x + slotW / 2 - 7, slotY + slotH / 2 + 4);
+          }
+
+          // verify bar (a single wide box under the slots, lit during verify)
+          const vY = slotY + slotH + 26;
+          const vH = Math.min(28, H * 0.14);
+          ctx.lineWidth = 1.5;
+          ctx.strokeStyle = phase === 'verify' ? getVar('--accent') : getVar('--muted-2');
+          ctx.strokeRect(x0, vY, totalW, vH);
+          ctx.font = '12px "EB Garamond", serif';
+          ctx.fillStyle = getVar('--muted');
+          ctx.fillText('target forward (1T MoE, FP4 experts)', x0, vY - 6);
+          if (phase === 'verify') {
+            ctx.globalAlpha = 0.18;
+            ctx.fillStyle = getVar('--accent');
+            ctx.fillRect(x0 + 1.5, vY + 1.5, totalW - 3, vH - 3);
+            ctx.globalAlpha = 1;
+          }
+
+          // committed-tokens tape at bottom
+          const tapeY = vY + vH + 28;
+          ctx.font = '12px "EB Garamond", serif';
+          ctx.fillStyle = getVar('--muted');
+          ctx.fillText('output tape · ' + totalTokens + ' tok', pad, tapeY - 8);
+          const tapeBoxW = 10, tapeGap = 2;
+          const maxBoxes = Math.floor((W - pad * 2) / (tapeBoxW + tapeGap));
+          const showBoxes = Math.min(totalTokens, maxBoxes);
+          for (let i = 0; i < showBoxes; i++) {
+            ctx.globalAlpha = 0.7;
+            ctx.fillStyle = getVar('--sage-deep');
+            ctx.fillRect(pad + i * (tapeBoxW + tapeGap), tapeY, tapeBoxW, 12);
+            ctx.globalAlpha = 1;
+          }
+        }
+
+        function advance(dt) {
+          phaseT += dt;
+          if (phase === 'draft' && phaseT >= ROUND_MS * 0.5) {
+            phase = 'verify'; phaseT = 0;
+            acceptedThisRound = sampleAccept();
+          } else if (phase === 'verify' && phaseT >= ROUND_MS * 0.3) {
+            phase = 'commit'; phaseT = 0;
+          } else if (phase === 'commit' && phaseT >= ROUND_MS * 0.45) {
+            totalTokens += acceptedThisRound;
+            round += 1;
+            phase = 'draft'; phaseT = 0;
+          }
+        }
+
+        let last = performance.now();
+        function frame(now) {
+          const dt = Math.min(80, now - last);
+          last = now;
+          if (running) advance(dt);
+          draw();
+          const acc = round > 0 ? (totalTokens / round).toFixed(2) : '—';
+          clock.textContent = 'round ' + round + ' · ' + totalTokens + ' tok · 實測接受長度 ' + acc;
+          requestAnimationFrame(frame);
+        }
+        requestAnimationFrame(frame);
+
+        toggleBtn.addEventListener('click', () => {
+          running = !running;
+          toggleBtn.innerHTML = running ? '&#10073;&#10073; pause' : '&#9655; play';
+          last = performance.now();
+        });
+        resetBtn.addEventListener('click', () => {
+          running = false; toggleBtn.innerHTML = '&#9655; play';
+          phase = 'draft'; phaseT = 0; round = 0; totalTokens = 0; acceptedThisRound = 0;
+        });
+        taskBtns.forEach((b) => b.addEventListener('click', () => {
+          task = b.dataset.task;
+          taskBtns.forEach((x) => x.classList.remove('active'));
+          b.classList.add('active');
+        }));
+      })();
+    </script>
+  </figure>
+
+  <p>注意模擬裡的 commit 階段：8 個草稿 token 並排，驗證後只有前 k 個被接受（綠色）、後面的被丟掉（淡色）。被丟掉的 token 不是浪費——target model 的單次 forward 同時算了全部 8 個位置的 logits，丟掉只是因為某個位置的草稿跟 target 分布不合、從那裡截斷。關鍵在於：無論接受 1 個還是 8 個，都只花一次 target forward。所以「平均每輪接受幾個」直接決定了「一次昂貴的 forward 攤到幾個有效 token」。下面三節依序拆三層，順序對應它們在 critical path 上的角色：先讓模型小到一次 forward 跑得動（FP4），再讓草稿階段不要拖後腿（DFlash），最後讓系統不在 operator 邊界上漏掉時間（persistent kernel）。</p>
+
+  <h2>FP4：只量化 MoE expert，其餘維持原精度</h2>
+
+  <p>第一層是把模型本身縮小。1T 參數即使是 MoE、每個 token 只啟用一部分 expert，權重從 GPU memory 搬到 tensor core 的頻寬仍然是硬瓶頸——在 1 毫秒的 token 預算裡，memory bandwidth 往往比算力先見底。降低精度是最直接的解法：把權重從 BF16/FP8 降到 FP4，每個權重的 byte 數砍掉，搬運量同步下降。但 FP4 只有 4 個 bit 的動態範圍，整模型無腦量化會把模型能力打殘。</p>
+
+  <p>MiMo 的選擇是「只量化 MoE expert」——把 expert 的權重降到 MXFP4（OCP Microscaling Formats 的 FP4 變體），而 attention、router、embedding 這些非 expert 的模組維持原精度。理由有兩層：第一，在一個 1T 的 MoE 裡，expert 佔了絕大多數參數，量化 expert 拿到的 memory 節省最大；第二，expert 對量化的容忍度最高——MoE 的 router 已經把輸入路由到專門化的 expert，每個 expert 處理的是輸入空間的一個子區域，本身的數值分布相對集中，降到 FP4 損失較小。反過來，attention 的 softmax、router 的 top-k 選擇對數值精度敏感，一旦量化會放大路由錯誤、雪崩到後面所有 expert 選錯。</p>
+
+  <p>MXFP4 不是裸 FP4。Microscaling 的做法是把權重分成小 block，每個 block 共享一個 scale factor——block 內用 FP4 存 mantissa，scale 用較高精度存。這樣每個 block 可以各自對齊到自己的數值範圍，等效動態範圍遠大於裸 FP4。裸 FP4 的問題在於：一個固定的 4-bit 編碼必須同時覆蓋很大的權重與很小的權重，大值佔滿了編碼空間、小值被量化成零，模型裡那些「小但重要」的權重直接消失。per-block scale 把這個問題局部化——每個 block 只需要表示自己那一小段範圍內的相對大小，FP4 的 4 個 bit 在局部範圍內反而夠用。MiMo 走的是 FP4 QAT（Quantization-Aware Training）——量化不是訓練完才套上去的後處理，而是在訓練過程中就讓模型「知道」自己會被量化，反向傳播時把量化誤差納入梯度。post-training 量化是「先訓好、再硬壓」，模型沒有機會適應；QAT 讓模型在訓練時就把權重往「量化後仍然好用」的方向調，這對 FP4 這種激進精度尤其關鍵。結果是量化後模型能力跟原模型「essentially on par」。要強調的是：原文只給了「能力基本持平」的定性結論與一張對照圖，沒有公布逐 benchmark 的數值 delta，也沒有單獨拆出「FP4 這層貢獻了多少 throughput」——這層的收益是隱性的，它讓後面兩層有足夠的 memory headroom 跑得動，而不是直接體現在某個獨立的加速倍數上。</p>
+
+  <pre data-kind="pseudocode"><code><em>// 選擇性量化：只有 MoE expert 降到 MXFP4</em>
+for module in model:
+    if module.is_moe_expert:
+        module.weight = mxfp4_quantize(module.weight)   <em>// 4-bit + per-block scale</em>
+    else:
+        module.weight = keep_original_precision(module.weight)  <em>// attn / router / embed</em>
+
+<em>// QAT：量化誤差在訓練時就進入反向傳播</em>
+<em>// 結果：能力 essentially on par（原文僅給定性對照，未公布逐 benchmark delta）</em></code></pre>
+
+  <figure class="vg-w-precision-map-mimo" data-svg-scroll="560">
+    <style>
+      .vg-w-precision-map-mimo { display: grid; gap: var(--s-2); }
+      .vg-w-precision-map-mimo svg { width: 100%; height: auto; }
+      .vg-w-precision-map-mimo figcaption { font-family: var(--scribed); font-style: italic; font-size: var(--fs-sm); color: var(--muted); margin: 0; }
+    </style>
+
+    <svg viewBox="0 0 480 300" preserveAspectRatio="xMidYMid meet" role="img"
+         aria-label="精度地圖：MoE expert 佔絕大多數參數、降到 MXFP4；attention、router、embedding 佔少數參數、維持原精度">
+      <text x="20" y="28" font-family="IM Fell English, serif" font-style="italic" font-size="14" fill="var(--ink)">精度地圖——降精度跟著參數量走，敏感模組留原精度</text>
+
+      <text x="20" y="58" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)" letter-spacing="0.05">1T 參數預算（依佔比，非等寬）</text>
+
+      <rect x="20" y="68" width="372" height="46" fill="var(--accent)" fill-opacity="0.20" stroke="var(--accent)" stroke-width="1.5"/>
+      <text x="206" y="90" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">MoE expert · 絕大多數參數</text>
+      <text x="206" y="107" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--accent-text)">→ MXFP4（4-bit + per-block scale）</text>
+
+      <rect x="396" y="68" width="64" height="46" fill="var(--sage-deep)" fill-opacity="0.78" stroke="var(--sage-deep)" stroke-width="1.5"/>
+      <text x="428" y="92" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--ink)">其餘</text>
+      <text x="428" y="107" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" fill="var(--ink)">原精度</text>
+
+      <text x="20" y="148" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">維持原精度的敏感模組——量化會放大路由錯誤：</text>
+
+      <circle cx="30" cy="172" r="5" fill="var(--sage-deep)" fill-opacity="0.78"/>
+      <text x="44" y="176" font-family="EB Garamond, serif" font-size="12" fill="var(--ink)">attention · softmax 對數值精度敏感</text>
+      <circle cx="30" cy="196" r="5" fill="var(--sage-deep)" fill-opacity="0.78"/>
+      <text x="44" y="200" font-family="EB Garamond, serif" font-size="12" fill="var(--ink)">router · top-k 路由一錯雪崩到後面所有 expert</text>
+      <circle cx="30" cy="220" r="5" fill="var(--sage-deep)" fill-opacity="0.78"/>
+      <text x="44" y="224" font-family="EB Garamond, serif" font-size="12" fill="var(--ink)">embedding · 輸入表示，誤差會傳遍全程</text>
+
+      <line x1="20" y1="244" x2="460" y2="244" stroke="var(--muted-2)" stroke-width="1"/>
+      <text x="20" y="266" font-family="IM Fell English, serif" font-style="italic" font-size="12" fill="var(--muted)">取捨：量化參數最多、容忍度最高的 expert，省最大 memory；</text>
+      <text x="20" y="284" font-family="IM Fell English, serif" font-style="italic" font-size="12" fill="var(--muted)">留下參數少、卻牽一髮動全身的 attn / router / embed。</text>
+    </svg>
+
+    <figcaption>選擇性量化的精度地圖：MiMo 只把佔絕大多數參數的 MoE expert 降到 MXFP4，attention / router / embedding 這些對精度敏感的少數模組維持原精度。原文僅給定性對照、未公布各模組精確參數佔比，長條寬度為示意。</figcaption>
+  </figure>
+
+  <p>為什麼這層必須跟另外兩層一起設計？因為 FP4 換來的 memory headroom，是 DFlash 並行驗證 8 個 token 的前提。並行驗證意味著一次 forward 要同時處理 block size 個位置的 activation，KV cache 與中間 activation 的 memory 佔用隨之放大。如果模型還是 FP8、權重已經把 memory 吃滿，根本騰不出空間做 block-level 並行驗證。FP4 把權重壓下去，省出來的空間正好給 DFlash 的並行驗證用——這是三層 co-design 第一個「互為前提」的接點。</p>
+
+  <h2>DFlash：block-level masked 並行草稿</h2>
+
+  <p>第二層是把草稿階段從自回歸改成並行。傳統 speculative decoding 的 draft model 是個小型自回歸模型：要猜 8 個 token，就得跑 8 次 draft forward，每次把上一個草稿 token 餵回去當輸入。草稿階段本身的延遲，隨草稿長度線性增長——猜越多、草稿越慢，到某個點草稿的成本就抵銷掉驗證省下的時間。這是傳統 speculative decoding 草稿長度做不長的根本原因。</p>
+
+  <p>DFlash 的做法是 block-level masked parallel prediction：不再一個一個自回歸地猜，而是一次性地、並行地預測一整個 block（8 個位置）的草稿 token。做法上借鑑 masked / diffusion language model 的思路——把要預測的 8 個位置全部設成 mask，讓 draft model 在單次 forward 裡同時輸出所有 mask 位置的分布。草稿階段從「8 次序列 forward」壓成「1 次並行 forward」，草稿延遲不再隨 block size 線性增長。draft model 用 Sliding Window Attention（SWA），剛好對齊 MiMo-V2 系列本身的 SWA 設計，draft 與 target 共享 attention 結構讓兩者的中間表示更容易對齊、提升接受率。</p>
+
+  <p>接受長度是衡量這套機制有效性的核心指標——每輪驗證後，平均有幾個草稿 token 通過驗證被接受。MiMo 公布的實測值分任務：coding 6.30（最高可達 7.14）、math/reasoning 5.56、agent 4.29。換句話說在 coding 場景，每輪 8 個草稿 token 大約有 6–7 個被接受。下面這張圖把三類任務的接受長度跟 block size 上限（8）放在一起，凸顯「每類任務距離理論上限還有多遠」。</p>
+
+  <figure class="vg-w-chart-mimo-acceptance" data-svg-scroll="720">
+    <style>
+      .vg-w-chart-mimo-acceptance { display: grid; gap: var(--s-2); }
+      .vg-w-chart-mimo-acceptance svg { width: 100%; height: auto; }
+      .vg-w-chart-mimo-acceptance figcaption { font-family: var(--scribed); font-style: italic; font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+
+    <svg viewBox="0 0 720 340" preserveAspectRatio="xMidYMid meet" role="img"
+         aria-label="DFlash 接受長度長條圖：coding 6.30、math/reasoning 5.56、agent 4.29，block size 上限 8">
+      <g id="vg-w-chart-mimo-acceptance-axes"></g>
+      <g id="vg-w-chart-mimo-acceptance-series"></g>
+    </svg>
+
+    <figcaption>每輪 block size = 8 個草稿 token；長條是各任務的平均接受長度（coding 6.30、math/reasoning 5.56、agent 4.29），虛線是 8 的理論上限，coding 的最高記錄 7.14 以空心標記標出。數字取自 MiMo TileRT blog。</figcaption>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-chart-mimo-acceptance');
+        const axesG = root.querySelector('#vg-w-chart-mimo-acceptance-axes');
+        const seriesG = root.querySelector('#vg-w-chart-mimo-acceptance-series');
+        const NS = 'http://www.w3.org/2000/svg';
+        function el(tag, attrs) { const e = document.createElementNS(NS, tag); for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v); return e; }
+
+        // [label, acceptance length, optional max]
+        const data = [
+          ['coding', 6.30, 7.14],
+          ['math / reasoning', 5.56, null],
+          ['agent', 4.29, null]
+        ];
+        const BLOCK = 8;
+
+        const X0 = 70, X1 = 690, Y0 = 280, Y1 = 36;
+        const maxY = 8;
+        const yOf = v => Y0 - (v / maxY) * (Y0 - Y1);
+        const bandW = (X1 - X0) / data.length;
+        const barW = bandW * 0.46;
+        const xCenter = i => X0 + (i + 0.5) * bandW;
+
+        // axes
+        axesG.appendChild(el('line', { x1: X0, y1: Y0, x2: X1, y2: Y0, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+        axesG.appendChild(el('line', { x1: X0, y1: Y0, x2: X0, y2: Y1, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+
+        // y ticks 0..8
+        for (let v = 0; v <= maxY; v += 2) {
+          const y = yOf(v);
+          axesG.appendChild(el('line', { x1: X0 - 4, y1: y, x2: X0, y2: y, stroke: 'var(--muted-2)' }));
+          const t = el('text', { x: X0 - 8, y: y + 4, 'text-anchor': 'end', 'font-family': 'JetBrains Mono, monospace', 'font-size': 12, fill: 'var(--muted)' });
+          t.textContent = String(v);
+          axesG.appendChild(t);
+        }
+
+        // block-size ceiling (8) dashed line
+        const yCeil = yOf(BLOCK);
+        seriesG.appendChild(el('line', { x1: X0, y1: yCeil, x2: X1, y2: yCeil, stroke: 'var(--accent)', 'stroke-width': 1.2, 'stroke-dasharray': '6 4', opacity: 0.7 }));
+        const ceilT = el('text', { x: X1, y: yCeil - 8, 'text-anchor': 'end', 'font-family': 'IM Fell English, serif', 'font-style': 'italic', 'font-size': 13, fill: 'var(--accent-text)' });
+        ceilT.textContent = 'block size 上限 = 8 草稿 token / 輪';
+        seriesG.appendChild(ceilT);
+
+        // y axis label
+        const yl = el('text', { x: 18, y: (Y0 + Y1) / 2, 'text-anchor': 'middle', 'font-family': 'EB Garamond, serif', 'font-size': 13, fill: 'var(--muted)', transform: `rotate(-90 18 ${(Y0 + Y1) / 2})` });
+        yl.textContent = '平均接受長度 (token / 輪)';
+        axesG.appendChild(yl);
+
+        // bars
+        data.forEach((d, i) => {
+          const cx = xCenter(i);
+          const x = cx - barW / 2;
+          const y = yOf(d[1]);
+          seriesG.appendChild(el('rect', { x, y, width: barW, height: Y0 - y, fill: 'var(--sage-deep)', opacity: 0.78 }));
+          // value label on bar
+          const vt = el('text', { x: cx, y: y - 10, 'text-anchor': 'middle', 'font-family': 'EB Garamond, serif', 'font-size': 18, fill: 'var(--ink)' });
+          vt.textContent = d[1].toFixed(2);
+          seriesG.appendChild(vt);
+          // category label
+          const ct = el('text', { x: cx, y: Y0 + 22, 'text-anchor': 'middle', 'font-family': 'Manrope, sans-serif', 'font-size': 13, fill: 'var(--muted)' });
+          ct.textContent = d[0];
+          axesG.appendChild(ct);
+          // max marker (coding 7.14)
+          if (d[2]) {
+            const ym = yOf(d[2]);
+            seriesG.appendChild(el('circle', { cx, cy: ym, r: 5, fill: 'none', stroke: 'var(--accent)', 'stroke-width': 1.8 }));
+            const mt = el('text', { x: cx + 12, y: ym + 4, 'text-anchor': 'start', 'font-family': 'JetBrains Mono, monospace', 'font-size': 12, fill: 'var(--accent-text)' });
+            mt.textContent = 'max ' + d[2].toFixed(2);
+            seriesG.appendChild(mt);
+          }
+        });
+
+        // utilization annotation
+        const ut = el('text', { x: X0 + 6, y: Y1 + 4, 'text-anchor': 'start', 'font-family': 'IM Fell English, serif', 'font-style': 'italic', 'font-size': 12, fill: 'var(--muted)' });
+        ut.textContent = 'coding 利用率 ≈ 79%，agent ≈ 54%——任務的可預測性決定並行草稿的命中率';
+        seriesG.appendChild(ut);
+      })();
+    </script>
+  </figure>
+
+  <p>圖裡的梯度有意思：coding 的接受長度最高，agent 最低。這不是隨機差異，而是反映任務本身的「可預測性」。程式碼有強語法結構——縮排、括號配對、變數命名慣例、常見的 boilerplate 樣板，下一段 token 高度可預測，draft model 並行猜 8 個很容易整段猜中。math/reasoning 居中：推理鏈有結構但分支多。agent 最難：工具呼叫、外部狀態、多輪互動讓下文更發散，並行草稿的命中率自然下降。原文也誠實點出一般對話場景（general conversation）的接受率「尚不高」、仍在持續優化——這類開放式生成的可預測性最低，是這套機制目前的弱項。</p>
+
+  <p>接受長度直接換算成 throughput：如果每輪驗證 forward 的成本固定，coding 一輪接受 6.30 個 token，等於把一次昂貴的 forward 攤到 6.30 個有效 token 上，相對於「一次 forward 一個 token」的自回歸基線，有效輸出速率拉高約 6 倍。這就是 1000 token/s 算術的另一半——FP4 讓單次 forward 跑得動，DFlash 讓單次 forward 換到更多 token。但這裡有個前提條件容易被忽略：block-level 並行驗證要真的快，target model 的單次 forward 必須能高效地同時算 8 個位置的 activation。如果系統棧每跑一個 operator 就要 launch 一次 kernel、在 operator 邊界上漏掉時間，那麼把驗證從 1 個位置擴到 8 個位置帶來的 batch 效率根本發揮不出來——這就把問題交給了第三層。</p>
+
+  <p>DFlash 訓練側還有一個值得記的工程細節：mask-signal sampling 被下推到 GPU-local shard，讓每個訓練 step 能產生數萬個獨立訓練訊號。並行草稿模型要學的是「在給定前文下、同時預測多個 mask 位置」的能力，訓練訊號的密度直接決定它學得多好——把 sampling 放到 GPU 本地分片，避免了 host-device 之間搬訊號的瓶頸，讓每個 step 的有效訓練量級拉高一個數量級。</p>
+
+  <h2>persistent engine kernel 與 warp specialization</h2>
+
+  <p>第三層是系統側，也是最容易被低估的一層。在 1000 token/s 下，每個 operator 的生命週期被壓縮到微秒級。傳統推理棧的執行模型是 per-operator launch：framework 把模型拆成一連串 operator（matmul、layernorm、all-reduce、activation），每個 operator 是一次獨立的 GPU kernel launch——CPU 端準備參數、發 launch 指令、GPU 排程、執行、寫回、再回到 CPU 發下一個。每次 launch 都有固定 overhead（kernel launch latency、CPU-GPU 同步、operator 之間的 memory round-trip）。當每個 operator 本身只要幾微秒，這些邊界 overhead 就從「可忽略」變成「主導項」。</p>
+
+  <p>下面這個 tab 把傳統 per-operator launch 跟 TileRT 的 persistent engine kernel 並排，逐項對照執行模型的差別。</p>
+
+  <figure class="vg-w-tabs-mimo-system">
+    <style>
+      .vg-w-tabs-mimo-system { display: grid; gap: var(--s-2); }
+      .vg-w-tabs-mimo-system .vg-w-affordance { display: flex; align-items: center; gap: var(--s-1); font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin: 0; }
+      .vg-w-tabs-mimo-system .vg-w-affordance svg { width: 14px !important; height: 14px !important; min-width: 14px; }
+      .vg-w-tabs-mimo-system input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-tabs-mimo-system .tabrow { display: flex; gap: var(--s-1); flex-wrap: wrap; border-bottom: 1px solid var(--line); }
+      .vg-w-tabs-mimo-system label { font-family: var(--sans); font-size: var(--fs-sm); padding: 10px 16px; min-height: 44px; display: inline-flex; align-items: center; cursor: pointer; color: var(--muted); border-bottom: 2px solid transparent; margin-bottom: -1px; }
+      .vg-w-tabs-mimo-system label:hover { color: var(--accent-text); }
+      .vg-w-tabs-mimo-system .panel { display: none; padding: var(--s-3) 0; }
+      .vg-w-tabs-mimo-system .panel h3 { margin: 0 0 var(--s-2) 0; font-family: IM Fell English, serif; font-style: italic; font-size: var(--fs-md); color: var(--ink); }
+      .vg-w-tabs-mimo-system .panel p { margin: 0 0 var(--s-2) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-tabs-mimo-system .panel .ledger { display: grid; gap: var(--s-1); grid-template-columns: 1fr; }
+      @media (min-width: 720px) { .vg-w-tabs-mimo-system .panel .ledger { grid-template-columns: 1fr 1fr; } }
+      .vg-w-tabs-mimo-system .cell { padding: var(--s-2); border-left: 2px solid var(--muted-2); }
+      .vg-w-tabs-mimo-system .cell.good { border-left-color: var(--sage-deep); }
+      .vg-w-tabs-mimo-system .cell .k { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); display: block; margin-bottom: 4px; }
+      .vg-w-tabs-mimo-system .cell .v { font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink); }
+      .vg-w-tabs-mimo-system:has(#vg-w-tabs-mimo-system-t1:checked) label[for="vg-w-tabs-mimo-system-t1"],
+      .vg-w-tabs-mimo-system:has(#vg-w-tabs-mimo-system-t2:checked) label[for="vg-w-tabs-mimo-system-t2"],
+      .vg-w-tabs-mimo-system:has(#vg-w-tabs-mimo-system-t3:checked) label[for="vg-w-tabs-mimo-system-t3"] { color: var(--accent-text); border-bottom-color: var(--accent); }
+      .vg-w-tabs-mimo-system:has(#vg-w-tabs-mimo-system-t1:checked) .panel-1,
+      .vg-w-tabs-mimo-system:has(#vg-w-tabs-mimo-system-t2:checked) .panel-2,
+      .vg-w-tabs-mimo-system:has(#vg-w-tabs-mimo-system-t3:checked) .panel-3 { display: block; }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/>
+      </svg>
+      <span>切換分頁對照三種執行模型 · 3 tabs</span>
+    </p>
+
+    <input type="radio" id="vg-w-tabs-mimo-system-t1" name="vg-w-tabs-mimo-system-sel" checked />
+    <input type="radio" id="vg-w-tabs-mimo-system-t2" name="vg-w-tabs-mimo-system-sel" />
+    <input type="radio" id="vg-w-tabs-mimo-system-t3" name="vg-w-tabs-mimo-system-sel" />
+
+    <div class="tabrow" role="tablist">
+      <label for="vg-w-tabs-mimo-system-t1">傳統 per-operator</label>
+      <label for="vg-w-tabs-mimo-system-t2">persistent kernel</label>
+      <label for="vg-w-tabs-mimo-system-t3">warp specialization</label>
+    </div>
+
+    <div class="panel panel-1" role="tabpanel">
+      <h3>傳統 per-operator launch——邊界 overhead 主導</h3>
+      <p>framework 把 forward 拆成數百個 operator，每個 operator 一次 kernel launch。在每個 operator 只要幾微秒的工作頻率下，launch latency、CPU-GPU 同步、operator 之間經 global memory 的中間結果 round-trip，三者加起來主導了 wall time。</p>
+      <div class="ledger">
+        <div class="cell"><span class="k">執行單位</span><span class="v">每 operator 獨立 launch 一次 kernel</span></div>
+        <div class="cell"><span class="k">operator 邊界</span><span class="v">每個邊界一次同步 + memory round-trip</span></div>
+        <div class="cell"><span class="k">資料流</span><span class="v">中間結果寫回 global memory、下一個 op 再讀回</span></div>
+        <div class="cell"><span class="k">微秒帳</span><span class="v">operator 本身幾 µs，邊界 overhead 同量級——overhead 從可忽略變主導</span></div>
+      </div>
+    </div>
+
+    <div class="panel panel-2" role="tabpanel">
+      <h3>persistent engine kernel——整條 pipeline 常駐 GPU</h3>
+      <p>TileRT 完全捨棄 per-operator launch，把整條 compute pipeline 常駐並持續流動在 GPU 內。operator 之間不再回到 CPU 重新 launch、不再經 global memory round-trip——當前 tile 還在 tensor core 上算的同時，後續資料已經在預取流入，operator 邊界的固定開銷被整段消掉。</p>
+      <div class="ledger">
+        <div class="cell good"><span class="k">執行單位</span><span class="v">整條 pipeline 一個常駐 kernel，不退出</span></div>
+        <div class="cell good"><span class="k">operator 邊界</span><span class="v">消掉——pipeline 內部直接銜接，無 re-launch</span></div>
+        <div class="cell good"><span class="k">資料流</span><span class="v">full-pipeline 連續預取：當前 tile 計算時下一段資料已在流入</span></div>
+        <div class="cell good"><span class="k">微秒帳</span><span class="v">不再被 launch / 同步主導，微秒級 operator 的有效利用率拉滿</span></div>
+      </div>
+    </div>
+
+    <div class="panel panel-3" role="tabpanel">
+      <h3>warp specialization——異質流水線協作</h3>
+      <p>在常駐 kernel 內部，不同的 warp（thread group）甚至整個 GPU 上的異質執行域各司其職、獨立運轉又精準協調：一組 warp 專責通訊、一組搬資料、一組做 tensor 運算。把通訊、資料搬移、tensor 計算在細粒度上解耦，三者可以重疊而不互相等待——這是讓 persistent kernel 內部的連續預取真正不停頓的底層機制。</p>
+      <div class="ledger">
+        <div class="cell good"><span class="k">通訊 warp</span><span class="v">專責跨卡 / 跨域通訊，與計算重疊</span></div>
+        <div class="cell good"><span class="k">資料搬移 warp</span><span class="v">負責把下一段 tile 預取到位</span></div>
+        <div class="cell good"><span class="k">tensor warp</span><span class="v">專注 tensor core 運算，不被搬運阻塞</span></div>
+        <div class="cell good"><span class="k">協調方式</span><span class="v">細粒度解耦、獨立運轉又精準同步，三類工作 overlap</span></div>
+      </div>
+    </div>
+
+    <figcaption>三種執行模型對照。原文把 operator 邊界與執行間隙點名為 1000 token/s 工作頻率下的核心瓶頸，但未公布具體的微秒級延遲拆分——這裡的「微秒帳」是定性描述，不是量化測量。</figcaption>
+  </figure>
+
+  <p>persistent engine kernel 的核心是「不退出」。傳統模型把每個 operator 當成一次「進 GPU、算完、出來」的往返；persistent kernel 把整條 pipeline 寫成一個常駐的 kernel，資料在 GPU 內部從一個計算階段直接流到下一個，不回 CPU、不經 global memory 中轉。原文的說法是 full-pipeline continuous prefetching——當前 tile 還在 tensor core 上算時，後續資料已經在流入。這把 operator 之間的 memory round-trip 與 re-launch 的固定開銷整段消掉。</p>
+
+  <p>warp specialization 是讓常駐 kernel 內部不停頓的機制。一個 GPU 的 warp（thread group）可以被分工：一組專責通訊（跨卡的權重 / activation 交換）、一組專責搬資料（把下一段 tile 從 memory 預取到 register / shared memory）、一組專責 tensor 運算。三類工作在硬體上重疊執行——tensor core 在算當前 tile 時，搬運 warp 已經在預取下一段、通訊 warp 已經在交換需要的資料。如果不做這個分工，一個 warp 又要算又要搬又要通訊，三者只能序列化、互相等待，連續預取就無從談起。這也是為什麼 warp specialization 跟 persistent kernel 必須一起設計：persistent kernel 提供「不退出的常駐執行體」，warp specialization 填進「在這個執行體內部如何不讓任何一類工作阻塞其他」。</p>
+
+  <figure class="vg-w-warp-overlap-mimo" data-svg-scroll="560">
+    <style>
+      .vg-w-warp-overlap-mimo { display: grid; gap: var(--s-2); }
+      .vg-w-warp-overlap-mimo svg { width: 100%; height: auto; }
+      .vg-w-warp-overlap-mimo figcaption { font-family: var(--scribed); font-style: italic; font-size: var(--fs-sm); color: var(--muted); margin: 0; }
+    </style>
+
+    <svg viewBox="0 0 480 300" preserveAspectRatio="xMidYMid meet" role="img"
+         aria-label="warp specialization 重疊時序：通訊、資料搬移、tensor 三類 warp 在同一段時間各司其職、overlap 執行，沒有任何一類阻塞其他">
+      <text x="20" y="26" font-family="IM Fell English, serif" font-style="italic" font-size="14" fill="var(--ink)">warp specialization——三類 warp 同時段 overlap，互不阻塞</text>
+
+      <text x="20" y="52" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)" letter-spacing="0.05">同一段時間（→），三類 warp 各跑各的、精準協調</text>
+
+      <line x1="116" y1="66" x2="116" y2="246" stroke="var(--muted-2)" stroke-width="1"/>
+
+      <text x="108" y="92" text-anchor="end" font-family="EB Garamond, serif" font-size="12" fill="var(--ink)">通訊 warp</text>
+      <rect x="120" y="76" width="120" height="26" fill="var(--accent)" fill-opacity="0.20" stroke="var(--accent)" stroke-width="1.2"/>
+      <text x="180" y="93" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" fill="var(--accent-text)">跨卡交換 tile n</text>
+      <rect x="300" y="76" width="120" height="26" fill="var(--accent)" fill-opacity="0.20" stroke="var(--accent)" stroke-width="1.2"/>
+      <text x="360" y="93" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" fill="var(--accent-text)">交換 tile n+1</text>
+
+      <text x="108" y="132" text-anchor="end" font-family="EB Garamond, serif" font-size="12" fill="var(--ink)">資料搬移 warp</text>
+      <rect x="180" y="116" width="120" height="26" fill="var(--sage-deep)" fill-opacity="0.42" stroke="var(--sage-deep)" stroke-width="1.2"/>
+      <text x="240" y="133" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" fill="var(--ink)">預取 tile n+1</text>
+      <rect x="360" y="116" width="60" height="26" fill="var(--sage-deep)" fill-opacity="0.42" stroke="var(--sage-deep)" stroke-width="1.2"/>
+      <text x="390" y="133" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" fill="var(--ink)">n+2</text>
+
+      <text x="108" y="172" text-anchor="end" font-family="EB Garamond, serif" font-size="12" fill="var(--ink)">tensor warp</text>
+      <rect x="120" y="156" width="120" height="26" fill="var(--sage-deep)" fill-opacity="0.78" stroke="var(--sage-deep)" stroke-width="1.2"/>
+      <text x="180" y="173" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" fill="var(--bg)">算 tile n</text>
+      <rect x="300" y="156" width="120" height="26" fill="var(--sage-deep)" fill-opacity="0.78" stroke="var(--sage-deep)" stroke-width="1.2"/>
+      <text x="360" y="173" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" fill="var(--bg)">算 tile n+1</text>
+
+      <line x1="240" y1="66" x2="240" y2="200" stroke="var(--accent)" stroke-width="1" stroke-dasharray="4 4" opacity="0.6"/>
+      <text x="246" y="200" font-family="IM Fell English, serif" font-style="italic" font-size="11" fill="var(--accent-text)">此刻：算 n 的同時，n+1 已在預取、已在通訊</text>
+
+      <line x1="20" y1="216" x2="460" y2="216" stroke="var(--muted-2)" stroke-width="1"/>
+      <text x="20" y="238" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">不分工的話：一個 warp 又算又搬又通訊，三者只能序列化、互相等待。</text>
+      <text x="20" y="262" font-family="IM Fell English, serif" font-style="italic" font-size="12" fill="var(--muted)">分工後：三條 lane 在時間軸上重疊，連續預取不停頓——這是 persistent kernel 內部</text>
+      <text x="20" y="280" font-family="IM Fell English, serif" font-style="italic" font-size="12" fill="var(--muted)">不漏掉微秒的底層機制。</text>
+    </svg>
+
+    <figcaption>warp specialization 的重疊時序：通訊 / 資料搬移 / tensor 三類 warp 在同一段時間各司其職、overlap 執行。tile 編號為示意，原文未公布逐 warp 的微秒級時序。</figcaption>
+  </figure>
+
+  <p>把三層串起來看 1000 token/s 的完整算術。FP4 把 1T 模型的權重壓到單次 forward 的 memory 預算內，並騰出空間給並行驗證；DFlash 讓一次 target forward 同時驗證 8 個草稿位置、coding 場景平均接受 6.30 個有效 token；persistent kernel + warp specialization 讓這次 forward 不在 operator 邊界上漏掉微秒，把微秒級 operator 的有效利用率拉滿。三者缺一：少了 FP4，模型大到一次 forward 跑不動，DFlash 的並行驗證沒空間；少了 DFlash，一次昂貴的 forward 只換一個 token，FP4 與常駐 kernel 省下的時間被自回歸吃光；少了 persistent kernel，block-level 並行驗證的 batch 效率被 launch overhead 抵銷，DFlash 的接受長度換不成 throughput。</p>
+
+  <p>最後是落地代價，原文也給了數字。這套 UltraSpeed 棧透過 API 開放，定價是 MiMo-V2.5-Pro 的 3 倍成本、換取約 10 倍的生成速度——對延遲敏感、token 量大的 coding / agent workload，這個 trade 可能划算；對成本敏感、延遲不關鍵的批次任務，3 倍單價未必合算。換個角度看這個比例：3 倍成本買 10 倍速度，等於每個 token 的有效單價降到原本的 0.3 倍，前提是你的 workload 真的吃得下這個速度——一個每秒只產出幾十 token 需求的離線批次任務，把它丟到 1000 token/s 的棧上只是在為用不到的延遲付溢價。原文也標注了一個受限的試用窗口（6 月 9 日至 23 日），每天有排隊名額上限、單次 session 有時長與閒置逾時限制，這暗示這套棧的單機資源仍然吃緊、還沒到能無限水平擴張的成熟度。原文未公布 GPU 型號、未給標準 MiMo-V2.5-Pro 不加優化的 baseline throughput、未給 FP4 的 memory 節省百分比與逐 operator 的微秒拆分——這些是評估「能不能複製到自己的棧」時會想要、但目前缺席的數字。對打算自建類似棧的團隊來說，最該記住的不是「1000 token/s」這個結果，而是三層互為前提這個結構約束：任何只挑一層來抄的嘗試，都會撞上另外兩層沒跟上而留下的瓶頸。</p>
+
+  <p class="vg-deep-closer"><strong>What this enables</strong>：當 1T 模型的單機推理從「每秒幾十 token」進到「每秒上千 token」，互動式 coding agent、即時推理鏈、長 context 的 agent loop 這類「要嘛快、要嘛沒人用」的場景，第一次有了在單台 8 卡 node 上落地的算術基礎——前提是你願意接受 FP4 的隱性能力損失、為 DFlash 重訓 draft model、並把推理棧改寫成常駐 kernel。三層一起改才有 10 倍，這正是 co-design 這個詞的重量。</p>
+</div>
