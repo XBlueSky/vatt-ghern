@@ -1,0 +1,595 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">2022 年 3 月 6 日週日清晨，Stripe 鎖住了整個 monorepo，跑完最後一輪 QA，然後把一個包含 370 萬行改動的 pull request 合進 main——「乾淨地合進去了，自動測試全綠」。隔天早上，幾百名工程師打開編輯器，發現自己手上的 Flow 全部變成了 TypeScript。</p>
+  <h1 class="vg-post-title">一個 PR 遷走 370 萬行——Stripe 怎麼從 Flow 跳到 TypeScript</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p>
+    <span class="vg-dropcap">大</span>規模型別遷移的常識做法是 file-by-file——一次轉一個檔，跑紅變綠，慢慢推進，半年一年都算正常。Stripe 的 Dashboard 沒這樣做：他們花幾個月把一個 codemod 養到能可靠地把整個 codebase 從 Flow 轉成 TypeScript，然後在一個週末把 370 萬行一次性合進去。這篇是這個 big-bang PR 的時間線——為什麼 Flow 撐不下去、為什麼選一次合而不是逐檔遷、codemod 怎麼補上 Flow 與 TS 的語義落差、怎麼在不凍結 repo 的前提下把一個巨大 PR 落地，以及切換那一刻發生了什麼。
+  </p>
+
+  <p>
+    這個故事的關鍵不是「他們很大膽」，而是一連串把風險拆掉的工程決定：把 codemod 設計成可重跑而非一次性 migration、用 <code>@ts-expect-error</code> 把「轉換」與「修錯」解耦、把切換窗口壓到一個週末。每一個決定單獨看都不戲劇化，但疊在一起，就把「370 萬行一次合」這件聽起來像賭命的事，變成了一個風險被逐項馴服的部署。
+  </p>
+
+  <p>
+    值得先講清楚這篇要拆解的對象。Stripe 不是第一個做大規模型別遷移的公司，但「single PR、370 萬行、一個週末」這個組合在公開案例裡仍屬罕見。多數團隊談遷移，談的是「我們花了 N 個季度逐步把 X% 的檔轉過去」；Stripe 談的是「我們花了 N 個月讓一個自動轉換器夠可靠，然後在某個週日清晨按下按鈕」。前者把成本攤在時間軸上，後者把成本集中在一個工具上——而工具的好處是它可以被測試、被重跑、被信任。先把時間軸攤開，下面這條 scrubber 可以拖，看任一時刻 main 與 migration branch 各自在做什麼。
+  </p>
+
+  <figure class="vg-w-scrub-stripe-ts-timeline" data-svg-scroll="720">
+    <style>
+      .vg-w-scrub-stripe-ts-timeline { display: grid; gap: var(--s-2); margin: var(--s-4) 0; }
+      .vg-w-scrub-stripe-ts-timeline svg { width: 100%; height: auto; }
+      .vg-w-scrub-stripe-ts-timeline .state { font-family: var(--serif); font-size: var(--fs-sm); padding: var(--s-2) var(--s-3); background: var(--bg-soft); border-left: 2px solid var(--accent); min-height: 4.5em; }
+      .vg-w-scrub-stripe-ts-timeline .state .when { font-family: var(--display); color: var(--accent-text); font-size: var(--fs-md); display: block; margin-bottom: 0.25em; }
+      .vg-w-scrub-stripe-ts-timeline input[type="range"] { width: 100%; height: 36px; accent-color: var(--accent); touch-action: none; }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M5 9 2 12l3 3"/><path d="m19 9 3 3-3 3"/><path d="M2 12h20"/>
+      </svg>
+      <span>拖動把手沿著時間軸移動 · 涵蓋 2020 末到 2022.03.06 的六個節點</span>
+    </p>
+    <svg viewBox="0 0 720 120" role="img" aria-label="Stripe Flow 到 TypeScript 遷移時間軸">
+      <line x1="50" y1="56" x2="670" y2="56" stroke="var(--muted-2)" stroke-width="1.5" />
+      <g id="vg-w-scrub-stripe-ts-timeline-events"></g>
+      <line id="vg-w-scrub-stripe-ts-timeline-handle-line" x1="50" y1="34" x2="50" y2="78" stroke="var(--accent)" stroke-width="2" />
+      <circle id="vg-w-scrub-stripe-ts-timeline-handle" cx="50" cy="56" r="8" fill="var(--accent)" cursor="grab" />
+      <text id="vg-w-scrub-stripe-ts-timeline-clock" x="50" y="26" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--ink)">2020 末</text>
+    </svg>
+    <input type="range" id="vg-w-scrub-stripe-ts-timeline-range" min="0" max="5" step="1" value="0" aria-label="遷移時間軸節點" />
+    <div class="state" id="vg-w-scrub-stripe-ts-timeline-state"></div>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-scrub-stripe-ts-timeline');
+        if (!root) return;
+        const svg = root.querySelector('svg');
+        const handle = root.querySelector('#vg-w-scrub-stripe-ts-timeline-handle');
+        const handleLine = root.querySelector('#vg-w-scrub-stripe-ts-timeline-handle-line');
+        const clock = root.querySelector('#vg-w-scrub-stripe-ts-timeline-clock');
+        const stateDiv = root.querySelector('#vg-w-scrub-stripe-ts-timeline-state');
+        const eventsG = root.querySelector('#vg-w-scrub-stripe-ts-timeline-events');
+        const range = root.querySelector('#vg-w-scrub-stripe-ts-timeline-range');
+        const NS = 'http://www.w3.org/2000/svg';
+
+        // [短標, 軸上時間標, repo 與 branch 的狀態]
+        const events = [
+          ['2020 末', '組隊', 'JavaScript Infrastructure team 成立。Flow 的 type checker 記憶體吃到鎖死筆電、editor 整合又慢又不穩，TypeScript 成為內部工程師「最想要」的需求第一名。'],
+          ['Sail 先轉', '出 .d.ts', '先不動 design system Sail（一套 React component 庫），而是為它生出 TypeScript 型別定義，讓 Flow 程式仍能引用；測試持續驗證這份定義對得上 Flow 端的改動。'],
+          ['養 codemod', '修邊角', '以 Airtable 開源的 source-to-source 轉換器為底，搬進 monorepo 逐步加固。一個典型 bug：codemod 在 generic 箭頭函式回傳物件字面量時，誤把消歧用的括號剝掉。幾十個這類 fix，每個都配回歸測試。'],
+          ['壓 suppression', '97k → 37k', '第一次全量轉換產生 97,000 個 suppression（約每千行一個），透過反覆改進 codemod 壓到 37,000。對照原本 Flow 端只有 5,000 個。即便如此，TS 量到的 type coverage 仍高於 Flow。'],
+          ['切換週', '進 QA', '在 CI 上把 build 跑綠、部署到 QA、找 product team 手測。修掉像 loader 寫死 .js 副檔名導致缺翻譯這類 bug，並開了一個 Slack channel 協調 rollout。'],
+          ['2022.03.06', '合 main', '週六重生一次 migration branch、跑驗證、進 QA、再測一遍，沒有新問題。週日清晨鎖 repo、最後一輪 QA、提交、乾淨合入、自動測試全綠、起 production 部署、解鎖、通知所有人。'],
+        ];
+        const X0 = 50, X1 = 670;
+        const xOf = i => X0 + (i / (events.length - 1)) * (X1 - X0);
+
+        events.forEach((e, i) => {
+          const c = document.createElementNS(NS, 'circle');
+          c.setAttribute('cx', xOf(i)); c.setAttribute('cy', 56); c.setAttribute('r', 4);
+          c.setAttribute('fill', i === events.length - 1 ? 'var(--accent)' : 'var(--muted)');
+          eventsG.appendChild(c);
+          const tx = document.createElementNS(NS, 'text');
+          tx.setAttribute('x', xOf(i)); tx.setAttribute('y', i % 2 ? 100 : 92);
+          tx.setAttribute('text-anchor', 'middle');
+          tx.setAttribute('font-family', 'Manrope, sans-serif');
+          tx.setAttribute('font-size', 11);
+          tx.setAttribute('fill', 'var(--muted)');
+          tx.textContent = e[1];
+          eventsG.appendChild(tx);
+        });
+
+        function update(i) {
+          const x = xOf(i);
+          handle.setAttribute('cx', x);
+          handleLine.setAttribute('x1', x); handleLine.setAttribute('x2', x);
+          clock.setAttribute('x', x);
+          clock.textContent = events[i][0];
+          stateDiv.innerHTML = '<span class="when">' + events[i][0] + '</span>' + events[i][2];
+        }
+
+        range.addEventListener('input', () => update(Number(range.value)));
+
+        // SVG handle 也可拖
+        function clientToIndex(clientX) {
+          const pt = svg.createSVGPoint();
+          pt.x = clientX; pt.y = 0;
+          const sp = pt.matrixTransform(svg.getScreenCTM().inverse());
+          const frac = Math.max(0, Math.min(1, (sp.x - X0) / (X1 - X0)));
+          return Math.round(frac * (events.length - 1));
+        }
+        let dragging = false;
+        handle.addEventListener('pointerdown', (e) => { dragging = true; handle.setPointerCapture(e.pointerId); });
+        handle.addEventListener('pointermove', (e) => {
+          if (!dragging) return;
+          const i = clientToIndex(e.clientX);
+          range.value = String(i);
+          update(i);
+        });
+        handle.addEventListener('pointerup', () => { dragging = false; });
+
+        update(0);
+      })();
+    </script>
+  </figure>
+
+  <h2>Flow 為什麼撐不下去</h2>
+
+  <p>
+    Stripe 的 Dashboard 是一個前端 monorepo，規模大到以「tens of thousands of modules」計。它原本用 Flow 做型別檢查——Flow 是 Facebook 出的 JavaScript 型別系統，跟 TypeScript 在同一個生態位競爭。問題不在 Flow 的型別表達力，而在它周邊的一切都在退化。
+  </p>
+
+  <p>
+    第一個痛點是效能與資源。官方說法是 type checker 的記憶體用量「would lock up laptops」——大到能把工程師的筆電鎖死；in-editor 的整合又「frequently slow and unreliable」，慢而且不穩。對一個每天要在這個 codebase 上跑無數次 type check 的團隊，這是直接打在生產力上的稅。型別檢查器的價值在於即時回饋——你打錯一個 prop 名字，編輯器當下就紅一條波浪線。一旦這個回饋變慢或變不可靠，型別系統就退化成「跑 CI 才知道」的事後檢查，喪失了它最大的存在理由。工程師會開始繞過它、忽略它，型別覆蓋於是悄悄爛掉。
+  </p>
+
+  <p>
+    這裡有個容易被略過的細節：Flow 是漸進式型別系統，它允許你在沒標型別的地方靜默放行。這個寬容在剛導入時是優點（不必一次標完全部），但日積月累，「沒標型別」的區域會自然擴張——尤其當 in-editor 體驗差到沒人想跟它互動時。型別系統的健康度跟它的人因體驗是綁在一起的，這是 Stripe 這段經驗裡很實際的一課。
+  </p>
+
+  <p>
+    第二個痛點是生態。2020 年前後 TypeScript 因為更好的 tooling 與社群支援徹底爆發，第三方型別定義（<code>@types/*</code> 那一整套）豐富到幾乎任何 npm 套件都有現成型別。Flow 沒有這個——很多套件的 Flow libdef 要嘛沒人維護、要嘛根本不存在。諷刺的是，這直接影響型別覆蓋率：後面會看到，即便 Stripe 轉完 TS 後 suppression 數字反而更多，TS 量到的 type coverage 仍然<em>高於</em> Flow，原因正是這個——TS 那套豐富的第三方型別補上了 Flow 缺的大片空白。
+  </p>
+
+  <p>
+    第三個痛點是人。TypeScript 成了 Stripe 工程師「a top request」——招進來的新人多半在前一家公司就寫 TS，回到 Flow 像是退回上一個世代。這不是錦上添花，而是 hiring 與 morale 的實際成本。一位工程師事後在內部寫下的話很能說明轉換前的氛圍：
+  </p>
+
+  <blockquote>
+    <p>「Seriously unreal. I remember a short time ago laughing at the idea of typescript ever landing at Stripe, and then I woke up Christmas Monday morning and it was here.」</p>
+  </blockquote>
+
+  <p>
+    「曾經嘲笑 TypeScript 永遠不可能在 Stripe 落地」——這句話點出了問題的另一面：大家都想要 TS，但沒人相信能搬得動。三百多萬行、上萬個 module、緊耦合的前端 codebase，逐檔遷看起來像是一條望不到頭的路。真正要回答的問題因此不是「該不該遷」，而是「怎麼遷才不會拖死自己」。
+  </p>
+
+  <p>
+    為這件事，Stripe 在 2020 年底專門組了一個 JavaScript Infrastructure team。值得注意的是時間尺度：這個團隊不是花一個 sprint 寫個腳本就上，而是花了超過一年把整套遷移機制養成熟——這本身就是 big-bang 路線的隱性成本，也是它的門檻。沒有一個專責團隊、沒有願意投入一年以上的耐心，這條路根本走不通。換句話說，「一個週末合 370 萬行」的前提，是「一年多的準備」。戲劇性的是那個週末，但工程量在前面那一年。
+  </p>
+
+  <h2>為什麼是 big-bang，而不是逐檔遷</h2>
+
+  <p>
+    逐檔遷（incremental）是教科書答案：建一個 Flow 與 TS 並存的互通層，一次轉一小撮檔，紅變綠、合進去、再轉下一撮。風險小、可隨時停。Stripe 沒選它，理由是這個 codebase 的形狀讓 incremental 的成本被放大。
+  </p>
+
+  <p>
+    官方描述 Dashboard 是「tight coupling between disparate components and no cleanly factored dependency graph」——元件之間緊耦合、沒有乾淨切分的依賴圖。在這種 codebase 上做 incremental，意味著在很長一段時間裡，開發者得同時面對兩種語言：改一個 feature 可能一半檔是 Flow、一半是 TS，而且兩邊的型別定義要靠一個互通層持續同步。這個互通層本身就是要維護的成本，而且它存在多久，「在兩種語言間切換」的認知負擔就持續多久。
+  </p>
+
+  <p>
+    把這個互通層的成本拆細看，它不只是「多寫一些 adapter」。Flow 與 TypeScript 的型別系統不是同構的——同一個概念在兩邊的寫法、甚至語義都可能有微妙差異。要讓兩邊的型別定義在整個並存期持續對得上，等於要長期維護一份雙向翻譯，而且每次任一邊改型別都得同步另一邊。對一個有上萬個 module、且元件之間緊耦合的 codebase，這份翻譯的維護面積會大到失控。更糟的是，這個成本不會隨遷移進度遞減——它在「最後一個檔轉完」之前都存在，而緊耦合恰恰會讓「最後一個檔」遲遲到不了。
+  </p>
+
+  <p>
+    big-bang 把這個成本換成一次性的：clean break，沒有並存期、沒有互通層、沒有「這個檔到底是哪種語言」的認知開銷。前提當然是——你得先有信心一次轉完且轉對。這個信心不是來自勇氣，而是來自兩個先例：Airtable 與 Zapier 都把各自的遷移用「single commit」一次落地過。這兩個先例的價值不只是「別人做過所以可行」，而是它們證明了「自動轉換器 + 原子提交」這個模式在真實 codebase 上能成立——Stripe 因此敢直接拿 Airtable 開源的 codemod 當底，而不是從零摸索。下面這張表把兩條路的取捨並排——可以點欄位排序。
+  </p>
+
+  <figure class="vg-w-table-stripe-migration-strategy">
+    <style>
+      .vg-w-table-stripe-migration-strategy { overflow-x: auto; margin: var(--s-4) 0; }
+      .vg-w-table-stripe-migration-strategy table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-stripe-migration-strategy thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; }
+      .vg-w-table-stripe-migration-strategy thead th[data-sort] { color: var(--accent-text); }
+      .vg-w-table-stripe-migration-strategy tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+      .vg-w-table-stripe-migration-strategy tbody td:first-child { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.04em; color: var(--ink); }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/>
+        <path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+      </svg>
+      <span>點欄位標題可排序 · 3 欄 × 5 列</span>
+    </p>
+    <table>
+      <thead>
+        <tr>
+          <th data-key="dim">維度</th>
+          <th data-key="inc">incremental（逐檔遷）</th>
+          <th data-key="big">big-bang（一次合）</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>並存期</td><td>長——可能數月到一年雙語言並存</td><td>無——一個週末 clean break</td></tr>
+        <tr><td>互通層</td><td>必須——Flow / TS 型別定義要持續同步</td><td>不需要——切完只剩一種語言</td></tr>
+        <tr><td>認知負擔</td><td>高——改一個 feature 常跨兩種語言</td><td>低——切換後語言唯一</td></tr>
+        <tr><td>回滾</td><td>容易——逐檔可獨立 revert</td><td>難——但用可重跑 codemod 換取「重生 branch」的能力</td></tr>
+        <tr><td>最適 codebase</td><td>依賴圖乾淨、低耦合</td><td>緊耦合、無乾淨依賴圖（正是 Dashboard）</td></tr>
+      </tbody>
+    </table>
+    <figcaption>
+      取捨的重點是最後一列：incremental 的優勢在「依賴圖乾淨」時才成立，而 Dashboard 恰好相反。codebase 的形狀，而非團隊的偏好，決定了這個選擇。
+    </figcaption>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-table-stripe-migration-strategy');
+        if (!root) return;
+        const headers = root.querySelectorAll('thead th');
+        const tbody = root.querySelector('tbody');
+        let activeKey = null, asc = true;
+        headers.forEach(h => h.addEventListener('click', () => {
+          const key = h.dataset.key;
+          if (activeKey === key) asc = !asc; else { activeKey = key; asc = true; }
+          headers.forEach(x => x.removeAttribute('data-sort'));
+          h.setAttribute('data-sort', asc ? 'asc' : 'desc');
+          const rows = [...tbody.querySelectorAll('tr')];
+          const idx = [...headers].indexOf(h);
+          rows.sort((a, b) => {
+            const av = a.children[idx].textContent.trim();
+            const bv = b.children[idx].textContent.trim();
+            return asc ? av.localeCompare(bv, 'zh-Hant') : bv.localeCompare(av, 'zh-Hant');
+          });
+          rows.forEach(r => tbody.appendChild(r));
+        }));
+      })();
+    </script>
+  </figure>
+
+  <h2>codemod 怎麼補上語法落差</h2>
+
+  <p>
+    big-bang 的全部風險都壓在一件事上：那個 codemod 要能可靠地把 Flow 轉成 <em>正確</em> 的 TypeScript。Stripe 沒有從零寫，而是拿 Airtable 開源的 source-to-source 轉換器當底——它 parse Flow、輸出 TypeScript——複製進 monorepo，然後花幾個月反覆加固。source-to-source 的意思是它在 AST 層面工作：把 Flow 程式 parse 成抽象語法樹、把樹上的 Flow-特有節點（型別標註、型別別名、utility type 等）改寫成 TypeScript 對應的節點，再印回原始碼。這比正則替換可靠得多——它理解語法結構，不會把字串裡剛好長得像型別標註的文字也改掉。
+  </p>
+
+  <p>
+    在動 application 程式之前，團隊先處理了一個依賴根源：Sail，Stripe 內部的 design system，一套大量被引用的 React component 庫。對 Sail 的處理很有意思——他們<em>沒有</em>把 Sail 本身轉成 TS，而是為它生出一份 TypeScript 型別定義（類似 <code>.d.ts</code>），讓仍在用 Flow 的程式能繼續引用 Sail，同時用測試持續驗證這份定義對得上 Sail 端的 Flow 改動。這一步把「最多人依賴的那塊」先穩住，等於在大遷移之前先拆掉一顆最大的相依地雷。
+  </p>
+
+  <p>
+    所謂「加固」具體長什麼樣？舉一個官方點名的 bug：箭頭函式回傳物件字面量時，必須加括號才能跟「語句區塊」消歧（<code>() => ({ a: 1 })</code> 而非 <code>() => { a: 1 }</code>）。Stripe 的 codemod 在<em>函式帶 generic</em> 時——這種語法在純 JS 裡不存在——會錯誤地把這對括號剝掉，產出語義改變的程式。這類 syntactic edge case 一個一個被找出來修，「dozens of similar fixes」，每個 fix 都附一條回歸測試，確保下次轉換不會 regress。下面這條 slider 把同一段 component 的 Flow 原型與 codemod 產出的 TS 並排——拖動分隔線看 codemod 改了哪些 token。
+  </p>
+
+  <figure class="vg-w-ba-stripe-flow-ts" data-interactive="drag">
+    <style>
+      .vg-w-ba-stripe-flow-ts { position: relative; overflow: hidden; margin: var(--s-4) 0; border: 1px solid var(--line); border-radius: 6px; }
+      .vg-w-ba-stripe-flow-ts .layer { position: absolute; inset: 0; padding: var(--s-3) var(--s-3); font-family: var(--mono); font-size: 12.5px; line-height: 1.7; white-space: pre; overflow: hidden; }
+      .vg-w-ba-stripe-flow-ts .spacer { padding: var(--s-3); font-family: var(--mono); font-size: 12.5px; line-height: 1.7; white-space: pre; visibility: hidden; }
+      .vg-w-ba-stripe-flow-ts .before { padding-right: 50%; color: var(--ink-soft); clip-path: polygon(0 0, 50% 0, 50% 100%, 0 100%); }
+      .vg-w-ba-stripe-flow-ts .after { padding-left: 50%; color: var(--ink); clip-path: polygon(50% 0, 100% 0, 100% 100%, 50% 100%); }
+      .vg-w-ba-stripe-flow-ts .tag { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.06em; }
+      .vg-w-ba-stripe-flow-ts .before .tag { color: var(--muted); }
+      .vg-w-ba-stripe-flow-ts .after .tag { color: var(--accent-text); }
+      .vg-w-ba-stripe-flow-ts .divider { position: absolute; top: 0; bottom: 0; left: 50%; width: 32px; transform: translateX(-50%); cursor: ew-resize; touch-action: none; z-index: 2; }
+      .vg-w-ba-stripe-flow-ts .divider::before { content: ''; position: absolute; left: 50%; top: 0; bottom: 0; width: 2px; transform: translateX(-50%); background: var(--accent); }
+      .vg-w-ba-stripe-flow-ts .divider::after { content: '↔'; position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); background: var(--accent); color: var(--bg); width: 32px; height: 32px; border-radius: 50%; display: grid; place-items: center; font-family: var(--sans); font-size: 16px; }
+      @media (max-width: 720px) { .vg-w-ba-stripe-flow-ts .layer, .vg-w-ba-stripe-flow-ts .spacer { font-size: 11px; } }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M5 9 2 12l3 3"/><path d="m19 9 3 3-3 3"/><path d="M2 12h20"/>
+      </svg>
+      <span>拖動分隔線比對 Flow 原碼與 codemod 產出的 TypeScript</span>
+    </p>
+    <div class="spacer">.tag
+type Props = { id: string, onPick: (string) =&gt; void };
+export default function Row(props: Props) {
+  const fmt = &lt;T&gt;(x: T): { v: T } =&gt; ({ v: x });
+  return &lt;li onClick={() =&gt; props.onPick(props.id)} /&gt;;
+}</div>
+    <div class="layer before"><span class="tag">// flow</span>
+type Props = { id: string, onPick: (string) =&gt; void };
+export default function Row(props: Props) {
+  const fmt = &lt;T&gt;(x: T): { v: T } =&gt; ({ v: x });
+  return &lt;li onClick={() =&gt; props.onPick(props.id)} /&gt;;
+}</div>
+    <div class="layer after" id="vg-w-ba-stripe-flow-ts-after"><span class="tag">// typescript</span>
+type Props = { id: string; onPick: (a: string) =&gt; void };
+export default function Row(props: Props) {
+  const fmt = &lt;T,&gt;(x: T): { v: T } =&gt; ({ v: x });
+  return &lt;li onClick={() =&gt; props.onPick(props.id)} /&gt;;
+}</div>
+    <div class="divider" id="vg-w-ba-stripe-flow-ts-divider"></div>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-ba-stripe-flow-ts');
+        if (!root) return;
+        const before = root.querySelector('.before');
+        const after = root.querySelector('#vg-w-ba-stripe-flow-ts-after');
+        const divider = root.querySelector('#vg-w-ba-stripe-flow-ts-divider');
+        let dragging = false;
+        function setPct(pct) {
+          const p = Math.max(0, Math.min(100, pct));
+          before.style.clipPath = `polygon(0 0, ${p}% 0, ${p}% 100%, 0 100%)`;
+          after.style.clipPath = `polygon(${p}% 0, 100% 0, 100% 100%, ${p}% 100%)`;
+          divider.style.left = `${p}%`;
+        }
+        divider.addEventListener('pointerdown', (e) => { dragging = true; divider.setPointerCapture(e.pointerId); });
+        root.addEventListener('pointermove', (e) => {
+          if (!dragging) return;
+          const rect = root.getBoundingClientRect();
+          setPct(((e.clientX - rect.left) / rect.width) * 100);
+        });
+        root.addEventListener('pointerup', () => { dragging = false; });
+        root.addEventListener('pointercancel', () => { dragging = false; });
+      })();
+    </script>
+  </figure>
+
+  <p>
+    上面那段刻意挑了三個有代表性的差異：物件型別裡的分隔符 Flow 用逗號、TS 慣用分號；函式型別的參數 Flow 容許省略名字（<code>(string) =&gt; void</code>），TS 要求參數名（<code>(a: string) =&gt; void</code>）；而那個帶 generic 的箭頭函式在 <code>.tsx</code> 檔裡 <code>&lt;T&gt;</code> 會跟 JSX 標籤撞，得寫成 <code>&lt;T,&gt;</code> 加一個逗號消歧——正是 codemod 早期剝錯括號那類問題的鄰居。這些都不是「翻譯」，而是兩套 parser 對同一份語法的不同要求，codemod 必須逐條補上。
+  </p>
+
+  <p>
+    這類 edge case 的麻煩之處在於它們是長尾的：頭幾十個 case 涵蓋了 codebase 裡 99% 的寫法，但剩下那 1% 散落在三百多萬行的各個角落，每一個都可能在切換那一刻悄悄產出語義錯誤的程式。這就是為什麼「每個 fix 配一條回歸測試」這件事不是工程潔癖，而是這條路能不能走通的核心：回歸測試把每一個被馴服的 edge case 固定住，確保下次對全新的 main 重跑 codemod 時，這個 case 不會復發。沒有這層測試守護，codemod 就只是個一次性腳本，跑一次的結果沒人敢信；有了它，codemod 才升級成一個可以反覆執行、結果可信的純函式——而這正是後面「不凍結 repo」那一招的前提。
+  </p>
+
+  <figure class="vg-w-longtail-stripe" data-svg-scroll="720">
+    <style>
+      .vg-w-longtail-stripe { display: grid; gap: var(--s-2); margin: var(--s-4) 0; }
+      .vg-w-longtail-stripe svg { width: 100%; height: auto; max-width: 720px; }
+      .vg-w-longtail-stripe figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+    <svg viewBox="0 0 720 240" preserveAspectRatio="xMidYMid meet" role="img"
+         aria-label="codemod edge case 的長尾分佈：頭部數十個 case 覆蓋約 99%，剩 1% 散在長尾">
+      <text x="20" y="28" font-family="EB Garamond, serif" font-size="16" fill="var(--ink)">edge case 的長尾——99% 集中在頭部</text>
+      <line x1="60" y1="190" x2="700" y2="190" stroke="var(--muted-2)" stroke-width="1"/>
+      <line x1="60" y1="60" x2="60" y2="190" stroke="var(--muted-2)" stroke-width="1"/>
+      <rect x="60" y="60" width="150" height="130" fill="var(--accent)" fill-opacity="0.10"/>
+      <rect x="70"  y="70"  width="26" height="120" rx="1" fill="var(--accent)" fill-opacity="0.30" stroke="var(--accent)" stroke-width="1"/>
+      <rect x="104" y="104" width="26" height="86"  rx="1" fill="var(--accent)" fill-opacity="0.28" stroke="var(--accent)" stroke-width="1"/>
+      <rect x="138" y="134" width="26" height="56"  rx="1" fill="var(--accent)" fill-opacity="0.26" stroke="var(--accent)" stroke-width="1"/>
+      <rect x="172" y="156" width="26" height="34"  rx="1" fill="var(--accent)" fill-opacity="0.24" stroke="var(--accent)" stroke-width="1"/>
+      <rect x="230" y="172" width="18" height="18" rx="1" fill="var(--ink-deep)" fill-opacity="0.22" stroke="var(--ink-deep)" stroke-width="0.8"/>
+      <rect x="280" y="176" width="18" height="14" rx="1" fill="var(--ink-deep)" fill-opacity="0.22" stroke="var(--ink-deep)" stroke-width="0.8"/>
+      <rect x="340" y="178" width="18" height="12" rx="1" fill="var(--ink-deep)" fill-opacity="0.22" stroke="var(--ink-deep)" stroke-width="0.8"/>
+      <rect x="420" y="180" width="18" height="10" rx="1" fill="var(--ink-deep)" fill-opacity="0.22" stroke="var(--ink-deep)" stroke-width="0.8"/>
+      <rect x="520" y="182" width="18" height="8"  rx="1" fill="var(--ink-deep)" fill-opacity="0.22" stroke="var(--ink-deep)" stroke-width="0.8"/>
+      <rect x="630" y="183" width="18" height="7"  rx="1" fill="var(--ink-deep)" fill-opacity="0.22" stroke="var(--ink-deep)" stroke-width="0.8"/>
+      <text x="135" y="216" text-anchor="middle" font-family="Manrope, sans-serif" font-size="12" fill="var(--accent-text)">頭部數十個 case ≈ 99%</text>
+      <text x="440" y="216" text-anchor="middle" font-family="Manrope, sans-serif" font-size="12" fill="var(--muted)">長尾 1%——散在 370 萬行裡</text>
+    </svg>
+    <figcaption>頭幾十個 case 覆蓋 99% 寫法；剩 1% 散在 370 萬行，每個都要一條回歸測試釘住，否則重跑就復發。</figcaption>
+  </figure>
+
+  <p>
+    語法之外還有 build tool。ESLint、Jest、Webpack、Metro 全都要改。Jest 的 snapshot 是個典型麻煩：snapshot 裡寫死了 test 檔的副檔名引用。Stripe 的解法是把所有產出統一成 <code>.tsx</code> 副檔名，這樣就能用一次 bulk-rewrite 把 snapshot 全部改對，同時維持 100% 測試通過。有些不相容則被判定「現在修不划算」——例如某些 custom ESLint rule 是針對 Babel 的 Flow parser 寫的，TS parser 產出的 AST 結構不同，這些 rule 在遷移後直接關掉。把這幾個 pass 攤開看：
+  </p>
+
+  <div class="vg-w-tabs-stripe-codemod-passes">
+    <style>
+      .vg-w-tabs-stripe-codemod-passes { display: grid; gap: var(--s-2); margin: var(--s-4) 0; }
+      .vg-w-tabs-stripe-codemod-passes input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-tabs-stripe-codemod-passes .tabs { display: flex; flex-wrap: wrap; gap: var(--s-2); border-bottom: 1px solid var(--line); }
+      .vg-w-tabs-stripe-codemod-passes .tab { font-family: var(--sans); font-size: var(--fs-sm); padding: var(--s-1) var(--s-2); cursor: pointer; color: var(--muted); min-height: 44px; display: flex; align-items: center; }
+      .vg-w-tabs-stripe-codemod-passes .panel { display: none; padding: var(--s-2) 0; font-family: var(--serif); font-size: var(--fs-sm); line-height: 1.75; }
+      .vg-w-tabs-stripe-codemod-passes .panel code { font-size: 0.9em; }
+      .vg-w-tabs-stripe-codemod-passes:has(#vg-w-tabs-stripe-codemod-passes-t1:checked) .panel-1 { display: block; }
+      .vg-w-tabs-stripe-codemod-passes:has(#vg-w-tabs-stripe-codemod-passes-t1:checked) [for="vg-w-tabs-stripe-codemod-passes-t1"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-stripe-codemod-passes:has(#vg-w-tabs-stripe-codemod-passes-t2:checked) .panel-2 { display: block; }
+      .vg-w-tabs-stripe-codemod-passes:has(#vg-w-tabs-stripe-codemod-passes-t2:checked) [for="vg-w-tabs-stripe-codemod-passes-t2"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-stripe-codemod-passes:has(#vg-w-tabs-stripe-codemod-passes-t3:checked) .panel-3 { display: block; }
+      .vg-w-tabs-stripe-codemod-passes:has(#vg-w-tabs-stripe-codemod-passes-t3:checked) [for="vg-w-tabs-stripe-codemod-passes-t3"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-stripe-codemod-passes:has(#vg-w-tabs-stripe-codemod-passes-t4:checked) .panel-4 { display: block; }
+      .vg-w-tabs-stripe-codemod-passes:has(#vg-w-tabs-stripe-codemod-passes-t4:checked) [for="vg-w-tabs-stripe-codemod-passes-t4"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect width="18" height="18" x="3" y="3" rx="2"/><path d="M3 9h18"/><path d="M9 21V9"/>
+      </svg>
+      <span>切換分頁看 codemod 的四個 pass · 4 tabs</span>
+    </p>
+    <input type="radio" id="vg-w-tabs-stripe-codemod-passes-t1" name="vg-w-tabs-stripe-codemod-passes-sel" checked />
+    <input type="radio" id="vg-w-tabs-stripe-codemod-passes-t2" name="vg-w-tabs-stripe-codemod-passes-sel" />
+    <input type="radio" id="vg-w-tabs-stripe-codemod-passes-t3" name="vg-w-tabs-stripe-codemod-passes-sel" />
+    <input type="radio" id="vg-w-tabs-stripe-codemod-passes-t4" name="vg-w-tabs-stripe-codemod-passes-sel" />
+    <div class="tabs">
+      <label class="tab" for="vg-w-tabs-stripe-codemod-passes-t1">1 · AST 轉換</label>
+      <label class="tab" for="vg-w-tabs-stripe-codemod-passes-t2">2 · 邊角修補</label>
+      <label class="tab" for="vg-w-tabs-stripe-codemod-passes-t3">3 · suppression</label>
+      <label class="tab" for="vg-w-tabs-stripe-codemod-passes-t4">4 · build tool</label>
+    </div>
+    <div class="panel panel-1">
+      以 Airtable 的開源 source-to-source 轉換器為底：parse Flow 的 AST、輸出對應的 TypeScript。複製進 monorepo 後成為團隊自己的 codemod，所有後續修補都疊在這一層之上。輸出一律用 <code>.tsx</code> 副檔名，讓後面的 snapshot 重寫有一個一致的目標。
+    </div>
+    <div class="panel panel-2">
+      幾個月反覆找 syntactic edge case 並修正。代表案例：generic 箭頭函式回傳物件字面量時誤剝消歧括號。共加入「dozens of」這類 fix，每一個都配一條回歸測試，確保下次全量重跑不會 regress——這是 codemod 能被信任地反覆執行的基礎。
+    </div>
+    <div class="panel panel-3">
+      第二個 codemod pass：不在遷移前把所有型別錯誤改完，而是用 TypeScript 的 <code>@ts-expect-error</code> 註解把問題逐處標記、延後到切換後再處理。這把「語言轉換」與「修型別錯」徹底解耦——轉換本身永遠能跑綠，錯誤變成一份可量化、可逐步消化的待辦清單。
+    </div>
+    <div class="panel panel-4">
+      ESLint / Jest / Webpack / Metro 全部更新。Jest snapshot 因為寫死副檔名，靠統一 <code>.tsx</code> 做 bulk-rewrite 解決。針對 Babel Flow parser 寫的 custom ESLint rule，因 AST 結構不同、修起來不划算，遷移後直接停用。另外用 TypeScript project references 在不重構應用碼的前提下切出 module 邊界，緩解 compiler 在上萬個 module 上的記憶體壓力。
+    </div>
+  </div>
+
+  <p>
+    第四個 pass 裡藏著一個常被低估的問題：記憶體。TypeScript 的 compiler 對上萬個 module 做全量型別檢查時，記憶體壓力很容易爆掉。Stripe 用的是 <code>project references</code>——讓 TS 把 codebase 切成有明確邊界的子專案、各自獨立檢查與快取，而不必把整棵依賴圖一次載進記憶體。關鍵在於他們用這個機制「推斷」出 module 邊界，而<em>不必重構應用程式碼</em>去配合——這是一個很 pragmatic 的取捨：能用工具設定解決的，就不要求工程師改架構。
+  </p>
+
+  <p>
+    第三個 pass 是整套設計裡最關鍵的一步：用 <code>@ts-expect-error</code> 做 suppression，把「轉換」與「修錯」拆開。<code>@ts-expect-error</code> 的語義是「我知道下一行有型別錯，先讓它過，但如果哪天這行<em>不再</em>報錯，請反過來提醒我把這個註解刪掉」——它不像 <code>@ts-ignore</code> 那樣無條件閉嘴，而是一個會自我提醒的暫時性抑制。這個語義對「先標記、後消化」的策略剛好：每修好一處型別、底下的 <code>@ts-expect-error</code> 就會變成「多餘」而被工具揪出來，suppression 清單於是能單調收斂、不會有人偷偷留著沒用的抑制。
+  </p>
+
+  <p>
+    如果堅持遷移前把所有型別錯誤改完，那等於要在一個移動標靶（持續變動的 main）上做幾萬處手改，永遠追不上——你改完一批，main 又長出新的 Flow 程式，下次重跑又是一批新錯。改用「先標記、後消化」，轉換這件事就永遠能跑綠，型別錯誤退化成一份切換後可以慢慢消化的待辦清單——而這份清單的數字，恰好是這次遷移最反直覺的部分。
+  </p>
+
+  <h2>97,000 個 suppression 卻換到更高的覆蓋率</h2>
+
+  <p>
+    第一次對 Dashboard 全量轉換，codemod 產出了 <strong>97,000</strong> 個 suppression 註解——大約每 1,000 行就有一個。對照之下，原本的 Flow codebase 只有 <strong>5,000</strong> 個 suppression。乍看像是「轉完反而更糟」：抑制的錯誤多了將近二十倍。
+  </p>
+
+  <p>
+    但兩件事讓這個數字不那麼可怕。其一，透過反覆改進 codemod，這 97,000 被壓到了 <strong>37,000</strong>——也就是說大部分 suppression 不是真的型別問題，而是 codemod 還不夠聰明、轉出來的東西 TS 不認，改好 codemod 就消失了。其二、也是最反直覺的：即便 suppression 數字仍遠高於 Flow，TS 量到的 <em>type coverage 反而更高</em>。
+  </p>
+
+  <p>
+    為什麼？因為 suppression 數量和 type coverage 量的是不同東西。suppression 是「這幾處我明確讓型別檢查閉嘴」；coverage 是「整個 codebase 裡有多少比例的值是有型別資訊覆蓋的」。Flow 之所以 suppression 少，部分原因是它對很多第三方套件根本沒有型別定義可檢查——沒有型別，就沒有錯誤可抑制，但那片區域其實是型別真空。TS 那套豐富的 <code>@types/*</code> 生態把這些真空填上，於是整體 coverage 上去了，代價是某些原本「無型別所以無錯」的地方現在有型別、暴露出需要 suppress 的真實落差。下面把這三個數字畫成同一張圖。
+  </p>
+
+  <figure class="vg-w-chart-stripe-suppressions" data-svg-scroll="800">
+    <style>
+      .vg-w-chart-stripe-suppressions { display: grid; gap: var(--s-2); margin: var(--s-4) 0; }
+      .vg-w-chart-stripe-suppressions svg { width: 100%; height: auto; max-width: 760px; }
+      .vg-w-chart-stripe-suppressions figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M3 3v16a2 2 0 0 0 2 2h16"/><path d="m19 9-5 5-4-4-3 3"/>
+      </svg>
+      <span>suppression 數量的三個節點 · 點長條看數值</span>
+    </p>
+    <svg viewBox="0 0 760 360" preserveAspectRatio="xMidYMid meet" role="img"
+         aria-label="Flow 基準、TS 首次轉換、TS 改進後的 suppression 數量長條圖">
+      <g id="vg-w-chart-stripe-suppressions-axes"></g>
+      <g id="vg-w-chart-stripe-suppressions-series"></g>
+    </svg>
+    <figcaption>
+      suppression 數量（@ts-expect-error / Flow suppress 註解）。數字來源：Stripe blog「Migrating to TypeScript」。注意這不是「越少越好」的指標——TS 端 37,000 個 suppression 對應的 type coverage 仍高於 Flow 端 5,000 個，因為兩者量的是不同的東西。
+    </figcaption>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-chart-stripe-suppressions');
+        if (!root) return;
+        const axesG = root.querySelector('#vg-w-chart-stripe-suppressions-axes');
+        const seriesG = root.querySelector('#vg-w-chart-stripe-suppressions-series');
+        const NS = 'http://www.w3.org/2000/svg';
+        function el(tag, attrs) {
+          const e = document.createElementNS(NS, tag);
+          for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+          return e;
+        }
+
+        // 真實數字：Stripe blog。[標籤, suppression 數, 顏色 token, 註腳]
+        const data = [
+          ['Flow 基準', 5000, 'var(--ink-deep)', '原本 codebase'],
+          ['TS 首次轉換', 97000, 'var(--accent)', 'codemod 第一版'],
+          ['TS 改進後', 37000, 'var(--sage-deep)', '反覆加固 codemod'],
+        ];
+
+        const X0 = 110, X1 = 700, Y0 = 290, Y1 = 50;
+        const maxY = 100000;
+        const yOf = v => Y0 - (v / maxY) * (Y0 - Y1);
+        const xOf = i => X0 + (i + 0.5) * (X1 - X0) / data.length;
+
+        // 標題
+        const title = el('text', { x: 405, y: 28, 'text-anchor': 'middle', 'font-family': 'EB Garamond, serif', 'font-size': 16, fill: 'var(--ink)' });
+        title.textContent = 'suppression 數量——97k 是 codemod 的初稿，不是終局';
+        axesG.appendChild(title);
+
+        // 軸線
+        axesG.appendChild(el('line', { x1: X0, y1: Y0, x2: X1, y2: Y0, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+        axesG.appendChild(el('line', { x1: X0, y1: Y0, x2: X0, y2: Y1, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+
+        // Y 刻度 每 20k
+        for (let v = 0; v <= maxY; v += 20000) {
+          const y = yOf(v);
+          axesG.appendChild(el('line', { x1: X0 - 4, y1: y, x2: X0, y2: y, stroke: 'var(--muted-2)' }));
+          const t = el('text', { x: X0 - 8, y: y + 4, 'text-anchor': 'end', 'font-family': 'Manrope, sans-serif', 'font-size': 11, fill: 'var(--muted)' });
+          t.textContent = (v / 1000) + 'k';
+          axesG.appendChild(t);
+          if (v > 0) {
+            axesG.appendChild(el('line', { x1: X0, y1: y, x2: X1, y2: y, stroke: 'var(--muted-2)', 'stroke-width': 0.5, 'stroke-dasharray': '2,3' }));
+          }
+        }
+
+        // Y 軸標籤
+        const yl = el('text', { x: 30, y: (Y0 + Y1) / 2, 'text-anchor': 'middle', 'font-family': 'EB Garamond, serif', 'font-size': 13, fill: 'var(--muted)', transform: `rotate(-90 30 ${(Y0 + Y1) / 2})` });
+        yl.textContent = 'suppression 註解數';
+        axesG.appendChild(yl);
+
+        // 長條 + 數值 + X 標籤
+        data.forEach((d, i) => {
+          const w = 90;
+          const y = yOf(d[1]);
+          const bar = el('rect', { x: xOf(i) - w / 2, y, width: w, height: Y0 - y, fill: d[2], 'fill-opacity': 0.22, stroke: d[2], 'stroke-width': 1.5, rx: 2, role: 'img', 'aria-label': d[0] + ' ' + d[1].toLocaleString() + ' 個' });
+          seriesG.appendChild(bar);
+
+          const vt = el('text', { x: xOf(i), y: y - 8, 'text-anchor': 'middle', 'font-family': 'EB Garamond, serif', 'font-size': 14, fill: d[2] });
+          vt.textContent = d[1].toLocaleString();
+          seriesG.appendChild(vt);
+
+          const lt = el('text', { x: xOf(i), y: Y0 + 20, 'text-anchor': 'middle', 'font-family': 'Manrope, sans-serif', 'font-size': 12, fill: 'var(--ink)' });
+          lt.textContent = d[0];
+          axesG.appendChild(lt);
+
+          const st = el('text', { x: xOf(i), y: Y0 + 36, 'text-anchor': 'middle', 'font-family': 'Manrope, sans-serif', 'font-size': 11, fill: 'var(--muted)' });
+          st.textContent = d[3];
+          axesG.appendChild(st);
+        });
+
+        // 註解箭頭：97k -> 37k 的下降
+        const drop = el('path', { d: `M ${xOf(1)} ${yOf(97000) - 30} C ${xOf(1) + 30} ${yOf(70000)}, ${xOf(2) - 30} ${yOf(60000)}, ${xOf(2)} ${yOf(37000) - 26}`, fill: 'none', stroke: 'var(--muted)', 'stroke-width': 1, 'stroke-dasharray': '3,3' });
+        seriesG.appendChild(drop);
+        const dropT = el('text', { x: (xOf(1) + xOf(2)) / 2, y: yOf(72000), 'text-anchor': 'middle', 'font-family': 'IM Fell English, serif', 'font-style': 'italic', 'font-size': 12, fill: 'var(--muted)' });
+        dropT.textContent = '−62%：改 codemod';
+        seriesG.appendChild(dropT);
+      })();
+    </script>
+  </figure>
+
+  <p>
+    這張圖的關鍵閱讀方式是：97k 那根長條不是「遷移的品質」，而是「codemod 第一版的粗糙程度」；從 97k 到 37k 的下降幾乎全來自改 codemod，而不是改應用程式碼。把 suppression 當成 codemod 成熟度的代理指標，而非 codebase 健康度的指標——這個區分讓團隊能客觀地問「我們的轉換器夠好了嗎」，而不是被一個嚇人的絕對數字綁架。
+  </p>
+
+  <p>
+    這裡有一個普遍適用的度量教訓：當你拿一個新工具量舊系統，第一輪數字往往反映的是「工具還不會用」，而非「系統有多糟」。如果 Stripe 在看到 97,000 這個數字時就退縮——「我們的 codebase 顯然爛到不能遷」——這次遷移會在第一週就被自己嚇死。真正該問的是「這 97,000 裡有多少是 codebase 真的問題，多少是轉換器的問題」，而回答這個問題的方法就是去改 codemod、看數字掉到哪裡為止。掉到 37,000 後不再明顯下降，那剩下的 37,000 才比較接近「真實落差」。把一個嚇人的絕對值分解成「工具雜訊 + 真實訊號」，是任何大規模自動化遷移都會遇到的判讀問題。
+  </p>
+
+  <p>
+    還有一個值得記住的對照：切換上線時，這個 codebase 帶著 37,000 個 <code>@ts-expect-error</code> 跑在 production。對某些團隊文化，「帶著三萬七千個已知型別抑制上線」聽起來像不可接受的技術債。但這正是 big-bang 哲學的核心取捨——把「達到完美型別」這個目標從「切換的前置條件」降級成「切換後的持續任務」。完美是收斂的終點，不是切換的閘門。願不願意接受這個降級，往往決定了一個團隊能不能走 big-bang。
+  </p>
+
+  <h2>不凍結 repo，把巨型 PR 落地</h2>
+
+  <p>
+    一個 370 萬行的 PR 最大的敵人不是型別錯誤，是時間——只要 main 還在動，這個 branch 就一直在腐爛。幾百名工程師每天還在往 main 推 Flow 程式，任何傳統意義的「長命 migration branch」在合進去之前早就被 merge conflict 淹死了。Stripe 的解法是把 branch 的存活時間壓到趨近於零：codemod 被設計成<em>可重跑</em>，而不是一條一次性的 migration pipeline。
+  </p>
+
+  <p>
+    這個性質改變了整個賽局。既然轉換是一個能對任意版本的 main 重新執行、且結果可信（因為每個 edge case 都有回歸測試守著）的純函式，那就沒必要維護一個長命 branch 去跟 main 賽跑。做法變成：在切換前把 codemod 養到足夠成熟，然後在切換那一刻才<em>重生</em> migration branch——對當下最新的 main 跑一遍 codemod，產出一個幾乎沒有 drift 的新 branch。branch 越短命，conflict 越少。
+  </p>
+
+  <p>
+    對比一下傳統的長命遷移 branch：你在某個時間點從 main 切出去、開始改，然後 main 持續前進，你得不斷 rebase / merge 把上游的新改動吸收進來。對一個跨越三百多萬行的 branch，每一次 rebase 都可能是幾百個 conflict，而且這個過程沒有終點——只要 branch 還活著，conflict 就持續生成。Stripe 的可重跑 codemod 把這個方程式整個改寫：不是「維護一個 branch 並持續吸收 main 的變化」，而是「保留一個能在任意時刻重新生成 branch 的函式」。狀態被換成了一個可重複執行的轉換，conflict 從「持續發生的事件」變成「一次性產出的瞬間」。
+  </p>
+
+  <p>
+    切換週（cutover week）做的是降低未知數：把 build 在 CI 上跑綠、部署到 QA、找 product team 對 user-facing 功能手測。這一週抓到了像「loader 寫死 <code>.js</code> 副檔名導致缺翻譯」這種只有真人點才會發現的 bug，並開了一個 Slack channel 專門協調 rollout。
+  </p>
+
+  <p>
+    然後是那個週末。<strong>週六（3 月 5 日）</strong>是一次全流程彩排：重生一份 migration branch、跑自動腳本、部署 QA、再驗證、再請 product team 測——確認沒有新問題。<strong>週日清晨（3 月 6 日）</strong>是正式切換，照一個收得很緊的順序走：鎖住 monorepo（阻止 main drift）→ 跑最後一輪 QA → 提交那個改動 →「merged cleanly and our automated tests passed」→ 起 production 部署 → 解鎖 repo → 通知所有工程師。整個 repo 被鎖住的窗口，只有清晨那段最後驗證到合入的時間。
+  </p>
+
+  <p>
+    為什麼要鎖 repo？因為從「重生 branch」到「合入 main」之間，只要有人往 main 推一個新 commit，這個 branch 就立刻有了 drift——它是基於某個 main 快照生成的，那個快照一變，乾淨合入的保證就破了。鎖住 monorepo 等於凍結那個快照，讓 codemod 的輸出與 main 的當前狀態完全一致，merge 才能「cleanly」。而能把鎖的窗口壓到一個清晨，靠的正是前面所有準備：彩排已經證明流程可跑、QA 已經抓掉肉眼可見的 bug、codemod 已經穩定到重生一次只要跑腳本。鎖的時間長短，直接反映了你對整套流程的信心程度。
+  </p>
+
+  <p>
+    這就是為什麼前面那張時間軸最後一格是「鎖 → 驗 → 合 → 部署 → 解鎖」一連串緊湊動作：可重跑的 codemod 把「凍結 repo 多久」這個成本，從「整個遷移期」壓縮成「一個週日清晨」。對幾百名工程師而言，他們感受到的全部代價，就是某個週末別往 main 推東西——而換來的是週一醒來時，整個 codebase 已經是 TypeScript。
+  </p>
+
+  <p>
+    隔天，幾百名工程師開始寫 TypeScript。轉換的平滑程度從另一段內部回饋看得最清楚——一位面試時還對這次遷移半信半疑的工程師寫道：
+  </p>
+
+  <blockquote>
+    <p>「When I was interviewing, I heard the migration from Flow to TypeScript was underway. I was admittedly skeptical, seeing prior teams struggle with the complexity and effort of even small codebases. The fact that I was back to normal in a few minutes [on] Monday was humbling.」</p>
+  </blockquote>
+
+  <p>
+    「Monday 早上幾分鐘就回到正常工作」——對一個 370 萬行的語言遷移來說，「幾分鐘」是個荒謬的數字，而這正是 big-bang 的回報：沒有並存期、沒有互通層，工程師醒來只面對一種語言。有人把它稱作「在 Stripe 期間最大的單一開發者生產力提升」。
+  </p>
+
+  <p>
+    當然，這條路有清楚的前提，不是誰都能照搬。它要求：（一）codebase 規模大到值得投入幾個月養 codemod；（二）緊耦合到 incremental 的互通層成本足以蓋過 big-bang 的風險；（三）願意接受「先標記、後消化」——切換時帶著 37,000 個 <code>@ts-expect-error</code> 上線，把修錯延後成一份待辦清單，而不是 blocker。少了任何一條，逐檔遷可能仍是更穩的選擇。
+  </p>
+
+  <p>
+    但這次遷移真正可遷移（pun intended）的洞見，與 Flow 或 TypeScript 本身無關，而是把一個高風險的一次性事件，拆成三個被馴服的子問題：用<em>回歸測試守護的可重跑 codemod</em> 換掉「長命 branch 跟 main 賽跑」；用 <code>@ts-expect-error</code> 把「轉換」與「修錯」解耦，讓轉換永遠跑綠；用「重生 branch + 鎖一個清晨」把凍結 repo 的成本壓到最小。big-bang 看起來像一次豪賭，實際上是把賭注一個一個拆解成可驗證的工程步驟。
+  </p>
+
+  <p class="vg-deep-closer"><strong>真正落地的不是膽量，是準備</strong>：當轉換是一個有回歸測試守護、可對最新 main 重跑的純函式，「一次合 370 萬行」就從一場豪賭變成一個鎖了一個週日清晨的部署。</p>
+</div>

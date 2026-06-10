@@ -1,0 +1,610 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">把「寫一句話」想成一隻手在紙上從左到右一個字一個字落筆——這是你認識的所有語言模型的樣子。DiffusionGemma 換了一種畫法：它先在整張紙上潑滿隨機雜訊，然後像沖洗一張底片那樣，讓 256 個字同時從模糊裡浮現、彼此校正，直到整段話一次成形。</p>
+  <h1 class="vg-post-title">DiffusionGemma——把文字生成從自迴歸換成擴散去噪</h1>
+</header>
+
+<div class="vg-post-prose">
+
+<p><span class="vg-dropcap">你</span>已經知道 transformer 怎麼把一段 prompt 編碼成向量、知道 attention 在算什麼。這篇不重講那些。這篇要回答的是一個更窄、也更新的問題：當 Google 在 2026 年 6 月把 DiffusionGemma 丟出來、宣稱它「在 GPU 上文字生成快了最多 4 倍」、而且「能在生成途中回頭改掉自己已經寫出的字」時——它到底改了哪一塊機制？讀完你會知道：擴散語言模型的一次 forward pass 在算什麼、為什麼它能並行產出整塊 token、為什麼它能自我修正、這套做法用什麼換什麼，以及為什麼它特別吃 NVIDIA GPU 的胃口。</p>
+
+<h2>逐字落筆的代價——自迴歸解碼為什麼天生是序列的</h2>
+
+<p>先把今天所有主流 LLM 的解碼方式攤開，因為 DiffusionGemma 替換掉的就是這一塊。標準的 Gemma、GPT、Llama 都是 autoregressive（自迴歸）：給定前面所有 token，模型算出下一個 token 的機率分布，採樣一個，把它接到序列尾端，然後拿這條變長了一格的序列再餵一次模型，算下下一個。第 N 個 token 的生成，在定義上依賴第 N-1 個的結果。</p>
+
+<p>這個依賴鏈有一個無法迴避的後果：生成 100 個 token 就要做 100 次 forward pass，而且這 100 次不能並行——第 50 次必須等第 49 次的採樣結果落定才能開始。你沒辦法用「多塞一張 GPU」把這條鏈拆開，因為它是資料依賴，不是算力不足。</p>
+
+<p>更關鍵的是，這 100 次 forward pass 每一次都很「浪費」。為了算第 51 個 token，模型要把前 50 個 token 的 key / value 全部讀進來做 attention。這些 KV 早就算好、躺在 KV cache 裡，這一步幾乎不做新的矩陣乘法，主要時間花在「把 cache 從 HBM 搬到 SM」。用一句話總結它的性能瓶頸：自迴歸解碼是 memory-bound（受記憶體頻寬限制）的工作。GPU 的算力多半閒著，卡在等記憶體。</p>
+
+<p>NVIDIA 的那篇 blog 把這件事講得很直白：傳統 LLM「一次生成一個 token，每個新字都依賴前一個字」，而這個依賴讓單次請求的延遲幾乎完全由 forward pass 的次數決定。你想讓一段 256 字的回覆快一倍，唯一的辦法是讓每次 forward pass 快一倍——但每次 pass 本來就沒在認真算，它在等記憶體。這是一條撞死的路。</p>
+
+<p>值得把這個 memory-bound 的處境再講清楚一點，因為它是後面所有加速論述的對照組。一次自迴歸 decode step 的時間大致拆成兩塊：把模型權重從 HBM 讀進 SM、以及把已生成 token 的 KV cache 從 HBM 讀進來。在 batch size 為 1 的單使用者情境，這兩塊都是「讀一堆資料、做很少的乘加、吐出一個 logits 分布」。算術強度（arithmetic intensity，每讀一個 byte 做幾次浮點運算）很低，低到 GPU 的 tensor core 大半時間在空轉等資料。這也是為什麼 batch 很多請求能拉高自迴歸的總吞吐——把多個請求的權重讀取攤平——但對「單一請求的延遲」毫無幫助：那條 256 步的依賴鏈還是得一步步走。</p>
+
+<p>業界這幾年為了打這條鏈想了不少招：speculative decoding 用一個小模型先猜幾個 token、大模型一次驗證一批；Medusa 之類的方法在模型上多接幾個 head 同時預測未來幾個位置。這些都是在「不改變自迴歸本質」的前提下，盡量把序列鏈壓短。它們有效，但天花板就在那裡——本質上你還是在一條因果鏈上猜測加驗證，猜錯了要回退。擴散語言模型走的是另一條路：乾脆放棄逐字因果，從一開始就把整塊當成一個並行的去噪問題來解。</p>
+
+<h2>整段一起沖洗——擴散語言模型把「生成」改寫成「去噪」</h2>
+
+<p>擴散模型這個詞你可能在影像生成那邊聽過：Stable Diffusion 從一張純雜訊的圖開始，反覆「去噪」，每一步把圖片推得更清晰一點，跑個 20~50 步收斂成一張圖。DiffusionGemma 做的是同一件事，只是把「像素」換成「token」。</p>
+
+<p>但這裡有個重要的技術差異不能含糊帶過。影像擴散是在連續空間裡加減高斯雜訊——像素值是浮點數，你可以對它加一點點雜訊、再去掉一點點。文字不是連續的，token 是離散的符號，你沒辦法對「貓」這個 token 加 0.1 的高斯雜訊。所以文字擴散用的不是連續雜訊，而是一種離散的腐化過程：把 token「遮掉」（mask）或「替換成隨機 token」。Google 的文件把 DiffusionGemma 的方案稱為 uniform-state diffusion——畫布起手是「由隨機占位 token 鋪滿」的均勻雜訊態，去噪過程就是反覆把這些占位符替換成模型有把握的真實 token。所謂「加噪」與「去噪」，在文字這邊其實是「遮蔽程度」與「還原程度」的來回。</p>
+
+<p>這個離散性正是擴散語言模型過去幾年一直做不太好的原因，也是 DiffusionGemma 這次值得停下來看的地方：把一個生產級、26B 規模、建立在 Gemma 4 骨幹上的擴散文字模型做到「在消費級顯卡上可用」，是這個方向第一次真正落到工程師桌面上，而不是停在 arxiv 的 toy model。</p>
+
+<p>它的生成過程分三個階段。第一，模型起手是一張「由隨機占位 token 鋪滿的畫布（canvas）」——對 DiffusionGemma 來說，這張畫布固定是 256 個 token 寬。第二，模型對這整張畫布做多次 forward pass，每一次「把已經有把握的 token 鎖定，並用它們當作線索去精修其餘的位置」。第三，反覆幾輪之後，「整段序列突然對焦（snap into focus）」，收斂成通順的輸出。</p>
+
+<p>注意這裡的根本差異：自迴歸的一次 forward pass 只產出 1 個 token；擴散的一次 forward pass 同時碰 256 個 token。Google 的開發者文件用的詞是「一次起草一整段 256 字的段落」。生成 256 字不再需要 256 次序列 pass，而是十幾次到幾十次「整塊去噪」pass——而且每一次 pass 內部的 256 個位置是並行算的。</p>
+
+<p>把這件事換算成計算特性就很有意思了：把一整塊 256 token 推過 transformer，是一個結結實實的大矩陣乘法。它不在等記憶體，它在拼命算。Google 的文件原話是這套做法「把瓶頸從記憶體頻寬轉移到算力（shifts the bottleneck from memory bandwidth to compute）」。NVIDIA 的版本講得更白：「把一整塊 256 token 並行拉過 transformer 是 compute-bound 的工作——這正是 NVIDIA GPU 為之而生的東西。」memory-bound 變成 compute-bound，是這次 4 倍加速的真正來源，不是模型變小了。</p>
+
+<p>用幾行 pseudocode 把兩種解碼的主迴圈擺在一起，差異會更刺眼：</p>
+
+<pre data-kind="pseudocode"><code><em>// 自迴歸：序列長度 = forward pass 次數</em>
+tokens = [BOS]
+for step in 1..256:
+    logits = model(tokens)        <em>// 整條序列餵進去，只取最後一格</em>
+    next   = sample(logits[-1])
+    tokens.append(next)           <em>// 接到尾端，永久定稿</em>
+<em>// → 256 次序列相依的 pass</em>
+
+<em>// 擴散：去噪步數 = forward pass 次數（≪ 序列長度）</em>
+canvas = random_tokens(256)       <em>// 整塊雜訊起手</em>
+for step in 1..16:
+    logits = model(canvas)        <em>// 256 個位置一次全算（bidirectional）</em>
+    conf   = confidence(logits)   <em>// 每個位置的把握程度</em>
+    canvas = update(canvas, logits, conf)   <em>// 高把握鎖定，低把握 re-noise</em>
+<em>// → 約 16 次並行的 pass，內部 256 位置同時算</em></code></pre>
+
+<p>注意第二段那行 <code>canvas = update(...)</code> 同時做了兩件自迴歸版本根本沒有的事：把高把握的位置鎖定下來當作後續的 context，把低把握的位置打回雜訊重來。自迴歸版本的 <code>tokens.append(next)</code> 只能往前加、不能回頭。這兩行的差異，就是「逐字落筆」與「整段沖洗」的全部分野。</p>
+
+<p>下面這個 widget 把這個「整塊一起浮現」的動態畫出來。自迴歸是逐格點亮的；擴散是整塊從亂碼裡同時收斂。按 play，看 256 格畫布怎麼一步步從隨機 token 對焦成文字——這是靜態圖永遠表達不出來的時間維度。</p>
+
+<figure class="vg-w-canvas-denoise">
+  <style>
+    .vg-w-canvas-denoise { display: grid; grid-template-rows: auto auto 1fr auto; gap: var(--s-2); }
+    .vg-w-canvas-denoise .toolbar { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); flex-wrap: wrap; }
+    .vg-w-canvas-denoise button { font-family: var(--sans); font-size: var(--fs-sm); padding: 6px 14px; min-height: 44px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); cursor: pointer; }
+    .vg-w-canvas-denoise button:hover { border-color: var(--accent); color: var(--accent-text); }
+    .vg-w-canvas-denoise .mode { display: flex; gap: 0; border: 1px solid var(--line); }
+    .vg-w-canvas-denoise .mode button { border: none; min-height: 44px; }
+    .vg-w-canvas-denoise .mode button[aria-pressed="true"] { background: var(--accent); color: var(--bg); }
+    .vg-w-canvas-denoise .clock { margin-left: auto; }
+    .vg-w-canvas-denoise canvas { width: 100%; height: auto; aspect-ratio: 16 / 7; display: block; }
+    .vg-w-canvas-denoise figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    @media (max-width: 720px) {
+      .vg-w-canvas-denoise canvas { aspect-ratio: 4 / 3; }
+    }
+  </style>
+
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <polygon points="6 3 20 12 6 21 6 3"/>
+    </svg>
+    <span>play to watch a 256-token canvas converge · toggle 自迴歸 vs 擴散</span>
+  </p>
+
+  <div class="toolbar">
+    <button id="vg-w-canvas-denoise-toggle">▷ play</button>
+    <button id="vg-w-canvas-denoise-reset">↺ reset</button>
+    <span class="mode">
+      <button id="vg-w-canvas-denoise-m-ar" aria-pressed="false">自迴歸</button>
+      <button id="vg-w-canvas-denoise-m-diff" aria-pressed="true">擴散</button>
+    </span>
+    <span class="clock" id="vg-w-canvas-denoise-clock">pass 0 · 已定稿 0 / 256</span>
+  </div>
+
+  <canvas id="vg-w-canvas-denoise-canvas"></canvas>
+
+  <figcaption>同一塊 256-token 畫布，兩種解碼策略。自迴歸從左到右逐格定稿，每個 pass 只能落一格。擴散每個 pass 對整塊重新評估、把高把握的位置鎖定（深色）、其餘留作雜訊（淺色），十幾步後整塊對焦。深淺代表該位置目前的置信度。</figcaption>
+
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-canvas-denoise');
+      const canvas = root.querySelector('canvas');
+      const toggle = root.querySelector('#vg-w-canvas-denoise-toggle');
+      const reset = root.querySelector('#vg-w-canvas-denoise-reset');
+      const mAr = root.querySelector('#vg-w-canvas-denoise-m-ar');
+      const mDiff = root.querySelector('#vg-w-canvas-denoise-m-diff');
+      const clock = root.querySelector('#vg-w-canvas-denoise-clock');
+      const ctx = canvas.getContext('2d');
+
+      const COLS = 32, ROWS = 8, N = COLS * ROWS; // 256 tokens
+      let mode = 'diff'; // 'diff' | 'ar'
+      let running = false;
+      let pass = 0;
+      // confidence[i] in [0,1]; AR-committed[i] boolean
+      let conf = new Array(N).fill(0);
+      let committed = new Array(N).fill(false);
+      // each cell gets a stable random "final convergence pass" for diffusion
+      let lockPass = new Array(N).fill(0);
+
+      function getCssVar(name) {
+        return getComputedStyle(root).getPropertyValue(name).trim() || '#888';
+      }
+
+      function seed() {
+        pass = 0;
+        conf = new Array(N).fill(0);
+        committed = new Array(N).fill(false);
+        // diffusion: most cells lock between pass 2 and 14, a few stubborn ones late
+        lockPass = Array.from({ length: N }, () => 2 + Math.floor(Math.random() * 12));
+      }
+      seed();
+
+      function resize() {
+        const dpr = window.devicePixelRatio || 1;
+        const rect = canvas.getBoundingClientRect();
+        canvas.width = rect.width * dpr;
+        canvas.height = rect.height * dpr;
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      }
+      new ResizeObserver(resize).observe(canvas);
+      resize();
+
+      const MAX_PASS_DIFF = 16;
+
+      function step() {
+        pass += 1;
+        if (mode === 'diff') {
+          for (let i = 0; i < N; i++) {
+            if (committed[i]) continue;
+            // confidence rises smoothly until its lockPass, then snaps committed
+            const target = pass >= lockPass[i] ? 1 : Math.min(0.85, pass / lockPass[i]);
+            conf[i] = target;
+            if (pass >= lockPass[i]) committed[i] = true;
+          }
+          if (pass >= MAX_PASS_DIFF) { for (let i = 0; i < N; i++) { conf[i] = 1; committed[i] = true; } running = false; }
+        } else {
+          // autoregressive: commit exactly one new token (left-to-right) per pass
+          const next = committed.indexOf(false);
+          if (next === -1) { running = false; }
+          else { committed[next] = true; conf[next] = 1; }
+        }
+      }
+
+      function draw() {
+        const W = canvas.getBoundingClientRect().width;
+        const H = canvas.getBoundingClientRect().height;
+        ctx.clearRect(0, 0, W, H);
+        const padX = 8, padTop = 6, padBot = 6;
+        const cw = (W - padX * 2) / COLS;
+        const ch = (H - padTop - padBot) / ROWS;
+        const cellPad = Math.max(1, Math.min(cw, ch) * 0.12);
+        const accent = getCssVar('--accent');
+        const ink = getCssVar('--ink');
+        const line = getCssVar('--line');
+        for (let i = 0; i < N; i++) {
+          const r = Math.floor(i / COLS), c = i % COLS;
+          const x = padX + c * cw, y = padTop + r * ch;
+          if (committed[i]) {
+            ctx.fillStyle = ink;
+            ctx.globalAlpha = 0.85;
+          } else if (conf[i] > 0.02) {
+            ctx.fillStyle = accent;
+            ctx.globalAlpha = 0.15 + conf[i] * 0.55;
+          } else {
+            ctx.fillStyle = line;
+            ctx.globalAlpha = 0.4;
+          }
+          ctx.fillRect(x + cellPad, y + cellPad, cw - cellPad * 2, ch - cellPad * 2);
+        }
+        ctx.globalAlpha = 1;
+      }
+
+      function frame() {
+        draw();
+        const done = committed.filter(Boolean).length;
+        clock.textContent = `pass ${pass} · 已定稿 ${done} / ${N}`;
+        requestAnimationFrame(frame);
+      }
+      requestAnimationFrame(frame);
+
+      let timer = null;
+      function tick() {
+        if (!running) return;
+        step();
+        const delay = mode === 'diff' ? 320 : 26; // AR needs many fast steps
+        timer = setTimeout(tick, delay);
+      }
+
+      toggle.addEventListener('click', () => {
+        running = !running;
+        toggle.textContent = running ? '⏸ pause' : '▷ play';
+        if (running) tick(); else if (timer) clearTimeout(timer);
+      });
+      reset.addEventListener('click', () => {
+        running = false; toggle.textContent = '▷ play';
+        if (timer) clearTimeout(timer);
+        seed();
+      });
+      function setMode(m) {
+        mode = m;
+        mAr.setAttribute('aria-pressed', String(m === 'ar'));
+        mDiff.setAttribute('aria-pressed', String(m === 'diff'));
+        running = false; toggle.textContent = '▷ play';
+        if (timer) clearTimeout(timer);
+        seed();
+      }
+      mAr.addEventListener('click', () => setMode('ar'));
+      mDiff.addEventListener('click', () => setMode('diff'));
+    })();
+  </script>
+</figure>
+
+<p>把 play 在兩個模式各按一次，你會直接看到那條依賴鏈消失：自迴歸模式下游標一格一格往右爬，擴散模式下整塊同時變深。這不是視覺花招——它就是兩種模型 forward pass 次數差異的字面寫照。</p>
+
+<h2>一次 pass 寫一格 vs 一次 pass 寫一塊——把兩種解碼擺在同一塊畫布上</h2>
+
+<p>上面那段動態講的是「過程」，下面這個對照講的是「單位」。同樣要產出一段文字，兩種模型在「一次 forward pass 換到多少 token」這件事上差了兩個數量級的概念。拖動中間的分隔線，左邊是自迴歸的視角、右邊是擴散的視角，看同一塊輸出在兩種解碼下被切成什麼形狀。</p>
+
+<figure class="vg-w-ba-decode" data-svg-scroll="720">
+  <style>
+    .vg-w-ba-decode { position: relative; aspect-ratio: 16 / 9; overflow: hidden; }
+    .vg-w-ba-decode .layer { position: absolute; inset: 0; }
+    .vg-w-ba-decode .after { clip-path: polygon(50% 0, 100% 0, 100% 100%, 50% 100%); }
+    .vg-w-ba-decode .divider {
+      position: absolute; top: 0; bottom: 0; left: 50%;
+      width: 32px; transform: translateX(-50%);
+      cursor: ew-resize; touch-action: none;
+    }
+    .vg-w-ba-decode .divider::before {
+      content: ''; position: absolute; left: 50%; top: 0; bottom: 0;
+      width: 2px; transform: translateX(-50%); background: var(--accent);
+    }
+    .vg-w-ba-decode .divider::after {
+      content: '↔'; position: absolute; left: 50%; top: 50%;
+      transform: translate(-50%, -50%);
+      background: var(--accent); color: var(--bg);
+      width: 32px; height: 32px; border-radius: 50%;
+      display: grid; place-items: center;
+      font-family: var(--sans); font-size: 16px;
+    }
+  </style>
+
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <polyline points="21 8 21 21 3 21 3 8"/><rect x="1" y="3" width="22" height="5"/><line x1="10" y1="12" x2="14" y2="12"/>
+    </svg>
+    <span>drag divider · 左 自迴歸逐字 · 右 擴散整塊</span>
+  </p>
+
+  <svg class="layer before" viewBox="0 0 720 405" preserveAspectRatio="xMidYMid meet">
+    <rect width="720" height="405" fill="var(--bg-soft)" />
+    <text x="40" y="50" font-family="Manrope, sans-serif" font-size="16" letter-spacing="0.06em" fill="var(--accent-text)">AUTOREGRESSIVE</text>
+    <text x="40" y="74" font-family="EB Garamond, serif" font-size="14" fill="var(--muted)">1 forward pass → 1 token · 256 passes 序列相依</text>
+    <g>
+      <rect x="40" y="110" width="44" height="44" rx="4" fill="var(--ink)" fill-opacity="0.85" />
+      <rect x="92" y="110" width="44" height="44" rx="4" fill="var(--ink)" fill-opacity="0.6" />
+      <rect x="144" y="110" width="44" height="44" rx="4" fill="var(--ink)" fill-opacity="0.35" />
+      <rect x="196" y="110" width="44" height="44" rx="4" fill="none" stroke="var(--line)" />
+      <rect x="248" y="110" width="44" height="44" rx="4" fill="none" stroke="var(--line)" />
+      <text x="62" y="138" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--bg)">t1</text>
+      <text x="114" y="138" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--bg)">t2</text>
+      <text x="166" y="138" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--bg)">t3</text>
+    </g>
+    <path d="M 84 132 L 92 132" stroke="var(--accent)" stroke-width="2" marker-end="url(#vg-w-ba-decode-arr)" />
+    <path d="M 136 132 L 144 132" stroke="var(--accent)" stroke-width="2" marker-end="url(#vg-w-ba-decode-arr)" />
+    <defs>
+      <marker id="vg-w-ba-decode-arr" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto">
+        <path d="M0,0 L6,4 L0,8 z" fill="var(--accent)" />
+      </marker>
+    </defs>
+    <text x="40" y="210" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">每格必須等左邊那格定稿才能開始。</text>
+    <text x="40" y="232" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">瓶頸：每 pass 都在搬 KV cache → memory-bound。</text>
+    <text x="40" y="300" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--muted)">passes = 序列長度</text>
+    <text x="40" y="324" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--muted)">attention = causal（只看左側）</text>
+  </svg>
+
+  <svg class="layer after" viewBox="0 0 720 405" preserveAspectRatio="xMidYMid meet" id="vg-w-ba-decode-after">
+    <rect width="720" height="405" fill="var(--accent)" fill-opacity="0.07" />
+    <text x="400" y="50" font-family="Manrope, sans-serif" font-size="16" letter-spacing="0.06em" fill="var(--accent-text)">DIFFUSION</text>
+    <text x="400" y="74" font-family="EB Garamond, serif" font-size="14" fill="var(--muted)">1 forward pass → 256 tokens · 約 16 passes 並行</text>
+    <g>
+      <rect x="400" y="110" width="30" height="30" rx="3" fill="var(--accent)" fill-opacity="0.55" />
+      <rect x="436" y="110" width="30" height="30" rx="3" fill="var(--accent)" fill-opacity="0.3" />
+      <rect x="472" y="110" width="30" height="30" rx="3" fill="var(--accent)" fill-opacity="0.7" />
+      <rect x="508" y="110" width="30" height="30" rx="3" fill="var(--accent)" fill-opacity="0.4" />
+      <rect x="544" y="110" width="30" height="30" rx="3" fill="var(--accent)" fill-opacity="0.6" />
+      <rect x="580" y="110" width="30" height="30" rx="3" fill="var(--accent)" fill-opacity="0.25" />
+      <rect x="616" y="110" width="30" height="30" rx="3" fill="var(--accent)" fill-opacity="0.5" />
+      <rect x="400" y="146" width="30" height="30" rx="3" fill="var(--accent)" fill-opacity="0.35" />
+      <rect x="436" y="146" width="30" height="30" rx="3" fill="var(--accent)" fill-opacity="0.65" />
+      <rect x="472" y="146" width="30" height="30" rx="3" fill="var(--accent)" fill-opacity="0.45" />
+      <rect x="508" y="146" width="30" height="30" rx="3" fill="var(--accent)" fill-opacity="0.6" />
+      <rect x="544" y="146" width="30" height="30" rx="3" fill="var(--accent)" fill-opacity="0.3" />
+      <rect x="580" y="146" width="30" height="30" rx="3" fill="var(--accent)" fill-opacity="0.55" />
+      <rect x="616" y="146" width="30" height="30" rx="3" fill="var(--accent)" fill-opacity="0.4" />
+    </g>
+    <text x="400" y="210" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">整塊同時評估，無格間相依。</text>
+    <text x="400" y="232" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">瓶頸：大矩陣乘法 → compute-bound。</text>
+    <text x="400" y="300" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--muted)">passes = 去噪步數（≪ 序列長度）</text>
+    <text x="400" y="324" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--muted)">attention = bidirectional（看全塊）</text>
+  </svg>
+  <div class="divider" id="vg-w-ba-decode-divider"></div>
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-ba-decode');
+      const after = root.querySelector('#vg-w-ba-decode-after');
+      const divider = root.querySelector('#vg-w-ba-decode-divider');
+      let dragging = false;
+      function setPct(pct) {
+        const clamped = Math.max(0, Math.min(100, pct));
+        after.style.clipPath = `polygon(${clamped}% 0, 100% 0, 100% 100%, ${clamped}% 100%)`;
+        divider.style.left = `${clamped}%`;
+      }
+      divider.addEventListener('pointerdown', (e) => { dragging = true; divider.setPointerCapture(e.pointerId); });
+      root.addEventListener('pointermove', (e) => {
+        if (!dragging) return;
+        const rect = root.getBoundingClientRect();
+        setPct(((e.clientX - rect.left) / rect.width) * 100);
+      });
+      root.addEventListener('pointerup', () => { dragging = false; });
+      root.addEventListener('pointercancel', () => { dragging = false; });
+    })();
+  </script>
+</figure>
+
+<p>右半邊那行「attention = bidirectional」是整套機制裡最該記住的字。自迴歸模型用的是 causal attention——第 N 個位置只准看它左邊的 token，這是它能逐字生成的前提，也是它無法回頭改字的根源。擴散去噪用的是 bidirectional attention：在去噪這個階段，畫布上每一個 query 位置都能 attend 到所有其他位置，包括它「右邊」尚未定稿的位置。這個雙向性，是下一節要講的自我修正能力的全部來源。</p>
+
+<h2>能回頭改字——bidirectional attention 怎麼讓模型修掉自己的錯</h2>
+
+<p>自迴歸有一個結構性的悲劇：一旦採樣了一個 token、把它接進序列，它就永遠定稿了。如果第 10 個字選錯了，導致第 30 個字怎麼接都不通順，模型沒有任何機制回去改第 10 個字——它只能在錯誤的前提上繼續往下寫。這就是為什麼自迴歸模型有時會「一條道走到黑」，明明開頭跑偏了還硬把句子寫完。</p>
+
+<p>這個悲劇的根源就是 causal attention。為了能逐字生成，自迴歸模型在訓練與推論時都強制「第 N 個位置只能看 1 到 N-1」——它從定義上看不到自己的右邊，因為右邊還沒生出來。這個約束讓它可以用 KV cache 高效推進，但也鎖死了它「事後回頭」的可能。你不能要求一個只能看左邊的模型去修正左邊，因為當它在處理右邊時，左邊早已是不可變的歷史。自迴歸的高效與不可修正，是同一個設計選擇的一體兩面。</p>
+
+<p>擴散去噪沒有這個約束，因為它的每一個 token 在每一次 pass 都是「暫定」的，不是「定稿」的。Google 的文件描述了一個很具體的機制：在某次去噪 pass 裡，「如果一個 token 的置信度掉下來了，sampler 可以把它重新加噪（re-noise）並替換掉」——這是自迴歸模型沒有的能力。換句話說，第 5 步看起來對的字，到第 9 步發現跟周圍對不上，模型可以把它打回雜訊狀態，下一輪重新去噪。文件用「高置信度的 token 幫忙解析相鄰位置，導致整段序列突然對焦」來形容這個彼此校正的過程。</p>
+
+<p>下面這張靜態圖把「re-noise 一個低置信度 token」的瞬間畫出來。關鍵在於：因為是雙向 attention，左右兩邊已經鎖定的高置信 token 一起對中間那個搖擺的位置施加約束，把它從錯誤的候選拉回正確的候選。</p>
+
+<figure class="vg-w-arch-self-correct" data-svg-scroll="800">
+  <style>
+    .vg-w-arch-self-correct svg { width: 100%; height: auto; }
+    .vg-w-arch-self-correct figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-2); }
+  </style>
+  <svg viewBox="0 0 720 320" preserveAspectRatio="xMidYMid meet" role="img" aria-label="self-correction via re-noising under bidirectional attention">
+    <text x="36" y="34" font-family="Manrope, sans-serif" font-size="13" letter-spacing="0.06em" fill="var(--muted)">PASS k：偵測到 t4 置信度下滑</text>
+    <g font-family="JetBrains Mono, monospace" font-size="13">
+      <rect x="36" y="56" width="92" height="48" rx="5" fill="var(--ink)" fill-opacity="0.85" />
+      <text x="82" y="85" text-anchor="middle" fill="var(--bg)">t3 ✓</text>
+      <rect x="140" y="56" width="92" height="48" rx="5" fill="var(--accent)" fill-opacity="0.25" stroke="var(--accent)" stroke-width="1.5" stroke-dasharray="4 3" />
+      <text x="186" y="80" text-anchor="middle" fill="var(--accent-text)">t4 ?</text>
+      <text x="186" y="96" text-anchor="middle" font-family="Manrope, sans-serif" font-size="10" fill="var(--muted)">conf 0.31</text>
+      <rect x="244" y="56" width="92" height="48" rx="5" fill="var(--ink)" fill-opacity="0.85" />
+      <text x="290" y="85" text-anchor="middle" fill="var(--bg)">t5 ✓</text>
+    </g>
+    <path d="M 128 80 L 140 80" stroke="var(--sage-deep)" stroke-width="2" marker-end="url(#vg-w-arch-self-correct-a)" />
+    <path d="M 244 80 L 232 80" stroke="var(--sage-deep)" stroke-width="2" marker-end="url(#vg-w-arch-self-correct-a)" />
+    <text x="186" y="128" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--sage-deep)">左右高置信鄰居雙向約束 t4</text>
+    <defs>
+      <marker id="vg-w-arch-self-correct-a" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto">
+        <path d="M0,0 L6,4 L0,8 z" fill="var(--sage-deep)" />
+      </marker>
+    </defs>
+
+    <line x1="400" y1="56" x2="400" y2="280" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="3 4" />
+
+    <text x="430" y="34" font-family="Manrope, sans-serif" font-size="13" letter-spacing="0.06em" fill="var(--muted)">RE-NOISE → PASS k+1：t4 重新去噪</text>
+    <g font-family="JetBrains Mono, monospace" font-size="13">
+      <rect x="430" y="56" width="92" height="48" rx="5" fill="var(--ink)" fill-opacity="0.85" />
+      <text x="476" y="85" text-anchor="middle" fill="var(--bg)">t3 ✓</text>
+      <rect x="534" y="56" width="92" height="48" rx="5" fill="var(--accent)" fill-opacity="0.7" />
+      <text x="580" y="80" text-anchor="middle" fill="var(--bg)">t4 ✓</text>
+      <text x="580" y="96" text-anchor="middle" font-family="Manrope, sans-serif" font-size="10" fill="var(--bg)">conf 0.94</text>
+      <rect x="638" y="56" width="52" height="48" rx="5" fill="var(--ink)" fill-opacity="0.85" />
+      <text x="664" y="85" text-anchor="middle" fill="var(--bg)">t5 ✓</text>
+    </g>
+    <text x="560" y="150" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">原本搖擺的 t4 被改寫成跟鄰居一致的字</text>
+
+    <g font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">
+      <text x="36" y="210">自迴歸：t4 一旦採樣即定稿，t5、t6 只能建立在它之上，</text>
+      <text x="36" y="232">就算後面全亂掉也無法回頭——causal attention 不看右側。</text>
+      <text x="36" y="266" fill="var(--accent-text)" font-family="Manrope, sans-serif" font-size="12" letter-spacing="0.04em">擴散：每個 token 在收斂前都可被 re-noise，這是能自我修正的唯一前提。</text>
+    </g>
+  </svg>
+  <figcaption>self-correction 不是額外的「校對模組」，它是 bidirectional attention 加上「token 在收斂前都是暫定」這兩個性質的自然結果。Google 把這稱為 intelligent self-correction。</figcaption>
+</figure>
+
+<p>這也解釋了為什麼擴散在某些「需要全局一致性」的任務上特別漂亮。Google 的開發者文件給了一個量化例子：用 Sudoku（數獨）做 supervised fine-tuning，base model 解題成功率大約 0%，SFT 之後拉到 80%，而且推論步數同時下降——fine-tune 過的模型 12 步就解出來，base model 要 48 步。數獨是個經典的「全局約束滿足」問題：填一格要同時滿足行、列、宮三個約束，逐字往右填的自迴歸天生不擅長，能來回改格子的擴散正中下懷。</p>
+
+<p>這個數獨數字有兩層意思，分開讀比較不會誤會。第一層是「能不能解對」：base 的 0% 到 SFT 的 80%，說明擴散的去噪框架本身不會自動會解數獨，得透過 fine-tune 教它把「填格→檢查約束→改格」這個迴圈映射到去噪步驟上。第二層、也是更有趣的一層是「要去噪幾步才解出來」：48 步降到 12 步。這代表 fine-tune 不只提升了正確率，還讓模型學會「更快收斂」——每一步去噪推進得更果斷，少了很多來回搖擺。對工程師來說這是個訊號：擴散模型的「步數」不是固定常數，它跟任務、跟 fine-tune 都有關，可以被優化。</p>
+
+<p>反過來講，這也劃出了擴散不擅長的邊界。如果任務本質就是「嚴格從左到右、後文強烈依賴前文的精確值」——例如逐字背誦一段已知文本、或產生一個每個 token 都不容出錯的長串 ID——擴散的並行假設反而幫倒忙：它一開始對整塊的猜測會彼此干擾，要花很多步才能把一條本來該是嚴格序列的東西收斂好。自迴歸在這種「天生序列」的任務上，逐字落筆的劣勢反而變成優勢。沒有一種解碼策略對所有任務都贏。</p>
+
+<h2>步數就是旋鈕——品質與延遲怎麼用去噪步數換算</h2>
+
+<p>到這裡你可能會問：既然擴散一次 pass 就碰 256 個 token，那一步搞定不就好了？不行。一步去噪等於要求模型從純雜訊直接猜出整段話，品質會崩。去噪步數是擴散模型最核心的旋鈕——步數越多，每一步只需把序列推進一點點，收斂越穩、品質越高，但延遲也越高；步數越少，越快，但越容易留下沒對焦的雜訊。</p>
+
+<p>這跟自迴歸的「步數 = 序列長度」是完全不同的成本曲線。自迴歸你沒得選，256 個 token 就是 256 步。擴散讓你把「要花幾步」變成一個可調參數，在品質和延遲之間滑動。拖下面這條滑桿，看去噪步數怎麼同時牽動相對延遲與輸出品質——兩條曲線往相反方向走，sweet spot 落在中間某處。</p>
+
+<figure class="vg-w-range-steps" data-svg-scroll="720">
+  <style>
+    .vg-w-range-steps { display: grid; grid-template-rows: auto 1fr auto; gap: var(--s-2); }
+    .vg-w-range-steps .controls { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+    .vg-w-range-steps .controls input { flex: 1; accent-color: var(--accent); height: 36px; touch-action: none; }
+    .vg-w-range-steps .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 16ch; text-align: right; }
+    .vg-w-range-steps svg { width: 100%; height: auto; }
+    .vg-w-range-steps figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+  </style>
+
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <polyline points="18 8 22 12 18 16"/><polyline points="6 8 2 12 6 16"/><line x1="2" y1="12" x2="22" y2="12"/>
+    </svg>
+    <span>drag · 去噪步數 1→64 → 看品質與延遲反向移動</span>
+  </p>
+
+  <div class="controls">
+    <label for="vg-w-range-steps-x">去噪步數 =</label>
+    <input id="vg-w-range-steps-x" type="range" min="1" max="64" step="1" value="16" />
+    <span class="readout" id="vg-w-range-steps-readout">16 步</span>
+  </div>
+
+  <svg viewBox="0 0 720 320" preserveAspectRatio="xMidYMid meet" role="img" aria-label="quality vs latency as a function of denoising steps">
+    <line x1="60" y1="270" x2="690" y2="270" stroke="var(--muted-2)" stroke-width="1" />
+    <line x1="60" y1="30"  x2="60"  y2="270" stroke="var(--muted-2)" stroke-width="1" />
+    <text x="375" y="302" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--muted)">去噪步數（denoising steps）</text>
+    <text x="22" y="150" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--muted)" transform="rotate(-90 22 150)">相對值（0–1）</text>
+
+    <path id="vg-w-range-steps-quality" fill="none" stroke="var(--sage-deep)" stroke-width="2.5" />
+    <path id="vg-w-range-steps-latency" fill="none" stroke="var(--accent)" stroke-width="2.5" />
+
+    <line id="vg-w-range-steps-marker" x1="0" y1="30" x2="0" y2="270" stroke="var(--ink)" stroke-width="1" stroke-dasharray="3 3" />
+    <circle id="vg-w-range-steps-dot-q" r="5" fill="var(--sage-deep)" />
+    <circle id="vg-w-range-steps-dot-l" r="5" fill="var(--accent)" />
+
+    <g font-family="Manrope, sans-serif" font-size="12">
+      <rect x="460" y="40" width="14" height="2.5" fill="var(--sage-deep)" />
+      <text x="482" y="44" fill="var(--ink)">輸出品質（收斂飽和）</text>
+      <rect x="460" y="60" width="14" height="2.5" fill="var(--accent)" />
+      <text x="482" y="64" fill="var(--ink)">相對延遲（≈ 線性於步數）</text>
+    </g>
+  </svg>
+
+  <figcaption>品質隨步數飽和（多去一步的邊際收益遞減），延遲約略線性於步數。實務上的取捨：與其追品質頂到滿（步數很高），不如選曲線開始走平的拐點——這也是 DiffusionGemma 用「十幾步」就能跑出 256 token、卻仍比自迴歸快數倍的原因。曲線為示意用途，非實測 benchmark。</figcaption>
+
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-range-steps');
+      const input = root.querySelector('input');
+      const readout = root.querySelector('.readout');
+      const qPath = root.querySelector('#vg-w-range-steps-quality');
+      const lPath = root.querySelector('#vg-w-range-steps-latency');
+      const marker = root.querySelector('#vg-w-range-steps-marker');
+      const dotQ = root.querySelector('#vg-w-range-steps-dot-q');
+      const dotL = root.querySelector('#vg-w-range-steps-dot-l');
+
+      const X0 = 60, X1 = 690, Y0 = 270, Y1 = 30, S_MAX = 64;
+      function xOf(s) { return X0 + ((s - 1) / (S_MAX - 1)) * (X1 - X0); }
+      function yOf(v) { return Y0 - Math.max(0, Math.min(1, v)) * (Y0 - Y1); }
+      // quality: saturating curve 1 - e^{-s/k}
+      function quality(s) { return 1 - Math.exp(-s / 9); }
+      // latency: roughly linear in steps, normalised to 1 at S_MAX
+      function latency(s) { return s / S_MAX; }
+
+      const q = [], l = [];
+      for (let s = 1; s <= S_MAX; s++) {
+        q.push(`${s === 1 ? 'M' : 'L'} ${xOf(s).toFixed(1)} ${yOf(quality(s)).toFixed(1)}`);
+        l.push(`${s === 1 ? 'M' : 'L'} ${xOf(s).toFixed(1)} ${yOf(latency(s)).toFixed(1)}`);
+      }
+      qPath.setAttribute('d', q.join(' '));
+      lPath.setAttribute('d', l.join(' '));
+
+      function update() {
+        const s = Number(input.value);
+        const x = xOf(s);
+        marker.setAttribute('x1', x); marker.setAttribute('x2', x);
+        dotQ.setAttribute('cx', x); dotQ.setAttribute('cy', yOf(quality(s)));
+        dotL.setAttribute('cx', x); dotL.setAttribute('cy', yOf(latency(s)));
+        readout.textContent = `${s} 步 · 品質 ${(quality(s) * 100).toFixed(0)}% · 延遲 ${(latency(s) * 100).toFixed(0)}%`;
+      }
+      input.addEventListener('input', update);
+      update();
+    })();
+  </script>
+</figure>
+
+<figure class="vg-w-passcount-diffusion" data-svg-scroll="720">
+  <style>
+    .vg-w-passcount-diffusion { display: grid; gap: var(--s-2); margin: var(--s-4) 0; }
+    .vg-w-passcount-diffusion svg { width: 100%; height: auto; max-width: 720px; }
+    .vg-w-passcount-diffusion figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+  </style>
+  <svg viewBox="0 0 720 200" preserveAspectRatio="xMidYMid meet" role="img"
+       aria-label="解碼 pass 數比較：自迴歸 256 步、擴散約 16 趟">
+    <text x="20" y="30" font-family="EB Garamond, serif" font-size="16" fill="var(--ink)">解碼要走幾趟——同樣 256 個 token</text>
+    <text x="20" y="74" font-family="Manrope, sans-serif" font-size="12" fill="var(--ink-soft)">自迴歸：逐 token</text>
+    <rect x="160" y="60" width="520" height="22" rx="2" fill="var(--ink-deep)" fill-opacity="0.22" stroke="var(--ink-deep)" stroke-width="1.5"/>
+    <text x="672" y="76" text-anchor="end" font-family="EB Garamond, serif" font-size="14" fill="var(--ink-deep)">256 步</text>
+    <text x="20" y="134" font-family="Manrope, sans-serif" font-size="12" fill="var(--ink-soft)">擴散：整塊並行</text>
+    <rect x="160" y="120" width="32" height="22" rx="2" fill="var(--accent)" fill-opacity="0.25" stroke="var(--accent)" stroke-width="1.5"/>
+    <text x="200" y="136" font-family="EB Garamond, serif" font-size="14" fill="var(--accent-text)">~16 趟</text>
+    <line x1="160" y1="158" x2="680" y2="158" stroke="var(--muted-2)" stroke-width="0.5"/>
+    <text x="160" y="180" font-family="IM Fell English, serif" font-style="italic" font-size="12" fill="var(--muted)">每趟對整塊 256 token 同時去噪，趟數約 16，而非 256</text>
+  </svg>
+  <figcaption>同樣生成 256 個 token，自迴歸要走 256 個序列步，擴散約 16 趟並行去噪就收斂——4 倍加速的來源。</figcaption>
+</figure>
+
+<p>為什麼一步去噪不行、值得再從機率的角度看一眼。模型在每一步只能輸出「在當前已知資訊下，每個位置各自的邊際分布」。若整塊幾乎全是雜訊，每個位置的條件資訊極少，模型只能各自獨立地猜——但語言的字與字之間高度相關，獨立猜出來的一整塊拼在一起多半不通順。多走幾步的價值在於：第一步把少數最有把握的字鎖定，這些字立刻變成第二步其餘位置的 context，於是第二步的條件分布變窄、更準。這就是 Google 文件講的「高置信度的 token 幫忙解析相鄰位置」。步數提供的，本質上是「讓資訊在位置之間逐步傳播」的輪數。</p>
+
+<p>關於品質有一句話必須說在前面，免得這篇讀起來像 Google 的新聞稿：DiffusionGemma 整體輸出品質低於標準的 Gemma 4。Google 自己在 blog 裡寫得很清楚——它「不適合追求最高品質的 production 應用」。這不是 4 倍加速白拿的午餐，而是用一截品質換來的延遲。它的定位是「速度優先、品質可接受」的場景：互動式草稿、code 補全的快速候選、需要低延遲回饋的 agent 內迴圈。</p>
+
+<p>把這個取捨放回上面那條曲線看：曲線是飽和的，意味著從 4 步加到 16 步，品質提升很明顯；從 16 步加到 64 步，品質只多擠出一點點，延遲卻線性翻了 4 倍。理性的部署選擇是踩在拐點附近——這也正是 DiffusionGemma 用「十幾步」跑完 256 token 的原因。它不是跑滿步數追品質頂點，而是停在「品質夠用、速度還快」的位置。換句話說，那個 4 倍加速本身就已經內含了一個品質取捨的選擇：你願意接受略低的品質，所以你可以停在低步數，所以你快。把步數拉到讓品質追平 Gemma 4，那個 4 倍大概也就不見了。</p>
+
+<h2>為什麼這顆模型特別吃 NVIDIA——本地跑起來的數字</h2>
+
+<p>把規格擺上來。DiffusionGemma 建立在 Gemma 4 的骨幹上，是一個 26B 的 Mixture-of-Experts（MoE）模型，但推論時每一步只啟用 3.8B 參數。授權是 Apache 2.0。量化之後「能舒服地塞進 18GB VRAM 上限」，這意味著它跑得進一張消費級顯卡。NVIDIA 提到的量化格式是 NVFP4。day-zero 就支援 Hugging Face Transformers、vLLM，以及用 Unsloth 做 fine-tuning；vLLM 那條路提供 OpenAI 相容的本地 serving，可以配置 entropy bound 與 canvas 長度等參數。</p>
+
+<p>MoE 這個選擇值得單獨拆一下，因為它跟擴散的計算特性配得很巧。26B 總參數、推論啟用 3.8B，意思是這顆模型有一大堆 expert，但每個 token（或每塊去噪）只路由到其中一小部分。對自迴歸 MoE，這主要是省算力；對擴散 MoE，它同時壓住了「一次要把 256 個位置都推過去」的算力帳——你不是把整個 26B 都對 256 個位置乘一遍，而是只動用被路由到的 3.8B。這讓「整塊並行」在算力上仍然付得起，也是它能塞進 18GB、在 RTX 5090 上跑出 700+ tokens/sec 的前提之一。總參數大保住了模型容量（品質），啟用參數小保住了單步成本（速度），擴散的並行性則保住了 forward pass 次數少（延遲）——三者疊起來才湊出那張吞吐表。</p>
+
+<p>真正有意思的是吞吐量數字，以及它們為什麼長這樣。下面這張表把三家來源公布的硬體數字攤開（可點欄位排序）。</p>
+
+<figure class="vg-w-table-throughput">
+  <style>
+    .vg-w-table-throughput { overflow-x: auto; }
+    .vg-w-table-throughput table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+    .vg-w-table-throughput thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; }
+    .vg-w-table-throughput thead th[data-sort] { color: var(--accent-text); }
+    .vg-w-table-throughput tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); }
+    .vg-w-table-throughput td.num { font-variant-numeric: tabular-nums; text-align: right; }
+    .vg-w-table-throughput figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-2); }
+  </style>
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/><path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+    </svg>
+    <span>click column header to sort · 4 columns × 4 rows</span>
+  </p>
+  <table>
+    <thead>
+      <tr>
+        <th data-key="hw">硬體</th>
+        <th data-key="tps" class="num">tokens / sec</th>
+        <th data-key="mem">記憶體</th>
+        <th data-key="src">來源</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td>NVIDIA H100（單卡）</td><td class="num">1000</td><td>—</td><td>Google / NVIDIA</td></tr>
+      <tr><td>GeForce RTX 5090</td><td class="num">700</td><td>18GB VRAM 內</td><td>Google</td></tr>
+      <tr><td>DGX Spark（GB10）</td><td class="num">150</td><td>128GB 統一記憶體</td><td>NVIDIA</td></tr>
+      <tr><td>DGX Station</td><td class="num">2000</td><td>748GB coherent</td><td>NVIDIA</td></tr>
+    </tbody>
+  </table>
+  <figcaption>三家來源公布的吞吐量。整體加速「最多約 4 倍快於同等的自迴歸模型，於單使用者情境」。注意 RTX 5090 的 700+ tokens/sec 是消費級顯卡——擴散把生成變成 compute-bound 之後，正好踩在 GPU 平行算力的甜蜜點。</figcaption>
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-table-throughput');
+      const headers = root.querySelectorAll('thead th');
+      const tbody = root.querySelector('tbody');
+      let activeKey = null, asc = true;
+      headers.forEach(h => h.addEventListener('click', () => {
+        const key = h.dataset.key;
+        if (activeKey === key) asc = !asc; else { activeKey = key; asc = true; }
+        headers.forEach(x => x.removeAttribute('data-sort'));
+        h.setAttribute('data-sort', asc ? 'asc' : 'desc');
+        const rows = [...tbody.querySelectorAll('tr')];
+        const idx = [...headers].indexOf(h);
+        rows.sort((a, b) => {
+          const av = a.children[idx].textContent.trim();
+          const bv = b.children[idx].textContent.trim();
+          const an = Number(av), bn = Number(bv);
+          const cmp = !Number.isNaN(an) && !Number.isNaN(bn) ? an - bn : av.localeCompare(bv);
+          return asc ? cmp : -cmp;
+        });
+        rows.forEach(r => tbody.appendChild(r));
+      }));
+    })();
+  </script>
+</figure>
+
+<p>把表往「為什麼」推一層。自迴歸是 memory-bound，所以它的瓶頸是 HBM 頻寬——換更快的記憶體才會快，加算力沒用。擴散把那次 256-token 的 forward pass 變成 compute-bound 的大矩陣乘法，瓶頸轉到 GPU 的浮點算力（以及 NVFP4 這類低精度格式的 tensor core 吞吐）。NVIDIA 那句「這正是 NVIDIA GPU 為之而生的東西」不是公關話術——它在陳述一個架構事實：擴散的 workload 形狀，剛好對齊了現代 GPU 大量閒置的平行算力。這也是為什麼一張 RTX 5090 都能跑出 700+ tokens/sec，而同尺寸的自迴歸模型在同一張卡上會卡在記憶體頻寬。</p>
+
+<p>再補一個容易被加速數字蓋掉的細節：超過 256 token 的序列怎麼辦？DiffusionGemma 用的是 block autoregressive diffusion——畫布固定 256 寬，一塊去噪收斂後，「模型把它提交進 KV cache」，再「初始化下一塊新的 256-token 畫布，以先前已提交的歷史為條件」。所以它在「塊內並行去噪」與「塊間自迴歸推進」之間做了個混血：塊內享受並行與自我修正，塊間仍是因果順序。長文本不是無限並行，而是一塊一塊往前推。prompt 的吞入則用 causal attention 做 prefill 寫 KV cache，只有去噪階段才切到 bidirectional——兩種 attention 在同一顆模型裡分工。</p>
+
+<p>這個混血架構有一個務必記住的後果：自我修正只在「塊內」有效。一旦某塊去噪收斂、提交進 KV cache，它就跟自迴歸一樣定稿了——後面的塊只能以它為條件，無法再回頭改它。所以 256 這個畫布寬度不只是個吞吐參數，它也是「自我修正的作用範圍」。一個錯誤如果跨越塊邊界才顯現（前一塊寫的某個設定，到下一塊才發現矛盾），模型同樣救不回來。這也解釋了為什麼 Google 把畫布定在 256 而不是更小：太小的塊會讓自我修正的窗口太窄、跨塊矛盾變多；太大的塊則讓單次 forward pass 的算力與記憶體成本爆掉。256 是這條取捨線上的一個工程選點。</p>
+
+<p>把整個推論生命週期串起來，DiffusionGemma 在一次請求裡其實切換了兩種 attention 模式：吞 prompt 時是 causal attention 的 prefill / incremental prefill，把 prompt 的 KV 寫進 cache，這一段跟普通自迴歸模型沒兩樣；進入生成後才切到 bidirectional 的去噪，讓畫布上每個 query 並行 attend 到所有位置。理解這點對讀懂吞吐數字很關鍵：那些 700、1000、2000 tokens/sec 量的是「去噪生成階段」的吐字速度，prompt 很長時的 prefill 仍然要付 causal 那一段的帳。對「短 prompt、長輸出」的互動場景，擴散的加速最明顯；對「長 prompt、短輸出」的場景，加速會被 prefill 稀釋。</p>
+
+<p>對「下週要不要動手用它」的工程判斷，落點大概是這樣：如果你的場景對延遲敏感、對絕對品質容忍度高（互動式補全、草稿生成、agent 的快速內迴圈、結構化約束問題如解謎/排程），DiffusionGemma 用一張消費級卡就能跑出自迴歸吃不到的吞吐，值得試。如果你的場景是「一句都不能錯」的 production 文案或 reasoning，Google 自己都說它品質低於 Gemma 4，先別替換主力模型。它是工具箱裡多出來的一把快刀，不是萬用刀的升級。</p>
+
+<p class="vg-deep-closer"><strong>Mental model</strong>：自迴歸是一隻手逐字落筆、寫過不能改；擴散去噪是讓整段話從雜訊裡同時對焦，每個字在定稿前都還能被鄰居拉回去——把生成從 memory-bound 的序列鏈，換成 compute-bound 的並行收斂，速度與「可回頭改字」就是這一換得來的。</p>
+
+</div>

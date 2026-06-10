@@ -1,0 +1,544 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">作者自己把話講死：「this is not safer for being in Rust，probably slightly unsafer than the C。」整份移植塞進 2015 個 unsafe block，不是因為翻得草率，而是因為 runtime 就是 GC——它的工作本來就是繞過型別系統去搬動活指標。</p>
+  <h1 class="vg-post-title">逐行把 OCaml runtime 從 C 翻成 Rust——一場不重寫的遷移</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p><span class="vg-dropcap">m</span>bacarella 的 <code>rustcaml</code> 做了一件聽起來矛盾的事：把 OCaml 4.14 的整個 C runtime——71 個 <code>runtime/*.c</code>、約 40,000 行——逐行翻成 Rust，而且刻意「翻」而不是「重寫」。目標不是寫出一份 idiomatic、借用檢查器點頭的 Rust runtime，而是保留 C 的結構與語意到「能持續 track upstream 改動」的程度。每翻完一個檔案就用未改動的官方 compiler test suite 跑一遍，per-file 的 build toggle 讓你能在 C 版與 Rust 版之間逐檔切換，git 每翻一檔 commit 一次以便 bisect。約七天、一個人、配合 Claude Code 完成。這篇拆的是它的內部結構：OCaml 的值怎麼編碼、GC 為何天生跟 borrow checker 為敵、unsafe 落在哪裡、哪些 C 慣用法在 stable Rust 根本沒有對應，以及「逐行」這個約束到底換來什麼。</p>
+
+  <h2>一個機器字：tagged integer 與 boxed block 的二選一</h2>
+
+  <p>先把「逐行」的工作流講清楚，因為它是整個專案能成立的支點。作者沒有一次重寫整個 runtime，而是建立了一個 per-file 的 build toggle：每個 <code>runtime/foo.c</code> 都有一個對應的 <code>foo.rs</code>，build system 用一個 flag 決定這一檔用 C 版還是 Rust 版 link 進去。於是流程變成一個機械的循環——挑一個還沒翻的 <code>.c</code>，逐行翻成 <code>.rs</code>，把 toggle 切到 Rust 版，跑<strong>未改動的</strong>官方 compiler test suite，全綠就 commit，紅了就在這一檔內 debug。71 個檔、約 40,000 行，每一檔都是一次「翻譯 → 切換 → 驗證 → commit」。這個結構的價值在於：任何時刻你手上都是一個 C 與 Rust 混合、但完整可運作的 runtime，而且任何迴歸都能用 git bisect 收斂到單一檔案的單一 commit——這是一份 big-bang 重寫永遠拿不到的安全網。</p>
+
+  <p>要理解這場移植為什麼充滿 unsafe，得先理解 OCaml 怎麼在記憶體裡擺一個值。OCaml 的每個值都是<strong>一個機器字</strong>（64-bit 平台上 8 byte），而這個字同時要能表示「一個小整數」或「一個指向 heap block 的指標」。判別方法是看最低位 bit：bottom bit 是 1，這個字就是 immediate integer，上面 63 個 bit 是有號整數；bottom bit 是 0，這個字就是 pointer，因為所有 heap block 都對齊到 4 或 8 byte、最低位天生是 0。作者在 thread 裡的原話：「if the bottom bit is set to 1, it knows the top 63-bits are an integer」、而 pointer「require no decoding to use」——指標完全不用解碼就能直接 deref，只有 immediate int 需要一次算術右移把 tag bit 抹掉。</p>
+
+  <p>下面這個 widget 把同一個 64-bit 字攤開來標註。OCaml 的值表示不是一個 struct，而是「同一塊 bit 在不同情況下代表完全不同的東西」這種 type erasure——這正是 Rust 型別系統最不喜歡的形狀。點任一區塊，看它在「C 怎麼讀」與「Rust 必須怎麼讀」兩種視角下分別是什麼。</p>
+
+  <figure class="vg-w-valrep-ocaml" data-svg-scroll="880">
+    <style>
+      .vg-w-valrep-ocaml { display: grid; grid-template-columns: 1fr; gap: var(--s-3); align-items: start; }
+      @media (min-width: 720px) { .vg-w-valrep-ocaml { grid-template-columns: 1.45fr 1fr; } }
+      .vg-w-valrep-ocaml svg { width: 100%; height: auto; max-width: 880px; }
+      .vg-w-valrep-ocaml input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-valrep-ocaml .region { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; transition: fill 200ms, stroke 200ms; }
+      .vg-w-valrep-ocaml .region:hover { stroke: var(--accent); }
+      .vg-w-valrep-ocaml .region:focus { outline: none; }
+      .vg-w-valrep-ocaml .region:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+      .vg-w-valrep-ocaml .lbl { pointer-events: none; font-family: JetBrains Mono, monospace; font-size: 12px; }
+      .vg-w-valrep-ocaml .sub { pointer-events: none; font-family: IM Fell English, serif; font-style: italic; font-size: 11px; fill: var(--muted); }
+      .vg-w-valrep-ocaml .head { font-family: IM Fell English, serif; font-style: italic; font-size: 13px; }
+      .vg-w-valrep-ocaml .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+      .vg-w-valrep-ocaml .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-valrep-ocaml .detail p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-valrep-ocaml .hint { font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin: 0 0 var(--s-1) 0; }
+      .vg-w-valrep-ocaml:has(#vg-w-valrep-ocaml-r1:checked) .region-1 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+      .vg-w-valrep-ocaml:has(#vg-w-valrep-ocaml-r2:checked) .region-2 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+      .vg-w-valrep-ocaml:has(#vg-w-valrep-ocaml-r3:checked) .region-3 { fill: var(--sage-deep); fill-opacity: 0.3; stroke: var(--sage-deep); }
+      .vg-w-valrep-ocaml:has(#vg-w-valrep-ocaml-r4:checked) .region-4 { fill: var(--sage-deep); fill-opacity: 0.3; stroke: var(--sage-deep); }
+      .vg-w-valrep-ocaml:has(#vg-w-valrep-ocaml-r1:checked) .detail-1 { display: block; }
+      .vg-w-valrep-ocaml:has(#vg-w-valrep-ocaml-r2:checked) .detail-2 { display: block; }
+      .vg-w-valrep-ocaml:has(#vg-w-valrep-ocaml-r3:checked) .detail-3 { display: block; }
+      .vg-w-valrep-ocaml:has(#vg-w-valrep-ocaml-r4:checked) .detail-4 { display: block; }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M9 9h6v6"/><path d="m9 15 6-6"/><circle cx="12" cy="12" r="9"/>
+      </svg>
+      <span>click any field to read its role · 4 fields across two value shapes</span>
+    </p>
+
+    <input type="radio" id="vg-w-valrep-ocaml-r1" name="vg-w-valrep-ocaml-sel" aria-label="select tag bit" checked />
+    <input type="radio" id="vg-w-valrep-ocaml-r2" name="vg-w-valrep-ocaml-sel" aria-label="select integer payload" />
+    <input type="radio" id="vg-w-valrep-ocaml-r3" name="vg-w-valrep-ocaml-sel" aria-label="select block header" />
+    <input type="radio" id="vg-w-valrep-ocaml-r4" name="vg-w-valrep-ocaml-sel" aria-label="select block fields" />
+
+    <svg viewBox="0 0 880 360" role="img"
+         aria-label="OCaml 的一個機器字：immediate integer（tag bit + 63-bit payload）對照 boxed block（header word + 多個 field word）">
+      <text x="440" y="26" text-anchor="middle" fill="var(--ink)" class="head">同一個 word，兩種讀法——bottom bit 決定一切</text>
+
+      <!-- Immediate integer row -->
+      <text x="20" y="74" fill="var(--muted)" class="sub">value with bottom bit = 1 ——&gt; immediate</text>
+      <!-- 63-bit payload region -->
+      <rect class="region region-2" data-target="vg-w-valrep-ocaml-r2" x="80" y="86" width="690" height="48" role="button" tabindex="0" aria-label="select integer payload" />
+      <text x="425" y="108" text-anchor="middle" fill="var(--ink)" class="lbl">63-bit signed integer payload</text>
+      <text x="425" y="126" text-anchor="middle" fill="var(--muted)" class="sub">Long_val(v) = v &gt;&gt; 1</text>
+      <!-- tag bit region -->
+      <rect class="region region-1" data-target="vg-w-valrep-ocaml-r1" x="770" y="86" width="60" height="48" role="button" tabindex="0" aria-label="select tag bit" />
+      <text x="800" y="114" text-anchor="middle" fill="var(--accent-text)" class="lbl">1</text>
+      <text x="800" y="150" text-anchor="middle" fill="var(--muted)" class="sub">bit 0</text>
+
+      <!-- Pointer row -->
+      <text x="20" y="196" fill="var(--muted)" class="sub">value with bottom bit = 0 ——&gt; pointer（無需解碼）</text>
+      <rect x="80" y="208" width="690" height="40" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.5" />
+      <text x="425" y="233" text-anchor="middle" fill="var(--ink)" class="lbl">aligned heap address ——&gt; points at field[0]</text>
+      <rect x="770" y="208" width="60" height="40" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.5" />
+      <text x="800" y="233" text-anchor="middle" fill="var(--muted)" class="lbl">0</text>
+
+      <!-- Boxed block -->
+      <text x="20" y="288" fill="var(--muted)" class="sub">the block it points at</text>
+      <rect class="region region-3" data-target="vg-w-valrep-ocaml-r3" x="80" y="300" width="200" height="44" role="button" tabindex="0" aria-label="select block header" />
+      <text x="180" y="320" text-anchor="middle" fill="var(--ink)" class="lbl">header word</text>
+      <text x="180" y="338" text-anchor="middle" fill="var(--muted)" class="sub">size · color · tag</text>
+      <rect class="region region-4" data-target="vg-w-valrep-ocaml-r4" x="290" y="300" width="160" height="44" role="button" tabindex="0" aria-label="select field 0" />
+      <text x="370" y="326" text-anchor="middle" fill="var(--ink)" class="lbl">field[0]</text>
+      <rect x="460" y="300" width="160" height="44" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.5" />
+      <text x="540" y="326" text-anchor="middle" fill="var(--muted)" class="lbl">field[1]</text>
+      <rect x="630" y="300" width="160" height="44" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.5" />
+      <text x="710" y="326" text-anchor="middle" fill="var(--muted)" class="lbl">field[2] …</text>
+      <line x1="800" y1="248" x2="370" y2="300" stroke="var(--muted)" stroke-width="1" stroke-dasharray="3,3" />
+    </svg>
+
+    <div>
+      <p class="hint">click a field above</p>
+      <div class="detail detail-1">
+        <h3>tag bit（bit 0）· 責任</h3>
+        <p>整個值表示系統的軸心。bit 0 = 1 代表這個字本身就是值（immediate）；bit 0 = 0 代表它是指標。heap block 對齊到 8 byte，地址最低三位天生是 0，所以「指標的 tag bit 永遠是 0」是免費的——不用額外空間存型別標記。</p>
+        <p><strong>C 怎麼讀</strong>：<code>Is_long(v)</code> 巨集就是 <code>((v) &amp; 1)</code>。<strong>Rust 必須</strong>：把 <code>value</code> 定義成 <code>usize</code>（不是 enum），手動 <code>v &amp; 1</code> 判別——型別系統幫不上忙，因為它不是 tagged union。</p>
+      </div>
+      <div class="detail detail-2">
+        <h3>63-bit integer payload · 責任</h3>
+        <p>承載小整數本身。OCaml 的 <code>int</code> 因此是 63-bit 而非 64-bit——犧牲一個 bit 換來「整數不必 box、不進 GC、deref 一個 int 不會誤把它當指標」。<code>Val_long(n) = (n &lt;&lt; 1) | 1</code> 編碼，<code>Long_val(v) = v &gt;&gt; 1</code> 解碼（算術右移保留符號）。</p>
+        <p><strong>翻譯落點</strong>：這層是純算術，Rust 翻起來最乾淨，<code>(n &lt;&lt; 1) | 1</code> 直接對應，幾乎不需要 unsafe。痛點不在這裡。</p>
+      </div>
+      <div class="detail detail-3">
+        <h3>header word · 責任</h3>
+        <p>每個 boxed block 在 field[0] <em>之前</em>有一個 header word，packing 了三件事：block 的 <strong>size</strong>（幾個 word）、GC 的 <strong>color</strong>（白/灰/黑，mark-sweep 用）、以及 <strong>tag</strong>（這個 block 是 tuple、string、closure、custom 哪一種）。指標指向 field[0]，要拿 header 得 <code>Hd_val(v) = ((header_t *)(v))[-1]</code>——往回讀一個 word。</p>
+        <p><strong>Rust 痛點</strong>：「往指標前面一個 word 讀」是 <code>ptr.offset(-1)</code>，越界於任何 Rust 認得的 allocation 之外，必然 unsafe。GC 還會就地改寫 color bit——這是 runtime 對「不可變引用底下的記憶體」做 mutation，borrow checker 的反面教材。</p>
+      </div>
+      <div class="detail detail-4">
+        <h3>block fields · 責任</h3>
+        <p>實際的 payload word。每個 field 本身又是一個 OCaml value——可能是 immediate int、也可能是指向另一個 block 的指標。runtime 對 field 的存取（<code>Field(v, i)</code>）本質上就是 <code>((value *)v)[i]</code> 這種 raw pointer 索引。</p>
+        <p><strong>Rust 痛點</strong>：每一次 <code>Field(v, i)</code> 都是 raw pointer deref，作者的原話是「every field access is ~a raw pointer deref」。type erasure 讓 Rust 沒有任何 struct 型別可以對應——只能是 <code>*mut usize</code> 上的索引，全程 unsafe。</p>
+      </div>
+    </div>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-valrep-ocaml');
+        root.querySelectorAll('.region').forEach((rect) => {
+          rect.addEventListener('click', () => {
+            const targetId = rect.getAttribute('data-target');
+            const radio = root.querySelector('#' + targetId);
+            if (radio) radio.checked = true;
+          });
+          rect.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              rect.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            }
+          });
+        });
+      })();
+    </script>
+  </figure>
+
+  <p>這張圖解釋了整場移植的根本張力。OCaml 的值表示是一種<strong>故意的 type erasure</strong>：所有東西都壓成一個 <code>usize</code>，靠一個 bit 跟一個 header word 在 runtime 動態分辨。Rust 的整個賣點是反過來的——把型別資訊靜態化、讓編譯器在編譯期擋掉非法存取。runtime 要做的恰恰是 Rust 設計來防止的事：把無型別的 word 當成指標 deref、往 allocation 邊界外讀 header、在 immutable view 底下改寫 GC color。所以「翻譯」這個詞要照字面理解——C 的 <code>value</code> typedef 變成 Rust 的 <code>type Value = usize</code>，C 的 <code>Field(v,i)</code> 巨集變成一個 <code>unsafe fn</code>，C 的指標算術變成 <code>(v as *mut usize).offset(i)</code>。語意一一對應，安全性也一一對應——也就是說，都不安全。</p>
+
+  <p>這個編碼選擇不是 OCaml 獨有的奇技，但它把後果推到極致。把整數做成 immediate、最低位當 tag，意味著小整數<strong>永遠不進 heap</strong>：它們不被 allocate、不被 GC 掃描、不需要 deref。代價是 OCaml 的 <code>int</code> 只有 63-bit、而且每次算術都要付出 shift 的成本（<code>a + b</code> 在 boxed 表示下是 <code>a + b</code>，在 tagged 表示下要寫成 <code>a + b - 1</code> 來抵銷兩個 tag bit）。這個 trade 在 functional 語言裡非常划算——大量的小整數、cons cell、option、變體建構子都因此免去 allocation。但對 runtime 的移植者來說，它把「每個 word 都可能是兩種東西之一」這件事釘進了每一行存取程式碼，沒有任何地方能逃進「這裡一定是指標」或「這裡一定是整數」的靜態保證。</p>
+
+  <p>header word 本身還藏著一個 Rust 特別難受的細節：它在 field[0] 的<strong>前面</strong>，而指標指向的是 field[0]。也就是說 runtime 持有的每個 block pointer，其合法可讀範圍其實是 <code>[ptr - 1 word, ptr + size words)</code>——起點在指標之前。Rust 的 <code>*mut T</code> 沒有「往負方向也合法」的概念；<code>ptr.offset(-1)</code> 在 miri 底下會直接判 undefined behavior，除非那塊記憶體是 runtime 自己用裸 allocator 配出來、且明確知道前一個 word 屬於同一個 allocation。逐行翻譯選擇的就是後者：runtime 自管 heap，header 與 fields 是同一塊 raw allocation，<code>Hd_val</code> 的 <code>[-1]</code> 在 <code>unsafe</code> 裡照抄。OCaml 還有一個 <code>Double_array</code> 的特例——float array 為了避免每個 float 都 box，整個 array 用沒有 tag 的 raw double 連續存放，header 的 tag 標成 <code>Double_array_tag</code>，存取時走完全不同的 path。這種「同一個 <code>Field</code> 介面、底下 layout 卻不同」的 special case，正是 type erasure 在 runtime 裡製造的複雜度。</p>
+
+  <h2>bottom bit 是個 discriminator——拖著它在 int 與 pointer 之間翻轉</h2>
+
+  <p>判別只看一個 bit，這件事值得自己動手玩一次才有體感。下面的滑桿掃過一個 raw word 的數值；每動一格，readout 告訴你這個 bit pattern 在 runtime 眼裡是 immediate int 還是 pointer，並用對應的解碼規則把它還原。注意最低位 bit 的開關效果是 binary 的——它不是「漸變」，而是把整個字的<strong>解讀</strong>瞬間切換到另一個世界。</p>
+
+  <figure class="vg-w-tagdecode-ocaml">
+    <style>
+      .vg-w-tagdecode-ocaml { display: grid; gap: var(--s-3); }
+      .vg-w-tagdecode-ocaml .row { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); flex-wrap: wrap; }
+      .vg-w-tagdecode-ocaml input[type="range"] { flex: 1; min-width: 180px; accent-color: var(--accent); height: 36px; touch-action: none; }
+      .vg-w-tagdecode-ocaml .lobit { display: flex; gap: var(--s-1); align-items: center; }
+      .vg-w-tagdecode-ocaml .lobit button { font-family: var(--mono); font-size: var(--fs-sm); min-height: 44px; min-width: 44px; border: 1px solid var(--line); background: var(--bg-soft); color: var(--ink); cursor: pointer; }
+      .vg-w-tagdecode-ocaml .lobit button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent-text); background: var(--bg); }
+      .vg-w-tagdecode-ocaml .panel { display: grid; gap: var(--s-1); padding: var(--s-3); background: var(--bg-soft); border-left: 2px solid var(--accent); }
+      .vg-w-tagdecode-ocaml .verdict { font-family: EB Garamond, serif; font-size: 1.6rem; color: var(--ink); }
+      .vg-w-tagdecode-ocaml .verdict em { font-style: italic; color: var(--accent-text); }
+      .vg-w-tagdecode-ocaml .mono { font-family: var(--mono); font-size: var(--fs-sm); color: var(--ink-soft); font-variant-numeric: tabular-nums; word-break: break-all; }
+      .vg-w-tagdecode-ocaml .mono b { color: var(--accent-text); font-weight: 600; }
+      .vg-w-tagdecode-ocaml .note { font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink-soft); }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/><path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+      </svg>
+      <span>drag the value, toggle bit 0 · watch the same word flip between int and pointer</span>
+    </p>
+
+    <div class="row">
+      <label for="vg-w-tagdecode-ocaml-x">payload =</label>
+      <input id="vg-w-tagdecode-ocaml-x" type="range" min="-128" max="128" step="1" value="42" />
+      <span class="lobit" role="group" aria-label="bottom bit">
+        <span>bit 0:</span>
+        <button type="button" data-bit="1" aria-pressed="true">1 = int</button>
+        <button type="button" data-bit="0" aria-pressed="false">0 = ptr</button>
+      </span>
+    </div>
+
+    <div class="panel">
+      <div class="verdict" data-verdict>這個 word 是 <em>immediate int</em></div>
+      <div class="mono" data-bits></div>
+      <div class="mono" data-decode></div>
+      <div class="note" data-note></div>
+    </div>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-tagdecode-ocaml');
+        const slider = root.querySelector('#vg-w-tagdecode-ocaml-x');
+        const btns = root.querySelectorAll('.lobit button');
+        const verdict = root.querySelector('[data-verdict]');
+        const bitsEl = root.querySelector('[data-bits]');
+        const decodeEl = root.querySelector('[data-decode]');
+        const noteEl = root.querySelector('[data-note]');
+        let bit = 1;
+
+        function lowBitsString(payload, b) {
+          // Show the low 8 bits of the encoded word for intuition.
+          const n = payload < 0 ? (256 + (payload % 256)) % 256 : payload % 256;
+          const enc = b === 1 ? ((n << 1) | 1) : (n << 1); // illustrative low-byte view
+          const s = (enc & 0x1ff).toString(2).padStart(9, '0');
+          const body = s.slice(0, -1);
+          const tag = s.slice(-1);
+          return body + '<b>' + tag + '</b>';
+        }
+
+        function render() {
+          const payload = Number(slider.value);
+          if (bit === 1) {
+            verdict.innerHTML = '這個 word 是 <em>immediate int</em>';
+            bitsEl.innerHTML = 'encoded word (low byte): …' + lowBitsString(payload, 1);
+            decodeEl.textContent = 'Long_val(v) = v >> 1  ——>  ' + payload;
+            noteEl.textContent = 'runtime 直接用：算術右移抹掉 tag bit，拿到 63-bit 有號整數。不進 heap、不被 GC 掃描、deref 它是型別錯誤。';
+          } else {
+            verdict.innerHTML = '這個 word 是 <em>pointer</em>';
+            bitsEl.innerHTML = 'encoded word (low byte): …' + lowBitsString(payload, 0);
+            decodeEl.textContent = 'Field(v, i) = ((value*)v)[i]  ——>  deref 無需解碼';
+            noteEl.textContent = 'runtime 直接 deref：bit 0 = 0 保證是對齊地址，往前一個 word 是 header。Rust 這裡只能 *mut usize + unsafe——型別系統無法靜態保證這個 word 真的是合法指標。';
+          }
+        }
+
+        slider.addEventListener('input', render);
+        btns.forEach((b) => b.addEventListener('click', () => {
+          bit = Number(b.dataset.bit);
+          btns.forEach((x) => x.setAttribute('aria-pressed', String(Number(x.dataset.bit) === bit)));
+          render();
+        }));
+        render();
+      })();
+    </script>
+    <figcaption>同一個數值，bit 0 一翻，runtime 對它的處置完全不同——這也是為什麼 Rust 無法用 enum 對應：tag 不是 discriminant field，而是值本身的最低位。low-byte 的 bit 顯示僅作直覺示意（terracotta 那一位是 tag bit）。</figcaption>
+  </figure>
+
+  <p>關鍵不在算術——<code>n &lt;&lt; 1 | 1</code> 翻成 Rust 毫無困難。關鍵在<strong>判別之後</strong>：一旦 runtime 認定某個 word 是 pointer，它要做的所有事都越過 Rust 的安全邊界。它把這個 <code>usize</code> cast 成 <code>*mut usize</code>，往前讀 header（在任何 Rust allocation 之外），往後索引 field，而且這些指標還會在 GC 期間被搬走、改寫。作者因此給出那句結論：「It's actually merely as hard as the C version if you use <code>unsafe</code>。」逐行翻譯的意義在這裡浮現——你不是在跟 Rust 的型別系統協商一個安全抽象，你是在用 <code>unsafe</code> 把 C 的記憶體模型原封不動搬過來，讓 diff 能對得上 upstream。</p>
+
+  <p>這裡值得停下來區分兩種「用 Rust 寫 runtime」的路線，因為它們的目標完全相反。一條是<strong>idiomatic 重寫</strong>：重新設計值表示、用 enum 或 <code>NonNull</code> wrapper 把 tag 變成型別系統認得的 discriminant、把 GC 包進一個 safe 的抽象（像 <code>gc-arena</code> 那種 crate 的做法），結果是一份 Rust 程式設計師會點頭的程式碼，但跟 OCaml 的 C runtime 已經沒有逐行對應關係。另一條是 <code>rustcaml</code> 選的<strong>transliteration</strong>：value 就是 <code>usize</code>、<code>Field</code> 就是 <code>unsafe fn</code>、巨集就是 <code>#[inline]</code> 的 <code>unsafe fn</code>，連 C 的變數命名與註解都盡量保留。重寫路線追求的是「更安全、更 Rust」，transliteration 路線追求的是「能跟 upstream 同步、能 bisect、能用既有 test suite 當 oracle」。兩條路線沒有對錯，只是回答不同的問題——而這篇講的這份移植，從第一行就明確選了後者。</p>
+
+  <p>選擇 transliteration 還有一個常被忽略的副作用：bug 的形狀也一起被保留了。如果 upstream C runtime 有一個靠 UB 僥倖跑對的角落（例如 strict-aliasing 邊緣、signed overflow），逐行翻過來的 Rust 會把同一個僥倖也帶過來，而不是「因為 Rust 比較嚴格所以順手修掉」。這既是缺點（你沒有趁機消滅 bug）也是優點（你沒有引入新的行為差異）——對「跟 C trunk byte-identical」這個驗收標準而言，後者才是要的：任何行為偏移都會在 fixpoint test 裡現形。</p>
+
+  <h2>GC 是 borrow checker 的天敵——拖著一個值穿過 collection</h2>
+
+  <p>真正讓「safe Rust runtime」這個想法破產的是 GC 本身。作者講得很白：「The runtime is the GC. It mutates and moves live pointers during collection。」OCaml 用的是 generational、moving collector：minor heap 滿了觸發 minor collection，存活的物件被<strong>複製</strong>到 major heap，原地址作廢，所有指向它的指標都要被改寫成新地址。這是一個會「搬動別人正持有的記憶體、並偷偷改寫指向它的所有指標」的操作——borrow checker 的整個存在意義就是禁止這種事。</p>
+
+  <p>下面把一個值放在 minor heap，拖著它穿過一次 collection。看它被複製到 major heap 後，原本指向它的 root（暫存器、stack、其他 block 的 field）如何被 runtime 逐一改寫成新地址。在 Rust 裡這意味著：你手上同時有「對舊位置的 raw pointer」「對新位置的 raw pointer」「以及一堆需要被原地改寫的、別處持有的指標」——沒有任何 borrow 規則能描述這個狀態。</p>
+
+  <figure class="vg-w-gc-ocaml" data-svg-scroll="880">
+    <style>
+      .vg-w-gc-ocaml { display: grid; gap: var(--s-2); }
+      .vg-w-gc-ocaml svg { width: 100%; height: auto; max-width: 880px; touch-action: none; }
+      .vg-w-gc-ocaml .zone { font-family: IM Fell English, serif; font-style: italic; font-size: 13px; }
+      .vg-w-gc-ocaml .lbl { font-family: JetBrains Mono, monospace; font-size: 11px; }
+      .vg-w-gc-ocaml .cap { font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink-soft); }
+      .vg-w-gc-ocaml .stage { font-family: var(--sans); font-size: var(--fs-sm); color: var(--accent-text); text-transform: uppercase; letter-spacing: 0.05em; }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M5 9h14"/><path d="m9 5-4 4 4 4"/><path d="M19 15H5"/><path d="m15 11 4 4-4 4"/>
+      </svg>
+      <span>drag the live object from minor heap into major heap · watch every pointer to it get rewritten · 1 moving collection</span>
+    </p>
+
+    <svg viewBox="0 0 880 360" role="img"
+         aria-label="把一個活物件從 minor heap 拖到 major heap 的 moving collection：原地址作廢，三個 root 的指標被改寫成新地址">
+      <!-- Minor heap zone -->
+      <rect x="40" y="60" width="360" height="240" fill="none" stroke="var(--muted-2)" stroke-width="1.5" stroke-dasharray="4,4" />
+      <text x="220" y="50" text-anchor="middle" fill="var(--muted)" class="zone">minor heap (nursery)</text>
+      <!-- Major heap zone -->
+      <rect x="480" y="60" width="360" height="240" fill="none" stroke="var(--sage-deep)" stroke-width="1.5" />
+      <text x="660" y="50" text-anchor="middle" fill="var(--sage-deep)" class="zone">major heap</text>
+
+      <!-- Roots column -->
+      <text x="40" y="330" fill="var(--muted)" class="lbl">roots: register · stack slot · other-block field[2]</text>
+
+      <!-- Root nodes (fixed) -->
+      <circle cx="90" cy="120" r="8" fill="var(--ink-deep)" />
+      <text x="90" y="105" text-anchor="middle" fill="var(--muted)" class="lbl">reg</text>
+      <circle cx="90" cy="190" r="8" fill="var(--ink-deep)" />
+      <text x="90" y="175" text-anchor="middle" fill="var(--muted)" class="lbl">stack</text>
+      <circle cx="90" cy="260" r="8" fill="var(--ink-deep)" />
+      <text x="90" y="245" text-anchor="middle" fill="var(--muted)" class="lbl">field[2]</text>
+
+      <!-- old slot (ghost) -->
+      <rect id="vg-w-gc-ocaml-old" x="230" y="160" width="80" height="40" fill="var(--muted-2)" fill-opacity="0.15" stroke="var(--muted-2)" stroke-width="1.5" stroke-dasharray="3,3" />
+      <text x="270" y="185" text-anchor="middle" fill="var(--muted)" class="lbl">old addr</text>
+
+      <!-- new slot target (ghost) -->
+      <rect x="600" y="160" width="80" height="40" fill="var(--sage-deep)" fill-opacity="0.1" stroke="var(--sage-deep)" stroke-width="1.5" stroke-dasharray="3,3" />
+      <text x="640" y="220" text-anchor="middle" fill="var(--sage-deep)" class="lbl">copy target</text>
+
+      <!-- pointer lines from roots to the live object -->
+      <line id="vg-w-gc-ocaml-l1" x1="98" y1="120" x2="230" y2="172" stroke="var(--accent)" stroke-width="1.5" />
+      <line id="vg-w-gc-ocaml-l2" x1="98" y1="190" x2="230" y2="180" stroke="var(--accent)" stroke-width="1.5" />
+      <line id="vg-w-gc-ocaml-l3" x1="98" y1="260" x2="230" y2="190" stroke="var(--accent)" stroke-width="1.5" />
+
+      <!-- the live object (draggable) -->
+      <rect id="vg-w-gc-ocaml-obj" x="230" y="160" width="80" height="40" fill="var(--accent)" fill-opacity="0.3" stroke="var(--accent)" stroke-width="2" cursor="grab" role="img" aria-label="live object, drag me" />
+      <text id="vg-w-gc-ocaml-objt" x="270" y="185" text-anchor="middle" fill="var(--ink)" class="lbl" pointer-events="none">live obj</text>
+
+      <text x="440" y="340" text-anchor="middle" fill="var(--muted)" class="cap" id="vg-w-gc-ocaml-cap">拖動方塊：越過中線進入 major heap，三個 root 的指標即時改寫</text>
+      <text x="780" y="330" text-anchor="end" fill="var(--accent-text)" class="stage" id="vg-w-gc-ocaml-stage">before collection</text>
+    </svg>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-gc-ocaml');
+        const svg = root.querySelector('svg');
+        const obj = root.querySelector('#vg-w-gc-ocaml-obj');
+        const objt = root.querySelector('#vg-w-gc-ocaml-objt');
+        const old = root.querySelector('#vg-w-gc-ocaml-old');
+        const l1 = root.querySelector('#vg-w-gc-ocaml-l1');
+        const l2 = root.querySelector('#vg-w-gc-ocaml-l2');
+        const l3 = root.querySelector('#vg-w-gc-ocaml-l3');
+        const cap = root.querySelector('#vg-w-gc-ocaml-cap');
+        const stage = root.querySelector('#vg-w-gc-ocaml-stage');
+        const W = 80, H = 40;
+        const X_MIN = 90, X_MAX = 700, Y_MIN = 80, Y_MAX = 260;
+        let dragging = false;
+
+        function clientToSvg(clientX, clientY) {
+          const pt = svg.createSVGPoint();
+          pt.x = clientX; pt.y = clientY;
+          const p = pt.matrixTransform(svg.getScreenCTM().inverse());
+          return p;
+        }
+        function moveTo(cx, cy) {
+          const x = Math.max(X_MIN, Math.min(X_MAX, cx - W / 2));
+          const y = Math.max(Y_MIN, Math.min(Y_MAX, cy - H / 2));
+          obj.setAttribute('x', x);
+          obj.setAttribute('y', y);
+          objt.setAttribute('x', x + W / 2);
+          objt.setAttribute('y', y + H / 2 + 5);
+          // anchor point the roots aim at = left-center of the object
+          const ax = x, ay = y + H / 2;
+          l1.setAttribute('x2', ax); l1.setAttribute('y2', ay - 6);
+          l2.setAttribute('x2', ax); l2.setAttribute('y2', ay);
+          l3.setAttribute('x2', ax); l3.setAttribute('y2', ay + 6);
+          const moved = x > 440;
+          old.setAttribute('opacity', moved ? '1' : '0');
+          stage.textContent = moved ? 'after: pointers rewritten' : 'before collection';
+          [l1, l2, l3].forEach((l) => l.setAttribute('stroke', moved ? 'var(--sage-deep)' : 'var(--accent)'));
+          cap.textContent = moved
+            ? 'object 已複製到 major heap：old addr 變灰（作廢），三個 root 的指標全部 rewrite 成新地址——這正是 borrow checker 禁止的「搬動他人持有的記憶體」'
+            : '拖動方塊：越過中線進入 major heap，三個 root 的指標即時改寫';
+        }
+        obj.addEventListener('pointerdown', (e) => {
+          dragging = true; obj.setPointerCapture(e.pointerId); obj.setAttribute('cursor', 'grabbing');
+        });
+        obj.addEventListener('pointermove', (e) => {
+          if (!dragging) return;
+          const p = clientToSvg(e.clientX, e.clientY);
+          moveTo(p.x, p.y);
+        });
+        obj.addEventListener('pointerup', (e) => {
+          dragging = false; obj.setAttribute('cursor', 'grab');
+        });
+        obj.addEventListener('keydown', (e) => {
+          const cur = Number(obj.getAttribute('x'));
+          if (e.key === 'ArrowRight') { e.preventDefault(); moveTo(cur + 40 + W / 2, Number(obj.getAttribute('y')) + H / 2); }
+          if (e.key === 'ArrowLeft') { e.preventDefault(); moveTo(cur - 40 + W / 2, Number(obj.getAttribute('y')) + H / 2); }
+        });
+        obj.setAttribute('tabindex', '0');
+      })();
+    </script>
+    <figcaption>moving collector 的核心動作：複製存活物件、作廢舊地址、改寫所有指向它的指標。OCaml 的 minor collection 用的就是這個 copy 策略；major heap 是 incremental mark-sweep。任何「一個物件被多個 root 指向、而且這些指標要被同步改寫」的形狀，都不可能用 Rust 的所有權與借用規則表達。</figcaption>
+  </figure>
+
+  <p>這也解釋了為什麼那 2015 個 unsafe block 不是工程缺陷，而是<strong>問題的本質</strong>。GC 的活動——複製、改寫指標、就地改 header 的 color bit——全都是「在多個別名指標之間移動資料」，這正是 Rust 用 <code>&amp;mut</code> 的獨佔性所禁止的。Rust 的借用模型核心是「同一時間，要嘛多個 <code>&amp;</code>、要嘛恰好一個 <code>&amp;mut</code>」；而 GC 在 collection 期間恰恰握著一個物件的多個別名（root、其他 block 的 field、它自己的 forwarding pointer），還要對它們全部寫入。沒有任何 lifetime 標註能描述「這些別名暫時失效、值被搬到別處、然後所有別名被改寫指向新位置」。這不是「Rust 太囉嗦」，而是 Rust 的安全保證跟 moving GC 的語意在定義上互斥。</p>
+
+  <p>多核版的 GC 機制更把這點推到極限。OCaml 的並行 runtime 需要 lock-free 的資料結構來協調多個 domain 的 minor collection 與 major heap 共享；作者特別提到 lock-free 的部分用 skip-list 而非 tree 實作，理由是「The concurrent, lock-free part is actually doable with a skip-list in a way that would be extremely hard if it was a tree」。skip-list 的 lock-free insert 只需要在少數幾個 forward pointer 上做 CAS，不像平衡樹要處理 rotation 跨多節點的原子性；這個選擇在 C 裡就成立，翻成 Rust 時也照抄——但它依賴的 <code>AtomicPtr</code> + 裸指標 traversal 同樣全程 unsafe，因為節點之間的 aliasing 是 lock-free 演算法的前提。Rust 著名的「learning Rust with too many linked lists」教材講的就是這種痛：連單向 linked list 在 safe Rust 裡都要 <code>Rc&lt;RefCell&lt;…&gt;&gt;</code> 繞一大圈，何況是 lock-free skip-list。結論還是那句：「merely as hard as the C version if you use unsafe」。Rust 沒有讓 GC 變安全，它只是讓你能把 C 的 GC 一行一行抄過來，並且——這是逐行翻譯真正的回報——讓抄過來的結果能跟 upstream 的 C 做 diff。</p>
+
+  <p>還有一個容易被忽略的約束：runtime 必須講 <strong>C ABI</strong>。OCaml 編譯器產出的 native code、以及所有用 C stub 寫的 binding，都假設 runtime 的函式遵循 C 的呼叫慣例與 symbol naming。作者點出 Rust 沒有自己的 stable FFI——<code>extern "C"</code> 是唯一能跟外界對接的方式。這意味著 runtime 的對外介面全部要標 <code>#[no_mangle] extern "C"</code>，參數與回傳值的記憶體佈局要跟 C 那邊位元對齊，任何 Rust 的 niche optimization（例如把 <code>Option&lt;NonNull&gt;</code> 壓成一個指標寬度）都不能用在跨 ABI 邊界的型別上。這層 ABI 約束加上 GC 的別名需求，等於從兩端把「safe Rust」的可能性夾死。</p>
+
+  <h2>那些 stable Rust 根本沒有的 C 慣用法</h2>
+
+  <p>除了 GC 與值表示，runtime 還大量用 C 的非標準慣用法——其中好幾個 stable Rust 沒有對應物，只能用 inline assembly 補。下面這張對照表把主要的幾個列出來：每一個都是「C 有、Rust（stable）沒有」的 gap，以及移植採用的補法。</p>
+
+  <figure class="vg-w-cmap-ocaml" data-svg-scroll="880">
+    <style>
+      .vg-w-cmap-ocaml svg { width: 100%; height: auto; max-width: 880px; }
+      .vg-w-cmap-ocaml .h { font-family: IM Fell English, serif; font-style: italic; font-size: 13px; }
+      .vg-w-cmap-ocaml .c { font-family: JetBrains Mono, monospace; font-size: 12px; }
+      .vg-w-cmap-ocaml .r { font-family: JetBrains Mono, monospace; font-size: 12px; }
+      .vg-w-cmap-ocaml .note { font-family: IM Fell English, serif; font-style: italic; font-size: 11px; fill: var(--muted); }
+      .vg-w-cmap-ocaml .col { font-family: var(--sans); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }
+    </style>
+    <svg viewBox="0 0 880 380" role="img"
+         aria-label="C runtime 慣用法到 Rust 的對照：computed goto、thread-local storage、setjmp/longjmp、static 交叉引用、variadic function">
+      <text x="440" y="24" text-anchor="middle" fill="var(--ink)" class="h">C 慣用法 ——&gt; stable Rust 沒有 ——&gt; 補法</text>
+
+      <text x="40" y="58" fill="var(--muted)" class="col">C idiom</text>
+      <text x="340" y="58" fill="var(--muted)" class="col">gap in stable Rust</text>
+      <text x="640" y="58" fill="var(--muted)" class="col">workaround</text>
+      <line x1="40" y1="68" x2="840" y2="68" stroke="var(--muted-2)" stroke-width="0.8" />
+
+      <!-- Row 1 computed goto -->
+      <text x="40" y="98" fill="var(--accent-text)" class="c">computed goto</text>
+      <text x="340" y="98" fill="var(--ink)" class="r">no &amp;&amp;label / goto *p</text>
+      <text x="640" y="98" fill="var(--sage-deep)" class="r">loop { match … }（stable）</text>
+      <text x="640" y="114" fill="var(--sage-deep)" class="r">become（nightly）</text>
+      <text x="40" y="118" fill="var(--muted)" class="note">bytecode dispatch 的 threaded loop，幫 CPU branch predictor</text>
+      <line x1="40" y1="130" x2="840" y2="130" stroke="var(--line)" stroke-width="0.6" />
+
+      <!-- Row 2 TLS -->
+      <text x="40" y="158" fill="var(--accent-text)" class="c">thread-local storage</text>
+      <text x="340" y="158" fill="var(--ink)" class="r">no_std 下無 stdlib TLS</text>
+      <text x="640" y="158" fill="var(--sage-deep)" class="r">inline asm 直接讀 TLS slot</text>
+      <text x="40" y="178" fill="var(--muted)" class="note">domain-local state、caml_state 等 per-thread 指標</text>
+      <line x1="40" y1="190" x2="840" y2="190" stroke="var(--line)" stroke-width="0.6" />
+
+      <!-- Row 3 setjmp/longjmp -->
+      <text x="40" y="218" fill="var(--accent-text)" class="c">setjmp / longjmp</text>
+      <text x="340" y="218" fill="var(--ink)" class="r">no returns_twice control</text>
+      <text x="640" y="218" fill="var(--sage-deep)" class="r">inline asm 版本，手動審計</text>
+      <text x="40" y="238" fill="var(--muted)" class="note">exception unwinding 的非區域跳轉</text>
+      <line x1="40" y1="250" x2="840" y2="250" stroke="var(--line)" stroke-width="0.6" />
+
+      <!-- Row 4 static cross-ref -->
+      <text x="40" y="278" fill="var(--accent-text)" class="c">static cross-reference</text>
+      <text x="340" y="278" fill="var(--ink)" class="r">const eval 不夠</text>
+      <text x="640" y="278" fill="var(--sage-deep)" class="r">.weak symbol（inline asm）</text>
+      <text x="40" y="298" fill="var(--muted)" class="note">跨 translation unit 的 symbol 引用</text>
+      <line x1="40" y1="310" x2="840" y2="310" stroke="var(--line)" stroke-width="0.6" />
+
+      <!-- Row 5 variadic + C ABI -->
+      <text x="40" y="338" fill="var(--accent-text)" class="c">variadic / C ABI</text>
+      <text x="340" y="338" fill="var(--ink)" class="r">no stable Rust FFI</text>
+      <text x="640" y="338" fill="var(--sage-deep)" class="r">extern "C" + inline asm</text>
+      <text x="40" y="358" fill="var(--muted)" class="note">runtime 必須講 C ABI 才能跟編出來的程式碼互通</text>
+    </svg>
+    <figcaption>五個 C 慣用法的 Rust 對照。computed goto 是最有意思的一個——它讓 bytecode interpreter 的 dispatch jump 對 CPU branch predictor 可預測；stable Rust 只能退回 <code>loop { match … }</code>，nightly 才有 <code>become</code>（explicit tail call）重建 threaded dispatch。其餘四個都得跌進 inline assembly。</figcaption>
+  </figure>
+
+  <p>computed goto 值得多講一句，因為它直接決定了那個 bytecode 慢 1.44x 的數字。OCaml 的 bytecode interpreter 用 computed goto 把「執行完一個 opcode 後跳到下一個 opcode 的 handler」變成一個對 branch predictor 友善的 indirect jump。重點在於 branch predictor 怎麼學：在 threaded code 裡，每個 opcode handler 末尾<strong>各有自己的</strong> indirect jump，predictor 因此能對「<code>OP_PUSH</code> 之後常接 <code>OP_ADD</code>」這種 opcode pair 建立 per-site 的歷史。一旦退回單一 <code>loop { match }</code>，所有 dispatch 收斂到同一個 switch jump，predictor 只看到一個高度多態的跳點，命中率塌下來。stable Rust 沒有 <code>&amp;&amp;label</code> 也沒有 <code>goto *p</code>，只能用 <code>loop { match opcode { … } }</code>；Rust nightly 的 <code>become</code>（explicit tail call）讓每個 opcode handler 尾呼叫下一個，把 dispatch 分散回各 handler，重建了 threaded dispatch，這就是為什麼 nightly 的 bytecode 反而比 C 快 5%。</p>
+
+  <p>這個現象不是 OCaml 獨有。CPython 最近也踩過同一個坑——它的 tail-call interpreter 一度被宣傳為純贏的優化，後來 nelhage 的分析指出那其實大部分是<strong>補回</strong>了之前因為某個 LLVM 版本的迴歸而失去的 computed-goto 效益，而非憑空的新增益。把這兩件事擺在一起看，結論很清楚：interpreter 的效能瓶頸常常不在「指令做什麼」，而在「dispatch 怎麼跳」——而 dispatch 形狀又被你用的語言能不能表達 threaded code 決定。<code>rustcaml</code> 的 stable/nightly 落差因此成了一個乾淨的對照實驗：同一份翻譯、唯一變數是 dispatch 能不能 tail-call，慢的那 44% 就精準歸因到 computed goto 的缺席。</p>
+
+  <pre data-kind="pseudocode"><code><em>// C：computed goto——dispatch 是分散的 indirect jump，predictor 友善</em>
+static void *table[] = { &amp;&amp;OP_ADD, &amp;&amp;OP_PUSH, ... };
+goto *table[*pc++];
+OP_ADD:  /* ... */  goto *table[*pc++];
+OP_PUSH: /* ... */  goto *table[*pc++];
+
+<em>// Rust stable：loop + match——dispatch 收斂成一個集中 branch</em>
+loop {
+    match bytecode[pc] {
+        OP_ADD  =&gt; { /* ... */ }
+        OP_PUSH =&gt; { /* ... */ }
+    }
+    pc += 1;
+}
+
+<em>// Rust nightly：become（explicit tail call）——重建 threaded dispatch</em>
+fn op_add(st: &amp;mut St) { /* ... */ become dispatch(st); }
+fn op_push(st: &amp;mut St) { /* ... */ become dispatch(st); }</code></pre>
+
+  <h2>逐行翻譯換來什麼——以及實測落在哪</h2>
+
+  <p>把這些拼起來就看得出「逐行」這個約束的回報結構。它<strong>不</strong>換來安全——作者反覆強調這份 Rust 比 C 略不安全。它換來的是兩件事：第一，<strong>可 diff 性</strong>。因為每個 <code>.rs</code> 檔對應一個 <code>.c</code> 檔、語意一一對應，upstream OCaml 改了 runtime 的某一行，你能在對應的 Rust 檔找到該改的那一行——這讓「跟上 4.14 之後的 bugfix」成為可能，而一份 idiomatic 重寫做不到（重寫之後 upstream 的 diff 無處安放）。第二，<strong>漸進信心</strong>。per-file toggle + 每檔一個 commit + 每檔跑完整 test suite，意味著任何時刻你都有一個可運作的混合 build，迴歸能 bisect 到單一檔案。</p>
+
+  <p>驗證的嚴謹程度值得記下：未改動的官方 compiler test suite、fixpoint test（compiler 編譯自己兩次、兩份 binary 必須 byte-identical）、Sandmark benchmark 的 A/B、TSan（thread sanitizer）、以及一整個 opam switch build 加社群套件（iter、gen、dune、digestif 等）。下表是實測——點欄位標題排序。native 落在 C trunk 的 0.865x–1.131x 之間（作者形容「eh, just about parity, kinda」），bytecode 在 stable 慢 1.44x，但 nightly 用了 explicit tail call 之後反而快 5%。</p>
+
+  <figure class="vg-w-bench-ocaml">
+    <style>
+      .vg-w-bench-ocaml table { width: 100%; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-bench-ocaml { overflow-x: auto; }
+      .vg-w-bench-ocaml table { min-width: 480px; }
+      .vg-w-bench-ocaml thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; }
+      .vg-w-bench-ocaml thead th[data-sort] { color: var(--accent-text); }
+      .vg-w-bench-ocaml thead th[data-sort="asc"]::after { content: ' ▴'; font-size: 0.7em; }
+      .vg-w-bench-ocaml thead th[data-sort="desc"]::after { content: ' ▾'; font-size: 0.7em; }
+      .vg-w-bench-ocaml tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); }
+      .vg-w-bench-ocaml td.num { font-variant-numeric: tabular-nums; text-align: right; font-family: JetBrains Mono, monospace; }
+      .vg-w-bench-ocaml td.cfg { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+      .vg-w-bench-ocaml td.win { font-family: JetBrains Mono, monospace; font-variant-numeric: tabular-nums; text-align: right; }
+      .vg-w-bench-ocaml td.win.fast { color: var(--sage-deep); }
+      .vg-w-bench-ocaml td.win.slow { color: var(--accent-text); }
+      .vg-w-bench-ocaml tbody tr:hover td { background: var(--bg-soft); }
+      .vg-w-bench-ocaml caption { text-align: left; caption-side: top; font-family: var(--scribed); font-style: italic; color: var(--muted); font-size: var(--fs-sm); padding: var(--s-1) 0; }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/><path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+      </svg>
+      <span>click a column header to sort · 4 configs × wall-clock vs C trunk</span>
+    </p>
+    <table>
+      <caption>rustcaml 相對 C trunk 的 wall-clock 落點（值 = Rust 時間 ÷ C trunk 時間；&lt;1 較快、&gt;1 較慢）。數字取自作者公布的 Sandmark 範圍。點欄位標題排序。</caption>
+      <thead>
+        <tr>
+          <th data-key="cfg">配置</th>
+          <th data-key="mode">模式</th>
+          <th data-key="best" class="num">best</th>
+          <th data-key="worst" class="num">worst</th>
+          <th data-key="rep" class="num">代表值 (×C)</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td class="cfg">Rust stable</td><td>native</td><td class="num">0.865</td><td class="num">1.131</td><td class="win slow" data-rep="1.05">1.05×</td></tr>
+        <tr><td class="cfg">Rust stable</td><td>bytecode</td><td class="num">0.791</td><td class="num">1.810</td><td class="win slow" data-rep="1.44">1.44×</td></tr>
+        <tr><td class="cfg">Rust nightly + ETC</td><td>native</td><td class="num">0.95</td><td class="num">1.05</td><td class="win slow" data-rep="1.00">1.00×</td></tr>
+        <tr><td class="cfg">Rust nightly + ETC</td><td>bytecode</td><td class="num">0.91</td><td class="num">0.91</td><td class="win fast" data-rep="0.91">0.91×</td></tr>
+      </tbody>
+    </table>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-bench-ocaml');
+        const headers = root.querySelectorAll('thead th');
+        const tbody = root.querySelector('tbody');
+        let activeKey = null, asc = true;
+        headers.forEach((h, idx) => h.addEventListener('click', () => {
+          const key = h.dataset.key;
+          if (activeKey === key) asc = !asc; else { activeKey = key; asc = true; }
+          headers.forEach((x) => x.removeAttribute('data-sort'));
+          h.setAttribute('data-sort', asc ? 'asc' : 'desc');
+          const rows = Array.from(tbody.querySelectorAll('tr'));
+          rows.sort((a, b) => {
+            let av, bv;
+            if (key === 'rep') {
+              av = Number(a.children[idx].getAttribute('data-rep'));
+              bv = Number(b.children[idx].getAttribute('data-rep'));
+            } else {
+              av = a.children[idx].textContent.trim();
+              bv = b.children[idx].textContent.trim();
+              const an = Number(av), bn = Number(bv);
+              if (!Number.isNaN(an) && !Number.isNaN(bn)) { av = an; bv = bn; }
+            }
+            const cmp = av < bv ? -1 : av > bv ? 1 : 0;
+            return asc ? cmp : -cmp;
+          });
+          rows.forEach((r) => tbody.appendChild(r));
+        }));
+      })();
+    </script>
+  </figure>
+
+  <p>幾個落點值得讀進去。native 的 stable 配置代表值約 1.05x，最壞 1.131x、最好甚至比 C 快（0.865x）——native code 本來就由 OCaml 編譯器產出，runtime 只是被呼叫的 support code，所以翻譯成 Rust 的影響有限。bytecode 是另一回事：interpreter 的 hot loop 直接被 computed-goto 的缺席拖累，stable 慢 1.44x，worst case 到 1.810x。nightly 用 <code>become</code> 重建 threaded dispatch 後，bytecode 反而 0.91x（快 5%）——這個反轉精確印證了「慢的原因是 dispatch 形狀，不是 Rust 本身」。值得提醒讀者：這份移植鎖定 OCaml 4.14，因為 5.x 的 runtime 為了 shared-memory 平行而整個重寫了 GC，逐行對照的基準會完全不同。</p>
+
+  <p>fixpoint test 特別值得理解它為什麼是個強 oracle。OCaml 編譯器是 self-hosting 的——它能拿自己編譯自己。fixpoint 的意思是：用 stage-1 編譯器編出 stage-2 編譯器，再用 stage-2 編出 stage-3；如果 runtime 的行為完全正確，stage-2 與 stage-3 的 binary 必須 byte-for-byte 相同。任何 runtime 的細微行為偏移——某個 hash 順序變了、某個 float 的捨入差一個 ulp、GC 觸發時機改變導致 finalizer 順序不同——都可能讓兩份 binary 出現差異，當場暴露。對「忠實翻譯」這個目標來說，這比任何單元測試都嚴格：它驗的不是「功能對不對」，而是「行為跟 C 一模一樣」。再配合 Sandmark 的 A/B 效能比對、TSan 抓 data race、以及一整個 opam switch 加 iter／gen／dune／digestif 等社群套件的實際 build，整個驗證面覆蓋了「正確性、行為一致性、效能、並行安全、生態相容」五個維度。</p>
+
+  <p>還有一個 meta 層面的觀察。整份移植是配合 Claude Opus 4.7／4.8 與 Claude Code 在約七天內完成的——這恰好是「逐行翻譯」這種任務的甜蜜點：規則機械、語意對應明確、每一步都有 test suite 當 oracle。它不是創造性的架構設計，而是高度結構化的 transliteration，正適合用 LLM 把人從 40,000 行的機械搬運裡解放出來。值得注意的是 per-file toggle 跟 LLM 工作流是互補的：每翻一檔就有一個明確的、可機器驗證的 stopping point，模型不需要一次抓住整個 runtime 的全局狀態，只要對著一個 <code>.c</code> 檔產出語意等價的 <code>.rs</code>、然後讓 test suite 判生死。OCaml 上游甚至為此類貢獻寫了 <code>AI.md</code> 政策——這場移植在工具與題型的契合度上，本身就是一個值得記下的案例。</p>
+
+  <p class="vg-deep-closer"><strong>What this enables</strong>：一份能跟 upstream C 做逐行 diff、用 unsafe 忠實保留 GC 與值表示的 Rust runtime——它不讓 OCaml 變安全，但讓「在 Rust 工具鏈裡持續維護一個 C runtime 的翻本」第一次變得 tractable，並順手量出 bytecode 慢的真正原因是 computed-goto 的缺席，而非 Rust。</p>
+</div>
