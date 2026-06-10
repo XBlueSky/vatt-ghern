@@ -1,0 +1,566 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">2010 年 Robert Haas 在 pgsql-performance 上寫下「We want hints, or at least many of us do. We just want them to actually work, and to not suck.」十五年後，Postgres 19 給的答案不是把 hint 塞進 SQL 註解裡，而是兩個叫 pg_plan_advice 與 pg_stash_advice 的 contrib 模組——advice 從 SQL 外面約束 planner，連寫進 query 都不必。</p>
+  <h1 class="vg-post-title">Postgres 終於要做 query hint——pg_plan_advice 怎麼回應十五年的六條反對</h1>
+</header>
+
+<div class="vg-post-prose">
+
+<p><span class="vg-dropcap">讀</span>完這篇你會知道：Postgres 擋了十五年的不是「讓人控制執行計畫」這個需求，而是「把控制寫成 SQL 註解」這個形式。pg_plan_advice 把需求與形式拆開——你仍可強迫 planner 用某個 index、join 順序、join 方法，但 advice 是一條獨立字串，掛在 GUC 或共享記憶體，query 一字不改。下面從 planner 為什麼 cost-based 講起，走過 advice 語法、六大反對如何被回應，最後落到「該不該開」。</p>
+
+<h2>一條查詢，planner 選錯了 join 順序——這是每個 DBA 都認得的場景</h2>
+
+<p>場景擺出來：你有一張大的 fact table <code>f</code>、兩張小的 dimension table <code>d1</code>、<code>d2</code>，寫了一條三表 join。EXPLAIN 出來，planner 先把 <code>f</code> 跟 <code>d2</code> 做 hash join、再 join <code>d1</code>，且對 <code>f</code> 走 sequential scan——一個上百萬列的全表掃描，外加兩層 hash：</p>
+
+<pre data-kind="output"><code>EXPLAIN SELECT ... FROM f JOIN d1 USING (dim_id) JOIN d2 USING (dim2_id) WHERE ...;
+
+ Hash Join  (cost=... rows=...)
+   -&gt;  Hash Join  (cost=... rows=...)
+         -&gt;  Seq Scan on f      <em>// ← 全表掃描上百萬列</em>
+         -&gt;  Hash
+               -&gt;  Seq Scan on d2
+   -&gt;  Hash
+         -&gt;  Seq Scan on d1</code></pre>
+
+<p>你心裡那個對的計畫，是先用 <code>d1</code> 的條件縮小範圍、對 <code>f</code> 上的 <code>idx_fact_dim_id</code> 走 index 變成 nested loop——掃的是幾百列。執行時間差兩三個數量級，但 cost 帳本上前者反而便宜，因為它的 row estimate 偏掉一個數量級。關鍵的不對稱在這：你知道 planner 錯了，是因為你掌握它沒有的領域知識——某個維度高度傾斜、<code>d1</code> 那個 filter 只命中極少數列，這些「資料的語意」不在統計直方圖裡。planner 估 join 成本靠單一 column 的 selectivity，當兩個 column 有隱性相關（如「城市」與「郵遞區號」）它假設獨立、把 selectivity 相乘，估出的列數小好幾個數量級。這不是 bug：cost model 算得完全正確，只是看不到那層相關性——你要做的是把你知道、它不知道的那點資訊餵回去。</p>
+
+<p>過去十五年，面對這個場景使用者只有一堆「曲線救國」的 workaround。官方從不承認它們是 hint，但每一個都是在偷偷告訴 planner「別這樣做」。最常見的三招全是「借語意副作用達成計畫控制」的變體：</p>
+
+<ul>
+<li><code>SET enable_seqscan = off</code>——給 sequential scan 加上天文數字的懲罰逼 planner 找 index。問題是它 session 全域，這條 query 想用 index、另一條小表卻該 seqscan，一刀切兩邊都受影響。</li>
+<li><code>OFFSET 0</code>——加在子查詢後阻止 flatten，形成 optimization fence；能間接固定 join 邊界，但是副作用不是意圖。</li>
+<li>把 CTE 物化（pre-12 <code>WITH</code> 預設就是 fence，12 之後要寫 <code>MATERIALIZED</code>）——同樣借語意副作用達成計畫控制。</li>
+</ul>
+
+<p>這三招都不直接表達意圖：你想說「對 <code>f</code> 走 <code>idx_fact_dim_id</code>」，寫出來的卻是「關掉整個 session 的 seqscan」。Kevin Grittner 在 2010 那場辯論裡點破這個悖論：連最反對 hint 的人，都在用 <code>enable_seqscan</code> 這類開關偷偷強迫 index scan——這些其實就是「用別的名字偽裝的 hint」。需求一直都在、也一直被滿足，只是用最糟的形式。pg_plan_advice 的出發點不是「要不要給控制權」，而是「既然控制權早就在行使，能不能給它一個正派的表達形式」。</p>
+
+<h2>為什麼 Postgres 擋了十五年——cost-based planner 的立場與那場辯論</h2>
+
+<p>Postgres 的 planner 是 cost-based：列舉可行計畫，用統計估成本，挑最低的。它要做三個正交的決定，advice 的詞彙表正好對應這三個維度——join 順序（N 表的順序隨 N 階乘成長）、每個 join 的方法（nested loop / hash join / merge join）、每張表的讀取方式（sequential scan / index scan / bitmap scan）。</p>
+
+<p>表多時 planner 從動態規劃窮舉切換成 GEQO（基因演算法），本來就不是找全域最優而是在預算內找夠好的，advice 縮小搜尋空間反而讓它更可能找到好計畫；前一節那個列數估錯在三個決定上都可能誤判，advice 讓你在任一維度覆寫它的選擇。這個信念在 95% 以上的 query 上是對的，pg_plan_advice 的挑戰是只服務剩下那 5%、又不鼓勵濫用——答案藏在「最後手段」定位與 graceful fallback：advice 難用到你不會隨手加，加錯了會乾淨退回而非製造災難。在這個信念下，Oracle 那種 <code>/*+ INDEX(t idx) */</code> 被視為越權干預；社群列出六條反對 hint 的理由，pg_plan_advice 的設計就是在逐條拆解：</p>
+
+<ol>
+<li><strong>維護負擔</strong>：hint 散落在成千上萬條 SQL 裡，沒人記得當初為什麼加、何時該移除。</li>
+<li><strong>升級失效</strong>：hint 寫死了某個計畫，下一版 planner 變聰明了，這個 hint 反而擋住更好的計畫。</li>
+<li><strong>掩蓋根因</strong>：加 hint 是治標，真正的問題（統計過期、缺 index、schema 設計）被一條 hint 蓋過去，沒人去修。</li>
+<li><strong>規模化差</strong>：一兩條 hint 還行，幾千條 query 各自帶 hint，整個系統的行為變得無法整體推理。</li>
+<li><strong>optimizer 通常比你聰明</strong>：人類拍腦袋指定的計畫，在資料分布改變後往往比 cost-based 的選擇更糟。</li>
+<li><strong>阻礙 planner 改進</strong>：使用者一旦能 hint，就不再回報 planner 的壞計畫，社群失去改進 optimizer 的訊號。</li>
+</ol>
+
+<p>這六條不是稻草人，每一條在 Oracle / MySQL 都真實發生過：一條十年前加的 <code>/*+ ORDERED */</code> 在資料量長大十倍後變成效能殺手卻沒人敢刪——這就是反對一、二的長相。問題從來不是「反對者太固執」，而是「能不能設計一個形式，得到 hint 的好處又不引入那些病」。2010 年那場 pgsql-performance 討論串把核心立場逐字留了下來：</p>
+
+<blockquote>
+  <p>Robert Haas：「We want hints, or at least many of us do. We just want them to actually work, and to not suck.」</p>
+</blockquote>
+
+<p>重點在「actually work」（不能默默失效）與「not suck」（不引入那六條病）這兩個高標。pg_plan_advice 的每個決定——Disabled 而非默默忽略、約束而非命令、SQL 外而非 SQL 內——都像在逐條滿足這兩個形容詞。</p>
+
+<blockquote>
+  <p>Tom Lane：「I haven't seen a hinting scheme that didn't suck... I don't say there can't be one.」</p>
+</blockquote>
+
+<p>被引用最多的是前半句，但 pg_plan_advice 真正接住的是後半句「我不是說不可能有」：那就做一個不爛的給你看。Josh Berkus 當年也給了一個優先序：遇到 planner 選錯，先調 GUC 參數、再設物件層級 cost 參數、再補統計 metadata 讓 planner 自己估準，hint 只能是窮盡這些後的最後手段。pg_plan_advice 走的正是這條路：advice 是 GUC、不進 SQL、定位成最後手段；你還是該先 <code>ANALYZE</code>、先建 extended statistics，advice 是這些都不夠時才上的工具。</p>
+
+<p>有個漂亮的觀察：六條裡有四條（維護負擔、升級失效、規模化差、阻礙改進）的根源都是「hint 嵌在 SQL 裡」，把 advice 移到 SQL 外面集中存放這四條就一起鬆動；剩下兩條（掩蓋根因、optimizer 較聰明）是 hint 行為本身固有的，只能用 graceful fallback 加可稽核性緩解。下面這個 tab widget 把六條逐條攤開。</p>
+
+<div class="vg-w-tabs-objections">
+  <style>
+    .vg-w-tabs-objections { display: grid; gap: var(--s-2); margin: var(--s-3) 0; }
+    .vg-w-tabs-objections input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+    .vg-w-tabs-objections .tabs { display: flex; flex-wrap: wrap; gap: var(--s-1); border-bottom: 1px solid var(--line); }
+    .vg-w-tabs-objections .tab { font-family: var(--sans); font-size: var(--fs-sm); padding: var(--s-1) var(--s-2); cursor: pointer; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+    .vg-w-tabs-objections .panel { display: none; padding: var(--s-2) 0; }
+    .vg-w-tabs-objections .panel h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+    .vg-w-tabs-objections .panel p { margin: 0 0 var(--s-2) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+    .vg-w-tabs-objections .panel .answer { border-left: 2px solid var(--sage-deep); padding-left: var(--s-2); }
+    .vg-w-tabs-objections:has(#vg-w-tabs-objections-t1:checked) .panel-1 { display: block; }
+    .vg-w-tabs-objections:has(#vg-w-tabs-objections-t1:checked) [for="vg-w-tabs-objections-t1"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    .vg-w-tabs-objections:has(#vg-w-tabs-objections-t2:checked) .panel-2 { display: block; }
+    .vg-w-tabs-objections:has(#vg-w-tabs-objections-t2:checked) [for="vg-w-tabs-objections-t2"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    .vg-w-tabs-objections:has(#vg-w-tabs-objections-t3:checked) .panel-3 { display: block; }
+    .vg-w-tabs-objections:has(#vg-w-tabs-objections-t3:checked) [for="vg-w-tabs-objections-t3"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    .vg-w-tabs-objections:has(#vg-w-tabs-objections-t4:checked) .panel-4 { display: block; }
+    .vg-w-tabs-objections:has(#vg-w-tabs-objections-t4:checked) [for="vg-w-tabs-objections-t4"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    .vg-w-tabs-objections:has(#vg-w-tabs-objections-t5:checked) .panel-5 { display: block; }
+    .vg-w-tabs-objections:has(#vg-w-tabs-objections-t5:checked) [for="vg-w-tabs-objections-t5"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    .vg-w-tabs-objections:has(#vg-w-tabs-objections-t6:checked) .panel-6 { display: block; }
+    .vg-w-tabs-objections:has(#vg-w-tabs-objections-t6:checked) [for="vg-w-tabs-objections-t6"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+  </style>
+  <input type="radio" id="vg-w-tabs-objections-t1" name="vg-w-tabs-objections-sel" checked />
+  <input type="radio" id="vg-w-tabs-objections-t2" name="vg-w-tabs-objections-sel" />
+  <input type="radio" id="vg-w-tabs-objections-t3" name="vg-w-tabs-objections-sel" />
+  <input type="radio" id="vg-w-tabs-objections-t4" name="vg-w-tabs-objections-sel" />
+  <input type="radio" id="vg-w-tabs-objections-t5" name="vg-w-tabs-objections-sel" />
+  <input type="radio" id="vg-w-tabs-objections-t6" name="vg-w-tabs-objections-sel" />
+  <div class="tabs">
+    <label class="tab" for="vg-w-tabs-objections-t1">維護負擔</label>
+    <label class="tab" for="vg-w-tabs-objections-t2">升級失效</label>
+    <label class="tab" for="vg-w-tabs-objections-t3">掩蓋根因</label>
+    <label class="tab" for="vg-w-tabs-objections-t4">規模化差</label>
+    <label class="tab" for="vg-w-tabs-objections-t5">optimizer 較聰明</label>
+    <label class="tab" for="vg-w-tabs-objections-t6">阻礙改進</label>
+  </div>
+  <div class="panel panel-1">
+    <h3>反對一 · 維護負擔</h3>
+    <div class="answer">
+      <p>傳統 hint 散落每條 query，三年後沒人記得當初為什麼加。advice 不在 SQL 裡——它是 GUC 字串，或存進 pg_stash_advice 一塊命名 stash，keyed by query-id；集中在一處，可列舉、稽核、整批移除，不必 grep 整個 codebase。</p>
+    </div>
+  </div>
+  <div class="panel panel-2">
+    <h3>反對二 · 升級失效</h3>
+    <div class="answer">
+      <p>hint 寫死計畫，下一版 planner 變聰明反而擋路。advice 與 SQL 解耦，移除是刪一筆 stash 紀錄不必動 code；升級後把對應 advice 拔掉重跑 EXPLAIN 即可驗證 planner 是否已自己選對。</p>
+    </div>
+  </div>
+  <div class="panel panel-3">
+    <h3>反對三 · 掩蓋根因</h3>
+    <div class="answer">
+      <p>加 hint 是治標——這條 advice 不假裝完全解決。但集中存放讓技術債可見：一份 stash 清單就是一張「planner 在這些 query 上估錯」的清單，是 root-cause 分析的起點。</p>
+    </div>
+  </div>
+  <div class="panel panel-4">
+    <h3>反對四 · 規模化差</h3>
+    <div class="answer">
+      <p>幾千條 query 各帶 hint，行為無法整體推理。pg_stash_advice 把 advice keyed by query-id 集中管理，可用 <code>ALTER DATABASE</code> 或 <code>ALTER ROLE</code> 設定整個 database / 角色套用哪個 stash，成為一份可版控、可 review 的配置。</p>
+    </div>
+  </div>
+  <div class="panel panel-5">
+    <h3>反對五 · optimizer 通常比你聰明</h3>
+    <div class="answer">
+      <p>人類指定的計畫在資料分布改變後往往更糟。pg_plan_advice 用 graceful fallback 回應：無法滿足的 advice 不強行扭曲計畫，而是被標成 Disabled，planner 退回剩餘約束下能找到的最佳計畫。advice 是約束、不是命令——你縮小搜尋空間，optimizer 仍在剩下的空間裡做 cost-based 選擇。</p>
+    </div>
+  </div>
+  <div class="panel panel-6">
+    <h3>反對六 · 阻礙 planner 改進</h3>
+    <div class="answer">
+      <p>能 hint 就不再回報壞計畫，社群失去改進訊號。但 EXPLAIN (PLAN_ADVICE) 能自動產生 advice 字串——「目前計畫」與「你想要的計畫」之間的 diff 可被機器讀出，advice 反而成為一種結構化的「壞計畫回報」。</p>
+    </div>
+  </div>
+</div>
+
+<h2>advice 是什麼——一條從 SQL 外面約束 planner 的字串</h2>
+
+<p>advice 是一條字串，描述「我要 planner 在搜尋計畫時遵守哪些約束」，掛在 query 外面。「約束」是關鍵：命令是「你必須這樣做」、做不到就報錯或硬幹爛結果，約束是「你的選擇必須落在這個範圍內」、planner 仍在選只是空間被縮小。<code>SEQ_SCAN(f)</code> 不是命令 planner 對 <code>f</code> 做 seqscan，而是約束它「只考慮 seqscan」，其餘自由度照樣用 cost 去選。你沒取代 optimizer，只給了它額外的邊界條件——這也解釋了為什麼無法滿足的 advice 可以乾淨退回。</p>
+
+<p>最小的形狀是設一個 GUC：</p>
+
+<pre data-kind="config"><code>SET pg_plan_advice.advice = 'JOIN_ORDER(a (b c) d)';</code></pre>
+
+<p>這條 advice 說：先 join <code>a</code>，再 join「<code>b</code> 與 <code>c</code> 的結果」，最後 join <code>d</code>，括號表示 join 的群組結構。advice 字串可以串接多個子句，每個約束計畫的一個面向。完整的詞彙表大致是：</p>
+
+<ul>
+<li><code>JOIN_ORDER(a (b c) d)</code>——以圓括號嚴格指定 join 的順序與群組。另有 <code>JOIN_ORDER(a {b c} d)</code> 用大括號表示這組內部順序可由 planner 自由決定。</li>
+<li><code>HASH_JOIN(d)</code>——某個 join 用 hash join，<code>d</code> 在 inner 側。<code>HASH_JOIN((d1 d2))</code> 表示這個 join 的 inner 側是 <code>d1</code>、<code>d2</code> 多個關聯。</li>
+<li><code>NESTED_LOOP_PLAIN(f)</code>——用 nested loop。</li>
+<li><code>INDEX_SCAN(f idx_fact_dim_id)</code>——對 alias <code>f</code> 走 index scan，並指定用哪個 index。</li>
+<li><code>SEQ_SCAN(f)</code>——對 <code>f</code> 強制 sequential scan。</li>
+<li><code>DO_NOT_SCAN</code>——把某表排除在計畫之外。</li>
+<li><code>GATHER</code> / <code>GATHER_MERGE</code> / <code>NO_GATHER(f d)</code>——控制平行查詢的 Gather 節點。</li>
+</ul>
+
+<p>詞彙表一對一映射到 planner 的三個決定維度（join 順序、join 方法、scan 方法）外加平行控制。advice 用 alias 而非 table 名指認目標，因為同一張 table 在 self-join 裡可能出現多次、用 table 名無法區分 instance。把幾條串起來就描述了一整個計畫的骨架：</p>
+
+<pre data-kind="config"><code>SET pg_plan_advice.advice =
+  'JOIN_ORDER(f d1 d2) HASH_JOIN(d1 d2) SEQ_SCAN(f) INDEX_SCAN(d1 idx_d1_pk)';</code></pre>
+
+<p>這跟 Oracle 風格的差別在位置。pg_hint_plan 借用 Oracle 把 hint 寫進 SQL 註解，<code>/*+ HashJoin(d1 d2) */</code> 直接黏在 query 文字裡；pg_plan_advice 把同樣的表達力搬到 SQL 外面，query 文字保持乾淨。搬到 SQL 外不就把資訊藏起來嗎？答案是 EXPLAIN (PLAN_ADVICE)——任何時候都能對一條 query 跑它，看到哪些 advice 在作用、命中狀態如何。下面這張圖把 advice 字串的解剖攤開。</p>
+
+<figure class="vg-w-svg-advice-anatomy">
+  <style>
+    .vg-w-svg-advice-anatomy svg { width: 100%; height: auto; }
+    .vg-w-svg-advice-anatomy figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-2); }
+  </style>
+  <svg viewBox="0 0 720 300" preserveAspectRatio="xMidYMid meet" role="img" aria-label="advice string anatomy">
+    <text x="20" y="34" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)" letter-spacing="0.08em">ONE ADVICE STRING, FOUR CLAUSE KINDS</text>
+
+    <rect x="20" y="50" width="680" height="44" rx="6" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1" />
+    <text x="36" y="78" font-family="JetBrains Mono, monospace" font-size="14" fill="var(--ink)">JOIN_ORDER(f d1 d2)  HASH_JOIN(d1 d2)  SEQ_SCAN(f)  INDEX_SCAN(d1 idx_d1_pk)</text>
+
+    <line x1="100" y1="94" x2="100" y2="130" stroke="var(--accent)" stroke-width="1.5" />
+    <line x1="290" y1="94" x2="290" y2="130" stroke="var(--accent)" stroke-width="1.5" />
+    <line x1="450" y1="94" x2="450" y2="130" stroke="var(--accent)" stroke-width="1.5" />
+    <line x1="590" y1="94" x2="590" y2="130" stroke="var(--accent)" stroke-width="1.5" />
+
+    <g font-family="EB Garamond, serif" font-size="14">
+      <rect x="40" y="130" width="150" height="56" rx="6" fill="none" stroke="var(--accent)" stroke-width="1.5" />
+      <text x="115" y="153" text-anchor="middle" fill="var(--accent-text)" font-size="13">join 順序約束</text>
+      <text x="115" y="173" text-anchor="middle" fill="var(--muted)" font-size="11" font-family="Manrope, sans-serif">枚舉空間的形狀</text>
+
+      <rect x="210" y="130" width="160" height="56" rx="6" fill="none" stroke="var(--sage-deep)" stroke-width="1.5" />
+      <text x="290" y="153" text-anchor="middle" fill="var(--sage-deep)" font-size="13">join 方法約束</text>
+      <text x="290" y="173" text-anchor="middle" fill="var(--muted)" font-size="11" font-family="Manrope, sans-serif">每個 join 怎麼算</text>
+
+      <rect x="390" y="130" width="130" height="56" rx="6" fill="none" stroke="var(--ink-deep)" stroke-width="1.5" />
+      <text x="455" y="153" text-anchor="middle" fill="var(--ink-deep)" font-size="13">scan 方法約束</text>
+      <text x="455" y="173" text-anchor="middle" fill="var(--muted)" font-size="11" font-family="Manrope, sans-serif">每張表怎麼讀</text>
+
+      <rect x="540" y="130" width="160" height="56" rx="6" fill="none" stroke="var(--ink-deep)" stroke-width="1.5" />
+      <text x="620" y="153" text-anchor="middle" fill="var(--ink-deep)" font-size="13">index 指名</text>
+      <text x="620" y="173" text-anchor="middle" fill="var(--muted)" font-size="11" font-family="Manrope, sans-serif">用哪一個 index</text>
+    </g>
+
+    <text x="20" y="226" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)" letter-spacing="0.08em">PLACED OUTSIDE THE SQL · NOT A COMMENT INSIDE IT</text>
+    <rect x="20" y="238" width="330" height="44" rx="6" fill="none" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="4 4" />
+    <text x="36" y="266" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--muted)">SET pg_plan_advice.advice = '...'</text>
+
+    <rect x="370" y="238" width="330" height="44" rx="6" fill="none" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="4 4" />
+    <text x="386" y="266" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--muted)">SELECT ... FROM f JOIN d1 ... JOIN d2 ...</text>
+  </svg>
+  <figcaption>一條 advice 字串拆成四類子句，分別約束 planner 搜尋空間的不同維度。關鍵在最下方：advice 與 query 是兩個分離的東西，前者不寫進後者。pg_hint_plan 則把這些子句塞進右邊那個框的 SQL 註解裡。</figcaption>
+</figure>
+
+<p>幾個語法細節值得記。<code>JOIN_ORDER</code> 的圓括號 <code>(b c)</code> 表示「這個子樹的結構固定」，大括號 <code>{b c}</code> 表示「這組必須一起 join、但組內順序 planner 自己挑」。advice 還可以用 dollar quoting 避免引號逃逸：<code>$$JOIN_ORDER(f d1 d2)$$</code>；開了 <code>pg_plan_advice.feedback_warnings = true</code>，無法滿足的 advice 會用 <code>WARNING</code> 講出來而非默默吞掉。</p>
+
+<h2>把 advice 貼到計畫樹上——哪個子句約束哪個節點，又在哪裡退回</h2>
+
+<p>EXPLAIN 印出來的縮排結構本質是一棵樹：葉節點是對單張表的 scan，內部節點是 join。advice 每一類子句作用在不同層級：<code>SEQ_SCAN</code> / <code>INDEX_SCAN</code> 約束葉節點怎麼讀，<code>HASH_JOIN</code> / <code>NESTED_LOOP_PLAIN</code> 約束內部節點怎麼算，<code>JOIN_ORDER</code> 約束整棵樹的形狀。下面這個 widget 是一棵 query plan tree：點任一節點，看哪一條 advice 子句約束了它，以及約束無法滿足時這個節點怎麼被標成 Disabled。</p>
+
+<figure class="vg-w-annotated-plantree">
+  <style>
+    .vg-w-annotated-plantree { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s-3); align-items: start; margin: var(--s-3) 0; }
+    .vg-w-annotated-plantree svg { width: 100%; height: auto; }
+    .vg-w-annotated-plantree input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+    .vg-w-annotated-plantree .node { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; transition: fill 200ms, stroke 200ms; }
+    .vg-w-annotated-plantree .node:hover { stroke: var(--accent); }
+    .vg-w-annotated-plantree .node:focus { outline: none; }
+    .vg-w-annotated-plantree .node:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .vg-w-annotated-plantree .node-text { pointer-events: none; }
+    .vg-w-annotated-plantree .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+    .vg-w-annotated-plantree .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+    .vg-w-annotated-plantree .detail p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+    .vg-w-annotated-plantree .detail code { font-size: 0.9em; }
+    .vg-w-annotated-plantree:has(#vg-w-annotated-plantree-r1:checked) .node-1 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+    .vg-w-annotated-plantree:has(#vg-w-annotated-plantree-r2:checked) .node-2 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+    .vg-w-annotated-plantree:has(#vg-w-annotated-plantree-r3:checked) .node-3 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+    .vg-w-annotated-plantree:has(#vg-w-annotated-plantree-r4:checked) .node-4 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+    .vg-w-annotated-plantree:has(#vg-w-annotated-plantree-r5:checked) .node-5 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+    .vg-w-annotated-plantree:has(#vg-w-annotated-plantree-r1:checked) .detail-1 { display: block; }
+    .vg-w-annotated-plantree:has(#vg-w-annotated-plantree-r2:checked) .detail-2 { display: block; }
+    .vg-w-annotated-plantree:has(#vg-w-annotated-plantree-r3:checked) .detail-3 { display: block; }
+    .vg-w-annotated-plantree:has(#vg-w-annotated-plantree-r4:checked) .detail-4 { display: block; }
+    .vg-w-annotated-plantree:has(#vg-w-annotated-plantree-r5:checked) .detail-5 { display: block; }
+    @media (max-width: 720px) {
+      .vg-w-annotated-plantree { grid-template-columns: 1fr; }
+    }
+  </style>
+
+  <input type="radio" id="vg-w-annotated-plantree-r1" name="vg-w-annotated-plantree-sel" checked />
+  <input type="radio" id="vg-w-annotated-plantree-r2" name="vg-w-annotated-plantree-sel" />
+  <input type="radio" id="vg-w-annotated-plantree-r3" name="vg-w-annotated-plantree-sel" />
+  <input type="radio" id="vg-w-annotated-plantree-r4" name="vg-w-annotated-plantree-sel" />
+  <input type="radio" id="vg-w-annotated-plantree-r5" name="vg-w-annotated-plantree-sel" />
+
+  <svg viewBox="0 0 480 360" preserveAspectRatio="xMidYMid meet" role="img" aria-label="query plan tree annotated with advice clauses">
+    <defs>
+      <marker id="vg-w-annotated-plantree-arrow" viewBox="0 0 10 10" refX="5" refY="9" markerWidth="6" markerHeight="6" orient="auto">
+        <path d="M 0 10 L 5 0 L 10 10 z" fill="currentColor" />
+      </marker>
+    </defs>
+
+    <!-- edges (child feeds parent, arrow points up) -->
+    <line x1="160" y1="120" x2="240" y2="70" stroke="currentColor" stroke-width="1.5" />
+    <line x1="320" y1="120" x2="240" y2="70" stroke="currentColor" stroke-width="1.5" />
+    <line x1="100" y1="210" x2="160" y2="160" stroke="currentColor" stroke-width="1.5" />
+    <line x1="220" y1="210" x2="160" y2="160" stroke="currentColor" stroke-width="1.5" />
+
+    <!-- node 1: top join -->
+    <rect class="node node-1" data-target="vg-w-annotated-plantree-r1" role="button" tabindex="0" aria-label="select top join node" x="180" y="30" width="120" height="40" rx="6" />
+    <text class="node-text" x="240" y="55" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">Join → d2</text>
+
+    <!-- node 2: lower join -->
+    <rect class="node node-2" data-target="vg-w-annotated-plantree-r2" role="button" tabindex="0" aria-label="select lower join node" x="100" y="120" width="120" height="40" rx="6" />
+    <text class="node-text" x="160" y="145" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">Hash Join</text>
+
+    <!-- node 3: scan f -->
+    <rect class="node node-3" data-target="vg-w-annotated-plantree-r3" role="button" tabindex="0" aria-label="select scan f node" x="40" y="210" width="120" height="40" rx="6" />
+    <text class="node-text" x="100" y="235" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">Scan f</text>
+
+    <!-- node 4: scan d1 -->
+    <rect class="node node-4" data-target="vg-w-annotated-plantree-r4" role="button" tabindex="0" aria-label="select scan d1 node" x="160" y="210" width="120" height="40" rx="6" />
+    <text class="node-text" x="220" y="235" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">Scan d1</text>
+
+    <!-- node 5: scan d2 -->
+    <rect class="node node-5" data-target="vg-w-annotated-plantree-r5" role="button" tabindex="0" aria-label="select scan d2 node" x="300" y="120" width="120" height="40" rx="6" />
+    <text class="node-text" x="360" y="145" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">Scan d2</text>
+
+    <text x="240" y="300" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)" letter-spacing="0.06em">CLICK A NODE TO SEE WHICH ADVICE CLAUSE BINDS IT</text>
+  </svg>
+
+  <div>
+    <div class="detail detail-1">
+      <h3>頂層 Join → d2 · 被 JOIN_ORDER 約束</h3>
+      <p><code>JOIN_ORDER(f d1 d2)</code> 把 <code>d2</code> 釘在最外層 join，planner 不能把它提前。這一條約束的是<strong>樹的形狀</strong>，不是任何單一節點的演算法；即使 <code>d2</code> 上有等值條件讓提前 join 更便宜，planner 仍須遵守順序——除非該 advice 無法滿足而被標 Disabled。</p>
+    </div>
+    <div class="detail detail-2">
+      <h3>Hash Join · 被 HASH_JOIN 約束</h3>
+      <p><code>HASH_JOIN(d1 d2)</code> 指定這個 join 用 hash join，inner 側是 <code>d1</code> / <code>d2</code> 的關聯。約束的是<strong>這個節點的演算法</strong>。</p>
+      <p>若估計記憶體不足以 hash，傳統上 planner 會自己改用 merge / nested loop；有了 advice，它會優先嘗試滿足 hash，無法滿足才退回並標記。</p>
+    </div>
+    <div class="detail detail-3">
+      <h3>Scan f · 被 SEQ_SCAN 或 INDEX_SCAN 約束</h3>
+      <p>這是場景裡的關鍵節點。原本 planner 對 <code>f</code> 選 sequential scan；<code>INDEX_SCAN(f idx_fact_dim_id)</code> 強迫它走指定 index。約束的是<strong>葉節點的讀取方式</strong>。</p>
+      <p>若 <code>idx_fact_dim_id</code> 不存在或不適用（例如 query 沒有可用的 index 條件），這條 advice 無法滿足，節點被標 <code>Disabled</code>，planner 退回 seqscan——graceful fallback。</p>
+    </div>
+    <div class="detail detail-4">
+      <h3>Scan d1 · 被 INDEX_SCAN 指名</h3>
+      <p><code>INDEX_SCAN(d1 idx_d1_pk)</code> 不只說「走 index」，還指名走哪一個。當一張表有多個可用 index，這條把選擇權從 cost model 手上拿過來。</p>
+      <p>指名一個語意上不對的 index，advice 一樣會被判 inapplicable 而退回——advice 是約束，不是無視正確性的命令。</p>
+    </div>
+    <div class="detail detail-5">
+      <h3>Scan d2 · 未被 advice 涵蓋</h3>
+      <p>advice 字串裡沒有提到 <code>d2</code> 的 scan 方法，所以這個節點完全由 planner 自由決定。這正是 advice 的「部分約束」性質：你只釘住你在意的維度，其餘交給 cost-based optimizer，EXPLAIN (PLAN_ADVICE) 會把它標成 <code>not matched</code>。</p>
+    </div>
+  </div>
+
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-annotated-plantree');
+      root.querySelectorAll('.node').forEach((rect) => {
+        rect.addEventListener('click', () => {
+          const targetId = rect.getAttribute('data-target');
+          const radio = root.querySelector('#' + targetId);
+          if (radio) radio.checked = true;
+        });
+        rect.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            rect.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+          }
+        });
+      });
+    })();
+  </script>
+</figure>
+
+<p>比較 Scan f（被 advice 覆寫）跟 Scan d2（沒談到）兩格，就看到「部分約束」的精髓：你只需釘住確定 planner 估錯的那幾個節點。注意關鍵字 <code>Disabled</code>——這是跟舊式 hint 最重要的差異：傳統 hint 寫 <code>/*+ INDEX(t idx) */</code> 但 index 用不上時 Oracle 要嘛默默忽略、要嘛硬走爛計畫；pg_plan_advice 走第三條路，無法滿足的子句被標成 Disabled，planner 退回剩餘約束下的最佳計畫，而 EXPLAIN (PLAN_ADVICE) 把這個狀態講給你聽。這也讓 advice 跨環境共用安全：搬到 production 萬一少了某 index，最壞只是部分 advice 退回預設。</p>
+
+
+<p>EXPLAIN 的輸出會在計畫旁邊註記每條 advice 的命中狀態：</p>
+
+<pre data-kind="output"><code>EXPLAIN (COSTS OFF, PLAN_ADVICE)
+SELECT ... FROM f JOIN d1 ... JOIN d2 ...;
+
+<em>/* matched */</em>                          <em>// advice 命中且生效</em>
+<em>/* matched, inapplicable, failed */</em>    <em>// 命中目標但無法套用（如 index 不存在）</em>
+<em>/* not matched */</em>                      <em>// advice 提到的目標不在這條 query</em>
+<em>/* matched, conflicting, failed */</em>     <em>// 兩條 advice 互相矛盾</em>
+<em>/* failed */</em>                           <em>// 最終計畫沒有遵守這條 advice</em></code></pre>
+
+<p>這套註記是判斷「advice 生不生效」的唯一可靠依據。<code>matched</code> 是你想看到的；<code>not matched</code> 是中性的（advice 寫了某 alias 但 query 沒有）。真正要警覺的是帶 <code>failed</code> 的兩種：<code>matched, inapplicable, failed</code>（找到目標但無法滿足，最典型是 <code>INDEX_SCAN(f some_idx)</code> 那個 index 不存在）與 <code>matched, conflicting, failed</code>（兩條 advice 互相打架），兩種都會讓對應節點被標 Disabled。</p>
+
+<p>下面這個 widget 讓你親手玩 graceful fallback：拖動「row estimate 偏差」slider，看 planner 的選擇何時與 advice 一致、何時被覆寫、何時變成 Disabled 退回。這條 slider 掃的是 planner 唯一真正會錯的東西——它對中間結果列數的估計。</p>
+
+<figure class="vg-w-range-fallback">
+  <style>
+    .vg-w-range-fallback { display: grid; gap: var(--s-2); margin: var(--s-3) 0; }
+    .vg-w-range-fallback .controls { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+    .vg-w-range-fallback .controls input { flex: 1; accent-color: var(--accent); height: 36px; }
+    .vg-w-range-fallback .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 9ch; text-align: right; }
+    .vg-w-range-fallback svg { width: 100%; height: auto; }
+    .vg-w-range-fallback figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+  </style>
+  <div class="controls">
+    <label for="vg-w-range-fallback-x">row estimate 偏差倍數 =</label>
+    <input id="vg-w-range-fallback-x" type="range" min="-3" max="3" value="0" step="0.1" />
+    <span class="readout" id="vg-w-range-fallback-readout">×1.0</span>
+  </div>
+  <svg viewBox="0 0 720 320" preserveAspectRatio="xMidYMid meet" role="img" aria-label="planner cost vs advice fallback">
+    <line x1="60" y1="270" x2="700" y2="270" stroke="var(--muted-2)" stroke-width="1" />
+    <line x1="60" y1="30"  x2="60"  y2="270" stroke="var(--muted-2)" stroke-width="1" />
+    <text x="380" y="302" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--muted)">中間結果列數估計（偏差越大、planner 越想 seqscan）</text>
+    <text x="24" y="150" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--muted)" transform="rotate(-90 24 150)">estimated cost</text>
+
+    <path id="vg-w-range-fallback-curve-seq" fill="none" stroke="var(--accent)" stroke-width="2" />
+    <path id="vg-w-range-fallback-curve-idx" fill="none" stroke="var(--sage-deep)" stroke-width="2" />
+    <line id="vg-w-range-fallback-cursor" x1="380" y1="30" x2="380" y2="270" stroke="var(--ink-deep)" stroke-width="1.5" stroke-dasharray="3 3" />
+    <circle id="vg-w-range-fallback-dot-seq" r="5" fill="var(--accent)" />
+    <circle id="vg-w-range-fallback-dot-idx" r="5" fill="var(--sage-deep)" />
+
+    <g font-family="Manrope, sans-serif" font-size="12">
+      <rect x="470" y="40" width="14" height="2" fill="var(--accent)" />
+      <text x="492" y="44" fill="var(--ink)">seq scan f 的成本</text>
+      <rect x="470" y="60" width="14" height="2" fill="var(--sage-deep)" />
+      <text x="492" y="64" fill="var(--ink)">index scan f 的成本（advice 想要的）</text>
+    </g>
+    <text id="vg-w-range-fallback-verdict" x="380" y="20" text-anchor="middle" font-family="Manrope, sans-serif" font-size="13" fill="var(--ink-deep)" letter-spacing="0.04em">advice 生效</text>
+  </svg>
+  <figcaption>橙線是 planner 心中 seqscan 的成本，綠線是 index scan 的成本，兩者隨估計偏差變動。advice 想要 index scan：只要 index scan 可行，advice 就把計畫釘在綠線；唯有 index 對這條 query 根本不可用（最右端）advice 才被標 Disabled、退回橙線。slider 掃的是 planner 唯一真正會估錯的量。</figcaption>
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-range-fallback');
+      const input = root.querySelector('input');
+      const readout = root.querySelector('.readout');
+      const curveSeq = root.querySelector('#vg-w-range-fallback-curve-seq');
+      const curveIdx = root.querySelector('#vg-w-range-fallback-curve-idx');
+      const cursor = root.querySelector('#vg-w-range-fallback-cursor');
+      const dotSeq = root.querySelector('#vg-w-range-fallback-dot-seq');
+      const dotIdx = root.querySelector('#vg-w-range-fallback-dot-idx');
+      const verdict = root.querySelector('#vg-w-range-fallback-verdict');
+
+      const X0 = 60, X1 = 700, Y0 = 270, Y1 = 30;
+      const V0 = -3, V1 = 3;
+
+      function xOf(v) { return X0 + ((v - V0) / (V1 - V0)) * (X1 - X0); }
+      // seqscan cost rises mildly with skew; index cost rises sharply
+      // when skew makes index selectivity poor, and is "unavailable" past v=2.5
+      function costSeq(v) { return 120 + 18 * (v + 3); }
+      function costIdx(v) { return 60 + 12 * Math.pow(Math.max(0, v + 1), 1.6); }
+      function yOf(c) { return Y0 - (Math.max(0, Math.min(300, c)) / 300) * (Y0 - Y1); }
+      const IDX_UNAVAILABLE = 2.5;
+
+      const ptsS = [], ptsI = [];
+      for (let v = V0; v <= V1 + 0.001; v += 0.1) {
+        const cmd = (v <= V0 + 0.001) ? 'M' : 'L';
+        ptsS.push(`${cmd} ${xOf(v).toFixed(1)} ${yOf(costSeq(v)).toFixed(1)}`);
+        if (v <= IDX_UNAVAILABLE) {
+          ptsI.push(`${(ptsI.length === 0) ? 'M' : 'L'} ${xOf(v).toFixed(1)} ${yOf(costIdx(v)).toFixed(1)}`);
+        }
+      }
+      curveSeq.setAttribute('d', ptsS.join(' '));
+      curveIdx.setAttribute('d', ptsI.join(' '));
+
+      function update() {
+        const v = Number(input.value);
+        readout.textContent = '×' + Math.pow(10, v / 3).toFixed(1);
+        const x = xOf(v);
+        cursor.setAttribute('x1', x); cursor.setAttribute('x2', x);
+        const cS = costSeq(v), cI = costIdx(v);
+        dotSeq.setAttribute('cx', x); dotSeq.setAttribute('cy', yOf(cS));
+        if (v <= IDX_UNAVAILABLE) {
+          dotIdx.setAttribute('opacity', '1');
+          dotIdx.setAttribute('cx', x); dotIdx.setAttribute('cy', yOf(cI));
+          if (cI <= cS) {
+            verdict.textContent = 'advice 生效 · 與 cost-based 一致 (matched)';
+          } else {
+            verdict.textContent = 'advice 覆寫 cost-based · planner 本想 seqscan (matched)';
+          }
+          verdict.setAttribute('fill', 'var(--sage-deep)');
+        } else {
+          dotIdx.setAttribute('opacity', '0');
+          verdict.textContent = 'index 不可用 · advice 標 Disabled · 退回 seqscan';
+          verdict.setAttribute('fill', 'var(--accent-text)');
+        }
+        verdict.setAttribute('x', Math.max(180, Math.min(560, x)));
+      }
+      input.addEventListener('input', update);
+      update();
+    })();
+  </script>
+</figure>
+
+<p>那麼 advice 字串本身從哪來？你不必手寫。EXPLAIN (PLAN_ADVICE) 還能把<strong>目前這個計畫</strong>逆向描述成 advice 字串。第一步，用傳統手段逼出好計畫，例如暫時 <code>SET enable_seqscan = off</code>；第二步，對這條 query 跑 EXPLAIN (PLAN_ADVICE) 導出 advice：</p>
+
+<pre data-kind="output"><code>EXPLAIN (COSTS OFF, PLAN_ADVICE)
+SELECT ... FROM f JOIN d1 USING (dim_id) JOIN d2 USING (dim2_id);
+
+                   QUERY PLAN
+------------------------------------------------------
+ Nested Loop
+   -&gt;  Index Scan using idx_fact_dim_id on f
+   -&gt;  ...
+ Plan advice:
+   JOIN_ORDER(f d1 d2) NESTED_LOOP_PLAIN(f)
+   INDEX_SCAN(f idx_fact_dim_id)</code></pre>
+
+<p>第三步，把 <code>enable_seqscan</code> 設回 <code>on</code>，把導出的 advice 貼進 <code>pg_plan_advice.advice</code>（或存進 stash）讓它持久。現在這條 query 不關閉 seqscan 也仍走你要的計畫，而你動的不是 SQL 是 advice。EXPLAIN 只輸出最小約束集；反過來也能拿它當計畫快照：升級前導出、升級後再導一次 diff，就是一種輕量的「planner 回歸檢測」。</p>
+
+<h2>pg_stash_advice、query-id 與跨重啟保留——advice 怎麼從一次性變成基礎設施</h2>
+
+<p>GUC 版的 advice 生命週期跟 session 一樣短，且套用到 session 裡的<strong>每一條</strong>提到該 alias 的 query，粒度太粗。pg_stash_advice 補的就是這兩段：把 advice 變成持久、可跨重啟的基礎設施，同時把套用粒度收細到「特定 query-id」。GUC 版適合「探索」（在 psql 反覆試、看 EXPLAIN），stash 版適合「固化」（探索定案後釘進 stash 永久生效）。</p>
+
+<p>它的機制建立在 query-id 上：Postgres 對每條 query 算一個跟動態參數無關的 hash（算 hash 前把常數參數化掉），所以 <code>WHERE x = 1</code> 跟 <code>WHERE x = 999</code> 算出同一個 query-id；pg_stash_advice 就是一張 <code>query-id → advice</code> 的表，存在共享記憶體裡、每個 backend 在 planning 時直接查、幾乎零成本。這跟 <code>pg_stat_statements</code> 是同一把 hash：你在那裡看到某條 query 的 <code>queryid</code> 很慢，直接拿那個 id 去 stash 掛 advice 就對得起來。用起來三步，先建一塊命名的 stash：</p>
+
+<pre data-kind="config"><code>CREATE EXTENSION pg_stash_advice;
+SELECT pg_create_advice_stash('production_tuning');</code></pre>
+
+<p>然後對某個 query-id 寫入 advice：</p>
+
+<pre data-kind="config"><code>SELECT pg_set_stashed_advice(
+    'production_tuning',
+    5424487836266966148,
+    'INDEX_SCAN(f idx_fact_dim_id) NESTED_LOOP_PLAIN(f)'
+);</code></pre>
+
+<p>那串 <code>5424487836266966148</code> 就是 query-id——一個 64-bit 的 hash。最後把 stash 啟用到某個範圍：</p>
+
+<pre data-kind="config"><code>SET pg_stash_advice.stash_name = 'production_tuning';
+ALTER DATABASE mydb SET pg_stash_advice.stash_name = 'production_tuning';
+ALTER ROLE reporting_user SET pg_stash_advice.stash_name = 'production_tuning';</code></pre>
+
+<p>第二、三行是關鍵——你可以讓整個 database 或某個特定角色自動套用一份 advice 集合，application code 一行都不改。這在讀寫分離架構裡特別有用：OLTP 走 <code>app_user</code> 讓 planner 自由發揮，分析報表走 <code>reporting_user</code> 跑容易估錯的大 join，你只在 <code>reporting_user</code> 上掛 stash、OLTP 路徑完全不受影響——舊世界你得在 application 層 <code>SET enable_seqscan = off</code> 且那還是 session 全域的。持久化由 <code>pg_stash_advice.persist = on</code>（預設）負責，advice 寫到磁碟撐過重啟，把計畫控制變成一份集中、可稽核、可版控的 stash，正面回應「規模化差」那條反對。</p>
+
+<p>「與動態參數無關」是雙面的。好處是一條 advice 自動套用到所有參數變體；風險是如果最佳計畫其實隨參數值而變（<code>x = 1</code> 該走 index、<code>x = 999</code> 該走 seqscan），一條 by-query-id 的 advice 就把兩種情況綁死——這正是「optimizer 通常比你聰明」那條反對的具體形態（Postgres 自己的 generic vs custom plan 會自適應，by-query-id advice 等於繞過它）。所以掛 advice 前，先確認最佳計畫對所有合理參數值都一致。</p>
+
+<h2>該不該開——它換來什麼、代價是什麼、跟 pg_hint_plan 怎麼選</h2>
+
+<p>pg_plan_advice 是 contrib 模組、不是核心預設開啟，所以「開不開」是個明確選擇。planner 在絕大多數 query 上表現良好，advice 是為那 1% 估錯的 query 準備的。真正的問題不是「要不要裝」，而是「我手上有沒有那種 planner 反覆估錯、又無法靠 ANALYZE 或 extended statistics 修好的 query」——有，它值得；沒有，先別急。下面這張表把它跟既有的兩條路並排：</p>
+
+<figure class="vg-w-table-compare">
+  <style>
+    .vg-w-table-compare { overflow-x: auto; margin: var(--s-3) 0; }
+    .vg-w-table-compare table { width: 100%; min-width: 540px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+    .vg-w-table-compare thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; }
+    .vg-w-table-compare thead th[data-sort] { color: var(--accent-text); }
+    .vg-w-table-compare tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+    .vg-w-table-compare figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-2); }
+  </style>
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/><path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+    </svg>
+    <span>click column header to sort · 4 columns × 5 rows</span>
+  </p>
+  <table>
+    <thead>
+      <tr>
+        <th data-key="dim">維度</th>
+        <th data-key="advice">pg_plan_advice (PG19)</th>
+        <th data-key="hint">pg_hint_plan (3rd party)</th>
+        <th data-key="guc">舊式 GUC / 副作用</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td>控制寫在哪</td><td>SQL 外面（GUC / stash）</td><td>SQL 註解 /*+ ... */</td><td>session GUC / OFFSET 0 等副作用</td></tr>
+      <tr><td>粒度</td><td>per-query-id，可精準到單條</td><td>per-statement</td><td>session 全域，一刀切</td></tr>
+      <tr><td>無法滿足時</td><td>標 Disabled、graceful 退回</td><td>多半默默忽略</td><td>不適用（本就是粗工具）</td></tr>
+      <tr><td>持久 / 跨重啟</td><td>stash 寫磁碟，撐過重啟</td><td>隨 SQL 走，跟 code 綁死</td><td>session 結束即失效</td></tr>
+      <tr><td>可否自動產生</td><td>EXPLAIN (PLAN_ADVICE) 產 advice</td><td>需人工撰寫</td><td>需人工試錯</td></tr>
+    </tbody>
+  </table>
+  <figcaption>三條路的核心差別不在「能不能控制計畫」——三者都能——而在控制放在哪、退路是什麼、以及能不能集中管理。pg_plan_advice 的賣點是把控制從 SQL 抽離並給它一條 graceful 退路。</figcaption>
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-table-compare');
+      const headers = root.querySelectorAll('thead th');
+      const tbody = root.querySelector('tbody');
+      let activeKey = null, asc = true;
+      headers.forEach(h => h.addEventListener('click', () => {
+        const key = h.dataset.key;
+        if (activeKey === key) asc = !asc; else { activeKey = key; asc = true; }
+        headers.forEach(x => x.removeAttribute('data-sort'));
+        h.setAttribute('data-sort', asc ? 'asc' : 'desc');
+        const rows = [...tbody.querySelectorAll('tr')];
+        const idx = [...headers].indexOf(h);
+        rows.sort((a, b) => {
+          const av = a.children[idx].textContent.trim();
+          const bv = b.children[idx].textContent.trim();
+          return asc ? av.localeCompare(bv) : bv.localeCompare(av);
+        });
+        rows.forEach(r => tbody.appendChild(r));
+      }));
+    })();
+  </script>
+</figure>
+
+<p>先把運作邊界釐清。advice 是約束、不是目標函數：你只能表達「join 順序是這個、scan 方法是那個」，不能表達「我希望這個計畫便宜一點」；而且不保證被遵守——每一條都可能被標 Disabled。由此引出最重要的實務紀律：把關鍵 query 的 advice 命中狀態納入測試，在 CI 跑 <code>EXPLAIN (PLAN_ADVICE)</code> 並 assert 輸出裡沒有 <code>failed</code>，這樣有人改 schema、刪 index、或重命名 alias 導致 advice 默默退回時測試會紅。新手最常踩的坑就是 alias：<code>INDEX_SCAN(f idx)</code> 裡的 <code>f</code> 是 alias 不是 table 名（<code>FROM fact AS f</code> 就寫 <code>f</code>），寫錯得到的是 <code>not matched</code>——不報錯也沒生效。再開 <code>feedback_warnings</code> 讓退回的 advice 在 log 留痕、讓 pipeline 對「advice failed」告警。</p>
+
+<p>它沒換來的正好對應六條反對裡無法用「位置」解決的兩條。第一，它沒讓「掩蓋根因」消失——advice 仍是治標，發現某 query 需要 advice 該去查為什麼 planner 估錯（統計過期就 <code>ANALYZE</code>、column 有相關性就建 extended statistics <code>CREATE STATISTICS</code>）；差別在於那份 stash 清單本身就是你的待辦清單，變長就是警訊。第二，它沒讓「optimizer 通常比你聰明」失效——你釘住一個計畫等於賭你此刻比 cost model 懂這條 query，分布漂移後可能輸；graceful Disabled 救得了「index 消失」的硬失效，救不了「advice 仍可滿足、但已不再是好計畫」的軟退化，所以 advice 需要定期複查、且應該少而精，當手術刀用在那幾條 planner 確實估錯的 query 上，而不是「幾百條各掛一條」那套「沒人敢刪的計畫債」。</p>
+
+<p>至於跟 pg_hint_plan 怎麼選，四個差異：in-tree 與否（pg_hint_plan 是第三方 extension，release 必須追著每個 Postgres 大版本跑，過去很多團隊延後升級的真實理由；pg_plan_advice 是 contrib，跟著本體一起升）；污染 SQL 與否（pg_hint_plan 把 hint 寫進 SQL 註解、改 hint 要動 code，pg_plan_advice 改 advice 是改一筆 stash，對「SQL 埋在 ORM 生成字串裡碰不到」這種處境是唯一可行的路）；失敗行為（pg_hint_plan 多半默默忽略，pg_plan_advice 把命中狀態做成 first-class 的 EXPLAIN 輸出與可選 WARNING）；能否自動產生（pg_hint_plan 靠人工撰寫，pg_plan_advice 的 EXPLAIN (PLAN_ADVICE) 能把任何現有計畫導成 advice）。</p>
+
+<p>結論不複雜：已重度依賴 pg_hint_plan 且運作良好就沒有非遷不可的理由；但要從零建立計畫控制，pg_plan_advice 是更對的起點——in-tree 的 contrib、advice 不污染 SQL、無法滿足時退得乾淨，而且 EXPLAIN (PLAN_ADVICE) 能替你產出初版 advice。Tom Lane 當年那句「我不是說不可能有不爛的 hinting scheme」，pg_plan_advice 的回答是把 hint 從 SQL 裡搬出來、加一條 graceful 退路、再讓 EXPLAIN 自己產生它。</p>
+
+<p class="vg-deep-closer"><strong>Take-away</strong>：query hint 之爭從來不是「能不能控制 planner」，而是「控制放在哪、出錯怎麼退」——pg_plan_advice 把控制搬到 SQL 外面、給無法滿足的 advice 一條標記 Disabled 的退路，於是十五年前那個「要 hint、但要能用、且不能爛」的願望，第一次有了不爛的形狀。</p>
+
+</div>

@@ -1,0 +1,581 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">資料中心網路三十年都長一個樣子——一層 leaf、一層 spine、整齊的 Clos／fat-tree，每條路徑可以畫在白板上。Amazon 的 RNG 把這套丟掉，改用一張「隨機接出來」的圖：沒有層、沒有 spine、沒有可預測的路徑，但少 69% 的 router、多 33% 的吞吐量、掉一顆 router 只掉約等比例的容量。賭注是——一個誠實承認自己是 stochastic 的網路，比一個假裝 deterministic 的網路更可靠。</p>
+  <h1 class="vg-post-title">{{ title }}</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p><span class="vg-dropcap">R</span>NG（Resilient Network Graphs）是 Amazon 揭露的資料中心網路架構，把階層式的 fat-tree／Clos 換成隨機圖（random graph／expander graph）。它要解的問題很具體——當你的網路要塞進幾萬顆 router、每年都得擴一批機櫃、隨時有 1% 的元件壞著，fat-tree 那種「層數固定、路徑可枚舉」的優雅就變成負債：要嘛 spine 變成瓶頸，要嘛擴容得整層重畫，要嘛一顆 spine switch 死掉就削掉一整片 bisection。RNG 由 Bernardi、Mahajan、Comandur 帶的團隊做出來，核心不是發明新理論，而是把一個 1970 年代就存在、2012 年 Jellyfish 點破卻卡死的點子——「隨機接線的圖在數學上逼近最佳 expander」——真的變成可路由、可佈線、可運維的生產系統。三個老問題各有一個對應的子系統：路由是 Spraypoint，佈線是 ShuffleBox，運維是「先用數學模型驗證再實體部署」。</p>
+
+  <p>底下四個小節對應這套架構的四個結構性問題。前三節各拆一個子系統——為什麼 expander 比 fat-tree 好（理論）、Spraypoint 怎麼在不爆 router memory 的前提下灑流量（路由）、ShuffleBox 怎麼把隨機性做成可佈線的被動硬體（佈線）。第四節回到 RNG 最反直覺的主張：把保證寫成機率，比把保證寫成絕對值更誠實。先從一個動態畫面開始——同一批封包，灑在隨機 expander 上跟集中在 fat-tree spine 上，掉 node 時兩者的退化方式完全不同。下方 canvas 可以邊跑邊敲掉節點，看「等比例退化」跟「斷崖式退化」的差別到底長什麼樣。</p>
+
+  <figure class="vg-w-mini-canvas-simulation vg-w-canvas-rng-spray">
+    <style>
+      .vg-w-canvas-rng-spray { display: grid; grid-template-rows: auto 1fr auto; gap: var(--s-2); }
+      .vg-w-canvas-rng-spray .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+      .vg-w-canvas-rng-spray button { font-family: var(--sans); font-size: var(--fs-sm); padding: 6px 14px; min-height: 44px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); cursor: pointer; }
+      .vg-w-canvas-rng-spray button:hover { border-color: var(--accent); color: var(--accent-text); }
+      .vg-w-canvas-rng-spray button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent-text); background: var(--bg-soft); }
+      .vg-w-canvas-rng-spray .seg { display: inline-flex; border: 1px solid var(--line); }
+      .vg-w-canvas-rng-spray .seg button { border: none; border-right: 1px solid var(--line); min-height: 40px; }
+      .vg-w-canvas-rng-spray .seg button:last-child { border-right: none; }
+      .vg-w-canvas-rng-spray canvas { width: 100%; height: auto; aspect-ratio: 2 / 1; display: block; cursor: crosshair; }
+      .vg-w-canvas-rng-spray .readout { font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); color: var(--ink-soft); font-variant-numeric: tabular-nums; }
+      .vg-w-canvas-rng-spray .readout em { color: var(--accent-text); font-style: normal; }
+      .vg-w-canvas-rng-spray figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+      @media (max-width: 720px) {
+        .vg-w-canvas-rng-spray canvas { aspect-ratio: 3 / 2; }
+      }
+    </style>
+
+    <div class="toolbar">
+      <span class="seg" role="group" aria-label="拓樸切換">
+        <button type="button" data-topo="rng" aria-pressed="true">random expander</button>
+        <button type="button" data-topo="fat" aria-pressed="false">fat-tree</button>
+      </span>
+      <button type="button" data-act="toggle">⏸ pause</button>
+      <button type="button" data-act="reset">↺ reset</button>
+      <span class="readout" data-readout style="margin-left: auto">delivered 0 · dropped 0 · capacity 100%</span>
+    </div>
+
+    <canvas data-canvas role="img" aria-label="封包在隨機 expander 與 fat-tree 上的灑流量與故障退化模擬；點擊節點可敲掉它"></canvas>
+
+    <figcaption>左半為 source、右半為 sink。<em>點任一節點把它敲掉</em>——random expander 上路徑會自動繞開、容量約等比例下降；fat-tree 上一旦敲掉 spine，整片 bisection 直接斷崖。Spraypoint 的灑流量行為在這裡簡化成「每個封包獨立隨機挑下一跳」。</figcaption>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-canvas-rng-spray');
+        const canvas = root.querySelector('[data-canvas]');
+        const ctx = canvas.getContext('2d');
+        const readout = root.querySelector('[data-readout]');
+        const toggleBtn = root.querySelector('[data-act="toggle"]');
+        const resetBtn = root.querySelector('[data-act="reset"]');
+        const topoBtns = root.querySelectorAll('[data-topo]');
+
+        function cssVar(name) {
+          return getComputedStyle(root).getPropertyValue(name).trim() || '#888';
+        }
+
+        let topo = 'rng';
+        let running = true;
+        let nodes = [];      // {x,y,layer,dead}
+        let edges = [];      // [a,b]
+        let adj = [];        // adjacency by node index (alive only computed on demand)
+        let packets = [];
+        let delivered = 0, dropped = 0;
+        let W = 0, H = 0;
+
+        const N_SRC = 6, N_SINK = 6;
+
+        function build() {
+          nodes = []; edges = []; packets = [];
+          delivered = 0; dropped = 0;
+          const rect = canvas.getBoundingClientRect();
+          W = rect.width; H = rect.height;
+
+          if (topo === 'fat') {
+            // fat-tree: src(leaf-left) -> agg-left -> spine -> agg-right -> sink(leaf-right)
+            const colsX = [0.08, 0.30, 0.50, 0.70, 0.92].map(f => f * W);
+            const layerCounts = [N_SRC, 4, 3, 4, N_SINK];
+            const layerStart = [];
+            layerCounts.forEach((c, li) => {
+              layerStart[li] = nodes.length;
+              for (let i = 0; i < c; i++) {
+                nodes.push({ x: colsX[li], y: (i + 1) / (c + 1) * H, layer: li, dead: false });
+              }
+            });
+            // fully connect adjacent layers
+            for (let li = 0; li < layerCounts.length - 1; li++) {
+              for (let a = 0; a < layerCounts[li]; a++) {
+                for (let b = 0; b < layerCounts[li + 1]; b++) {
+                  edges.push([layerStart[li] + a, layerStart[li + 1] + b]);
+                }
+              }
+            }
+          } else {
+            // random expander: src column, sink column, middle nodes scattered, random wiring
+            const N_MID = 14;
+            for (let i = 0; i < N_SRC; i++) nodes.push({ x: 0.07 * W, y: (i + 1) / (N_SRC + 1) * H, layer: 0, dead: false });
+            for (let i = 0; i < N_MID; i++) nodes.push({ x: (0.22 + Math.random() * 0.56) * W, y: (0.08 + Math.random() * 0.84) * H, layer: 1, dead: false });
+            for (let i = 0; i < N_SINK; i++) nodes.push({ x: 0.93 * W, y: (i + 1) / (N_SINK + 1) * H, layer: 2, dead: false });
+            const mids = nodes.map((n, i) => i).filter(i => nodes[i].layer === 1);
+            const srcs = nodes.map((n, i) => i).filter(i => nodes[i].layer === 0);
+            const sinks = nodes.map((n, i) => i).filter(i => nodes[i].layer === 2);
+            // each src wires to 3 random mids; each mid wires to 3 random other mids + maybe sinks
+            const seen = new Set();
+            function addEdge(a, b) { const k = a < b ? a + ',' + b : b + ',' + a; if (a !== b && !seen.has(k)) { seen.add(k); edges.push([a, b]); } }
+            srcs.forEach(s => { for (let k = 0; k < 3; k++) addEdge(s, mids[(Math.random() * mids.length) | 0]); });
+            sinks.forEach(s => { for (let k = 0; k < 3; k++) addEdge(s, mids[(Math.random() * mids.length) | 0]); });
+            mids.forEach(m => { for (let k = 0; k < 3; k++) addEdge(m, mids[(Math.random() * mids.length) | 0]); });
+          }
+          rebuildAdj();
+        }
+
+        function rebuildAdj() {
+          adj = nodes.map(() => []);
+          edges.forEach(([a, b]) => { adj[a].push(b); adj[b].push(a); });
+        }
+
+        function srcIndices() { return nodes.map((n, i) => i).filter(i => nodes[i].layer === 0 && !nodes[i].dead); }
+        function isSink(i) { const maxL = topo === 'fat' ? 4 : 2; return nodes[i].layer === maxL; }
+
+        function spawn() {
+          const srcs = srcIndices();
+          if (!srcs.length) return;
+          const s = srcs[(Math.random() * srcs.length) | 0];
+          packets.push({ at: s, prev: -1, x: nodes[s].x, y: nodes[s].y, hops: 0, alive: true, t: 0 });
+        }
+
+        function advance(p) {
+          // pick a random alive neighbour that moves rightward-ish; bias toward higher layer
+          const opts = adj[p.at].filter(n => !nodes[n].dead && n !== p.prev);
+          if (!opts.length) { p.alive = false; dropped++; return; }
+          // prefer neighbours with layer >= current (expander: random; fat-tree: forward)
+          const fwd = opts.filter(n => nodes[n].layer >= nodes[p.at].layer);
+          const pool = fwd.length ? fwd : opts;
+          const nxt = pool[(Math.random() * pool.length) | 0];
+          p.prev = p.at; p.at = nxt; p.hops++;
+          if (p.hops > 24) { p.alive = false; dropped++; return; }
+          if (isSink(nxt)) { p.alive = false; delivered++; }
+        }
+
+        let aliveCapBase = null;
+        function capacityPct() {
+          // capacity proxy = number of alive src->sink paths reachable, normalized
+          const aliveNodes = nodes.filter(n => !n.dead).length;
+          const total = nodes.length;
+          if (topo === 'fat') {
+            // if any spine layer fully dead -> 0; else proportional-ish but cliff on spine loss
+            const spineAlive = nodes.filter(n => n.layer === 2 && !n.dead).length;
+            const spineTotal = nodes.filter(n => n.layer === 2).length;
+            if (spineTotal > 0 && spineAlive === 0) return 0;
+            // each lost spine cuts a big chunk
+            return Math.round(100 * spineAlive / spineTotal * (aliveNodes / total));
+          }
+          return Math.round(100 * aliveNodes / total);
+        }
+
+        function draw() {
+          ctx.clearRect(0, 0, W, H);
+          // edges
+          ctx.lineWidth = 1;
+          ctx.strokeStyle = cssVar('--muted-2');
+          ctx.globalAlpha = 0.45;
+          edges.forEach(([a, b]) => {
+            if (nodes[a].dead || nodes[b].dead) return;
+            ctx.beginPath();
+            ctx.moveTo(nodes[a].x, nodes[a].y);
+            ctx.lineTo(nodes[b].x, nodes[b].y);
+            ctx.stroke();
+          });
+          ctx.globalAlpha = 1;
+          // packets
+          packets.forEach(p => {
+            if (!p.alive) return;
+            ctx.fillStyle = cssVar('--accent');
+            ctx.beginPath();
+            ctx.arc(p.x, p.y, 3, 0, Math.PI * 2);
+            ctx.fill();
+          });
+          // nodes
+          nodes.forEach((n, i) => {
+            ctx.beginPath();
+            ctx.arc(n.x, n.y, n.layer === 1 && topo === 'fat' ? 7 : 6, 0, Math.PI * 2);
+            if (n.dead) {
+              ctx.fillStyle = cssVar('--bg');
+              ctx.fill();
+              ctx.strokeStyle = cssVar('--muted-2');
+              ctx.lineWidth = 1;
+              ctx.stroke();
+            } else if (topo === 'fat' && n.layer === 2) {
+              ctx.fillStyle = cssVar('--ink-deep');  // spine — single point of bottleneck
+              ctx.fill();
+            } else if (n.layer === 0) {
+              ctx.fillStyle = cssVar('--sage-deep');
+              ctx.fill();
+            } else if (isSink(i)) {
+              ctx.fillStyle = cssVar('--sage-deep');
+              ctx.fill();
+            } else {
+              ctx.fillStyle = cssVar('--ink-soft');
+              ctx.fill();
+            }
+          });
+          // labels
+          ctx.font = '12px "Manrope", sans-serif';
+          ctx.fillStyle = cssVar('--muted');
+          ctx.fillText('source', 6, 14);
+          ctx.textAlign = 'right';
+          ctx.fillText('sink', W - 6, 14);
+          ctx.textAlign = 'left';
+          if (topo === 'fat') {
+            ctx.fillStyle = cssVar('--ink-deep');
+            ctx.textAlign = 'center';
+            ctx.fillText('spine', W * 0.5, H - 6);
+            ctx.textAlign = 'left';
+          }
+        }
+
+        let last = performance.now();
+        let acc = 0;
+        function frame(now) {
+          const dt = Math.min(0.05, (now - last) / 1000);
+          last = now;
+          if (running) {
+            acc += dt;
+            while (acc > 0.18) { spawn(); acc -= 0.18; }
+            packets.forEach(p => {
+              if (!p.alive) return;
+              p.t += dt;
+              if (p.t > 0.12) { p.t = 0; advance(p); }
+              // ease position toward current node
+              p.x += (nodes[p.at].x - p.x) * Math.min(1, dt * 12);
+              p.y += (nodes[p.at].y - p.y) * Math.min(1, dt * 12);
+            });
+            if (packets.length > 220) packets = packets.filter(p => p.alive).slice(-180);
+          }
+          draw();
+          readout.innerHTML = 'delivered ' + delivered + ' · dropped ' + dropped + ' · capacity <em>' + capacityPct() + '%</em>';
+          requestAnimationFrame(frame);
+        }
+
+        function resize() {
+          const dpr = window.devicePixelRatio || 1;
+          const rect = canvas.getBoundingClientRect();
+          canvas.width = rect.width * dpr;
+          canvas.height = rect.height * dpr;
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+          build();
+        }
+        new ResizeObserver(resize).observe(canvas);
+
+        canvas.addEventListener('click', (e) => {
+          const rect = canvas.getBoundingClientRect();
+          const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+          let best = -1, bestD = 1e9;
+          nodes.forEach((n, i) => {
+            const d = (n.x - mx) ** 2 + (n.y - my) ** 2;
+            if (d < bestD) { bestD = d; best = i; }
+          });
+          if (best >= 0 && bestD < 18 * 18) {
+            nodes[best].dead = !nodes[best].dead;
+          }
+        });
+
+        toggleBtn.addEventListener('click', () => {
+          running = !running;
+          toggleBtn.textContent = running ? '⏸ pause' : '▷ play';
+          last = performance.now();
+        });
+        resetBtn.addEventListener('click', () => { build(); });
+        topoBtns.forEach(b => b.addEventListener('click', () => {
+          topo = b.dataset.topo;
+          topoBtns.forEach(x => x.setAttribute('aria-pressed', x === b ? 'true' : 'false'));
+          build();
+        }));
+
+        requestAnimationFrame(frame);
+      })();
+    </script>
+  </figure>
+
+  <h2>expander graph：為什麼一張隨機接線的圖能贏過 fat-tree</h2>
+
+  <p>先把 fat-tree 的優點講清楚，才知道 RNG 在賭什麼。Clos／fat-tree 的迷人之處是 <em>非阻塞</em>（non-blocking）與 <em>可預測</em>：只要每一層的上行頻寬等於下行頻寬，理論上任意 src-sink 配對都能找到不衝突的路徑，而且因為層數固定，路徑長度是常數、轉發表是可枚舉的。代價藏在三個地方。第一，要做到非阻塞，spine 層必須堆足夠多的 router，router 數量隨規模呈超線性成長——每加一排 leaf，spine 就得跟著膨脹。第二，bisection bandwidth（把網路從中間切一刀、跨切面的總頻寬）全壓在 spine 上，spine 任何一顆 switch 掛掉，跨切面容量就掉一整塊。第三，擴容是離散的：fat-tree 的 radix（每顆 switch 的 port 數）決定了它能長到多大，要突破就得加一層、整個重畫。</p>
+
+  <p>expander graph 從另一個方向解這三件事。一張圖是好的 expander，意思是「任何一個節點子集都跟外界有很多條邊相連」——形式化講，任意大小不超過一半的頂點集合 S，從 S 連出去的邊數至少正比於 |S|，沒有任何子集能被少數幾條邊孤立起來。這個性質直接翻譯成網路的三個好處：<strong>path diversity</strong>（任兩點間有大量近乎等長的不相交路徑，流量天然分散）、<strong>高 bisection bandwidth</strong>（要把圖切兩半就得切斷大量邊，所以跨切面頻寬高且不集中在某一層）、<strong>漸進可擴張</strong>（隨機圖沒有「層」的概念，加機櫃就是再接一批隨機邊，不必重畫拓樸）。理論根源很老：1970 年代 expander graph 作為「連通性極強的稀疏圖」被提出，Valiant 在 1976 年就用它討論過 routing。真正讓它對工程有意義的是 Friedman 在 1991 年的證明——<em>一張隨機接線的網路，以極高機率，幾乎跟最佳的顯式 expander 構造一樣好</em>。也就是說，你不需要費力去設計一個數學上最優的拓樸，你只要「亂接」，接出來的圖就近乎最優。</p>
+
+  <p>這就是 RNG 的理論賭注：放棄可枚舉的 deterministic 拓樸，換取隨機圖的 path diversity 與 bisection。但「亂接近乎最優」是個漸進命題——它說的是 with high probability、是 N 夠大時。實務上的問題從來不是「隨機圖好不好」，2012 年的 Jellyfish 論文已經把這點論證得很清楚：同樣的 port 預算，隨機圖能塞進比 fat-tree 多約 25% 的 server，而且擴容無痛。Jellyfish 卡死的是另外三件事——<em>路由在隨機圖上很難（沒有層次就沒有現成的最短路轉發）、佈線更難（真正隨機的接線在機房裡無法施工）、運維變得不可預測（沒有規則拓樸就難以推理故障）</em>。RNG 的貢獻不在理論，在於把這三道工程牆一道一道拆掉。下面這張對照表把 fat-tree、Jellyfish、RNG 三者在每個維度上並排，點欄位標題可以重排。</p>
+
+  <figure class="vg-w-matter-of-fact-table vg-w-table-rng-lineage">
+    <style>
+      .vg-w-table-rng-lineage { overflow-x: auto; }
+      .vg-w-table-rng-lineage table { width: 100%; min-width: 520px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-rng-lineage caption { text-align: left; caption-side: top; font-family: var(--scribed); font-style: italic; color: var(--muted); font-size: var(--fs-sm); padding: var(--s-1) 0; }
+      .vg-w-table-rng-lineage thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; }
+      .vg-w-table-rng-lineage thead th[data-sort] { color: var(--accent-text); }
+      .vg-w-table-rng-lineage thead th[data-sort="asc"]::after { content: ' ▴'; font-size: 0.7em; }
+      .vg-w-table-rng-lineage thead th[data-sort="desc"]::after { content: ' ▾'; font-size: 0.7em; }
+      .vg-w-table-rng-lineage tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+      .vg-w-table-rng-lineage td.year { font-family: JetBrains Mono, monospace; font-variant-numeric: tabular-nums; color: var(--ink-deep); white-space: nowrap; }
+      .vg-w-table-rng-lineage td.k { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); white-space: nowrap; }
+      .vg-w-table-rng-lineage tbody tr:hover td { background: var(--bg-soft); }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/><path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+      </svg>
+      <span>click column header to sort · 4 columns × 5 rows</span>
+    </p>
+    <table>
+      <caption>從 expander 理論到 RNG 的譜系——年份、貢獻者、解掉了什麼、留下什麼沒解。點欄位標題排序。</caption>
+      <thead>
+        <tr>
+          <th data-key="year">年代</th>
+          <th data-key="who">里程碑</th>
+          <th data-key="give">帶來的</th>
+          <th data-key="gap">留下的缺口</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="year">1970s</td>
+          <td>expander graph 理論（Valiant 1976 用於 routing）</td>
+          <td>「稀疏卻連通性極強」的圖類，定義出 bisection／expansion 指標</td>
+          <td>純理論，沒人把它接成實體網路</td>
+        </tr>
+        <tr>
+          <td class="year">1991</td>
+          <td>Friedman 證明</td>
+          <td>隨機接線的圖以極高機率逼近最佳 expander——「亂接」就近乎最優</td>
+          <td>是漸進命題，對「怎麼路由／佈線／運維」無話可說</td>
+        </tr>
+        <tr>
+          <td class="year">2012</td>
+          <td>Jellyfish（隨機圖資料中心拓樸）</td>
+          <td>同 port 預算多塞 ~25% server、擴容無痛、bisection 高</td>
+          <td>路由難、佈線無法施工、運維不可預測——三牆未破</td>
+        </tr>
+        <tr>
+          <td class="year">2026</td>
+          <td>RNG · Spraypoint（Bernardi, Mahajan, Comandur）</td>
+          <td>沿圖 expansion 灑流量，不爆 router forwarding state</td>
+          <td>保證是 stochastic 而非 deterministic（被論證為更誠實）</td>
+        </tr>
+        <tr>
+          <td class="year">2026</td>
+          <td>RNG · ShuffleBox</td>
+          <td>被動光學裝置 + 隨機 box 間佈線 → quasi-random 拓樸，可施工</td>
+          <td>quasi-random 而非真隨機（行為上等價）</td>
+        </tr>
+      </tbody>
+    </table>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-table-rng-lineage');
+        const headers = root.querySelectorAll('thead th');
+        const tbody = root.querySelector('tbody');
+        let activeKey = null, asc = true;
+        headers.forEach((h, idx) => h.addEventListener('click', () => {
+          const key = h.dataset.key;
+          if (activeKey === key) asc = !asc; else { activeKey = key; asc = true; }
+          headers.forEach(x => x.removeAttribute('data-sort'));
+          h.setAttribute('data-sort', asc ? 'asc' : 'desc');
+          const rows = Array.from(tbody.querySelectorAll('tr'));
+          rows.sort((a, b) => {
+            const av = a.children[idx].textContent.trim();
+            const bv = b.children[idx].textContent.trim();
+            const an = parseFloat(av), bn = parseFloat(bv);
+            const cmp = (!Number.isNaN(an) && !Number.isNaN(bn)) ? an - bn : av.localeCompare(bv);
+            return asc ? cmp : -cmp;
+          });
+          rows.forEach(r => tbody.appendChild(r));
+        }));
+      })();
+    </script>
+  </figure>
+
+  <p>有一個容易混淆的點值得釐清：RNG 不是「無腦亂接」。Friedman 的定理保證的是「隨機接線在分布意義上近乎最優」，但任何一次具體的抽樣都可能抽到比較差的圖——可能某個區域恰好連得稀。RNG 的運維子系統正是處理這件事：在實體部署之前，先用數學模型對「這一次抽出來的具體拓樸」算出 expansion、bisection、最差情況路徑長度等指標，不合格就重抽或局部修補。也就是說隨機性被框在一個「先驗證、後佈線」的閘門後面——你享受隨機圖的統計優勢，但不接受任何一張碰巧很爛的圖。這跟 fat-tree「拓樸寫死在規格裡、不必驗證」是完全不同的工作流，卻換來了 fat-tree 給不起的彈性。</p>
+
+  <h2>Spraypoint：在不爆 router memory 的前提下沿著圖灑流量</h2>
+
+  <p>隨機圖最直接的路由難題是：fat-tree 因為有層次，每顆 switch 只要知道「往上送還是往下送」就夠了，forwarding state 小且規則；隨機圖沒有層，最短路徑路由意味著每顆 router 都得記住「到每個目的地的下一跳」，forwarding table 隨網路規模爆炸——這正是 Jellyfish 卡住的第一道牆。一個能裝幾萬顆 router 的網路，如果每顆都要存全域最短路表，router 的 TCAM／SRAM 根本放不下。</p>
+
+  <p>Spraypoint 的解法不是「算出最短路再塞進表裡」，而是<em>利用圖的 expansion 性質直接灑</em>。原文的說法是：Spraypoint 是「a forwarding scheme that exploits the expansion properties of the graph to distribute traffic without overwhelming router memory with forwarding state」。直覺是這樣——在一個好的 expander 上，你不需要知道最短路，因為「往隨機方向多跳幾步」就能以極高機率快速逼近任何目的地（這是 expander 的混合性質：random walk 在 expander 上收斂得非常快）。把流量沿著圖的多條路徑灑開（spray），不但天然做了 load balancing，還把每顆 router 需要維護的 state 從「全域目的地表」壓成「局部規則」。封包不再沿單一最短路前進，而是被分散到大量近乎等長的路徑上——這正是 path diversity 從理論性質變成可用頻寬的地方。</p>
+
+  <pre data-kind="pseudocode"><code><em>// fat-tree：每顆 switch 需要全域可達的 forwarding state</em>
+forward(pkt):
+    nexthop = forwarding_table[pkt.dst]   <em>// 表大小 ∝ 目的地數量</em>
+    send(pkt, nexthop)
+
+<em>// Spraypoint：利用 expansion，沿多路徑灑、不存全域最短路</em>
+forward(pkt):
+    if at_destination(pkt): deliver(pkt); return
+    <em>// 在一個好的 expander 上，往「擴張方向」的隨機鄰居推進，</em>
+    <em>// 期望跳數 ~ O(log N)，state 只需局部資訊</em>
+    cand = expansion_neighbors(local_topology)   <em>// 局部、規則</em>
+    nexthop = spray_pick(cand, pkt.flow_hash)    <em>// 分散到多路徑</em>
+    send(pkt, nexthop)
+
+<em>// 關鍵差異：forwarding state 不再 ∝ N，</em>
+<em>// 而是 ∝ 本地 degree——這是 Jellyfish 卡死、RNG 解開的那道牆</em></code></pre>
+
+  <p>這裡有個工程上的張力要說清楚：灑流量會打亂封包順序，也可能讓某些封包繞遠路。Spraypoint 之所以可行，前提是底層拓樸真的是個好 expander——expansion 夠好，random walk 的混合時間（mixing time）就短，平均跳數壓在 O(log N) 而不是發散，繞遠的尾巴才不會太長。這把「拓樸品質」跟「路由可行性」綁在一起：拓樸不夠 expander，Spraypoint 的灑就會退化成漫無目的的亂走。所以前一節講的「先驗證拓樸的 expansion 再佈線」不只是運維潔癖，它是 Spraypoint 能不能成立的前置條件。把這三件事連起來看——ShuffleBox 保證接出來的是 quasi-random 的好 expander、運維模型保證這次抽樣確實夠好、Spraypoint 才能放心地沿 expansion 灑而不必背全域路表。</p>
+
+  <p>結果是 fat-tree 給不起的數字。原文列的對照是：相較 fat-tree，RNG 用<strong>少 69% 的 router</strong>、達到<strong>高 33% 的吞吐量</strong>、<strong>低 40% 的網路功耗</strong>、<strong>低 27% 的營運成本</strong>。少 69% router 而吞吐量還高 33%，這個組合不是調參調出來的，是拓樸層面的：fat-tree 的 router 預算大量花在「為了非阻塞而堆的 spine」，expander 把那筆預算省下來，同樣的 port 拿去拉 path diversity。下面這張圖把四個指標並排——注意 router 數量與吞吐量是反向的（少而快），這才是重點。</p>
+
+  <figure class="vg-w-data-driven-chart vg-w-chart-rng-metrics">
+    <style>
+      .vg-w-chart-rng-metrics { display: grid; gap: var(--s-2); }
+      .vg-w-chart-rng-metrics svg { width: 100%; height: auto; }
+      .vg-w-chart-rng-metrics figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+    <svg viewBox="0 0 720 340" preserveAspectRatio="xMidYMid meet" role="img" aria-label="RNG 相較 fat-tree 的四項指標：router 少 69%、吞吐高 33%、功耗低 40%、opex 低 27%">
+      <g id="vg-w-chart-rng-metrics-axes"></g>
+      <g id="vg-w-chart-rng-metrics-series"></g>
+    </svg>
+    <figcaption>RNG 相對 fat-tree 的四項指標（fat-tree = 100% 基準，灰色虛線）。綠色代表「越低越好」（router 數、功耗、opex），赤色代表「越高越好」（吞吐量）。資料：<a href="https://perspectives.mvdirona.com/2026/06/flat-datacenter-networks-at-scale/">mvdirona — Flat Datacenter Networks at Scale</a>。</figcaption>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-chart-rng-metrics');
+        const axesG = root.querySelector('#vg-w-chart-rng-metrics-axes');
+        const seriesG = root.querySelector('#vg-w-chart-rng-metrics-series');
+        const NS = 'http://www.w3.org/2000/svg';
+        function el(tag, attrs) { const e = document.createElementNS(NS, tag); for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v); return e; }
+
+        // [label, RNG value as % of fat-tree, higherIsBetter]
+        const data = [
+          ['router 數量', 31, false],   // 69% fewer -> 31% of baseline
+          ['吞吐量', 133, true],         // 33% higher
+          ['網路功耗', 60, false],       // 40% lower
+          ['營運成本 opex', 73, false],  // 27% lower
+        ];
+
+        const X0 = 90, X1 = 690, Y0 = 285, Y1 = 40;
+        const maxY = 140;
+        const yOf = v => Y0 - (v / maxY) * (Y0 - Y1);
+        const bandW = (X1 - X0) / data.length;
+        const barW = bandW * 0.46;
+
+        // axes
+        axesG.appendChild(el('line', { x1: X0, y1: Y0, x2: X1, y2: Y0, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+        axesG.appendChild(el('line', { x1: X0, y1: Y0, x2: X0, y2: Y1, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+        for (let v = 0; v <= maxY; v += 20) {
+          const y = yOf(v);
+          axesG.appendChild(el('line', { x1: X0 - 4, y1: y, x2: X0, y2: y, stroke: 'var(--muted-2)' }));
+          const t = el('text', { x: X0 - 8, y: y + 4, 'text-anchor': 'end', 'font-family': 'Manrope, sans-serif', 'font-size': 12, fill: 'var(--muted)' });
+          t.textContent = v + '%';
+          axesG.appendChild(t);
+        }
+        // baseline (fat-tree = 100%)
+        const yb = yOf(100);
+        axesG.appendChild(el('line', { x1: X0, y1: yb, x2: X1, y2: yb, stroke: 'var(--ink-deep)', 'stroke-width': 1.2, 'stroke-dasharray': '5,4' }));
+        const bl = el('text', { x: X1, y: yb - 7, 'text-anchor': 'end', 'font-family': 'IM Fell English, serif', 'font-style': 'italic', 'font-size': 13, fill: 'var(--ink-deep)' });
+        bl.textContent = 'fat-tree 基準 100%';
+        axesG.appendChild(bl);
+        // y title
+        const yl = el('text', { x: 22, y: (Y0 + Y1) / 2, 'text-anchor': 'middle', 'font-family': 'EB Garamond, serif', 'font-size': 13, fill: 'var(--muted)', transform: 'rotate(-90 22 ' + ((Y0 + Y1) / 2) + ')' });
+        yl.textContent = '相對 fat-tree (%)';
+        axesG.appendChild(yl);
+
+        data.forEach((d, i) => {
+          const cx = X0 + bandW * (i + 0.5);
+          const top = yOf(d[2] ? d[1] : d[1]);
+          const fill = d[2] ? 'var(--accent)' : 'var(--sage-deep)';
+          seriesG.appendChild(el('rect', { x: cx - barW / 2, y: Math.min(top, yb), width: barW, height: Math.abs(top - yb), fill: fill, opacity: 0.85 }));
+          // value label
+          const vt = el('text', { x: cx, y: top - 8, 'text-anchor': 'middle', 'font-family': 'JetBrains Mono, monospace', 'font-size': 14, fill: d[2] ? 'var(--accent-text)' : 'var(--sage-deep)' });
+          vt.textContent = d[1] + '%';
+          seriesG.appendChild(vt);
+          // delta annotation
+          const delta = d[1] >= 100 ? ('+' + (d[1] - 100) + '%') : ('−' + (100 - d[1]) + '%');
+          const dt = el('text', { x: cx, y: top - 26, 'text-anchor': 'middle', 'font-family': 'IM Fell English, serif', 'font-style': 'italic', 'font-size': 12, fill: 'var(--muted)' });
+          dt.textContent = delta;
+          seriesG.appendChild(dt);
+          // x label
+          const xt = el('text', { x: cx, y: Y0 + 20, 'text-anchor': 'middle', 'font-family': 'Manrope, sans-serif', 'font-size': 12, fill: 'var(--muted)' });
+          xt.textContent = d[0];
+          axesG.appendChild(xt);
+        });
+
+        // legend
+        const lg = el('g', { 'font-family': 'Manrope, sans-serif', 'font-size': 12 });
+        lg.appendChild(el('rect', { x: 110, y: 52, width: 12, height: 12, fill: 'var(--sage-deep)', opacity: 0.85 }));
+        const l1 = el('text', { x: 128, y: 62, fill: 'var(--ink)' }); l1.textContent = '越低越好'; lg.appendChild(l1);
+        lg.appendChild(el('rect', { x: 220, y: 52, width: 12, height: 12, fill: 'var(--accent)', opacity: 0.85 }));
+        const l2 = el('text', { x: 238, y: 62, fill: 'var(--ink)' }); l2.textContent = '越高越好'; lg.appendChild(l2);
+        seriesG.appendChild(lg);
+      })();
+    </script>
+  </figure>
+
+  <h2>ShuffleBox：把隨機性做成可佈線的被動光學硬體</h2>
+
+  <p>Jellyfish 卡死的第二道牆是佈線。一張真正隨機的圖，意味著機房裡有成千上萬條光纖以「沒有規則」的方式從任一機櫃連到任一機櫃——這在施工上是惡夢：無法畫線材表、無法批量採購固定長度的線、無法讓技師照圖施工、壞了無法定位。「隨機」在數學上是優點，在物理佈線上是不可施工。</p>
+
+  <p>ShuffleBox 是 RNG 化解這道牆的關鍵：它是一個<em>被動光學裝置</em>，原文描述為「a passive optical device whose internal wiring combined with randomized ShuffleBox-to-ShuffleBox cabling yields 'quasi-random' graphs that behave like truly random graphs」。拆開看是兩層隨機的疊加。第一層是 ShuffleBox 內部的固定接線——盒子裡的光纖按某個固定但「打散」的 permutation 接好，這是出廠就定死的、可大量複製的硬體，不需要現場施工。第二層是 ShuffleBox 之間的接線本身帶一點隨機。兩層疊起來，產生的不是真隨機圖，而是 <em>quasi-random</em>（準隨機）圖——但它在 expansion、bisection、path diversity 這些對網路真正重要的指標上，行為跟真隨機圖一樣好。這正好踩在 Friedman 定理的精神上：你不需要真隨機，你只需要一個在統計性質上跟隨機圖無法區分的圖。</p>
+
+  <p>「被動」這個詞是 ShuffleBox 的工程核心，值得多說一句。被動光學裝置沒有電子元件、不耗電、不發熱、幾乎不會壞——隨機性被固化進一塊無源的玻璃與光纖裡，而不是靠一台會故障的交換機去動態產生。這把「隨機拓樸」的成本從「每次都要現場亂接」降到「採購一批標準化的盒子、照規則插上」。技師看到的是規則的、可重複的佈線（盒子 A 的 port 連盒子 B 的 port），而 expander 的隨機性藏在盒子內部與盒間 permutation 裡——施工複雜度跟 fat-tree 同級，拓樸性質卻是隨機圖等級。下面這張 SVG 把這兩層隨機畫出來：左邊是技師眼中規則的 box-to-box 佈線，右邊是它在邏輯上等價的 quasi-random 圖。</p>
+
+  <figure class="vg-w-shufflebox-diagram vg-w-arch-rng-shufflebox" data-svg-scroll="720">
+    <svg viewBox="0 0 720 320" role="img" aria-label="ShuffleBox 的兩層隨機：左為規則的 box-to-box 物理佈線，右為等價的 quasi-random 邏輯圖" style="width: 100%; height: auto;">
+      <style>
+        .vg-w-arch-rng-shufflebox text { font-family: EB Garamond, serif; font-size: 13px; }
+        .vg-w-arch-rng-shufflebox .label { font-family: IM Fell English, serif; font-style: italic; }
+        .vg-w-arch-rng-shufflebox .head { font-family: IM Fell English, serif; font-style: italic; font-size: 14px; }
+        .vg-w-arch-rng-shufflebox .tiny { font-family: JetBrains Mono, monospace; font-size: 10px; }
+      </style>
+
+      <!-- left: physical, regular -->
+      <text x="170" y="28" text-anchor="middle" fill="var(--ink)" class="head">技師眼中：規則 box-to-box 佈線</text>
+      <!-- two shuffleboxes as rounded rects -->
+      <rect x="40" y="60" width="100" height="200" rx="6" fill="var(--bg-soft)" stroke="var(--ink-deep)" stroke-width="1.5"/>
+      <text x="90" y="80" text-anchor="middle" fill="var(--ink-deep)" class="label">ShuffleBox A</text>
+      <rect x="200" y="60" width="100" height="200" rx="6" fill="var(--bg-soft)" stroke="var(--ink-deep)" stroke-width="1.5"/>
+      <text x="250" y="80" text-anchor="middle" fill="var(--ink-deep)" class="label">ShuffleBox B</text>
+      <!-- internal fixed permutation inside A (the "hidden" randomness) -->
+      <g stroke="var(--accent)" stroke-width="1.2" opacity="0.7" fill="none">
+        <path d="M48 110 C 90 110, 90 200, 132 200"/>
+        <path d="M48 140 C 90 140, 90 110, 132 110"/>
+        <path d="M48 170 C 90 170, 90 230, 132 230"/>
+        <path d="M48 200 C 90 200, 90 140, 132 140"/>
+        <path d="M48 230 C 90 230, 90 170, 132 170"/>
+      </g>
+      <text x="90" y="278" text-anchor="middle" fill="var(--accent-text)" class="tiny">內部固定 permutation（出廠定死）</text>
+      <!-- regular cabling A->B -->
+      <g stroke="var(--muted)" stroke-width="1.4">
+        <line x1="140" y1="110" x2="200" y2="110"/>
+        <line x1="140" y1="140" x2="200" y2="140"/>
+        <line x1="140" y1="170" x2="200" y2="170"/>
+        <line x1="140" y1="200" x2="200" y2="200"/>
+        <line x1="140" y1="230" x2="200" y2="230"/>
+      </g>
+      <text x="170" y="300" text-anchor="middle" fill="var(--muted)" class="tiny">box 間佈線：規則、可施工、可批量採購</text>
+
+      <!-- divider -->
+      <line x1="360" y1="50" x2="360" y2="290" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="3,4"/>
+      <text x="360" y="170" text-anchor="middle" fill="var(--muted)" class="label" transform="rotate(-90 360 170)">邏輯等價 ≈</text>
+
+      <!-- right: logical quasi-random graph -->
+      <text x="540" y="28" text-anchor="middle" fill="var(--ink)" class="head">邏輯上：quasi-random expander</text>
+      <!-- scattered nodes + random edges -->
+      <g stroke="var(--sage-deep)" stroke-width="1.1" opacity="0.65" fill="none">
+        <line x1="430" y1="90" x2="560" y2="150"/>
+        <line x1="430" y1="90" x2="500" y2="230"/>
+        <line x1="560" y1="150" x2="650" y2="100"/>
+        <line x1="560" y1="150" x2="620" y2="240"/>
+        <line x1="500" y1="230" x2="620" y2="240"/>
+        <line x1="500" y1="230" x2="650" y2="100"/>
+        <line x1="430" y1="90" x2="650" y2="100"/>
+        <line x1="650" y1="100" x2="620" y2="240"/>
+        <line x1="560" y1="150" x2="500" y2="230"/>
+        <line x1="430" y1="180" x2="560" y2="150"/>
+        <line x1="430" y1="180" x2="620" y2="240"/>
+        <line x1="430" y1="180" x2="430" y2="90"/>
+      </g>
+      <g fill="var(--ink-soft)">
+        <circle cx="430" cy="90" r="7"/>
+        <circle cx="430" cy="180" r="7"/>
+        <circle cx="560" cy="150" r="7"/>
+        <circle cx="500" cy="230" r="7"/>
+        <circle cx="650" cy="100" r="7"/>
+        <circle cx="620" cy="240" r="7"/>
+      </g>
+      <text x="540" y="300" text-anchor="middle" fill="var(--sage-deep)" class="tiny">每點 degree 相近、無中心、任意子集都連得出去</text>
+    </svg>
+    <figcaption>同一套硬體的兩種看法。左：技師施工時看到的是規則的 box-to-box 佈線，隨機性鎖在 ShuffleBox 內部固定的 permutation 與盒間佈線裡。右：這套接線在邏輯上等價於一張 quasi-random expander——無中心、degree 均勻、任意子集都有大量連外邊。被動光學意味著這塊隨機性不耗電、不發熱、幾乎不壞。</figcaption>
+  </figure>
+
+  <p>把 ShuffleBox 跟運維子系統連起來看，就能理解 RNG 為什麼能「先驗證再佈線」。因為拓樸是由「ShuffleBox 內部 permutation」加「盒間佈線方案」這兩個可枚舉的參數決定的，工程團隊可以在還沒插任何一條線之前，先把這組參數餵進數學模型、算出整張圖的 expansion 與 bisection、確認它是個夠好的 expander，然後才生成「port-by-port 的安裝指令」交給技師。原文特別點出 RNG「designed to work with the exact same routers and optics already deployed in fat-tree data centers」——它不需要新硬體，省下的成本來自拓樸本身，而不是換一批昂貴的設備。這也是為什麼 27% 的 opex 降幅是可信的：少 69% router、低 40% 功耗，本來就是 opex 的兩個大頭，再加上「用既有設備、施工複雜度不變」，營運面沒有引入新的長期負擔。</p>
+
+  <h2>stochastic 比假裝 deterministic 更誠實</h2>
+
+  <p>RNG 最容易被攻擊的點，是它的效能保證是<em>機率性</em>的而非<em>絕對</em>的。fat-tree 可以拍胸脯說「只要拓樸照規格接好、沒有故障，任意配對都非阻塞」；RNG 只能說「以極高機率，這張圖的 expansion 不低於某個值」。直覺上前者聽起來更可靠。RNG 團隊的反駁很鋒利：原文指出，「Fat-tree guarantees are also effectively stochastic once you account for real-world failures, which are frequent at scale. RNG simply makes the stochastic nature explicit.」——fat-tree 的保證一旦把「現實中無時無刻都有元件在壞」算進去，本來就是機率性的；RNG 只是把這件事攤開來講。</p>
+
+  <p>這個論點的力道，在故障退化的形狀上看得最清楚。fat-tree 的「非阻塞」是一個建立在「沒有故障」假設上的保證——而在幾萬顆 router 的規模下，「沒有故障」從來不成立，always-on 的真相是「隨時有 1% 的元件壞著」。一旦 spine switch 壞了，fat-tree 的退化是<em>斷崖式</em>的：跨切面的 bisection 集中在 spine，掉一顆 spine 就削掉一整塊容量，掉幾顆就可能讓某些 src-sink 配對徹底斷線。RNG 的退化是<em>等比例</em>的——原文的數字是「losing 1% of routers results in a roughly 1% capacity loss」，掉 1% 的 router 大約只掉 1% 的容量。原因正是 expander 的定義：沒有任何子集能被少數邊孤立，也就沒有「打掉它就斷一片」的單點。容量像氣球漏氣一樣平滑地下降，而不是像玻璃一樣某一點裂開就碎。</p>
+
+  <p>所以「誠實」不是修辭。一個寫死 deterministic 保證的系統，把「故障」當成規格之外的例外處理——而例外恰恰是規模下的常態，於是真實行為（斷崖）跟承諾（非阻塞）之間出現一道你只能在事故時才發現的鴻溝。一個明說自己 stochastic 的系統，把故障放進模型的核心：它不承諾「永不阻塞」，它承諾「容量隨損壞等比例平滑退化」——而這個承諾在故障常態化的世界裡，是真的能兌現的。把這件事翻成維運語言：fat-tree 給你一條漂亮但會突然斷裂的繩子，RNG 給你一條稍微鬆一點、但你拉斷一股它只少一股力的纜繩。回到最上面那個 canvas——切到 fat-tree、敲掉中間那顆深藍色的 spine，看 capacity 怎麼掉；再切回 random expander、隨便敲掉幾顆，看它怎麼只少一點點。那個視覺差距，就是「誠實的機率保證」跟「會碎的絕對保證」之間的全部差別。</p>
+
+  <p>退一步看，RNG 給我們的不只是一個更省的網路，而是一個關於「保證」的方法論轉向：在故障是常態而非例外的尺度下，把不確定性顯式地寫進設計，比把它藏進「正常情況下」的小字裡更可靠。expander 理論從 1970 年代躺到現在，Friedman 在 1991 年就證明「亂接近乎最優」，Jellyfish 在 2012 年就指出該怎麼用——缺的從來不是理論，是把路由、佈線、運維三道工程牆一起拆掉的決心。Spraypoint、ShuffleBox、外加「先驗證後佈線」的運維模型，補上的正是這三塊。</p>
+
+  <p class="vg-deep-closer"><strong>What this enables</strong>：當網路不再假裝自己永不故障、而是把隨機性與退化曲線寫進設計核心，資料中心就能用既有的 router 與光學設備、少 69% 的 router、達到高 33% 的吞吐量，並換來「掉 1% router 只掉 1% 容量」的平滑退化——一張誠實承認自己是機率的網路，比一張假裝確定的網路更耐得住規模。</p>
+</div>
