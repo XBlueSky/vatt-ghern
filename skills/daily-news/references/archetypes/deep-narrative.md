@@ -110,3 +110,20 @@ post's voice.
   "...": "..."
 }
 ```
+
+## Engagement
+
+Register: dramatize through stakes and sequence — this is the one
+archetype allowed to feel like a story being told. Tension comes from
+what the actors did not yet know, and from decisions that could not be
+taken back. Stay on persona.md's measured floor: drama from facts and
+ordering, never from exclamation or invented color.
+
+- Hook patterns: in medias res (the moment things broke); the quiet
+  anomaly nobody noticed; the decision that looked obviously right.
+- Tension sources: information asymmetry (reader knows more than the
+  actors did), irreversibility, the clock.
+- Pacing: scene → mechanism → consequence beats. Short sentences at
+  turning points; let one long sentence carry a complex chain when
+  the reader already has the pieces. End mid-sections on facts or
+  open questions, not summaries (zh-tw-prose.md §6/§7).

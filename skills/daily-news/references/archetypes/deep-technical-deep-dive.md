@@ -100,3 +100,18 @@ methodology):
   "...": "..."
 }
 ```
+
+## Engagement
+
+Register: cool. The mechanism's elegance carries the post — your job
+is to stage it, not to cheer for it. The reader's pull is "how can
+that possibly work?", answered layer by layer.
+
+- Hook patterns: the impossible number (a result that sounds wrong
+  until the mechanism explains it); the constraint that should make
+  the design infeasible.
+- Tension sources: the gap between the headline result and the
+  reader's mental cost model; each layer of the descent resolving one
+  piece and exposing the next.
+- Pacing: alternate dense mechanism paragraphs with one-line
+  landings. Numbers do the emotional work; adjectives do not.

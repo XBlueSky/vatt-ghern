@@ -29,6 +29,10 @@
 //     (per-widget screenshots are recommended but not strictly required —
 //      the four whole-page screenshots are the minimum proof)
 //
+//   src/posts/YYYY/MM/DD/<slug>.ledger.json   # Step 7b/7.6 reading ledger,
+//     COMMITTED next to the post (presence-only here; schema + resolution
+//     validation is check-claim-ledger.mjs's job)
+//
 // Usage:
 //   node skills/daily-news/scripts/check-quality-gate-evidence.mjs src/posts/YYYY/MM/DD/
 //
@@ -63,7 +67,6 @@ const dateSlug = `${parts[0]}-${parts[1]}-${parts[2]}`;
 
 const qualityDir = `/tmp/vg-quality-${dateSlug}`;
 const auditDir = `/tmp/vg-audit-${dateSlug}`;
-
 const ROLLUP_ARCHETYPES = new Set(["weekly-rollup", "monthly-rollup"]);
 
 const slugs = readdirSync(targetDir)
@@ -111,6 +114,21 @@ if (!isRollupDir && !existsSync(qualityDir)) {
       violations.push(`Step 7.5: missing reviewer A output for ${slug} (expected ${a})`);
     if (!existsSync(b))
       violations.push(`Step 7.5: missing reviewer B output for ${slug} (expected ${b})`);
+  }
+}
+
+// --- Step 7.6 evidence: committed reading ledger per post ---
+// Rollup posts synthesize from already-published roundups (no new claims),
+// so Step 7.6 does not run for them — same guard as Step 7.5.
+if (!isRollupDir) {
+  for (const slug of slugs) {
+    const p = join(norm, `${slug}.ledger.json`);
+    if (!existsSync(p))
+      violations.push(
+        `Step 7.6: missing committed reading ledger for ${slug} (expected ${p}). ` +
+          `Authors write it while reading sources (SKILL.md Step 7b); there is ` +
+          `no skip clause.`
+      );
   }
 }
 
@@ -182,6 +200,7 @@ if (!isRollupDir && deepCount < 3) {
         ["url", "refill", "exhausted"],
         ["step 7.5", "blocking"],
         ["step 8.5", "blocking"],
+        ["step 7.6", "unverifiable"],
       ];
       const containsBanned = bannedSubstrings.find((s) => reason.includes(s));
       if (containsBanned) {
@@ -191,7 +210,8 @@ if (!isRollupDir && deepCount < 3) {
             `wallclock / dispatch cost is NEVER a Step 5 reason to trim". ` +
             `If runtime evidence later showed Step 7.5 / 8.5 couldn't fit, ` +
             `say so with the explicit "Step 7.5 blocking..." / "Step 8.5 ` +
-            `blocking..." pattern; do not paraphrase it as "budget".`
+            `blocking..." / "Step 7.6 ... unverifiable ..." pattern; do not ` +
+            `paraphrase it as "budget".`
         );
       } else {
         const matches = legalPatterns.some((pat) =>
@@ -200,7 +220,7 @@ if (!isRollupDir && deepCount < 3) {
         if (!matches) {
           violations.push(
             `Step 5: deep-count justification reason "${parsed.reason}" ` +
-              `does not match any of the 5 legal structural reasons. See ` +
+              `does not match any of the 6 legal structural reasons. See ` +
               `SKILL.md Step 5c "Trimming N below 3 is ONLY legitimate ` +
               `when…" list.`
           );
@@ -235,5 +255,6 @@ if (violations.length > 0) {
 process.stdout.write(
   `OK: quality-gate evidence present for ${slugs.length} post(s) in ${targetDir}\n` +
     `  Step 7.5 reviewer artifacts: ${qualityDir}/\n` +
+    `  Step 7.6 reading ledgers: committed in ${targetDir}\n` +
     `  Step 8.5 screenshot artifacts: ${auditDir}/\n`
 );

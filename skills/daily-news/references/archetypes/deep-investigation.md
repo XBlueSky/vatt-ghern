@@ -111,3 +111,17 @@ Free. For investigations, common shapes:
   "...": "..."
 }
 ```
+
+## Engagement
+
+Register: suspense. The post is a hypothesis elimination — open
+questions pull the reader forward, so do not answer up-front what the
+structure is designed to converge on.
+
+- Hook patterns: the symptom that contradicts intuition; two facts
+  that cannot both be true.
+- Tension sources: each ruled-out hypothesis narrows the space; the
+  cost of the wrong answer; partial evidence pointing two ways.
+- Pacing: end sections on the next open question. The convergence
+  section is the payoff — spend the word budget there, not on the
+  setup.

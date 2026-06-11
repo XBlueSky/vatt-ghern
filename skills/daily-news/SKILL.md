@@ -316,6 +316,8 @@ reasons applies**:
    (record refill attempt in PR body)
 4. Step 7.5 blocking exhausted on a draft after 5 retries (Step 7.5c)
 5. Step 8.5 blocking exhausted on a draft after 5 iterations
+6. Step 7.6 fact-check: a high-load unverifiable claim unresolved
+   after 3 fix rounds (Step 7.6c)
 
 **"Budget / wallclock / dispatch cost" is NEVER a Step 5 reason to
 trim.** Steps 7.5 and 8.5 have their own runtime trim mechanisms
@@ -452,6 +454,9 @@ Each brief carries these fields:
 - `summary` — 2-3 sentences telling the sub-agent what to cover
 - `output_path` — `src/posts/YYYY/MM/DD/deep-<kebab-slug>.html`
 - `sidecar_path` — same path with `.11tydata.json`
+- `ledger_path` — same path with `.ledger.json` (the reading ledger
+  the author builds while fetching sources; see
+  `references/fact-check.md`)
 - `related_roundup` — `/YYYY/MM/DD/roundup/`
 - `recent_widgets` — a flat list of the `widget_templates` used by the last
   ~5 deep-stories, PLUS the hero each of today's *other* deep-stories is
@@ -498,8 +503,11 @@ Each sub-agent is constrained per the brief:
 - Tools allowed: WebFetch, Read, Write only.
 - No nested `Agent` dispatch, no Bash, no Edit on other days' posts,
   no git operations.
-- Writes ONE HTML to `output_path` + ONE sidecar to `sidecar_path`,
-  reports back with `{status, char_count, archetype, archetype_deviations}`.
+- Writes ONE HTML to `output_path` + ONE sidecar to `sidecar_path`
+  + ONE reading ledger to `ledger_path` (built while reading, per
+  `references/fact-check.md` § The authoring discipline), reports
+  back with `{status, char_count, archetype, archetype_deviations,
+  note_count, spine_points}`.
 
 If a sub-agent reports `BLOCKED` or `DONE_WITH_CONCERNS`:
 
@@ -513,11 +521,13 @@ If a sub-agent reports `BLOCKED` or `DONE_WITH_CONCERNS`:
 
 After all sub-agents return:
 
-1. Read each output HTML + sidecar back to confirm the files exist and
-   the sidecar parses as JSON.
+1. Read each output HTML + sidecar + ledger back to confirm the files exist and
+   the sidecar + ledger parse as JSON.
 2. Verify per-file invariants the sub-agent was told to honour:
-   - Prose ≥ 500 lines (HTML lines excluding inside `<script>`,
-     `<style>`, `<svg>`, `<canvas>` blocks).
+   - Prose ≥ 4000 CJK chars in `.vg-post-body` (widget code inside
+     `<script>`, `<style>`, `<svg>`, `<canvas>` excluded) — same floor
+     `archetype-check.mjs` enforces mechanically in Step 8. A floor,
+     not a target (tier-3 §11: density > length).
    - `<p class="vg-deep-opener">` and `<p class="vg-deep-closer"><strong>`.
    - ≥ 3 widgets total (count of elements with `class="vg-w-*"`).
    - ≥ 1 widget is interactive (contains `<script>` OR `<input>`
@@ -526,6 +536,9 @@ After all sub-agents return:
    - Body matches the picked archetype's H2 *count range* (phrasing free).
    - Sidecar contains `widget_count`, `widget_questions`,
      `widget_templates` arrays; lengths agree.
+   - Ledger contains a 5-7 point `spine`, non-empty `notes[]`, and a
+     `perspective` set per source (`claims` may be empty — the
+     Step 7.6 checker fills it).
 3. **Count-conservation invariant** (added 2026-05-21 after PR #30):
    `N_deep_dispatched_in_step_7b == N_deep_written_files`. If a
    sub-agent BLOCKED or its output got dropped, refer to Step 5d's
@@ -644,7 +657,7 @@ ONE response (single message with multiple `Agent` tool blocks).
 Each reviewer:
 - Tools: Read only
 - Reads: post HTML + sidecar + rubric file + archetype reference (if
-  deep-story) + persona file
+  deep-story) + persona file + ledger spine (deep-story only)
 - Does NOT read: other posts, exemplars, other reviewer's output
 - Emits: ONE JSON object per the rubric's "Reviewer output format"
   schema
@@ -753,6 +766,103 @@ These populate the PR body sections defined in Step 9's template
 | Roundup blocking-drops | BLOCKED — do NOT open PR. Report status with roundup's blocking axes. |
 | Reviewer dispatch returns no output (network / tool failure) | Re-dispatch that reviewer once. Still nothing → treat as BLOCKING vote. |
 
+### Step 7.6: Fact-check gate (trace + authenticity)
+
+After Step 7.5 settles (prose is final modulo fact fixes), verify the
+posts against their reading ledgers, and the ledgers against the
+world. Authors built the ledgers while reading (Step 7b); this step
+proves the post only asserts what the notes contain (trace) and that
+the notes' quotes are real (authenticity). The standard lives in
+`references/fact-check.md`; the checker contract in
+`references/fact-check-brief.md`. Ledgers are committed next to the
+posts (`<slug>.ledger.json`) — they are PR-review evidence and the
+site's re-verification record.
+
+**No skip clause exists.** Same enforcement rule as Steps 7.5/8.5:
+if wall-clock or budget is tight, drop deep-stories (N → N-1) so the
+remaining gate fits — never ship unverified claims to ship more
+posts. `check-quality-gate-evidence.mjs` fails when ledgers are
+missing; `check-claim-ledger.mjs` fails when they are incomplete or
+unresolved.
+
+#### Step 7.6a: Dispatch fact-check sub-agents (parallel)
+
+For each post (1 roundup + N deep-stories), dispatch **1 checker
+sub-agent** with `subagent_type: general-purpose` and **`model:
+"opus"` required** (hedge-strength and source-independence judgment
+is design-grade; if Opus is unavailable, report BLOCKED rather than
+fall back). All ≤4 dispatches in ONE response. Each checker (tools:
+Read + WebFetch only):
+
+- **Trace pass** — extracts load-bearing claims from the post and
+  binds each to ledger notes (`note_ids`); unbound + unmarked =
+  trace failure.
+- **Authenticity pass** — re-fetches every ledger source; verifies
+  each used note's `quote` is really in the source at the recorded
+  `hedge` strength; judges independence (echo ≠ corroboration) and
+  timeliness; fills any `archive_url` the author left null.
+- For the roundup: creates `roundup.ledger.json` (claims-only — no
+  notes/spine), ≥1 claim per item lede verified against the item's
+  source URL.
+- Emits the completed ledger JSON; the parent writes it back to
+  `ledger_path`.
+
+#### Step 7.6b: Apply the action matrix
+
+Parent walks the returned claims: every claim whose `action` ≠
+`none` needs a fix per the fact-check.md action matrix (high-load
+`unverifiable` → correct from source or delete; unmarked `inferred`
+→ mark as inference or delete; `hedge_delta: inflated` → restore the
+note's hedging strength; high-load `pending` → alternate source or
+visible hedged attribution).
+
+#### Step 7.6c: Fix loop
+
+For each post with actionable claims, dispatch one retry author
+sub-agent (Opus, per Step 7b) whose brief contains the claim list,
+each claim's verdict + evidence + bound notes, and the **fix
+discipline**: deletion, hedging, marking-as-inference, or correcting
+to what the note's quote actually says ONLY — a fix may not
+introduce facts, numbers, or quotes absent from the ledger
+(zh-tw-prose.md §1). Trace failures may also be fixed by ADDING a
+note — but only with a verbatim quote from a re-fetched source.
+After fixes, re-dispatch the checker with the re-check variant brief
+(fixed claims only); parent merges verdicts and updates each claim's
+`resolution`, bumping `checker_rounds`.
+
+Iteration budget: up to **3 rounds** per post. A high-load
+`unverifiable` claim that survives 3 rounds drops the post
+(N → N-1), logged under `## Step 7.6 Fact-check drops`; if that post
+is the roundup, the routine is BLOCKED — do NOT open PR. Fixes here
+are deletions/hedges/corrections, narrow by construction — they do
+not re-trigger Step 7.5.
+
+#### Step 7.6d: Mechanical validation
+
+```bash
+node ${CLAUDE_PLUGIN_ROOT}/skills/daily-news/scripts/check-claim-ledger.mjs src/posts/YYYY/MM/DD/
+```
+
+Validates every committed ledger: schema + enums, spine 5-7, one
+perspective set per source, notes integrity (verbatim quote, hedge,
+interpretation separation), trace binding (`note_ids` non-empty or
+verdict `inferred`), coverage arithmetic, claim floors (deep ≥
+min(10, candidates); roundup ≥ item count), and resolution rules (no
+surviving high-load `unverifiable`, no `pending-fix`,
+`accepted-with-flag` only for medium/low-load `pending`). Exit 1 =
+the discipline is not done; the fix is to finish it, never to edit
+ledger fields to pass.
+
+#### Failure modes for Step 7.6
+
+| Scenario | Handling |
+|---|---|
+| Author sub-agent returns post but no ledger (or unparseable) | Treat as BLOCKED for that post in Step 7c — re-dispatch the brief; the ledger is not optional output. |
+| Checker emits malformed JSON | Re-dispatch that checker (up to 2 retries). Still malformed → treat the post as unverified: drop it (deep-story) or BLOCK (roundup). |
+| All ledger sources unreachable on re-fetch | Every claim is `pending`. High-load pendings need alternate sources or hedged attribution; if the post's core claims can't be supported, drop the post. |
+| Archive (web.archive.org) fails or times out | Non-blocking. `archive_url: null`, move on — the gate warns but does not fail. |
+| High-load `unverifiable` survives 3 fix rounds | Drop the post (N → N-1); roundup → BLOCKED, no PR. |
+
 ### Step 8: Self-check (mechanical)
 
 Run the validation scripts:
@@ -773,10 +883,14 @@ npx html-validate "_site/**/*.html"
 node ${CLAUDE_PLUGIN_ROOT}/tests/archetype-check.mjs _site/
 node ${CLAUDE_PLUGIN_ROOT}/tests/link-check.mjs
 
-# Quality-gate evidence: enforces that Step 7.5 and Step 8.5 actually ran
-# (reviewer JSON + screenshot artifacts present on disk). Exits 1 if any
-# post lacks evidence. Run this AFTER Steps 7.5 and 8.5 have completed
-# and BEFORE the commit / PR step.
+# Fact-check ledger validation (re-run of Step 7.6d — cheap, keep it in
+# the battery so a post-7.6 edit can't silently invalidate a ledger)
+node ${CLAUDE_PLUGIN_ROOT}/skills/daily-news/scripts/check-claim-ledger.mjs src/posts/YYYY/MM/DD/
+
+# Quality-gate evidence: enforces that Steps 7.5, 7.6, and 8.5 actually ran
+# (reviewer JSON + fact-check ledgers + screenshot artifacts present on
+# disk). Exits 1 if any post lacks evidence. Run this AFTER Steps 7.5, 7.6,
+# and 8.5 have completed and BEFORE the commit / PR step.
 node ${CLAUDE_PLUGIN_ROOT}/skills/daily-news/scripts/check-quality-gate-evidence.mjs src/posts/YYYY/MM/DD/
 ```
 
@@ -785,8 +899,8 @@ checks fail.
 
 `check-quality-gate-evidence.mjs` failing means the routine skipped a
 quality pass. The fix is **never** "delete the gate" or "stub the
-artifacts"; the fix is to actually run Step 7.5 / 8.5, or to drop deep
-stories until what remains fits the budget the routine can pay.
+artifacts"; the fix is to actually run Step 7.5 / 7.6 / 8.5, or to drop
+deep stories until what remains fits the budget the routine can pay.
 
 ### Step 8.5: Visual self-review (Playwright + multimodal)
 
@@ -1138,6 +1252,28 @@ For each post (roundup + deep-stories):
 
 - (none) — or batch_score=<N>, attempted retries=<M>, final state notes.
 
+## Step 7.6 Fact-check (REQUIRED — no "skipped" allowed)
+
+This section MUST contain per-post ledger summaries. Empty or
+"skipped" is an INVALID PR — `check-quality-gate-evidence.mjs` fails
+when ledgers are missing and `check-claim-ledger.mjs` fails when they
+are unresolved.
+
+For each post (roundup + deep-stories):
+- `<output_path>` — claims checked: <N> (of <M> candidates; <K> dropped low-load)
+  - trace: <N-bound> bound to notes · <N-inferred> marked inferred · <N-trace-failures> trace failures fixed
+  - verdicts: 已核實 <n1> · 待核實 <n2> · 推斷 <n3> · 不可核實 <n4>
+  - fixes applied: <list each — corrected / hedged / marked-inferred / deleted, with claim id + one-line what>
+  - accepted-with-flag: <list each pending medium/low-load claim the human should eyeball, with its source>
+  - unarchived sources: <list each archive_url: null, or (none)>
+  - Ledger: `src/posts/YYYY/MM/DD/<slug>.ledger.json` (committed — review the diff)
+  - Checker rounds: <N>
+
+## Step 7.6 Fact-check drops
+
+- (none) — or list: `<output_path>`, the claim(s) that could not be
+  corrected or deleted in 3 rounds, and the verdict evidence.
+
 ## Deep-story archetypes used today
 
 - {{deep_title_1}} — `narrative`
@@ -1160,6 +1296,7 @@ reason) fails the publish gate.
   - `Step 5d URL collision with refill pool exhausted: <details>`
   - `Step 7.5 BLOCKING retry exhausted on <slug> after 5 rounds`
   - `Step 8.5 Blocking visual issue unfixable after 5 iterations on <slug>`
+  - `Step 7.6 fact-check: high-load unverifiable claim unresolved after 3 rounds on <slug>`
 
 "Budget" / "wallclock" / "dispatch cost" / "Opus quota" is NOT a
 valid Step 5 reason — see SKILL.md Step 5c. If you wrote one of those
@@ -1205,17 +1342,22 @@ Do not merge. Wait for human review.
 | Step 7.5 content: post fails 5 BLOCKING retries | Drop the post (N → N-1). Log to PR body. Routine continues. |
 | Step 7.5 content: roundup fails 5 BLOCKING retries | Abort routine. Do NOT open PR. Report BLOCKED status. |
 | Step 7.5 content: inter-post diversity fails 2 retries | Accept and log to PR body. Routine continues. |
+| Step 7.6 fact-check: checker crashes or emits malformed JSON after retries | Treat the post as unverified: drop it if it's a deep-story; abort routine if it's the roundup. |
+| Step 7.6 fact-check: high-load unverifiable claim survives 3 fix rounds | Drop the post (N → N-1); log to PR body. Roundup → abort routine, do NOT open PR. |
 
 ## Output expectations summary
 
 A successful run produces:
 
-- 1 × `roundup.html` + `roundup.11tydata.json` in `src/posts/YYYY/MM/DD/`
-- 0-3 × `deep-<slug>.html` + matching `.11tydata.json` (count may be
-  reduced from intended N by Step 7.5 Blocking drops)
+- 1 × `roundup.html` + `roundup.11tydata.json` + `roundup.ledger.json`
+  (claims-only, written by the Step 7.6 checker) in `src/posts/YYYY/MM/DD/`
+- 0-3 × `deep-<slug>.html` + matching `.11tydata.json` + matching
+  `.ledger.json` (the committed reading ledger; count may be reduced
+  from intended N by Step 7.5 / 7.6 drops)
 - One git branch `daily/YYYY-MM-DD` pushed to origin
 - One PR open against `main` with the body template above filled in,
-  including the five Step 7.5 content-quality sections
+  including the five Step 7.5 content-quality sections and the two
+  Step 7.6 fact-check sections
 
 ## Why this is split across multiple references
 
