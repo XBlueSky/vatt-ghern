@@ -72,8 +72,14 @@ export function validateLedger(ledger, opts) {
 
   if (typeof ledger.output_path !== "string" || ledger.output_path === "") {
     v("ledger missing output_path");
-  } else if (opts.postPath && ledger.output_path !== opts.postPath) {
-    v(`output_path "${ledger.output_path}" does not match post path "${opts.postPath}"`);
+  } else if (opts.postPath) {
+    const tail = (p) => p.split("/").filter(Boolean).slice(-4).join("/");
+    if (tail(ledger.output_path) !== tail(opts.postPath)) {
+      v(
+        `output_path "${ledger.output_path}" does not match post path ` +
+          `"${opts.postPath}" (compared on trailing YYYY/MM/DD/<slug>.html)`
+      );
+    }
   }
   if (!Number.isInteger(ledger.checker_rounds) || ledger.checker_rounds < 1) {
     v("checker_rounds must be an integer >= 1");
@@ -92,6 +98,14 @@ export function validateLedger(ledger, opts) {
       v(
         `coverage mismatch: candidate_claims (${cov.candidate_claims}) != ` +
           `checked (${cov.checked}) + dropped_low_load (${cov.dropped_low_load})`
+      );
+    }
+    if (
+      Array.isArray(ledger.claims) &&
+      cov.checked !== ledger.claims.length
+    ) {
+      v(
+        `coverage.checked (${cov.checked}) != claims.length (${ledger.claims.length})`
       );
     }
     if (cov.dropped_low_load > 0) {

@@ -162,7 +162,7 @@ test("validateLedger: deep ledger requires a 5-7 point spine", () => {
   const short = makeDeepLedger({ spine: ["1", "2", "3"] });
   assert.ok(
     validateLedger(short, DEEP_OPTS).violations.some((v) =>
-      v.includes(`${SPINE_MIN}`)
+      v.includes("spine must be")
     )
   );
   const long = makeDeepLedger({
@@ -170,7 +170,7 @@ test("validateLedger: deep ledger requires a 5-7 point spine", () => {
   });
   assert.ok(
     validateLedger(long, DEEP_OPTS).violations.some((v) =>
-      v.includes(`${SPINE_MAX}`)
+      v.includes("spine must be")
     )
   );
 });
@@ -199,7 +199,7 @@ test("validateLedger: note fields validated (quote, hedge enum, url in sources)"
   const badHedge = makeDeepLedger({ notes: [makeNote({ hedge: "maybe" })] });
   assert.ok(
     validateLedger(badHedge, DEEP_OPTS).violations.some((v) =>
-      v.includes("hedge")
+      v.includes("bad hedge")
     )
   );
   const strayUrl = makeDeepLedger({
@@ -354,6 +354,20 @@ test("validateLedger: coverage arithmetic must balance", () => {
   );
 });
 
+test("validateLedger: coverage.checked must equal claims.length", () => {
+  const ledger = makeDeepLedger();
+  ledger.coverage = {
+    candidate_claims: 12,
+    checked: 12,
+    dropped_low_load: 0,
+  };
+  assert.ok(
+    validateLedger(ledger, DEEP_OPTS).violations.some((v) =>
+      v.includes("claims.length")
+    )
+  );
+});
+
 test("validateLedger: null archive_url warns; missing field fails", () => {
   const ledger = makeDeepLedger();
   ledger.sources[0].archive_url = null;
@@ -377,6 +391,34 @@ test("validateLedger: roundup floor is one claim per item", () => {
     roundupItems: 10,
   });
   assert.ok(violations.some((v) => v.includes("item")));
+});
+
+test("validateLedger: output_path matches on trailing date+slug, not absolute prefix", () => {
+  const ledger = makeDeepLedger();
+  const { violations } = validateLedger(ledger, {
+    ...DEEP_OPTS,
+    postPath: "/abs/checkout/elsewhere/src/posts/2026/06/12/deep-foo.html",
+  });
+  assert.deepEqual(violations, []);
+  const wrong = validateLedger(ledger, {
+    ...DEEP_OPTS,
+    postPath: "src/posts/2026/06/13/deep-foo.html",
+  });
+  assert.ok(wrong.violations.some((v) => v.includes("does not match")));
+});
+
+test("validateLedger: inferred claim with action none needs a note", () => {
+  const ledger = makeDeepLedger({
+    claims: [
+      makeClaim({ note_ids: [], verdict: "inferred", evidence: null, note: "" }),
+    ],
+  });
+  ledger.coverage = { candidate_claims: 1, checked: 1, dropped_low_load: 0 };
+  assert.ok(
+    validateLedger(ledger, DEEP_OPTS).violations.some((v) =>
+      v.includes("needs a note")
+    )
+  );
 });
 
 test("countRoundupItems: counts zero-padded item card ids", () => {
@@ -415,7 +457,7 @@ test("CLI: committed ledgers next to posts exit 0", () => {
   );
   writeFileSync(join(postsDir, "deep-foo.html"), "<p>內文</p>");
   const ledger = makeDeepLedger({
-    output_path: join(postsDir, "deep-foo.html"),
+    output_path: "src/posts/2026/06/12/deep-foo.html",
   });
   writeFileSync(join(postsDir, "deep-foo.ledger.json"), JSON.stringify(ledger));
   const { status, output } = runCli([postsDir]);
@@ -446,7 +488,7 @@ test("CLI: roundup floor uses item count from the HTML", () => {
     `<article id="item-01"></article><article id="item-02"></article><article id="item-03"></article>`
   );
   const ledger = makeRoundupLedger({
-    output_path: join(postsDir, "roundup.html"),
+    output_path: "src/posts/2026/06/12/roundup.html",
   });
   writeFileSync(join(postsDir, "roundup.ledger.json"), JSON.stringify(ledger));
   const { status, output } = runCli([postsDir]);
