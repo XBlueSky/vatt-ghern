@@ -6,6 +6,10 @@ file plus the post's archetype reference and scores each axis 0-10 with
 a required justification citing specific HTML elements (H2 text, opener
 quote, paragraph number).
 
+Axes 1-6 and 8 are per-post axes scored by the dual reviewers; Axis 7
+is batch-only (separate reviewer, only when N ≥ 2 deep-stories) — the
+numbering skip is historical, not an error.
+
 ## Score band semantics
 
 - **9-10**: Excellent. No retry needed.
@@ -124,7 +128,7 @@ contribute to any single post's per-post blocking score.
   N times.
 
 Inter-post handling:
-- Evaluated AFTER all per-post 1-6 axes settle.
+- Evaluated AFTER all per-post axes (1-6 and 8) settle.
 - If batch_score < 7: identify the most-similar post; retry that one
   only with "find another angle" instruction.
 - Inter-post retry budget: 2 rounds max.
@@ -139,15 +143,20 @@ Reviewer reads `skills/daily-news/references/zh-tw-prose.md` as the
 standard. This axis judges the gradient prose problems the Step 8
 mechanical scanner cannot catch: sentence rhythm, translation-ese
 residue, register drift, grey-zone jargon. The finite high-confidence
-set (zh-CN terms, banned boilerplate phrases) is already blocked
-mechanically by `check-zh-prose.mjs` — do not re-litigate exact-match
-hits here; score what's left.
+set (zh-CN terms, banned boilerplate phrases) is owned by
+`check-zh-prose.mjs` in Step 8 — which runs AFTER this gate, so
+exact-match hits may still be live in the draft you are scoring. Do
+not score them as Axis 8 deductions; they have a dedicated mechanical
+gate downstream. Score only the gradient problems that gate cannot
+catch.
 
 - **9-10**: No AI boilerplate, no jargon, no translation-ese; varied
   sentence rhythm; measured written register throughout. Reads like a
   senior Taiwanese engineer's written Chinese.
-- **7-8**: One or two mild hits — a stray 「此外」, one light
-  translation-ese clause, one monotone paragraph.
+- **7-8**: One or two mild hits — a stray 「此外」-class connector,
+  one light translation-ese clause, one monotone paragraph. (A single
+  「但是」/「不過」 is normal written Chinese, not a hit — see
+  zh-tw-prose.md §3.)
 - **4-6**: Multiple boilerplate/translation-ese instances; or
   noticeable grey-zone jargon (痛點/落地/賽道); or colloquial register
   drift (聊天腔) against the measured persona.
