@@ -897,8 +897,8 @@ checks fail.
 
 `check-quality-gate-evidence.mjs` failing means the routine skipped a
 quality pass. The fix is **never** "delete the gate" or "stub the
-artifacts"; the fix is to actually run Step 7.5 / 8.5, or to drop deep
-stories until what remains fits the budget the routine can pay.
+artifacts"; the fix is to actually run Step 7.5 / 7.6 / 8.5, or to drop
+deep stories until what remains fits the budget the routine can pay.
 
 ### Step 8.5: Visual self-review (Playwright + multimodal)
 
@@ -1347,9 +1347,11 @@ Do not merge. Wait for human review.
 
 A successful run produces:
 
-- 1 × `roundup.html` + `roundup.11tydata.json` in `src/posts/YYYY/MM/DD/`
-- 0-3 × `deep-<slug>.html` + matching `.11tydata.json` (count may be
-  reduced from intended N by Step 7.5 Blocking drops)
+- 1 × `roundup.html` + `roundup.11tydata.json` + `roundup.ledger.json`
+  (claims-only, written by the Step 7.6 checker) in `src/posts/YYYY/MM/DD/`
+- 0-3 × `deep-<slug>.html` + matching `.11tydata.json` + matching
+  `.ledger.json` (the committed reading ledger; count may be reduced
+  from intended N by Step 7.5 / 7.6 drops)
 - One git branch `daily/YYYY-MM-DD` pushed to origin
 - One PR open against `main` with the body template above filled in,
   including the five Step 7.5 content-quality sections and the two
