@@ -13,9 +13,11 @@
 //   - missing summary → generic card (title + hint only), reported in
 //     `missing` so the build can warn; never breaks the build.
 //
-// Assumption: attribute values are authored as valid HTML (entities already
-// encoded), so summary and title text pass through to card HTML without
-// re-escaping.
+// Assumption: title text (from figcaption) passes through to card HTML without
+// re-escaping. Summary text is read from a data attribute, where raw < and >
+// are legal HTML; the transform escapes them when moving the value into element
+// text content (only < and >, not & — authored entities like &quot; must not
+// double-encode).
 
 // Quote-aware open-tag regex: handles `"..."`, `'...'`, and bare non-> chars,
 // so a literal > inside a quoted attribute value does not end the tag match.
@@ -82,10 +84,11 @@ export function injectMobileCards(html) {
     }
     swapped += 1;
 
+    const summaryText = summary.replace(/</g, "&lt;").replace(/>/g, "&gt;");
     const card =
       '<div class="vg-mobile-card" data-pagefind-ignore>' +
       `<p class="vg-mobile-card-title">${title}</p>` +
-      (summary ? `<p class="vg-mobile-card-summary">${summary}</p>` : "") +
+      (summary ? `<p class="vg-mobile-card-summary">${summaryText}</p>` : "") +
       `<p class="vg-mobile-card-hint">${HINT_TEXT}</p>` +
       "</div>";
 

@@ -87,7 +87,17 @@ test("summary containing > survives intact and is not reported missing", () => {
   const { html: out, swapped, missing } = injectMobileCards(html);
   assert.equal(swapped, 1);
   assert.deepEqual(missing, []);
-  assert.match(out, /<p class="vg-mobile-card-summary">當 a > b 時吞吐量領先/);
+  assert.match(out, /<p class="vg-mobile-card-summary">當 a &gt; b 時吞吐量領先/);
+});
+
+test("summary containing < renders &lt; in card text", () => {
+  const html = wrap(
+    `<figure class="vg-w-lt-demo" data-mobile-summary="當 p95 < 50µs 時才算達標，限制主要來自 NIC 中斷合併的延遲。"><svg></svg></figure>`
+  );
+  const { html: out, swapped, missing } = injectMobileCards(html);
+  assert.equal(swapped, 1);
+  assert.deepEqual(missing, []);
+  assert.match(out, /<p class="vg-mobile-card-summary">當 p95 &lt; 50µs/);
 });
 
 test("summary attribute before class attribute still matches", () => {
