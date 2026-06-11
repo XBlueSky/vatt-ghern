@@ -32,11 +32,10 @@ import { fileURLToPath } from "node:url";
 const here = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(here, "..");
 
-// Mobile summary contract strictness. false → missing/odd-length
-// data-mobile-summary is a warning (transition state while legacy posts
-// are backfilled). Flip to true once the backfill lands so CI blocks
-// regressions. See docs/superpowers/specs/2026-06-11-mobile-ebook-reading-design.md
-const MOBILE_SUMMARY_STRICT = false;
+// Mobile summary contract strictness. The 2026-05/06 backfill landed, so
+// missing/odd-length data-mobile-summary is now a hard violation. See
+// docs/superpowers/specs/2026-06-11-mobile-ebook-reading-design.md
+const MOBILE_SUMMARY_STRICT = true;
 
 // Validate that every "catalog:<name>" entry in a sidecar's widget_templates
 // resolves to an existing catalog-widget trio (partial + sidecar + static JS).

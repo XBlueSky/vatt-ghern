@@ -9,6 +9,10 @@ is cut. Until then, every merged PR shows up under `Unreleased`.
 
 ### Added
 
+- Mobile ebook-style reading: on touch devices every interactive widget
+  swaps to a build-injected summary card (`data-mobile-summary` +
+  Eleventy transform + capability-query CSS); desktop keeps full
+  interactivity. Routine contract enforced by archetype-check.
 - Code-block typography + PrismJS syntax highlight via a build-time
   Eleventy transform; sketch-of-an-algorithm pseudocode tier with left
   accent rule, top-right kind chip, and Spectral-italic comments (PR #7).
