@@ -144,7 +144,7 @@ When a claim cites ≥2 sources, judge whether they are independent:
 
 ## Timeliness（時效分層）
 
-Classify each claim's shelf life:
+Classify each note's shelf life (claims inherit it through their bound notes):
 
 - `durable` — protocol semantics, historical events, algorithmic facts.
 - `annual` — pricing, market share, "current version" statements;
@@ -184,6 +184,7 @@ are PR-review evidence.
   "sources": [
     {
       "url": "https://example.com/post",
+      "fetch_status": "ok",       // ok | failed — author records the read-time fetch; checker overwrites with the re-fetch result
       "archive_url": "https://web.archive.org/web/…",  // attempted at READ time; null allowed
       "published": "2026-06-10",                        // or null
       "perspective": {            // ≥1 set per source (not per quote)

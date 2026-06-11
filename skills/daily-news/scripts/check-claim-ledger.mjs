@@ -134,7 +134,7 @@ export function validateLedger(ledger, opts) {
         if (!p || fields.some((f) => typeof p[f] !== "string" || p[f] === "")) {
           v(
             `sources[${i}]: perspective incomplete — mechanism/tradeoff/reader_use ` +
-              `all required per source (帶問題讀; see fact-check.md § Perspective layer)`
+              `all required per source (帶問題讀; see fact-check.md § The authoring discipline)`
           );
         }
       }
