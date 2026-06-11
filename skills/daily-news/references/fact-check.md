@@ -105,7 +105,10 @@ Every checked claim gets exactly one verdict:
   presented as sourced fact requires action.
 - **`unverifiable`（不可核實）** — the checker re-fetched the source
   and the claim is NOT there, or contradicts what is there. This
-  includes hedge inflation severe enough to change meaning.
+  includes hedge inflation severe enough to change meaning. A trace
+  failure — a sourced-sounding claim with no backing note and no
+  inference marking — is also `unverifiable` without any fetch (see
+  § Trace stage).
 
 `verdict` and `load` are **orthogonal** — a verdict states what the
 evidence shows; `load`（high / medium / low）states how much the post

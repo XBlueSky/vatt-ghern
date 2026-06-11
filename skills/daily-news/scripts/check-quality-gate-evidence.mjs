@@ -210,7 +210,8 @@ if (!isRollupDir && deepCount < 3) {
             `wallclock / dispatch cost is NEVER a Step 5 reason to trim". ` +
             `If runtime evidence later showed Step 7.5 / 8.5 couldn't fit, ` +
             `say so with the explicit "Step 7.5 blocking..." / "Step 8.5 ` +
-            `blocking..." pattern; do not paraphrase it as "budget".`
+            `blocking..." / "Step 7.6 ... unverifiable ..." pattern; do not ` +
+            `paraphrase it as "budget".`
         );
       } else {
         const matches = legalPatterns.some((pat) =>
@@ -219,7 +220,7 @@ if (!isRollupDir && deepCount < 3) {
         if (!matches) {
           violations.push(
             `Step 5: deep-count justification reason "${parsed.reason}" ` +
-              `does not match any of the 5 legal structural reasons. See ` +
+              `does not match any of the 6 legal structural reasons. See ` +
               `SKILL.md Step 5c "Trimming N below 3 is ONLY legitimate ` +
               `when…" list.`
           );

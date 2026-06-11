@@ -55,7 +55,8 @@ at the stated strength. Emit JSON only.
 4. **Assign** verdict × load and `action` per the action matrix. Set
    `resolution` to "none-needed" when action is "none"; otherwise the
    literal string "pending-fix" — the parent fills it after the fix
-   loop.
+   loop. Set `checker_rounds` to 1 (the re-check variant uses round
+   numbers ≥ 2).
 
 ## Hard rules
 
@@ -93,6 +94,9 @@ differences:
 - Extract ≥1 claim per item lede and verify each claim directly
   against the item's source URL (no notes layer — omit `note_ids`
   from each claim).
+- With no notes layer, judge `hedge_delta` by comparing the lede
+  directly against the fetched source's strength (default `none`),
+  and `independence` against the item's source set as usual.
 - Archive each source (one Wayback attempt per URL, non-blocking).
 - The mechanical gate skips spine and trace rules for roundup ledgers.
 

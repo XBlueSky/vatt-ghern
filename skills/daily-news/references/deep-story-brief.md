@@ -130,7 +130,7 @@ You are writing ONE deep-story for vatt'ghern's daily-news routine.
     visibly inconsistent index card (PR #35, 2026-05-23 shipped one
     English sidecar summary and had to patch it post-merge).
 11.5 Write the ledger to {{ledger_path}}: spine + sources (with
-    perspective + archive_url) + notes. Leave `claims` as an empty
+    fetch_status, perspective + archive_url) + notes. Leave `claims` as an empty
     array and `checker_rounds: 0` — the Step 7.6 checker fills them.
     Set `output_path` to {{output_path}}, `checked_at` to today.
 12. Report back: path written, character count, archetype deviations
