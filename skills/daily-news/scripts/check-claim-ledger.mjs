@@ -214,10 +214,10 @@ export function validateLedger(ledger, opts) {
       if (!Array.isArray(c.note_ids)) {
         cv("note_ids must be an array");
       } else if (c.note_ids.length === 0) {
-        if (c.verdict !== "inferred")
+        if (c.verdict !== "inferred" && c.resolution !== "deleted")
           cv(
             `trace failure: empty note_ids with verdict "${c.verdict}" — ` +
-              `a claim either traces to a note or is marked inferred`
+              `a claim either traces to a note, is marked inferred, or was deleted`
           );
       } else {
         for (const nid of c.note_ids) {

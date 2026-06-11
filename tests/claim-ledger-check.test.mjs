@@ -238,6 +238,22 @@ test("validateLedger: empty note_ids requires verdict inferred", () => {
   assert.deepEqual(validateLedger(ok, DEEP_OPTS).violations, []);
 });
 
+test("validateLedger: deleted claims are exempt from trace binding", () => {
+  const ledger = makeDeepLedger({
+    claims: [
+      makeClaim({
+        note_ids: [],
+        verdict: "unverifiable",
+        evidence: null,
+        action: "delete",
+        resolution: "deleted",
+      }),
+    ],
+  });
+  ledger.coverage = { candidate_claims: 1, checked: 1, dropped_low_load: 0 };
+  assert.deepEqual(validateLedger(ledger, DEEP_OPTS).violations, []);
+});
+
 test("validateLedger: note_ids must reference existing notes", () => {
   const ledger = makeDeepLedger({
     claims: [makeClaim({ note_ids: ["n99"] })],

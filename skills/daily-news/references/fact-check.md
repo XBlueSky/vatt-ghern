@@ -241,6 +241,8 @@ synthesis). Trace failures go to the fix loop: add the missing note by
 re-reading the source, or rewrite/mark the sentence. The mechanical
 gate (`check-claim-ledger.mjs`) enforces the binding; the checker's
 honesty about it is auditable because the notes' quotes are verbatim.
+Deleted claims keep their empty binding as a historical record — the
+mechanical gate exempts `resolution: "deleted"` from the trace rule.
 
 ## Action matrix — verdict × load
 
