@@ -1,10 +1,14 @@
-# Content Quality Rubric — 7 axes
+# Content Quality Rubric — 8 axes
 
 This file is the single source of truth for the content-quality gate in
 Step 7.5 of the daily-news routine. The reviewer sub-agent reads this
 file plus the post's archetype reference and scores each axis 0-10 with
 a required justification citing specific HTML elements (H2 text, opener
 quote, paragraph number).
+
+Axes 1-6 and 8 are per-post axes scored by the dual reviewers; Axis 7
+is batch-only (separate reviewer, only when N ≥ 2 deep-stories) — the
+numbering skip is historical, not an error.
 
 ## Score band semantics
 
@@ -124,7 +128,7 @@ contribute to any single post's per-post blocking score.
   N times.
 
 Inter-post handling:
-- Evaluated AFTER all per-post 1-6 axes settle.
+- Evaluated AFTER all per-post axes (1-6 and 8) settle.
 - If batch_score < 7: identify the most-similar post; retry that one
   only with "find another angle" instruction.
 - Inter-post retry budget: 2 rounds max.
@@ -132,6 +136,35 @@ Inter-post handling:
 
 Justification must identify `most_similar_post: <output_path>` when
 score < 7.
+
+## Axis 8 — zh-TW prose 自然度（per-post）
+
+Reviewer reads `skills/daily-news/references/zh-tw-prose.md` as the
+standard. This axis judges the gradient prose problems the Step 8
+mechanical scanner cannot catch: sentence rhythm, translation-ese
+residue, register drift, grey-zone jargon. The finite high-confidence
+set (zh-CN terms, banned boilerplate phrases) is owned by
+`check-zh-prose.mjs` in Step 8 — which runs AFTER this gate, so
+exact-match hits may still be live in the draft you are scoring. Do
+not score them as Axis 8 deductions; they have a dedicated mechanical
+gate downstream. Score only the gradient problems that gate cannot
+catch.
+
+- **9-10**: No AI boilerplate, no jargon, no translation-ese; varied
+  sentence rhythm; measured written register throughout. Reads like a
+  senior Taiwanese engineer's written Chinese.
+- **7-8**: One or two mild hits — a stray 「此外」-class connector,
+  one light translation-ese clause, one monotone paragraph. (A single
+  「但是」/「不過」 is normal written Chinese, not a hit — see
+  zh-tw-prose.md §3.)
+- **4-6**: Multiple boilerplate/translation-ese instances; or
+  noticeable grey-zone jargon (痛點/落地/賽道); or colloquial register
+  drift (聊天腔) against the measured persona.
+- **0-3**: Template-shaped prose throughout; pervasive translation-ese
+  or jargon; register inconsistent with persona.md.
+
+Justification must quote the offending (or exemplary) sentences
+verbatim — no abstract "節奏單一" without the sentences that show it.
 
 ## Reviewer output format
 
@@ -148,7 +181,8 @@ Reviewer sub-agent emits a single JSON object per post:
     "material": {"score": 9, "justification": "..."},
     "depth": {"score": 8, "justification": "..."},
     "relevance": {"score": 7, "justification": "...", "dimension_used": "actionability"},
-    "anti_template": {"score": 9, "justification": "..."}
+    "anti_template": {"score": 9, "justification": "..."},
+    "zh_prose": {"score": 8, "justification": "..."}
   },
   "overall": "PASS" // or PASS-with-notes | IMPORTANT | BLOCKING
 }
@@ -178,6 +212,7 @@ For the inter-post (Axis 7) reviewer, output format is:
 - Visual rendering (Step 8.5)
 - Source selection (Step 3 scoring rubric)
 - Dedup against past days (Step 3 + Step 8)
+- Exact-match zh-CN terms / banned AI phrases (Step 8 `check-zh-prose.mjs`)
 
 These have their own gates. The content rubric assumes those have
 already passed.

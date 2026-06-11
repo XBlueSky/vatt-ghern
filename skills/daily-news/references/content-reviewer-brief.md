@@ -10,7 +10,7 @@ of these per post-being-reviewed × 2 (dual-reviewer consensus).
 You are reviewing ONE post for vatt'ghern's daily-news content-quality
 gate. You are reviewer instance {{1 or 2}} of 2 independent reviewers
 on this post. You CANNOT see the other reviewer's output. Score on the
-7-axis rubric below and emit JSON only.
+8-axis rubric below and emit JSON only.
 
 ## Post under review
 
@@ -26,6 +26,8 @@ on this post. You CANNOT see the other reviewer's output. Score on the
 3. skills/daily-news/references/content-quality-rubric.md
 4. (deep-story only) skills/daily-news/references/archetypes/deep-{{archetype}}.md
 5. skills/daily-news/references/persona.md (voice rules)
+6. skills/daily-news/references/zh-tw-prose.md (zh-TW prose standard
+   for Axis 8)
 
 ## What you may NOT read
 
@@ -36,7 +38,7 @@ on this post. You CANNOT see the other reviewer's output. Score on the
 
 ## Your task
 
-Score axes 1-6 (per-post axes). Do NOT score Axis 7 — that's a
+Score axes 1-6 and 8 (per-post axes). Do NOT score Axis 7 — that's a
 separate batch reviewer step.
 
 Each axis requires:
@@ -50,6 +52,9 @@ For Axis 2 (Structural), state which archetype standard you applied:
 
 For Axis 5 (Relevance), state which dimension you applied:
 "Relevance (actionability): 8/10 — ..."
+
+For Axis 8 (zh-TW prose), quote the offending or exemplary sentences
+verbatim from the post body.
 
 ## Output format
 
