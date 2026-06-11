@@ -307,7 +307,21 @@ export default function (eleventyConfig) {
     }
     const partial = readFileSync(partialPath, "utf8");
 
-    return `<figure class="vg-w-${name}" id="${id}" data-widget="${name}" data-pagefind-ignore>${partial}</figure>${scriptTag}`;
+    // Mobile summary: per-instance override via opts.summary, else the
+    // catalog default from <name>.widget.json `mobile_summary`. The
+    // mobile-cards transform turns this into the touch-device summary card.
+    let mobileSummary = opts.summary || "";
+    const metaPath = join(__dirname, "src", "_includes", "widgets", `${name}.widget.json`);
+    if (!mobileSummary && existsSync(metaPath)) {
+      try {
+        mobileSummary = JSON.parse(readFileSync(metaPath, "utf8")).mobile_summary || "";
+      } catch { /* sidecar unreadable — fall through to no attribute */ }
+    }
+    const summaryAttr = mobileSummary
+      ? ` data-mobile-summary="${mobileSummary.replace(/"/g, "&quot;")}"`
+      : "";
+
+    return `<figure class="vg-w-${name}" id="${id}" data-widget="${name}"${summaryAttr} data-pagefind-ignore>${partial}</figure>${scriptTag}`;
   });
 
   // Asset passthrough inside posts (images, videos, CSVs, PDFs — no JSON sidecars).

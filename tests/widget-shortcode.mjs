@@ -40,3 +40,17 @@ test("widget shortcode dedupes script + increments id on second instance", async
   assert.doesNotMatch(second, /<script src=/);
   assert.match(second, /id="vg-w-feature-flags-2"/);
 });
+
+test("widget shortcode emits data-mobile-summary from widget.json", async () => {
+  const widget = await getWidgetShortcode();
+  const ctx = { page: { inputPath: "./p3.html" } };
+  const html = widget.call(ctx, "feature-flags");
+  assert.match(html, /data-mobile-summary="[^"]{20,}"/);
+});
+
+test("widget shortcode summary opt overrides widget.json", async () => {
+  const widget = await getWidgetShortcode();
+  const ctx = { page: { inputPath: "./p4.html" } };
+  const html = widget.call(ctx, "feature-flags", { summary: "覆寫摘要，說明此實例在本文脈絡下的特定結論，長度合於檢查規範。" });
+  assert.match(html, /data-mobile-summary="覆寫摘要/);
+});
