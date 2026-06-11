@@ -109,3 +109,53 @@ test("CLI: clean html + flag-only sidecar exits 0 and lists flags", () => {
   assert.ok(out.includes("OK"));
   assert.ok(out.includes("對象"), "flag terms are listed for judgment");
 });
+
+test("scanPhrases: gap patterns do not span clause boundaries", () => {
+  const hits = scanPhrases("隨著時間推移，模型的發展加速。");
+  assert.equal(hits.length, 0);
+});
+
+test("scanPhrases: counts aggregate per pattern", () => {
+  const hits = scanPhrases("賦能之後再賦能，最後又賦能。");
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].count, 3);
+});
+
+test("CLI: auto term in sidecar fails the gate", () => {
+  const dir = mkdtempSync(join(tmpdir(), "zh-prose-"));
+  writeFileSync(
+    join(dir, "deep-x.11tydata.json"),
+    JSON.stringify({ title: "代碼審查的故事", summary: "ok" })
+  );
+  let status = 0;
+  try {
+    execFileSync(process.execPath, [SCRIPT, dir], { encoding: "utf8" });
+  } catch (e) {
+    status = e.status;
+  }
+  assert.equal(status, 1);
+});
+
+test("CLI: missing arg and nonexistent dir exit 2", () => {
+  for (const args of [[], ["/nonexistent/zh-prose-dir"]]) {
+    let status = 0;
+    try {
+      execFileSync(process.execPath, [SCRIPT, ...args], { encoding: "utf8" });
+    } catch (e) {
+      status = e.status;
+    }
+    assert.equal(status, 2);
+  }
+});
+
+test("CLI: directory with no scannable files exits 2", () => {
+  const dir = mkdtempSync(join(tmpdir(), "zh-prose-"));
+  writeFileSync(join(dir, "notes.txt"), "irrelevant");
+  let status = 0;
+  try {
+    execFileSync(process.execPath, [SCRIPT, dir], { encoding: "utf8" });
+  } catch (e) {
+    status = e.status;
+  }
+  assert.equal(status, 2);
+});

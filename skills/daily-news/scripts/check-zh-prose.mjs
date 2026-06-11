@@ -23,7 +23,7 @@
 // below in sync with that file's §2 and §4.
 //
 // Exit 0 = clean (flag hits allowed). Exit 1 = auto/phrase hits. Exit 2 =
-// usage error.
+// usage error (bad args or nothing to scan).
 
 import { readFileSync, readdirSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -33,11 +33,12 @@ const here = dirname(fileURLToPath(import.meta.url));
 const TERMS_PATH = join(here, "..", "data", "zh-tw-terms.json");
 
 // Finite, high-confidence set. Anything debatable goes to Axis 8, not here.
+// NOTE: `pattern` strings are RegExp source, not literals — escape metachars when adding entries.
 export const BANNED_PHRASES = [
   // 時代開場
-  { pattern: "隨著.{1,12}的(發展|興起|普及|演進)", label: "時代開場" },
-  { pattern: "在(當今|這個).{0,10}的?時代", label: "時代開場" },
-  { pattern: "在.{1,8}的浪潮(中|下)", label: "時代開場" },
+  { pattern: "隨著[^，。；]{1,12}的(發展|興起|普及|演進)", label: "時代開場" },
+  { pattern: "在(當今|這個)[^，。；]{0,10}的?時代", label: "時代開場" },
+  { pattern: "在[^，。；]{1,8}的浪潮(中|下)", label: "時代開場" },
   // 共識開場
   { pattern: "眾所周知", label: "共識開場" },
   { pattern: "不言而喻", label: "共識開場" },
@@ -52,7 +53,7 @@ export const BANNED_PHRASES = [
   { pattern: "讓我們拭目以待", label: "結尾套話" },
   { pattern: "未來可期", label: "結尾套話" },
   { pattern: "攜手(共進|並進|前行)", label: "結尾套話" },
-  { pattern: "開啟.{0,8}新篇章", label: "結尾套話" },
+  { pattern: "開啟[^，。；]{0,8}新篇章", label: "結尾套話" },
   { pattern: "值得我們深思", label: "結尾套話" },
   // 互聯網黑話（高信心子集；痛點/落地/賽道 等灰色詞歸 Axis 8）
   { pattern: "賦能", label: "互聯網黑話" },
@@ -70,8 +71,8 @@ export function stripNonProse(html) {
     .replace(/<pre\b[\s\S]*?<\/pre>/gi, " ");
 }
 
-// Longest-match, non-overlapping scan (same semantics as upstream
-// zh-tw-terms.mjs): at each position take the longest matching term,
+// Longest-match, non-overlapping scan (same semantics as the scanner in
+// kevintsengtw/stop-slop-zh-tw): at each position take the longest matching term,
 // then skip its length. Prevents 數據庫 counting as 數據 + 庫.
 export function scanTerms(text, terms) {
   const sorted = [...terms].sort((a, b) => b.from.length - a.from.length);
@@ -122,6 +123,13 @@ function main() {
   const files = readdirSync(targetDir).filter(
     (f) => f.endsWith(".html") || f.endsWith(".11tydata.json")
   );
+
+  if (files.length === 0) {
+    process.stderr.write(
+      `No scannable files (*.html / *.11tydata.json) in ${targetDir} — wiring bug?\n`
+    );
+    process.exit(2);
+  }
 
   let failures = 0;
   const flagLines = [];
