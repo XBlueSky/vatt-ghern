@@ -32,7 +32,7 @@ async function readMaybe(path) {
   }
 }
 
-// 1. Rubric file exists and contains all 7 axes
+// 1. Rubric file exists and contains all 8 axes
 const rubricPath = join(
   root,
   "skills/daily-news/references/content-quality-rubric.md"
@@ -49,6 +49,7 @@ if (!rubric) {
     "## Axis 5 — Relevance",
     "## Axis 6 — Intra-post anti-template",
     "## Axis 7 — Inter-post diversity",
+    "## Axis 8 — zh-TW prose 自然度",
   ];
   for (const axis of requiredAxes) {
     if (!rubric.includes(axis)) {
@@ -78,6 +79,9 @@ if (!brief) {
   }
   if (!brief.includes("Read only")) {
     fail("reviewer brief should explicitly restrict tools to Read only");
+  }
+  if (!brief.includes("zh-tw-prose.md")) {
+    fail("reviewer brief does not reference zh-tw-prose.md (Axis 8)");
   }
   pass("reviewer brief structure");
 }
@@ -139,7 +143,7 @@ if (!skill) {
   if (!skill.includes("### Step 7.5: Content quality gate")) {
     fail("SKILL.md missing Step 7.5 section heading");
   }
-  if (!skill.includes("## Content Quality Review")) {
+  if (!skill.includes("Content Quality Review")) {
     fail("SKILL.md PR body template missing 'Content Quality Review' section");
   }
   if (!skill.includes("## Reviewer disagreements")) {

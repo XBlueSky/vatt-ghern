@@ -1,4 +1,4 @@
-# Content Quality Rubric — 7 axes
+# Content Quality Rubric — 8 axes
 
 This file is the single source of truth for the content-quality gate in
 Step 7.5 of the daily-news routine. The reviewer sub-agent reads this
@@ -133,6 +133,30 @@ Inter-post handling:
 Justification must identify `most_similar_post: <output_path>` when
 score < 7.
 
+## Axis 8 — zh-TW prose 自然度（per-post）
+
+Reviewer reads `skills/daily-news/references/zh-tw-prose.md` as the
+standard. This axis judges the gradient prose problems the Step 8
+mechanical scanner cannot catch: sentence rhythm, translation-ese
+residue, register drift, grey-zone jargon. The finite high-confidence
+set (zh-CN terms, banned boilerplate phrases) is already blocked
+mechanically by `check-zh-prose.mjs` — do not re-litigate exact-match
+hits here; score what's left.
+
+- **9-10**: No AI boilerplate, no jargon, no translation-ese; varied
+  sentence rhythm; measured written register throughout. Reads like a
+  senior Taiwanese engineer's written Chinese.
+- **7-8**: One or two mild hits — a stray 「此外」, one light
+  translation-ese clause, one monotone paragraph.
+- **4-6**: Multiple boilerplate/translation-ese instances; or
+  noticeable grey-zone jargon (痛點/落地/賽道); or colloquial register
+  drift (聊天腔) against the measured persona.
+- **0-3**: Template-shaped prose throughout; pervasive translation-ese
+  or jargon; register inconsistent with persona.md.
+
+Justification must quote the offending (or exemplary) sentences
+verbatim — no abstract "節奏單一" without the sentences that show it.
+
 ## Reviewer output format
 
 Reviewer sub-agent emits a single JSON object per post:
@@ -148,7 +172,8 @@ Reviewer sub-agent emits a single JSON object per post:
     "material": {"score": 9, "justification": "..."},
     "depth": {"score": 8, "justification": "..."},
     "relevance": {"score": 7, "justification": "...", "dimension_used": "actionability"},
-    "anti_template": {"score": 9, "justification": "..."}
+    "anti_template": {"score": 9, "justification": "..."},
+    "zh_prose": {"score": 8, "justification": "..."}
   },
   "overall": "PASS" // or PASS-with-notes | IMPORTANT | BLOCKING
 }
@@ -178,6 +203,7 @@ For the inter-post (Axis 7) reviewer, output format is:
 - Visual rendering (Step 8.5)
 - Source selection (Step 3 scoring rubric)
 - Dedup against past days (Step 3 + Step 8)
+- Exact-match zh-CN terms / banned AI phrases (Step 8 `check-zh-prose.mjs`)
 
 These have their own gates. The content rubric assumes those have
 already passed.
