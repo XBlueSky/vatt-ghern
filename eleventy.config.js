@@ -7,6 +7,7 @@ import { readFileSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { isoWeekKey, isoWeekRange, isoWeekLabel } from "./scripts/iso-week.mjs";
+import { injectMobileCards } from "./scripts/mobile-card-transform.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const LUCIDE_DIR = join(__dirname, "node_modules", "lucide-static", "icons");
@@ -107,6 +108,22 @@ export default function (eleventyConfig) {
         return `<pre${preAttrs} tabindex="0" class="language-${lang}"><code class="language-${lang}">${highlighted}</code></pre>`;
       }
     );
+  });
+
+  // ── Mobile summary cards ──────────────────────────────────────
+  // Post pages only (/YYYY/MM/DD/<slug>/index.html). Injects a summary card
+  // after each vg-w-* figure and a one-shot notice at the top of
+  // .vg-post-body. CSS shows them only on coarse-pointer devices; the widget
+  // gallery and cookbook pages are desktop teaching surfaces and are skipped.
+  const POST_OUTPUT_RE = /[/\\]\d{4}[/\\]\d{2}[/\\]\d{2}[/\\][^/\\]+[/\\]index\.html$/;
+  eleventyConfig.addTransform("mobile-cards", function (content) {
+    const out = this.page.outputPath;
+    if (!out || !POST_OUTPUT_RE.test(out)) return content;
+    const { html, missing } = injectMobileCards(content);
+    for (const cls of missing) {
+      console.warn(`[mobile-cards] ${out}: ${cls} missing data-mobile-summary (generic card injected)`);
+    }
+    return html;
   });
 
   // Inline lucide SVG icon. Usage:

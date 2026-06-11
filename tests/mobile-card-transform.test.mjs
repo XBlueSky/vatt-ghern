@@ -129,3 +129,30 @@ test("card title hard-caps at 60 chars with ellipsis", () => {
   assert.equal(m[1].length, 60);
   assert.ok(m[1].endsWith("…"));
 });
+
+async function getMobileCardsTransform() {
+  const cfg = (await import("../eleventy.config.js")).default;
+  let captured;
+  const fakeConfig = {
+    on() {}, addShortcode() {}, addPairedShortcode() {}, addFilter() {},
+    addCollection() {}, addPlugin() {},
+    addTransform(name, fn) { if (name === "mobile-cards") captured = fn; },
+    addPassthroughCopy() {}, addWatchTarget() {}, setServerOptions() {},
+    addGlobalData() {}, setFrontMatterParsingOptions() {},
+    ignores: { add() {} }, addBundle() {}, amendLibrary() {}, setLibrary() {},
+  };
+  cfg(fakeConfig);
+  assert.ok(captured, "mobile-cards transform must be registered");
+  return captured;
+}
+
+test("transform applies to post output paths only", async () => {
+  const fn = await getMobileCardsTransform();
+  const html = `<div class="vg-post-body"><figure class="vg-w-x" data-mobile-summary="一句長度合於規範的摘要，描述這個圖表想傳達的核心結論與重點。"><svg></svg></figure></div>`;
+  const post = fn.call({ page: { outputPath: "_site/2026/06/11/deep-x/index.html" } }, html);
+  assert.match(post, /vg-mobile-card/);
+  const gallery = fn.call({ page: { outputPath: "_site/widgets/cookbook/tab-switcher-pure-css/index.html" } }, html);
+  assert.equal(gallery, html);
+  const noOut = fn.call({ page: { outputPath: false } }, html);
+  assert.equal(noOut, html);
+});
