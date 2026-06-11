@@ -77,3 +77,55 @@ test("notice counts only swapped widgets", () => {
   assert.equal(swapped, 2);
   assert.match(out, /本文含 2 個互動圖表/);
 });
+
+// Issue 1: > inside attribute values
+
+test("summary containing > survives intact and is not reported missing", () => {
+  const html = wrap(
+    `<figure class="vg-w-gt-demo" data-mobile-summary="當 a > b 時吞吐量領先，差距隨批次放大，結論在實測中不變。"><svg></svg></figure>`
+  );
+  const { html: out, swapped, missing } = injectMobileCards(html);
+  assert.equal(swapped, 1);
+  assert.deepEqual(missing, []);
+  assert.match(out, /<p class="vg-mobile-card-summary">當 a > b 時吞吐量領先/);
+});
+
+test("summary attribute before class attribute still matches", () => {
+  const html = wrap(
+    `<figure data-mobile-summary="即使屬性順序顛倒且含 > 符號，這個圖表仍應被置換為摘要卡。" class="vg-w-order-demo"><svg></svg></figure>`
+  );
+  const { html: out, swapped, missing } = injectMobileCards(html);
+  assert.equal(swapped, 1);
+  assert.deepEqual(missing, []);
+});
+
+test('keep figure with a summary attribute is still untouched', () => {
+  const html = wrap(
+    `<figure class="vg-w-static" data-mobile="keep" data-mobile-summary="這張靜態圖在手機可讀，不需要置換成摘要卡,保留原樣即可。"><svg></svg></figure>`
+  );
+  const { html: out, swapped } = injectMobileCards(html);
+  assert.equal(swapped, 0);
+  assert.equal(out, html);
+});
+
+// Issue 2: figcaption title truncation
+
+test("card title truncates figcaption at first 。", () => {
+  const html = wrap(
+    `<figure class="vg-w-cap-demo" data-mobile-summary="摘要文字長度合於規範，描述這個圖表想傳達的核心結論與重點。"><svg></svg><figcaption>去噪八步的全貌。後半段是冗長的操作說明，不該出現在卡片標題。</figcaption></figure>`
+  );
+  const { html: out } = injectMobileCards(html);
+  assert.match(out, /<p class="vg-mobile-card-title">去噪八步的全貌<\/p>/);
+});
+
+test("card title hard-caps at 60 chars with ellipsis", () => {
+  const longCap = "甲".repeat(70);
+  const html = wrap(
+    `<figure class="vg-w-cap-long" data-mobile-summary="摘要文字長度合於規範，描述這個圖表想傳達的核心結論與重點。"><svg></svg><figcaption>${longCap}</figcaption></figure>`
+  );
+  const { html: out } = injectMobileCards(html);
+  const m = out.match(/<p class="vg-mobile-card-title">([^<]+)<\/p>/);
+  assert.ok(m, "title present");
+  assert.equal(m[1].length, 60);
+  assert.ok(m[1].endsWith("…"));
+});
