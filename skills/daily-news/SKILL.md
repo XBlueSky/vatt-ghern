@@ -316,6 +316,8 @@ reasons applies**:
    (record refill attempt in PR body)
 4. Step 7.5 blocking exhausted on a draft after 5 retries (Step 7.5c)
 5. Step 8.5 blocking exhausted on a draft after 5 iterations
+6. Step 7.6 fact-check: a high-load unverifiable claim unresolved
+   after 3 fix rounds (Step 7.6c)
 
 **"Budget / wallclock / dispatch cost" is NEVER a Step 5 reason to
 trim.** Steps 7.5 and 8.5 have their own runtime trim mechanisms
@@ -753,6 +755,91 @@ These populate the PR body sections defined in Step 9's template
 | Roundup blocking-drops | BLOCKED — do NOT open PR. Report status with roundup's blocking axes. |
 | Reviewer dispatch returns no output (network / tool failure) | Re-dispatch that reviewer once. Still nothing → treat as BLOCKING vote. |
 
+### Step 7.6: Fact-check gate
+
+After Step 7.5 settles (prose is final modulo fact fixes), verify that
+what the posts **assert** is actually **in** the cited sources. Steps
+7.5/8/8.5 judge how the prose reads, whether the HTML is valid, and how
+the page renders; none of them re-opens the sources. Step 7.6 closes
+that gap: claim extraction → source re-fetch → adversarial verification,
+with an evidence ledger per post. The standard lives in
+`references/fact-check.md` (claim taxonomy, 出處四態 verdicts, hedge
+delta, source independence, 時效分層, archiving, action matrix); the
+sub-agent contract lives in `references/fact-check-brief.md`.
+
+**No skip clause exists.** Same enforcement rule as Steps 7.5/8.5: if
+wall-clock or budget is tight, drop deep-stories (N → N-1) so the
+remaining gate fits — never ship unverified claims to ship more posts.
+`check-quality-gate-evidence.mjs` fails the publish gate when ledgers
+are missing; `check-claim-ledger.mjs` fails it when ledgers are
+incomplete or unresolved.
+
+#### Step 7.6a: Dispatch fact-check sub-agents (parallel)
+
+For each post (1 roundup + N deep-stories), dispatch **1 checker
+sub-agent** with `subagent_type: general-purpose` and **`model: "opus"`
+required** (hedge-strength and source-independence judgment is
+design-grade; if Opus is unavailable, report BLOCKED rather than fall
+back). All ≤4 dispatches in ONE response. Each checker:
+
+- Tools: Read + WebFetch only
+- Reads: fact-check.md, the post HTML, its sidecar (whose `sources[]`
+  is the ground truth to verify against)
+- Re-fetches every sidecar source; attempts one Wayback snapshot per
+  URL (`https://web.archive.org/save/<url>`, non-blocking on failure)
+- Emits: ONE evidence-ledger JSON per the schema in fact-check.md
+
+#### Step 7.6b: Write ledgers + apply the action matrix
+
+Parent writes each returned ledger to
+`/tmp/vg-factcheck-YYYY-MM-DD/<slug>-ledger.json`, then walks the
+claims: every claim whose `action` ≠ `none` needs a fix per the
+fact-check.md action matrix (high-load `unverifiable` → correct from
+source or delete; unmarked `inferred` → mark as inference or delete;
+`hedge_delta: inflated` → restore the source's hedging strength;
+high-load `pending` → alternate source or visible hedged attribution).
+
+#### Step 7.6c: Fix loop
+
+For each post with actionable claims, dispatch one retry author
+sub-agent (Opus, per Step 7b) whose brief contains the claim list,
+each claim's verdict + evidence, and the **fix discipline**: deletion,
+hedging, marking-as-inference, or correcting to what the source
+actually says ONLY — a fix may not introduce new facts, numbers, or
+quotes (zh-tw-prose.md §1). After fixes, re-dispatch the checker with
+the re-check variant brief (fixed claims only); parent merges verdicts
+and updates each claim's `resolution`.
+
+Iteration budget: up to **3 rounds** per post. If a high-load
+`unverifiable` claim still cannot be corrected or deleted after 3
+rounds (e.g. the whole post leans on a claim its source does not
+make), drop the post (N → N-1) and log under `## Step 7.6 Fact-check
+drops`; if that post is the roundup, the routine is BLOCKED — do NOT
+open PR. Fixes here are deletions/hedges/corrections, narrow in scope
+by construction — they do not re-trigger Step 7.5.
+
+#### Step 7.6d: Mechanical validation
+
+```bash
+node ${CLAUDE_PLUGIN_ROOT}/skills/daily-news/scripts/check-claim-ledger.mjs src/posts/YYYY/MM/DD/
+```
+
+Validates every ledger: schema + enums, coverage arithmetic, claim
+floors (≥ min(10, candidates) per deep-story, ≥ 1 per roundup item),
+and the resolution rules (no surviving high-load `unverifiable`, no
+`pending-fix`, `accepted-with-flag` only for medium/low-load `pending`
+claims). Exit 1 = the fix loop is not done; the fix is to finish it,
+never to edit ledger verdicts to pass.
+
+#### Failure modes for Step 7.6
+
+| Scenario | Handling |
+|---|---|
+| Checker emits malformed JSON | Re-dispatch that checker (up to 2 retries). Still malformed → treat the post as unverified: drop it (deep-story) or BLOCK (roundup). |
+| All sidecar sources unreachable on re-fetch | Every claim is `pending`. High-load pendings need alternate sources or hedged attribution; if the post's core claims can't be supported at all, drop the post. |
+| Archive (web.archive.org) fails or times out | Non-blocking. Record `archive_url: null`, move on — the gate warns but does not fail. |
+| High-load `unverifiable` survives 3 fix rounds | Drop the post (N → N-1); roundup → BLOCKED, no PR. |
+
 ### Step 8: Self-check (mechanical)
 
 Run the validation scripts:
@@ -773,10 +860,14 @@ npx html-validate "_site/**/*.html"
 node ${CLAUDE_PLUGIN_ROOT}/tests/archetype-check.mjs _site/
 node ${CLAUDE_PLUGIN_ROOT}/tests/link-check.mjs
 
-# Quality-gate evidence: enforces that Step 7.5 and Step 8.5 actually ran
-# (reviewer JSON + screenshot artifacts present on disk). Exits 1 if any
-# post lacks evidence. Run this AFTER Steps 7.5 and 8.5 have completed
-# and BEFORE the commit / PR step.
+# Fact-check ledger validation (re-run of Step 7.6d — cheap, keep it in
+# the battery so a post-7.6 edit can't silently invalidate a ledger)
+node ${CLAUDE_PLUGIN_ROOT}/skills/daily-news/scripts/check-claim-ledger.mjs src/posts/YYYY/MM/DD/
+
+# Quality-gate evidence: enforces that Steps 7.5, 7.6, and 8.5 actually ran
+# (reviewer JSON + fact-check ledgers + screenshot artifacts present on
+# disk). Exits 1 if any post lacks evidence. Run this AFTER Steps 7.5, 7.6,
+# and 8.5 have completed and BEFORE the commit / PR step.
 node ${CLAUDE_PLUGIN_ROOT}/skills/daily-news/scripts/check-quality-gate-evidence.mjs src/posts/YYYY/MM/DD/
 ```
 
@@ -1138,6 +1229,27 @@ For each post (roundup + deep-stories):
 
 - (none) — or batch_score=<N>, attempted retries=<M>, final state notes.
 
+## Step 7.6 Fact-check (REQUIRED — no "skipped" allowed)
+
+This section MUST contain per-post ledger summaries. Empty or
+"skipped" is an INVALID PR — `check-quality-gate-evidence.mjs` fails
+when ledgers are missing and `check-claim-ledger.mjs` fails when they
+are unresolved.
+
+For each post (roundup + deep-stories):
+- `<output_path>` — claims checked: <N> (of <M> candidates; <K> dropped low-load)
+  - verdicts: 已核實 <n1> · 待核實 <n2> · 推斷 <n3> · 不可核實 <n4>
+  - fixes applied: <list each — corrected / hedged / marked-inferred / deleted, with claim id + one-line what>
+  - accepted-with-flag: <list each pending medium/low-load claim the human should eyeball, with its source>
+  - unarchived sources: <list each archive_url: null, or (none)>
+  - Ledger artifact: `/tmp/vg-factcheck-YYYY-MM-DD/<slug>-ledger.json`
+  - Checker rounds: <N>
+
+## Step 7.6 Fact-check drops
+
+- (none) — or list: `<output_path>`, the claim(s) that could not be
+  corrected or deleted in 3 rounds, and the verdict evidence.
+
 ## Deep-story archetypes used today
 
 - {{deep_title_1}} — `narrative`
@@ -1160,6 +1272,7 @@ reason) fails the publish gate.
   - `Step 5d URL collision with refill pool exhausted: <details>`
   - `Step 7.5 BLOCKING retry exhausted on <slug> after 5 rounds`
   - `Step 8.5 Blocking visual issue unfixable after 5 iterations on <slug>`
+  - `Step 7.6 fact-check: high-load unverifiable claim unresolved after 3 rounds on <slug>`
 
 "Budget" / "wallclock" / "dispatch cost" / "Opus quota" is NOT a
 valid Step 5 reason — see SKILL.md Step 5c. If you wrote one of those
@@ -1205,6 +1318,8 @@ Do not merge. Wait for human review.
 | Step 7.5 content: post fails 5 BLOCKING retries | Drop the post (N → N-1). Log to PR body. Routine continues. |
 | Step 7.5 content: roundup fails 5 BLOCKING retries | Abort routine. Do NOT open PR. Report BLOCKED status. |
 | Step 7.5 content: inter-post diversity fails 2 retries | Accept and log to PR body. Routine continues. |
+| Step 7.6 fact-check: checker crashes or emits malformed JSON after retries | Treat the post as unverified: drop it if it's a deep-story; abort routine if it's the roundup. |
+| Step 7.6 fact-check: high-load unverifiable claim survives 3 fix rounds | Drop the post (N → N-1); log to PR body. Roundup → abort routine, do NOT open PR. |
 
 ## Output expectations summary
 
@@ -1215,7 +1330,8 @@ A successful run produces:
   reduced from intended N by Step 7.5 Blocking drops)
 - One git branch `daily/YYYY-MM-DD` pushed to origin
 - One PR open against `main` with the body template above filled in,
-  including the five Step 7.5 content-quality sections
+  including the five Step 7.5 content-quality sections and the two
+  Step 7.6 fact-check sections
 
 ## Why this is split across multiple references
 

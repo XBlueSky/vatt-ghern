@@ -68,6 +68,12 @@ Reviewer states which standard was used:
 Justification must cite specific material (e.g., "para 7 names RFC 9000
 §3.2", "no specific numbers anywhere in body").
 
+Axis 3 judges grounding *texture* (does the prose cite concrete
+material), not grounding *truth* (is the cited material really in the
+source). Truth is Step 7.6's job (`references/fact-check.md`) — do not
+re-fetch sources here, and do not assume a high Axis 3 score certifies
+accuracy.
+
 ## Axis 4 — Depth vs. paraphrase
 
 - **9-10**: Each H2 teaches a mechanism (why X works this way) or

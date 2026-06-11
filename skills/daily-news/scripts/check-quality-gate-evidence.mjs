@@ -29,6 +29,11 @@
 //     (per-widget screenshots are recommended but not strictly required —
 //      the four whole-page screenshots are the minimum proof)
 //
+//   /tmp/vg-factcheck-YYYY-MM-DD/
+//     <slug>-ledger.json       # Step 7.6 fact-check evidence ledger
+//     (presence-only here; schema + resolution validation is
+//      check-claim-ledger.mjs's job)
+//
 // Usage:
 //   node skills/daily-news/scripts/check-quality-gate-evidence.mjs src/posts/YYYY/MM/DD/
 //
@@ -63,6 +68,7 @@ const dateSlug = `${parts[0]}-${parts[1]}-${parts[2]}`;
 
 const qualityDir = `/tmp/vg-quality-${dateSlug}`;
 const auditDir = `/tmp/vg-audit-${dateSlug}`;
+const factcheckDir = `/tmp/vg-factcheck-${dateSlug}`;
 
 const ROLLUP_ARCHETYPES = new Set(["weekly-rollup", "monthly-rollup"]);
 
@@ -111,6 +117,24 @@ if (!isRollupDir && !existsSync(qualityDir)) {
       violations.push(`Step 7.5: missing reviewer A output for ${slug} (expected ${a})`);
     if (!existsSync(b))
       violations.push(`Step 7.5: missing reviewer B output for ${slug} (expected ${b})`);
+  }
+}
+
+// --- Step 7.6 evidence: fact-check ledger per post ---
+// Rollup posts synthesize from already-published roundups (no new claims),
+// so Step 7.6 does not run for them — same guard as Step 7.5.
+if (!isRollupDir && !existsSync(factcheckDir)) {
+  violations.push(
+    `Step 7.6 evidence missing: ${factcheckDir}/ does not exist. ` +
+      `The fact-check pass must run for every post and write one ` +
+      `evidence ledger per slug to this directory. There is no skip ` +
+      `clause — see SKILL.md Step 7.6 and references/fact-check.md.`
+  );
+} else if (!isRollupDir) {
+  for (const slug of slugs) {
+    const p = join(factcheckDir, `${slug}-ledger.json`);
+    if (!existsSync(p))
+      violations.push(`Step 7.6: missing fact-check ledger for ${slug} (expected ${p})`);
   }
 }
 
@@ -182,6 +206,7 @@ if (!isRollupDir && deepCount < 3) {
         ["url", "refill", "exhausted"],
         ["step 7.5", "blocking"],
         ["step 8.5", "blocking"],
+        ["step 7.6", "unverifiable"],
       ];
       const containsBanned = bannedSubstrings.find((s) => reason.includes(s));
       if (containsBanned) {
@@ -235,5 +260,6 @@ if (violations.length > 0) {
 process.stdout.write(
   `OK: quality-gate evidence present for ${slugs.length} post(s) in ${targetDir}\n` +
     `  Step 7.5 reviewer artifacts: ${qualityDir}/\n` +
+    `  Step 7.6 fact-check ledgers: ${factcheckDir}/\n` +
     `  Step 8.5 screenshot artifacts: ${auditDir}/\n`
 );
