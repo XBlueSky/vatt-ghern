@@ -29,11 +29,42 @@ classic failure modes are:
   numbers/scenes/quotes, but §1 is an author-side rule with no
   verifier. This layer is the verifier.
 
+The fix is structural, not just post-hoc: the evidence ledger is built
+**while reading** (Step 7b), not reconstructed afterwards. Reading
+notes separate the source's words from the author's interpretation at
+the moment of reading; the post may only assert what the notes
+contain; verification then has two cheap-to-expensive stages — trace
+(post → notes) and authenticity (notes → re-fetched sources). The
+ledger is also the internalization record: its perspective fields
+(mechanism / tradeoff / reader_use) answer at reading time the
+questions rubric Axes 4/5 will ask at review time, and its `spine` is
+the argument backbone the Axis 2 reviewer checks the post against.
+
 Verification is a **gate, not a score**. LLM judges inflate numeric
 scores (the reason rubric scores are advisory + human-final); a
 fact-check verdict is closer to a mechanical fact — either the source
 supports the sentence or it does not. That is why this layer emits
 per-claim verdicts and required actions, not a 0–10 axis.
+
+## The authoring discipline (Step 7b: read → structure → write)
+
+- **Read**: for every source fetched, write notes into the ledger as
+  you read — `quote` (verbatim, original language), `hedge` (the
+  source's own strength: hedged/asserted), `interpretation` (your
+  reading, physically separate from the quote), `timeliness`. Attempt
+  one Wayback snapshot per source URL at read time
+  (`https://web.archive.org/save/<url>`; record null on failure, never
+  retry). Fill one `perspective` set per source: what mechanism does
+  this teach (Axis 4)? what tradeoff? what does a Taiwanese engineer
+  reader do with it (Axis 5)?
+- **Structure**: before drafting, distil the `spine` — a 5–7 point
+  argument backbone — from the perspective fields. Read your
+  archetype's Engagement section for register/hook/tension guidance.
+- **Write**: numbers, quotes, attributions, and causal assertions may
+  only come from the notes' fact layer. Material not in the notes:
+  re-read the source and add a note, or mark the sentence as
+  inference（出處四態的「推斷」）. Never upgrade a note's hedge
+  strength in prose.
 
 ## What counts as a check-worthy claim
 
@@ -85,16 +116,16 @@ matrix below crosses them.
 ## Hedge delta
 
 For every `verified`-candidate claim, compare epistemic strength
-between source and post:
+between the note's recorded `hedge` field and the post sentence:
 
 - `none` — same strength.
-- `inflated` — source hedges, post asserts ("may/early results
-  suggest/in our benchmark" → 「是/已經/砍半」). An inflated claim is
-  **not** `verified`; verdict becomes `unverifiable` when the
-  unhedged version is not in the source, with `hedge_delta:
-  "inflated"` recording why.
-- `deflated` — post is weaker than source. Never an error; record it
-  and move on.
+- `inflated` — note records `hedge: "hedged"`, but the post asserts
+  ("may/early results suggest/in our benchmark" → 「是/已經/砍半」).
+  An inflated claim is **not** `verified`; verdict becomes
+  `unverifiable` when the unhedged version is not in the source, with
+  `hedge_delta: "inflated"` recording why.
+- `deflated` — post is weaker than the note's hedge. Never an error;
+  record it and move on.
 
 ## Source independence
 
@@ -126,57 +157,89 @@ Classify each claim's shelf life:
 
 ## Archiving discipline
 
-Link rot makes every future re-verification impossible, so the checker
-archives **at check time**: for each source URL, attempt a Wayback
-snapshot via `https://web.archive.org/save/<url>` (a plain WebFetch GET
-triggers Save Page Now) and record the snapshot URL in
-`sources[].archive_url`. Archive failure is non-blocking — record
-`null` and continue; the gate warns but does not fail on a null
-archive. Never let archiving anxiety consume the check budget: one
-attempt per URL, move on.
+Link rot makes every future re-verification impossible, so the
+**author** archives **at read time** (Step 7b): for each source URL,
+attempt a Wayback snapshot via `https://web.archive.org/save/<url>` (a
+plain WebFetch GET triggers Save Page Now) and record the snapshot URL
+in `sources[].archive_url`. The checker fills gaps for any source the
+author left null. Archive failure is non-blocking — record `null` and
+continue; the gate warns but does not fail on a null archive. Never let
+archiving anxiety consume the read budget: one attempt per URL, move
+on.
 
 ## Evidence ledger schema
 
-One ledger per post, written by the parent to
-`/tmp/vg-factcheck-YYYY-MM-DD/<slug>-ledger.json`:
+One ledger per deep-story, committed next to the post at
+`src/posts/YYYY/MM/DD/deep-<slug>.ledger.json`. Ledgers are excluded
+from the 11ty build (the posts passthrough already excludes JSON) and
+are PR-review evidence.
 
 ```jsonc
 {
   "output_path": "src/posts/2026/06/12/deep-foo.html",
-  "checked_at": "2026-06-12",
-  "checker_rounds": 1,            // bumped on each Step 7.6c re-check
-  "coverage": {
-    "candidate_claims": 31,       // claims found in extraction pass
-    "checked": 24,
-    "dropped_low_load": 7         // must equal candidate - checked
-  },
+  "spine": [
+    "1. …",                     // 5-7 point argument backbone,
+    "2. …"                      // distilled from perspective fields
+  ],
   "sources": [
     {
       "url": "https://example.com/post",
-      "fetch_status": "ok",       // ok | failed
-      "archive_url": "https://web.archive.org/web/20260612.../...",  // or null
-      "published": "2026-06-10"   // or null when undatable
+      "archive_url": "https://web.archive.org/web/…",  // attempted at READ time; null allowed
+      "published": "2026-06-10",                        // or null
+      "perspective": {            // ≥1 set per source (not per quote)
+        "mechanism": "what this source teaches, as a mechanism",
+        "tradeoff": "the tradeoff behind it",
+        "reader_use": "what a Taiwanese engineer does with it"
+      }
     }
   ],
-  "claims": [
+  "notes": [
+    {
+      "id": "n01",
+      "url": "https://example.com/post",
+      "quote": "verbatim source text — original language, no translation",
+      "hedge": "hedged",          // hedged | asserted — source's own strength
+      "interpretation": "author's reading — physically separate from quote",
+      "timeliness": "volatile"    // durable | annual | volatile
+    }
+  ],
+  "claims": [                     // filled by the Step 7.6 checker
     {
       "id": "c01",
-      "claim_text": "verbatim sentence (or minimal span) from the post",
-      "location": "under H2「…」/ roundup item-03",
+      "claim_text": "verbatim span from the post",
+      "location": "under H2「…」",
       "type": "number",           // number|quote|attribution|date-version|causal|superlative
       "load": "high",             // high|medium|low
-      "source_urls": ["https://example.com/post"],
+      "note_ids": ["n01"],        // trace target; [] = trace failure
       "independence": "single-source",  // corroborated|echo|single-source
-      "verdict": "verified",      // verified|pending|inferred|unverifiable
-      "hedge_delta": "none",      // none|inflated|deflated
-      "evidence": "verbatim quote from the source, or null",
-      "note": "",                 // required when verdict=inferred and action=none
+      "verdict": "verified",      // verified|pending|inferred|unverifiable（出處四態）
+      "hedge_delta": "none",      // none|inflated|deflated (post vs. note's hedge)
+      "evidence": "verbatim source quote, or null",
+      "note": "",
       "action": "none",           // none|correct|hedge|mark-inferred|delete
       "resolution": "none-needed" // none-needed|corrected|hedged|marked-inferred|deleted|accepted-with-flag
     }
-  ]
+  ],
+  "checked_at": "2026-06-12",
+  "checker_rounds": 1,
+  "coverage": { "candidate_claims": 31, "checked": 24, "dropped_low_load": 7 }
 }
 ```
+
+**Roundup variant**: `roundup.ledger.json` is claims-only — no
+`notes[]`, no `spine`, no `perspective` — produced by the checker
+post-hoc and committed like the deep-story ledgers. The mechanical gate
+skips spine and trace rules for it. Minimum: ≥1 claim per item lede.
+
+## Trace stage
+
+Before authenticity checking, every load-bearing claim extracted from
+the post binds to `note_ids`. An empty binding is a trace failure
+unless the verdict is `inferred` (the claim is the author's marked
+synthesis). Trace failures go to the fix loop: add the missing note by
+re-reading the source, or rewrite/mark the sentence. The mechanical
+gate (`check-claim-ledger.mjs`) enforces the binding; the checker's
+honesty about it is auditable because the notes' quotes are verbatim.
 
 ## Action matrix — verdict × load
 
@@ -197,8 +260,9 @@ Plus two cross-cutting rules:
 **Fix discipline** (mirrors zh-tw-prose.md §1): every fix is deletion,
 hedging, marking as inference, or correcting *to what the source
 actually says*. A fix may NOT introduce new facts, numbers, or quotes
-that the checker has not verified. The Step 7.6c retry brief repeats
-this constraint verbatim.
+that the checker has not verified. Trace failures may be fixed by
+adding a note — but only with a verbatim quote from a re-fetched
+source. The Step 7.6c retry brief repeats this constraint verbatim.
 
 ## What this layer is NOT
 
@@ -209,5 +273,5 @@ this constraint verbatim.
 - Not a style pass. If the checker finds prose problems, it ignores
   them; Steps 7.5/8 own prose.
 - Not a search for new material. The checker verifies against the
-  sidecar's `sources[]` (plus alternate sources it finds when chasing
+  ledger's `sources[]` (plus alternate sources it finds when chasing
   a `pending` claim); it never feeds new color back into the post.
