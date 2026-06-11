@@ -1,30 +1,26 @@
 #!/usr/bin/env node
-// check-claim-ledger.mjs — mechanical validation of Step 7.6 fact-check
-// ledgers.
+// check-claim-ledger.mjs — mechanical validation of per-post reading
+// ledgers (Step 7b authoring discipline + Step 7.6 fact-check gate).
 //
-// Why this exists: the fact-check layer (references/fact-check.md) is a
-// judgment pass run by a checker sub-agent, but its OUTPUT is structured —
-// per-claim verdict × load × action × resolution. That structure makes the
-// dangerous end-states mechanically detectable: a high-load unverifiable
-// claim that survived the fix loop, an inflated hedge marked "none-needed",
-// a fix loop that never completed ("pending-fix" still in the ledger), a
-// checker that extracted 3 claims from a 1000-line deep-story. This script
-// does NOT judge whether a verdict is correct (the evidence field + human
-// PR review own that) — it proves the ledger is complete, internally
-// consistent, and that every required action was resolved.
+// Ledger-first design (2026-06-11 spec): authors build the ledger WHILE
+// reading sources (notes = verbatim quote + hedge + interpretation,
+// physically separated; perspective per source; 5-7 point spine before
+// drafting). The Step 7.6 checker (a) traces every load-bearing claim to
+// a note and (b) re-fetches sources to verify quotes are real. This script
+// proves the artifact is complete and internally consistent — it does NOT
+// judge whether a verdict is correct (the evidence field + human PR review
+// own that).
 //
-// Expected artifact layout (produced by Step 7.6 of the routine):
-//
-//   /tmp/vg-factcheck-YYYY-MM-DD/
-//     <slug>-ledger.json    # one per published post (roundup + each deep)
+// Ledgers are COMMITTED next to the post:
+//   src/posts/YYYY/MM/DD/deep-<slug>.ledger.json  (full: spine+notes+claims)
+//   src/posts/YYYY/MM/DD/roundup.ledger.json      (claims-only light check —
+//   no notes[], no spine; trace rules skipped)
 //
 // Usage:
-//   node skills/daily-news/scripts/check-claim-ledger.mjs src/posts/YYYY/MM/DD/ [ledger-dir]
+//   node skills/daily-news/scripts/check-claim-ledger.mjs src/posts/YYYY/MM/DD/
 //
-// [ledger-dir] overrides /tmp/vg-factcheck-YYYY-MM-DD (used by tests).
-//
-// Exit 0 = every ledger present, valid, and fully resolved (warnings
-// allowed). Exit 1 = violations. Exit 2 = usage error.
+// Exit 0 = ledgers present, valid, fully resolved (warnings allowed).
+// Exit 1 = violations. Exit 2 = usage error.
 
 import { readFileSync, readdirSync, existsSync, statSync } from "node:fs";
 import { join } from "node:path";
@@ -46,24 +42,28 @@ const ENUMS = {
     "accepted-with-flag",
   ],
   fetch_status: ["ok", "failed"],
+  hedge: ["hedged", "asserted"],
+  timeliness: ["durable", "annual", "volatile"],
 };
 
 const ROLLUP_ARCHETYPES = new Set(["weekly-rollup", "monthly-rollup"]);
 
-// Minimum checked-claim floor for a deep-story: the brief demands ≥10 (or
-// every claim when fewer than 10 exist in the post).
+// Spine: 5-7 point argument backbone, written before drafting.
+export const SPINE_MIN = 5;
+export const SPINE_MAX = 7;
+
+// Minimum checked-claim floor for a deep-story (brief demands >=10, or
+// every claim when fewer exist in the post).
 export const DEEP_MIN_CLAIMS = 10;
 
-// Count roundup item cards. Every item lede carries at least one factual
-// claim, so the roundup ledger must check at least this many claims.
 export function countRoundupItems(html) {
   const m = html.match(/\bid="item-\d{2}"/g);
   return m ? m.length : 0;
 }
 
-// Validate one parsed ledger. Returns { violations: [...], warnings: [...] }.
-// opts: { slug, postPath (repo-relative expected output_path), isDeep,
-//         roundupItems (number, only for the roundup) }
+// Validate one parsed ledger.
+// opts: { slug, postPath, isDeep, roundupItems }
+// Returns { violations: [...], warnings: [...] }.
 export function validateLedger(ledger, opts) {
   const violations = [];
   const warnings = [];
@@ -95,15 +95,18 @@ export function validateLedger(ledger, opts) {
       );
     }
     if (cov.dropped_low_load > 0) {
-      w(`${cov.dropped_low_load} candidate claim(s) dropped as low-load (listed for PR body)`);
+      w(`${cov.dropped_low_load} candidate claim(s) dropped as low-load (list in PR body)`);
     }
   }
 
+  // --- sources ---
+  const sourceUrls = new Set();
   if (!Array.isArray(ledger.sources) || ledger.sources.length === 0) {
     v("sources[] missing or empty");
   } else {
     for (const [i, s] of ledger.sources.entries()) {
       if (typeof s.url !== "string" || s.url === "") v(`sources[${i}]: missing url`);
+      else sourceUrls.add(s.url);
       if (!ENUMS.fetch_status.includes(s.fetch_status))
         v(`sources[${i}]: bad fetch_status "${s.fetch_status}"`);
       if (!("archive_url" in s)) {
@@ -111,9 +114,60 @@ export function validateLedger(ledger, opts) {
       } else if (s.archive_url === null) {
         w(`sources[${i}] (${s.url}): no archive snapshot — link-rot risk`);
       }
+      if (opts.isDeep) {
+        const p = s.perspective;
+        const fields = ["mechanism", "tradeoff", "reader_use"];
+        if (!p || fields.some((f) => typeof p[f] !== "string" || p[f] === "")) {
+          v(
+            `sources[${i}]: perspective incomplete — mechanism/tradeoff/reader_use ` +
+              `all required per source (帶問題讀; see fact-check.md § Perspective layer)`
+          );
+        }
+      }
     }
   }
 
+  // --- spine (deep only) ---
+  if (opts.isDeep) {
+    if (!Array.isArray(ledger.spine)) {
+      v("spine missing — the 5-7 point argument backbone must be written before drafting");
+    } else if (
+      ledger.spine.length < SPINE_MIN ||
+      ledger.spine.length > SPINE_MAX ||
+      ledger.spine.some((s) => typeof s !== "string" || s === "")
+    ) {
+      v(
+        `spine must be ${SPINE_MIN}-${SPINE_MAX} non-empty points, got ` +
+          `${Array.isArray(ledger.spine) ? ledger.spine.length : "?"}`
+      );
+    }
+  }
+
+  // --- notes (deep only) ---
+  const noteIds = new Set();
+  if (opts.isDeep) {
+    if (!Array.isArray(ledger.notes) || ledger.notes.length === 0) {
+      v("notes[] missing or empty — the reading-time evidence layer is mandatory");
+    } else {
+      for (const n of ledger.notes) {
+        const id = n.id ?? "<no-id>";
+        const nv = (msg) => violations.push(`${opts.slug} ${id}: ${msg}`);
+        if (noteIds.has(id)) nv("duplicate note id");
+        noteIds.add(id);
+        if (typeof n.quote !== "string" || n.quote === "")
+          nv("note quote must be verbatim, non-empty source text");
+        if (typeof n.url !== "string" || !sourceUrls.has(n.url))
+          nv(`note url "${n.url}" not in sources[]`);
+        if (!ENUMS.hedge.includes(n.hedge)) nv(`bad hedge "${n.hedge}"`);
+        if (typeof n.interpretation !== "string")
+          nv("interpretation field missing (empty string allowed; absence is not)");
+        if (!ENUMS.timeliness.includes(n.timeliness))
+          nv(`bad timeliness "${n.timeliness}"`);
+      }
+    }
+  }
+
+  // --- claims ---
   if (!Array.isArray(ledger.claims) || ledger.claims.length === 0) {
     v("claims[] missing or empty");
     return { violations, warnings };
@@ -132,12 +186,30 @@ export function validateLedger(ledger, opts) {
       if (!ENUMS[field].includes(c[field])) cv(`bad ${field} "${c[field]}"`);
     }
     if (c.resolution === "pending-fix") {
-      cv("resolution still \"pending-fix\" — the Step 7.6c fix loop did not complete");
+      cv('resolution still "pending-fix" — the Step 7.6c fix loop did not complete');
       continue;
     }
     if (!ENUMS.resolution.includes(c.resolution)) {
       cv(`bad resolution "${c.resolution}"`);
       continue;
+    }
+
+    // Trace binding (deep only): a claim either traces to notes or is
+    // an explicit inference.
+    if (opts.isDeep) {
+      if (!Array.isArray(c.note_ids)) {
+        cv("note_ids must be an array");
+      } else if (c.note_ids.length === 0) {
+        if (c.verdict !== "inferred")
+          cv(
+            `trace failure: empty note_ids with verdict "${c.verdict}" — ` +
+              `a claim either traces to a note or is marked inferred`
+          );
+      } else {
+        for (const nid of c.note_ids) {
+          if (!noteIds.has(nid)) cv(`note_ids references missing note "${nid}"`);
+        }
+      }
     }
 
     // Consistency rules — see fact-check.md § Action matrix.
@@ -148,16 +220,12 @@ export function validateLedger(ledger, opts) {
     if (c.verdict === "verified" && (typeof c.evidence !== "string" || c.evidence === ""))
       cv("verdict verified requires verbatim evidence quote");
     if (c.verdict === "unverifiable" && !["corrected", "deleted"].includes(c.resolution))
-      cv(
-        `verdict unverifiable must resolve to corrected/deleted, got "${c.resolution}"`
-      );
+      cv(`verdict unverifiable must resolve to corrected/deleted, got "${c.resolution}"`);
     if (
       c.resolution === "accepted-with-flag" &&
       !(c.verdict === "pending" && c.load !== "high")
     )
-      cv(
-        "accepted-with-flag is only legal for pending verdicts at medium/low load"
-      );
+      cv("accepted-with-flag is only legal for pending verdicts at medium/low load");
     if (c.hedge_delta === "inflated" && c.action === "none")
       cv("hedge_delta inflated requires a fix action");
     if (
@@ -165,13 +233,10 @@ export function validateLedger(ledger, opts) {
       c.action === "none" &&
       (typeof c.note !== "string" || c.note === "")
     )
-      cv(
-        "inferred claim with action none needs a note (e.g. \"already marked as inference in text\")"
-      );
+      cv('inferred claim with action none needs a note (e.g. "already marked as inference in text")');
   }
 
-  // Claim-count floors. A checker that "checked" 3 claims on a 1000-line
-  // deep-story did not run the extraction pass the brief demands.
+  // Claim-count floors.
   const checked = ledger.claims.length;
   if (opts.isDeep) {
     const floor = cov && Number.isInteger(cov.candidate_claims)
@@ -185,8 +250,8 @@ export function validateLedger(ledger, opts) {
   } else if (Number.isInteger(opts.roundupItems) && opts.roundupItems > 0) {
     if (checked < opts.roundupItems)
       v(
-        `roundup ledger has ${checked} checked claim(s) for ${opts.roundupItems} ` +
-          `items — every item lede carries at least one claim`
+        `roundup ledger has ${checked} checked claim(s) for ${opts.roundupItems} item(s) ` +
+          `— every item lede carries at least one claim`
       );
   }
 
@@ -197,7 +262,7 @@ function main() {
   const targetDir = process.argv[2];
   if (!targetDir) {
     process.stderr.write(
-      "Usage: check-claim-ledger.mjs <src/posts/YYYY/MM/DD/> [ledger-dir]\n"
+      "Usage: check-claim-ledger.mjs <src/posts/YYYY/MM/DD/>\n"
     );
     process.exit(2);
   }
@@ -214,8 +279,6 @@ function main() {
     );
     process.exit(2);
   }
-  const dateSlug = `${parts[0]}-${parts[1]}-${parts[2]}`;
-  const ledgerDir = process.argv[3] || `/tmp/vg-factcheck-${dateSlug}`;
 
   const slugs = readdirSync(targetDir)
     .filter((f) => f.endsWith(".11tydata.json"))
@@ -247,49 +310,41 @@ function main() {
   const allViolations = [];
   const allWarnings = [];
 
-  if (!existsSync(ledgerDir)) {
-    allViolations.push(
-      `Step 7.6 evidence missing: ${ledgerDir}/ does not exist. The ` +
-        `fact-check pass must run for every post and write one ledger ` +
-        `JSON per slug. There is no skip clause — see SKILL.md Step 7.6.`
-    );
-  } else {
-    for (const slug of slugs) {
-      const p = join(ledgerDir, `${slug}-ledger.json`);
-      if (!existsSync(p)) {
-        allViolations.push(
-          `Step 7.6: missing fact-check ledger for ${slug} (expected ${p})`
-        );
-        continue;
-      }
-      let ledger;
-      try {
-        ledger = JSON.parse(readFileSync(p, "utf8"));
-      } catch (e) {
-        allViolations.push(`${slug}: ledger is not valid JSON (${e.message})`);
-        continue;
-      }
-      const isDeep = slug.startsWith("deep-");
-      let roundupItems = null;
-      if (!isDeep) {
-        try {
-          roundupItems = countRoundupItems(
-            readFileSync(join(norm, `${slug}.html`), "utf8")
-          );
-        } catch {
-          roundupItems = null;
-        }
-      }
-      const postPath = join(norm, `${slug}.html`);
-      const { violations, warnings } = validateLedger(ledger, {
-        slug,
-        postPath,
-        isDeep,
-        roundupItems,
-      });
-      allViolations.push(...violations);
-      allWarnings.push(...warnings);
+  for (const slug of slugs) {
+    const p = join(norm, `${slug}.ledger.json`);
+    if (!existsSync(p)) {
+      allViolations.push(
+        `Step 7.6: missing committed reading ledger for ${slug} (expected ${p}). ` +
+          `There is no skip clause — see SKILL.md Step 7.6.`
+      );
+      continue;
     }
+    let ledger;
+    try {
+      ledger = JSON.parse(readFileSync(p, "utf8"));
+    } catch (e) {
+      allViolations.push(`${slug}: ledger is not valid JSON (${e.message})`);
+      continue;
+    }
+    const isDeep = slug.startsWith("deep-");
+    let roundupItems = null;
+    if (!isDeep) {
+      try {
+        roundupItems = countRoundupItems(
+          readFileSync(join(norm, `${slug}.html`), "utf8")
+        );
+      } catch {
+        roundupItems = null;
+      }
+    }
+    const { violations, warnings } = validateLedger(ledger, {
+      slug,
+      postPath: join(norm, `${slug}.html`),
+      isDeep,
+      roundupItems,
+    });
+    allViolations.push(...violations);
+    allWarnings.push(...warnings);
   }
 
   if (allWarnings.length) {
@@ -298,18 +353,18 @@ function main() {
   }
   if (allViolations.length) {
     process.stderr.write(
-      `\nClaim-ledger check FAILED for ${targetDir} (ledgers: ${ledgerDir})\n\n`
+      `\nClaim-ledger check FAILED for ${targetDir}\n\n`
     );
     for (const m of allViolations) process.stderr.write(`  · ${m}\n`);
     process.stderr.write(
       `\nThis gate enforces SKILL.md Step 7.6. Fix by completing the ` +
-        `fact-check fix loop (correct/hedge/mark/delete per ` +
-        `references/fact-check.md), not by editing ledger verdicts to pass.\n`
+        `authoring discipline / fix loop (correct/hedge/mark/delete per ` +
+        `references/fact-check.md), not by editing ledger fields to pass.\n`
     );
     process.exit(1);
   }
   process.stdout.write(
-    `OK: fact-check ledgers complete and resolved for ${slugs.length} post(s) in ${targetDir}\n`
+    `OK: reading ledgers complete and resolved for ${slugs.length} post(s) in ${targetDir}\n`
   );
 }
 
