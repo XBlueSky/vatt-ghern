@@ -454,6 +454,9 @@ Each brief carries these fields:
 - `summary` — 2-3 sentences telling the sub-agent what to cover
 - `output_path` — `src/posts/YYYY/MM/DD/deep-<kebab-slug>.html`
 - `sidecar_path` — same path with `.11tydata.json`
+- `ledger_path` — same path with `.ledger.json` (the reading ledger
+  the author builds while fetching sources; see
+  `references/fact-check.md`)
 - `related_roundup` — `/YYYY/MM/DD/roundup/`
 - `recent_widgets` — a flat list of the `widget_templates` used by the last
   ~5 deep-stories, PLUS the hero each of today's *other* deep-stories is
@@ -500,8 +503,11 @@ Each sub-agent is constrained per the brief:
 - Tools allowed: WebFetch, Read, Write only.
 - No nested `Agent` dispatch, no Bash, no Edit on other days' posts,
   no git operations.
-- Writes ONE HTML to `output_path` + ONE sidecar to `sidecar_path`,
-  reports back with `{status, char_count, archetype, archetype_deviations}`.
+- Writes ONE HTML to `output_path` + ONE sidecar to `sidecar_path`
+  + ONE reading ledger to `ledger_path` (built while reading, per
+  `references/fact-check.md` § The authoring discipline), reports
+  back with `{status, char_count, archetype, archetype_deviations,
+  note_count, spine_points}`.
 
 If a sub-agent reports `BLOCKED` or `DONE_WITH_CONCERNS`:
 
@@ -515,8 +521,8 @@ If a sub-agent reports `BLOCKED` or `DONE_WITH_CONCERNS`:
 
 After all sub-agents return:
 
-1. Read each output HTML + sidecar back to confirm the files exist and
-   the sidecar parses as JSON.
+1. Read each output HTML + sidecar + ledger back to confirm the files exist and
+   the sidecar + ledger parse as JSON.
 2. Verify per-file invariants the sub-agent was told to honour:
    - Prose ≥ 500 lines (HTML lines excluding inside `<script>`,
      `<style>`, `<svg>`, `<canvas>` blocks).
@@ -528,6 +534,9 @@ After all sub-agents return:
    - Body matches the picked archetype's H2 *count range* (phrasing free).
    - Sidecar contains `widget_count`, `widget_questions`,
      `widget_templates` arrays; lengths agree.
+   - Ledger contains a 5-7 point `spine`, non-empty `notes[]`, and a
+     `perspective` set per source (`claims` may be empty — the
+     Step 7.6 checker fills it).
 3. **Count-conservation invariant** (added 2026-05-21 after PR #30):
    `N_deep_dispatched_in_step_7b == N_deep_written_files`. If a
    sub-agent BLOCKED or its output got dropped, refer to Step 5d's
@@ -646,7 +655,7 @@ ONE response (single message with multiple `Agent` tool blocks).
 Each reviewer:
 - Tools: Read only
 - Reads: post HTML + sidecar + rubric file + archetype reference (if
-  deep-story) + persona file
+  deep-story) + persona file + ledger spine (deep-story only)
 - Does NOT read: other posts, exemplars, other reviewer's output
 - Emits: ONE JSON object per the rubric's "Reviewer output format"
   schema
@@ -755,68 +764,76 @@ These populate the PR body sections defined in Step 9's template
 | Roundup blocking-drops | BLOCKED — do NOT open PR. Report status with roundup's blocking axes. |
 | Reviewer dispatch returns no output (network / tool failure) | Re-dispatch that reviewer once. Still nothing → treat as BLOCKING vote. |
 
-### Step 7.6: Fact-check gate
+### Step 7.6: Fact-check gate (trace + authenticity)
 
-After Step 7.5 settles (prose is final modulo fact fixes), verify that
-what the posts **assert** is actually **in** the cited sources. Steps
-7.5/8/8.5 judge how the prose reads, whether the HTML is valid, and how
-the page renders; none of them re-opens the sources. Step 7.6 closes
-that gap: claim extraction → source re-fetch → adversarial verification,
-with an evidence ledger per post. The standard lives in
-`references/fact-check.md` (claim taxonomy, 出處四態 verdicts, hedge
-delta, source independence, 時效分層, archiving, action matrix); the
-sub-agent contract lives in `references/fact-check-brief.md`.
+After Step 7.5 settles (prose is final modulo fact fixes), verify the
+posts against their reading ledgers, and the ledgers against the
+world. Authors built the ledgers while reading (Step 7b); this step
+proves the post only asserts what the notes contain (trace) and that
+the notes' quotes are real (authenticity). The standard lives in
+`references/fact-check.md`; the checker contract in
+`references/fact-check-brief.md`. Ledgers are committed next to the
+posts (`<slug>.ledger.json`) — they are PR-review evidence and the
+site's re-verification record.
 
-**No skip clause exists.** Same enforcement rule as Steps 7.5/8.5: if
-wall-clock or budget is tight, drop deep-stories (N → N-1) so the
-remaining gate fits — never ship unverified claims to ship more posts.
-`check-quality-gate-evidence.mjs` fails the publish gate when ledgers
-are missing; `check-claim-ledger.mjs` fails it when ledgers are
-incomplete or unresolved.
+**No skip clause exists.** Same enforcement rule as Steps 7.5/8.5:
+if wall-clock or budget is tight, drop deep-stories (N → N-1) so the
+remaining gate fits — never ship unverified claims to ship more
+posts. `check-quality-gate-evidence.mjs` fails when ledgers are
+missing; `check-claim-ledger.mjs` fails when they are incomplete or
+unresolved.
 
 #### Step 7.6a: Dispatch fact-check sub-agents (parallel)
 
 For each post (1 roundup + N deep-stories), dispatch **1 checker
-sub-agent** with `subagent_type: general-purpose` and **`model: "opus"`
-required** (hedge-strength and source-independence judgment is
-design-grade; if Opus is unavailable, report BLOCKED rather than fall
-back). All ≤4 dispatches in ONE response. Each checker:
+sub-agent** with `subagent_type: general-purpose` and **`model:
+"opus"` required** (hedge-strength and source-independence judgment
+is design-grade; if Opus is unavailable, report BLOCKED rather than
+fall back). All ≤4 dispatches in ONE response. Each checker (tools:
+Read + WebFetch only):
 
-- Tools: Read + WebFetch only
-- Reads: fact-check.md, the post HTML, its sidecar (whose `sources[]`
-  is the ground truth to verify against)
-- Re-fetches every sidecar source; attempts one Wayback snapshot per
-  URL (`https://web.archive.org/save/<url>`, non-blocking on failure)
-- Emits: ONE evidence-ledger JSON per the schema in fact-check.md
+- **Trace pass** — extracts load-bearing claims from the post and
+  binds each to ledger notes (`note_ids`); unbound + unmarked =
+  trace failure.
+- **Authenticity pass** — re-fetches every ledger source; verifies
+  each used note's `quote` is really in the source at the recorded
+  `hedge` strength; judges independence (echo ≠ corroboration) and
+  timeliness; fills any `archive_url` the author left null.
+- For the roundup: creates `roundup.ledger.json` (claims-only — no
+  notes/spine), ≥1 claim per item lede verified against the item's
+  source URL.
+- Emits the completed ledger JSON; the parent writes it back to
+  `ledger_path`.
 
-#### Step 7.6b: Write ledgers + apply the action matrix
+#### Step 7.6b: Apply the action matrix
 
-Parent writes each returned ledger to
-`/tmp/vg-factcheck-YYYY-MM-DD/<slug>-ledger.json`, then walks the
-claims: every claim whose `action` ≠ `none` needs a fix per the
-fact-check.md action matrix (high-load `unverifiable` → correct from
-source or delete; unmarked `inferred` → mark as inference or delete;
-`hedge_delta: inflated` → restore the source's hedging strength;
-high-load `pending` → alternate source or visible hedged attribution).
+Parent walks the returned claims: every claim whose `action` ≠
+`none` needs a fix per the fact-check.md action matrix (high-load
+`unverifiable` → correct from source or delete; unmarked `inferred`
+→ mark as inference or delete; `hedge_delta: inflated` → restore the
+note's hedging strength; high-load `pending` → alternate source or
+visible hedged attribution).
 
 #### Step 7.6c: Fix loop
 
 For each post with actionable claims, dispatch one retry author
 sub-agent (Opus, per Step 7b) whose brief contains the claim list,
-each claim's verdict + evidence, and the **fix discipline**: deletion,
-hedging, marking-as-inference, or correcting to what the source
-actually says ONLY — a fix may not introduce new facts, numbers, or
-quotes (zh-tw-prose.md §1). After fixes, re-dispatch the checker with
-the re-check variant brief (fixed claims only); parent merges verdicts
-and updates each claim's `resolution`.
+each claim's verdict + evidence + bound notes, and the **fix
+discipline**: deletion, hedging, marking-as-inference, or correcting
+to what the note's quote actually says ONLY — a fix may not
+introduce facts, numbers, or quotes absent from the ledger
+(zh-tw-prose.md §1). Trace failures may also be fixed by ADDING a
+note — but only with a verbatim quote from a re-fetched source.
+After fixes, re-dispatch the checker with the re-check variant brief
+(fixed claims only); parent merges verdicts and updates each claim's
+`resolution`, bumping `checker_rounds`.
 
-Iteration budget: up to **3 rounds** per post. If a high-load
-`unverifiable` claim still cannot be corrected or deleted after 3
-rounds (e.g. the whole post leans on a claim its source does not
-make), drop the post (N → N-1) and log under `## Step 7.6 Fact-check
-drops`; if that post is the roundup, the routine is BLOCKED — do NOT
-open PR. Fixes here are deletions/hedges/corrections, narrow in scope
-by construction — they do not re-trigger Step 7.5.
+Iteration budget: up to **3 rounds** per post. A high-load
+`unverifiable` claim that survives 3 rounds drops the post
+(N → N-1), logged under `## Step 7.6 Fact-check drops`; if that post
+is the roundup, the routine is BLOCKED — do NOT open PR. Fixes here
+are deletions/hedges/corrections, narrow by construction — they do
+not re-trigger Step 7.5.
 
 #### Step 7.6d: Mechanical validation
 
@@ -824,20 +841,24 @@ by construction — they do not re-trigger Step 7.5.
 node ${CLAUDE_PLUGIN_ROOT}/skills/daily-news/scripts/check-claim-ledger.mjs src/posts/YYYY/MM/DD/
 ```
 
-Validates every ledger: schema + enums, coverage arithmetic, claim
-floors (≥ min(10, candidates) per deep-story, ≥ 1 per roundup item),
-and the resolution rules (no surviving high-load `unverifiable`, no
-`pending-fix`, `accepted-with-flag` only for medium/low-load `pending`
-claims). Exit 1 = the fix loop is not done; the fix is to finish it,
-never to edit ledger verdicts to pass.
+Validates every committed ledger: schema + enums, spine 5-7, one
+perspective set per source, notes integrity (verbatim quote, hedge,
+interpretation separation), trace binding (`note_ids` non-empty or
+verdict `inferred`), coverage arithmetic, claim floors (deep ≥
+min(10, candidates); roundup ≥ item count), and resolution rules (no
+surviving high-load `unverifiable`, no `pending-fix`,
+`accepted-with-flag` only for medium/low-load `pending`). Exit 1 =
+the discipline is not done; the fix is to finish it, never to edit
+ledger fields to pass.
 
 #### Failure modes for Step 7.6
 
 | Scenario | Handling |
 |---|---|
+| Author sub-agent returns post but no ledger (or unparseable) | Treat as BLOCKED for that post in Step 7c — re-dispatch the brief; the ledger is not optional output. |
 | Checker emits malformed JSON | Re-dispatch that checker (up to 2 retries). Still malformed → treat the post as unverified: drop it (deep-story) or BLOCK (roundup). |
-| All sidecar sources unreachable on re-fetch | Every claim is `pending`. High-load pendings need alternate sources or hedged attribution; if the post's core claims can't be supported at all, drop the post. |
-| Archive (web.archive.org) fails or times out | Non-blocking. Record `archive_url: null`, move on — the gate warns but does not fail. |
+| All ledger sources unreachable on re-fetch | Every claim is `pending`. High-load pendings need alternate sources or hedged attribution; if the post's core claims can't be supported, drop the post. |
+| Archive (web.archive.org) fails or times out | Non-blocking. `archive_url: null`, move on — the gate warns but does not fail. |
 | High-load `unverifiable` survives 3 fix rounds | Drop the post (N → N-1); roundup → BLOCKED, no PR. |
 
 ### Step 8: Self-check (mechanical)
@@ -1238,11 +1259,12 @@ are unresolved.
 
 For each post (roundup + deep-stories):
 - `<output_path>` — claims checked: <N> (of <M> candidates; <K> dropped low-load)
+  - trace: <N-bound> bound to notes · <N-inferred> marked inferred · <N-trace-failures> trace failures fixed
   - verdicts: 已核實 <n1> · 待核實 <n2> · 推斷 <n3> · 不可核實 <n4>
   - fixes applied: <list each — corrected / hedged / marked-inferred / deleted, with claim id + one-line what>
   - accepted-with-flag: <list each pending medium/low-load claim the human should eyeball, with its source>
   - unarchived sources: <list each archive_url: null, or (none)>
-  - Ledger artifact: `/tmp/vg-factcheck-YYYY-MM-DD/<slug>-ledger.json`
+  - Ledger: `src/posts/YYYY/MM/DD/<slug>.ledger.json` (committed — review the diff)
   - Checker rounds: <N>
 
 ## Step 7.6 Fact-check drops
