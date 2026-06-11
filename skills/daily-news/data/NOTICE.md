@@ -14,8 +14,11 @@ Attribution chain:
   ([taiwan.md](https://taiwan.md)), CC BY-SA 4.0.
 
 Local modifications: `mode` values may be adjusted (auto ⇄ flag) based
-on calibration against this site's corpus. Schema unchanged:
-`{from, to, mode: "auto"|"flag", cat, note?}`.
+on calibration against this site's corpus, and local guard entries may
+be added with `mode: "ok"` (correct Taiwan compounds — e.g. 演算法 —
+that contain zh-CN auto substrings; the scanner consumes them silently
+so the substring cannot false-fire). Schema:
+`{from, to, mode: "auto"|"flag"|"ok", cat, note?}`.
 
 The scanner code that consumes this file
 (`skills/daily-news/scripts/check-zh-prose.mjs`) and the prose

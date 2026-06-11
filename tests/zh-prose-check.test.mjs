@@ -159,3 +159,25 @@ test("CLI: directory with no scannable files exits 2", () => {
   }
   assert.equal(status, 2);
 });
+
+test("scanTerms: ok-mode guard — 演算法 consumes 算法 substring", () => {
+  const hits = scanTerms("這個演算法比舊的演算法快", TERMS);
+  const byFrom = Object.fromEntries(hits.map((h) => [h.from, h]));
+  assert.ok(!byFrom["算法"], "auto substring must not fire inside the guard");
+  assert.equal(byFrom["演算法"].mode, "ok");
+  assert.equal(byFrom["演算法"].count, 2);
+});
+
+test("CLI: ok-mode guard terms are never reported and never fail", () => {
+  const dir = mkdtempSync(join(tmpdir(), "zh-prose-"));
+  writeFileSync(
+    join(dir, "deep-algo.html"),
+    `<p>這個演算法的複雜度是 O(n log n)，控制代碼由 kernel 管理。</p>`
+  );
+  const out = execFileSync(process.execPath, [SCRIPT, dir], {
+    encoding: "utf8",
+  });
+  assert.ok(out.includes("OK"));
+  assert.ok(!out.includes("演算法"), "ok guards are silent");
+  assert.ok(!out.includes("算法」"), "no auto-substring report either");
+});
