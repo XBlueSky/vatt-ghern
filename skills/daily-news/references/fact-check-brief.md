@@ -18,6 +18,7 @@ at the stated strength. Emit JSON only.
 
 - output_path:  {{path/to/post.html}}
 - sidecar_path: {{path/to/post.11tydata.json}}
+- ledger_path:  {{path/to/post.ledger.json}}
 - date:         {{YYYY-MM-DD}}
 
 ## Required reading (in order)
@@ -26,42 +27,45 @@ at the stated strength. Emit JSON only.
    taxonomy, 出處四態 verdicts, hedge delta, source independence,
    timeliness, archiving, ledger schema, action matrix.
 2. The post HTML at {{output_path}}
-3. The sidecar JSON at {{sidecar_path}} — its `sources[]` array is
-   the claim-support ground truth you verify against.
+3. The sidecar JSON at {{sidecar_path}}
+4. The ledger JSON at {{ledger_path}} — its `notes[]` are the evidence
+   layer you verify; its `spine` and `notes[].interpretation` and
+   `sources[].perspective` fields are NOT your concern — style and
+   structure belong to other gates.
 
 ## Your task
 
-1. **Extract** load-bearing factual claims from the post body
-   (`number` / `quote` / `attribution` / `date-version` / `causal` /
-   `superlative` per fact-check.md). Record total found in
-   `coverage.candidate_claims`. Prioritize quotes and numbers, then
-   attributions, then causal/superlative. Check at least 10 claims
-   for a deep-story (all of them if fewer exist); for a roundup,
-   check at least one claim per item lede.
-2. **Re-fetch** every URL in the sidecar's `sources[]` with WebFetch.
-   For each, also attempt one archive snapshot via
-   `https://web.archive.org/save/<url>` and record the resulting
-   snapshot URL (or null — never retry archiving).
-3. **Verify** each claim against the fetched source text:
-   - Quote the supporting passage verbatim into `evidence`, or state
-     what you looked for and did not find.
-   - Compare hedging strength (`hedge_delta`) — a hedged source
-     behind an unhedged claim is NOT verified.
-   - For multi-source claims, judge `independence`: do the sources
-     have separate provenance, or do they echo one origin?
-   - Classify `timeliness` and flag volatile claims with stale
-     sources.
-4. **Assign** verdict × load and the required `action` per the
-   fact-check.md action matrix. Set every claim's `resolution` to
-   "none-needed" when action is "none"; otherwise leave resolution
-   exactly as the literal string "pending-fix" — the parent fills it
-   after the fix loop.
+1. **Trace pass.** Extract load-bearing factual claims from the post
+   body (`number`/`quote`/`attribution`/`date-version`/`causal`/
+   `superlative` per fact-check.md; ≥10 for a deep-story or all if
+   fewer exist). Bind each claim to the ledger's notes via `note_ids`.
+   A claim with no supporting note and no inference marking in the
+   text is a trace failure — verdict `unverifiable` unless the text
+   marks it as inference (then `inferred`).
+2. **Authenticity pass.** Re-fetch every URL in the ledger's
+   `sources[]` with WebFetch. For each note you used in a binding,
+   verify the `quote` exists verbatim (or trivially reformatted) in
+   the fetched text, and that the note's `hedge` matches the source's
+   strength. A quote you cannot find is `unverifiable` — that is the
+   fabrication signal this layer exists for. Fill `archive_url` for
+   any source the author left null (one attempt, non-blocking).
+3. **Judge** independence (echo ≠ corroboration) and timeliness per
+   fact-check.md; compare the post sentence's strength against the
+   note's `hedge` (`hedge_delta`).
+4. **Assign** verdict × load and `action` per the action matrix. Set
+   `resolution` to "none-needed" when action is "none"; otherwise the
+   literal string "pending-fix" — the parent fills it after the fix
+   loop.
 
 ## Hard rules
 
 - Tools allowed: Read, WebFetch only. No Bash, no Edit, no Write, no
   Agent dispatch, no git operations.
 - You may NOT modify any file. The parent writes your ledger to disk.
+- Do NOT modify `spine`, `notes[].interpretation`, or
+  `sources[].perspective` — those are the author's internalization
+  record. You only append `claims[]`, fill `archive_url` gaps, and
+  set `fetch_status`.
 - Do NOT judge prose style, structure, or widget quality — other
   gates own those.
 - Do NOT verify claims against your own knowledge. "I know this is
@@ -71,9 +75,26 @@ at the stated strength. Emit JSON only.
 
 ## Output format
 
-Emit ONE valid JSON object matching fact-check.md § "Evidence ledger
-schema". No prose outside the JSON. No markdown fence wrapping.
+Emit ONE valid JSON object: the full ledger with your `claims[]`,
+updated `sources[].fetch_status`/`archive_url`, `checked_at`,
+`checker_rounds`, `coverage`. The parent writes it back to
+{{ledger_path}}.
 ```
+
+## Roundup variant
+
+The roundup has no reading ledger pre-built by the author. The checker
+**creates** `roundup.ledger.json` (claims-only: no `notes[]`, no
+`spine`, no `perspective`). Use the same brief above with these
+differences:
+
+- `ledger_path` is `src/posts/YYYY/MM/DD/roundup.ledger.json` (the
+  checker creates it from scratch).
+- Extract ≥1 claim per item lede and verify each claim directly
+  against the item's source URL (no notes layer — omit `note_ids`
+  from each claim).
+- Archive each source (one Wayback attempt per URL, non-blocking).
+- The mechanical gate skips spine and trace rules for roundup ledgers.
 
 ## Re-check variant (Step 7.6c rounds ≥ 2)
 
@@ -104,9 +125,9 @@ Agent tool blocks (1 roundup + 3 deep-stories) in ONE response,
 rationale as Steps 7b/7.5a: verdict judgment on hedge strength and
 source independence is design-grade; if Opus is unavailable, report
 BLOCKED rather than fall back). Parent writes each returned ledger to
-`/tmp/vg-factcheck-YYYY-MM-DD/<slug>-ledger.json`, applies the action
-matrix, runs the Step 7.6c fix loop, and finally validates with
-`scripts/check-claim-ledger.mjs`.
+the committed path (`src/posts/YYYY/MM/DD/<slug>.ledger.json`),
+applies the action matrix, runs the Step 7.6c fix loop, and finally
+validates with `scripts/check-claim-ledger.mjs`.
 
 ## Why single checker (not dual)
 
