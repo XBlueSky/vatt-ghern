@@ -16,6 +16,7 @@ on this post. You CANNOT see the other reviewer's output. Score on the
 
 - output_path:  {{path/to/post.html}}
 - sidecar_path: {{path/to/post.11tydata.json}}
+- ledger_path:  {{path/to/post.ledger.json}}   (deep-story only)
 - archetype:    {{narrative|technical-deep-dive|...|null for roundup}}
 - domain:       {{ai|systems|infra|web|backend|null for roundup}}
 
@@ -23,6 +24,10 @@ on this post. You CANNOT see the other reviewer's output. Score on the
 
 1. The post HTML at {{output_path}}
 2. The sidecar JSON at {{sidecar_path}}
+2.5 (deep-story only) The `spine` array in the ledger at
+   {{ledger_path}} — the author's pre-writing argument backbone.
+   Read ONLY the spine; do not read notes/claims (fact truth is
+   Step 7.6's gate, not yours).
 3. skills/daily-news/references/content-quality-rubric.md
 4. (deep-story only) skills/daily-news/references/archetypes/deep-{{archetype}}.md
 5. skills/daily-news/references/persona.md (voice rules)
@@ -49,6 +54,13 @@ Each axis requires:
 
 For Axis 2 (Structural), state which archetype standard you applied:
 "Structural coherence (narrative archetype): 7/10 — ..."
+
+For Axis 2 on a deep-story, also judge against the spine: does the
+post follow its declared backbone, and does the backbone itself hold
+as an argument (5-7 points forming one line)? A post that abandons
+its spine mid-way, or a spine that is a topic list rather than an
+argument, costs Axis 2 points; cite the spine point and the H2 where
+they diverge.
 
 For Axis 5 (Relevance), state which dimension you applied:
 "Relevance (actionability): 8/10 — ..."

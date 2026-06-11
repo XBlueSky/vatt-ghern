@@ -57,6 +57,12 @@ the standard for this post's archetype. Standards switch:
 Reviewer states which standard was used:
 "Structural coherence (technical-deep-dive archetype): 8/10 — ..."
 
+For deep-stories the reviewer also receives the ledger's `spine`
+(the author's 5-7 point pre-writing backbone). Divergence between
+spine and post, or a spine that does not form one argument, scores
+against this axis — cite the spine point and the section where they
+part ways.
+
 ## Axis 3 — Material grounding
 
 - **9-10**: Real RFC sections, commit SHAs, benchmark numbers, direct
