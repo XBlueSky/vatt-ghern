@@ -29,10 +29,9 @@
 //     (per-widget screenshots are recommended but not strictly required —
 //      the four whole-page screenshots are the minimum proof)
 //
-//   /tmp/vg-factcheck-YYYY-MM-DD/
-//     <slug>-ledger.json       # Step 7.6 fact-check evidence ledger
-//     (presence-only here; schema + resolution validation is
-//      check-claim-ledger.mjs's job)
+//   src/posts/YYYY/MM/DD/<slug>.ledger.json   # Step 7b/7.6 reading ledger,
+//     COMMITTED next to the post (presence-only here; schema + resolution
+//     validation is check-claim-ledger.mjs's job)
 //
 // Usage:
 //   node skills/daily-news/scripts/check-quality-gate-evidence.mjs src/posts/YYYY/MM/DD/
@@ -68,8 +67,6 @@ const dateSlug = `${parts[0]}-${parts[1]}-${parts[2]}`;
 
 const qualityDir = `/tmp/vg-quality-${dateSlug}`;
 const auditDir = `/tmp/vg-audit-${dateSlug}`;
-const factcheckDir = `/tmp/vg-factcheck-${dateSlug}`;
-
 const ROLLUP_ARCHETYPES = new Set(["weekly-rollup", "monthly-rollup"]);
 
 const slugs = readdirSync(targetDir)
@@ -120,21 +117,18 @@ if (!isRollupDir && !existsSync(qualityDir)) {
   }
 }
 
-// --- Step 7.6 evidence: fact-check ledger per post ---
+// --- Step 7.6 evidence: committed reading ledger per post ---
 // Rollup posts synthesize from already-published roundups (no new claims),
 // so Step 7.6 does not run for them — same guard as Step 7.5.
-if (!isRollupDir && !existsSync(factcheckDir)) {
-  violations.push(
-    `Step 7.6 evidence missing: ${factcheckDir}/ does not exist. ` +
-      `The fact-check pass must run for every post and write one ` +
-      `evidence ledger per slug to this directory. There is no skip ` +
-      `clause — see SKILL.md Step 7.6 and references/fact-check.md.`
-  );
-} else if (!isRollupDir) {
+if (!isRollupDir) {
   for (const slug of slugs) {
-    const p = join(factcheckDir, `${slug}-ledger.json`);
+    const p = join(norm, `${slug}.ledger.json`);
     if (!existsSync(p))
-      violations.push(`Step 7.6: missing fact-check ledger for ${slug} (expected ${p})`);
+      violations.push(
+        `Step 7.6: missing committed reading ledger for ${slug} (expected ${p}). ` +
+          `Authors write it while reading sources (SKILL.md Step 7b); there is ` +
+          `no skip clause.`
+      );
   }
 }
 
@@ -260,6 +254,6 @@ if (violations.length > 0) {
 process.stdout.write(
   `OK: quality-gate evidence present for ${slugs.length} post(s) in ${targetDir}\n` +
     `  Step 7.5 reviewer artifacts: ${qualityDir}/\n` +
-    `  Step 7.6 fact-check ledgers: ${factcheckDir}/\n` +
+    `  Step 7.6 reading ledgers: committed in ${targetDir}\n` +
     `  Step 8.5 screenshot artifacts: ${auditDir}/\n`
 );
