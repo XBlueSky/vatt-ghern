@@ -21,6 +21,7 @@ You are writing ONE deep-story for vatt'ghern's daily-news routine.
 - summary:        {{2-3 sentence English/Chinese brief of what to cover}}
 - output_path:    src/posts/{{YYYY}}/{{MM}}/{{DD}}/deep-{{slug}}.html
 - sidecar_path:   src/posts/{{YYYY}}/{{MM}}/{{DD}}/deep-{{slug}}.11tydata.json
+- ledger_path:    src/posts/{{YYYY}}/{{MM}}/{{DD}}/deep-{{slug}}.ledger.json
 - related_roundup: /{{YYYY}}/{{MM}}/{{DD}}/roundup/
 - recent_widgets: [{{template-id}}, ...]   (heroes + supports used by recent
                   and same-day deep-stories; the parent fills this in Step 7a.
@@ -28,9 +29,20 @@ You are writing ONE deep-story for vatt'ghern's daily-news routine.
 
 ## What to do
 
-1. WebFetch every URL in (primary_url + variant_urls) to gather
-   technical detail. Quote real numbers, RFC sections, code patterns,
-   commit SHAs — material grounding is non-negotiable.
+1. WebFetch every URL in (primary_url + variant_urls) and build your
+   reading ledger AS YOU READ (schema: fact-check.md § Evidence
+   ledger). Per source: attempt one Wayback snapshot
+   (https://web.archive.org/save/<url>; null on failure, never retry)
+   and fill one perspective set (mechanism / tradeoff / reader_use).
+   Per fact worth using: one note — verbatim quote (original
+   language), the source's own hedge strength, and your
+   interpretation in a SEPARATE field. The post may only assert what
+   the notes contain; material grounding is non-negotiable.
+1.5 Read skills/daily-news/references/fact-check.md § "The authoring
+   discipline" — the full read → structure → write contract. The
+   Step 7.6 checker will trace every load-bearing claim in your post
+   back to these notes and re-fetch the sources to verify your
+   quotes; a quote that is not really in the source kills the post.
 2. Read the archetype reference:
    skills/daily-news/references/archetypes/deep-{{archetype}}.md
 3. Read the persona: skills/daily-news/references/persona.md
@@ -91,10 +103,16 @@ You are writing ONE deep-story for vatt'ghern's daily-news routine.
    Catalog widget（`{% widget %}`）免寫——摘要來自 widget.json；如需
    per-instance 覆寫：`{% widget "name", summary="..." %}`。
    詳見 widget-isolation.md「Mobile summary contract」。
+9.8 **Distil the thread-spine before drafting**: 5-7 points, the
+   argument backbone, written into the ledger's `spine` array. Build
+   it from your perspective fields, ordered for the archetype's arc
+   (the archetype reference's Engagement section sets register, hook
+   patterns, and tension sources). The Step 7.5 Axis 2 reviewer reads
+   this spine and judges the post against it.
 10. Write the HTML to {{output_path}} following the archetype's H2
     sequence, widget budget, and closer label. Use the design-system
     colors + typography. Each widget MUST have a `.vg-w-<widget-id>`
-    class prefix on its root element.
+    class prefix on its root element. Claims (numbers/quotes/attributions/causal) only from your notes' fact layer; never upgrade a note's hedge; mark inferences as inferences（「合理的推測是…」）.
 11. Write the sidecar to {{sidecar_path}} per the schema in
     references/archetypes.md § Sidecar spec. `sources[]` MUST include
     EVERY variant_url. Sidecar MUST include `widget_count`,
@@ -111,6 +129,10 @@ You are writing ONE deep-story for vatt'ghern's daily-news routine.
     Mixing an English `summary` with a Chinese title produces a
     visibly inconsistent index card (PR #35, 2026-05-23 shipped one
     English sidecar summary and had to patch it post-merge).
+11.5 Write the ledger to {{ledger_path}}: spine + sources (with
+    perspective + archive_url) + notes. Leave `claims` as an empty
+    array and `checker_rounds: 0` — the Step 7.6 checker fills them.
+    Set `output_path` to {{output_path}}, `checked_at` to today.
 12. Report back: path written, character count, archetype deviations
     (if any) with reasoning, widget count, and widget templates used.
 
@@ -138,6 +160,10 @@ You are writing ONE deep-story for vatt'ghern's daily-news routine.
 - zh-tw-prose.md 鐵律：所有數字、場景、引語必須來自 source；去 AI 味
   靠刪與改寫，不靠補細節。zh-CN 用語與 AI 套話會被 Step 8 的
   check-zh-prose.mjs 機械擋下。
+- Ledger discipline: every number/quote/attribution in the post
+  traces to a note in {{ledger_path}}. Quote fields are verbatim
+  source text — the checker re-fetches and looks for them. Inventing
+  or "improving" a quote is the one unforgivable failure mode.
 - Each widget has its `.vg-w-<widget-id>` class prefix. IDs inside
   the widget are prefixed with the widget id (see widget-isolation
   Rule 2).
@@ -152,12 +178,15 @@ Return a status block:
 - status: DONE | DONE_WITH_CONCERNS | BLOCKED
 - output_path: <path>
 - sidecar_path: <path>
+- ledger_path: <path>
 - char_count: <number>
 - prose_line_count: <number>  (excludes <script>, <style>, <svg>, <canvas>)
 - archetype: <name>
 - widget_count: <number>
 - widget_templates: <list of cookbook ids used>
 - archetype_deviations: <list or "none">
+- note_count: <number>
+- spine_points: <number>
 - concerns: <list or "none">
 ````
 
