@@ -80,6 +80,14 @@ You are writing ONE deep-story for vatt'ghern's daily-news routine.
      conceptual question + the picked template/snippet + the
      data/state it operates on. If you cannot write a conceptual
      question for a widget, drop it.
+9.5 **每個 widget 附 mobile 摘要**：在每個 `<figure class="vg-w-...">` 開
+   標籤寫 `data-mobile-summary="20–80 字 takeaway"`。觸控裝置上互動
+   widget 會被換成摘要卡，手機讀者只看到這句話，所以寫結論本身，不是
+   「本圖展示…」的外觀描述。禁用半形冒號、Latin em-dash 與半形雙引號。
+   純靜態小圖可改標 `data-mobile="keep"`。
+   Catalog widget（`{% widget %}`）免寫——摘要來自 widget.json；如需
+   per-instance 覆寫：`{% widget "name", summary="..." %}`。
+   詳見 widget-isolation.md「Mobile summary contract」。
 10. Write the HTML to {{output_path}} following the archetype's H2
     sequence, widget budget, and closer label. Use the design-system
     colors + typography. Each widget MUST have a `.vg-w-<widget-id>`

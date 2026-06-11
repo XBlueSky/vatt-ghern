@@ -360,3 +360,25 @@ The `tests/archetype-check.mjs` enforcer does not yet test these
 mechanically (no headless mobile rendering). The author is responsible
 for self-checking at 375px in dev tools or Playwright before declaring
 DONE. See anti-examples §F4-F6 for common mobile breaks to avoid.
+
+## Mobile summary contract (data-mobile-summary)
+
+Interactive widgets are desktop-only. On coarse-pointer devices (phones,
+tablets) the build hides every `vg-w-*` figure and shows an auto-injected
+summary card instead (`scripts/mobile-card-transform.mjs`). Author
+obligations — enforced by `tests/archetype-check.mjs`:
+
+1. Every `<figure class="vg-w-...">` MUST carry `data-mobile-summary`，
+   20–80 字。寫這個 widget 要傳達的 takeaway（結論本身），不是外觀描述。
+   手機讀者只會看到這句話。禁用半形冒號、Latin em-dash 與半形雙引號
+   （要引用就用「」；archetype-check 與 build 都會以字元長度檢查）。
+   CJK 雙破折號「——」（成對）與 Latin 程式碼內的半形冒號（如 `std::sort`、`13:43`）不在禁用範圍；禁的是緊鄰 CJK 的單個半形冒號與單個 Latin em-dash。
+   GOOD: `data-mobile-summary="同樣 1000 token，diffusion 八次迭代全部出齊，autoregressive 要走 1000 步，吞吐量差距由此而來。"`
+   BAD:  `data-mobile-summary="本圖以滑桿展示去噪過程的動畫效果。"`（外觀描述，讀者學不到結論）
+2. 純靜態、無互動、小螢幕可讀的 figure 可用 `data-mobile="keep"` 退出
+   置換（figure 在觸控裝置照常顯示，不注入卡片）。
+3. Widget JS 不得在觸控裝置初始化。IIFE 第一行：
+   `if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;`
+4. 不要手寫 `.vg-mobile-card` / `.vg-mobile-notice` markup——它們由 build
+   注入，手寫會造成重複。
+5. 互動 widget 必須以 `<figure class="vg-w-...">` 包裹才會參與 mobile 置換；`<div class="vg-w-...">` 形式的 widget（如 tabs）不會被換成摘要卡，會在觸控裝置上原樣顯示，也不受本契約檢查。新 widget 一律用 `<figure>`。

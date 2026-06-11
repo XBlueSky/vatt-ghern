@@ -32,6 +32,11 @@ import { fileURLToPath } from "node:url";
 const here = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(here, "..");
 
+// Mobile summary contract strictness. The 2026-05/06 backfill landed, so
+// missing/odd-length data-mobile-summary is now a hard violation. See
+// docs/superpowers/specs/2026-06-11-mobile-ebook-reading-design.md
+const MOBILE_SUMMARY_STRICT = true;
+
 // Validate that every "catalog:<name>" entry in a sidecar's widget_templates
 // resolves to an existing catalog-widget trio (partial + sidecar + static JS).
 // Catalog widgets are summoned via {% widget "<name>" %}; this guards the
@@ -231,8 +236,11 @@ function checkExplainer(path, html) {
   if (actual.length < 4 || actual.length > 6) {
     violations.push(`${path}: explainer requires 4-6 H2 elements (case → gap → idea → example → applicability), found ${actual.length}`);
   }
-  const bodyMatch = html.match(/<div[^>]+class="[^"]*vg-post-prose[^"]*"[^>]*>([\s\S]*?)<\/div>/);
-  const body = bodyMatch ? bodyMatch[1] : html;
+  // Injected mobile cards/notice end with </div> and would terminate the
+  // non-greedy vg-post-prose capture early — strip them before matching.
+  const cleaned = html.replace(/<div class="vg-mobile-(?:card|notice)"[\s\S]*?<\/div>/g, "");
+  const bodyMatch = cleaned.match(/<div[^>]+class="[^"]*vg-post-prose[^"]*"[^>]*>([\s\S]*?)<\/div>/);
+  const body = bodyMatch ? bodyMatch[1] : cleaned;
   if (!/<pre\b/.test(body) && !/<svg\b/.test(body)) {
     violations.push(`${path}: explainer body must contain <pre><code> or <svg> for the worked example`);
   }
@@ -327,6 +335,7 @@ function checkWidgetContract(path, html) {
   // whitespace; lines are an unreliable proxy. Scope is .vg-post-body, not the whole
   // rendered page, so layout chrome (head meta, nav, footer) doesn't inflate the count.
   const proseBody = body
+    .replace(/<div class="vg-mobile-(?:card|notice)"[\s\S]*?<\/div>/g, "")
     .replace(/<script[\s\S]*?<\/script>/g, "")
     .replace(/<style[\s\S]*?<\/style>/g, "")
     .replace(/<svg[\s\S]*?<\/svg>/g, "")
@@ -381,6 +390,25 @@ function checkWidgetContract(path, html) {
           violations.push(`${path}: post-level <style> rule selector lacks .vg-w- scoping: "${sel}"`);
         }
       }
+    }
+  }
+
+  // 8. Mobile summary contract: every vg-w-* figure carries
+  // data-mobile-summary (20–80 chars, the takeaway) or opts out with
+  // data-mobile="keep". Cards are injected at build time; this only
+  // checks the attribute the author owns.
+  const sink = MOBILE_SUMMARY_STRICT ? violations : warnings;
+  for (const m of body.matchAll(/<figure\b(?:"[^"]*"|'[^']*'|[^>"'])*>/g)) {
+    const tag = m[0];
+    if (!/class="[^"]*\bvg-w-/.test(tag)) continue;
+    if (tag.includes('data-mobile="keep"')) continue;
+    const cls = tag.match(/vg-w-[a-z0-9-]+/)?.[0] ?? "vg-w-?";
+    const sm = tag.match(/data-mobile-summary="([^"]*)"/);
+    const len = sm ? sm[1].trim().length : 0;
+    if (!sm || len === 0) {
+      sink.push(`${path}: ${cls} missing data-mobile-summary (20–80 字 takeaway, or data-mobile="keep")`);
+    } else if (len < 20 || len > 80) {
+      sink.push(`${path}: ${cls} data-mobile-summary is ${len} chars (require 20–80)`);
     }
   }
 }
