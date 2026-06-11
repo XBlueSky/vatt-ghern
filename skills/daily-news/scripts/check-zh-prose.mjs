@@ -16,6 +16,9 @@
 //      hit fails.
 //   3. Lexicon `flag` entries (同形詞: 程序/對象/質量/支持…) — listed for
 //      context judgment, never fail.
+//   4. Lexicon `ok` entries (correct-form guards: 演算法/控制代碼…) —
+//      silently consumed by the longest-match scan so a shorter auto
+//      substring (算法 inside 演算法) can't fire. Never reported.
 //
 // Gradient prose problems (rhythm, translation-ese, register) are NOT
 // scanned here — they belong to rubric Axis 8 (reviewer judgment). Rules
@@ -144,6 +147,9 @@ function main() {
         process.stderr.write(
           `${f}: 中國用語「${hit.from}」→「${hit.to}」 ×${hit.count}\n`
         );
+      } else if (hit.mode === "ok") {
+        // correct-form guard (演算法/控制代碼…) — consumed by longest-match
+        // so the auto substring inside it never fires. Never reported.
       } else {
         flagLines.push(
           `${f}: ⚠ 同形詞「${hit.from}」→「${hit.to}」 ×${hit.count}` +

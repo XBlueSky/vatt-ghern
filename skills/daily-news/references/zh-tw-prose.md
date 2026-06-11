@@ -134,5 +134,12 @@ tech lead（見 persona.md）：書面、節制、材料紮實——去掉的是
 |----|--------|--------|
 | 本檔 §1-§8 | 作者下筆時的規則 | author brief 必讀 |
 | `check-zh-prose.mjs` | 有限高信心集：zh-CN 用語（auto 詞）、§2 禁語、§4 高信心黑話 | Step 8，命中即 fail |
-| 同形詞（flag 詞） | 程序／對象／質量／支持／文件…依語境判斷 | scanner 列出、agent 判斷 |
+| 同形詞（flag 詞） | 程序／對象／質量／支持／文件／模板／異常…依語境判斷 | scanner 列出、agent 判斷 |
+| 護欄（ok 詞） | 正確台灣複合詞（演算法／控制代碼／激勵函數…）含有 auto 子字串時，longest-match 先吃掉、不誤判 | scanner 靜默吃掉、不報 |
 | rubric Axis 8 | 梯度問題：節奏、翻譯腔殘留、register 跑掉、灰色黑話 | Step 7.5 雙 reviewer |
+
+校準說明（2026-06）：以最近 live corpus 校準後，`模板`（HTML 模板、stencil
+模板）與 `異常`（異常乾淨／併發異常等 abnormal/anomaly 義）由 auto 降為
+flag——台灣技術寫作本就常用，僅特定語境（套用範本、try/catch 例外）才偏
+zh-CN。`算法` 維持 auto，但新增 `演算法` 等 ok 護欄，避免掃到正確台灣詞裡
+的子字串。§2／§4 的禁語／黑話清單未動，與 scanner 仍同步。
