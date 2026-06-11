@@ -56,7 +56,7 @@ export function injectMobileCards(html) {
     out = out.replace(
       '<div class="vg-post-body">',
       '<div class="vg-post-body">' +
-        `<div class="vg-mobile-notice" data-pagefind-ignore>本文含 ${swapped} 個互動圖表,手機版以重點摘要呈現,完整互動內容請以桌面瀏覽器開啟。</div>`
+        `<div class="vg-mobile-notice" data-pagefind-ignore>本文含 ${swapped} 個互動圖表，手機版以重點摘要呈現，完整互動內容請以桌面瀏覽器開啟。</div>`
     );
   }
   return { html: out, swapped, missing };
