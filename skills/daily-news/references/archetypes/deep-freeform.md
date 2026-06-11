@@ -89,3 +89,15 @@ Sidecar JSON:
   "...": "..."
 }
 ```
+
+## Engagement
+
+Register: author's pick — but pick ONE and sustain it. Freeform means
+free shape, not free drift: choose a single tension source (puzzle,
+stakes, verdict, aha) appropriate to the material and declare it in
+the sidecar `summary`'s framing. Hooks are unconstrained; the same
+measured floor applies (persona.md, zh-tw-prose.md §8).
+
+- The spine (ledger `spine` array) is the discipline that replaces
+  the missing structural contract: if the 5-7 points do not form one
+  argument, the post is not freeform — it is unfocused.

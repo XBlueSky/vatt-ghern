@@ -107,3 +107,17 @@ Free. For comparisons, common shapes:
   "...": "..."
 }
 ```
+
+## Engagement
+
+Register: verdict tension without clickbait. State the criteria and
+the contenders early — what you hold back is the per-axis outcome,
+never the existence of an answer.
+
+- Hook patterns: the choice the reader is actually facing this
+  quarter; the default everyone picks for the wrong reason.
+- Tension sources: axes that disagree (A wins on latency, B on
+  operability); the scoreboard moment where the reader's guess gets
+  corrected.
+- Pacing: axis-by-axis cadence with numbers per axis; one clear
+  pick at the end with its applicability boundary (per the closer).

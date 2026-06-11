@@ -115,3 +115,17 @@ Free. For explainers, common shapes:
   "...": "..."
 }
 ```
+
+## Engagement
+
+Register: the staged aha. Start where the reader actually is (often:
+holding a wrong-but-reasonable mental model) and build to the moment
+the new model clicks.
+
+- Hook patterns: the wrong mental model named explicitly; the
+  question the reader has Googled and gotten bad answers for.
+- Tension sources: the gap between what the old model predicts and
+  what actually happens; the worked example as the midpoint payoff
+  where the new model earns its keep.
+- Pacing: prereq → concept → example → boundary, with the example
+  placed before fatigue sets in. Never explain past the click.
