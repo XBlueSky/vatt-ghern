@@ -237,8 +237,11 @@ function checkExplainer(path, html) {
   if (actual.length < 4 || actual.length > 6) {
     violations.push(`${path}: explainer requires 4-6 H2 elements (case → gap → idea → example → applicability), found ${actual.length}`);
   }
-  const bodyMatch = html.match(/<div[^>]+class="[^"]*vg-post-prose[^"]*"[^>]*>([\s\S]*?)<\/div>/);
-  const body = bodyMatch ? bodyMatch[1] : html;
+  // Injected mobile cards/notice end with </div> and would terminate the
+  // non-greedy vg-post-prose capture early — strip them before matching.
+  const cleaned = html.replace(/<div class="vg-mobile-(?:card|notice)"[\s\S]*?<\/div>/g, "");
+  const bodyMatch = cleaned.match(/<div[^>]+class="[^"]*vg-post-prose[^"]*"[^>]*>([\s\S]*?)<\/div>/);
+  const body = bodyMatch ? bodyMatch[1] : cleaned;
   if (!/<pre\b/.test(body) && !/<svg\b/.test(body)) {
     violations.push(`${path}: explainer body must contain <pre><code> or <svg> for the worked example`);
   }
