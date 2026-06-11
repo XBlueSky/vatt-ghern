@@ -47,6 +47,8 @@ truth — do not re-derive their contents:
 - **`references/persona.md`** — Voice (measured, curious, materially-rooted),
   five priority domains, what earns inclusion vs. what doesn't, punctuation
   rules (`：` not `:`; `——` not `—`).
+- **`references/zh-tw-prose.md`** — 中文 prose 規則（AI 套話、黑話、
+  翻譯腔、節奏、台灣用語）。鐵律：去 AI 味靠刪與改寫，不得捏造細節。
 - **`references/sources.md`** — Tier-1 through Tier-5 source list with
   priority order. HackerNoon is the primary signal.
 - **`references/archetypes.md`** — Required HTML structure for roundup and
@@ -677,6 +679,10 @@ original brief (from Step 7a — held by parent) PLUS:
   exit BLOCKING; >= 7 to exit IMPORTANT)
 - Permission to keep widgets unchanged unless reviewer findings cite
   widget content (most prose findings should not touch widgets)
+- For Axis 8 (zh-TW prose) findings: the retry must obey
+  zh-tw-prose.md §1 — fix by deletion and rewriting only. Inventing
+  numbers, scenes, or quotes to "add texture" is fabrication and
+  forbidden; every concrete detail must come from the source material.
 
 Parent dispatches retry author sub-agents in parallel (one per post
 needing retry) — **same `model: "opus"` requirement as Step 7b**.
@@ -754,6 +760,9 @@ Run the validation scripts:
 ```bash
 # Dedup check (catches anything missed in step 3)
 node ${CLAUDE_PLUGIN_ROOT}/skills/daily-news/scripts/check-dup.mjs src/posts/YYYY/MM/DD/
+
+# zh-TW prose check (zh-CN terms + AI-boilerplate phrases; flag terms listed for judgment)
+node ${CLAUDE_PLUGIN_ROOT}/skills/daily-news/scripts/check-zh-prose.mjs src/posts/YYYY/MM/DD/
 
 # Schema/structure check
 node ${CLAUDE_PLUGIN_ROOT}/skills/daily-news/scripts/publish.mjs src/posts/YYYY/MM/DD/
@@ -1108,6 +1117,7 @@ For each post (roundup + deep-stories):
   - Axis 4 (Depth): <consensus-score> (A=<a>, B=<b>)
   - Axis 5 (Relevance, <dimension>): <consensus-score> (A=<a>, B=<b>)
   - Axis 6 (Anti-template): <consensus-score> (A=<a>, B=<b>)
+  - Axis 8 (zh-TW prose): <consensus-score> (A=<a>, B=<b>) — "<short justification>"
   - (Axis 7 inter-post diversity: see § Inter-post diversity concerns below)
   - Reviewer JSON artifacts: `/tmp/vg-quality-YYYY-MM-DD/<slug>-reviewer-A.json`, `<slug>-reviewer-B.json`
   - Retry rounds: <N>

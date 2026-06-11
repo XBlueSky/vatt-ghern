@@ -34,6 +34,9 @@ You are writing ONE deep-story for vatt'ghern's daily-news routine.
 2. Read the archetype reference:
    skills/daily-news/references/archetypes/deep-{{archetype}}.md
 3. Read the persona: skills/daily-news/references/persona.md
+3.5 Read the zh-TW prose rules:
+   skills/daily-news/references/zh-tw-prose.md — apply while drafting.
+   The Step 8 scanner and reviewer Axis 8 are backstops, not the fix.
 4. Read the design-system: skills/daily-news/references/design-system.md
 5. Read the widget-isolation contract:
    skills/daily-news/references/widget-isolation.md
@@ -132,6 +135,9 @@ You are writing ONE deep-story for vatt'ghern's daily-news routine.
   sidecar's `widget_questions` array (one entry per widget).
 - Persona invariants: `——` (CJK double em-dash) not `—`; `：` (CJK
   colon) not `:` in prose.
+- zh-tw-prose.md 鐵律：所有數字、場景、引語必須來自 source；去 AI 味
+  靠刪與改寫，不靠補細節。zh-CN 用語與 AI 套話會被 Step 8 的
+  check-zh-prose.mjs 機械擋下。
 - Each widget has its `.vg-w-<widget-id>` class prefix. IDs inside
   the widget are prefixed with the widget id (see widget-isolation
   Rule 2).
