@@ -138,11 +138,13 @@ You are writing ONE deep-story for vatt'ghern's daily-news routine.
 
 ## Hard rules
 
-- **Prose ≥ 500 lines** (HTML inside `<p>`, `<h2>`, etc.). Widget
-  markup inside `<script>`, `<style>`, `<svg>`, `<canvas>` does NOT
-  count against the prose budget. The previous "600-1200 lines of
-  HTML" rule caused sub-agents to skimp on widget code; that rule is
-  removed.
+- **Prose ≥ 4000 CJK chars** in `.vg-post-body` (widget code inside
+  `<script>`, `<style>`, `<svg>`, `<canvas>` excluded) — the floor
+  `tests/archetype-check.mjs` actually enforces. This is a *floor*,
+  not a target: do NOT write to a length quota
+  (widget-cookbook/tier-3-principles.md §11, density > length). The
+  older "prose ≥ 500 lines" phrasing is retired — line counts rewarded
+  padding and contradicted §11.
 - **≥ 3 widgets total**. ≥ 1 must be a Tier-1 (interactive) hero
   widget — that is, the widget includes at least one of: `<script>`
   (interactive logic), `<input>` (user input), `<canvas>` (loop).
@@ -180,7 +182,7 @@ Return a status block:
 - sidecar_path: <path>
 - ledger_path: <path>
 - char_count: <number>
-- prose_line_count: <number>  (excludes <script>, <style>, <svg>, <canvas>)
+- cjk_char_count: <number>  (CJK chars in .vg-post-body, widget code excluded)
 - archetype: <name>
 - widget_count: <number>
 - widget_templates: <list of cookbook ids used>

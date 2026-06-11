@@ -524,8 +524,10 @@ After all sub-agents return:
 1. Read each output HTML + sidecar + ledger back to confirm the files exist and
    the sidecar + ledger parse as JSON.
 2. Verify per-file invariants the sub-agent was told to honour:
-   - Prose ≥ 500 lines (HTML lines excluding inside `<script>`,
-     `<style>`, `<svg>`, `<canvas>` blocks).
+   - Prose ≥ 4000 CJK chars in `.vg-post-body` (widget code inside
+     `<script>`, `<style>`, `<svg>`, `<canvas>` excluded) — same floor
+     `archetype-check.mjs` enforces mechanically in Step 8. A floor,
+     not a target (tier-3 §11: density > length).
    - `<p class="vg-deep-opener">` and `<p class="vg-deep-closer"><strong>`.
    - ≥ 3 widgets total (count of elements with `class="vg-w-*"`).
    - ≥ 1 widget is interactive (contains `<script>` OR `<input>`
