@@ -324,6 +324,11 @@ export default function (eleventyConfig) {
       ? ` data-mobile-summary="${mobileSummary.replace(/"/g, "&quot;")}"`
       : "";
     const tier = opts.mobile || meta.mobile_tier || "swap";
+    if (!["swap", "keep", "static"].includes(tier)) {
+      throw new Error(
+        `{% widget "${name}" %}: unknown mobile tier "${tier}" — use swap | keep | static`
+      );
+    }
     const tierAttr = ` data-mobile="${tier}"`;
 
     return `<figure class="vg-w-${name}" id="${id}" data-widget="${name}"${tierAttr}${summaryAttr} data-pagefind-ignore>${partial}</figure>${scriptTag}`;
