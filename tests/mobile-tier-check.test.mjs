@@ -19,6 +19,14 @@ test("new post, no tier → explicit-tier violation", () => {
   assert.match(v[0], /must declare data-mobile/);
 });
 
+test("new post, no tier, no summary → both violations", () => {
+  const body = `<figure class="vg-w-a"><svg></svg></figure>`;
+  const v = checkMobileContract(NEW, body);
+  assert.equal(v.length, 2);
+  assert.match(v[0], /must declare data-mobile/);
+  assert.match(v[1], /missing data-mobile-summary/);
+});
+
 test("new post, explicit swap with valid summary → ok", () => {
   const body = `<figure class="vg-w-a" data-mobile="swap" data-mobile-summary="${SUMMARY}"><canvas></canvas></figure>`;
   assert.deepEqual(checkMobileContract(NEW, body), []);

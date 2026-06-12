@@ -444,7 +444,8 @@ function checkWidgetContract(path, html) {
   }
 
   // 8. Mobile tier contract — extracted to checkMobileContract (unit-tested
-  // in tests/mobile-tier-check.test.mjs).
+  // in tests/mobile-tier-check.test.mjs). Behaviour change vs the original
+  // §8: "static" tier figures no longer require data-mobile-summary.
   for (const v of checkMobileContract(path, body)) violations.push(v);
 }
 
