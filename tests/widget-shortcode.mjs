@@ -54,3 +54,17 @@ test("widget shortcode summary opt overrides widget.json", async () => {
   const html = widget.call(ctx, "feature-flags", { summary: "覆寫摘要，說明此實例在本文脈絡下的特定結論，長度合於檢查規範。" });
   assert.match(html, /data-mobile-summary="覆寫摘要/);
 });
+
+test("widget shortcode emits explicit data-mobile, default swap", async () => {
+  const widget = await getWidgetShortcode();
+  const ctx = { page: { inputPath: "./p5.html" } };
+  const html = widget.call(ctx, "feature-flags");
+  assert.match(html, /data-mobile="swap"/);
+});
+
+test("widget shortcode mobile opt overrides the tier", async () => {
+  const widget = await getWidgetShortcode();
+  const ctx = { page: { inputPath: "./p6.html" } };
+  const html = widget.call(ctx, "feature-flags", { mobile: "keep" });
+  assert.match(html, /data-mobile="keep"/);
+});
