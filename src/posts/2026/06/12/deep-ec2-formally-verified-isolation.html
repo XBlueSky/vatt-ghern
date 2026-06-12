@@ -1,0 +1,414 @@
+---
+layout: layouts/post.njk
+title: 把虛擬機隔離證明成數學定理——EC2 的形式化驗證引擎
+date: 2026-06-12
+tags: ['post', 'infra']
+---
+
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">要證明一個 hypervisor「不會洩漏」，傳統做法是測試與審查——但測試只能證明 bug 存在，不能證明 bug 不存在。AWS 的賭注是另一條路：把 hypervisor 裡「隔離 VM」這一件事抽成一個小到可以被機器證明的元件，然後寫出 330,000 行 Isabelle/HOL，把隔離這條性質變成一個定理。</p>
+  <h1 class="vg-post-title">{{ title }}</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p><span class="vg-dropcap">隔</span>離兩台共處一機的虛擬機，是雲端最底層、也最不能出錯的承諾。AWS 在 2026 年 6 月 10 日公開的這篇文章（作者 Dominic Mulligan、Nathan Chong）講的不是又一個 hypervisor 加固，而是一個結構上的轉向：他們把 Nitro Hypervisor 裡「whose sole job is isolating virtual machines (VMs) from each other」的那一塊單獨切出來，命名為 Nitro Isolation Engine，再對它做完整的形式化驗證。文章自稱這是第一個部署在商用雲、機密性與完整性都有機器可檢證明的 hypervisor。整套 Isabelle/HOL「model and proof comprise 330,000 lines of machine-checked mathematics」——規模上對標 seL4，差別是它已經在 Graviton5 上 always-on 出貨。</p>
+
+  <p>為什麼非得先縮小不可，文章只用一句話點破整個方法論的關鍵：通用 hypervisor 功能繁多，「that complexity makes proving correctness much more difficult」——複雜度本身就是證明的敵人。它接著給出對策：「distilling the hypervisor's critical isolation logic into a minimal component, the Nitro Isolation Engine, makes it small enough to verify and audit。」把關鍵的隔離邏輯蒸餾成一個最小元件，這個「最小」不是修辭，而是讓「驗證」這個動作在數學上由不可能變成可能的前提。值得注意原文這句話的受詞是兩個動詞：verify 與 audit。縮小不只把機器證明變得可行，也讓「人逐行審查」重新變得可能——一個幾萬行、功能交織的元件，連人工複查都無從下手，遑論機器窮盡。先把要證的對象砍到一個職責單一的核心，剩下的每一步才有機會被逐條檢查。</p>
+
+  <p>底下幾節依序拆開這台引擎：先看為什麼要把它縮小（separation kernel 的 policy/mechanism 分離），再看用什麼語言寫才證得動（μRust），接著是兩條互補的證明路線——功能性質走 separation logic 加 weakest-precondition，機密性走 noninterference——最後談這份證明的邊界在哪裡。先從一個互動小工具開始，因為整篇最反直覺的概念是 noninterference，而它最好用「動手撥一下」來理解。</p>
+
+  <figure class="vg-w-param-noninterference" data-svg-scroll="800" data-mobile-summary="祕密怎麼撥，observer 投影都不變——這就是 noninterference。">
+    <style>
+      .vg-w-param-noninterference { display: grid; grid-template-rows: auto auto 1fr auto; gap: var(--s-2); }
+      .vg-w-param-noninterference .controls { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); flex-wrap: wrap; }
+      .vg-w-param-noninterference .controls label { text-transform: uppercase; letter-spacing: 0.05em; }
+      .vg-w-param-noninterference .controls input[type="range"] { flex: 1; min-width: 140px; height: 36px; accent-color: var(--accent); touch-action: none; }
+      .vg-w-param-noninterference .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 5ch; text-align: right; font-family: JetBrains Mono, monospace; }
+      .vg-w-param-noninterference .verdict { font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink-soft); padding: var(--s-2); border-left: 2px solid var(--accent); background: var(--bg-soft); }
+      .vg-w-param-noninterference .verdict em { font-style: italic; color: var(--accent-text); }
+      .vg-w-param-noninterference svg { width: 100%; height: auto; }
+      .vg-w-param-noninterference figcaption { font-family: var(--scribed); font-style: italic; font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M5 12h14"/><path d="m12 5 7 7-7 7"/><path d="M5 5v14"/>
+      </svg>
+      <span>拖動滑桿改變 VM-A 的祕密值，看 observer 投影是否變化 · 1 個祕密變數</span>
+    </p>
+
+    <div class="controls">
+      <label for="vg-w-param-noninterference-x">VM-A secret =</label>
+      <input id="vg-w-param-noninterference-x" type="range" min="0" max="255" step="1" value="42" />
+      <span class="readout" id="vg-w-param-noninterference-x-readout">42</span>
+    </div>
+
+    <svg viewBox="0 0 720 300" role="img" aria-label="兩個只在祕密值不同的 state，經過一步 step 後 observer 可見投影維持一致">
+      <text x="180" y="26" text-anchor="middle" fill="var(--ink)" font-family="IM Fell English, serif" font-style="italic" font-size="14">state s （含祕密 h）</text>
+      <text x="540" y="26" text-anchor="middle" fill="var(--ink)" font-family="IM Fell English, serif" font-style="italic" font-size="14">state s′ （祕密 h 固定為 0）</text>
+
+      <!-- secret rows (NOT visible to observer) -->
+      <rect x="40" y="44" width="280" height="40" fill="var(--accent)" fill-opacity="0.16" stroke="var(--muted-2)" stroke-width="1"/>
+      <text x="56" y="62" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="11">high  · observer 看不到</text>
+      <text x="56" y="78" fill="var(--accent-text)" font-family="JetBrains Mono, monospace" font-size="12" id="vg-w-param-noninterference-hi-a">h = 42</text>
+      <rect x="400" y="44" width="280" height="40" fill="var(--accent)" fill-opacity="0.16" stroke="var(--muted-2)" stroke-width="1"/>
+      <text x="416" y="62" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="11">high  · observer 看不到</text>
+      <text x="416" y="78" fill="var(--accent-text)" font-family="JetBrains Mono, monospace" font-size="12">h = 0</text>
+
+      <!-- low / observable rows -->
+      <rect x="40" y="92" width="280" height="40" fill="var(--sage)" fill-opacity="0.22" stroke="var(--muted-2)" stroke-width="1"/>
+      <text x="56" y="110" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="11">low · observer 投影</text>
+      <text x="56" y="126" fill="var(--ink)" font-family="JetBrains Mono, monospace" font-size="12" id="vg-w-param-noninterference-lo-a">obs = 0x0c</text>
+      <rect x="400" y="92" width="280" height="40" fill="var(--sage)" fill-opacity="0.22" stroke="var(--muted-2)" stroke-width="1"/>
+      <text x="416" y="110" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="11">low · observer 投影</text>
+      <text x="416" y="126" fill="var(--ink)" font-family="JetBrains Mono, monospace" font-size="12" id="vg-w-param-noninterference-lo-b">obs = 0x0c</text>
+
+      <!-- step arrow -->
+      <line x1="180" y1="150" x2="180" y2="196" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-param-noninterference-arrow)"/>
+      <line x1="540" y1="150" x2="540" y2="196" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-param-noninterference-arrow)"/>
+      <text x="360" y="178" text-anchor="middle" fill="var(--muted)" font-family="IM Fell English, serif" font-style="italic" font-size="13">step（執行一個 Isolation Engine 操作）</text>
+      <defs>
+        <marker id="vg-w-param-noninterference-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+        </marker>
+      </defs>
+
+      <!-- post-step observable -->
+      <rect x="40" y="204" width="280" height="44" fill="var(--sage)" fill-opacity="0.32" stroke="var(--sage-deep)" stroke-width="1.5"/>
+      <text x="56" y="224" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="11">low after step · observer 投影</text>
+      <text x="56" y="242" fill="var(--ink)" font-family="JetBrains Mono, monospace" font-size="12" id="vg-w-param-noninterference-out-a">obs′ = 0x0c</text>
+      <rect x="400" y="204" width="280" height="44" fill="var(--sage)" fill-opacity="0.32" stroke="var(--sage-deep)" stroke-width="1.5"/>
+      <text x="416" y="224" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="11">low after step · observer 投影</text>
+      <text x="416" y="242" fill="var(--ink)" font-family="JetBrains Mono, monospace" font-size="12" id="vg-w-param-noninterference-out-b">obs′ = 0x0c</text>
+
+      <text x="360" y="278" text-anchor="middle" fill="var(--accent-text)" font-family="JetBrains Mono, monospace" font-size="13" id="vg-w-param-noninterference-eq">obs′(s) ≡ obs′(s′) ✓</text>
+    </svg>
+
+    <div class="verdict" id="vg-w-param-noninterference-verdict">兩個 state 只在 observer 看不到的 high 部分不同；step 之後 observer 能看到的投影<em>一個 bit 都沒變</em>。observer 因此無法從這步推回祕密值——<em>indistinguishable before、indistinguishable after</em>。</div>
+
+    <figcaption>祕密值在 0 到 255 之間隨你撥，observer 投影恆等於兩邊一致。這個小工具示範的是文章對機密性的定義：「if two states are indistinguishable to an observer before a step, they must remain indistinguishable afterward.」</figcaption>
+
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        const root = document.querySelector('.vg-w-param-noninterference');
+        const input = root.querySelector('#vg-w-param-noninterference-x');
+        const readout = root.querySelector('#vg-w-param-noninterference-x-readout');
+        const hiA = root.querySelector('#vg-w-param-noninterference-hi-a');
+        const eqLine = root.querySelector('#vg-w-param-noninterference-eq');
+        const verdict = root.querySelector('#vg-w-param-noninterference-verdict');
+        // observer projection deliberately drops the high bits: a fixed low function of state.
+        function update() {
+          const n = Number(input.value);
+          readout.textContent = String(n);
+          hiA.textContent = 'h = ' + n;
+          // projection is the SAME regardless of n; that is the whole point.
+          eqLine.textContent = 'obs′(s) ≡ obs′(s′) ✓';
+          if (n === 0) {
+            verdict.innerHTML = 's 與 s′ 此刻連 high 都相等；step 之後當然也不可分辨。撥動滑桿讓 high 不同，看投影是否仍然一致——<em>它會</em>。';
+          } else {
+            verdict.innerHTML = '兩個 state 只在 observer 看不到的 high 部分不同（h = ' + n + ' vs h = 0）；step 之後 observer 投影<em>仍然一個 bit 都沒變</em>。observer 學不到祕密——<em>indistinguishable before、indistinguishable after</em>。';
+          }
+        }
+        input.addEventListener('input', update);
+        update();
+      })();
+    </script>
+  </figure>
+
+  <h2>把要證的東西縮小：separation kernel 的 policy／mechanism 分離</h2>
+
+  <p>形式化驗證最大的敵人是程式碼的尺寸——要證的狀態空間隨著功能膨脹，幾萬行的通用 hypervisor 在數學上幾乎無法窮盡。AWS 的第一步因此不是「證 hypervisor」，而是「把 hypervisor 裡真正需要被信任的那一小塊切出來」。這一塊就是 Nitro Isolation Engine，文章對它的定義一句話帶過卻很關鍵：它是 Nitro Hypervisor 的一個元件，唯一職責就是把 VM 彼此隔開。其餘所有事——要不要隔離、怎麼配資源、排哪台 VM——都不是它管的。</p>
+
+  <p>這個切法有個名字：separation kernel。文章引 John Rushby 在 1981 年提出的這個術語——「a minimal OS component that partitions a system into isolated compartments」，一個把系統劃分成彼此隔離的隔間的最小 OS 元件——並點出它的核心招式：「the key idea: separate policy from mechanism。」把決策與執行劈開，正是縮小證明範圍的那一刀。文章把 separation kernel 的特性講得很乾淨：「A separation kernel does not decide what to isolate, how to allocate resources, or which VMs to schedule: those decisions are made elsewhere. Instead, it focuses solely on enforcing isolation.」決策（policy）與執行（mechanism）被劈成兩半，被驗證的只有 mechanism 那一半。policy 那一半——VM 的建立、資源配置、遷移、排程——仍由 Nitro Hypervisor 處理，但它的權限被收掉了：「it is now deprivileged and must ask the Nitro Isolation Engine to perform any operation touching guest state.」</p>
+
+  <p>這一刀為什麼能讓證明變得可行，值得想清楚。policy 那一半的程式碼通常最龐雜、改得最頻繁——排程策略會調、資源配額會變、遷移邏輯會演化。如果這些都得跟著被重新證明，驗證工作會被功能迭代拖垮。把 policy 推到證明範圍之外、只證那個小而穩定的 mechanism，等於把「需要被信任、也需要被證明」的表面積壓到最小。換句話說，policy/mechanism 分離不只是架構美學，它直接決定了 330,000 行證明覆蓋得完還是覆蓋不完。</p>
+
+  <p>文章自己也把這層因果寫得很白：把職責收斂到「只 enforce 隔離」之後，「this clarity of purpose makes separation kernels much simpler to implement than full OS kernels.」——這種目標的純粹，讓 separation kernel 比完整的 OS kernel 容易實作。這句話的重量在於它把「容易驗證」往前推了一步：一個東西之所以好證，往往是因為它一開始就被設計得夠簡單；驗證不是事後硬加上去的一道工序，而是在「要不要塞進這個功能」的每個決策點就已被預先考慮。separation kernel 的單一職責，是先在實作層面把複雜度壓下來，證明工具才有施力的餘地。</p>
+
+  <p>這句「deprivileged」是整個架構的支點。在傳統 hypervisor 裡，管排程的那塊程式碼同時握有改寫 guest 記憶體的權力，於是它的任何 bug 都可能變成跨 VM 洩漏。Nitro 把這兩件事分開後，hypervisor 要碰 guest state 只能透過 Isolation Engine 的受控介面提出請求；可信任計算基（TCB）因此收縮到只剩 Isolation Engine 一個元件。下面的圖把這個 policy/mechanism 的責任邊界攤開，點任何一個方塊看它負責什麼、刻意不知道什麼。</p>
+
+  <figure class="vg-w-annotated-sepkernel" data-svg-scroll="640" data-mobile-summary="hypervisor 被 deprivileged 後，TCB 收縮到只剩 Isolation Engine 一個元件。">
+    <style>
+      .vg-w-annotated-sepkernel { display: grid; grid-template-columns: 1fr; gap: var(--s-3); align-items: start; }
+      @media (min-width: 720px) { .vg-w-annotated-sepkernel { grid-template-columns: 1fr; } }
+      .vg-w-annotated-sepkernel svg { width: 100%; height: auto; }
+      .vg-w-annotated-sepkernel input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-annotated-sepkernel .component { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; transition: fill 200ms, stroke 200ms; }
+      .vg-w-annotated-sepkernel .component:hover { stroke: var(--accent); }
+      .vg-w-annotated-sepkernel .component:focus { outline: none; }
+      .vg-w-annotated-sepkernel .component:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+      .vg-w-annotated-sepkernel .component-text { pointer-events: none; font-family: EB Garamond, serif; font-size: 15px; }
+      .vg-w-annotated-sepkernel .component-sub { pointer-events: none; font-family: IM Fell English, serif; font-style: italic; font-size: 11px; fill: var(--muted); }
+      .vg-w-annotated-sepkernel .edge-text { pointer-events: none; font-family: JetBrains Mono, monospace; font-size: 10px; fill: var(--muted); }
+      .vg-w-annotated-sepkernel .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+      .vg-w-annotated-sepkernel .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-annotated-sepkernel .detail p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-annotated-sepkernel .hint { font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin: 0 0 var(--s-1) 0; }
+      .vg-w-annotated-sepkernel:has(#vg-w-annotated-sepkernel-r1:checked) .component-1 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-annotated-sepkernel:has(#vg-w-annotated-sepkernel-r2:checked) .component-2 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-annotated-sepkernel:has(#vg-w-annotated-sepkernel-r3:checked) .component-3 { fill: var(--sage-deep); fill-opacity: 0.3; stroke: var(--sage-deep); }
+      .vg-w-annotated-sepkernel:has(#vg-w-annotated-sepkernel-r1:checked) .detail-1 { display: block; }
+      .vg-w-annotated-sepkernel:has(#vg-w-annotated-sepkernel-r2:checked) .detail-2 { display: block; }
+      .vg-w-annotated-sepkernel:has(#vg-w-annotated-sepkernel-r3:checked) .detail-3 { display: block; }
+    </style>
+
+    <input type="radio" id="vg-w-annotated-sepkernel-r1" name="vg-w-annotated-sepkernel-sel" aria-label="選 Nitro Hypervisor" checked />
+    <input type="radio" id="vg-w-annotated-sepkernel-r2" name="vg-w-annotated-sepkernel-sel" aria-label="選 Nitro Isolation Engine" />
+    <input type="radio" id="vg-w-annotated-sepkernel-r3" name="vg-w-annotated-sepkernel-sel" aria-label="選 Guest VMs" />
+
+    <svg viewBox="0 0 480 280" role="img" aria-label="policy 與 mechanism 分離：deprivileged hypervisor 經受控介面請求 Isolation Engine 碰 guest state">
+      <text x="240" y="22" text-anchor="middle" fill="var(--ink)" font-family="IM Fell English, serif" font-style="italic" font-size="13">policy 在上、mechanism 在中、guest 在下</text>
+
+      <!-- Hypervisor (policy, deprivileged) -->
+      <rect class="component component-1" data-target="vg-w-annotated-sepkernel-r1" role="button" tabindex="0" aria-label="select Nitro Hypervisor" x="60" y="40" width="360" height="48" rx="2"/>
+      <text class="component-text" x="240" y="62" text-anchor="middle" fill="var(--ink)">Nitro Hypervisor · policy（deprivileged）</text>
+      <text class="component-sub" x="240" y="80" text-anchor="middle">建立 · 配置 · 遷移 · 排程</text>
+
+      <line x1="240" y1="88" x2="240" y2="126" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-annotated-sepkernel-arrow)"/>
+      <text class="edge-text" x="252" y="110">request：任何碰 guest state 的操作</text>
+
+      <!-- Isolation Engine (mechanism, verified) -->
+      <rect class="component component-2" data-target="vg-w-annotated-sepkernel-r2" role="button" tabindex="0" aria-label="select Nitro Isolation Engine" x="60" y="128" width="360" height="48" rx="2"/>
+      <text class="component-text" x="240" y="150" text-anchor="middle" fill="var(--ink)">Nitro Isolation Engine · mechanism（verified）</text>
+      <text class="component-sub" x="240" y="168" text-anchor="middle">enforce isolation · 330k 行 Isabelle/HOL 證明</text>
+
+      <line x1="160" y1="176" x2="160" y2="212" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-annotated-sepkernel-arrow)"/>
+      <line x1="320" y1="176" x2="320" y2="212" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-annotated-sepkernel-arrow)"/>
+
+      <!-- Guests -->
+      <rect class="component component-3" data-target="vg-w-annotated-sepkernel-r3" role="button" tabindex="0" aria-label="select VM A" x="60" y="214" width="160" height="46" rx="2"/>
+      <text class="component-text" x="140" y="242" text-anchor="middle" fill="var(--ink)">Guest VM A</text>
+      <rect class="component component-3" data-target="vg-w-annotated-sepkernel-r3" role="button" tabindex="0" aria-label="select VM B" x="260" y="214" width="160" height="46" rx="2"/>
+      <text class="component-text" x="340" y="242" text-anchor="middle" fill="var(--ink)">Guest VM B</text>
+
+      <defs>
+        <marker id="vg-w-annotated-sepkernel-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+        </marker>
+      </defs>
+    </svg>
+
+    <div>
+      <p class="hint">click a layer</p>
+      <div class="detail detail-1">
+        <h3>Nitro Hypervisor · policy</h3>
+        <p>仍負責所有決策——VM 的建立、資源配置、遷移、排程。但它「is now deprivileged」：要碰 guest state，只能向 Isolation Engine 提出請求，自己沒有直接改寫 guest 記憶體的權力。</p>
+        <p><strong>刻意不持有</strong>：直接觸碰 guest state 的特權。它的 bug 不再能直接變成跨 VM 洩漏。</p>
+      </div>
+      <div class="detail detail-2">
+        <h3>Nitro Isolation Engine · mechanism</h3>
+        <p>唯一職責是 enforce 隔離。它不決定要不要隔離、配多少資源、排哪台 VM——「those decisions are made elsewhere」。整個可信任計算基收縮到這一個元件，也只有這一個元件被 330,000 行 Isabelle/HOL 證明覆蓋。</p>
+        <p><strong>刻意不負責</strong>：policy。決策邏輯留在上層，引擎只執行受控操作。</p>
+      </div>
+      <div class="detail detail-3">
+        <h3>Guest VMs · 被隔離的對象</h3>
+        <p>兩台共處一機的 guest。證明要保證的就是：A 的祕密不流向 B、B 不能竄改 A——「only authorized information flows can occur」。guest 之間沒有任何直接通道，所有跨界操作都必須過 Isolation Engine。</p>
+        <p><strong>刻意不知道</strong>：彼此的存在。從 guest 的角度，它獨佔整台機器。</p>
+      </div>
+    </div>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-annotated-sepkernel');
+        root.querySelectorAll('.component').forEach((rect) => {
+          rect.addEventListener('click', () => {
+            const targetId = rect.getAttribute('data-target');
+            const radio = root.querySelector('#' + targetId);
+            if (radio) radio.checked = true;
+          });
+          rect.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); rect.dispatchEvent(new MouseEvent('click', { bubbles: true })); }
+          });
+        });
+      })();
+    </script>
+  </figure>
+
+  <p>把 TCB 縮到一個職責單一的元件，是這整套工作能成立的前提。seL4 當年證的是一個微核心，這裡證的是一個更專一的 separation kernel——小到讓 330,000 行證明能把它的每條執行路徑都覆蓋。值得記住的是：縮小範圍不是偷工，而是讓「證明」這個動詞在工程上變得可能的唯一辦法。</p>
+
+  <h2>μRust：先把語言砍到可推理的子集</h2>
+
+  <p>就算元件夠小，Rust 本身對形式推理仍然太大。Rust 的 trait、dynamic dispatch、generic 單態化這些特性讓編譯器很強，卻也讓「對每一條程式路徑都給出數學規格」變得棘手——dynamic dispatch 意味著呼叫點背後可能是任意實作，推理時得把整個可能集合都納入。AWS 的選擇是先把語言縮小：他們形式化了 Rust 的一個 core subset，叫 μRust。</p>
+
+  <p>文章對 μRust 的定義同時講了它的能力與它的取捨：「μRust is a restricted subset of the Rust programming language that is expressive enough to write the Nitro Isolation Engine but amenable to formal reasoning because we deliberately excluded advanced Rust features, such as traits and dynamic dispatch.」表達力夠寫整個 Isolation Engine，但 trait 與 dynamic dispatch 被刻意排除。換句話說，引擎是用一個「故意比 Rust 笨一點」的 Rust 寫的——笨到每個呼叫點都是靜態確定的、每條路徑都能被符號化地走完。這跟 μRust 名字裡的 μ 是同一個意思：把語言收斂到一個能被完整建模的核心。</p>
+
+  <p>μRust 不是憑空造的語言，而是 Rust 的一個 core subset 的形式化——文章稱之為「formalization of a core subset of the Rust language, called μRust」。這個分寸拿捏很關鍵：它必須仍然是 Rust，工程師才能真的用它寫出整個 Isolation Engine、也才能享受 Rust 既有的記憶體安全保證；但它又必須比完整的 Rust 收斂，數學上的規格才寫得出來。「expressive enough to write the Nitro Isolation Engine but amenable to formal reasoning」這句話裡的 but，標的就是這條張力線——表達力與可推理性之間，他們選了一個能同時站住兩腳的點。</p>
+
+  <p>這個取捨值得一般 Rust 工程師留意：它說明了「可驗證」和「好用」之間真實存在張力。trait 與 dynamic dispatch 正是日常 Rust 抽象能力的來源，而它們恰恰是形式推理最難啃的部分——dynamic dispatch 意味著一個呼叫點背後的實際實作要到執行期才定，推理時無法在靜態階段把「這裡到底跑哪段程式」釘死，整個可能集合都得被攤進證明。把可驗證性擺第一，就得在語言層面先付出表達力的代價——這不是 Rust 的缺陷，而是「要證明」這件事對任何語言都會提出的要求。</p>
+
+  <h2>separation logic 加 weakest-precondition：證功能與記憶體安全</h2>
+
+  <p>語言收斂之後，第一條證明路線處理的是「功能性質」：程式做對了該做的事、而且不會踩到記憶體錯誤。文章列出的三個目標是 absence of runtime errors、memory safety、functional correctness。用的工具是兩件配套的東西——Separation Logic 與 weakest-precondition calculus。前者「for precisely capturing specifications」，後者是把規格推回到程式入口的演算法。</p>
+
+  <p>separation logic 之所以是這類證明的標準武器，文章一句話講明了它的本行：「a logic designed to reason about low-level pointer-manipulating programs」——一套專為推理低階指標操作程式而設計的邏輯。它天生擅長講「這塊記憶體歸我、那塊記憶體歸你、兩者不重疊」。它的核心連接詞把堆的兩個不相交部分接起來，讓「A 的操作不會動到 B 的記憶體」這種敘述可以被形式化地寫下、被推理。對一個職責是「把 VM 隔開」的引擎來說，這種「不相交」的語言剛好對味——隔離本質上就是一句記憶體分離的斷言。一個處理 guest 記憶體頁、指標滿天飛的引擎，正是 separation logic 最該被派上場的地方。</p>
+
+  <p>weakest-precondition 則是反向工作的。給定「執行完這段程式後，這個 postcondition 要成立」，它計算出「執行前最弱需要成立的 precondition 是什麼」，一路把規格從程式末端推回到入口。如果入口的條件能被滿足，整段程式的正確性就成立。但這裡的「正確」是一個比直覺更強的版本。文章把 contract 指定的目標明確界定為 total correctness：「in all states that satisfy the precondition, the program always terminates, and the resulting state satisfies the postcondition.」拆開看是兩件事綁在一起——在所有滿足 precondition 的 state 下，程式不只「算出對的結果」（結果 state 滿足 postcondition），還必須「一定會停下來」（always terminates）。partial correctness 只要求「如果停了，結果是對的」；total correctness 把「會停」也納進證明義務，等於把無窮迴圈、卡死這類失敗模式一併排除。</p>
+
+  <p>而 total correctness 真正划算的地方，是它一次帶出三個性質。文章接著說：「this total-correctness condition also means the program is memory safe and free of runtime errors.」一旦把 total correctness 證下來，memory safety 與 absence of runtime errors 不是另外再證的兩件事，而是同一個條件的副產品——三個性質被一次性鎖在一起。道理在於：要求程式在每條路徑上都正常終止並滿足 postcondition，等於把讀寫越界、解參空指標、觸發 runtime error 這些執行全部排除在外，因為它們要麼讓程式停不下來，要麼讓結果 state 違反規格。把這些接起來——用 separation logic 寫規格、用 weakest-precondition 推回去——就得到 memory safety 與 functional correctness 的機器可檢證明。下面這張表把兩條證明路線各自的工具與所證性質擺在一起對照。</p>
+
+  <figure class="vg-w-table-prooflines" data-mobile-summary="兩條獨立路線：功能正確不蘊含機密性，所以機密性得單獨證。">
+    <style>
+      .vg-w-table-prooflines { overflow-x: auto; }
+      .vg-w-table-prooflines table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-prooflines caption { text-align: left; caption-side: top; font-family: var(--scribed); font-style: italic; color: var(--muted); font-size: var(--fs-sm); padding: var(--s-1) 0; }
+      .vg-w-table-prooflines thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); }
+      .vg-w-table-prooflines tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+      .vg-w-table-prooflines tbody tr:hover td { background: var(--bg-soft); }
+      .vg-w-table-prooflines td.route { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-table-prooflines code { font-size: 0.88em; }
+    </style>
+    <table>
+      <caption>兩條互補的證明路線——左半證「程式做對了」，右半證「祕密沒洩漏」。性質與技術名稱皆取自原文。</caption>
+      <thead>
+        <tr>
+          <th>證明路線</th>
+          <th>所證性質</th>
+          <th>核心技術</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="route">功能驗證</td>
+          <td>absence of runtime errors</td>
+          <td>μRust 形式化 · separation logic 寫規格</td>
+        </tr>
+        <tr>
+          <td class="route">功能驗證</td>
+          <td>memory safety</td>
+          <td>separation logic（堆的不相交斷言）</td>
+        </tr>
+        <tr>
+          <td class="route">功能驗證</td>
+          <td>functional correctness</td>
+          <td>weakest-precondition calculus</td>
+        </tr>
+        <tr>
+          <td class="route">機密 / 完整性</td>
+          <td>only authorized information flows can occur</td>
+          <td>noninterference · indistinguishability preservation</td>
+        </tr>
+      </tbody>
+    </table>
+    <figcaption>兩條路線不是冗餘——功能正確不蘊含機密性。一段程式可以完全正確地做完它該做的事，同時把祕密寫進一個 observer 看得到的地方。機密性需要一條獨立的證明。</figcaption>
+  </figure>
+
+  <p>支撐這條路線的證明基礎設施，AWS 已經在 2025 年開源——文章把它定位為「a general-purpose proof infrastructure that we open-sourced in 2025 as the AutoCorrode library」。兩個字眼值得記住：general-purpose 與 open-sourced。把 μRust 程式接上 separation logic 與 weakest-precondition 的這套機械，不是只活在 Nitro 內部、用完即棄的一次性產物，而是被設計成可套用到其他驗證對象、且已經公開的通用基礎設施。對一個訴諸「機器可檢」的成果來說，工具公開本身就是可信度的一部分。</p>
+
+  <h2>noninterference：為什麼「功能正確」還不夠</h2>
+
+  <p>功能驗證證完，還缺一塊最關鍵的——機密性。這兩者的差別常被混淆：一段程式可以「完全正確」地完成規格，同時把一台 VM 的祕密悄悄寫進另一台看得到的位置。功能正確管的是「做對了該做的事」，機密性管的是「沒做不該被看到的事」，後者不蘊含於前者。所以文章用了一條完全不同的證明路線，目標一句話：「Only authorized information flows can occur。」</p>
+
+  <p>這條路線的形式工具是 noninterference，證明策略叫 indistinguishability preservation。文章先給它一個定位：「Noninterference is the idea of indistinguishability preservation that we use to make confidentiality and integrity mathematically precise.」——它的作用，是把「機密性」「完整性」這兩個本來模糊的字眼，變成數學上精確、可被機器檢查的命題。機密性與完整性在這裡是一體兩面：前者是「祕密不外流」，後者是「外界不能竄改」，但都能被收斂成同一句 information-flow 斷言——只有被授權的流動可以發生。</p>
+
+  <p>它的核心直覺，文章講得異常清楚，值得逐字讀：「if two states are indistinguishable to an observer before a step, they must remain indistinguishable afterward. The intuitive reason why this captures confidentiality is that the observer has learned nothing new because of the step.」翻成白話：取兩個只在「祕密」上不同、但在「observer 能看到的部分」完全相同的 state，讓引擎走一步；如果走完之後 observer 看到的部分還是相同，那 observer 就無從分辨剛才那一步背後的祕密是什麼——它什麼都沒學到。這個「學到 nothing new」是關鍵措辭：機密性不是「祕密被加密」或「祕密被藏好」，而是更強的「祕密的任何值都不會在 observer 可見的行為上留下差別」。文章開頭那個互動小工具示範的正是這件事：你撥動 VM-A 的祕密值，observer 投影恆等於兩邊一致。</p>
+
+  <p>要對「每一步」都成立才算數，而這正是建模深度開始咬人的地方。文章舉了 PSCI_CPU_ON 這個操作當例子——它「captures what happens when an executing guest virtual CPU tries to turn itself on (an erroneous request)」，也就是一個正在跑的 guest CPU 試圖開啟自己這種錯誤請求。這個例子選得好，是因為它走的是錯誤路徑而非快樂路徑：一個已經在跑的 virtual CPU 要求把自己打開，本身就矛盾。引擎的處理也被規格如實寫下——「the Nitro Isolation Engine sees that, to act as the caller, the virtual CPU must be turned on already, and it therefore returns a defined error code, AlreadyOn.」要能當 caller 發出請求，該 virtual CPU 顯然已是開著的，於是引擎回傳一個定義好的 error code AlreadyOn。注意這裡沒有 panic、沒有未定義行為，連錯誤都有明確的、被規格覆蓋的結果——這正是「absence of runtime errors」在一個具體操作上的樣子。</p>
+
+  <p>光是這個錯誤路徑的規格就相當複雜，文章的解釋是：「the complexity in the specification is a reflection of the depth of our modeling and the fact that several other error checks must already have been performed.」規格複雜不是因為寫得囉嗦，而是因為要走到這一步，前面已經必須通過好幾道 error check——模型把這些前置條件都如實納進來了。這句話反過來讀更有意思：規格的複雜度，是建模忠實度的副作用。一個偷懶的模型可以把這些 check 抽象掉、讓規格看起來乾淨，但那等於在證明裡偷偷假設「前面都沒出錯」；Nitro 把每一道 check 都顯式建進模型，於是 noninterference 必須對「連這個錯誤請求都被正確擋下」一併成立。每一個操作、包括每一條錯誤路徑，都得單獨扛起 indistinguishability 被保住的義務——這正是為什麼前面要把語言縮成 μRust、把元件縮成 separation kernel。</p>
+
+  <p>對讀者來說，這裡的 takeaway 是：noninterference 不是一句口號，而是一個要對引擎的每一個操作（包括所有錯誤路徑）逐一驗證 indistinguishability 被保住的義務。下圖把功能與機密兩條路線疊成一座證明階梯，從 μRust 的語言底座一路堆到 noninterference 的頂層性質。</p>
+
+  <figure class="vg-w-ladder-proofstack" data-svg-scroll="560" data-mobile="keep" data-mobile-summary="證明階梯：μRust 語言底座往上，左路 separation logic 加 weakest-precondition 證 memory safety 與 functional correctness，右路 noninterference 加 indistinguishability preservation 證機密性與完整性。">
+    <svg class="vg-w-ladder-proofstack-svg" viewBox="0 0 480 320" role="img" style="width: 100%; height: auto; max-width: 520px;"
+         aria-label="證明階梯：μRust 底座、左路 separation logic 與 weakest-precondition、右路 noninterference 與 indistinguishability preservation">
+      <style>
+        .vg-w-ladder-proofstack-svg text { font-family: EB Garamond, serif; font-size: 13px; }
+        .vg-w-ladder-proofstack-svg .lbl { font-family: IM Fell English, serif; font-style: italic; font-size: 11px; fill: var(--muted); }
+        .vg-w-ladder-proofstack-svg .prop { font-family: JetBrains Mono, monospace; font-size: 11px; }
+        .vg-w-ladder-proofstack-svg .head { font-family: IM Fell English, serif; font-style: italic; font-size: 13px; }
+      </style>
+
+      <!-- base: muRust -->
+      <rect x="40" y="264" width="400" height="40" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.5"/>
+      <text x="240" y="282" text-anchor="middle" fill="var(--ink)">μRust · Rust 的可推理 core subset</text>
+      <text x="240" y="297" text-anchor="middle" class="lbl">刻意排除 traits、dynamic dispatch</text>
+
+      <!-- split into two columns -->
+      <text x="140" y="42" text-anchor="middle" fill="var(--ink)" class="head">功能驗證</text>
+      <text x="340" y="42" text-anchor="middle" fill="var(--ink)" class="head">機密 / 完整性</text>
+
+      <!-- left column blocks -->
+      <rect x="40" y="56" width="200" height="44" fill="var(--accent)" fill-opacity="0.16" stroke="var(--accent)" stroke-width="1.2"/>
+      <text x="140" y="74" text-anchor="middle" fill="var(--ink)">Separation Logic</text>
+      <text x="140" y="90" text-anchor="middle" class="lbl">堆的不相交斷言</text>
+
+      <rect x="40" y="112" width="200" height="44" fill="var(--accent)" fill-opacity="0.16" stroke="var(--accent)" stroke-width="1.2"/>
+      <text x="140" y="130" text-anchor="middle" fill="var(--ink)">weakest-precondition</text>
+      <text x="140" y="146" text-anchor="middle" class="lbl">把規格推回程式入口</text>
+
+      <rect x="40" y="170" width="200" height="68" fill="var(--sage)" fill-opacity="0.18" stroke="var(--sage-deep)" stroke-width="1.2"/>
+      <text x="140" y="190" text-anchor="middle" fill="var(--ink)">所證性質</text>
+      <text x="140" y="208" text-anchor="middle" class="prop" fill="var(--accent-text)">memory safety</text>
+      <text x="140" y="224" text-anchor="middle" class="prop" fill="var(--accent-text)">functional correctness</text>
+
+      <!-- right column blocks -->
+      <rect x="240" y="56" width="200" height="44" fill="var(--accent)" fill-opacity="0.16" stroke="var(--accent)" stroke-width="1.2"/>
+      <text x="340" y="74" text-anchor="middle" fill="var(--ink)">noninterference</text>
+      <text x="340" y="90" text-anchor="middle" class="lbl">information-flow 性質</text>
+
+      <rect x="240" y="112" width="200" height="44" fill="var(--accent)" fill-opacity="0.16" stroke="var(--accent)" stroke-width="1.2"/>
+      <text x="340" y="130" text-anchor="middle" fill="var(--ink)">indistinguishability</text>
+      <text x="340" y="146" text-anchor="middle" class="lbl">preservation per step</text>
+
+      <rect x="240" y="170" width="200" height="68" fill="var(--sage)" fill-opacity="0.18" stroke="var(--sage-deep)" stroke-width="1.2"/>
+      <text x="340" y="190" text-anchor="middle" fill="var(--ink)">所證性質</text>
+      <text x="340" y="208" text-anchor="middle" class="prop" fill="var(--accent-text)">confidentiality</text>
+      <text x="340" y="224" text-anchor="middle" class="prop" fill="var(--accent-text)">integrity</text>
+
+      <text x="240" y="256" text-anchor="middle" class="lbl">兩條路線各自獨立，皆編入 330,000 行 Isabelle/HOL</text>
+    </svg>
+    <figcaption>同一座 μRust 底座往上分出兩條獨立路線。功能正確不蘊含機密性，所以右路不能省。整座階梯共 330,000 行 machine-checked mathematics，規模可比 seL4。</figcaption>
+  </figure>
+
+  <h2>這份證明保證了什麼、沒保證什麼</h2>
+
+  <p>形式化驗證最容易被誤讀的地方，是把「證明了 X」聽成「整台機器無懈可擊」。文章在這點上相當誠實，邊界劃得很清楚，值得逐條記下來。</p>
+
+  <p>第一，被證的是 Nitro Isolation Engine，不包含被 deprivileged 的 hypervisor。policy 那一半留在證明範圍之外——這正是 separation kernel 設計的目的：把需要被信任的東西縮到最小，但「縮到最小」反過來說就是「最小之外的東西沒被證」。第二，並發程式碼的推理方法尚未在這篇展開：文章把「how we handle reasoning about concurrent code」連同 conformance testing 一起列為「we're excited to share in future posts」，意思是這次公開的成果裡，這部分的方法論還沒攤出來。第三，也是最容易被忽略的——形式化驗證證的是「模型符合規格」，它不涵蓋 side-channel 攻擊，也不涵蓋硬體層的漏洞。一個在數學上完美隔離的引擎，仍可能被 cache timing 之類的旁路洩漏資訊，因為那條通道根本不在被建模的狀態空間裡。下圖把「圈內已證」與「圈外未涵蓋」攤開對照。</p>
+
+  <figure class="vg-w-scope-boundary" data-svg-scroll="560" data-mobile="keep" data-mobile-summary="圈內已證：Isolation Engine 的 memory safety、functional correctness、機密性、完整性，330k 行 Isabelle/HOL。圈外未涵蓋：deprivileged hypervisor、並發推理方法、side-channel、硬體漏洞。">
+    <svg class="vg-w-scope-boundary-svg" viewBox="0 0 500 280" role="img" style="width: 100%; height: auto; max-width: 520px;"
+         aria-label="證明範圍邊界：圈內為已證性質，圈外為未涵蓋項目">
+      <style>
+        .vg-w-scope-boundary-svg text { font-family: EB Garamond, serif; font-size: 12px; }
+        .vg-w-scope-boundary-svg .in { font-family: JetBrains Mono, monospace; font-size: 11px; fill: var(--accent-text); }
+        .vg-w-scope-boundary-svg .out { font-family: JetBrains Mono, monospace; font-size: 11px; fill: var(--muted); }
+        .vg-w-scope-boundary-svg .head { font-family: IM Fell English, serif; font-style: italic; font-size: 13px; }
+      </style>
+
+      <text x="240" y="22" text-anchor="middle" fill="var(--ink)" class="head">圈內已證 ── 圈外未涵蓋</text>
+
+      <!-- inner verified region -->
+      <rect x="120" y="44" width="240" height="148" rx="6" fill="var(--sage)" fill-opacity="0.16" stroke="var(--sage-deep)" stroke-width="1.6"/>
+      <text x="240" y="66" text-anchor="middle" fill="var(--ink)" font-family="IM Fell English, serif" font-style="italic" font-size="12">Nitro Isolation Engine（已證）</text>
+      <text x="240" y="92" text-anchor="middle" class="in">memory safety</text>
+      <text x="240" y="112" text-anchor="middle" class="in">functional correctness</text>
+      <text x="240" y="132" text-anchor="middle" class="in">confidentiality</text>
+      <text x="240" y="152" text-anchor="middle" class="in">integrity</text>
+      <text x="240" y="178" text-anchor="middle" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="10">330,000 行 Isabelle/HOL</text>
+
+      <!-- outer uncovered items -->
+      <text x="60" y="60" text-anchor="start" class="out">deprivileged</text>
+      <text x="60" y="76" text-anchor="start" class="out">hypervisor</text>
+
+      <text x="474" y="60" text-anchor="end" class="out">並發推理</text>
+      <text x="474" y="76" text-anchor="end" class="out">（future post）</text>
+
+      <text x="60" y="232" text-anchor="start" class="out">side-channel</text>
+      <text x="60" y="248" text-anchor="start" class="out">（cache timing…）</text>
+
+      <text x="474" y="232" text-anchor="end" class="out">硬體漏洞</text>
+      <text x="474" y="248" text-anchor="end" class="out">（不在模型內）</text>
+
+      <text x="240" y="248" text-anchor="middle" fill="var(--muted)" class="head">conformance testing 亦留待後續</text>
+    </svg>
+    <figcaption>圈內四條性質有機器可檢的證明撐著；圈外四項都不在這次公開的範圍內。把這兩圈分清楚，才不會把一個誠實的成果誤讀成「全機無懈可擊」。</figcaption>
+  </figure>
+
+  <p>放回脈絡看規模感：文章說它「comparable in scale to seL4, the landmark project that first demonstrated that realistic operating-system verification was feasible and was an inspiration for our own work.」seL4 是第一個證明「現實作業系統驗證可行」的里程碑，AWS 直接承認它是這項工作的 inspiration。把 330,000 行放到這個座標上才讀得出分量：這是與學界公認最硬的形式化驗證里程碑同一量級的工程。要注意原文只說「comparable in scale」，並沒有給出 seL4 的具體行數來逐項對照——它比的是量級。</p>
+
+  <p>真正的差別不在規模而在落地：「unlike seL4, the Nitro Isolation Engine is designed for a commercial cloud environment and ships on production hardware as an always-on feature for Graviton5 users.」seL4 證明了「可行」，但它本質上是研究與高保證場景的微核心；Nitro Isolation Engine 則從一開始就為商用雲設計、跑在量產硬體上、而且 always-on。always-on 是這份成果對普通使用者最直接的意義：不是一個要你去開的選項、也不是高階方案才有的加值，而是預設就在那裡、不需要任何操作的底層保證。具體說，Graviton5 的 M9g／M9gd 是第一批用上新 Nitro Isolation Engine 的 instance type——在這些機型上跑 EC2 的人，VM 隔離這條性質背後從此有一份機器可檢的數學證明撐著。</p>
+
+  <p class="vg-deep-closer"><strong>What this enables</strong>：把「VM 隔離」從一個靠測試與審查支撐的工程信心，變成一條有 330,000 行機器可檢數學撐著的性質——前提是你也記得它的邊界：證的是隔離引擎，不是整台機器，並發、side-channel、硬體漏洞都還在圈外等後續。</p>
+</div>
