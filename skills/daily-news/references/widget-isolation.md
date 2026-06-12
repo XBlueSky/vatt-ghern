@@ -361,24 +361,48 @@ mechanically (no headless mobile rendering). The author is responsible
 for self-checking at 375px in dev tools or Playwright before declaring
 DONE. See anti-examples §F4-F6 for common mobile breaks to avoid.
 
-## Mobile summary contract (data-mobile-summary)
+## Mobile tier contract (data-mobile)
 
-Interactive widgets are desktop-only. On coarse-pointer devices (phones,
-tablets) the build hides every `vg-w-*` figure and shows an auto-injected
-summary card instead (`scripts/mobile-card-transform.mjs`). Author
-obligations — enforced by `tests/archetype-check.mjs`:
+每個 `<figure class="vg-w-...">` 必須明確標 `data-mobile` 三值之一
+（2026-06-12 起 archetype-check 硬性要求；優先順序 keep > static > swap）：
 
-1. Every `<figure class="vg-w-...">` MUST carry `data-mobile-summary`，
-   20–80 字。寫這個 widget 要傳達的 takeaway（結論本身），不是外觀描述。
-   手機讀者只會看到這句話。禁用半形冒號、Latin em-dash 與半形雙引號
-   （要引用就用「」；archetype-check 與 build 都會以字元長度檢查）。
-   CJK 雙破折號「——」（成對）與 Latin 程式碼內的半形冒號（如 `std::sort`、`13:43`）不在禁用範圍；禁的是緊鄰 CJK 的單個半形冒號與單個 Latin em-dash。
+1. `data-mobile="keep"` — 純靜態、無控制項、小螢幕可讀的 figure
+   （含真 `<table>` widget）。觸控裝置照常顯示，不注入卡片。
+2. `data-mobile="static"` — 有 `<input>`/`<button>` 等控制項、但「預設
+   畫面本身就是一張讀得懂的完整圖」的互動 widget。觸控裝置顯示 figure，
+   控制項被 CSS 藏掉。義務：
+   - figure 必須有 `data-svg-scroll`（SVG 文字在手機不縮小，橫向滑動看全圖）
+   - 控制列（`.controls`、`.switches`、`.ctl` 等非舞台元素）加
+     `data-vg-controls`；figure 內有 input/button/select 而無
+     `data-vg-controls` 標記 → archetype-check 違規
+   - `.vg-w-affordance` 提示行不必標記，touch CSS 一律藏
+   - 預設狀態（不點不拖）必須是完整可讀的圖——verdict 文案、SVG 內容
+     都以預設值呈現給手機讀者
+3. `data-mobile="swap"`（或不寫，等同 swap）— 互動本身就是內容、靜態
+   畫面無意義的 widget（before/after slider、canvas 互動 demo）。觸控
+   裝置換成摘要卡。義務：`data-mobile-summary`，20–80 字 takeaway
+   （結論本身，不是外觀描述）。禁用半形冒號、Latin em-dash 與半形雙引號
+   （要引用就用「」）；CJK 雙破折號「——」（成對）與 Latin 程式碼內的
+   半形冒號（如 `std::sort`、`13:43`）不在禁用範圍；禁的是緊鄰 CJK 的
+   單個半形冒號與單個 Latin em-dash。
    GOOD: `data-mobile-summary="同樣 1000 token，diffusion 八次迭代全部出齊，autoregressive 要走 1000 步，吞吐量差距由此而來。"`
    BAD:  `data-mobile-summary="本圖以滑桿展示去噪過程的動畫效果。"`（外觀描述，讀者學不到結論）
-2. 純靜態、無互動、小螢幕可讀的 figure 可用 `data-mobile="keep"` 退出
-   置換（figure 在觸控裝置照常顯示，不注入卡片）。
-3. Widget JS 不得在觸控裝置初始化。IIFE 第一行：
+
+決策樹：figure 沒有任何控制項？→ keep。有控制項但預設畫面讀得懂？→
+static。拿掉互動就沒有東西可看？→ swap（最後手段——swap 等於手機讀者
+只剩一句話，先想清楚預設畫面真的撐不起一張靜態圖嗎）。
+
+其餘不變的義務：
+
+4. Widget JS 不得在觸控裝置初始化。IIFE 第一行：
    `if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;`
-4. 不要手寫 `.vg-mobile-card` / `.vg-mobile-notice` markup——它們由 build
-   注入，手寫會造成重複。
-5. 互動 widget 必須以 `<figure class="vg-w-...">` 包裹才會參與 mobile 置換；`<div class="vg-w-...">` 形式的 widget（如 tabs）不會被換成摘要卡，會在觸控裝置上原樣顯示，也不受本契約檢查。新 widget 一律用 `<figure>`。
+5. 不要手寫 `.vg-mobile-card` / `.vg-mobile-notice` markup——swap 卡片由
+   build 注入（標題＋摘要，無「請以桌面瀏覽器開啟」字句；該提示只在文章
+   頂部 notice 出現一次），手寫會造成重複。
+6. 互動 widget 必須以 `<figure class="vg-w-...">` 包裹才會參與 mobile
+   置換；`<div class="vg-w-...">` 形式的 widget（如 tabs）不受本契約
+   檢查。新 widget 一律用 `<figure>`。
+7. Catalog widget（`{% widget %}`）的 tier 預設 `swap`，可由 widget.json
+   的 `mobile_tier` 或 per-instance `mobile="static"`/`mobile="keep"` 覆寫；
+   摘要同前（`mobile_summary` / `summary=`）。未知 tier 值會在 build 時
+   直接 throw。
