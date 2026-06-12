@@ -1,0 +1,517 @@
+{
+  "output_path": "src/posts/2026/06/13/deep-cloudflare-scan-throughput-10x.html",
+  "spine": [
+    "1. 症狀：Security Insights 掃描卡在每秒約 10 次，backlog 累積數百萬筆事件、API 頻繁逾時、process 崩潰——目標是不加機器把吞吐量拉十倍。",
+    "2. 假設一（Kafka 消費端）：一則慢訊息阻塞整個 partition（head-of-line blocking），證據是 15/30 partition 落後；解法是批次消費＋每訊息開 goroutine，再拆 slow/fast lane。",
+    "3. 假設二（資料庫寫入）：每個 issue 一次 round trip，最大批量 50 萬筆＝單一 API call 裡五十萬次往返、查詢與交易；解法是 UNNEST／COPY 混合。",
+    "4. 假設三（API 跨洲延遲）：primary DB 在 Portland，API 卻在 Portland 與 Amsterdam active-active，Amsterdam 平均一次呼叫近 3 秒、Portland 才 10 ms；解法是改 active-passive 讓 active API 跟著 primary。",
+    "5. 收尾的排程改寫：zone 獨立於 account 排程、隨機化 last_scheduled_at、加入 adaptive rate limiting，攤平排程造成的尖峰。",
+    "6. 結果：尖峰排程時穩定每秒 120+ 次掃描，超過十倍目標，且不靠加 pod 或 partition——靠讀 code、SQL、log、metric 找瓶頸。"
+  ],
+  "sources": [
+    {
+      "url": "https://blog.cloudflare.com/scaling-security-scans/",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": null,
+      "perspective": {
+        "mechanism": "一條訊息佇列／一個跨區資料庫呼叫／一個 N+1 寫入迴圈，各自如何形成吞吐量上限；瓶頸不是「機器不夠」而是順序消費、跨洲 RTT、每筆一次 round trip 這三種結構問題。",
+        "tradeoff": "不加硬體的代價是要逐層量測與改寫——批次消費換來亂序、UNNEST/COPY 換來分支判斷、active-passive 換掉 Amsterdam 的就近服務；每個修復都犧牲某種簡單性換吞吐量。",
+        "reader_use": "台灣工程師遇到 Kafka consumer lag、ORM N+1 寫入、跨區資料庫呼叫時，可以照同一條偵查路線：先看 partition lag 與按地區拆分的 API 延遲，再決定動哪一層。"
+      }
+    }
+  ],
+  "notes": [
+    {
+      "id": "n01",
+      "url": "https://blog.cloudflare.com/scaling-security-scans/",
+      "quote": "we were executing around 10 scans per second",
+      "hedge": "asserted",
+      "interpretation": "原始吞吐量基線，作者用 around 輕度 hedge。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n02",
+      "url": "https://blog.cloudflare.com/scaling-security-scans/",
+      "quote": "increase our scanning throughput by around 10x on average – from 10 scans per second to 100 per second",
+      "hedge": "asserted",
+      "interpretation": "十倍目標，from 10 to 100 是設定的目標值。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n03",
+      "url": "https://blog.cloudflare.com/scaling-security-scans/",
+      "quote": "Today, Security Insights sustains over 120 scans per second during peak scheduling, exceeding our 10x improvement goal",
+      "hedge": "asserted",
+      "interpretation": "最終達成值，超過 120/秒，超過十倍目標。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n04",
+      "url": "https://blog.cloudflare.com/scaling-security-scans/",
+      "quote": "perform[s] regular scans for all accounts, zones, and DNS records, looking for potential security risks and misconfigurations",
+      "hedge": "asserted",
+      "interpretation": "系統做什麼：對 account/zone/DNS record 定期掃描找風險與錯誤設定。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n05",
+      "url": "https://blog.cloudflare.com/scaling-security-scans/",
+      "quote": "millions of events were filling up our backlog waiting to be processed",
+      "hedge": "asserted",
+      "interpretation": "症狀一：backlog 累積數百萬事件。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n06",
+      "url": "https://blog.cloudflare.com/scaling-security-scans/",
+      "quote": "our API was frequently timing out",
+      "hedge": "asserted",
+      "interpretation": "症狀二：API 頻繁逾時。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n07",
+      "url": "https://blog.cloudflare.com/scaling-security-scans/",
+      "quote": "our processes were crashing",
+      "hedge": "asserted",
+      "interpretation": "症狀三：process 崩潰。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n08",
+      "url": "https://blog.cloudflare.com/scaling-security-scans/",
+      "quote": "Messages that are slow to process block the consumer from progressing to the next message",
+      "hedge": "asserted",
+      "interpretation": "head-of-line blocking 的機制描述。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n09",
+      "url": "https://blog.cloudflare.com/scaling-security-scans/",
+      "quote": "Although we can only consume messages in order, there is nothing stopping us from consuming multiple messages at once.",
+      "hedge": "asserted",
+      "interpretation": "突破點：順序消費不妨礙一次拿多筆。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n10",
+      "url": "https://blog.cloudflare.com/scaling-security-scans/",
+      "quote": "We changed our checkers to consume messages in batches, processing each message in a separate goroutine.",
+      "hedge": "asserted",
+      "interpretation": "Kafka 消費端第一個修復：批次消費＋每訊息一個 goroutine。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n11",
+      "url": "https://blog.cloudflare.com/scaling-security-scans/",
+      "quote": "We opted for a very simple approach: splitting our consumer groups and checkers in two – the 'slow lane' and the 'fast lane'.",
+      "hedge": "asserted",
+      "interpretation": "第二個修復：consumer group 拆成 slow lane / fast lane。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n12",
+      "url": "https://blog.cloudflare.com/scaling-security-scans/",
+      "quote": "Exactly 15 partitions can be seen lagging behind (the lines that reach or approach zero later than around 03/10 03:00). This is because the load balancer splits traffic evenly between our API endpoints.",
+      "hedge": "asserted",
+      "interpretation": "證據：30 個 partition 裡剛好 15 個落後，因為 load balancer 平均分流。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n13",
+      "url": "https://blog.cloudflare.com/scaling-security-scans/",
+      "quote": "for each issue: make a round trip to the database per insight. With a maximum observed size of 500,000, this was half a million round trips, queries, and transactions in a single API call.",
+      "hedge": "asserted",
+      "interpretation": "資料庫假設：每個 issue 一次 round trip，最大 50 萬筆＝單一 API call 五十萬次往返。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n14",
+      "url": "https://blog.cloudflare.com/scaling-security-scans/",
+      "quote": "We settled on a hybrid approach: Using UNNEST when the number of issues was below a threshold; Using COPY when the number of issues exceeded this threshold",
+      "hedge": "asserted",
+      "interpretation": "資料庫修復：低於門檻用 UNNEST，超過用 COPY 的混合策略。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n15",
+      "url": "https://blog.cloudflare.com/scaling-security-scans/",
+      "quote": "Our primary database is located in Portland, Oregon. Our API, however, was running active-active in both Portland and Amsterdam. Even at the speed of light, the round-trip latency between Portland and Amsterdam would be 50 milliseconds.",
+      "hedge": "asserted",
+      "interpretation": "API 假設的根因：primary DB 在 Portland，API 卻 active-active 在兩地，光速下 RTT 就要 50 ms。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n16",
+      "url": "https://blog.cloudflare.com/scaling-security-scans/",
+      "quote": "Our average API call completed in 10 ms in Portland, but almost 3 seconds in Amsterdam!",
+      "hedge": "asserted",
+      "interpretation": "證據：同一個 API call 在 Portland 平均 10 ms，Amsterdam 將近 3 秒。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n17",
+      "url": "https://blog.cloudflare.com/scaling-security-scans/",
+      "quote": "we switched our API to active-passive, ensuring the active API followed our primary database.",
+      "hedge": "asserted",
+      "interpretation": "API 修復：改 active-passive，讓 active API 跟著 primary DB。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n18",
+      "url": "https://blog.cloudflare.com/scaling-security-scans/",
+      "quote": "Schedule zones independently of accounts: each zone gets its own last_scheduled_at field.",
+      "hedge": "asserted",
+      "interpretation": "排程修復一：zone 獨立於 account 排程，各有自己的 last_scheduled_at。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n19",
+      "url": "https://blog.cloudflare.com/scaling-security-scans/",
+      "quote": "Randomize the last_scheduled_at time for existing accounts and zones.",
+      "hedge": "asserted",
+      "interpretation": "排程修復二：隨機化既有 account/zone 的 last_scheduled_at。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n20",
+      "url": "https://blog.cloudflare.com/scaling-security-scans/",
+      "quote": "Introduce adaptive rate limiting for scan scheduling.",
+      "hedge": "asserted",
+      "interpretation": "排程修復三：為掃描排程加入 adaptive rate limiting。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n21",
+      "url": "https://blog.cloudflare.com/scaling-security-scans/",
+      "quote": "By looking closely at our code, SQL queries, logs, and metrics, we were able to increase our capacity without simply adding more pods or partitions.",
+      "hedge": "asserted",
+      "interpretation": "方法論收尾：靠讀 code/SQL/log/metric，而非加 pod 或 partition。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n22",
+      "url": "https://blog.cloudflare.com/scaling-security-scans/",
+      "quote": "We increased scanning throughput for Security Insights by more than 10x, enabled security insights for millions of customers, and doubled our scanning frequency for all customers.",
+      "hedge": "asserted",
+      "interpretation": "總結成果：吞吐量超過十倍、為數百萬客戶開通、所有客戶掃描頻率加倍。",
+      "timeliness": "annual"
+    }
+  ],
+  "claims": [
+    {
+      "id": "c01",
+      "claim_text": "基線每秒約 10 次掃描。",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n01"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "Before these improvements, we were executing around 10 scans per second."
+    },
+    {
+      "id": "c02",
+      "claim_text": "目標：平均拉高約 10 倍，從每秒 10 次到 100 次。",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n02"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "increase our scanning throughput by around 10x on average – from 10 scans per second to 100 per second."
+    },
+    {
+      "id": "c03",
+      "claim_text": "尖峰排程時穩定每秒超過 120 次掃描，超過 10 倍目標。",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n03"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "Today, Security Insights sustains over 120 scans per second during peak scheduling, exceeding our 10x improvement goal."
+    },
+    {
+      "id": "c04",
+      "claim_text": "對所有 account、zone、DNS record 定期掃描找風險與錯誤設定。",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n04"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "we perform regular scans for all accounts, zones, and DNS records, looking for potential security risks and misconfigurations."
+    },
+    {
+      "id": "c05",
+      "claim_text": "三盞燈：backlog 數百萬事件、API 頻繁逾時、process 崩潰。",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n05",
+        "n06",
+        "n07"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "millions of events were filling up our backlog ...; our API was frequently timing out; our processes were crashing."
+    },
+    {
+      "id": "c06",
+      "claim_text": "慢訊息擋住 consumer 前進（head-of-line blocking）。",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n08"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "Messages that are slow to process block the consumer from progressing to the next message."
+    },
+    {
+      "id": "c07",
+      "claim_text": "30 個 partition 剛好 15 個落後，因 load balancer 平均分流。",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n12"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "Exactly 15 partitions can be seen lagging behind ... the load balancer splits traffic evenly between our API endpoints."
+    },
+    {
+      "id": "c08",
+      "claim_text": "只能順序消費，但沒有什麼能阻止一次消費多筆。",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n09"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "Although we can only consume messages in order, there is nothing stopping us from consuming multiple messages at once."
+    },
+    {
+      "id": "c09",
+      "claim_text": "批次消費 + 每訊息 goroutine；consumer group 拆 slow/fast lane。",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n10",
+        "n11"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "consume messages in batches, processing each message in a separate goroutine ... splitting our consumer groups and checkers in two – the 'slow lane' and the 'fast lane'."
+    },
+    {
+      "id": "c10",
+      "claim_text": "每 issue 一次 round trip；最大 50 萬筆 = 單一 call 五十萬次往返。",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n13"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "make a round trip to the database per insight. With a maximum observed size of 500,000, this was half a million round trips, queries, and transactions in a single API call."
+    },
+    {
+      "id": "c11",
+      "claim_text": "混合策略：低於門檻用 UNNEST、超過用 COPY。",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n14"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "Using UNNEST when the number of issues was below a threshold ... Using COPY when the number of issues exceeded this threshold."
+    },
+    {
+      "id": "c12",
+      "claim_text": "API call 在 Portland 平均 10 ms、Amsterdam 將近 3 秒。",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n16"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "Our average API call completed in 10 ms in Portland, but almost 3 seconds in Amsterdam!"
+    },
+    {
+      "id": "c13",
+      "claim_text": "primary DB 在 Portland，API active-active 兩地；Portland-Amsterdam RTT 50 ms。",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n15"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "Our primary database is located in Portland, Oregon. Our API ... was running active-active in both Portland and Amsterdam. Even at the speed of light, the round-trip latency between Portland and Amsterdam would be 50 milliseconds."
+    },
+    {
+      "id": "c14",
+      "claim_text": "改 active-passive，active API 跟著 primary database。",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n17"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "we switched our API to active-passive, ensuring the active API followed our primary database."
+    },
+    {
+      "id": "c15",
+      "claim_text": "排程三修：zone 獨立 last_scheduled_at、隨機化、adaptive rate limiting。",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n18",
+        "n19",
+        "n20"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "Schedule zones independently of accounts: each zone gets its own last_scheduled_at field. Randomize the last_scheduled_at time ... Introduce adaptive rate limiting for scan scheduling."
+    },
+    {
+      "id": "c16",
+      "claim_text": "排程造成尖峰的一般機制（text-marked 合理推斷）。",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": null,
+      "note": "Author explicitly text-marked this as 「合理推斷」 in prose; source does not spell out the thundering-herd mechanism in detail. Legal text-marked inference."
+    },
+    {
+      "id": "c17",
+      "claim_text": "靠讀 code、SQL query、log、metric，不加 pod 或 partition 提升容量。",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n21"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "By looking closely at our code, SQL queries, logs, and metrics, we were able to increase our capacity without simply adding more pods or partitions."
+    },
+    {
+      "id": "c18",
+      "claim_text": "吞吐量超過 10 倍、為數百萬客戶開通、所有客戶掃描頻率加倍。",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n22"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "we increased scanning throughput for Security Insights by more than 10x, enabled security insights for millions of customers, and doubled our scanning frequency for all customers."
+    },
+    {
+      "id": "c19",
+      "claim_text": "圖註：中段 40/70 標示意，只有基線 10、目標 100、最終 120+ 為來源數字。",
+      "type": "number",
+      "load": "medium",
+      "note_ids": [
+        "n01",
+        "n02",
+        "n03"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "baseline ~10, goal 100, final over 120 — middle bars explicitly labelled illustrative (示意/≈) in figcaption."
+    },
+    {
+      "id": "c20",
+      "claim_text": "同一呼叫兩地差近 300 倍（10 ms vs 近 3 秒的算術描述）。",
+      "type": "number",
+      "load": "medium",
+      "note_ids": [
+        "n16"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "Our average API call completed in 10 ms in Portland, but almost 3 seconds in Amsterdam! (≈300x is the arithmetic, not an inflated source strength)"
+    }
+  ],
+  "checked_at": "2026-06-13",
+  "checker_rounds": 1,
+  "coverage": {
+    "candidate_claims": 24,
+    "checked": 20,
+    "dropped_low_load": 4
+  }
+}
