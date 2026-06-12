@@ -1065,17 +1065,28 @@ sleep 2 && curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/
    f. **Touch-tier audit — true touch emulation** (added 2026-06-12,
       static-tier spec): the 375px *resize* in (a)–(c) does NOT trigger
       the touch CSS (`hover: none / pointer: coarse` is capability
-      detection, not width). Run a real touch-emulation context
-      (Playwright `devices['iPhone 13']`, hasTouch) once per deep-story:
-      scrollIntoView + screenshot every `.vg-post-body
-      figure[class*="vg-w-"]`, every `.vg-mobile-card`, and the
-      `.vg-mobile-notice`. LOOK at the screenshots and check per tier:
-      - `keep`/`static`: figure visible; NO control remnants（slider、
-        checkbox、radio、button 全藏乾淨，無空白破洞）; `data-svg-scroll`
-        figure 可橫向滑到最右端; text passes the box-test (no
-        text-vs-text / text-vs-box overlap, nothing clipped).
-      - `static`: 預設狀態讀得懂——verdict/annotation 文字是有意義的
-        預設值，不是空白或 placeholder。
+      detection, not width).
+
+      Open a NEW device-emulated browser context for this step — do
+      NOT reuse the resized desktop window:
+
+      ```js
+      const { chromium, devices } = require("@playwright/test");
+      const browser = await chromium.launch();
+      const ctx = await browser.newContext({ ...devices["iPhone 13"] });
+      const page = await ctx.newPage();
+      ```
+
+      Per deep-story: navigate, then scrollIntoView + screenshot every
+      `.vg-post-body figure[class*="vg-w-"]`, every `.vg-mobile-card`,
+      and the `.vg-mobile-notice`. LOOK at the screenshots and check
+      per tier:
+      - `keep`: figure visible; NO control remnants（slider、checkbox、
+        radio、button 全藏乾淨，無空白破洞）; text passes the box-test
+        (no text-vs-text / text-vs-box overlap, nothing clipped).
+      - `static`: all `keep` checks, PLUS — figure 有 `data-svg-scroll`
+        且可橫向滑到最右端；預設狀態讀得懂——verdict/annotation 文字是
+        有意義的預設值，不是空白或 placeholder。
       - `swap`: card shows title + summary, NO per-card desktop hint;
         top notice appears exactly once.
 

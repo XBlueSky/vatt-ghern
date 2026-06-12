@@ -402,7 +402,8 @@ static。拿掉互動就沒有東西可看？→ swap（最後手段——swap �
 6. 互動 widget 必須以 `<figure class="vg-w-...">` 包裹才會參與 mobile
    置換；`<div class="vg-w-...">` 形式的 widget（如 tabs）不受本契約
    檢查。新 widget 一律用 `<figure>`。
-7. Catalog widget（`{% widget %}`）的 tier 預設 `swap`，可由 widget.json
-   的 `mobile_tier` 或 per-instance `mobile="static"`/`mobile="keep"` 覆寫；
+7. Catalog widget（`{% widget %}`）的 tier 預設 `swap`；widget.json 用
+   `mobile_tier` 設該 widget 的預設，shortcode inline 用 `mobile="static"`/
+   `mobile="keep"` 做 per-instance 覆寫（inline 優先）。
    摘要同前（`mobile_summary` / `summary=`）。未知 tier 值會在 build 時
    直接 throw。
