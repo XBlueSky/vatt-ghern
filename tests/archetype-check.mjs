@@ -32,11 +32,6 @@ import { fileURLToPath } from "node:url";
 const here = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(here, "..");
 
-// Mobile summary contract strictness. The 2026-05/06 backfill landed, so
-// missing/odd-length data-mobile-summary is now a hard violation. See
-// docs/superpowers/specs/2026-06-11-mobile-ebook-reading-design.md
-const MOBILE_SUMMARY_STRICT = true;
-
 // Validate that every "catalog:<name>" entry in a sidecar's widget_templates
 // resolves to an existing catalog-widget trio (partial + sidecar + static JS).
 // Catalog widgets are summoned via {% widget "<name>" %}; this guards the
@@ -56,6 +51,61 @@ export function checkCatalogTemplateRefs(widgetTemplates) {
     if (!ok) errs.push(`widget_templates references missing catalog widget: ${name}`);
   }
   return errs;
+}
+
+// Mobile tier contract. Three tiers (spec: docs/superpowers/specs/
+// 2026-06-12-mobile-widget-static-tier-design.md):
+//   keep   — figure shown as-is on touch; no summary required
+//   static — figure shown, controls hidden; requires data-svg-scroll, and
+//            data-vg-controls when the figure has input/button/select
+//   swap   — summary card (default when attribute absent); requires
+//            data-mobile-summary 20–80 字
+// Posts dated >= EXPLICIT_TIER_SINCE must declare a tier on every vg-w figure.
+export const EXPLICIT_TIER_SINCE = "2026-06-12";
+
+export function checkMobileContract(path, body) {
+  const out = [];
+  const dm = path.replace(/\\/g, "/").match(/\/(\d{4})\/(\d{2})\/(\d{2})\//);
+  const postDate = dm ? `${dm[1]}-${dm[2]}-${dm[3]}` : null;
+  const explicitRequired = postDate !== null && postDate >= EXPLICIT_TIER_SINCE;
+
+  const OPEN_RE = /<figure\b(?:"[^"]*"|'[^']*'|[^>"'])*>/g;
+  let m;
+  while ((m = OPEN_RE.exec(body)) !== null) {
+    const tag = m[0];
+    if (!/class="[^"]*\bvg-w-/.test(tag)) continue;
+    const cls = tag.match(/vg-w-[a-z0-9-]+/)?.[0] ?? "vg-w-?";
+    const tier = tag.match(/\bdata-mobile="([^"]*)"/)?.[1] ?? null;
+
+    if (tier !== null && !["keep", "static", "swap"].includes(tier)) {
+      out.push(`${path}: ${cls} unknown data-mobile="${tier}" (use keep|static|swap)`);
+      continue;
+    }
+    if (explicitRequired && tier === null) {
+      out.push(`${path}: ${cls} must declare data-mobile (keep|static|swap) — required for posts since ${EXPLICIT_TIER_SINCE}`);
+    }
+    if (tier === "keep") continue;
+    if (tier === "static") {
+      if (!/\bdata-svg-scroll="/.test(tag)) {
+        out.push(`${path}: ${cls} data-mobile="static" requires data-svg-scroll (SVG text must not shrink on phones)`);
+      }
+      const close = body.indexOf("</figure>", m.index + tag.length);
+      const figureBody = close === -1 ? "" : body.slice(m.index + tag.length, close);
+      if (/<(?:input|button|select)\b/.test(figureBody) && !figureBody.includes("data-vg-controls")) {
+        out.push(`${path}: ${cls} data-mobile="static" has input/button/select but no data-vg-controls — touch readers would see dead controls`);
+      }
+      continue;
+    }
+    // swap (explicit or absent): summary required, 20–80 chars
+    const sm = tag.match(/data-mobile-summary="([^"]*)"/);
+    const len = sm ? sm[1].trim().length : 0;
+    if (!sm || len === 0) {
+      out.push(`${path}: ${cls} missing data-mobile-summary (20–80 字 takeaway; or use data-mobile="keep"/"static")`);
+    } else if (len < 20 || len > 80) {
+      out.push(`${path}: ${cls} data-mobile-summary is ${len} chars (require 20–80)`);
+    }
+  }
+  return out;
 }
 
 // CLI entry only when run directly (`node tests/archetype-check.mjs <dir>`).
@@ -393,24 +443,9 @@ function checkWidgetContract(path, html) {
     }
   }
 
-  // 8. Mobile summary contract: every vg-w-* figure carries
-  // data-mobile-summary (20–80 chars, the takeaway) or opts out with
-  // data-mobile="keep". Cards are injected at build time; this only
-  // checks the attribute the author owns.
-  const sink = MOBILE_SUMMARY_STRICT ? violations : warnings;
-  for (const m of body.matchAll(/<figure\b(?:"[^"]*"|'[^']*'|[^>"'])*>/g)) {
-    const tag = m[0];
-    if (!/class="[^"]*\bvg-w-/.test(tag)) continue;
-    if (tag.includes('data-mobile="keep"')) continue;
-    const cls = tag.match(/vg-w-[a-z0-9-]+/)?.[0] ?? "vg-w-?";
-    const sm = tag.match(/data-mobile-summary="([^"]*)"/);
-    const len = sm ? sm[1].trim().length : 0;
-    if (!sm || len === 0) {
-      sink.push(`${path}: ${cls} missing data-mobile-summary (20–80 字 takeaway, or data-mobile="keep")`);
-    } else if (len < 20 || len > 80) {
-      sink.push(`${path}: ${cls} data-mobile-summary is ${len} chars (require 20–80)`);
-    }
-  }
+  // 8. Mobile tier contract — extracted to checkMobileContract (unit-tested
+  // in tests/mobile-tier-check.test.mjs).
+  for (const v of checkMobileContract(path, body)) violations.push(v);
 }
 
 const ARCHETYPE_CHECKERS = {
