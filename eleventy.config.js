@@ -307,21 +307,31 @@ export default function (eleventyConfig) {
     }
     const partial = readFileSync(partialPath, "utf8");
 
-    // Mobile summary: per-instance override via opts.summary, else the
-    // catalog default from <name>.widget.json `mobile_summary`. The
-    // mobile-cards transform turns this into the touch-device summary card.
-    let mobileSummary = opts.summary || "";
+    // Mobile contract: per-instance opts override the catalog defaults from
+    // <name>.widget.json (`mobile_summary`, `mobile_tier`). Catalog widgets
+    // are interactive by construction, so the tier defaults to "swap"; a
+    // widget whose default frame reads statically can set mobile_tier in its
+    // widget.json or be overridden per instance with mobile="static"/"keep".
+    let meta = {};
     const metaPath = join(__dirname, "src", "_includes", "widgets", `${name}.widget.json`);
-    if (!mobileSummary && existsSync(metaPath)) {
+    if (existsSync(metaPath)) {
       try {
-        mobileSummary = JSON.parse(readFileSync(metaPath, "utf8")).mobile_summary || "";
-      } catch { /* sidecar unreadable — fall through to no attribute */ }
+        meta = JSON.parse(readFileSync(metaPath, "utf8"));
+      } catch { /* sidecar unreadable — fall through to defaults */ }
     }
+    const mobileSummary = opts.summary || meta.mobile_summary || "";
     const summaryAttr = mobileSummary
       ? ` data-mobile-summary="${mobileSummary.replace(/"/g, "&quot;")}"`
       : "";
+    const tier = opts.mobile || meta.mobile_tier || "swap";
+    if (!["swap", "keep", "static"].includes(tier)) {
+      throw new Error(
+        `{% widget "${name}" %}: unknown mobile tier "${tier}" — use swap | keep | static`
+      );
+    }
+    const tierAttr = ` data-mobile="${tier}"`;
 
-    return `<figure class="vg-w-${name}" id="${id}" data-widget="${name}"${summaryAttr} data-pagefind-ignore>${partial}</figure>${scriptTag}`;
+    return `<figure class="vg-w-${name}" id="${id}" data-widget="${name}"${tierAttr}${summaryAttr} data-pagefind-ignore>${partial}</figure>${scriptTag}`;
   });
 
   // Asset passthrough inside posts (images, videos, CSVs, PDFs — no JSON sidecars).

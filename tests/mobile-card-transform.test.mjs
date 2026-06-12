@@ -15,8 +15,8 @@ test("widget with summary gets card + data-mobile-swap + notice", () => {
   assert.match(out, /<figure data-mobile-swap class="vg-w-test-demo"/);
   assert.match(out, /<\/figure><div class="vg-mobile-card" data-pagefind-ignore>/);
   assert.match(out, /<p class="vg-mobile-card-summary">同樣的輸入/);
-  assert.match(out, /<p class="vg-mobile-card-hint">互動版圖表請以桌面瀏覽器開啟<\/p>/);
-  assert.match(out, /<div class="vg-mobile-notice" data-pagefind-ignore>本文含 1 個互動圖表，手機版以重點摘要呈現，完整互動內容請以桌面瀏覽器開啟。<\/div>/);
+  assert.doesNotMatch(out, /vg-mobile-card-hint/);
+  assert.match(out, /<div class="vg-mobile-notice" data-pagefind-ignore>本文 1 個互動圖表在手機上以重點摘要呈現，互動版請以桌面瀏覽器開啟。<\/div>/);
 });
 
 test("card title comes from figcaption text, tags stripped", () => {
@@ -75,7 +75,7 @@ test("notice counts only swapped widgets", () => {
   );
   const { html: out, swapped } = injectMobileCards(html);
   assert.equal(swapped, 2);
-  assert.match(out, /本文含 2 個互動圖表/);
+  assert.match(out, /本文 2 個互動圖表在手機上以重點摘要呈現/);
 });
 
 // Issue 1: > inside attribute values
@@ -116,6 +116,34 @@ test('keep figure with a summary attribute is still untouched', () => {
   const { html: out, swapped } = injectMobileCards(html);
   assert.equal(swapped, 0);
   assert.equal(out, html);
+});
+
+test('data-mobile="static" leaves figure untouched, no card, no notice', () => {
+  const html = wrap(
+    `<figure class="vg-w-live-demo" data-mobile="static" data-svg-scroll="800"><div class="ctl" data-vg-controls><input type="range"></div><svg></svg></figure>`
+  );
+  const { html: out, swapped } = injectMobileCards(html);
+  assert.equal(swapped, 0);
+  assert.equal(out, html);
+});
+
+test('data-mobile="swap" behaves like attribute absent (card injected)', () => {
+  const html = wrap(
+    `<figure class="vg-w-explicit-swap" data-mobile="swap" data-mobile-summary="互動本身才是內容的圖表，明確標 swap 後仍應被置換為摘要卡。"><canvas></canvas></figure>`
+  );
+  const { html: out, swapped, missing } = injectMobileCards(html);
+  assert.equal(swapped, 1);
+  assert.deepEqual(missing, []);
+  assert.match(out, /vg-mobile-card/);
+});
+
+test("card contains title and summary only — no hint line", () => {
+  const html = wrap(
+    `<figure class="vg-w-no-hint" data-mobile-summary="摘要文字長度合於規範，描述這個圖表想傳達的核心結論與重點。"><svg></svg></figure>`
+  );
+  const { html: out } = injectMobileCards(html);
+  assert.doesNotMatch(out, /vg-mobile-card-hint/);
+  assert.doesNotMatch(out, /互動版圖表請以桌面瀏覽器開啟/);
 });
 
 // Issue 2: figcaption title truncation

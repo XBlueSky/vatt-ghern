@@ -95,14 +95,16 @@ You are writing ONE deep-story for vatt'ghern's daily-news routine.
      conceptual question + the picked template/snippet + the
      data/state it operates on. If you cannot write a conceptual
      question for a widget, drop it.
-9.5 **每個 widget 附 mobile 摘要**：在每個 `<figure class="vg-w-...">` 開
-   標籤寫 `data-mobile-summary="20–80 字 takeaway"`。觸控裝置上互動
-   widget 會被換成摘要卡，手機讀者只看到這句話，所以寫結論本身，不是
-   「本圖展示…」的外觀描述。禁用半形冒號、Latin em-dash 與半形雙引號。
-   純靜態小圖可改標 `data-mobile="keep"`。
-   Catalog widget（`{% widget %}`）免寫——摘要來自 widget.json；如需
-   per-instance 覆寫：`{% widget "name", summary="..." %}`。
-   詳見 widget-isolation.md「Mobile summary contract」。
+9.5 **每個 widget 標 mobile tier**：在每個 `<figure class="vg-w-...">` 開
+   標籤明確寫 `data-mobile="keep|static|swap"`（優先順序 keep > static >
+   swap；archetype-check 硬性要求）。純靜態圖與真 table → `keep`；有控制
+   項但預設畫面讀得懂 → `static`（加 `data-svg-scroll`，控制列標
+   `data-vg-controls`）；互動本身是內容 → `swap`＋`data-mobile-summary`
+   20–80 字 takeaway（寫結論本身，禁半形冒號、Latin em-dash、半形雙引號）。
+   手機讀者看 keep/static 的靜態圖、swap 的摘要卡，所以 static widget 的
+   預設狀態必須自成一張完整的圖。
+   Catalog widget（`{% widget %}`）tier 預設 swap，可用 `mobile=` 覆寫。
+   詳見 widget-isolation.md「Mobile tier contract」。
 9.8 **Distil the thread-spine before drafting**: 5-7 points, the
    argument backbone, written into the ledger's `spine` array. Build
    it from your perspective fields, ordered for the archetype's arc

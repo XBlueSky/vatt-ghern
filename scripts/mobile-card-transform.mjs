@@ -1,17 +1,24 @@
 // scripts/mobile-card-transform.mjs — Mobile summary-card injection.
 //
-// On coarse-pointer devices interactive widgets are desktop-only: CSS hides
-// every figure tagged `data-mobile-swap` and shows the injected
-// `.vg-mobile-card` instead (see site.css "Mobile summary cards" section).
+// On coarse-pointer devices interactive widgets use a three-tier system.
 // This module is a pure function so `npm test` can exercise it without
 // running Eleventy; eleventy.config.js wires it in as a transform.
 //
-// Contract (see widget-isolation.md "Mobile summary contract"):
-//   - <figure class="vg-w-..." data-mobile-summary="20–80 字 takeaway">
-//     → figure tagged data-mobile-swap + card injected after it
-//   - data-mobile="keep" → figure left alone (static, small-screen-safe)
-//   - missing summary → generic card (title + hint only), reported in
-//     `missing` so the build can warn; never breaks the build.
+// Three-tier contract
+// (see docs/superpowers/specs/2026-06-12-mobile-widget-static-tier-design.md):
+//
+//   data-mobile="keep"   → figure left alone (always small-screen-safe)
+//   data-mobile="static" → figure left alone; CSS hides [data-vg-controls]
+//                          on touch (see site.css "Mobile static tier" section)
+//   data-mobile="swap"   → figure hidden, summary card injected (explicit form)
+//   (absent)             → same as "swap" — card injected (default)
+//
+// Card format: title (from figcaption) + summary (from data-mobile-summary),
+// no per-card hint line. A single notice is emitted once at the top of the
+// post body when swapped > 0.
+//
+// Missing summary → generic card (title only), reported in `missing` so the
+// build can warn; never breaks the build.
 //
 // Assumption: title text (from figcaption) passes through to card HTML without
 // re-escaping. Summary text is read from a data attribute, where raw < and >
@@ -22,7 +29,6 @@
 // Quote-aware open-tag regex: handles `"..."`, `'...'`, and bare non-> chars,
 // so a literal > inside a quoted attribute value does not end the tag match.
 const OPEN_TAG_RE = /<figure\b(?:"[^"]*"|'[^']*'|[^>"'])*>/g;
-const HINT_TEXT = "互動版圖表請以桌面瀏覽器開啟";
 const GENERIC_TITLE = "互動圖表";
 
 /** Extract the value of a double-quoted attribute, or null if absent. */
@@ -64,8 +70,11 @@ export function injectMobileCards(html) {
     const classAttr = attrValue(openTag, "class");
     if (!classAttr || !/\bvg-w-[a-z0-9-]+/.test(classAttr)) continue;
 
-    // Skip figures that should stay as-is.
-    if (attrValue(openTag, "data-mobile") === "keep") continue;
+    // Tier check: keep and static figures stay in the page on touch
+    // (static additionally hides [data-vg-controls] via CSS). Absent or
+    // explicit "swap" → summary card.
+    const tier = attrValue(openTag, "data-mobile");
+    if (tier === "keep" || tier === "static") continue;
     if (openTag.includes("data-mobile-swap")) continue; // already processed
 
     // Find the closing </figure> from just after the open tag.
@@ -89,7 +98,6 @@ export function injectMobileCards(html) {
       '<div class="vg-mobile-card" data-pagefind-ignore>' +
       `<p class="vg-mobile-card-title">${title}</p>` +
       (summary ? `<p class="vg-mobile-card-summary">${summaryText}</p>` : "") +
-      `<p class="vg-mobile-card-hint">${HINT_TEXT}</p>` +
       "</div>";
 
     const newOpenTag = openTag.replace(/^<figure\b/, "<figure data-mobile-swap");
@@ -113,7 +121,7 @@ export function injectMobileCards(html) {
     out = out.replace(
       '<div class="vg-post-body">',
       '<div class="vg-post-body">' +
-        `<div class="vg-mobile-notice" data-pagefind-ignore>本文含 ${swapped} 個互動圖表，手機版以重點摘要呈現，完整互動內容請以桌面瀏覽器開啟。</div>`
+        `<div class="vg-mobile-notice" data-pagefind-ignore>本文 ${swapped} 個互動圖表在手機上以重點摘要呈現，互動版請以桌面瀏覽器開啟。</div>`
     );
   }
   return { html: out, swapped, missing };

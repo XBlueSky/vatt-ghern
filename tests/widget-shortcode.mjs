@@ -29,6 +29,7 @@ test("widget shortcode wraps partial in vg-w figure with data-widget", async () 
   assert.match(html, /id="vg-w-feature-flags-1"/);
   assert.match(html, /data-flag-table/); // partial body inlined (real feature-flags anchor)
   assert.match(html, /<script src="\/static\/widgets\/feature-flags\.js" defer><\/script>/);
+  assert.match(html, /data-mobile="swap"/);
 });
 
 test("widget shortcode dedupes script + increments id on second instance", async () => {
@@ -53,4 +54,25 @@ test("widget shortcode summary opt overrides widget.json", async () => {
   const ctx = { page: { inputPath: "./p4.html" } };
   const html = widget.call(ctx, "feature-flags", { summary: "覆寫摘要，說明此實例在本文脈絡下的特定結論，長度合於檢查規範。" });
   assert.match(html, /data-mobile-summary="覆寫摘要/);
+});
+
+test("widget shortcode emits explicit data-mobile, default swap", async () => {
+  const widget = await getWidgetShortcode();
+  const ctx = { page: { inputPath: "./p5.html" } };
+  const html = widget.call(ctx, "feature-flags");
+  assert.match(html, /data-mobile="swap"/);
+  assert.match(html, /data-mobile="swap"[^>]*data-mobile-summary=/);
+});
+
+test("widget shortcode mobile opt overrides the tier", async () => {
+  const widget = await getWidgetShortcode();
+  const ctx = { page: { inputPath: "./p6.html" } };
+  const html = widget.call(ctx, "feature-flags", { mobile: "keep" });
+  assert.match(html, /data-mobile="keep"/);
+});
+
+test("widget shortcode throws on unknown mobile tier", async () => {
+  const widget = await getWidgetShortcode();
+  const ctx = { page: { inputPath: "./p7.html" } };
+  assert.throws(() => widget.call(ctx, "feature-flags", { mobile: "statc" }), /unknown mobile tier "statc"/);
 });
