@@ -1,0 +1,449 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">每秒只跑得動 10 次掃描，backlog 卻塞著數百萬筆事件——Cloudflare 把吞吐量拉到十倍，沒有多開一台機器。瓶頸到底藏在哪一層？</p>
+  <h1 class="vg-post-title">把安全掃描吞吐量拉高十倍——Cloudflare 一場不加機器的瓶頸獵巡</h1>
+</header>
+
+<div class="vg-post-prose vg-post-body">
+  <p><span class="vg-dropcap">瓶</span>頸最難的地方，從來不是修，而是定位。Cloudflare 的 Security Insights 會「對所有 account、zone、DNS record 定期掃描，找潛在的安全風險與錯誤設定」。某個時間點，這套系統撐不住了：每秒只跑得動「大約 10 次掃描」，而「數百萬筆事件塞滿 backlog 等著被處理」、「API 頻繁逾時」、「process 一直崩潰」。三個症狀同時發作，像三盞同時亮起的故障燈，卻沒有一盞直接告訴你引擎哪裡壞了。</p>
+
+  <p>團隊定下的目標很乾脆：把掃描吞吐量「平均拉高大約 10 倍——從每秒 10 次到每秒 100 次」。但這篇值得讀的地方不在那個數字，而在他們怎麼把「系統很慢」這個模糊的抱怨，拆成三個可以分別證實或推翻的假設，逐層量測，再逐層動手。最後他們不靠多加 pod、也不靠多加 partition，把吞吐量推過了每秒 120 次。下面就照他們的偵查順序走一遍。</p>
+
+  <h2>症狀有三盞燈，瓶頸只有幾處</h2>
+
+  <p>先把眼前的事實擺清楚。基線是每秒約 10 次掃描，目標是每秒 100 次。三個觀察到的症狀分別指向系統的不同部位：backlog 堆積指向「東西進得來、出不去」的消費端；API 逾時指向請求路徑上某處很慢；process 崩潰則可能是前兩者壓力的下游結果，也可能是獨立病灶。一個成熟系統的吞吐量上限，往往不是被「機器總算力」卡住，而是被某一條序列化的路徑卡住——找到那條路徑，比加算力重要得多。</p>
+
+  <p>這三盞燈並非互相獨立，而是會彼此餵養。消費端消化不掉訊息，backlog 就往上堆；backlog 一漲，每個積壓的帳號到了 checker 手上都帶著更大的 issue 批量，寫入路徑被放大，API 跟著逾時；逾時又讓上游重試、把更多訊息灌回佇列，process 在記憶體與連線壓力下崩潰，崩潰後恢復又得重跑——一個正回饋的惡性循環。正因如此，盯著任何單一症狀都會誤判：你以為加 consumer 就能消化 backlog，結果只是把同一批放大的寫入更快推向那個近 3 秒的 API。要打斷循環，得先把三個環節各自的瓶頸機制看清楚，而不是對著最吵的那盞燈猛灌資源。</p>
+
+  <p>值得把這套系統做的事先講清楚，因為它解釋了為什麼負載會這麼大。Security Insights「對所有 account、zone、DNS record 定期掃描，找潛在的安全風險與錯誤設定」——掃描的對象不是少數重點目標，而是整個客群名下的每一個 zone、每一筆 DNS record。對象規模一大，定期重掃就是一條源源不絕的事件流；只要消費速度跟不上產生速度，backlog 就會單調往上爬。三盞燈裡最容易被當成「最終災難」的其實是 process 崩潰：它通常不是病根，而是前兩個問題累積到極限的表現——佇列塞爆、單一請求跑太久、記憶體與連線被拖垮，最後整個 process 倒下。把崩潰當成根因去修（例如自動重新啟動、加記憶體）只會延後問題，真正要解的是讓它崩潰的那股壓力。</p>
+
+  <p>目標的設法也透露了團隊的判斷。他們要的是「平均拉高大約 10 倍——從每秒 10 次到每秒 100 次」，注意這裡用的是「平均」與「大約」這種克制的措辭，而不是承諾一個尖峰峰值。把基線釘在「大約每秒 10 次」、把目標釘在每秒 100 次，等於先畫好了一把可以量測進度的尺：每動一層修復，就回到這把尺上看吞吐量挪了多少。沒有這把尺，「系統變快了」永遠是個感覺；有了它，每個假設都得拿出可被否證的數字。</p>
+
+  <p>把三盞燈擺在一起讀，還能讀出它們各自指向系統的哪個方向。原文把症狀講得很白：第一是「數百萬筆事件塞滿 backlog 等著被處理」，第二是「我們的 API 頻繁逾時」，第三是「我們的 process 一直崩潰」。第一盞燈描述的是「量」——進來的比出去的多，存量只增不減；第二盞燈描述的是「單次的慢」——某條請求路徑跑不完才會逾時；第三盞燈描述的是「韌性的崩潰」——系統撐不住前兩者的壓力。同一個吞吐量問題，被這三盞燈從存量、延遲、穩定性三個面向各照了一遍。偵查的難處正在於此：你看到的是三個面向的表徵，要找的卻是它們共同的源頭，而源頭未必只有一個。事後回看，backlog 的源頭在消費端的序列化，逾時的源頭一半在寫入放大、一半在跨洲拓撲，而崩潰是這些壓力疊上來的結果——三盞燈背後其實藏著不只三處病灶。</p>
+
+  <p>偵查的第一個動作是把目標可視化：如果每一層修復都拆開來算，吞吐量是怎麼一階一階往上爬的？下面這張圖把整段歷程攤平。拖動底下的滑桿，逐步「套用」每一個修復，看每秒掃描數從基線往目標、再往最終值移動。</p>
+
+  <figure class="vg-w-chart-scan-throughput" data-mobile="swap" data-svg-scroll="720" data-mobile-summary="吞吐量不是一刀拉到位，而是四層修復一階一階堆上去——基線每秒 10 次、目標 100 次、最終穩定超過 120 次，全程沒加機器。">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M5 12h14"/><path d="m12 5 7 7-7 7"/>
+      </svg>
+      <span>drag the slider to apply each fix in order · 5 stages</span>
+    </p>
+    <style>
+      .vg-w-chart-scan-throughput { display: grid; gap: var(--s-2); }
+      .vg-w-chart-scan-throughput svg.vg-w-chart-scan-throughput-main { width: 100%; height: auto; }
+      .vg-w-chart-scan-throughput .ctl { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); }
+      .vg-w-chart-scan-throughput .ctl input { flex: 1; height: 36px; accent-color: var(--accent); }
+      .vg-w-chart-scan-throughput .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 13ch; text-align: right; }
+      .vg-w-chart-scan-throughput figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+
+    <svg class="vg-w-chart-scan-throughput-main" viewBox="0 0 720 340" preserveAspectRatio="xMidYMid meet" role="img" aria-label="掃描吞吐量隨修復階段上升的長條圖">
+      <g id="vg-w-chart-scan-throughput-axes"></g>
+      <g id="vg-w-chart-scan-throughput-series"></g>
+    </svg>
+
+    <div class="ctl" data-vg-controls>
+      <label for="vg-w-chart-scan-throughput-x">已套用</label>
+      <input id="vg-w-chart-scan-throughput-x" type="range" min="0" max="4" step="1" value="4" aria-label="套用到第幾個修復階段" />
+      <span class="readout" id="vg-w-chart-scan-throughput-out">全部</span>
+    </div>
+
+    <figcaption>每秒掃描數：基線 10、目標 100、最終 120+。階段標籤對應文中四層修復。數字取自 Cloudflare <a href="https://blog.cloudflare.com/scaling-security-scans/">Scaling security scans</a>；中間階段的單點高度為示意，僅基線（10）、目標（100）與最終（120+）為原文數字。</figcaption>
+
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        const root = document.querySelector('.vg-w-chart-scan-throughput');
+        const axesG = root.querySelector('#vg-w-chart-scan-throughput-axes');
+        const seriesG = root.querySelector('#vg-w-chart-scan-throughput-series');
+        const inp = root.querySelector('#vg-w-chart-scan-throughput-x');
+        const out = root.querySelector('#vg-w-chart-scan-throughput-out');
+
+        // stage label, throughput value, real?  — only baseline/goal/final are source numbers.
+        const stages = [
+          ['基線', 10, true],
+          ['消費端批次 + slow/fast lane', 40, false],
+          ['UNNEST / COPY 寫入', 70, false],
+          ['API active-passive', 100, true],
+          ['排程改寫 (最終)', 120, true],
+        ];
+
+        const X0 = 70, X1 = 690, Y0 = 290, Y1 = 36;
+        const maxY = 130;
+        const yOf = v => Y0 - (v / maxY) * (Y0 - Y1);
+        const bw = (X1 - X0) / stages.length;
+        const NS = 'http://www.w3.org/2000/svg';
+        function el(tag, attrs) {
+          const e = document.createElementNS(NS, tag);
+          for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+          return e;
+        }
+
+        // axes
+        axesG.appendChild(el('line', { x1: X0, y1: Y0, x2: X1, y2: Y0, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+        axesG.appendChild(el('line', { x1: X0, y1: Y0, x2: X0, y2: Y1, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+        for (let v = 0; v <= maxY; v += 20) {
+          const y = yOf(v);
+          axesG.appendChild(el('line', { x1: X0 - 4, y1: y, x2: X0, y2: y, stroke: 'var(--muted-2)' }));
+          const t = el('text', { x: X0 - 8, y: y + 4, 'text-anchor': 'end', 'font-family': 'Manrope, sans-serif', 'font-size': 12, fill: 'var(--muted)' });
+          t.textContent = String(v);
+          axesG.appendChild(t);
+        }
+        const yl = el('text', { x: 18, y: (Y0 + Y1) / 2, 'text-anchor': 'middle', 'font-family': 'EB Garamond, serif', 'font-size': 13, fill: 'var(--muted)', transform: `rotate(-90 18 ${(Y0 + Y1) / 2})` });
+        yl.textContent = 'scans / sec';
+        axesG.appendChild(yl);
+
+        // reference lines: goal 100, baseline 10
+        [[10, '基線 10'], [100, '目標 100']].forEach(([v, lab]) => {
+          const y = yOf(v);
+          axesG.appendChild(el('line', { x1: X0, y1: y, x2: X1, y2: y, stroke: 'var(--muted-2)', 'stroke-width': 1, 'stroke-dasharray': '3 4' }));
+          const t = el('text', { x: X0 + 6, y: y - 5, 'text-anchor': 'start', 'font-family': 'Manrope, sans-serif', 'font-size': 11, fill: 'var(--muted)' });
+          t.textContent = lab;
+          axesG.appendChild(t);
+        });
+
+        function render(upto) {
+          seriesG.replaceChildren();
+          stages.forEach((s, i) => {
+            const [label, val, real] = s;
+            const active = i <= upto;
+            const cx = X0 + (i + 0.5) * bw;
+            const x = cx - bw * 0.30;
+            const w = bw * 0.60;
+            const y = yOf(val);
+            seriesG.appendChild(el('rect', {
+              x, y, width: w, height: Y0 - y,
+              fill: active ? 'var(--accent)' : 'var(--bg-soft)',
+              'fill-opacity': active ? (real ? 0.85 : 0.4) : 1,
+              stroke: active ? 'var(--accent)' : 'var(--muted-2)',
+              'stroke-width': 1,
+            }));
+            // value label
+            const vt = el('text', { x: cx, y: y - 7, 'text-anchor': 'middle', 'font-family': 'Manrope, sans-serif', 'font-size': 12, fill: active ? 'var(--accent-text)' : 'var(--muted)' });
+            vt.textContent = (i === 4 ? '120+' : (real ? String(val) : '≈' + val));
+            seriesG.appendChild(vt);
+            // x label (two lines if long)
+            const words = label.split(' ');
+            const line1 = words.slice(0, 2).join(' ');
+            const line2 = words.slice(2).join(' ');
+            const t1 = el('text', { x: cx, y: Y0 + 18, 'text-anchor': 'middle', 'font-family': 'Manrope, sans-serif', 'font-size': 11, fill: active ? 'var(--ink)' : 'var(--muted)' });
+            t1.textContent = line1;
+            seriesG.appendChild(t1);
+            if (line2) {
+              const t2 = el('text', { x: cx, y: Y0 + 32, 'text-anchor': 'middle', 'font-family': 'Manrope, sans-serif', 'font-size': 11, fill: active ? 'var(--ink)' : 'var(--muted)' });
+              t2.textContent = line2;
+              seriesG.appendChild(t2);
+            }
+          });
+        }
+
+        function onInput() {
+          const n = Number(inp.value);
+          out.textContent = n === 4 ? '全部' : `前 ${n + 1} 階段`;
+          render(n);
+        }
+        inp.addEventListener('input', onInput);
+        onInput();
+      })();
+    </script>
+  </figure>
+
+  <p>注意中間兩根長條（消費端與寫入修復）標的是約略值——原文沒有逐段公布每一步的吞吐量，只給了基線 10、目標 100 與最終的 120+。所以這張圖的兩端是事實，中段是示意：它要傳達的不是「每一步精確貢獻幾」，而是「瓶頸是被一層層解開的，不是一刀斃命」。接下來就是這幾刀。</p>
+
+  <h2>假設一：一則慢訊息卡住整條 partition</h2>
+
+  <p>掃描事件走 Kafka。Kafka 的順序保證是把雙面刃：「處理得慢的訊息會擋住 consumer 前進到下一則訊息」。換句話說，只要批次裡有一筆 issue 多的帳號跑得特別久，它後面排隊的所有訊息都得乾等——這就是 head-of-line blocking。backlog 堆到數百萬，這個機制是頭號嫌疑。</p>
+
+  <p>怎麼證實？團隊去看各 partition 的 lag。證據相當乾淨：一張 lag 圖上，「剛好有 15 個 partition 落後（那些比 03/10 03:00 前後更晚才接近歸零的線）。這是因為 load balancer 把流量平均分到我們的 API endpoint」。30 個 partition 裡精確的一半落後，不是隨機抖動，而是分流結構在 lag 上留下的指紋——這把「某些 consumer 在挨餓」從猜測變成了可量測的事實。</p>
+
+  <p>第一個修復來自一個簡單觀察：「雖然我們只能照順序消費訊息，但沒有什麼能阻止我們一次消費多筆。」於是「把 checker 改成批次消費訊息，每則訊息丟進各自的 goroutine 處理」。順序仍在，但處理不再被最慢那筆串成一列。光這樣還不夠：慢訊息與快訊息混在同一條 lane 裡，慢的還是會拖累整體節奏。最後的解法「非常簡單：把 consumer group 與 checker 一拆為二——slow lane 和 fast lane」。慢工和快工分流，互不阻塞。</p>
+
+  <figure class="vg-w-diagram-scan-lanes" data-mobile="keep" data-svg-scroll="720">
+    <svg viewBox="0 0 720 320" role="img" aria-label="head-of-line blocking 與 slow/fast lane 拆分示意圖" style="width: 100%; height: auto;">
+      <style>
+        .vg-w-diagram-scan-lanes text { font-family: 'Manrope', sans-serif; }
+        .vg-w-diagram-scan-lanes .ttl { font-family: 'EB Garamond', serif; }
+      </style>
+      <!-- before -->
+      <text class="ttl" x="20" y="30" font-size="16" fill="var(--ink)">改之前 · 單一 lane</text>
+      <text x="20" y="50" font-size="12" fill="var(--muted)">一則慢訊息擋住後面所有訊息</text>
+      <line x1="40" y1="92" x2="560" y2="92" stroke="var(--muted-2)" stroke-width="1"/>
+      <!-- messages -->
+      <rect x="60" y="72" width="36" height="36" fill="var(--sage)" fill-opacity="0.5" stroke="var(--muted-2)"/>
+      <rect x="104" y="72" width="36" height="36" fill="var(--sage)" fill-opacity="0.5" stroke="var(--muted-2)"/>
+      <rect x="148" y="68" width="44" height="44" fill="var(--accent)" fill-opacity="0.85" stroke="var(--accent)"/>
+      <text x="170" y="95" text-anchor="middle" font-size="11" fill="var(--bg)">慢</text>
+      <rect x="206" y="72" width="36" height="36" fill="var(--bg-soft)" stroke="var(--muted-2)"/>
+      <rect x="250" y="72" width="36" height="36" fill="var(--bg-soft)" stroke="var(--muted-2)"/>
+      <rect x="294" y="72" width="36" height="36" fill="var(--bg-soft)" stroke="var(--muted-2)"/>
+      <text x="350" y="95" font-size="12" fill="var(--muted)">⟵ 全部卡在這裡乾等</text>
+      <text x="60" y="132" font-size="11" fill="var(--muted)">consumer</text>
+
+      <!-- after -->
+      <text class="ttl" x="20" y="186" font-size="16" fill="var(--ink)">改之後 · slow / fast lane</text>
+      <text x="20" y="206" font-size="12" fill="var(--muted)">批次消費，每訊息一個 goroutine；快慢分流</text>
+      <!-- fast lane -->
+      <line x1="40" y1="240" x2="560" y2="240" stroke="var(--muted-2)" stroke-width="1"/>
+      <text x="600" y="244" font-size="12" fill="var(--sage-deep)">fast lane</text>
+      <rect x="60" y="222" width="34" height="34" fill="var(--sage)" fill-opacity="0.6" stroke="var(--muted-2)"/>
+      <rect x="102" y="222" width="34" height="34" fill="var(--sage)" fill-opacity="0.6" stroke="var(--muted-2)"/>
+      <rect x="144" y="222" width="34" height="34" fill="var(--sage)" fill-opacity="0.6" stroke="var(--muted-2)"/>
+      <rect x="186" y="222" width="34" height="34" fill="var(--sage)" fill-opacity="0.6" stroke="var(--muted-2)"/>
+      <!-- slow lane -->
+      <line x1="40" y1="290" x2="560" y2="290" stroke="var(--muted-2)" stroke-width="1"/>
+      <text x="600" y="294" font-size="12" fill="var(--accent-text)">slow lane</text>
+      <rect x="60" y="270" width="44" height="40" fill="var(--accent)" fill-opacity="0.85" stroke="var(--accent)"/>
+      <text x="82" y="295" text-anchor="middle" font-size="11" fill="var(--bg)">慢</text>
+      <rect x="116" y="272" width="40" height="36" fill="var(--accent)" fill-opacity="0.5" stroke="var(--accent)"/>
+    </svg>
+    <figcaption>Kafka 順序保證讓一則慢訊息阻塞整條 partition；拆成 slow / fast lane 後，慢工不再卡住快工。圖為機制示意。</figcaption>
+  </figure>
+
+  <p>這裡藏著一個容易被忽略的取捨。把每則訊息丟進各自的 goroutine 並行處理，等於放棄了「嚴格照序、一筆做完才做下一筆」的單純語意：原文點明「我們只能照順序消費訊息」，但消費的順序和處理的完成順序自此脫鉤。對掃描這類「各帳號彼此獨立、誰先誰後不影響結果」的工作來說，這個取捨划算——它換來的是吞吐量，付出的是一點程式上的複雜度（要管理一批並行的 goroutine、處理各自的失敗）。但若工作之間有順序相依，這招就不能照搬。拆 slow/fast lane 則是把「並行」再往上推一層：與其讓快慢訊息在同一條 lane 裡互相牽制，不如讓它們走各自的 consumer group，慢工自己消化慢工的尾巴。</p>
+
+  <p>那張 lag 圖的「剛好 15 個」值得再多看一眼，因為它把一個本來會被當成隨機抖動的現象，解釋成了結構的必然。30 個 partition 裡正好一半落後，對應的是「load balancer 把流量平均分到我們的 API endpoint」——平均分流意味著兩半 partition 收到的工作量在統計上對等，落後的那一半不是運氣差，而是被某條共同的慢路徑（後面會看到，正是跨洲那條）系統性地拖住。這正是一個好的可量測證據該有的樣子：它不只告訴你「有東西在 lag」，還讓你能反推出 lag 的成因落在分流結構上。如果落後的 partition 是隨機的 7 個或 23 個，故事就會完全不同——數字的整齊本身就是線索。</p>
+
+  <p>批次消費這一步的關鍵突破，是一句聽起來幾乎像廢話、實際上鬆開了整個瓶頸的觀察：「雖然我們只能照順序消費訊息，但沒有什麼能阻止我們一次消費多筆。」順序消費與並行處理一直被團隊當成同一件事，所以才會一筆做完才碰下一筆；一旦把「消費的順序」和「處理的並行度」拆開，Kafka 本來就允許的自由度就被釋放出來——「把 checker 改成批次消費訊息，每則訊息丟進各自的 goroutine 處理」。這層拿掉的是「序列化」這個結構性瓶頸，而不是算力。修法很克制：沒有去加 partition 數，而是承認「一次拿多筆」這個 Kafka 一直允許、團隊先前沒用上的自由度。第一個假設成立，但 backlog 只是入口；API 逾時和崩潰還沒解釋完。</p>
+
+  <h2>假設二：一次 API 呼叫裡藏著五十萬次往返</h2>
+
+  <p>第二盞燈是 API 逾時。順著請求路徑往下看，問題出在寫入。原本的寫法是一個迴圈：「對每個 issue：每筆 insight 對資料庫做一次 round trip。在觀察到的最大批量 50 萬筆下，這就是單一次 API call 裡五十萬次往返、查詢與交易。」這是經典的 N+1 寫入放大——程式碼看起來人畜無害，一個迴圈裡藏一條 query，但乘上 50 萬就成了壓垮 API 的單一請求。逾時不是網路慢，是這條請求自己在原地跑了五十萬圈。</p>
+
+  <p>修法不是無腦塞進一條巨大的 INSERT，而是按資料量分流：「最後採用混合策略——issue 數低於某門檻時用 UNNEST，超過門檻時用 COPY。」兩種都是 PostgreSQL 把多列一次灌進去的手段，但取捨不同：UNNEST 把陣列展開成多列、走一般的查詢計畫，對中小批量足夠快也保有彈性；COPY 是批量載入的快車道，量大時遠勝逐筆，但較硬。門檻讓系統在「彈性」與「純吞吐」之間自動切換，而不是兩者擇一。原本一次 API call 的五十萬次往返，被壓成個位數的批次操作。</p>
+
+  <p>「五十萬」這個數字之所以致命，在於它出現在「單一次 API call」這個尺度上。原文寫得很白：「在觀察到的最大批量 50 萬筆下，這就是單一次 API call 裡五十萬次往返、查詢與交易。」不是五十萬個請求各自做一次往返，而是一個請求要在自己的生命週期裡連續做五十萬次往返、五十萬次查詢、五十萬次交易。任何一次往返哪怕只花一毫秒，乘上五十萬就是數百秒——遠遠超過任何合理的逾時門檻。逾時於是不是偶發的網路抖動，而是這條請求的結構決定的：它注定跑不完。這也解釋了為什麼前面排隊的訊息會被它擋住，以及為什麼 backlog 一漲、批量變大，逾時就更頻繁——批量正是這條迴圈的乘數。</p>
+
+  <p>UNNEST 與 COPY 的二選一其實是個假命題，團隊的處理方式才是這段最實用的地方：不是挑一個贏家，而是「issue 數低於某門檻時用 UNNEST，超過門檻時用 COPY」。兩者各有甜蜜區——量小的時候，UNNEST 把陣列展開成多列、走一般查詢計畫，省去 COPY 的固定開銷又保有彈性；量大的時候，COPY 這條批量載入快車道的單位成本遠低於逐筆，固定開銷被攤平到可以忽略。用一個門檻把兩條曲線接起來，系統就能在每個批量大小上都落在較便宜的那條上，而不是被迫整段用同一種寫法。原本一次 API call 的五十萬次往返，被壓成個位數的批次操作。</p>
+
+  <p>到這裡，三盞燈裡的 backlog 和 API 逾時各有了著落。但 API 的故事還沒完——逾時的成因不只一個。</p>
+
+  <h2>假設三：primary 在 Portland，API 卻在 Amsterdam 等地球轉</h2>
+
+  <p>第三個假設最反直覺，也最漂亮，因為它的證據是一個你沒法跟物理討價還價的數字。團隊把 API 延遲按地區拆開來看，發現：「我們的 API call 在 Portland 平均 10 ms 完成，在 Amsterdam 卻要將近 3 秒！」同一份程式碼、同一個呼叫，兩地差了將近 300 倍。這不是程式碼問題，是部署拓撲問題。</p>
+
+  <p>根因在於資料庫與 API 的地理錯位：「我們的 primary database 在 Oregon 的 Portland。但我們的 API 跑的是 active-active，Portland 和 Amsterdam 兩地都有。即使以光速計算，Portland 到 Amsterdam 之間的往返延遲也要 50 毫秒。」Amsterdam 的 API 每做一件需要寫入的事，都得橫跨大西洋去找 Portland 的 primary，一次來回 50 ms 是物理下限，疊上多次往返就成了近 3 秒。active-active 在這裡是個陷阱：它讓兩地都能服務請求，卻沒讓兩地都離資料近。</p>
+
+  <figure class="vg-w-ba-scan-api-region" data-mobile="swap" data-mobile-summary="同一呼叫 Portland 10 ms、Amsterdam 近 3 秒；改 active-passive 解跨洲延遲。" data-interactive="drag" data-svg-scroll="720">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M8 7 3 12l5 5"/><path d="m16 7 5 5-5 5"/><path d="M3 12h18"/>
+      </svg>
+      <span>drag the divider · active-active vs active-passive</span>
+    </p>
+    <style>
+      .vg-w-ba-scan-api-region { position: relative; aspect-ratio: 2 / 1; overflow: hidden; }
+      .vg-w-ba-scan-api-region .layer { position: absolute; inset: 0; }
+      .vg-w-ba-scan-api-region .after { clip-path: polygon(50% 0, 100% 0, 100% 100%, 50% 100%); }
+      .vg-w-ba-scan-api-region .divider {
+        position: absolute; top: 0; bottom: 0; left: 50%;
+        width: 32px; transform: translateX(-50%);
+        cursor: ew-resize; touch-action: none;
+      }
+      .vg-w-ba-scan-api-region .divider::before {
+        content: ''; position: absolute; left: 50%; top: 0; bottom: 0;
+        width: 2px; transform: translateX(-50%); background: var(--accent);
+      }
+      .vg-w-ba-scan-api-region .divider::after {
+        content: '↔'; position: absolute; left: 50%; top: 50%;
+        transform: translate(-50%, -50%);
+        background: var(--accent); color: var(--bg);
+        width: 32px; height: 32px; border-radius: 50%;
+        display: grid; place-items: center;
+        font-family: var(--sans); font-size: 16px;
+      }
+    </style>
+
+    <svg class="layer before" viewBox="0 0 640 320" role="img" aria-label="active-active：Amsterdam 跨洲呼叫 primary，近 3 秒">
+      <rect width="640" height="320" fill="var(--bg-soft)"/>
+      <text x="24" y="36" font-family="EB Garamond, serif" font-size="17" fill="var(--ink)">active-active</text>
+      <!-- portland -->
+      <circle cx="150" cy="170" r="10" fill="var(--accent)"/>
+      <text x="150" y="205" text-anchor="middle" font-family="Manrope, sans-serif" font-size="12" fill="var(--ink)">Portland</text>
+      <text x="150" y="222" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">primary DB + API</text>
+      <text x="150" y="148" text-anchor="middle" font-family="Manrope, sans-serif" font-size="12" fill="var(--accent-text)">10 ms</text>
+      <!-- amsterdam -->
+      <circle cx="500" cy="170" r="10" fill="none" stroke="var(--accent)" stroke-width="2"/>
+      <text x="500" y="205" text-anchor="middle" font-family="Manrope, sans-serif" font-size="12" fill="var(--ink)">Amsterdam</text>
+      <text x="500" y="222" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">API（無 primary）</text>
+      <text x="500" y="148" text-anchor="middle" font-family="Manrope, sans-serif" font-size="12" fill="var(--accent-text)">≈ 3 s</text>
+      <!-- transatlantic link -->
+      <path d="M490 170 H160" fill="none" stroke="var(--accent)" stroke-width="2" stroke-dasharray="5 5"/>
+      <text x="325" y="160" text-anchor="middle" font-family="Manrope, sans-serif" font-size="12" fill="var(--muted)">跨大西洋每趟 50 ms（光速下限）</text>
+    </svg>
+
+    <svg class="layer after" viewBox="0 0 640 320" id="vg-w-ba-scan-api-region-after" role="img" aria-label="active-passive：active API 跟著 primary，10 ms">
+      <rect width="640" height="320" fill="var(--accent)" fill-opacity="0.06"/>
+      <text x="24" y="36" font-family="EB Garamond, serif" font-size="17" fill="var(--accent-text)">active-passive</text>
+      <circle cx="150" cy="170" r="10" fill="var(--accent)"/>
+      <text x="150" y="205" text-anchor="middle" font-family="Manrope, sans-serif" font-size="12" fill="var(--ink)">Portland</text>
+      <text x="150" y="222" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">primary DB + active API</text>
+      <text x="150" y="148" text-anchor="middle" font-family="Manrope, sans-serif" font-size="12" fill="var(--accent-text)">10 ms</text>
+      <circle cx="500" cy="170" r="9" fill="none" stroke="var(--muted-2)" stroke-width="2" stroke-dasharray="3 3"/>
+      <text x="500" y="205" text-anchor="middle" font-family="Manrope, sans-serif" font-size="12" fill="var(--muted)">Amsterdam</text>
+      <text x="500" y="222" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">passive（待命）</text>
+      <path d="M160 170 H200" fill="none" stroke="var(--accent)" stroke-width="2"/>
+      <text x="325" y="160" text-anchor="middle" font-family="Manrope, sans-serif" font-size="12" fill="var(--muted)">active API 跟著 primary，不再跨洲</text>
+    </svg>
+
+    <div class="divider" id="vg-w-ba-scan-api-region-divider"></div>
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        const root = document.querySelector('.vg-w-ba-scan-api-region');
+        const after = root.querySelector('#vg-w-ba-scan-api-region-after');
+        const divider = root.querySelector('#vg-w-ba-scan-api-region-divider');
+        let dragging = false;
+        function setPct(pct) {
+          const c = Math.max(0, Math.min(100, pct));
+          after.style.clipPath = `polygon(${c}% 0, 100% 0, 100% 100%, ${c}% 100%)`;
+          divider.style.left = `${c}%`;
+        }
+        divider.addEventListener('pointerdown', (e) => { dragging = true; divider.setPointerCapture(e.pointerId); });
+        root.addEventListener('pointermove', (e) => {
+          if (!dragging) return;
+          const rect = root.getBoundingClientRect();
+          setPct(((e.clientX - rect.left) / rect.width) * 100);
+        });
+        root.addEventListener('pointerup', () => { dragging = false; });
+        root.addEventListener('pointercancel', () => { dragging = false; });
+      })();
+    </script>
+  </figure>
+
+  <p>那個「50 毫秒」是這段最該記住的數字，因為它不是某次測量、而是物理下限。原文點得很清楚：「即使以光速計算，Portland 到 Amsterdam 之間的往返延遲也要 50 毫秒。」這意味著無論你怎麼優化 Amsterdam 那一側的程式碼、加多少 CPU、調多細的連線池，只要一次寫入需要跨洲找 primary，每趟就先被光速扣掉 50 ms，沒有商量餘地。而前一節已經看到，一次 API call 裡可能藏著大量往返；把每趟的 50 ms 乘上多次往返，將近 3 秒的尾巴就出來了。這把假設一裡「剛好 15 個 partition 落後」也補上了最後一塊拼圖：落後的那一半，很可能正是被分流到 Amsterdam、每次寫入都得繞地球半圈的那一半。</p>
+
+  <p>修復是把假設反過來用：「我們把 API 切成 active-passive，確保 active 的 API 跟著 primary database。」active 端永遠和 primary 同處一地，寫入的往返就退回 10 ms 那一檔，那個將近 3 秒的尾巴直接消失。代價很實在：Amsterdam 退成 passive、不再就近服務當地請求，少了一份地理上的容錯與就近延遲。但對一個寫入密集的後端排程系統來說，這筆帳算得過來——它的請求幾乎都要落到 primary，「離資料近」帶來的數百倍延遲改善，遠比「離使用者近」省下的那點傳輸時間值錢。active-active 聽起來總是比 active-passive 高級，但它預設兩地對等地服務寫入，而當寫入只有一個 primary 時，這個「對等」就是假的——其中一地注定要付跨洲的稅。這也是三個假設裡唯一一個根因不在程式碼、而在拓撲的：你讀再多 SQL 也找不到它，只有把延遲按地區切開才看得見。</p>
+
+  <h2>三個假設怎麼各自落地</h2>
+
+  <p>把偵查路線收攏成一張對照表。三盞燈、三個假設、各自怎麼被證實、各自的修法——點任一張卡看它落在哪一層。</p>
+
+  <figure class="vg-w-stack-scan-hypotheses" data-mobile="keep">
+    <style>
+      .vg-w-stack-scan-hypotheses { display: flex; flex-direction: column; gap: var(--s-3); align-items: stretch; }
+      .vg-w-stack-scan-hypotheses input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-stack-scan-hypotheses .stack-title { font-family: 'IM Fell English', serif; font-style: italic; font-size: var(--fs-md); margin: 0 0 var(--s-1) 0; color: var(--ink); line-height: 1.4; }
+      .vg-w-stack-scan-hypotheses .stack-cards { display: flex; flex-direction: column; gap: var(--s-1); list-style: none; padding: 0; margin: 0; }
+      .vg-w-stack-scan-hypotheses .stack-cards label { display: block; padding: var(--s-2); border: 1px solid var(--muted-2); border-radius: 2px; cursor: pointer; transition: border-color 200ms, background 200ms; min-height: 44px; }
+      .vg-w-stack-scan-hypotheses .stack-cards label:hover { border-color: var(--accent); }
+      .vg-w-stack-scan-hypotheses .stack-cards .card-head { font-family: 'EB Garamond', serif; font-size: var(--fs-md); margin: 0 0 4px 0; color: var(--ink); display: flex; align-items: baseline; justify-content: space-between; gap: var(--s-2); flex-wrap: wrap; }
+      .vg-w-stack-scan-hypotheses .stack-cards .card-sub { font-family: 'IM Fell English', serif; font-style: italic; font-size: var(--fs-sm); color: var(--muted); margin: 0; line-height: 1.5; }
+      .vg-w-stack-scan-hypotheses .stack-cards .card-tag { font-family: 'JetBrains Mono', monospace; font-size: var(--fs-xs); color: var(--accent-text); font-style: normal; }
+      .vg-w-stack-scan-hypotheses:has(#vg-w-stack-scan-hypotheses-r1:checked) .card-1,
+      .vg-w-stack-scan-hypotheses:has(#vg-w-stack-scan-hypotheses-r2:checked) .card-2,
+      .vg-w-stack-scan-hypotheses:has(#vg-w-stack-scan-hypotheses-r3:checked) .card-3 {
+        border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent);
+      }
+      .vg-w-stack-scan-hypotheses svg.diagram { display: none; }
+      @media (min-width: 720px) {
+        .vg-w-stack-scan-hypotheses svg.diagram { display: block; width: 100%; height: auto; max-width: 880px; }
+        .vg-w-stack-scan-hypotheses .stack-title { display: none; }
+        .vg-w-stack-scan-hypotheses .stack-cards { display: none; }
+      }
+      .vg-w-stack-scan-hypotheses .layer { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; }
+      .vg-w-stack-scan-hypotheses:has(#vg-w-stack-scan-hypotheses-r1:checked) .layer-1,
+      .vg-w-stack-scan-hypotheses:has(#vg-w-stack-scan-hypotheses-r2:checked) .layer-2,
+      .vg-w-stack-scan-hypotheses:has(#vg-w-stack-scan-hypotheses-r3:checked) .layer-3 {
+        fill: var(--accent); fill-opacity: 0.18; stroke: var(--accent);
+      }
+      .vg-w-stack-scan-hypotheses .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+      .vg-w-stack-scan-hypotheses:has(#vg-w-stack-scan-hypotheses-r1:checked) .detail-1,
+      .vg-w-stack-scan-hypotheses:has(#vg-w-stack-scan-hypotheses-r2:checked) .detail-2,
+      .vg-w-stack-scan-hypotheses:has(#vg-w-stack-scan-hypotheses-r3:checked) .detail-3 { display: block; }
+      .vg-w-stack-scan-hypotheses .hint { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+      .vg-w-stack-scan-hypotheses .detail h3 { font-family: 'EB Garamond', serif; font-size: var(--fs-md); margin: 0 0 var(--s-1); }
+      .vg-w-stack-scan-hypotheses .detail p { margin: 0; }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>
+      </svg>
+      <span>click any hypothesis to read how it was confirmed · 3 layers</span>
+    </p>
+
+    <input type="radio" id="vg-w-stack-scan-hypotheses-r1" name="vg-w-stack-scan-hypotheses-sel" checked aria-label="假設一：消費端" />
+    <input type="radio" id="vg-w-stack-scan-hypotheses-r2" name="vg-w-stack-scan-hypotheses-sel" aria-label="假設二：寫入" />
+    <input type="radio" id="vg-w-stack-scan-hypotheses-r3" name="vg-w-stack-scan-hypotheses-sel" aria-label="假設三：API 拓撲" />
+
+    <p class="stack-title" id="vg-w-stack-scan-hypotheses-title">三盞燈 · 三個假設 · 各自的證據與修法</p>
+    <ul class="stack-cards" aria-labelledby="vg-w-stack-scan-hypotheses-title">
+      <li class="card-1"><label for="vg-w-stack-scan-hypotheses-r1">
+        <p class="card-head"><span>消費端 · backlog 堆積</span><code class="card-tag">Kafka</code></p>
+        <p class="card-sub">證據：30 個 partition 剛好 15 個落後。修法：批次消費＋每訊息 goroutine，再拆 slow/fast lane。</p>
+      </label></li>
+      <li class="card-2"><label for="vg-w-stack-scan-hypotheses-r2">
+        <p class="card-head"><span>寫入 · API 逾時（之一）</span><code class="card-tag">SQL</code></p>
+        <p class="card-sub">證據：每 issue 一次 round trip，最大 50 萬筆＝單一 call 五十萬次往返。修法：UNNEST / COPY 混合。</p>
+      </label></li>
+      <li class="card-3"><label for="vg-w-stack-scan-hypotheses-r3">
+        <p class="card-head"><span>拓撲 · API 逾時（之二）</span><code class="card-tag">geo</code></p>
+        <p class="card-sub">證據：同一呼叫 Portland 10 ms、Amsterdam 近 3 秒。修法：改 active-passive，active API 跟著 primary。</p>
+      </label></li>
+    </ul>
+
+    <svg class="diagram" viewBox="0 0 880 320" role="img" aria-label="三個假設的層級與證據對照">
+      <text x="40" y="30" font-family="EB Garamond, serif" font-size="16" fill="var(--ink)">三盞燈 · 三個假設 · 各自的證據與修法</text>
+      <rect class="layer layer-1" x="40" y="56" width="800" height="72" rx="2" role="button" tabindex="0" aria-label="假設一：消費端"/>
+      <text x="60" y="88" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">假設一 · 消費端 backlog（Kafka）</text>
+      <text x="60" y="110" font-family="Manrope, sans-serif" font-size="12" fill="var(--muted)">證據：30 partition 中 15 個落後 · 修法：批次＋goroutine、slow/fast lane</text>
+      <rect class="layer layer-2" x="40" y="140" width="800" height="72" rx="2" role="button" tabindex="0" aria-label="假設二：寫入"/>
+      <text x="60" y="172" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">假設二 · 寫入放大（SQL）</text>
+      <text x="60" y="194" font-family="Manrope, sans-serif" font-size="12" fill="var(--muted)">證據：最大 50 萬筆 = 單一 call 五十萬次往返 · 修法：UNNEST / COPY 混合</text>
+      <rect class="layer layer-3" x="40" y="224" width="800" height="72" rx="2" role="button" tabindex="0" aria-label="假設三：API 拓撲"/>
+      <text x="60" y="256" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">假設三 · API 跨洲拓撲（geo）</text>
+      <text x="60" y="278" font-family="Manrope, sans-serif" font-size="12" fill="var(--muted)">證據：Portland 10 ms vs Amsterdam 近 3 秒 · 修法：active-passive 跟著 primary</text>
+    </svg>
+
+    <div>
+      <p class="hint">點任一個假設看它怎麼被證實。</p>
+      <div class="detail detail-1">
+        <h3>消費端 · Kafka head-of-line blocking</h3>
+        <p>慢訊息擋住 consumer 前進。lag 圖上 30 個 partition 剛好 15 個落後，指紋來自 load balancer 把流量平均分到 API endpoint。修法不加 partition，而是批次消費、每訊息一個 goroutine，再把 checker 拆成 slow lane 與 fast lane。</p>
+      </div>
+      <div class="detail detail-2">
+        <h3>寫入 · N+1 放大</h3>
+        <p>原本對每個 issue 都對資料庫做一次 round trip，最大批量 50 萬筆時，等於單一次 API call 裡五十萬次往返、查詢與交易。改成混合策略：issue 數低於門檻用 UNNEST、超過門檻用 COPY。</p>
+      </div>
+      <div class="detail detail-3">
+        <h3>拓撲 · 跨洲延遲</h3>
+        <p>primary 在 Portland，API 卻 active-active 兩地都跑。Amsterdam 每次寫入都得橫跨大西洋，光速下單趟 50 ms，平均近 3 秒；Portland 才 10 ms。改成 active-passive，讓 active API 跟著 primary。</p>
+      </div>
+    </div>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-stack-scan-hypotheses');
+        if (!root) return;
+        const radios = [
+          root.querySelector('#vg-w-stack-scan-hypotheses-r1'),
+          root.querySelector('#vg-w-stack-scan-hypotheses-r2'),
+          root.querySelector('#vg-w-stack-scan-hypotheses-r3'),
+        ];
+        root.querySelectorAll('svg.diagram .layer').forEach((rect, i) => {
+          const select = () => { if (radios[i]) radios[i].checked = true; };
+          rect.addEventListener('click', select);
+          rect.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); select(); }
+          });
+        });
+      })();
+    </script>
+  </figure>
+
+  <p>三個假設各有歸宿，但這還只解釋了「為什麼某次掃描會慢」。要把全系統的吞吐量穩住，還欠最後一塊：那些掃描是怎麼被排上去的。</p>
+
+  <h2>最後一刀：把排程的尖峰攤平</h2>
+
+  <p>逐筆變快之後，排程本身成了新的壓力來源——當大量 account 共用同一個時間欄位、又在相近時刻一起到期，瞬間湧入的掃描請求會把剛修好的下游再次打滿（這是排程造成尖峰的一般機制，原文以三項修改回應它，未逐一展開細節，此處為合理推斷）。團隊的三項修改都針對「把同時到期攤開」：先是「讓 zone 獨立於 account 排程：每個 zone 有自己的 last_scheduled_at 欄位」，把排程的最小單位拆細；再「隨機化既有 account 與 zone 的 last_scheduled_at 時間」，打散原本對齊的到期時刻；最後「為掃描排程引入 adaptive rate limiting」，在尖峰時主動節流。三招合起來，把一個會週期性自我衝撞的排程器，改成穩定吐出工作的節流閥。</p>
+
+  <p>回頭看這條偵查路線，最值得學的是四個修復沒有一個是「加資源」。消費端拆 slow/fast lane 動的是消費模式，寫入改 UNNEST/COPY 動的是 query 形狀，API 改 active-passive 動的是部署拓撲，排程三招動的是請求的時間分布。四種瓶頸——序列化、寫入放大、跨洲延遲、尖峰對齊——分屬完全不同的層，卻被同一套「量測、定位、改寫」的紀律一一拆解。這也說明為什麼三盞燈一起亮：它們其實是同一個吞吐量上限在不同層面的投影，而不是四個獨立的故障。</p>
+
+  <p>結果是：「今天，Security Insights 在尖峰排程時穩定維持每秒超過 120 次掃描，超過了我們 10 倍的改善目標。」攤開來看，整輪工作「把 Security Insights 的掃描吞吐量提高了超過 10 倍，為數百萬客戶開通了 security insights，並把所有客戶的掃描頻率加倍」。沒有新機房，沒有更大的 instance，連 partition 數都沒動。</p>
+
+  <p class="vg-deep-closer"><strong>Take-away</strong>：當吞吐量卡住而 backlog、逾時、崩潰同時發作，先別急著加機器——用 Cloudflare 自己的話，「靠仔細看我們的 code、SQL query、log 與 metric，我們在沒有單純多加 pod 或 partition 的情況下提升了容量」。下次先看 partition lag 和按地區拆開的 API 延遲，瓶頸常常就藏在那兩張圖裡。</p>
+</div>

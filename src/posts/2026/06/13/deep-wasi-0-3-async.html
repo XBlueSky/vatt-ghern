@@ -1,0 +1,407 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">在 WASI 0.2，只要一個 component 用了 streaming 或 async API，它就無法跟任何其他 component compose——async 與「可組合」這兩件 component model 的招牌能力，過去是互斥的。0.3 把 event loop 從每個 component 手裡收回給 host，這道牆才倒。</p>
+  <h1 class="vg-post-title">{{ title }}</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p><span class="vg-dropcap">W</span>ASI 0.3 在 2026-06-11 釋出，按官方說法「<code>async is now native to WebAssembly Components</code>」，規格已 stable。具體做了一件事：把 <code>stream&lt;T&gt;</code>、<code>future&lt;T&gt;</code>、<code>async</code> 三個構造放進 Component Model 的 canonical ABI，成為一等公民。在這之前，async 不是 component model 的能力，而是每個 component 各自在內部模擬出來的東西——它有 runtime、有 event loop，但那個 loop 只屬於它自己。這篇拆的是：這三個原語在 ABI 層長什麼樣、舊的模擬法為什麼擋住了 composition、把 loop 收回 host 之後機制如何運轉，以及對寫或組合 WASM component 的人，下一週的工作會差在哪。</p>
+
+  <p>先把整件事的形狀擺出來。下面這個互動小工具讓你把一條「A 呼叫 B、B 呼叫 C」的 component 鏈，在 sync compose 與原生 async 兩種模式之間切換，並拖動每段 IO 等待的時間，看 end-to-end 的牆鐘時間怎麼變。重點不在數字本身，而在兩條曲線的形狀——sync 模式下總時間是各段相加，async 模式下 host 把所有在等待的 task 交錯排程，總時間趨近最慢那一段。</p>
+
+  <figure class="vg-w-param-compose-async" data-mobile="static" data-svg-scroll="720">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M5 9l-3 3 3 3"/><path d="M9 5l3-3 3 3"/><path d="M15 19l-3 3-3-3"/><path d="M19 9l3 3-3 3"/><path d="M2 12h20"/><path d="M12 2v20"/>
+      </svg>
+      <span>拖滑桿調每段 IO 等待、切換 sync / async compose · 3 段 component 鏈</span>
+    </p>
+    <style>
+      .vg-w-param-compose-async { display: grid; gap: var(--s-2); }
+      .vg-w-param-compose-async .controls { display: grid; grid-template-columns: 1fr; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+      @media (min-width: 720px) { .vg-w-param-compose-async .controls { grid-template-columns: auto 1fr auto; align-items: center; } }
+      .vg-w-param-compose-async .controls input[type="range"] { height: 36px; accent-color: var(--accent); touch-action: none; width: 100%; }
+      .vg-w-param-compose-async .modeline { display: flex; gap: var(--s-2); align-items: center; flex-wrap: wrap; }
+      .vg-w-param-compose-async .modeline label { display: inline-flex; align-items: center; gap: var(--s-1); cursor: pointer; min-height: 36px; }
+      .vg-w-param-compose-async .modeline input { accent-color: var(--accent); width: 18px; height: 18px; }
+      .vg-w-param-compose-async .readout { font-variant-numeric: tabular-nums; color: var(--ink); text-align: right; min-width: 7ch; }
+      .vg-w-param-compose-async svg { width: 100%; height: auto; }
+      .vg-w-param-compose-async figcaption { font-family: var(--scribed); font-style: italic; font-size: var(--fs-sm); color: var(--muted); }
+      .vg-w-param-compose-async .bar { transition: width 180ms ease-out, x 180ms ease-out; }
+    </style>
+
+    <div class="controls" data-vg-controls>
+      <span class="modeline" role="radiogroup" aria-label="compose 模式">
+        <label><input type="radio" name="vg-w-param-compose-async-mode" value="sync" checked /> sync compose</label>
+        <label><input type="radio" name="vg-w-param-compose-async-mode" value="async" /> 原生 async</label>
+      </span>
+      <input id="vg-w-param-compose-async-io" type="range" min="10" max="200" value="80" aria-label="每段 IO 等待 ms" />
+      <span class="readout"><span id="vg-w-param-compose-async-io-ro">80</span> ms / 段</span>
+    </div>
+
+    <svg viewBox="0 0 720 260" preserveAspectRatio="xMidYMid meet" role="img"
+         aria-label="三段 component 呼叫鏈在 sync 與 async compose 下的時間軸對照">
+      <line x1="70" y1="220" x2="700" y2="220" stroke="var(--muted-2)" stroke-width="1" />
+      <text x="385" y="248" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--muted)">牆鐘時間 →</text>
+      <text x="20" y="56" font-family="IM Fell English, serif" font-style="italic" font-size="13" fill="var(--muted)">A</text>
+      <text x="20" y="108" font-family="IM Fell English, serif" font-style="italic" font-size="13" fill="var(--muted)">B</text>
+      <text x="20" y="160" font-family="IM Fell English, serif" font-style="italic" font-size="13" fill="var(--muted)">C</text>
+
+      <rect class="bar" id="vg-w-param-compose-async-a" x="70" y="40" width="120" height="22" rx="2" fill="var(--accent)" opacity="0.55" />
+      <rect class="bar" id="vg-w-param-compose-async-b" x="70" y="92" width="120" height="22" rx="2" fill="var(--sage)" opacity="0.65" />
+      <rect class="bar" id="vg-w-param-compose-async-c" x="70" y="144" width="120" height="22" rx="2" fill="var(--ink-deep)" opacity="0.5" />
+
+      <line class="bar" id="vg-w-param-compose-async-end" x1="190" y1="30" x2="190" y2="220" stroke="var(--accent-text)" stroke-width="1.5" stroke-dasharray="3,3" />
+      <text class="bar" id="vg-w-param-compose-async-total" x="196" y="206" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--accent-text)">240 ms</text>
+
+      <text id="vg-w-param-compose-async-note" x="385" y="20" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="12" fill="var(--muted)">sync：每段等前一段做完，總時間 = 三段相加</text>
+    </svg>
+
+    <figcaption>sync compose 下三段相加；切到 async，host 把三段的 IO 等待交錯，總時間趨近最慢那一段。模型化的時間軸，用來凸顯 compose 形狀差異，不是 benchmark。</figcaption>
+
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        const root = document.querySelector('.vg-w-param-compose-async');
+        const io = root.querySelector('#vg-w-param-compose-async-io');
+        const ioRo = root.querySelector('#vg-w-param-compose-async-io-ro');
+        const a = root.querySelector('#vg-w-param-compose-async-a');
+        const b = root.querySelector('#vg-w-param-compose-async-b');
+        const c = root.querySelector('#vg-w-param-compose-async-c');
+        const end = root.querySelector('#vg-w-param-compose-async-end');
+        const total = root.querySelector('#vg-w-param-compose-async-total');
+        const note = root.querySelector('#vg-w-param-compose-async-note');
+        const X0 = 70, X1 = 700, SCALE = (X1 - X0) / 600; // up to 600ms maps to width
+        function mode() { return root.querySelector('input[name="vg-w-param-compose-async-mode"]:checked').value; }
+        function update() {
+          const t = Number(io.value);
+          ioRo.textContent = String(t);
+          const w = t * SCALE;
+          if (mode() === 'sync') {
+            // serial: A then B then C
+            a.setAttribute('x', X0); a.setAttribute('width', w);
+            b.setAttribute('x', X0 + w); b.setAttribute('width', w);
+            c.setAttribute('x', X0 + 2 * w); c.setAttribute('width', w);
+            const e = X0 + 3 * w;
+            end.setAttribute('x1', e); end.setAttribute('x2', e);
+            total.setAttribute('x', Math.min(e + 6, 660));
+            total.textContent = (t * 3) + ' ms';
+            note.textContent = 'sync：每段等前一段做完，總時間 = 三段相加';
+          } else {
+            // async: all start together, overlap; total ~ max segment (model slowest + small tail)
+            a.setAttribute('x', X0); a.setAttribute('width', w);
+            b.setAttribute('x', X0 + w * 0.18); b.setAttribute('width', w);
+            c.setAttribute('x', X0 + w * 0.36); c.setAttribute('width', w);
+            const e = X0 + w * 1.36;
+            end.setAttribute('x1', e); end.setAttribute('x2', e);
+            total.setAttribute('x', Math.min(e + 6, 660));
+            total.textContent = Math.round(t * 1.36) + ' ms';
+            note.textContent = 'async：host 在同一 loop 交錯排程，總時間趨近最慢那段';
+          }
+        }
+        io.addEventListener('input', update);
+        root.querySelectorAll('input[name="vg-w-param-compose-async-mode"]').forEach((r) => r.addEventListener('change', update));
+        update();
+      })();
+    </script>
+  </figure>
+
+  <h2>canonical ABI 裡的三個新原語：stream、future、async func</h2>
+
+  <p>0.3 的全部新意可以收斂成一句：「adding stream&lt;T&gt;, future&lt;T&gt;, and async as first-class constructs to the canonical ABI」。canonical ABI 是 Component Model 定義「component 之間怎麼傳值、怎麼呼叫」的那層介面合約——把 async 放進這層，意思是 async 不再是某個語言的 runtime 自己的事，而是 component 邊界本身認得的東西。一個 Rust 寫的 component export 一個 <code>async func</code>，一個 JS 寫的 component import 它，兩邊不需要共享同一個 async runtime，因為 await 的語意已經寫在 ABI 裡，由 host 兜起來。</p>
+
+  <p>「first-class constructs to the canonical ABI」這幾個字是整件事的關鍵，值得拆開。first-class 在型別系統語境裡的意思是「跟其他基本型別平起平坐、可以被傳遞、被組合、被當成值對待」。把 async 做成 first-class，相對的是把它做成 second-class——某種得靠約定俗成的呼叫慣例、靠 guest 自己維護的狀態機才能兜出來的東西，正是 0.2 的處境。一個 second-class 的能力沒辦法被 ABI 保證，跨邊界時它的語意會散掉；first-class 的能力 ABI 認得，跨邊界時 lift / lower 規則會把它完整搬過去。0.3 把 async 從約定升格成型別，這一步才讓後面「跨 component 邊界 await」成為一個有定義的操作。</p>
+
+  <p>三個構造各自的角色不同，但共享一個關鍵的型別語意——它們是 owned handle。文章說得很直接：「stream&lt;T&gt; and future&lt;T&gt; function like resource types: each is an owned handle, passing one across a component boundary transfers ownership from caller to callee. Unlike resource types, they can't be borrowed.」這句話裡有三層資訊：它們像 resource type、跨邊界傳遞會轉移 ownership、但跟 resource 不同，不能 borrow。下面這個小工具把三個構造攤開，點任一個看它擁有什麼、語意上跟 resource type 差在哪。</p>
+
+  <figure class="vg-w-stack-constructs-abi" data-mobile="keep">
+    <style>
+      .vg-w-stack-constructs-abi { display: flex; flex-direction: column; gap: var(--s-3); align-items: stretch; }
+      .vg-w-stack-constructs-abi input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-stack-constructs-abi .stack-title { font-family: IM Fell English, serif; font-style: italic; font-size: var(--fs-md); margin: 0; color: var(--ink); line-height: 1.4; }
+      .vg-w-stack-constructs-abi .stack-cards { display: flex; flex-direction: column; gap: var(--s-1); list-style: none; padding: 0; margin: 0; }
+      .vg-w-stack-constructs-abi .stack-cards label { display: block; padding: var(--s-2); border: 1px solid var(--muted-2); border-radius: 2px; cursor: pointer; transition: border-color 200ms, background 200ms; min-height: 44px; }
+      .vg-w-stack-constructs-abi .stack-cards label:hover { border-color: var(--accent); }
+      .vg-w-stack-constructs-abi .stack-cards .card-head { font-family: JetBrains Mono, monospace; font-size: var(--fs-sm); margin: 0 0 4px 0; color: var(--ink); display: flex; align-items: baseline; justify-content: space-between; gap: var(--s-2); flex-wrap: wrap; }
+      .vg-w-stack-constructs-abi .stack-cards .card-sub { font-family: IM Fell English, serif; font-style: italic; font-size: var(--fs-sm); color: var(--muted); margin: 0; line-height: 1.5; }
+      .vg-w-stack-constructs-abi .stack-cards .card-tag { font-family: var(--sans); font-size: var(--fs-xs); color: var(--accent-text); font-style: normal; text-transform: uppercase; letter-spacing: 0.05em; }
+      .vg-w-stack-constructs-abi:has(#vg-w-stack-constructs-abi-r1:checked) .card-1,
+      .vg-w-stack-constructs-abi:has(#vg-w-stack-constructs-abi-r2:checked) .card-2,
+      .vg-w-stack-constructs-abi:has(#vg-w-stack-constructs-abi-r3:checked) .card-3 { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+      .vg-w-stack-constructs-abi svg.diagram { display: none; }
+      @media (min-width: 720px) {
+        .vg-w-stack-constructs-abi svg.diagram { display: block; width: 100%; height: auto; max-width: 880px; }
+        .vg-w-stack-constructs-abi .stack-title, .vg-w-stack-constructs-abi .stack-cards { display: none; }
+      }
+      .vg-w-stack-constructs-abi .layer { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; }
+      .vg-w-stack-constructs-abi .layer-text { font-family: JetBrains Mono, monospace; font-size: 14px; pointer-events: none; }
+      .vg-w-stack-constructs-abi .layer-sub { font-family: IM Fell English, serif; font-style: italic; font-size: 12px; fill: var(--muted); pointer-events: none; }
+      .vg-w-stack-constructs-abi .head { font-family: IM Fell English, serif; font-style: italic; font-size: 13px; }
+      .vg-w-stack-constructs-abi:has(#vg-w-stack-constructs-abi-r1:checked) .layer-1,
+      .vg-w-stack-constructs-abi:has(#vg-w-stack-constructs-abi-r2:checked) .layer-2,
+      .vg-w-stack-constructs-abi:has(#vg-w-stack-constructs-abi-r3:checked) .layer-3 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+      .vg-w-stack-constructs-abi .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+      .vg-w-stack-constructs-abi .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-stack-constructs-abi .detail p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-stack-constructs-abi:has(#vg-w-stack-constructs-abi-r1:checked) .detail-1,
+      .vg-w-stack-constructs-abi:has(#vg-w-stack-constructs-abi-r2:checked) .detail-2,
+      .vg-w-stack-constructs-abi:has(#vg-w-stack-constructs-abi-r3:checked) .detail-3 { display: block; }
+      .vg-w-stack-constructs-abi .hint { font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin: 0 0 var(--s-1) 0; }
+    </style>
+
+    <input type="radio" id="vg-w-stack-constructs-abi-r1" name="vg-w-stack-constructs-abi-sel" checked aria-label="future" />
+    <input type="radio" id="vg-w-stack-constructs-abi-r2" name="vg-w-stack-constructs-abi-sel" aria-label="stream" />
+    <input type="radio" id="vg-w-stack-constructs-abi-r3" name="vg-w-stack-constructs-abi-sel" aria-label="async func" />
+
+    <p class="stack-title" id="vg-w-stack-constructs-abi-title">canonical ABI 的三個新一等構造——點任一個看它擁有什麼</p>
+    <ul class="stack-cards" aria-labelledby="vg-w-stack-constructs-abi-title">
+      <li class="card-1"><label for="vg-w-stack-constructs-abi-r1">
+        <p class="card-head"><span>future&lt;T&gt;</span><span class="card-tag">owned · 不可 borrow</span></p>
+        <p class="card-sub">一個會在未來送達一個 T 的 handle。跨 component 邊界傳出去，ownership 從 caller 轉給 callee。值送達時，runtime 排程正在 await 它的 task。</p>
+      </label></li>
+      <li class="card-2"><label for="vg-w-stack-constructs-abi-r2">
+        <p class="card-head"><span>stream&lt;T&gt;</span><span class="card-tag">owned · 不可 borrow</span></p>
+        <p class="card-sub">一連串 T 的 handle，同樣是 owned，傳遞即轉移 ownership。對應 0.2 的 input-stream / output-stream，0.3 統一成 stream&lt;u8&gt; 之類的型別。</p>
+      </label></li>
+      <li class="card-3"><label for="vg-w-stack-constructs-abi-r3">
+        <p class="card-head"><span>async func</span><span class="card-tag">ABI 一等公民</span></p>
+        <p class="card-sub">component 直接 export / import 的 async 函式。呼叫端 await 它即可，邊界本身懂 async，不需要兩邊共享同一個 async runtime。</p>
+      </label></li>
+    </ul>
+
+    <svg class="diagram" viewBox="0 0 880 300" role="img"
+         aria-label="future、stream、async func 三個 canonical ABI 構造及其 ownership 語意">
+      <text x="40" y="26" fill="var(--ink)" class="head">canonical ABI 的三個新一等構造——owned handle，跨邊界轉移 ownership，不可 borrow</text>
+
+      <rect class="layer layer-1" data-target="vg-w-stack-constructs-abi-r1" x="40" y="48" width="800" height="64" rx="3" role="button" tabindex="0" aria-label="future" />
+      <text x="60" y="78" fill="var(--ink)" class="layer-text">future&lt;T&gt;</text>
+      <text x="60" y="100" class="layer-sub">未來送達一個 T 的 handle；值送達時 runtime 排程 await 它的 task，跨多層 component 邊界也成立</text>
+      <text x="820" y="84" text-anchor="end" fill="var(--accent-text)" font-family="JetBrains Mono, monospace" font-size="11">owned</text>
+
+      <rect class="layer layer-2" data-target="vg-w-stack-constructs-abi-r2" x="40" y="124" width="800" height="64" rx="3" role="button" tabindex="0" aria-label="stream" />
+      <text x="60" y="154" fill="var(--ink)" class="layer-text">stream&lt;T&gt;</text>
+      <text x="60" y="176" class="layer-sub">一連串 T 的 handle；對應 0.2 的 input-stream / output-stream，0.3 收斂成 stream&lt;u8&gt;</text>
+      <text x="820" y="160" text-anchor="end" fill="var(--accent-text)" font-family="JetBrains Mono, monospace" font-size="11">owned</text>
+
+      <rect class="layer layer-3" data-target="vg-w-stack-constructs-abi-r3" x="40" y="200" width="800" height="64" rx="3" role="button" tabindex="0" aria-label="async func" />
+      <text x="60" y="230" fill="var(--ink)" class="layer-text">async func</text>
+      <text x="60" y="252" class="layer-sub">component 直接 export / import；呼叫端 await 即可，邊界本身懂 async</text>
+      <text x="820" y="236" text-anchor="end" fill="var(--accent-text)" font-family="JetBrains Mono, monospace" font-size="11">first-class</text>
+
+      <text x="440" y="288" text-anchor="middle" fill="var(--muted)" class="layer-sub">future 與 stream 像 resource type，但不可 borrow——這道限制讓跨邊界排程的所有權鏈不會分岔</text>
+    </svg>
+
+    <div>
+      <p class="hint">click a construct above</p>
+      <div class="detail detail-1">
+        <h3>future&lt;T&gt; · owned handle</h3>
+        <p>文件原文：each is an owned handle, passing one across a component boundary transfers ownership from caller to callee。future 代表「一個之後會出現的值」。把它傳給另一個 component，等於把「誰負責收這個值、誰被它喚醒」一併交出去。</p>
+        <p>關鍵後果：the runtime schedules whichever task is awaiting it, even if it was passed through multiple component boundaries。await 的 task 可能在三層 component 之外，runtime 照樣排得到它。</p>
+      </div>
+      <div class="detail detail-2">
+        <h3>stream&lt;T&gt; · owned handle</h3>
+        <p>stream 是 future 的「多值」版本，同屬 owned handle、跨邊界轉移 ownership。release notes 把 0.2 的 <code>resource input-stream</code> 與 <code>resource output-stream</code> 都映射到 0.3 的 <code>stream&lt;u8&gt;</code>——兩個方向收斂成一個型別。</p>
+        <p>「不能 borrow」在這裡尤其重要：一條 stream 的消費權只能屬於一個 task，避免兩個 component 同時宣稱在讀同一條流。</p>
+      </div>
+      <div class="detail detail-3">
+        <h3>async func · ABI 一等公民</h3>
+        <p>原文：Components export and import async funcs directly。0.2 時，async 介面得偽裝成同步函式加一套 poll；0.3 直接讓 component 的 import / export 帶 async 語意。</p>
+        <p>這是「原生」二字的具體所指：async 寫進 canonical ABI，呼叫方只要 await，跨語言、跨 component 都認得。</p>
+      </div>
+    </div>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-stack-constructs-abi');
+        root.querySelectorAll('.layer').forEach((rect) => {
+          rect.addEventListener('click', () => {
+            const radio = root.querySelector('#' + rect.getAttribute('data-target'));
+            if (radio) radio.checked = true;
+          });
+          rect.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); rect.dispatchEvent(new MouseEvent('click', { bubbles: true })); } });
+        });
+      })();
+    </script>
+  </figure>
+
+  <p>「不能 borrow」這條限制值得停一下。resource type 在 component model 裡可以被 borrow——某個 component 暫時取得一個 handle 的使用權、用完歸還，所有權不轉移。stream 與 future 刻意拿掉這條路：它們只能被 own，傳出去就是轉移。理由跟跨邊界排程有關。當一個 future 的 await task 可能位在好幾層 component 之外，runtime 需要一條清楚不分岔的所有權鏈，才知道值送達時該喚醒誰。允許 borrow 等於允許「同一個 future 有多個暫時持有者」，那條鏈就會分岔，排程語意立刻變得難以定義。把它收緊成 owned-only，是讓共用 event loop 能正確運作的前提。</p>
+
+  <p>把這三個構造放進 canonical ABI 的意義，要對照 component model 原本的型別系統才看得清楚。canonical ABI 規定的是「跨 component 邊界時，每種型別怎麼 lower 成 linear memory 的 byte、怎麼 lift 回另一邊的型別」——record、variant、list、resource 各有自己的編碼規則。在 0.3 之前，這套規則裡沒有任何「一個值會在未來才出現」的概念，所有東西都是當下就在的。<code>future&lt;T&gt;</code> 與 <code>stream&lt;T&gt;</code> 補的正是這個缺口：它們在 ABI 層就是一個 handle（一個整數 index，指向 host 那邊的一張表），lift / lower 的是 handle 而非值本身。值什麼時候出現、出現後喚醒誰，是 handle 背後的 host 機制負責。這也是為什麼說它們「像 resource type」——resource 在 ABI 層也是 handle。差別只在 resource 可借、future / stream 不可借。</p>
+
+  <p>對寫 <code>.wit</code> 介面定義的人，這個改變最直接的影響是介面長相。0.2 一個會回傳資料流的介面，得宣告一個 <code>resource</code>、給它一堆 method（<code>read</code>、<code>subscribe</code>、<code>blocking-read</code>），再叫使用者自己把這些 method 串成一個讀取迴圈。0.3 同一個介面就是一個回傳 <code>stream&lt;u8&gt;</code> 的 function，使用者拿到 stream 直接消費。介面從「一組 method 加一份隱含的使用協定」變成「一個帶 async 語意的型別簽章」——隱含協定被 ABI 收編成顯式型別，這是 release notes 說介面「more ergonomic」的具體所指。</p>
+
+  <h2>0.2 的三步舞與 per-component event loop</h2>
+
+  <p>要看懂 0.3 解了什麼，得先看 0.2 怎麼模擬 async。文章的描述是：「In WASI 0.2 each component needed its own event loop/async runtime.」每個 component 自帶一套 event loop 與 async runtime。等待這件事靠 <code>poll(list&lt;pollable&gt;)</code> 完成——把一批 <code>pollable</code> handle 丟給 poll，問「你們誰就緒了」，這是典型的 readiness-based 介面：你先拿到一個代表「某件事將會就緒」的 token，然後反覆去 poll 它直到它說「好了」。</p>
+
+  <p>更麻煩的是非同步函式呼叫的形狀。0.2 沒有 async func，所以一個概念上 async 的操作得拆成三步：<code>start-foo</code> 啟動、<code>finish-foo</code> 取結果，中間用 <code>subscribe</code> 拿到一個可以 poll 的 pollable。文章用「the three-step start-foo / finish-foo / subscribe dance」形容它——三步舞。下面把這支舞跟 0.3 的單一 async func 簽章並排，拖中間的分隔線就能對照兩種寫法。</p>
+
+  <p>這支舞每一步都有它存在的理由，也正因如此才麻煩。<code>start-foo</code> 把操作丟出去、立刻回來，不阻塞；它回傳的不是結果，而是一個代表「這次操作」的 handle。<code>subscribe</code> 從這個 handle 生出一個 <code>pollable</code>，這是專門拿去等的 token。<code>poll(list&lt;pollable&gt;)</code> 把一批 pollable 丟給 component 自己的 event loop，loop 阻塞到至少一個就緒。就緒之後，<code>finish-foo</code> 才真正把結果拿出來。四個動詞、兩種 handle，描述的其實是「await 一次 async 呼叫」這一件事——只因為 ABI 不認得 async，整個流程被攤平成同步原語的組合，由 guest 自己重新組裝出 async 的語意。0.3 的 <code>foo: async func(...)</code> 把這四步收回一個簽章，await 的機制下沉到 host。</p>
+
+  <figure class="vg-w-ba-poll-vs-async" data-mobile="swap" data-mobile-summary="0.2 一個 async 呼叫要拆成 start／finish／subscribe 加 poll 輪詢；0.3 收斂成一行 async func。" data-svg-scroll="720">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M18 8L22 12L18 16"/><path d="M6 8L2 12L6 16"/><path d="M2 12H22"/>
+      </svg>
+      <span>拖分隔線比較 0.2 三步舞與 0.3 async func · before / after</span>
+    </p>
+    <style>
+      .vg-w-ba-poll-vs-async { position: relative; aspect-ratio: 16 / 10; overflow: hidden; border: 1px solid var(--line); }
+      @media (max-width: 720px) { .vg-w-ba-poll-vs-async { aspect-ratio: 4 / 5; } }
+      .vg-w-ba-poll-vs-async .layer { position: absolute; inset: 0; }
+      .vg-w-ba-poll-vs-async .after { clip-path: polygon(50% 0, 100% 0, 100% 100%, 50% 100%); }
+      .vg-w-ba-poll-vs-async .divider { position: absolute; top: 0; bottom: 0; left: 50%; width: 32px; transform: translateX(-50%); cursor: ew-resize; touch-action: none; z-index: 3; }
+      .vg-w-ba-poll-vs-async .divider::before { content: ''; position: absolute; left: 50%; top: 0; bottom: 0; width: 2px; transform: translateX(-50%); background: var(--accent); }
+      .vg-w-ba-poll-vs-async .divider::after { content: '↔'; position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); background: var(--accent); color: var(--bg); width: 32px; height: 32px; border-radius: 50%; display: grid; place-items: center; font-family: var(--sans); font-size: 16px; }
+    </style>
+
+    <svg class="layer before" viewBox="0 0 440 275" preserveAspectRatio="xMidYMid meet" role="img" aria-label="WASI 0.2 三步舞寫法">
+      <rect width="440" height="275" fill="var(--bg-soft)" />
+      <text x="24" y="36" font-family="Manrope, sans-serif" font-size="14" fill="var(--muted)" letter-spacing="1.1">WASI 0.2</text>
+      <text x="24" y="60" font-family="IM Fell English, serif" font-style="italic" font-size="13" fill="var(--muted)">readiness-based · 三步舞</text>
+      <text x="24" y="98" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--ink)">let p = start-foo(args);</text>
+      <text x="24" y="122" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--ink)">let pollable = p.subscribe();</text>
+      <text x="24" y="146" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--ink)">poll(list[pollable]);</text>
+      <text x="24" y="170" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--ink)">let r = finish-foo(p);</text>
+      <text x="24" y="216" font-family="IM Fell English, serif" font-style="italic" font-size="12" fill="var(--muted)">每個 component 自帶 event loop，</text>
+      <text x="24" y="236" font-family="IM Fell English, serif" font-style="italic" font-size="12" fill="var(--muted)">poll 迴圈在 component 內部跑</text>
+    </svg>
+
+    <svg class="layer after" viewBox="0 0 440 275" preserveAspectRatio="xMidYMid meet" id="vg-w-ba-poll-vs-async-after" role="img" aria-label="WASI 0.3 async func 寫法">
+      <rect width="440" height="275" fill="var(--bg)" />
+      <rect width="440" height="275" fill="var(--accent)" fill-opacity="0.06" />
+      <text x="24" y="36" font-family="Manrope, sans-serif" font-size="14" fill="var(--accent-text)" letter-spacing="1.1">WASI 0.3</text>
+      <text x="24" y="60" font-family="IM Fell English, serif" font-style="italic" font-size="13" fill="var(--muted)">completion-based · 一行</text>
+      <text x="24" y="98" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--ink)">foo: async func(args) -&gt; R;</text>
+      <text x="24" y="134" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--ink)">let r = foo(args).await;</text>
+      <text x="24" y="180" font-family="IM Fell English, serif" font-style="italic" font-size="12" fill="var(--muted)">host 管一個共用 event loop，</text>
+      <text x="24" y="200" font-family="IM Fell English, serif" font-style="italic" font-size="12" fill="var(--muted)">await 交給 runtime，跨邊界排程</text>
+      <text x="24" y="236" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--sage-deep)">// most changes are entirely mechanical</text>
+    </svg>
+
+    <div class="divider" id="vg-w-ba-poll-vs-async-divider"></div>
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        const root = document.querySelector('.vg-w-ba-poll-vs-async');
+        const after = root.querySelector('#vg-w-ba-poll-vs-async-after');
+        const divider = root.querySelector('#vg-w-ba-poll-vs-async-divider');
+        let dragging = false;
+        function setPct(pct) {
+          const c = Math.max(0, Math.min(100, pct));
+          after.style.clipPath = `polygon(${c}% 0, 100% 0, 100% 100%, ${c}% 100%)`;
+          divider.style.left = `${c}%`;
+        }
+        divider.addEventListener('pointerdown', (e) => { dragging = true; divider.setPointerCapture(e.pointerId); });
+        root.addEventListener('pointermove', (e) => { if (!dragging) return; const r = root.getBoundingClientRect(); setPct(((e.clientX - r.left) / r.width) * 100); });
+        root.addEventListener('pointerup', () => { dragging = false; });
+        root.addEventListener('pointercancel', () => { dragging = false; });
+      })();
+    </script>
+  </figure>
+
+  <p>這支三步舞本身只是不好寫，真正的問題在它的後果。每個 component 各自跑一個 event loop，這些 loop 之間沒有共同的時間基準、沒有共享的 ready queue，彼此無法協調。文章把這句話講得毫不留情：「If a component used streaming or async APIs, it couldn't be composed with any other components.」一旦你的 component 用了 streaming 或 async，它就不能跟任何其他 component compose。component model 賣的就是「把小 component 拼成大系統」這個能力，而 async——現代 IO 幾乎所有東西——恰好把它關掉了。0.2 的 async 與 0.2 的 composition，實際上是兩個不能同時用的功能。</p>
+
+  <p>release notes 把這次遷移整理成一張對照表，多數是機械式替換：<code>resource pollable</code> 變 <code>future&lt;T&gt;</code>，<code>resource input-stream</code> 與 <code>output-stream</code> 都變 <code>stream&lt;u8&gt;</code>，<code>poll(list&lt;pollable&gt;)</code> 換成 runtime 處理的 await，<code>subscribe()</code> 換成從呼叫直接 return 一個 <code>future&lt;...&gt;</code>，<code>start-foo</code> / <code>finish-foo</code> 配對收斂成一個 <code>foo: async func(...)</code>。文章對改動範圍的形容是「Most of the changes in the 0.3 interfaces are entirely mechanical.」——多數介面改動是純機械式的，這對要遷移既有 WASI 介面的人是好消息：大部分工作是把 poll pattern 換成 async func，而不是重新設計語意。</p>
+
+  <pre data-kind="config"><code><em>// 0.2 → 0.3 介面遷移對照（取自 release notes）</em>
+resource pollable          ──&gt;  future&lt;T&gt;
+resource input-stream      ──&gt;  stream&lt;u8&gt;
+resource output-stream     ──&gt;  stream&lt;u8&gt;   <em>// 寫入方向</em>
+poll(list&lt;pollable&gt;)        ──&gt;  await on a future   <em>// runtime 處理</em>
+subscribe() on resource    ──&gt;  return future&lt;...&gt; from the call
+start-foo / finish-foo     ──&gt;  foo: async func(...)</code></pre>
+
+  <h2>host 收回 event loop：一個 loop 排程所有 component</h2>
+
+  <p>0.3 的核心轉移只有一句：「WASI 0.3 makes it so the host is now the one in charge of managing the one event loop that is shared by all components.」event loop 的所有權從 component 收回到 host，而且是「一個」被所有 component 共享的 loop。這個改動很小，後果很大。當所有 component 跑在同一個 host 管理的 loop 上，async 與 composition 不再互斥——它們現在用的是同一套排程機制。</p>
+
+  <p>共用 loop 帶來的具體能力是跨邊界排程。文章描述：「When a value has been delivered to a future, the runtime schedules whichever task is awaiting it, even if it was passed through multiple component boundaries.」一個 future 在 component A 產生，被傳給 B，B 又傳給 C，C 裡某個 task 在 await 它。值送達時，runtime 直接排程那個位於 C 的 task——即使它在三層 component 之外。在 0.2 那是不可能的：A 的 event loop 根本不知道 C 的 event loop 存在，沒有任何共享狀態能讓「A 的值送達」喚醒「C 的 task」。下面這張圖把兩種拓樸並排——左邊 0.2 的 N 個各自為政的 loop，右邊 0.3 的單一 host loop。</p>
+
+  <figure class="vg-w-eventloop-topology" data-mobile="keep" data-svg-scroll="880">
+    <svg viewBox="0 0 880 340" role="img"
+         aria-label="0.2 每個 component 自帶 event loop 無法協調，對照 0.3 一個 host 共用 loop 跨邊界排程" style="width: 100%; height: auto; max-width: 880px;">
+      <style>
+        .vg-w-eventloop-topology text { font-family: EB Garamond, serif; font-size: 12px; }
+        .vg-w-eventloop-topology .label { font-family: IM Fell English, serif; font-style: italic; }
+        .vg-w-eventloop-topology .head { font-family: IM Fell English, serif; font-style: italic; font-size: 13px; }
+        .vg-w-eventloop-topology .comp { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; }
+        .vg-w-eventloop-topology .loop02 { fill: none; stroke: var(--muted); stroke-width: 1.5; stroke-dasharray: 4,3; }
+        .vg-w-eventloop-topology .hostloop { fill: var(--accent); fill-opacity: 0.12; stroke: var(--accent); stroke-width: 1.5; }
+        .vg-w-eventloop-topology .mono { font-family: JetBrains Mono, monospace; font-size: 11px; }
+      </style>
+
+      <!-- LEFT: 0.2 -->
+      <text x="40" y="26" fill="var(--muted)" class="label">WASI 0.2 —— 每個 component 自帶 event loop，彼此無法協調</text>
+      <g>
+        <rect class="comp" x="40" y="44" width="110" height="92" rx="3" />
+        <text x="95" y="74" text-anchor="middle" fill="var(--ink)">A</text>
+        <circle class="loop02" cx="95" cy="106" r="18" />
+        <text x="95" y="110" text-anchor="middle" fill="var(--muted)" class="mono">loop</text>
+
+        <rect class="comp" x="175" y="44" width="110" height="92" rx="3" />
+        <text x="230" y="74" text-anchor="middle" fill="var(--ink)">B</text>
+        <circle class="loop02" cx="230" cy="106" r="18" />
+        <text x="230" y="110" text-anchor="middle" fill="var(--muted)" class="mono">loop</text>
+
+        <rect class="comp" x="310" y="44" width="110" height="92" rx="3" />
+        <text x="365" y="74" text-anchor="middle" fill="var(--ink)">C</text>
+        <circle class="loop02" cx="365" cy="106" r="18" />
+        <text x="365" y="110" text-anchor="middle" fill="var(--muted)" class="mono">loop</text>
+      </g>
+      <text x="40" y="166" fill="var(--muted)" class="label">三個 loop 沒有共享 ready queue —— A 的值送達無法喚醒 C 的 task</text>
+      <text x="40" y="190" fill="var(--accent-text)" class="mono">⇒ 用了 async / streaming 的 component 不能 compose</text>
+
+      <line x1="40" y1="212" x2="840" y2="212" stroke="var(--muted-2)" stroke-width="0.8" />
+
+      <!-- RIGHT: 0.3 -->
+      <text x="40" y="240" fill="var(--accent-text)" class="label">WASI 0.3 —— host 管一個共用 loop，跨 component 邊界排程</text>
+      <rect class="hostloop" x="40" y="252" width="500" height="72" rx="4" />
+      <text x="56" y="272" fill="var(--accent-text)" class="mono">host event loop（共用）</text>
+      <rect class="comp" x="70" y="282" width="90" height="32" rx="3" />
+      <text x="115" y="303" text-anchor="middle" fill="var(--ink)">A</text>
+      <rect class="comp" x="180" y="282" width="90" height="32" rx="3" />
+      <text x="225" y="303" text-anchor="middle" fill="var(--ink)">B</text>
+      <rect class="comp" x="290" y="282" width="90" height="32" rx="3" />
+      <text x="335" y="303" text-anchor="middle" fill="var(--ink)">C</text>
+      <path d="M160 298 L180 298" stroke="var(--accent)" stroke-width="1.5" marker-end="url(#vg-w-eventloop-topology-arr)" />
+      <path d="M270 298 L290 298" stroke="var(--accent)" stroke-width="1.5" marker-end="url(#vg-w-eventloop-topology-arr)" />
+      <defs>
+        <marker id="vg-w-eventloop-topology-arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0 0 L6 3 L0 6 Z" fill="var(--accent)" />
+        </marker>
+      </defs>
+      <text x="560" y="278" fill="var(--ink)" class="label">future 穿過 A→B→C 三層邊界，</text>
+      <text x="560" y="298" fill="var(--ink)" class="label">值送達時 runtime 直接排程 C 裡</text>
+      <text x="560" y="318" fill="var(--ink)" class="label">正在 await 的 task。</text>
+    </svg>
+    <figcaption>左：0.2 的 N 個 event loop 各自為政，沒有共享狀態能跨 component 喚醒 task。右：0.3 把 loop 收回 host，一個共用 loop 讓 future 的喚醒穿過多層邊界。</figcaption>
+  </figure>
+
+  <p>把 loop 收回 host 還有一個不那麼顯眼但實際的好處：host 才是真正貼著 OS 的那一層。真正的 IO multiplexing 原語——epoll、kqueue、io_uring、IOCP——都在 host 端。0.2 讓每個 component 自帶 loop，等於要求每個 guest runtime 各自去逼近這些原語、各跑一套排程，彼此還對不上。把唯一一個 loop 放在 host，guest 只負責產生與 await futures，底下要對接哪個 OS 的哪套 IO 介面，是 host 的事。對寫 host integration 的人來說，這把「我要實作的 async 介面」從「每個 guest runtime 一套」收斂成「host 一套」。</p>
+
+  <p>這裡有個值得辨明的對照：0.2 的「每個 component 自帶 event loop」不是哪個實作偷懶，而是 ABI 沒有 async 概念時的必然結果。當邊界只認得同步呼叫，guest 要做 async，唯一的辦法就是在自己內部跑一個 loop、把同步的 poll 原語包成 async 的假象——Rust 的 component 用 tokio 或某個 reactor，JS 的用它自己的 microtask queue，各搭各的台。問題不在任何一個 loop 寫得好不好，而在它們之間沒有共同語言：A 的 reactor 不知道 B 的 reactor 正在等什麼，兩個 loop 各自空轉或各自阻塞，無從合併成一次等待。0.3 不是把這些 loop 寫得更好，而是把「需要 N 個 loop」這個前提拿掉——async 進了 ABI，guest 就不需要自帶 loop 了。</p>
+
+  <p>共用 loop 也改變了「阻塞」這件事在 component 組合裡的傳染方式。0.2 裡，一個 component 在它自己的 loop 上阻塞等 IO，這個阻塞對外面是不透明的——對 caller 來說它就是一個還沒回來的同步呼叫，caller 的 loop 只能跟著卡住，或者 caller 得自己也走一套 poll。阻塞會沿著呼叫鏈往上傳，每一層都得各自處理。0.3 裡，當 C 裡的 task await 一個還沒送達的 future，它讓出的是同一個 host loop，host 可以馬上去跑別的就緒 task——包括完全無關的另一條 component 鏈。讓出與被排程都發生在同一個 loop 上，這正是本文開頭那個互動圖想讓你體感的事：sync 模式下阻塞逐層相加，async 模式下所有等待被同一個 loop 交錯吃掉。</p>
+
+  <h2>completion-based，不是 readiness-based</h2>
+
+  <p>0.3 的 async 還換了執行模型。文章說：「The async model is completion-based, not readiness-based. This is similar to the ultra-efficient Linux io_uring and Windows' IOCP/IoRing APIs.」這兩種模型的差別是 IO 介面設計裡的老問題。readiness-based——epoll、select、0.2 的 <code>poll(list&lt;pollable&gt;)</code>——的流程是：你問 kernel「這個 fd 可讀了嗎」，kernel 說「可讀了」，然後你自己去 read。它通知的是「就緒」，實際的搬運還是你做。completion-based——io_uring、IOCP——反過來：你提交一個操作（「幫我讀這個 fd」），kernel 把整件事做完，再通知你「做完了，結果在這」。通知的是「完成」，搬運由底層代勞。</p>
+
+  <p>為什麼這對 component model 是對的選擇？因為跨 component 邊界傳遞「就緒訊號再讓對方自己搬」會把 IO 的細節漏進 component 邊界。readiness 模型要求等待方持有 fd、自己發 read。但在 component 組合裡，發起 IO 的 component 跟消費結果的 component 可能隔著好幾層邊界，中間那些 component 不該、也不能碰底層 fd。completion 模型剛好對上 future 的語意：你拿到的是一個 <code>future&lt;T&gt;</code>，它 await 出來就是「完成的結果 T」，而不是「現在可以去搬了」的訊號。誰來搬、怎麼搬，封在 host 那一個 loop 裡。把它跟 io_uring 並列不是修辭——它們解的是同一類問題：用 completion 把搬運從呼叫方手裡拿走。</p>
+
+  <p>completion-based 還改變了 host 與 guest 之間誰主動的關係。readiness 模型裡，guest 是主動方：它持有 fd、自己發 read、自己決定什麼時候搬。host 只負責回答「就緒了沒」。completion 模型反過來把 guest 變成被動方：guest 提交一個操作就交出去，接下來是 host 把事做完、主動把結果送回那個 await 點。對 sandbox 安全模型這是個順手的對齊——WASM 的整個賣點就是 guest 不該直接碰宿主資源，把 IO 的搬運封進 host、guest 只看得到 future 的結果，本來就比「讓 guest 持有 fd 自己 poll」更貼合 WASM 的隔離邊界。0.3 選 completion，等於讓 async 模型跟 WASM 原本的信任邊界長在一起。</p>
+
+  <p>這也讓前面「不可 borrow」那條限制更合理。completion-based 下，一個 future 代表「一份正在被 host 處理、完成後會送達的結果」。如果它能被 borrow，等於多個持有者同時宣稱在等同一份結果，而 host 只會把它送達一個 await 點。owned-only 保證了「一個 future、一個 await、一個喚醒」的乾淨對應——這正是讓 host 那個共用 loop 能簡單正確地排程的條件。三個設計選擇——canonical ABI、共用 host loop、completion 模型——是互相咬合的，不是三件獨立的事：把 async 升格進 ABI，才談得上把 loop 收回 host；loop 收回 host，才需要一個能跨邊界送達的 completion 模型；completion 模型要乾淨，才需要 future 不可 borrow。一拉一整串。</p>
+
+  <h2>直接 compose：從毫秒到奈秒</h2>
+
+  <p>機制講完，落到使用上最大的改變是 component 之間可以直接 compose。文章對效果的描述是：「For most microservices this will reduce the time for calling other microservices from milliseconds to nanoseconds: six orders of magnitude.」注意這句帶 <code>For most microservices</code> 與 <code>will</code>——是條件式加未來式，不是已測得的普適結果。它的理由很實在：當兩個 component 可以直接 compose，呼叫對方就不必走網路；省掉的是序列化、socket、TCP/HTTP 來回那整串開銷。一個本地函式呼叫是奈秒級，一次網路 RPC 是毫秒級——六個數量級的差距來自「拿掉網路」這個結構性改變，而 0.3 讓用了 async 的 component 終於能被這樣 compose。</p>
+
+  <p>這個奈秒數字要小心讀。它不是說「同一段 component 邏輯在 0.3 跑快了六個數量級」，而是說「原本得拆成兩個 microservice、靠網路互呼的東西，現在可以 compose 成同一個 process 裡兩個直接互呼的 component」。省下的是網路那一跳，不是運算本身。能不能吃到這個好處，取決於你的兩個 component 是否真的能放在同一個 host 裡 compose——對很多既有架構，跨服務邊界是組織邊界、部署邊界，不是隨手就能合併的。文章自己也用 <code>For most microservices</code> 與 <code>will</code> 框住了這個 claim，把它當成「結構上現在可行」而非「你的系統明天就會快六個數量級」來讀，才是誠實的。</p>
+
+  <p>對不同角色，下一步的判斷不一樣。如果你在寫 WASM component——edge runtime 上的函式、plugin 系統的模組——0.3 之後 async 介面才真正能跟其他 component 拼起來，過去因為「用了 async 就不能 compose」而被迫合成一個大 component 的設計，現在可以拆開。如果你在做 host integration，要實作的 async 介面從「每個 guest runtime 各一套」收斂成「host 一套共用 loop」，對接 io_uring / IOCP 的工作集中到一個地方。而要遷移既有 0.2 介面的人，release notes 那張對照表是權威依據，多數改動是機械式的 poll-換-async-func；真正需要動腦的少數，是那些原本就刻意用 0.2 的同步攤平來規避 composition 限制的介面——它們的設計假設在 0.3 失效，得重想。</p>
+
+  <p>時程是這篇唯一會過期的部分。<code>poll(list&lt;pollable&gt;)</code> 變成 await、三步舞變成一行，這些語意是 durable 的；但「現在能不能用」要看 runtime 與語言支援。Wasmtime 45 跑的是 release candidate，按文章說法「Wasmtime 46 will ship WASI 0.3.0 with Component Model Async enabled by default」——預設開啟要等 46。guest 端的語言 binding 也還沒到齊：「Async support for guest binding generators is also in-progress for many languages」，多數語言的 async guest 支援仍 in-progress，官方用未來式說「you'll be able to write WASI 0.3 components in Rust, Go, JavaScript, Python, and more」。規格 stable 與工具鏈到位之間，這段差距是現在要評估遷移時必須算進去的。</p>
+
+  <p class="vg-deep-closer"><strong>What this enables</strong>：把 event loop 從每個 component 收回給 host、配上 completion-based 的 owned future，WASI 0.3 讓「用了 async 的 component」與「可被 compose 的 component」第一次成為同一種 component——這是 0.2 結構上做不到的事。</p>
+</div>
