@@ -4,6 +4,10 @@
 //   #2  matter-of-fact-table rendered as <pre> instead of a real <table>
 //   #11 SVG role=button widget with data-target rects but no bridge script
 //
+// Note: #11 is file-level. A green result only proves at least one
+// getAttribute('data-target') bridge exists in the file, NOT that every
+// SVG-button widget is individually wired.
+//
 // See docs/superpowers/specs/2026-06-15-widget-antipattern-gate-design.md
 // and the vatt-ghern-widget-gotchas memory (#2, #11).
 //
@@ -13,6 +17,7 @@
 
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 // Pure scanner: takes HTML text, returns an array of findings.
 // A finding is { rule, file, detail }.
@@ -20,11 +25,11 @@ export function scanWidgetStatic(html, file) {
   const findings = [];
 
   // --- Rule #2: fake matter-of-fact-table ---------------------------------
-  const figureRe = /<figure\b[^>]*\bclass="([^"]*)"[^>]*>([\s\S]*?)<\/figure>/gi;
+  const figureRe = /<figure\b[^>]*\bclass=(["'])([^"']*)\1[^>]*>([\s\S]*?)<\/figure>/gi;
   let m;
   while ((m = figureRe.exec(html)) !== null) {
-    const cls = m[1];
-    const body = m[2];
+    const cls = m[2];
+    const body = m[3];
     if (/\bvg-w-table-[a-z0-9-]+/i.test(cls)) {
       if (!/<table\b/i.test(body)) {
         findings.push({
@@ -96,7 +101,6 @@ function main() {
   process.exit(all.length ? 1 : 0);
 }
 
-import { fileURLToPath } from "node:url";
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   main();
 }

@@ -19,6 +19,15 @@ test("fake-table: real <table> passes", () => {
   assert.ok(!findings.some((f) => f.rule === "fake-table"));
 });
 
+test("fake-table: flags only the broken figure among clean siblings", () => {
+  const html = `
+    <figure class="vg-w-table-good"><table><tr><td>x</td></tr></table></figure>
+    <figure class="vg-w-table-bad"><pre>a  b</pre></figure>`;
+  const findings = scanWidgetStatic(html, "multi.html").filter((f) => f.rule === "fake-table");
+  assert.equal(findings.length, 1);
+  assert.ok(findings[0].detail.includes("vg-w-table-bad"));
+});
+
 test("dead-svg-button: data-target without bridge fires", () => {
   const findings = scanWidgetStatic(read("dead-svg-button-flag.html"), "dead-svg-button-flag.html");
   assert.ok(findings.some((f) => f.rule === "dead-svg-button"));
