@@ -1,0 +1,593 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">在 Postgres 裡，一筆 <code>DELETE</code> 不會把空間還給作業系統——它只是把 row 標成「死的」，留給 autovacuum 日後清掃，索引原封不動，還得當成一份寫入複製到下游。用 PlanetScale 的話講，這是「work added，not work done」。唯一規模化的刪除，是讓刪除退化成 <code>DROP TABLE</code>。</p>
+  <h1 class="vg-post-title">{{ title }}</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p><span class="vg-dropcap">刪</span>除資料聽起來像是「把工作做完」——把不要的 row 拿掉，table 應該變小、磁碟應該變鬆。Postgres 的 MVCC 把這個直覺整個顛倒過來。PlanetScale 的 Tom Pang 在 2026 年 6 月 11 日的文章裡講得很直接：<code>DELETE</code> 不刪實體資料，它只在 row 上記一個「這版本到某交易之後就看不到了」的標記，真正回收空間的是後面跑來的 vacuum。大量刪除時，這筆帳會累積成 dead tuple、索引膨脹、WAL 放大、複製延遲。文章的結論是一句反直覺的設計判斷：與其把刪除做快，不如把資料結構設計成「刪除就是 <code>DROP TABLE</code>」——也就是 date-based partitioning，讓批次刪除退化成偶爾 drop 一個 partition。</p>
+
+  <figure class="vg-w-heap-postgres-dead-tuple" data-mobile="swap" data-mobile-summary="DELETE 只把 row 標成死的、空間留在原處等 vacuum；只有 DROP TABLE 直接刪檔，磁碟才一次歸零。">
+    <style>
+      .vg-w-heap-postgres-dead-tuple { display: grid; grid-template-rows: auto auto 1fr auto; gap: var(--s-2); }
+      .vg-w-heap-postgres-dead-tuple .vg-w-affordance { display: flex; align-items: center; gap: var(--s-1); font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin: 0; }
+      .vg-w-heap-postgres-dead-tuple .controls { display: flex; flex-wrap: wrap; gap: var(--s-2); align-items: center; }
+      .vg-w-heap-postgres-dead-tuple button { font-family: var(--sans); font-size: var(--fs-sm); padding: 6px 14px; min-height: 44px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); cursor: pointer; }
+      .vg-w-heap-postgres-dead-tuple button:hover { border-color: var(--accent); color: var(--accent-text); }
+      .vg-w-heap-postgres-dead-tuple .meter { display: grid; grid-template-columns: auto 1fr; gap: var(--s-1) var(--s-2); align-items: center; font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); }
+      .vg-w-heap-postgres-dead-tuple .meter .track { height: 12px; background: var(--bg-soft); border: 1px solid var(--line); position: relative; }
+      .vg-w-heap-postgres-dead-tuple .meter .fill { position: absolute; left: 0; top: 0; bottom: 0; background: var(--accent); transition: width 200ms ease-out; }
+      .vg-w-heap-postgres-dead-tuple .meter .fill.os { background: var(--sage-deep); }
+      .vg-w-heap-postgres-dead-tuple canvas { width: 100%; height: auto; aspect-ratio: 16 / 9; display: block; }
+      .vg-w-heap-postgres-dead-tuple figcaption { font-family: var(--scribed); font-style: italic; font-size: var(--fs-sm); color: var(--muted); }
+      @media (max-width: 720px) { .vg-w-heap-postgres-dead-tuple canvas { aspect-ratio: 4 / 3; } }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/><path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+      </svg>
+      <span>按按鈕操作 heap page · INSERT / DELETE / VACUUM / DROP 各看磁碟怎麼變</span>
+    </p>
+
+    <div class="controls" role="group" aria-label="heap 操作">
+      <button data-act="insert">+ INSERT 一批</button>
+      <button data-act="delete">DELETE 一半</button>
+      <button data-act="vacuum">VACUUM</button>
+      <button data-act="drop">DROP TABLE</button>
+      <button data-act="reset">↺ reset</button>
+    </div>
+
+    <canvas id="vg-w-heap-postgres-dead-tuple-canvas"></canvas>
+
+    <div class="meter">
+      <span>table 佔的頁面</span>
+      <div class="track"><div class="fill" data-fill="pages" style="width:0%"></div></div>
+      <span>還給 OS 的空間</span>
+      <div class="track"><div class="fill os" data-fill="os" style="width:0%"></div></div>
+    </div>
+
+    <figcaption data-cap>每個小方格是一個 tuple：實心是 live、空心打叉是 dead。DELETE 把 live 轉成 dead，頁面數不變；VACUUM 把 dead 標成「可覆寫」，頁面數還是不變、空間仍在 Postgres 手上；只有 DROP TABLE 把整個檔案刪掉，OS 才真正拿回空間。</figcaption>
+
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        const root = document.querySelector('.vg-w-heap-postgres-dead-tuple');
+        const canvas = root.querySelector('#vg-w-heap-postgres-dead-tuple-canvas');
+        const ctx = canvas.getContext('2d');
+        const fillPages = root.querySelector('[data-fill="pages"]');
+        const fillOs = root.querySelector('[data-fill="os"]');
+        const cap = root.querySelector('[data-cap]');
+
+        const PER_PAGE = 12;      // tuples per page (visual)
+        const MAX_PAGES = 8;
+        // tuples: array of {state: 'live'|'dead'|'free'}
+        let pages = [];           // each page = array of tuple states
+        let osReclaimed = 0;      // pages handed back to OS
+        let dropped = false;
+
+        function resize() {
+          const dpr = window.devicePixelRatio || 1;
+          const rect = canvas.getBoundingClientRect();
+          canvas.width = rect.width * dpr;
+          canvas.height = rect.height * dpr;
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        }
+        new ResizeObserver(() => { resize(); draw(); }).observe(canvas);
+
+        function cssVar(n) { return getComputedStyle(root).getPropertyValue(n).trim() || '#000'; }
+
+        function insert() {
+          dropped = false;
+          // fill into existing 'free' slots first, then new pages
+          let toAdd = 18;
+          for (const pg of pages) {
+            for (let i = 0; i < pg.length && toAdd > 0; i++) {
+              if (pg[i] === 'free') { pg[i] = 'live'; toAdd--; }
+            }
+          }
+          while (toAdd > 0 && pages.length < MAX_PAGES) {
+            const pg = new Array(PER_PAGE).fill('free');
+            for (let i = 0; i < PER_PAGE && toAdd > 0; i++) { pg[i] = 'live'; toAdd--; }
+            pages.push(pg);
+          }
+          cap.textContent = 'INSERT：新 row 先填進現有頁面的空槽，填滿才向 OS 要新頁面。table 變大。';
+        }
+
+        function del() {
+          // turn roughly half the live tuples into dead — heap pages UNCHANGED
+          for (const pg of pages) {
+            for (let i = 0; i < pg.length; i++) {
+              if (pg[i] === 'live' && Math.random() < 0.5) pg[i] = 'dead';
+            }
+          }
+          cap.textContent = 'DELETE：live → dead。注意頁面數一格沒少——刪掉的 row 變成 dead tuple 留在原處，這就是「work added」。';
+        }
+
+        function vacuum() {
+          // dead -> free (reusable), pages NOT returned unless trailing page fully free
+          for (const pg of pages) {
+            for (let i = 0; i < pg.length; i++) if (pg[i] === 'dead') pg[i] = 'free';
+          }
+          // only trailing entirely-free pages get returned (rare special case)
+          let returned = 0;
+          while (pages.length > 0 && pages[pages.length - 1].every((s) => s === 'free')) {
+            pages.pop(); returned++;
+          }
+          osReclaimed = Math.min(MAX_PAGES, osReclaimed + returned);
+          cap.textContent = returned > 0
+            ? 'VACUUM：dead 標成可覆寫；剛好末尾整頁全空，這一頁才還給 OS（特例）。其餘空間仍在 Postgres 手上。'
+            : 'VACUUM：dead 全標成可覆寫，但頁面留著等新 row 覆蓋——標準 VACUUM 不把空間還給 OS。';
+        }
+
+        function drop() {
+          pages = [];
+          osReclaimed = MAX_PAGES;
+          dropped = true;
+          cap.textContent = 'DROP TABLE：整個 heap 檔案被刪除、buffer cache 直接清掉。磁碟一次歸零——零 dead tuple、零 vacuum 債。';
+        }
+
+        function reset() {
+          pages = []; osReclaimed = 0; dropped = false;
+          cap.textContent = '空 table。按 INSERT 開始。';
+        }
+
+        function counts() {
+          let live = 0, dead = 0, free = 0;
+          for (const pg of pages) for (const s of pg) {
+            if (s === 'live') live++; else if (s === 'dead') dead++; else free++;
+          }
+          return { live, dead, free };
+        }
+
+        function draw() {
+          const W = canvas.getBoundingClientRect().width;
+          const H = canvas.getBoundingClientRect().height;
+          ctx.clearRect(0, 0, W, H);
+          ctx.font = '13px "EB Garamond", serif';
+
+          const cols = 4;
+          const rows = 2;
+          const padX = 16, padY = 28, gapX = 14, gapY = 16;
+          const cellW = (W - padX * 2 - gapX * (cols - 1)) / cols;
+          const cellH = (H - padY - 18 - gapY * (rows - 1)) / rows;
+
+          ctx.fillStyle = cssVar('--muted');
+          ctx.fillText('heap：' + pages.length + ' 頁 / ' + MAX_PAGES + ' 上限', padX, 18);
+
+          for (let p = 0; p < MAX_PAGES; p++) {
+            const r = Math.floor(p / cols), c = p % cols;
+            const x = padX + c * (cellW + gapX);
+            const y = padY + r * (cellH + gapY);
+            const used = p < pages.length;
+            ctx.strokeStyle = used ? cssVar('--ink') : cssVar('--muted-2');
+            ctx.lineWidth = used ? 1.5 : 1;
+            ctx.setLineDash(used ? [] : [3, 3]);
+            ctx.strokeRect(x, y, cellW, cellH);
+            ctx.setLineDash([]);
+            if (!used) continue;
+            const pg = pages[p];
+            const tcols = 4, trows = 3;
+            const tpadX = 6, tpadY = 6, tgap = 3;
+            const tw = (cellW - tpadX * 2 - tgap * (tcols - 1)) / tcols;
+            const th = (cellH - tpadY * 2 - tgap * (trows - 1)) / trows;
+            for (let i = 0; i < PER_PAGE; i++) {
+              const tr = Math.floor(i / tcols), tc = i % tcols;
+              const tx = x + tpadX + tc * (tw + tgap);
+              const ty = y + tpadY + tr * (th + tgap);
+              const st = pg[i];
+              if (st === 'live') {
+                ctx.fillStyle = cssVar('--accent'); ctx.globalAlpha = 0.85;
+                ctx.fillRect(tx, ty, tw, th); ctx.globalAlpha = 1;
+              } else if (st === 'dead') {
+                ctx.strokeStyle = cssVar('--muted'); ctx.lineWidth = 1;
+                ctx.strokeRect(tx, ty, tw, th);
+                ctx.beginPath();
+                ctx.moveTo(tx, ty); ctx.lineTo(tx + tw, ty + th);
+                ctx.moveTo(tx + tw, ty); ctx.lineTo(tx, ty + th);
+                ctx.strokeStyle = cssVar('--muted-2'); ctx.stroke();
+              } else {
+                ctx.strokeStyle = cssVar('--line'); ctx.lineWidth = 1;
+                ctx.strokeRect(tx, ty, tw, th);
+              }
+            }
+          }
+          const c = counts();
+          ctx.fillStyle = cssVar('--muted');
+          ctx.fillText('live ' + c.live + ' · dead ' + c.dead + ' · free ' + c.free, padX, H - 4);
+
+          const pagePct = (pages.length / MAX_PAGES) * 100;
+          fillPages.style.width = pagePct.toFixed(0) + '%';
+          fillOs.style.width = ((osReclaimed / MAX_PAGES) * 100).toFixed(0) + '%';
+        }
+
+        root.querySelectorAll('button[data-act]').forEach((b) => {
+          b.addEventListener('click', () => {
+            const a = b.dataset.act;
+            if (a === 'insert') insert();
+            else if (a === 'delete') del();
+            else if (a === 'vacuum') vacuum();
+            else if (a === 'drop') drop();
+            else reset();
+            draw();
+          });
+        });
+
+        resize();
+        reset();
+        draw();
+      })();
+    </script>
+  </figure>
+
+  <h2>dead tuple：DELETE 標記，不刪除</h2>
+
+  <p>Postgres 的 MVCC 讓同一個 row 可以同時存在多個版本，這樣不同交易能各自看到「自己查詢當下」的值。官方文件講得很白：「In PostgreSQL, an <code>UPDATE</code> or <code>DELETE</code> of a row does not immediately remove the old version of the row.」——一個 row 的舊版本不會在 <code>DELETE</code> 當下就被移除。原因是 MVCC 的正確性需要它：只要還有交易可能看得到這個版本，它就不能被刪。實際存放方式是把修改過、刪除過的 row 跟現行的擺在一起，靠 transaction ID 與 visibility map 去跳過那些「dead tuple」。Pang 的描述是：「It stores modified and deleted rows alongside current ones, relying on transaction IDs and visibility maps to skip over 'dead tuples'.」</p>
+
+  <p>所以一筆 <code>DELETE</code> 在物理上做的事，是把 tuple header 裡的 <code>xmax</code> 填上目前的交易 ID，宣告「這個版本在這個交易之後就不可見了」。tuple 還躺在原本的 heap page 上，佔的 byte 一個沒少。讀取的交易靠 <code>xmin</code> / <code>xmax</code> 跟自己的 snapshot 比對 dead tuple 的可見性——它不出現在結果裡，但仍然要被掃過、被判斷。上面那個互動模擬就是這個機制：按下 DELETE，實心方格變成打叉的空格，頁面數一格不少。批次刪一百萬列，等於在 heap 裡留下一百萬個要日後清理的 dead tuple。</p>
+
+  <p>每個 tuple 的 header 都帶著一對交易 ID：<code>xmin</code> 是「哪個交易插入了這個版本」，<code>xmax</code> 是「哪個交易把它標成 dead」。一個讀取交易拿著自己的 snapshot 走過 heap，對每個 tuple 都要做同一套判斷——<code>xmin</code> 是否已經 commit 且在我可見的範圍內、<code>xmax</code> 是否還沒填或填的是我看不到的交易。只有兩個條件都對，這個版本才算「對我可見」。dead tuple 的麻煩就在這裡：它的 <code>xmax</code> 已經填上某個 commit 的交易，對「現在」的查詢來說早就不可見，可是它不能被立刻清掉。原因是 MVCC 的正確性——只要系統裡還存在一個更早開始、snapshot 看得到這個版本的長交易，這個 dead tuple 對「那個交易」就還是活的。換句話說，一個 tuple 能不能被回收，不是看它對當下可不可見，而是看它對「所有還沒結束的交易」是不是都已經不可見。這個門檻（Postgres 內部以一個最舊可見 horizon 在追蹤）一旦被一個遲遲不結束的長交易卡住，整個資料庫的 dead tuple 都回收不了——這也是為什麼一條忘了 commit 的交易能讓 bloat 失控。回到刪除：<code>DELETE</code> 只負責填 <code>xmax</code>，至於這些版本何時真的能被覆寫，要等到沒有任何交易還看得到它們，再加上 vacuum 真的跑過來這兩件事都成立。</p>
+
+  <p>這跟大多數人腦中的成本模型是錯位的。直覺把刪除想成「釋放」，把空間想成刪完就立刻變鬆；MVCC 的現實是刪除其實是「再寫一次」——把每個被刪 tuple 的 header 改一遍，動到的那些頁面全部變成 dirty page，要被寫回磁碟、要進 WAL。換句話說，你以為在做減法，引擎在做的卻是加法。真正的「變小」要等很久以後 vacuum 跑過、而且還要有新資料來覆蓋那些空槽才會發生。這個落差就是後面每一段成本的源頭：dead tuple 不會自己消失，它們從刪除那一刻起就掛在帳上，等著被別人來清。一張高刪除率的表，可見的 live row 也許只剩兩成，磁碟上卻仍維持滿載的尺寸，差額全是還沒被回收的死版本。對讀取端來說，這些死版本不是透明的——visibility map 雖然能標記「整頁都還活著」讓掃描跳過，但只要一頁裡混了 dead tuple，這頁就得逐 tuple 判斷可見性，掃描成本就回來了。</p>
+
+  <h2>autovacuum：把回收推遲到日後</h2>
+
+  <p>既然 <code>DELETE</code> 不釋放空間，回收就得有別人來做。官方文件列出 <code>VACUUM</code> 必須定期處理 table 的理由，第一條就是「To recover or reuse disk space occupied by updated or deleted rows.」——回收或重用被更新、刪除的 row 佔掉的磁碟空間。Pang 用了一個擬人的講法：「Later on, a vacuum process comes along and says, 'Hey, these bytes in this heap page are now free, you can overwrite them.'」——稍後 vacuum 跑過來說，這些 byte 現在空了，你可以覆寫它們。</p>
+
+  <p>關鍵在「可以覆寫」四個字，而不是「還給作業系統」。文件對標準 <code>VACUUM</code> 的行為說得很清楚：「The standard form of <code>VACUUM</code> removes dead row versions in tables and indexes and marks the space available for future reuse. However, it will not return the space to the operating system, except in the special case where one or more pages at the end of a table become entirely free and an exclusive table lock can be easily obtained.」——標準 <code>VACUUM</code> 把 dead row 版本標成「將來可重用」，但不把空間還給 OS，除非剛好是 table 末尾整頁全空、又能輕鬆拿到 exclusive lock 這個特例。在互動模擬裡按 VACUUM，你會看到 dead 方格變回空槽（可覆寫），但頁面數通常不動，「還給 OS」那條量表多半維持原樣。</p>
+
+  <p>Pang 把這點明說成 Postgres 的刻意選擇：「<code>DELETE</code> or even autovacuum doesn't typically return data to the operating system; they only say 'the space in those pages can be written over.' This is an intentional choice by Postgres.」這個選擇有它的道理：「It optimizes for the case where <code>DELETE</code> workloads are mixed with <code>INSERT</code> ones, and releasing space to the operating system and then asking for it back is relatively expensive and should be avoided.」刪除跟插入混在一起時，把空間還 OS 再要回來相對昂貴，留著等覆寫反而划算。問題是這假設在「批次刪除、之後不再回填」的場景下失效：沒有等量的新 row 來覆蓋那些空槽，table 在磁碟上維持原尺寸，內部卻佈滿可重用的洞——這就是 bloat。Pang 提醒：「If you're running a <code>DELETE</code> over a large amount of data, you can imagine how it adds work to every read query and autovacuum.」大量 <code>DELETE</code> 替每一條讀取查詢、也替 autovacuum 加了工作。</p>
+
+  <p>把 autovacuum 想成一個跟在後面收垃圾的背景行程會比較準確。它不是即時的：autovacuum 由 dead tuple 累積到一定門檻才被觸發，跑起來又要跟線上 workload 搶 IO 與 CPU，所以在突發的批次刪除之後，它幾乎一定是落後的——dead tuple 先堆起來，vacuum 才慢慢追。落後多少，直接決定了 table 在磁碟上膨脹多少。</p>
+
+  <p>觸發門檻這件事值得拆開看，因為它正好解釋了批次刪除為什麼特別容易把 autovacuum 餓著。autovacuum 判斷一張表該不該清，靠的是「死掉的 tuple 數量超過某個比例的表大小」這類門檻——大致是一個固定基數加上表行數的某個百分比。合理的推測是，這個設計對「穩定混合 workload」很合理：刪一點、改一點，死 tuple 緩緩累積到門檻，vacuum 從容跟上。但批次刪除違反了這個假設——它在極短時間內一次製造海量 dead tuple，瞬間遠遠衝過門檻，autovacuum 這才被叫醒，從零開始追一座已經堆好的山。更糟的是，autovacuum 同時間能跑的 worker 數量有上限，又被刻意限速以免吃垮線上 IO，於是一邊是突然出現的百萬筆死版本，一邊是慢慢爬的回收速度，落後幾乎是必然。這段門檻與限速的細節是順著 autovacuum 機制推的，文章本身談的是「<code>DELETE</code> 替 autovacuum 加工作」這個結果，沒有展開到觸發參數。</p>
+
+  <p>更麻煩的是官方文件明講 autovacuum 行為的一個特性：它「will never issue <code>VACUUM FULL</code>」，永遠不會主動做那個會把整張表重寫、真正壓縮還空間的版本。官方對 <code>VACUUM FULL</code> 的描述是：「In contrast, <code>VACUUM FULL</code> actively compacts tables by writing a complete new version of the table file with no dead space. This minimizes the size of the table, but can take a long time.」——它主動壓縮表，把整張表重寫成一份沒有 dead space 的新檔，能把尺寸縮到最小，但會花很久。也就是說，靠 autovacuum 你最多只能拿回「可覆寫」的狀態，拿不回磁碟尺寸——要把已經膨脹的表縮回去，得手動跑 <code>VACUUM FULL</code>，而它需要鎖住整張表、又要把表完整重寫一遍，對線上服務同樣昂貴。這就構成一個尷尬的兩難：自動的那個只標記不縮表，能縮表的那個又重到不能在尖峰時間對線上大表跑。批次刪除把你推進的，正是這個兩難的中間地帶。下面這個互動小工具把兩個變數放上滑桿：刪除比例，跟 autovacuum 落後的程度。兩者越高，實際磁碟佔用相對於真正還活著的資料就膨脹越多——這就是 bloat 的形狀。</p>
+
+  <figure class="vg-w-param-postgres-bloat-curve" data-mobile="static" data-svg-scroll="720">
+    <style>
+      .vg-w-param-postgres-bloat-curve { display: grid; grid-template-rows: auto auto 1fr auto; gap: var(--s-2); }
+      .vg-w-param-postgres-bloat-curve .vg-w-affordance { display: flex; align-items: center; gap: var(--s-1); font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin: 0; }
+      .vg-w-param-postgres-bloat-curve .controls { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); flex-wrap: wrap; }
+      .vg-w-param-postgres-bloat-curve .controls label { min-width: 11ch; }
+      .vg-w-param-postgres-bloat-curve .controls input { flex: 1; min-width: 120px; height: 36px; accent-color: var(--accent); touch-action: none; }
+      .vg-w-param-postgres-bloat-curve .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 6ch; text-align: right; }
+      .vg-w-param-postgres-bloat-curve svg { width: 100%; height: auto; }
+      .vg-w-param-postgres-bloat-curve figcaption { font-family: var(--scribed); font-style: italic; font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M5 12h14"/><path d="m12 5 7 7-7 7"/>
+      </svg>
+      <span>拖兩根滑桿 · 刪除比例 × autovacuum 落後 → 看 table 膨脹</span>
+    </p>
+
+    <div class="controls" role="group" aria-label="bloat 參數" data-vg-controls>
+      <label for="vg-w-param-postgres-bloat-curve-del">刪除比例</label>
+      <input id="vg-w-param-postgres-bloat-curve-del" type="range" min="0" max="90" step="5" value="50" />
+      <span class="readout" data-out="del">50%</span>
+    </div>
+    <div class="controls" role="group" aria-label="vacuum 落後" data-vg-controls>
+      <label for="vg-w-param-postgres-bloat-curve-lag">vacuum 落後</label>
+      <input id="vg-w-param-postgres-bloat-curve-lag" type="range" min="0" max="100" step="5" value="70" />
+      <span class="readout" data-out="lag">70%</span>
+    </div>
+
+    <svg viewBox="0 0 720 300" preserveAspectRatio="xMidYMid meet" role="img" aria-label="刪除比例與 vacuum 落後決定 table bloat 倍率的長條圖">
+      <line x1="70" y1="250" x2="700" y2="250" stroke="var(--muted-2)" stroke-width="1"/>
+      <line x1="70" y1="30" x2="70" y2="250" stroke="var(--muted-2)" stroke-width="1"/>
+      <text x="20" y="140" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="13" fill="var(--muted)" transform="rotate(-90 20 140)">磁碟佔用 (相對原始 = 1.0)</text>
+
+      <!-- baseline (logical live data) -->
+      <rect x="140" y="170" width="120" height="80" fill="var(--sage)" opacity="0.6"/>
+      <text x="200" y="270" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--muted)">邏輯上的 live 資料</text>
+      <text x="200" y="160" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--sage-deep)" data-live-pct>50%</text>
+
+      <!-- actual on-disk size -->
+      <rect data-bloat-bar x="420" y="90" width="120" height="160" fill="var(--accent)" opacity="0.5"/>
+      <line data-orig-line x1="410" y1="170" x2="550" y2="170" stroke="var(--muted)" stroke-width="1" stroke-dasharray="4,3"/>
+      <text x="480" y="270" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--muted)">實際磁碟佔用</text>
+      <text data-bloat-label x="480" y="80" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="14" fill="var(--accent-text)">1.0×</text>
+
+      <text x="385" y="20" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="13" fill="var(--ink)" data-verdict>刪一半、vacuum 落後七成——磁碟幾乎沒縮，全是 dead tuple 撐著。</text>
+    </svg>
+
+    <figcaption>模型示意：刪除比例越高、autovacuum 越落後，實際磁碟佔用相對於「真正還活著的資料」就膨脹越多。標準 VACUUM 只把 dead 標成可覆寫，磁碟尺寸要等新 row 回填或 VACUUM FULL 才會降，所以即使刪掉大半，on-disk size 仍貼著原始高水位。曲線為機制示意，非實測基準。</figcaption>
+
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        const root = document.querySelector('.vg-w-param-postgres-bloat-curve');
+        const del = root.querySelector('#vg-w-param-postgres-bloat-curve-del');
+        const lag = root.querySelector('#vg-w-param-postgres-bloat-curve-lag');
+        const outDel = root.querySelector('[data-out="del"]');
+        const outLag = root.querySelector('[data-out="lag"]');
+        const bar = root.querySelector('[data-bloat-bar]');
+        const label = root.querySelector('[data-bloat-label]');
+        const livePct = root.querySelector('[data-live-pct]');
+        const verdict = root.querySelector('[data-verdict]');
+
+        const Y0 = 250, TOP = 50; // bar bottom & top of plotting region
+        const ORIG_H = 80;        // height representing 1.0x (original size)
+
+        function update() {
+          const d = Number(del.value) / 100;   // fraction deleted
+          const l = Number(lag.value) / 100;    // vacuum lag fraction (1 = fully behind)
+          outDel.textContent = del.value + '%';
+          outLag.textContent = lag.value + '%';
+          livePct.textContent = Math.round((1 - d) * 100) + '%';
+
+          // logical live fraction = (1 - d). On-disk stays near original (1.0)
+          // until vacuum catches up AND new rows reuse the holes.
+          // bloat ratio relative to live data = 1 / max(live, 1 - d*l ... )
+          const live = Math.max(0.05, 1 - d);
+          // effective on-disk: original (1.0) shrinks only by the part vacuum
+          // reclaimed AND that wasn't refilled — here modelled as fully behind => 1.0
+          const onDisk = live + d * (1 - (1 - l)); // when l=1 -> back to 1.0; l=0 -> live
+          const ratio = onDisk / live;
+
+          const h = Math.min(200, ORIG_H * onDisk * 2);
+          bar.setAttribute('y', String(Y0 - h));
+          bar.setAttribute('height', String(h));
+          label.setAttribute('y', String(Math.max(TOP, Y0 - h - 8)));
+          label.textContent = ratio.toFixed(1) + '×';
+
+          if (d < 0.1) {
+            verdict.textContent = '幾乎沒刪——磁碟佔用就等於 live 資料，沒有 bloat 問題。';
+          } else if (l > 0.6) {
+            verdict.textContent = '刪 ' + del.value + '%、vacuum 落後 ' + lag.value + '%——磁碟幾乎沒縮，全是 dead tuple 撐著高水位。';
+          } else if (l < 0.2) {
+            verdict.textContent = 'vacuum 跟上了：dead 已標可覆寫，但磁碟尺寸仍要等新 row 回填或 VACUUM FULL 才真正降。';
+          } else {
+            verdict.textContent = '部分回收：dead 一部分標成可覆寫，但 on-disk size 仍貼著原始高水位。';
+          }
+        }
+        del.addEventListener('input', update);
+        lag.addEventListener('input', update);
+        update();
+      })();
+    </script>
+  </figure>
+
+  <h2>index bloat：索引完全沒被碰到</h2>
+
+  <p>heap 的 dead tuple 還只是一半故事。Pang 指出 <code>DELETE</code> 連索引都不動：「index data is not touched at all when issuing a <code>DELETE</code>; instead, readers reading the index have to resolve 'is this tuple dead.'」——下 <code>DELETE</code> 時索引資料完全沒被碰，是讀索引的人得自己去解「這個 tuple 是不是死了」。</p>
+
+  <p>這對 B-tree 索引特別痛。索引項仍然指向那些已經 dead 的 heap tuple，掃索引的查詢沿著索引項走到 heap、再去檢查 visibility，發現是 dead 就丟掉。換句話說刪除越多，索引裡指向死資料的「殭屍指標」越多，每次索引掃描要過濾掉的無效項也越多。直到 vacuum 跑過，才會把這些索引項一併清掉——官方文件也確認標準 <code>VACUUM</code> 是同時處理 table 與索引的：「removes dead row versions in tables and indexes」。在 vacuum 追上之前，這段成本是讀取端在付：每一次走索引，都得多走一段、多判斷一輪。</p>
+
+  <p>把這件事放回「成本被轉嫁」的框架就更清楚了。下 <code>DELETE</code> 的那個交易，付的只是改 heap header 的錢，它很快就 commit、回報成功，看起來乾淨俐落。可是這筆刪除在索引上留下的爛攤子，帳是記在後面每一個讀者頭上的——他們不知道自己掃過的那些索引項早就指向死資料，只是默默多花了時間去走、去判斷、去丟棄。這種「寫的人輕鬆、讀的人埋單」的不對稱，正是大量 <code>DELETE</code> 最隱蔽的地方：監控上你看到刪除很快就完成，卻在幾小時後發現一批讀取查詢的延遲悄悄爬高，兩件事之間的因果並不直觀。下面這張圖把同一筆「邏輯上的刪除」攤開成它在物理層實際展開的幾份寫入工作，讓這個轉嫁看得見。</p>
+
+  <p>這裡有一個容易被忽略的不對稱。官方文件確認標準 <code>VACUUM</code> 同時處理 table 與索引、把空間標成可重用，但「標成可重用」之後 heap 與索引的回填行為並不一樣。合理的推測是，heap 的空槽只要有新 row 寫進來就容易被原地蓋掉，B-tree 索引項受結構限制，新插入的 key 未必落回剛被刪掉的位置，於是在高刪除率的表上，索引的膨脹常常比 heap 更難自然收斂，最後得靠 <code>REINDEX</code> 重建——又是一筆要鎖、要重寫的維護成本。這部分是順著機制推的，文章本身沒有展開到索引回填策略。</p>
+
+  <p>合理的推測是，這也是為什麼常有人觀察到「刪了一大批資料、查詢反而變慢」——不是 planner 壞了，是索引跟 heap 同時膨脹，讀取要掃過、判斷、丟棄的 dead 版本變多了。你以為刪除替查詢瘦身，實際上在 vacuum 追上、索引重建之前，刪除的帳完整地轉嫁到後面每一次讀取上。</p>
+
+  <figure class="vg-w-amp-postgres-delete-write" data-mobile="keep" data-svg-scroll="720">
+    <svg class="vg-w-amp-postgres-delete-write-svg" viewBox="0 0 720 340" role="img"
+         aria-label="一筆邏輯 DELETE 在物理上展開成 heap header 改寫、索引留殭屍指標、WAL 記錄、複製到下游四份寫入工作"
+         style="width: 100%; height: auto; max-width: 720px;">
+      <style>
+        .vg-w-amp-postgres-delete-write-svg text { font-family: EB Garamond, serif; font-size: 13px; }
+        .vg-w-amp-postgres-delete-write-svg .head { font-family: IM Fell English, serif; font-style: italic; font-size: 14px; }
+        .vg-w-amp-postgres-delete-write-svg .lbl { font-family: IM Fell English, serif; font-style: italic; font-size: 12px; fill: var(--muted); }
+        .vg-w-amp-postgres-delete-write-svg .num { font-family: JetBrains Mono, monospace; font-size: 11px; }
+        .vg-w-amp-postgres-delete-write-svg .box { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; }
+        .vg-w-amp-postgres-delete-write-svg .work { fill: var(--accent); fill-opacity: 0.18; stroke: var(--accent); stroke-width: 1.5; }
+      </style>
+      <defs>
+        <marker id="vg-w-amp-postgres-delete-write-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0 0 L10 5 L0 10 z" fill="var(--muted)"/>
+        </marker>
+      </defs>
+
+      <text x="360" y="24" text-anchor="middle" fill="var(--ink)" class="head">一筆「邏輯上的刪除」展開成四份物理寫入工作</text>
+
+      <!-- logical delete -->
+      <rect class="box" x="40" y="60" width="150" height="56"/>
+      <text x="115" y="84" text-anchor="middle" fill="var(--ink)">DELETE … WHERE</text>
+      <text x="115" y="102" text-anchor="middle" class="lbl">邏輯：一句 SQL</text>
+
+      <line x1="190" y1="88" x2="250" y2="88" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#vg-w-amp-postgres-delete-write-arrow)"/>
+
+      <!-- work 1: heap header -->
+      <rect class="work" x="250" y="48" width="200" height="40"/>
+      <text x="350" y="66" text-anchor="middle" fill="var(--ink)">改寫 heap tuple header</text>
+      <text x="350" y="82" text-anchor="middle" class="lbl">填 xmax，page 變 dirty</text>
+
+      <!-- work 2: index untouched -->
+      <rect class="work" x="250" y="96" width="200" height="40"/>
+      <text x="350" y="114" text-anchor="middle" fill="var(--ink)">索引留下殭屍指標</text>
+      <text x="350" y="130" text-anchor="middle" class="lbl">index not touched，讀者自查 dead</text>
+
+      <!-- work 3: WAL -->
+      <rect class="work" x="250" y="144" width="200" height="40"/>
+      <text x="350" y="162" text-anchor="middle" fill="var(--ink)">寫一筆 WAL record</text>
+      <text x="350" y="178" text-anchor="middle" class="lbl">刪除也是寫，要落 WAL</text>
+
+      <!-- work 4: replication -->
+      <rect class="work" x="250" y="192" width="200" height="40"/>
+      <text x="350" y="210" text-anchor="middle" fill="var(--ink)">複製到下游 replica</text>
+      <text x="350" y="226" text-anchor="middle" class="lbl">當成一份 write 全程複製</text>
+
+      <!-- deferred work: vacuum -->
+      <line x1="450" y1="68" x2="520" y2="68" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#vg-w-amp-postgres-delete-write-arrow)"/>
+      <rect class="box" x="520" y="48" width="160" height="184" stroke-dasharray="4,3"/>
+      <text x="600" y="80" text-anchor="middle" fill="var(--ink)">autovacuum</text>
+      <text x="600" y="102" text-anchor="middle" class="lbl">日後才跑</text>
+      <text x="600" y="128" text-anchor="middle" class="lbl">heap dead → 可覆寫</text>
+      <text x="600" y="150" text-anchor="middle" class="lbl">清索引殭屍指標</text>
+      <text x="600" y="172" text-anchor="middle" class="lbl">空間不還 OS</text>
+      <text x="600" y="206" text-anchor="middle" fill="var(--accent-text)" class="num">work added</text>
+      <line x1="450" y1="116" x2="520" y2="120" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="2,2"/>
+
+      <text x="360" y="276" text-anchor="middle" fill="var(--ink)" class="head">「work added, not work done」</text>
+      <text x="360" y="300" text-anchor="middle" class="lbl">一句 SQL → 改 heap + 留殭屍索引 + 寫 WAL + 複製下游，回收還排在 autovacuum 的隊伍裡</text>
+    </svg>
+    <figcaption>同一筆 <code>DELETE</code> 的物理展開：heap header 改寫、索引留下指向 dead tuple 的殭屍指標、一筆 WAL record、再複製到每個 replica；真正的空間回收則被推遲給 autovacuum。寬度與框線一致是刻意的——四份工作沒有主從，都是被加上去的。</figcaption>
+  </figure>
+
+  <h2>WAL 與複製：刪除是一份要傳遍下游的寫入</h2>
+
+  <p>單機之內的帳已經夠重，把鏡頭拉到複製拓樸，<code>DELETE</code> 的成本還要再乘一層：「Deletes also need to be fully replicated; they are still a work of writes, which means large-scale <code>DELETE</code>s can impact other writers to your application and cause them to wait for the <code>DELETE</code> replication to finish (under synchronous and semi-synchronous replication).」——刪除也要被完整複製、本質上就是寫入；在同步與半同步複製下，大規模 <code>DELETE</code> 會影響其他寫入者，讓它們等這批刪除的複製跑完。</p>
+
+  <p>每一筆改了 <code>xmax</code> 的 heap 變更都會落進 WAL，而 WAL 是 streaming replication 的傳輸載體，於是這一大批刪除以 WAL record 的形式串流到每個 replica、由 replica 重放。Pang 把「讓其他寫入者等待」這個效果明確限定在同步與半同步複製下——那時 commit 得等複製確認回來，這批刪除就會卡住其他人的提交；非同步複製不會讓寫入者停下來等，但仍要付出 replica 落後、WAL 堆積的代價。從複製的角度看，刪除沒有「我在減少資料」的特權，它跟 INSERT、UPDATE 一樣是寫入，一樣佔 WAL、一樣要全程複製。</p>
+
+  <p>這個放大效果在實務上常被低估，因為大家心裡的成本模型停在「主庫刪一刪就好」。真實的傳播鏈是這樣：主庫產生 WAL、replica 拉 WAL、replica 序列重放——而重放是單一通道的，replica 上的這批刪除重放沒做完，後面排隊的所有變更都得等。如果你有讀寫分離、把報表流量打在 replica 上，一次大刪除就可能讓 replica 的 replay lag 拉高，讀到的資料變舊；如果有下游靠 logical replication 餵資料倉儲或 CDC pipeline，這批刪除還會以每一列一筆事件的形式往更下游灌。一句 <code>DELETE … WHERE created_at < cutoff</code> 在 SQL 層看起來只有一行，在物理層卻是「刪幾列就有幾列份的 WAL、幾列份的複製、幾列份的下游事件」。資料量越大，這個乘法越可怕，而它全部都還沒算到 autovacuum 之後要補的那一刀。</p>
+
+  <p>還有一層常被忘記的放大：vacuum 自己也要寫 WAL。autovacuum 之後跑來把 dead tuple 標成可覆寫、把索引裡的殭屍指標清掉，這些動作同樣是對頁面的修改，同樣要落 WAL、同樣要複製到下游。也就是說，一筆批次刪除在 WAL 上其實要算兩次帳——刪除當下改 <code>xmax</code> 的那一批，加上日後 vacuum 回收時改頁面的那一批。前者你下指令時就付了，後者推遲發生、卻一樣要傳遍整個複製拓樸。這部分順著「vacuum 也是寫」的機制推得：刪除製造的工作不只是它自己那筆，還包括它替後面的回收行程預訂下來的那一筆，兩筆都要佔 WAL、都要複製。從整條鏈看，一個邏輯上「想讓資料變少」的動作，在 WAL 這個維度上反而連續產生了兩波寫入。</p>
+
+  <p>把這幾段加起來，<code>DELETE</code> 的帳單就清楚了：heap 留 dead tuple、索引留殭屍指標、autovacuum 欠一筆債、WAL 放大再複製到全下游，連回收本身又是一輪寫入與複製，每一項都是加上去的工作。這就是 Pang 那句結論的重量——「Overall, <code>DELETE</code> is really 'work added,' not 'work done.'」</p>
+
+  <h2>DROP TABLE：刪檔，而不是標記</h2>
+
+  <p>既然問題出在「<code>DELETE</code> 改的是 row 層級的 metadata、空間留在原地」，規模化的解法就是把刪除的單位換掉——不刪 row，刪整張表。Pang 對 <code>DROP TABLE</code> 與 <code>TRUNCATE</code> 的描述是：「<code>DROP TABLE</code> and <code>TRUNCATE</code> require a heavyweight <code>AccessExclusiveLock</code> on the table, but are loosely independent of data size.」——它們需要一個重量級的 <code>AccessExclusiveLock</code>，但成本大致跟資料量無關。這是關鍵的不對稱：刪一千列跟刪十億列，<code>DELETE</code> 的成本差一百萬倍，<code>DROP TABLE</code> 幾乎一樣。</p>
+
+  <p>物理層的差別更直接：「At the physical layer they remove files from the operating system directly, plus sweep the Postgres buffer cache to remove pages related to the table.」——直接從作業系統移除檔案，再清掃 buffer cache 把這張表相關的頁面拿掉。Postgres 的 table 在磁碟上就是一組檔案，<code>DROP TABLE</code> 把檔案刪了、buffer cache 裡的 page 一併掃掉，沒有逐列 header 改寫、沒有 dead tuple、沒有要傳遍下游的 WAL 放大。Pang 用三個零總結：「They produce zero dead tuples, zero vacuum debt, zero work for readers.」在最上面的互動模擬裡按 DROP TABLE，整個 heap 一次清空、「還給 OS」的量表瞬間拉滿，跟 VACUUM 那條幾乎不動的量表正好對照。</p>
+
+  <p>這個不對稱值得停下來體會一下。<code>DELETE</code> 的成本天生跟「刪幾列」綁在一起，刪得越多越貴，而且貴在加上去的工作；<code>DROP TABLE</code> 跟 <code>TRUNCATE</code> 的成本卻跟資料量「loosely independent」——刪一千列跟刪十億列，<code>DELETE</code> 的成本差好幾個數量級，<code>DROP TABLE</code> 幾乎一樣，因為它做的事情是「刪檔」而不是「逐列改 metadata」。這正是為什麼把刪除的單位從 row 換成整張表，是一個質變而不是量變：你不是把同一件昂貴的事做得快一點，你是換掉了那件事本身。</p>
+
+  <p>代價當然存在，就是那個 <code>AccessExclusiveLock</code>——Postgres 最強的鎖，期間任何讀寫都被擋。對一張正在服務線上流量的 table，直接 <code>DROP</code> 顯然不可行，整張表會在 drop 的瞬間對所有連線消失。所以這條路不能停在「把 <code>DELETE</code> 換成 <code>DROP</code>」，它需要一個資料結構設計，讓「要被刪的那部分」剛好是一張可以獨立 <code>DROP</code> 的表，而且 drop 它不擋到還在服務的資料。換句話說，問題從「怎麼把刪除做快」轉成「怎麼讓要刪的東西天生就是一張可丟棄的表」。這把問題帶到 partitioning。</p>
+
+  <figure class="vg-w-tabs-postgres-delete-vs-drop" data-mobile="keep">
+    <style>
+      .vg-w-tabs-postgres-delete-vs-drop { display: grid; gap: var(--s-2); }
+      .vg-w-tabs-postgres-delete-vs-drop input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-tabs-postgres-delete-vs-drop .vg-w-affordance { display: flex; align-items: center; gap: var(--s-1); font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin: 0; }
+      .vg-w-tabs-postgres-delete-vs-drop .tabs { display: flex; gap: var(--s-2); border-bottom: 1px solid var(--line); }
+      .vg-w-tabs-postgres-delete-vs-drop .tab { font-family: var(--sans); font-size: var(--fs-sm); padding: var(--s-1) var(--s-2); cursor: pointer; color: var(--muted); min-height: 44px; display: flex; align-items: center; }
+      .vg-w-tabs-postgres-delete-vs-drop .panel { display: none; padding: var(--s-2) 0; }
+      .vg-w-tabs-postgres-delete-vs-drop .grid { display: grid; grid-template-columns: 1fr; gap: var(--s-1) var(--s-3); font-family: var(--serif); font-size: var(--fs-sm); }
+      @media (min-width: 560px) { .vg-w-tabs-postgres-delete-vs-drop .grid { grid-template-columns: auto 1fr; } }
+      .vg-w-tabs-postgres-delete-vs-drop .k { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+      .vg-w-tabs-postgres-delete-vs-drop .bad { color: var(--accent-text); }
+      .vg-w-tabs-postgres-delete-vs-drop .good { color: var(--sage-deep); }
+      .vg-w-tabs-postgres-delete-vs-drop:has(#vg-w-tabs-postgres-delete-vs-drop-t1:checked) .panel-1,
+      .vg-w-tabs-postgres-delete-vs-drop:has(#vg-w-tabs-postgres-delete-vs-drop-t2:checked) .panel-2,
+      .vg-w-tabs-postgres-delete-vs-drop:has(#vg-w-tabs-postgres-delete-vs-drop-t3:checked) .panel-3 { display: block; }
+      .vg-w-tabs-postgres-delete-vs-drop:has(#vg-w-tabs-postgres-delete-vs-drop-t1:checked) [for="vg-w-tabs-postgres-delete-vs-drop-t1"],
+      .vg-w-tabs-postgres-delete-vs-drop:has(#vg-w-tabs-postgres-delete-vs-drop-t2:checked) [for="vg-w-tabs-postgres-delete-vs-drop-t2"],
+      .vg-w-tabs-postgres-delete-vs-drop:has(#vg-w-tabs-postgres-delete-vs-drop-t3:checked) [for="vg-w-tabs-postgres-delete-vs-drop-t3"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-postgres-delete-vs-drop figcaption { font-family: var(--scribed); font-style: italic; font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/>
+      </svg>
+      <span>切分頁 · 三種移除方式各付什麼代價 · 3 個面向</span>
+    </p>
+
+    <input type="radio" id="vg-w-tabs-postgres-delete-vs-drop-t1" name="vg-w-tabs-postgres-delete-vs-drop-sel" checked />
+    <input type="radio" id="vg-w-tabs-postgres-delete-vs-drop-t2" name="vg-w-tabs-postgres-delete-vs-drop-sel" />
+    <input type="radio" id="vg-w-tabs-postgres-delete-vs-drop-t3" name="vg-w-tabs-postgres-delete-vs-drop-sel" />
+    <div class="tabs">
+      <label class="tab" for="vg-w-tabs-postgres-delete-vs-drop-t1">DELETE</label>
+      <label class="tab" for="vg-w-tabs-postgres-delete-vs-drop-t2">TRUNCATE</label>
+      <label class="tab" for="vg-w-tabs-postgres-delete-vs-drop-t3">DROP TABLE</label>
+    </div>
+
+    <div class="panel panel-1">
+      <div class="grid">
+        <span class="k">成本隨資料量</span><span>線性——刪 N 列做 N 份 header 改寫</span>
+        <span class="k">dead tuple</span><span class="bad">大量產生，等 autovacuum 清</span>
+        <span class="k">索引</span><span class="bad">不動，留殭屍指標讓讀者自查</span>
+        <span class="k">空間還 OS</span><span class="bad">否——只標「可覆寫」</span>
+        <span class="k">WAL / 複製</span><span class="bad">每筆刪除都落 WAL、複製到下游</span>
+        <span class="k">鎖</span><span class="good">row-level，不擋整表</span>
+      </div>
+    </div>
+    <div class="panel panel-2">
+      <div class="grid">
+        <span class="k">成本隨資料量</span><span class="good">大致無關——「loosely independent of data size」</span>
+        <span class="k">dead tuple</span><span class="good">零</span>
+        <span class="k">索引</span><span class="good">隨表一起清空</span>
+        <span class="k">空間還 OS</span><span class="good">是——直接清掉檔案內容</span>
+        <span class="k">WAL / 複製</span><span class="good">不展開成逐列寫入</span>
+        <span class="k">鎖</span><span class="bad">需要 AccessExclusiveLock（整表）</span>
+      </div>
+    </div>
+    <div class="panel panel-3">
+      <div class="grid">
+        <span class="k">成本隨資料量</span><span class="good">大致無關——刪檔，跟列數脫鉤</span>
+        <span class="k">dead tuple</span><span class="good">零 dead tuple、零 vacuum 債</span>
+        <span class="k">索引</span><span class="good">隨表結構一併移除</span>
+        <span class="k">空間還 OS</span><span class="good">是——直接從 OS 移除檔案、清 buffer cache</span>
+        <span class="k">WAL / 複製</span><span class="good">讀者零額外工作</span>
+        <span class="k">鎖</span><span class="bad">需要 AccessExclusiveLock（整表）</span>
+      </div>
+    </div>
+    <figcaption>三種移除方式在六個面向上的對照。<code>DELETE</code> 用較弱的鎖換來線性成本與滿地 dead tuple；<code>TRUNCATE</code> / <code>DROP TABLE</code> 用整表的 <code>AccessExclusiveLock</code> 換來「跟資料量脫鉤」的回收。partitioning 的設計目標，就是把那個整表的鎖縮到「一個已經沒人讀的 partition」身上。</figcaption>
+  </figure>
+
+  <h2>partitioning：把大量 DELETE 換成偶爾 DROP partition</h2>
+
+  <p>整篇文章的設計結論收在這一句：「Partitioning can transform a workload that does 'lots of <code>DELETE</code>' into a workload that does 'occasional <code>DROP TABLE</code>.'」——partitioning 能把一個「做大量 <code>DELETE</code>」的 workload，轉成一個「偶爾做 <code>DROP TABLE</code>」的 workload。</p>
+
+  <p>具體做法是 date-based partitioning。把一張會持續累積又有保留期限的大表（log、event、metric、session 這類）按時間切成多個 partition——每天或每月一個 child table。對應用層來說，它看到的還是同一張邏輯表，讀寫照舊；底層由 Postgres 根據 partition key 把每一列 route 到對應的 child table。新資料寫進當期 partition，舊資料隨時間落在舊 partition。保留期到了、某段時間的資料整批要清掉時，你做的不是對主表下 <code>DELETE … WHERE created_at < …</code>（那會展開成前面所有成本），而是直接 <code>DROP</code> 掉那個過期 partition。被 drop 的是一張已經沒有新寫入、查詢也多半不再碰的 child table，它的 <code>AccessExclusiveLock</code> 只擋自己，不影響當期 partition 的線上流量。批次刪除於是退化成「偶爾 drop 一個分頁」——也就是 Pang 說的把「lots of <code>DELETE</code>」的 workload 轉成「occasional <code>DROP TABLE</code>」的 workload。</p>
+
+  <p>這個設計不是免費的。partition key 的選擇決定 drop 的粒度與查詢路由：按月切，保留窗就是「整月」，你沒辦法只 drop 半個月；切太細（每天一個 partition）child table 數量會爆，planner 要考慮的 partition 也變多。查詢還要能 partition pruning——WHERE 帶得到 partition key，planner 才能只掃相關的 partition；若查詢常跨整個時間範圍或不帶時間條件，好處會打折，甚至因為 fan-out 到所有 partition 而變慢。保留窗則直接對應「保留幾個 partition」：保留 90 天、每天一個，就是永遠維持約 90 個 child table，每天 drop 最舊的、create 一個新的當期。合理的推測是，這意味著要有一套排程去定期 create 未來、drop 過期的 partition——這層運維機制是換來「便宜刪除」的隱性成本。</p>
+
+  <p>粒度的取捨值得多想一層。partition 切得細，每次 drop 丟掉的資料量小、保留窗的解析度高，但 child table 數量多到一定程度，planner 在規劃每一個查詢時都要把所有 partition 納入考慮，規劃時間本身會變成負擔，連帶吃掉 partition pruning 省下來的好處。partition 切得粗，child table 少、規劃便宜，但 drop 的單位變大——保留窗只能以那個粗粒度前進，想精準刪到某一天就做不到。多數實務上的選擇是讓 partition 粒度去對齊「retention 真正需要的精度」：如果保留策略本來就是以「天」為單位談的，按天切就剛好；如果是以「月」談的，按月切就夠，沒必要為了不存在的精度需求把 child table 數量推高。partition key 一旦選定、資料灌進去，要再改幾乎等於重建整張表，所以這是少數值得在 schema 設計階段就想清楚、而不是上線後再調的決定。</p>
+
+  <figure class="vg-w-partition-postgres-retention" data-mobile="keep" data-svg-scroll="720">
+    <svg class="vg-w-partition-postgres-retention-svg" viewBox="0 0 720 300" role="img"
+         aria-label="date-based partitioning 的保留窗：每天一個 partition，當期寫入、過期的整個 DROP，保留窗滑動前進"
+         style="width: 100%; height: auto; max-width: 720px;">
+      <style>
+        .vg-w-partition-postgres-retention-svg text { font-family: EB Garamond, serif; font-size: 12px; }
+        .vg-w-partition-postgres-retention-svg .head { font-family: IM Fell English, serif; font-style: italic; font-size: 14px; }
+        .vg-w-partition-postgres-retention-svg .lbl { font-family: IM Fell English, serif; font-style: italic; font-size: 11px; fill: var(--muted); }
+        .vg-w-partition-postgres-retention-svg .num { font-family: JetBrains Mono, monospace; font-size: 10px; }
+      </style>
+
+      <text x="360" y="24" text-anchor="middle" fill="var(--ink)" class="head">保留窗滑動：過期 partition 整個 DROP，當期 partition 接收寫入</text>
+
+      <!-- dropped partition -->
+      <rect x="30" y="120" width="80" height="48" fill="var(--muted-2)" opacity="0.25" stroke="var(--muted-2)" stroke-width="1.2" stroke-dasharray="4,3"/>
+      <text x="70" y="148" text-anchor="middle" fill="var(--muted)">day_01</text>
+      <text x="70" y="186" text-anchor="middle" class="lbl">過期 → DROP</text>
+      <line x1="42" y1="132" x2="98" y2="156" stroke="var(--muted-2)" stroke-width="1"/>
+      <line x1="98" y1="132" x2="42" y2="156" stroke="var(--muted-2)" stroke-width="1"/>
+
+      <!-- retention window bracket -->
+      <rect x="130" y="100" width="430" height="88" fill="var(--sage)" opacity="0.12" stroke="var(--sage-deep)" stroke-width="1.2"/>
+      <text x="345" y="92" text-anchor="middle" fill="var(--sage-deep)" class="lbl">保留窗（例如 90 天 = 90 個 child table）</text>
+
+      <!-- retained partitions -->
+      <rect x="146" y="120" width="80" height="48" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.4"/>
+      <text x="186" y="148" text-anchor="middle" fill="var(--ink)">day_02</text>
+      <rect x="236" y="120" width="80" height="48" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.4"/>
+      <text x="276" y="148" text-anchor="middle" fill="var(--ink)">day_03</text>
+      <text x="356" y="148" text-anchor="middle" fill="var(--muted)" class="num">· · · · ·</text>
+      <rect x="396" y="120" width="80" height="48" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.4"/>
+      <text x="436" y="148" text-anchor="middle" fill="var(--ink)">day_89</text>
+
+      <!-- current partition (writes) -->
+      <rect x="486" y="120" width="80" height="48" fill="var(--accent)" fill-opacity="0.2" stroke="var(--accent)" stroke-width="1.6"/>
+      <text x="526" y="148" text-anchor="middle" fill="var(--accent-text)">day_90</text>
+      <text x="526" y="186" text-anchor="middle" class="lbl">當期寫入</text>
+      <line x1="526" y1="104" x2="526" y2="116" stroke="var(--accent)" stroke-width="1.4" marker-end="url(#vg-w-partition-arrow)"/>
+
+      <!-- future partition (pre-created) -->
+      <rect x="586" y="120" width="80" height="48" fill="var(--bg)" stroke="var(--muted-2)" stroke-width="1.2" stroke-dasharray="4,3"/>
+      <text x="626" y="148" text-anchor="middle" fill="var(--muted)">day_91</text>
+      <text x="626" y="186" text-anchor="middle" class="lbl">排程預建</text>
+
+      <defs>
+        <marker id="vg-w-partition-arrow" viewBox="0 0 10 10" refX="5" refY="9" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M0 0 L10 0 L5 10 z" fill="var(--accent)"/>
+        </marker>
+      </defs>
+
+      <text x="360" y="230" text-anchor="middle" fill="var(--ink)" class="head">每天：DROP 最舊一個 · CREATE 未來一個 · 窗口整體右移一格</text>
+      <text x="360" y="256" text-anchor="middle" class="lbl">批次刪除（DELETE … WHERE created_at &lt; cutoff）退化成「DROP day_01」——零 dead tuple、零 vacuum 債、空間直接還 OS</text>
+      <text x="360" y="278" text-anchor="middle" class="lbl">代價：partition key 選擇決定粒度、查詢要帶得到 key 才能 pruning、要有排程維護 create/drop 節奏</text>
+    </svg>
+    <figcaption>date-based partitioning 把「保留 90 天」實作成「永遠維持約 90 個 child table」。新資料只寫當期 partition，過期的整個 <code>DROP</code>，窗口每天右移一格。原本會展開成滿地 dead tuple 的批次 <code>DELETE</code>，變成一句跟資料量脫鉤的 <code>DROP TABLE</code>。</figcaption>
+  </figure>
+
+  <p>值得補一句的是，這條路不是對所有刪除都適用。它的前提是「要被刪的資料剛好能沿著某個維度整批切開」——時間是最自然的那個維度，因為保留策略通常本來就是按時間定的。如果你的刪除是零散的、跨整個鍵空間的（例如「刪掉所有被檢舉的留言」），那刪除的單位就無法乾淨地對齊到一個 partition，partitioning 幫不上忙，你還是得吃 <code>DELETE</code> 的成本。所以這不是一個放諸四海的銀彈，而是一個針對特定形狀資料的設計選擇：持續累積、有保留窗、刪除沿時間整段發生——log、event、metric、audit trail 這些剛好都符合，也剛好是最容易長到大到讓 <code>DELETE</code> 變成問題的那一類表。</p>
+
+  <p>走完這條路徑，標題就不是修辭而是精確的主張：能規模化的不是「刪得快的 <code>DELETE</code>」——那種東西不存在，因為它的成本天生隨資料量線性、又把回收推遲成 vacuum 債——而是「結構上讓刪除等於 <code>DROP TABLE</code>」。你不是把刪除最佳化，是把刪除的單位從 row 換成整張分頁表。對正在設計一張會長很大的表的人，這個結論很實際：在資料還沒灌進去之前先想清楚「這張表將來要怎麼變小」，往往比事後再來跟 bloat 跟 autovacuum 纏鬥便宜太多。</p>
+
+  <p class="vg-deep-closer"><strong>The unlock</strong>：把「要被刪的資料」設計成一張可以獨立 <code>DROP</code> 的 partition，於是 retention 不再是一筆隨時間越長越貴的 <code>DELETE</code>，而是一句成本恆定的 <code>DROP TABLE</code>——<strong>唯一能規模化的刪除，是不做刪除</strong>。</p>
+</div>
