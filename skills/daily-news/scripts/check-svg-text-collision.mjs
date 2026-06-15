@@ -37,14 +37,25 @@ async function run(urls) {
   const page = await ctx.newPage();
 
   let anyFail = false;
+  let figuresInspected = 0;
   const findings = [];
 
   try {
     for (const url of urls) {
-      await page.goto(url, { waitUntil: "networkidle" });
-      const groups = await page.evaluate(() => {
+      // This check measures rendered geometry via getBBox(), so it needs
+      // layout. networkidle could settle on an empty/partial DOM (0 figures =>
+      // silent PASS having inspected nothing); use "load" plus an explicit wait
+      // for the widget SVG text to exist before measuring. The .catch(()=>{})
+      // means a page with genuinely no widget text proceeds and finds nothing
+      // (correct) instead of hanging.
+      await page.goto(url, { waitUntil: "load" });
+      await page
+        .waitForSelector('figure[class*="vg-w-"] svg text', { timeout: 5000 })
+        .catch(() => {});
+      const { groups, figureCount } = await page.evaluate(() => {
         const out = [];
-        document.querySelectorAll('figure[class*="vg-w-"]').forEach((fig) => {
+        const figs = document.querySelectorAll('figure[class*="vg-w-"]');
+        figs.forEach((fig) => {
           const figCls = Array.from(fig.classList).find((c) => c.startsWith("vg-w-")) || fig.className;
           fig.querySelectorAll("svg").forEach((svg, si) => {
             const texts = [];
@@ -64,8 +75,11 @@ async function run(urls) {
             if (texts.length >= 2) out.push({ figCls, svgIndex: si, texts });
           });
         });
-        return out;
+        // groups only includes svgs with >=2 texts, which undercounts; report
+        // the total figure count separately so a zero-inspection run is visible.
+        return { groups: out, figureCount: figs.length };
       });
+      figuresInspected += figureCount;
 
       for (const g of groups) {
         for (let i = 0; i < g.texts.length; i++) {
@@ -93,7 +107,17 @@ async function run(urls) {
     await browser.close();
   }
 
-  process.stdout.write(JSON.stringify({ verdict: anyFail ? "FAIL" : "PASS", findings }, null, 2) + "\n");
+  // A zero-inspection run is legitimate (a page may have no widgets) but is
+  // also exactly what a silent load failure looks like — surface it instead of
+  // letting it masquerade as a clean PASS.
+  if (figuresInspected === 0 && urls.length > 0) {
+    process.stderr.write(
+      `WARNING: inspected 0 vg-w-* figures across ${urls.length} url(s) — possible load failure\n`
+    );
+  }
+  process.stdout.write(
+    JSON.stringify({ verdict: anyFail ? "FAIL" : "PASS", figures_inspected: figuresInspected, findings }, null, 2) + "\n"
+  );
   process.exit(anyFail ? 1 : 0);
 }
 
