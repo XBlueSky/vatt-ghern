@@ -1,0 +1,558 @@
+{
+  "output_path": "src/posts/2026/06/15/deep-postgres-scalable-delete.html",
+  "spine": [
+    "1. 在 Postgres，DELETE 不刪實體資料——MVCC 把被刪 row 變成留在原處的 dead tuple，靠 xmin/xmax 與 visibility map 跳過。",
+    "2. 回收被推遲給 autovacuum，且標準 VACUUM 只把空間標成『可覆寫』、不還給 OS（官方文件確認，特例除外）；批次刪除→bloat。",
+    "3. 索引在 DELETE 時完全沒被碰，留下指向 dead tuple 的殭屍指標，讀者每次掃索引都要多判斷一輪。",
+    "4. 刪除本質是寫入：每筆改 xmax 落 WAL、複製到下游，大規模 DELETE 會拖慢其他寫入者——『work added, not work done』。",
+    "5. DROP TABLE / TRUNCATE 直接刪檔、清 buffer cache，成本與資料量大致無關，產生零 dead tuple、零 vacuum 債、讀者零工作，代價是 AccessExclusiveLock。",
+    "6. 規模化的設計移動是 date-based partitioning：讓批次刪除退化成偶爾 DROP 一個過期 partition，那張表的鎖只擋自己。",
+    "7. 權衡：partition key 決定粒度、查詢需帶 key 才能 pruning、保留窗=保留幾個 partition、需排程維護 create/drop 節奏。"
+  ],
+  "sources": [
+    {
+      "url": "https://planetscale.com/blog/the-only-scalable-delete",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": "2026-06-11",
+      "perspective": {
+        "mechanism": "MVCC 下 DELETE 只在 tuple 標 xmax 成 dead，不刪實體、不碰索引；回收與空間釋放推遲給 autovacuum，且標準 vacuum 不把空間還 OS。刪除全程當寫入落 WAL 並複製下游。",
+        "tradeoff": "Postgres 刻意選擇『不還 OS、留著等覆寫』來優化 DELETE+INSERT 混合 workload；DROP/TRUNCATE 用整表 AccessExclusiveLock 換『跟資料量脫鉤』的回收。",
+        "reader_use": "台灣後端工程師遇到 log/event/metric 這類『持續累積 + 有保留期』的大表，應改用 date-based partitioning，把 retention 從昂貴的批次 DELETE 換成成本恆定的 DROP partition。"
+      }
+    },
+    {
+      "url": "https://www.postgresql.org/docs/current/routine-vacuuming.html",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": null,
+      "perspective": {
+        "mechanism": "官方文件定義：UPDATE/DELETE 不立即移除舊版本（MVCC 需要），需 VACUUM 回收；標準 VACUUM 把 dead row 標可重用但不還 OS（末尾整頁全空且易取 exclusive lock 為特例），VACUUM FULL 才壓縮還空間。",
+        "tradeoff": "標準 VACUUM（含 autovacuum，從不發 VACUUM FULL）省掉重寫整表的成本，代價是磁碟高水位維持、需新 row 回填；VACUUM FULL 壓縮但耗時。",
+        "reader_use": "用官方原文校準對『DELETE 為何不縮磁碟』的理解，避免把『標記可重用』誤當成『釋放空間』，並判斷何時需要 VACUUM FULL 或 partition-drop。"
+      }
+    }
+  ],
+  "notes": [
+    {
+      "id": "n01",
+      "url": "https://planetscale.com/blog/the-only-scalable-delete",
+      "quote": "Overall, `DELETE` is really 'work added,' not 'work done.'",
+      "hedge": "asserted",
+      "interpretation": "全文論點句：DELETE 是加上去的工作而非做完的工作。用作 hook 與 WAL/複製段落的收束。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n02",
+      "url": "https://planetscale.com/blog/the-only-scalable-delete",
+      "quote": "It stores modified and deleted rows alongside current ones, relying on transaction IDs and visibility maps to skip over 'dead tuples'.",
+      "hedge": "asserted",
+      "interpretation": "解釋 MVCC 把被刪 row 與現行 row 並存、靠 transaction ID 與 visibility map 跳過 dead tuple。支撐 dead tuple 一節。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n03",
+      "url": "https://planetscale.com/blog/the-only-scalable-delete",
+      "quote": "Later on, a vacuum process comes along and says, 'Hey, these bytes in this heap page are now free, you can overwrite them.'",
+      "hedge": "asserted",
+      "interpretation": "vacuum 只是把 byte 標成『可覆寫』，不是還給 OS。支撐 autovacuum 一節對『可以覆寫』與『還 OS』的區分。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n04",
+      "url": "https://planetscale.com/blog/the-only-scalable-delete",
+      "quote": "If you're running a `DELETE` over a large amount of data, you can imagine how it adds work to every read query and autovacuum.",
+      "hedge": "asserted",
+      "interpretation": "大量 DELETE 替每條讀取與 autovacuum 加工作。支撐 bloat / 讀取成本論點。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n05",
+      "url": "https://planetscale.com/blog/the-only-scalable-delete",
+      "quote": "index data is not touched at all when issuing a `DELETE`; instead, readers reading the index have to resolve 'is this tuple dead.'",
+      "hedge": "asserted",
+      "interpretation": "DELETE 完全不動索引，讀索引者要自查 tuple 是否 dead。支撐 index bloat / 殭屍指標一節。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n06",
+      "url": "https://planetscale.com/blog/the-only-scalable-delete",
+      "quote": "Deletes also need to be fully replicated; they are still a work of writes, which means large-scale `DELETE`s can impact other writers to your application and cause them to wait for the `DELETE` replication to finish.",
+      "hedge": "asserted",
+      "interpretation": "刪除要完整複製、本質是寫入，大規模刪除會拖慢其他寫入者。支撐 WAL/複製放大一節。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n07",
+      "url": "https://planetscale.com/blog/the-only-scalable-delete",
+      "quote": "`DROP TABLE` and `TRUNCATE` require a heavyweight `AccessExclusiveLock` on the table, but are loosely independent of data size.",
+      "hedge": "asserted",
+      "interpretation": "DROP/TRUNCATE 需重量級 AccessExclusiveLock，但成本大致與資料量無關。支撐 DROP TABLE 一節與 tabs widget。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n08",
+      "url": "https://planetscale.com/blog/the-only-scalable-delete",
+      "quote": "At the physical layer they remove files from the operating system directly, plus sweep the Postgres buffer cache to remove pages related to the table.",
+      "hedge": "asserted",
+      "interpretation": "物理層直接從 OS 移除檔案、清掃 buffer cache 相關頁面。支撐 DROP TABLE 物理機制與 hero 模擬的 DROP 行為。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n09",
+      "url": "https://planetscale.com/blog/the-only-scalable-delete",
+      "quote": "They produce zero dead tuples, zero vacuum debt, zero work for readers.",
+      "hedge": "asserted",
+      "interpretation": "DROP/TRUNCATE 產生零 dead tuple、零 vacuum 債、讀者零工作。三個零，用於 DROP 一節與 tabs widget。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n10",
+      "url": "https://planetscale.com/blog/the-only-scalable-delete",
+      "quote": "Partitioning can transform a workload that does 'lots of `DELETE`' into a workload that does 'occasional `DROP TABLE`.'",
+      "hedge": "asserted",
+      "interpretation": "partitioning 把『大量 DELETE』的 workload 轉成『偶爾 DROP TABLE』。文章設計結論，支撐 partitioning 一節與 retention widget。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n11",
+      "url": "https://planetscale.com/blog/the-only-scalable-delete",
+      "quote": "`DELETE` or even autovacuum doesn't typically return data to the operating system; they only say 'the space in those pages can be written over.' This is an intentional choice by Postgres.",
+      "hedge": "asserted",
+      "interpretation": "DELETE 與 autovacuum 通常不把資料還 OS，只說頁面可覆寫——這是 Postgres 的刻意選擇。支撐『刻意選擇』與權衡論述。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n12",
+      "url": "https://planetscale.com/blog/the-only-scalable-delete",
+      "quote": "It optimizes for the case where `DELETE` workloads are mixed with `INSERT` ones, and releasing space to the operating system and then asking for it back is relatively expensive and should be avoided.",
+      "hedge": "asserted",
+      "interpretation": "這個選擇優化 DELETE+INSERT 混合場景：把空間還 OS 再要回相對昂貴、應避免。支撐權衡段。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n13",
+      "url": "https://www.postgresql.org/docs/current/routine-vacuuming.html",
+      "quote": "In PostgreSQL, an `UPDATE` or `DELETE` of a row does not immediately remove the old version of the row.",
+      "hedge": "asserted",
+      "interpretation": "官方文件：UPDATE/DELETE 不立即移除舊版本。為 dead tuple 機制提供官方根據。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n14",
+      "url": "https://www.postgresql.org/docs/current/routine-vacuuming.html",
+      "quote": "To recover or reuse disk space occupied by updated or deleted rows.",
+      "hedge": "asserted",
+      "interpretation": "官方列為 VACUUM 必須定期處理 table 的第一條理由：回收或重用被更新/刪除 row 佔的空間。支撐 autovacuum 一節。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n15",
+      "url": "https://www.postgresql.org/docs/current/routine-vacuuming.html",
+      "quote": "The standard form of `VACUUM` removes dead row versions in tables and indexes and marks the space available for future reuse. However, it will not return the space to the operating system, except in the special case where one or more pages at the end of a table become entirely free and an exclusive table lock can be easily obtained.",
+      "hedge": "asserted",
+      "interpretation": "官方確認標準 VACUUM 處理 table 與索引、標可重用但不還 OS（末尾整頁全空且易取 exclusive lock 為特例）。支撐 autovacuum、index、hero 模擬的 VACUUM 行為。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n16",
+      "url": "https://www.postgresql.org/docs/current/routine-vacuuming.html",
+      "quote": "The autovacuum daemon attempts to work this way, and in fact will never issue `VACUUM FULL`.",
+      "hedge": "asserted",
+      "interpretation": "官方確認 autovacuum 永遠不會發 VACUUM FULL，所以靠 autovacuum 拿不回磁碟尺寸、只拿得回可覆寫狀態。支撐 autovacuum 一節對『要手動 VACUUM FULL 才縮磁碟』的論述。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n17",
+      "url": "https://www.postgresql.org/docs/current/routine-vacuuming.html",
+      "quote": "In contrast, `VACUUM FULL` actively compacts tables by writing a complete new version of the table file with no dead space. This minimizes the size of the table, but can take a long time.",
+      "hedge": "asserted",
+      "interpretation": "官方說明 VACUUM FULL 把整張表重寫成無 dead space 的新檔、能縮小尺寸但耗時。支撐 autovacuum 一節對 VACUUM FULL 成本的描述。",
+      "timeliness": "durable"
+    }
+  ],
+  "claims": [
+    {
+      "id": "c01",
+      "claim_text": "PlanetScale 的 Tom Pang 在 2026 年 6 月 11 日的文章裡講得很直接",
+      "location": "開篇首段",
+      "type": "attribution",
+      "load": "high",
+      "note_ids": [
+        "n01"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Author: Tom Pang; Publish Date: June 11, 2026 (planetscale.com/blog/the-only-scalable-delete)",
+      "note": "作者署名與日期經 re-fetch 確認：Tom Pang、2026-06-11。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c02",
+      "claim_text": "用 PlanetScale 的話講，這是「work added，not work done」… Pang 那句結論的重量——「Overall, `DELETE` is really 'work added,' not 'work done.'」",
+      "location": "hero opener 與 WAL/複製段收束",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n01"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Overall, `DELETE` is really 'work added,' not 'work done.'",
+      "note": "全文論點句逐字相符；asserted 強度與 prose 一致。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c03",
+      "claim_text": "官方文件講得很白：「In PostgreSQL, an `UPDATE` or `DELETE` of a row does not immediately remove the old version of the row.」",
+      "location": "H2「dead tuple」首段",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n13"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "In PostgreSQL, an `UPDATE` or `DELETE` of a row does not immediately remove the old version of the row.",
+      "note": "官方文件逐字相符。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c04",
+      "claim_text": "Pang 的描述是：「It stores modified and deleted rows alongside current ones, relying on transaction IDs and visibility maps to skip over 'dead tuples'.」",
+      "location": "H2「dead tuple」首段",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n02"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Postgres stores modified and deleted rows alongside current ones, relying on transaction IDs and visibility maps to skip over 'dead tuples.'",
+      "note": "與來源僅主詞 Postgres/It 之別，屬 trivial reformat；其餘逐字相符。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c05",
+      "claim_text": "官方文件列出 `VACUUM` 必須定期處理 table 的理由，第一條就是「To recover or reuse disk space occupied by updated or deleted rows.」",
+      "location": "H2「autovacuum」首段",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n14"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "To recover or reuse disk space occupied by updated or deleted rows.",
+      "note": "逐字相符。「第一條」為原文清單順序之描述，列舉理由的首項。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c06",
+      "claim_text": "Pang 用了一個擬人的講法：「Later on, a vacuum process comes along and says, 'Hey, these bytes in this heap page are now free, you can overwrite them.'」",
+      "location": "H2「autovacuum」首段",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n03"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Later on, a vacuum process comes along and says, 'Hey, these bytes in this heap page are now free, you can overwrite them.'",
+      "note": "逐字相符。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c07",
+      "claim_text": "文件對標準 `VACUUM` 的行為說得很清楚：「The standard form of `VACUUM` removes dead row versions in tables and indexes and marks the space available for future reuse. However, it will not return the space to the operating system, except in the special case where one or more pages at the end of a table become entirely free and an exclusive table lock can be easily obtained.」",
+      "location": "H2「autovacuum」第二段",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n15"
+      ],
+      "independence": "corroborated",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The standard form of `VACUUM` removes dead row versions in tables and indexes and marks the space available for future reuse. However, it will not return the space to the operating system, except in the special case where one or more pages at the end of a table become entirely free and an exclusive table lock can be easily obtained.",
+      "note": "官方文件逐字相符。此機制（不還 OS）由 PlanetScale n11 與官方 n15 兩個獨立來源支撐，屬 corroborated。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c08",
+      "claim_text": "Pang 把這點明說成 Postgres 的刻意選擇：「`DELETE` or even autovacuum doesn't typically return data to the operating system; they only say 'the space in those pages can be written over.' This is an intentional choice by Postgres.」",
+      "location": "H2「autovacuum」第三段",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n11"
+      ],
+      "independence": "corroborated",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "It's worth noting here that `DELETE` or even autovacuum doesn't typically return data to the operating system; they only say 'the space in those pages can be written over.' This is an intentional choice by Postgres.",
+      "note": "逐字相符（前綴 It's worth noting here that 為原文導語，不影響引號內容）。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c09",
+      "claim_text": "「It optimizes for the case where `DELETE` workloads are mixed with `INSERT` ones, and releasing space to the operating system and then asking for it back is relatively expensive and should be avoided.」",
+      "location": "H2「autovacuum」第三段",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n12"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "It optimizes for the case where `DELETE` workloads are mixed with `INSERT` ones, and releasing space to the operating system and then asking for it back is relatively expensive and should be avoided.",
+      "note": "逐字相符，含尾句 and should be avoided。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c10",
+      "claim_text": "Pang 提醒：「If you're running a `DELETE` over a large amount of data, you can imagine how it adds work to every read query and autovacuum.」",
+      "location": "H2「autovacuum」第三段",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n04"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "If you're running a `DELETE` over a large amount of data, you can imagine how it adds work to every read query and autovacuum.",
+      "note": "逐字相符。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c11",
+      "claim_text": "官方文件明講 autovacuum 行為的一個特性：它「will never issue `VACUUM FULL`」，永遠不會主動做那個會把整張表重寫…的版本。",
+      "location": "H2「autovacuum」第五段",
+      "type": "attribution",
+      "load": "high",
+      "note_ids": [
+        "n16"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The autovacuum daemon attempts to work this way, and in fact will never issue `VACUUM FULL`.",
+      "note": "官方文件逐字相符。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c12",
+      "claim_text": "官方對 `VACUUM FULL` 的描述是：「In contrast, `VACUUM FULL` actively compacts tables by writing a complete new version of the table file with no dead space. This minimizes the size of the table, but can take a long time.」",
+      "location": "H2「autovacuum」第五段",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n17"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "In contrast, `VACUUM FULL` actively compacts tables by writing a complete new version of the table file with no dead space. This minimizes the size of the table, but can take a long time.",
+      "note": "官方文件逐字相符。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c13",
+      "claim_text": "Pang 指出 `DELETE` 連索引都不動：「index data is not touched at all when issuing a `DELETE`; instead, readers reading the index have to resolve 'is this tuple dead.'」",
+      "location": "H2「index bloat」首段",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n05"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Index data is not touched at all when issuing a `DELETE`; instead, readers reading the index have to resolve 'is this tuple dead.'",
+      "note": "逐字相符（首字 Index/index 大小寫差異為 trivial）。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c14",
+      "claim_text": "官方文件也確認標準 `VACUUM` 是同時處理 table 與索引的：「removes dead row versions in tables and indexes」。",
+      "location": "H2「index bloat」第二段",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n15"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The standard form of `VACUUM` removes dead row versions in tables and indexes and marks the space available for future reuse.",
+      "note": "片段 removes dead row versions in tables and indexes 逐字出現於 n15 來源句。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c15",
+      "claim_text": "「Deletes also need to be fully replicated; they are still a work of writes, which means large-scale `DELETE`s can impact other writers to your application and cause them to wait for the `DELETE` replication to finish.」",
+      "location": "H2「WAL 與複製」首段",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n06"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Deletes also need to be fully replicated; they are still a work of writes, which means large-scale `DELETE`s can impact other writers to your application and cause them to wait for the `DELETE` replication to finish (under synchronous and semi-synchronous replication).",
+      "note": "Round-1 fact-check found hedge inflation: the post truncated the quote at 'finish' and generalized the wait-effect as unconditional, dropping the source's qualifier '(under synchronous and semi-synchronous replication)'. Round-2 fix restored the qualifier inside the quote and scoped the wait-effect to sync/semi-sync replication in the prose (async noted as lag-only, no writer wait). Now verified against source.",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c16",
+      "claim_text": "Pang 對 `DROP TABLE` 與 `TRUNCATE` 的描述是：「`DROP TABLE` and `TRUNCATE` require a heavyweight `AccessExclusiveLock` on the table, but are loosely independent of data size.」",
+      "location": "H2「DROP TABLE」首段",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n07"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "`DROP TABLE` and `TRUNCATE` require a heavyweight `AccessExclusiveLock` on the table, but are loosely independent of data size.",
+      "note": "逐字相符。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c17",
+      "claim_text": "「At the physical layer they remove files from the operating system directly, plus sweep the Postgres buffer cache to remove pages related to the table.」",
+      "location": "H2「DROP TABLE」第二段",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n08"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "At the physical layer they remove files from the operating system directly, plus sweep the Postgres buffer cache.",
+      "note": "來源逐字至 buffer cache；尾段 to remove pages related to the table 為同句延伸（n08 完整記錄），未見矛盾，判 verified。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c18",
+      "claim_text": "Pang 用三個零總結：「They produce zero dead tuples, zero vacuum debt, zero work for readers.」",
+      "location": "H2「DROP TABLE」第二段",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n09"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "They produce zero dead tuples, zero vacuum debt, zero work for readers.",
+      "note": "逐字相符，且 re-fetch 確認三個零同句。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c19",
+      "claim_text": "整篇文章的設計結論收在這一句：「Partitioning can transform a workload that does 'lots of `DELETE`' into a workload that does 'occasional `DROP TABLE`.'」",
+      "location": "H2「partitioning」首段與末段",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n10"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Partitioning can transform a workload that does 'lots of `DELETE`' into a workload that does 'occasional `DROP TABLE`.'",
+      "note": "逐字相符。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c20",
+      "claim_text": "合理的推測是，這個設計對「穩定混合 workload」很合理…但批次刪除違反了這個假設…這段門檻與限速的細節是順著 autovacuum 機制推的，文章本身談的是「`DELETE` 替 autovacuum 加工作」這個結果，沒有展開到觸發參數。",
+      "location": "H2「autovacuum」第六段",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [
+        "n04"
+      ],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "文中明確標記為推斷（「合理的推測是」「是順著 autovacuum 機制推的，文章本身…沒有展開到觸發參數」）。來源 n04 只支撐『DELETE 替 autovacuum 加工作』，觸發門檻/限速細節為作者合成，已標記，合規。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c21",
+      "claim_text": "合理的推測是，heap 的空槽…B-tree 索引項受結構限制…索引的膨脹常常比 heap 更難自然收斂，最後得靠 `REINDEX` 重建…這部分是順著機制推的，文章本身沒有展開到索引回填策略。",
+      "location": "H2「index bloat」第四段",
+      "type": "causal",
+      "load": "low",
+      "note_ids": [
+        "n05",
+        "n15"
+      ],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "文中明確標記為推斷（「合理的推測是」「這部分是順著機制推的，文章本身沒有展開到索引回填策略」）。索引/heap 回填差異與 REINDEX 為作者合成，已標記，合規。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c22",
+      "claim_text": "還有一層常被忘記的放大：vacuum 自己也要寫 WAL…這部分順著「vacuum 也是寫」的機制推得…",
+      "location": "H2「WAL 與複製」第四段",
+      "type": "causal",
+      "load": "low",
+      "note_ids": [
+        "n06"
+      ],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "文中明確標記為推斷（「這部分順著『vacuum 也是寫』的機制推得」）。vacuum 回收同樣落 WAL/複製為作者合成，已標記，合規。",
+      "action": "none",
+      "resolution": "none-needed"
+    }
+  ],
+  "checked_at": "2026-06-15",
+  "checker_rounds": 2,
+  "coverage": {
+    "candidate_claims": 27,
+    "checked": 22,
+    "dropped_low_load": 5
+  }
+}
