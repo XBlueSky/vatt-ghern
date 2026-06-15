@@ -34,51 +34,67 @@ async function run(urls) {
   const { chromium } = await import("@playwright/test");
   const browser = await chromium.launch();
   const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
-  const page = await ctx.newPage();
 
   let anyFail = false;
   let figuresInspected = 0;
+  let loadErrors = 0;
   const findings = [];
 
   try {
     for (const url of urls) {
-      // This check measures rendered geometry via getBBox(), so it needs
-      // layout. networkidle could settle on an empty/partial DOM (0 figures =>
-      // silent PASS having inspected nothing); use "load" plus an explicit wait
-      // for the widget SVG text to exist before measuring. The .catch(()=>{})
-      // means a page with genuinely no widget text proceeds and finds nothing
-      // (correct) instead of hanging.
-      await page.goto(url, { waitUntil: "load" });
-      await page
-        .waitForSelector('figure[class*="vg-w-"] svg text', { timeout: 5000 })
-        .catch(() => {});
-      const { groups, figureCount } = await page.evaluate(() => {
-        const out = [];
-        const figs = document.querySelectorAll('figure[class*="vg-w-"]');
-        figs.forEach((fig) => {
-          const figCls = Array.from(fig.classList).find((c) => c.startsWith("vg-w-")) || fig.className;
-          fig.querySelectorAll("svg").forEach((svg, si) => {
-            const texts = [];
-            svg.querySelectorAll("text").forEach((t) => {
-              let bb;
-              try {
-                bb = t.getBBox();
-              } catch {
-                return;
-              }
-              if (bb.width === 0 && bb.height === 0) return;
-              texts.push({
-                sample: (t.textContent || "").slice(0, 40),
-                left: bb.x, right: bb.x + bb.width, top: bb.y, bottom: bb.y + bb.height,
+      // A throwing page.goto/evaluate (bad host, 404, nav failure) must not
+      // abort the whole batch nor masquerade as a clean PASS. Wrap each url:
+      // on failure, log it, count it, and move on to the next url. Use a FRESH
+      // page per url: a failed goto leaves Chromium mid-navigation to
+      // chrome-error://, which would otherwise interrupt the next url's goto
+      // ("interrupted by another navigation"). A new page fully isolates that.
+      let groups, figureCount;
+      const page = await ctx.newPage();
+      try {
+        // This check measures rendered geometry via getBBox(), so it needs
+        // layout. networkidle could settle on an empty/partial DOM (0 figures =>
+        // silent PASS having inspected nothing); use "load" plus an explicit wait
+        // for the widget SVG text to exist before measuring. The .catch(()=>{})
+        // means a page with genuinely no widget text proceeds and finds nothing
+        // (correct) instead of hanging.
+        await page.goto(url, { waitUntil: "load" });
+        await page
+          .waitForSelector('figure[class*="vg-w-"] svg text', { timeout: 5000 })
+          .catch(() => {});
+        ({ groups, figureCount } = await page.evaluate(() => {
+          const out = [];
+          const figs = document.querySelectorAll('figure[class*="vg-w-"]');
+          figs.forEach((fig) => {
+            const figCls = Array.from(fig.classList).find((c) => c.startsWith("vg-w-")) || fig.className;
+            fig.querySelectorAll("svg").forEach((svg, si) => {
+              const texts = [];
+              svg.querySelectorAll("text").forEach((t) => {
+                let bb;
+                try {
+                  bb = t.getBBox();
+                } catch {
+                  return;
+                }
+                if (bb.width === 0 && bb.height === 0) return;
+                texts.push({
+                  sample: (t.textContent || "").slice(0, 40),
+                  left: bb.x, right: bb.x + bb.width, top: bb.y, bottom: bb.y + bb.height,
+                });
               });
+              if (texts.length >= 2) out.push({ figCls, svgIndex: si, texts });
             });
-            if (texts.length >= 2) out.push({ figCls, svgIndex: si, texts });
           });
-        });
-        // groups only includes svgs with >=2 texts, which undercounts; report
-        // the total figure count separately so a zero-inspection run is visible.
-        return { groups: out, figureCount: figs.length };
-      });
+          // groups only includes svgs with >=2 texts, which undercounts; report
+          // the total figure count separately so a zero-inspection run is visible.
+          return { groups: out, figureCount: figs.length };
+        }));
+      } catch (err) {
+        process.stderr.write(`ERROR loading ${url}: ${err.message}\n`);
+        loadErrors += 1;
+        continue;
+      } finally {
+        await page.close().catch(() => {});
+      }
       figuresInspected += figureCount;
 
       for (const g of groups) {
@@ -115,10 +131,23 @@ async function run(urls) {
       `WARNING: inspected 0 vg-w-* figures across ${urls.length} url(s) — possible load failure\n`
     );
   }
+  // Exit-code policy: real findings win (exit 1); otherwise a load failure is an
+  // operational error (exit 2), distinct from a genuinely clean PASS (exit 0).
+  // A load error makes the verdict ERROR so the JSON is never an ambiguous PASS.
+  const verdict = anyFail ? "FAIL" : loadErrors > 0 ? "ERROR" : "PASS";
+  if (loadErrors > 0) {
+    process.stderr.write(
+      `FAILED to load ${loadErrors} of ${urls.length} url(s) — treat as gate failure, not PASS\n`
+    );
+  }
   process.stdout.write(
-    JSON.stringify({ verdict: anyFail ? "FAIL" : "PASS", figures_inspected: figuresInspected, findings }, null, 2) + "\n"
+    JSON.stringify(
+      { verdict, figures_inspected: figuresInspected, load_errors: loadErrors, findings },
+      null,
+      2
+    ) + "\n"
   );
-  process.exit(anyFail ? 1 : 0);
+  process.exit(anyFail ? 1 : loadErrors > 0 ? 2 : 0);
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
@@ -127,5 +156,11 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     process.stderr.write("usage: check-svg-text-collision.mjs <url> [<url> ...]\n");
     process.exit(2);
   }
-  run(urls);
+  // Backstop: per-url failures are handled inside run() now, but await/catch any
+  // truly unexpected throw so it exits non-zero cleanly instead of becoming an
+  // unhandled rejection (stack dump + possible exit 0).
+  run(urls).catch((err) => {
+    process.stderr.write(`FATAL: ${err && err.message ? err.message : err}\n`);
+    process.exit(2);
+  });
 }
