@@ -178,8 +178,10 @@ You are writing ONE deep-story for vatt'ghern's daily-news routine.
   `css-scroll-timeline`. These will fail Step 7c verification.
 - **Each widget carries a conceptual question** recorded in the
   sidecar's `widget_questions` array (one entry per widget).
-- Persona invariants: `——` (CJK double em-dash) not `—`; `：` (CJK
-  colon) not `:` in prose.
+- Persona invariants in prose: `——` (CJK double em-dash) not Latin
+  `—`/`–`; `：` (CJK colon) not `:`; full-width quotes `「」`/`『』` not
+  half-width `"`/`"`. (Widget code is exempt; these apply to
+  `.vg-post-body` prose, and are exactly what `em_dash_check` audits.)
 - zh-tw-prose.md 鐵律：所有數字、場景、引語必須來自 source；去 AI 味
   靠刪與改寫，不靠補細節。zh-CN 用語與 AI 套話會被 Step 8 的
   check-zh-prose.mjs 機械擋下。
