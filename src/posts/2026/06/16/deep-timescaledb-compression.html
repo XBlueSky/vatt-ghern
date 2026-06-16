@@ -1,0 +1,344 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">同一份感測器資料，308 MB 進去、7.2 MB 出來，而且查詢還快了 28 倍——這不是把 row 一列一列 gzip 起來，而是先把資料重排，讓每種型別的欄位各自挑到最省的編碼。</p>
+  <h1 class="vg-post-title">TimescaleDB 怎麼把時序壓到剩零頭——columnar 壓縮從零講起</h1>
+</header>
+
+<div class="vg-post-body">
+
+<p><span class="vg-dropcap">讀</span>完這篇，你會知道一件具體的事：當有人說「TimescaleDB 把時序資料壓到剩 2%」，他到底壓了什麼、怎麼壓的、以及這個數字什麼時候拿得到、什麼時候拿不到。我們不從 column store 的學術定義講，而是跟著一個 chunk 被轉換的過程走一遍：列怎麼被打包成批、批怎麼變成壓縮表裡的一列、每個欄位變成陣列之後又各自套了什麼編碼。沒碰過 columnar 壓縮的後端工程師，也能讀懂壓縮率到底從哪來。</p>
+
+<h2>一張一直在長的表——時序資料難在哪裡</h2>
+
+<p>先把場景擺出來。你有一台機器，上面一堆感測器，每秒回報一次溫度、轉速、電壓。一台機器、十個指標、一秒一筆，一天就是大約八十六萬列；一千台機器，一天就是八億列。這是時序工作負載最樸素的形狀：寫進去的列遠多於改動的列，而且絕大多數欄位的相鄰兩列長得幾乎一樣——溫度從 72.3 變成 72.4，時間戳從某一秒變成下一秒。</p>
+
+<p>用一般的 row-by-row 儲存，這張表有兩個問題。一是大：每一列都把 machine_id、時間戳、十個浮點、各種 tag 完整存一份，而這些值高度重複，等於把同樣的東西抄了上億遍。二是掃描慢：你想算「上週這一千台機器的平均溫度」，引擎得把每一列整列讀進來——包含你根本沒用到的轉速、電壓欄位——才能取出溫度那一欄。</p>
+
+<p>關鍵觀察是：時序資料的冗餘不是隨機分布的，它沿著「同一欄位的時間方向」聚集。相鄰時間戳只差一秒，相鄰溫度只差零點幾度，同一台機器的 machine_id 整段都一樣。Row 儲存把這些值打散在每一列裡，根本沒辦法利用這種冗餘。要榨出空間，得先把資料換個排法。</p>
+
+<h2>row 引擎與 column 引擎，各擅長一半——以及不二選一的那個設計</h2>
+
+<p>資料庫引擎在「怎麼把資料擺到磁碟上」這件事上，長期有兩條路線。Row store 把一列的所有欄位連續放在一起；column store 把同一欄位的所有值連續放在一起。兩者各擅長一半工作。</p>
+
+<p>Row store 適合寫入與更新：新增一筆就是在尾巴接一段、改一筆就是原地改。它也適合「抓出某一列的全部欄位」這種點查。代價是分析掃描：你只要溫度，卻被迫整列讀進來。Column store 反過來——同型別的值連續排在一起，掃描單一欄位飛快，而且因為相鄰值相似，壓縮率天生就高；代價是寫入與單列更新昂貴，因為一列的資料被拆散在各個欄位的儲存區。</p>
+
+<p>把這個取捨講得更實在一點：column store 的寫入為什麼貴。要新增一筆資料，你不是在一個地方接一段，而是得分別跑去溫度的儲存區、轉速的儲存區、時間戳的儲存區，每一處各補一個值——一筆寫入散成十幾個分頭的小動作。更糟的是單列更新：壓縮過的一排值是一個整體，想改其中一格，往往得把整排解開、改掉、再重壓回去。這對「不斷有新資料湧進、且最近的資料還可能被修正」的時序場景簡直是噩夢。但反過來看歷史資料：上個月那批溫度讀數，既不會再改，也幾乎只被拿去做聚合掃描，column store 的缺點對它完全不痛，優點卻全用得上。同一張表，不同年齡的資料，對引擎的要求竟然剛好相反——這就是 Hypercore 切入的縫隙。</p>
+
+<figure class="vg-w-arch-row-vs-col-timescaledb" data-mobile="keep" data-svg-scroll="720">
+  <svg viewBox="0 0 720 300" preserveAspectRatio="xMidYMid meet" role="img" aria-label="row store 與 column store 的磁碟佈局對照">
+    <text x="180" y="28" text-anchor="middle" font-family="Manrope, sans-serif" font-size="13" letter-spacing="0.06em" fill="var(--muted)">ROW STORE</text>
+    <text x="540" y="28" text-anchor="middle" font-family="Manrope, sans-serif" font-size="13" letter-spacing="0.06em" fill="var(--muted)">COLUMN STORE</text>
+
+    <g font-family="JetBrains Mono, monospace" font-size="12">
+      <rect x="40" y="48" width="280" height="34" fill="none" stroke="var(--muted-2)" stroke-width="1" />
+      <rect x="40" y="48" width="70" height="34" fill="var(--accent)" fill-opacity="0.18" />
+      <rect x="110" y="48" width="70" height="34" fill="var(--sage)" fill-opacity="0.25" />
+      <rect x="180" y="48" width="70" height="34" fill="var(--ink-deep)" fill-opacity="0.15" />
+      <rect x="250" y="48" width="70" height="34" fill="var(--accent)" fill-opacity="0.10" />
+      <text x="75" y="70" text-anchor="middle" fill="var(--ink)">id</text>
+      <text x="145" y="70" text-anchor="middle" fill="var(--ink)">ts</text>
+      <text x="215" y="70" text-anchor="middle" fill="var(--ink)">temp</text>
+      <text x="285" y="70" text-anchor="middle" fill="var(--ink)">rpm</text>
+
+      <rect x="40" y="86" width="280" height="34" fill="none" stroke="var(--muted-2)" stroke-width="1" />
+      <rect x="40" y="86" width="70" height="34" fill="var(--accent)" fill-opacity="0.18" />
+      <rect x="110" y="86" width="70" height="34" fill="var(--sage)" fill-opacity="0.25" />
+      <rect x="180" y="86" width="70" height="34" fill="var(--ink-deep)" fill-opacity="0.15" />
+      <rect x="250" y="86" width="70" height="34" fill="var(--accent)" fill-opacity="0.10" />
+      <text x="75" y="108" text-anchor="middle" fill="var(--ink)">id</text>
+      <text x="145" y="108" text-anchor="middle" fill="var(--ink)">ts</text>
+      <text x="215" y="108" text-anchor="middle" fill="var(--ink)">temp</text>
+      <text x="285" y="108" text-anchor="middle" fill="var(--ink)">rpm</text>
+    </g>
+    <text x="180" y="150" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" font-style="italic" fill="var(--muted)">一列連續放 · 寫入/點查快</text>
+    <text x="180" y="172" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" font-style="italic" fill="var(--muted)">只要一欄也得整列讀</text>
+
+    <g font-family="JetBrains Mono, monospace" font-size="12">
+      <rect x="400" y="48" width="60" height="72" fill="var(--accent)" fill-opacity="0.18" stroke="var(--muted-2)" stroke-width="1" />
+      <rect x="465" y="48" width="60" height="72" fill="var(--sage)" fill-opacity="0.25" stroke="var(--muted-2)" stroke-width="1" />
+      <rect x="530" y="48" width="60" height="72" fill="var(--ink-deep)" fill-opacity="0.15" stroke="var(--muted-2)" stroke-width="1" />
+      <rect x="595" y="48" width="60" height="72" fill="var(--accent)" fill-opacity="0.10" stroke="var(--muted-2)" stroke-width="1" />
+      <text x="430" y="88" text-anchor="middle" fill="var(--ink)">id</text>
+      <text x="495" y="88" text-anchor="middle" fill="var(--ink)">ts</text>
+      <text x="560" y="88" text-anchor="middle" fill="var(--ink)">temp</text>
+      <text x="625" y="88" text-anchor="middle" fill="var(--ink)">rpm</text>
+    </g>
+    <text x="540" y="150" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" font-style="italic" fill="var(--muted)">一欄連續放 · 掃描/壓縮強</text>
+    <text x="540" y="172" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" font-style="italic" fill="var(--muted)">寫入/單列改動昂貴</text>
+
+    <rect x="40" y="206" width="615" height="66" rx="8" fill="var(--bg-soft)" stroke="var(--line)" stroke-width="1" />
+    <text x="60" y="232" font-family="Manrope, sans-serif" font-size="12" letter-spacing="0.06em" fill="var(--accent-text)">HYPERCORE</text>
+    <text x="60" y="256" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">新資料留在 row chunk（寫入快），舊 chunk 自動轉成 columnar 壓縮格式——不二選一。</text>
+  </svg>
+  <figcaption>同一份資料的兩種磁碟佈局。Hypercore 不在兩者之間挑邊站，而是按資料新舊分流。</figcaption>
+</figure>
+
+<p>過去這個取捨逼人二選一：要嘛整套用 row store、吞下分析掃描的慢與儲存的胖，要嘛整套搬去 column store、吞下寫入與單列更新的痛。對時序工作負載來說兩邊都不甘心——它既要能高速吞下源源不絕的新資料，又要能省空間地保存大量幾乎不再改動的歷史。Hypercore 的觀察是，這兩種需求其實落在資料的不同年齡上：剛進來的資料要快寫快改，放久的資料要省要快掃。既然如此，何不讓資料按年齡走不同的引擎。</p>
+
+<p>TimescaleDB 的 Hypercore 的做法就是把這個取捨拆成時間問題。原文的定義是「a hybrid row-columnar engine in which new data lands in Postgres row-based chunks (fast INSERTs and UPDATEs), while older chunks are automatically converted to a columnar, compressed format」。剛寫進來的資料還可能被改、被查最近狀態，留在 PostgreSQL 的 row chunk 裡，寫入與更新都快；放久了、不太會再改的舊 chunk，自動轉成 columnar 壓縮格式，省空間又利於掃描。新舊資料各走最適合自己的引擎，而 chunk 這個按時間切分的單位，剛好就是切換引擎的天然界線。</p>
+
+<h2>把一批列疊成一列——壓縮的真正形狀</h2>
+
+<p>轉換的核心動作只有一句話，但這句話是整篇文章的樞紐。原文寫：「Converting a chunk groups rows into batches of up to 1000 and each batch becomes a single row in the compressed table, in which the columns are arrays.」</p>
+
+<p>拆開來看。轉換一個 chunk 時，引擎把裡面的列分組，每組最多 1000 列，這一組叫一個 batch。然後——這是關鍵——每一個 batch 變成壓縮表裡的「一列」。原本一萬列的 chunk，壓縮後大約只剩十列。而原本表裡的每一個欄位，在這新的一列裡變成一個陣列：溫度欄變成一個裝了一千個溫度值的陣列，時間戳欄變成一個裝了一千個時間戳的陣列。</p>
+
+<figure class="vg-w-arch-batch-transform-timescaledb" data-mobile="keep" data-svg-scroll="720">
+  <svg viewBox="0 0 720 340" preserveAspectRatio="xMidYMid meet" role="img" aria-label="1000 列打包成壓縮表一列、欄位變陣列">
+    <text x="120" y="28" text-anchor="middle" font-family="Manrope, sans-serif" font-size="12" letter-spacing="0.06em" fill="var(--muted)">ROW CHUNK · 最多 1000 列</text>
+    <g font-family="JetBrains Mono, monospace" font-size="11" fill="var(--ink)">
+      <rect x="30" y="42" width="180" height="22" fill="none" stroke="var(--muted-2)" />
+      <text x="40" y="58">m1 · 09:00:01 · 72.3</text>
+      <rect x="30" y="64" width="180" height="22" fill="none" stroke="var(--muted-2)" />
+      <text x="40" y="80">m1 · 09:00:02 · 72.4</text>
+      <rect x="30" y="86" width="180" height="22" fill="none" stroke="var(--muted-2)" />
+      <text x="40" y="102">m1 · 09:00:03 · 72.4</text>
+      <rect x="30" y="108" width="180" height="22" fill="none" stroke="var(--muted-2)" />
+      <text x="40" y="124">m1 · 09:00:04 · 72.5</text>
+    </g>
+    <text x="120" y="156" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" font-style="italic" fill="var(--muted)">⋮ 一路到 ~1000 列</text>
+
+    <path d="M 230 90 L 300 90" stroke="var(--accent)" stroke-width="2" marker-end="url(#vg-w-arch-batch-transform-timescaledb-arrow)" />
+    <defs>
+      <marker id="vg-w-arch-batch-transform-timescaledb-arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+        <path d="M0,0 L6,3 L0,6 Z" fill="var(--accent)" />
+      </marker>
+    </defs>
+    <text x="265" y="78" text-anchor="middle" font-family="Manrope, sans-serif" font-size="10" fill="var(--accent-text)">打包</text>
+
+    <text x="500" y="28" text-anchor="middle" font-family="Manrope, sans-serif" font-size="12" letter-spacing="0.06em" fill="var(--muted)">COMPRESSED TABLE · 一個 batch = 一列</text>
+    <rect x="320" y="42" width="370" height="120" rx="6" fill="var(--bg-soft)" stroke="var(--accent)" stroke-width="1.5" />
+    <g font-family="JetBrains Mono, monospace" font-size="11" fill="var(--ink)">
+      <text x="338" y="64" fill="var(--muted)">machine_id</text>
+      <text x="460" y="64">m1   <tspan fill="var(--muted)">（整批同值）</tspan></text>
+      <text x="338" y="92" fill="var(--muted)">ts[]</text>
+      <text x="460" y="92">[09:00:01, :02, :03, …]</text>
+      <text x="338" y="120" fill="var(--muted)">temp[]</text>
+      <text x="460" y="120">[72.3, 72.4, 72.4, 72.5, …]</text>
+      <text x="338" y="148" fill="var(--muted)">rpm[]</text>
+      <text x="460" y="148">[1480, 1480, 1481, …]</text>
+    </g>
+
+    <text x="360" y="206" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">每個欄位現在是一個陣列——同型別的值排成一排。</text>
+    <text x="360" y="230" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">壓縮就發生在這一排上：對 ts[] 套時間戳編碼、</text>
+    <text x="360" y="254" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">對 temp[] 套浮點編碼，各挑各的最省演算法。</text>
+
+    <rect x="30" y="276" width="660" height="46" rx="8" fill="none" stroke="var(--line)" stroke-width="1" />
+    <text x="50" y="304" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">原本一萬列的 chunk，壓縮後大約只剩十列——每列各包一批，欄位全變陣列。</text>
+  </svg>
+  <figcaption>整套壓縮的形狀：列數塌縮成原本的千分之一，但每列變胖——欄位是陣列。真正的壓縮接著對這些陣列動手。</figcaption>
+</figure>
+
+<p>為什麼這個重排是一切的前提？因為一旦「同一個欄位的一千個值」排成連續一排，你就能對這一排套用「為這種型別量身打造」的編碼。row 格式做不到這件事——它的相鄰位元組是不同型別的欄位，溫度後面接著轉速，沒有任何規律可循。把同型別的值排在一起，規律才浮現：時間戳幾乎等差、溫度幾乎不變、machine_id 整批一樣。</p>
+
+<p>這裡有個值得停下來的細節：壓縮表的一列，並不是一段不透明的二進位塊。它仍是一張正常 PostgreSQL 表裡的一列，只是每個欄位的型別從「一個 float」變成「一個壓縮過的 float 陣列」，外加幾個放索引用的 metadata 欄位。換句話說，整套壓縮是長在 PostgreSQL 的儲存模型之上，而不是繞過它——這也是為什麼 Hypercore 能讓壓縮資料跟未壓縮資料在同一條 SQL 查詢裡無縫混用：查最近三天，碰到的是 row chunk；查上個月，碰到的是壓縮 chunk；查横跨兩者的範圍，planner 各用各的存取路徑，回給你的是同一張結果。把 1000 這個批量級記在心裡也有用——它大到足以攤平壓縮的固定開銷、讓每一排夠長到編碼能發揮，又小到讓 batch elimination 的粒度夠細，剪批時不會因為一批太大而被迫多解壓一堆無關的列。下面這個 widget 讓你拖一拖 chunk 的列數，看一個 chunk 會被切成幾批、壓縮表會多出幾列。</p>
+
+<figure class="vg-w-range-batch-count-timescaledb" data-mobile="static" data-svg-scroll="720">
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M5 12h14"/><path d="m12 5 7 7-7 7"/>
+    </svg>
+    <span>拖動滑桿改變 chunk 列數 · 看批數與壓縮表列數怎麼變</span>
+  </p>
+  <div class="controls" data-vg-controls>
+    <label for="vg-w-range-batch-count-timescaledb-x">chunk 列數 =</label>
+    <input id="vg-w-range-batch-count-timescaledb-x" type="range" min="1000" max="2000000" step="1000" value="40000" />
+    <span class="readout" id="vg-w-range-batch-count-timescaledb-readout">40,000 列</span>
+  </div>
+  <svg viewBox="0 0 720 200" preserveAspectRatio="xMidYMid meet" role="img" aria-label="chunk 列數對應批數與壓縮表列數">
+    <text x="40" y="56" font-family="Manrope, sans-serif" font-size="12" letter-spacing="0.05em" fill="var(--muted)">每批最多</text>
+    <text x="40" y="78" font-family="JetBrains Mono, monospace" font-size="22" fill="var(--ink)">1000 列</text>
+
+    <text x="280" y="56" font-family="Manrope, sans-serif" font-size="12" letter-spacing="0.05em" fill="var(--muted)">切成幾批 / 壓縮後幾列</text>
+    <text x="280" y="86" font-family="JetBrains Mono, monospace" font-size="32" fill="var(--accent-text)" id="vg-w-range-batch-count-timescaledb-batches">40</text>
+
+    <text x="280" y="120" font-family="EB Garamond, serif" font-size="13" font-style="italic" fill="var(--muted)" id="vg-w-range-batch-count-timescaledb-note">40,000 列 → 40 批 → 壓縮表 40 列</text>
+
+    <rect x="40" y="150" width="640" height="24" rx="4" fill="var(--bg-soft)" stroke="var(--line)" />
+    <rect x="40" y="150" width="8" height="24" rx="2" fill="var(--accent)" id="vg-w-range-batch-count-timescaledb-bar" />
+    <text x="40" y="194" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">壓縮表列數相對 chunk 列數 · 約千分之一</text>
+  </svg>
+  <figcaption>每批上限 1000 列，所以壓縮表列數約等於 chunk 列數除以一千。列數塌縮本身不省空間——省空間的是接下來對陣列的編碼。</figcaption>
+  <script>
+    (function () {
+      if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+      const root = document.querySelector('.vg-w-range-batch-count-timescaledb');
+      const input = root.querySelector('input');
+      const readout = root.querySelector('#vg-w-range-batch-count-timescaledb-readout');
+      const batchesEl = root.querySelector('#vg-w-range-batch-count-timescaledb-batches');
+      const noteEl = root.querySelector('#vg-w-range-batch-count-timescaledb-note');
+      const bar = root.querySelector('#vg-w-range-batch-count-timescaledb-bar');
+      const BATCH = 1000;
+      function fmt(n) { return n.toLocaleString('en-US'); }
+      function update() {
+        const rows = Number(input.value);
+        const batches = Math.ceil(rows / BATCH);
+        readout.textContent = `${fmt(rows)} 列`;
+        batchesEl.textContent = fmt(batches);
+        noteEl.textContent = `${fmt(rows)} 列 → ${fmt(batches)} 批 → 壓縮表 ${fmt(batches)} 列`;
+        const frac = batches / rows;
+        bar.setAttribute('width', String(Math.max(8, 640 * frac)));
+      }
+      input.addEventListener('input', update);
+      update();
+    })();
+  </script>
+</figure>
+
+<h2>一排同型別的值，各有各的省法——四種編碼</h2>
+
+<p>到這裡資料已經重排好：每個欄位是一排同型別的值。壓縮的最後一哩，是對每一排挑一個最適合它的編碼。Hypercore 按欄位型別分四類處理，這也是整體壓縮率的來源。</p>
+
+<p>在進到細節之前，先抓住一個貫穿全部四種編碼的共同直覺：每一種都在賭「這排值裡藏著某種便宜的規律」，而它們賭的規律各不相同。一排值可能在三個維度上具備冗餘——值之間的差很小且穩定、相鄰值在位元上很像、或者同一個值反覆出現。差值家族賭第一種，XOR 賭第二種，run-length 與字典賭第三種。沒有哪一種編碼能同時吃下三種規律，所以 Hypercore 不選一個通用演算法硬套全表，而是看欄位的型別與形狀，把對的賭注押到對的欄位上。理解這一層，後面四種編碼就不是四個要背的名詞，而是同一個問題的四種答案：這排值的冗餘長什麼樣，我就用哪種方式把它榨掉。</p>
+
+<p>時間戳與整數型欄位走的是差值家族：原文列的是「delta encoding, delta-of-delta, simple-8b and run-length encoding」。Delta 編碼存的不是值本身，而是相鄰兩值的差。一排每秒一筆的時間戳，原值是十位數的大整數，差值卻全是 1。Delta-of-delta 再對差值取一次差——固定頻率的時間戳，差值本身也固定，二階差就全是 0。simple-8b 再把這一堆小整數緊緻地打包進機器字。原文給的典型壓縮比是「Typical ratio for timestamps 50-100×」：一排幾乎等差的時間戳，壓到原本的五十到一百分之一。</p>
+
+<p>把這個用一排真的時間戳走一遍最清楚。假設每秒一筆，原始值是這樣的 Unix epoch 秒數：</p>
+
+<pre data-kind="output"><code>原值       1718524801  1718524802  1718524803  1718524805  1718524806
+delta              —          +1          +1          +2          +1   <em>// 第一階差</em>
+delta-of-delta     —           —           0          +1          -1   <em>// 第二階差</em>
+</code></pre>
+
+<p>原值每個要十位數、約 31 個位元才存得下。一階 delta 之後全變成 1 或 2，一個位元組綽綽有餘；第三筆到第四筆中間掉了一秒（可能是漏採），delta 從 1 跳到 2，但 delta-of-delta 把這個跳動也壓成一個 +1。最後這排只剩一堆 0 與正負 1，simple-8b 能把好幾十個這種小數塞進同一個 64 位元的機器字。一排幾乎等差的值，就是這樣壓到剩零頭——它利用的不是「值小」，而是「值之間的關係穩定」。這也是為什麼 orderby 要把時間排好：差值的穩定性，全靠排序維持。</p>
+
+<p>run-length 是同一個家族裡更極端的一招。原文把它列在時間戳那組編碼裡，但它真正大放異彩的場合，是那種「整排幾乎都是同一個值」的欄位——狀態碼、開關旗標、或被 segmentby 切出來、整批同值的 machine_id。一排五百個連續的 1，run-length 只存「1，重複 500」這一對數字，五百個值塌成兩個。差值家族的共通精神是一樣的：別存值，存值與值之間那個更短的東西。</p>
+
+<p>浮點欄位不能用整數差值，因為兩個浮點數相減在位元層面不一定變小。Hypercore 用的是「XOR-based compression (based on Gorilla) with a touch of dictionary compression」。它把相鄰兩個浮點數的位元做 XOR——溫度從 72.3 到 72.4，大部分高位位元相同，XOR 之後前後一長串是 0，只剩中間幾個位元在變，於是可以只存「有幾個前導 0、有幾個尾隨 0、中間那幾個位元是什麼」。這是 Gorilla 這套 Facebook 時序壓縮論文帶起來的做法。</p>
+
+<p>為什麼要繞道 XOR 而不直接相減？因為一個 IEEE 754 雙精度浮點數的位元是「符號、指數、尾數」三段拼起來的，數值上的小變化不保證位元上的小變化——72.3 減 72.4 在十進位看很小，換算成浮點位元卻可能整段不同。XOR 不問數值大小，只問「哪幾個位元不一樣」。兩個相近的溫度讀數，符號相同、指數通常相同、尾數的高位也大半相同，XOR 之後自然前後都是一長串 0，真正在變的位元擠在中間一小段。Gorilla 的洞見就是：與其存整個 64 位元，不如只存「前導 0 的個數、有意義位元的長度、那段位元本身」。溫度這種一秒只動零點幾度的訊號，中間變動的往往只有幾個位元，壓縮比因此很高；反過來，若一排浮點數彼此毫無關係、上下亂跳，XOR 之後中間那段很長，這招就省不了多少——又一次，壓縮率是資料形狀的函式，不是引擎的承諾。</p>
+
+<p>字串與低基數欄位走字典編碼：建一張「不同字串 → 短整數編號」的表，陣列裡只存編號。一排一百萬個 region 標籤，實際只有 us-east、eu-west 那幾種值，字典編碼把每個冗長字串換成一個一位元組的編號，原本的字串只在字典裡各存一份。JSONB 也吃這套——重複出現的 key 與 value 進字典，陣列裡留編號。字典編碼省的是「同一個東西被抄很多遍」這種冗餘，所以它跟 run-length 一樣，欄位的唯一值越少、效果越好。這四種編碼沒有一種是萬用的，每一種都假設了資料的某種規律：差值家族賭值之間關係穩定、XOR 賭相鄰值相近、run-length 與字典賭值會重複。把對的編碼配給對的欄位，正是 Hypercore 按型別分類處理的用意。下面這張圖把四種型別並排，點一根長條看它對應的編碼怎麼運作。</p>
+
+<figure class="vg-w-chart-codec-ratios-timescaledb" data-mobile="static" data-svg-scroll="720">
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M9 11.5 11 13.5 15.5 9"/><circle cx="12" cy="12" r="9"/>
+    </svg>
+    <span>點任一根長條 · 讀該欄位型別用什麼編碼 · 4 種型別</span>
+  </p>
+  <div class="codec-picker" data-vg-controls>
+    <button type="button" data-codec="ts" aria-label="看時間戳編碼">時間戳</button>
+    <button type="button" data-codec="float" aria-label="看浮點編碼">浮點</button>
+    <button type="button" data-codec="repeat" aria-label="看重複值編碼">重複值</button>
+    <button type="button" data-codec="str" aria-label="看字串編碼">字串 / JSONB</button>
+  </div>
+  <svg viewBox="0 0 720 340" preserveAspectRatio="xMidYMid meet" role="img" aria-label="各欄位型別的編碼與典型壓縮比">
+    <line x1="120" y1="40" x2="120" y2="220" stroke="var(--muted-2)" stroke-width="1" />
+    <line x1="120" y1="220" x2="690" y2="220" stroke="var(--muted-2)" stroke-width="1" />
+    <text x="60" y="130" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--muted)" transform="rotate(-90 60 130)">壓縮比（越右越省）</text>
+
+    <g id="vg-w-chart-codec-ratios-timescaledb-bars"></g>
+
+    <rect x="120" y="248" width="570" height="74" rx="8" fill="var(--bg-soft)" stroke="var(--line)" stroke-width="1" />
+    <text x="138" y="272" font-family="Manrope, sans-serif" font-size="11" letter-spacing="0.06em" fill="var(--accent-text)" id="vg-w-chart-codec-ratios-timescaledb-detail-title">時間戳 · DELTA / DELTA-OF-DELTA / SIMPLE-8B</text>
+    <text x="138" y="296" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)" id="vg-w-chart-codec-ratios-timescaledb-detail-1">存相鄰兩值的差，再對差取一次差。固定頻率時間戳的二階差全是 0。</text>
+    <text x="138" y="316" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)" id="vg-w-chart-codec-ratios-timescaledb-detail-2">典型壓縮比 50–100×。</text>
+  </svg>
+  <figcaption>長條只標相對量級，不是同一場 benchmark 的精確測值；唯一帶原文數字的是時間戳的 50–100×。點長條看每種型別實際套的編碼。</figcaption>
+  <script>
+    (function () {
+      if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+      const root = document.querySelector('.vg-w-chart-codec-ratios-timescaledb');
+      const barsG = root.querySelector('#vg-w-chart-codec-ratios-timescaledb-bars');
+      const dTitle = root.querySelector('#vg-w-chart-codec-ratios-timescaledb-detail-title');
+      const d1 = root.querySelector('#vg-w-chart-codec-ratios-timescaledb-detail-1');
+      const d2 = root.querySelector('#vg-w-chart-codec-ratios-timescaledb-detail-2');
+      const NS = 'http://www.w3.org/2000/svg';
+      function el(tag, attrs) { const e = document.createElementNS(NS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); return e; }
+
+      const data = [
+        { key: 'ts', label: '時間戳', mag: 0.95,
+          title: '時間戳 · DELTA / DELTA-OF-DELTA / SIMPLE-8B',
+          l1: '存相鄰兩值的差，再對差取一次差。固定頻率時間戳的二階差全是 0。',
+          l2: '典型壓縮比 50–100×（原文 Typical ratio for timestamps 50-100×）。' },
+        { key: 'float', label: '浮點', mag: 0.6,
+          title: '浮點 · XOR-BASED（BASED ON GORILLA）',
+          l1: '相鄰兩浮點做 XOR，只存前導 0 數、尾隨 0 數與中間變動的位元。',
+          l2: '再加一點字典壓縮（a touch of dictionary compression）。' },
+        { key: 'repeat', label: '重複值', mag: 0.8,
+          title: '重複值 · RUN-LENGTH ENCODING',
+          l1: '一排連續相同的值，存成「值 × 重複次數」。',
+          l2: 'machine_id 這種整批同值的欄位最吃這招。' },
+        { key: 'str', label: '字串 / JSONB', mag: 0.5,
+          title: '字串 / JSONB · DICTIONARY',
+          l1: '建「字串 → 短整數編號」的表，陣列裡只存編號。',
+          l2: '低基數（重複字串多）時最省。' },
+      ];
+
+      const X0 = 120, X1 = 690, slotH = 44, gap = 8;
+      data.forEach((d, i) => {
+        const y = 50 + i * (slotH + gap);
+        const w = (X1 - X0) * d.mag;
+        const r = el('rect', { x: X0, y: y, width: w, height: slotH, rx: 4, fill: 'var(--accent)', 'fill-opacity': '0.22', stroke: 'var(--accent)', 'stroke-width': '1.5', role: 'button', tabindex: '0', 'aria-label': '看' + d.label + '編碼', 'data-codec': d.key, style: 'cursor:pointer' });
+        const t = el('text', { x: X0 + 12, y: y + 28, 'font-family': 'JetBrains Mono, monospace', 'font-size': '14', fill: 'var(--ink)', 'pointer-events': 'none' });
+        t.textContent = d.label;
+        barsG.appendChild(r); barsG.appendChild(t);
+        function pick() { dTitle.textContent = d.title; d1.textContent = d.l1; d2.textContent = d.l2; data.forEach(o => { const rr = barsG.querySelector('[data-codec="' + o.key + '"]'); rr.setAttribute('fill-opacity', o.key === d.key ? '0.42' : '0.22'); }); }
+        r.addEventListener('click', pick);
+        r.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pick(); } });
+      });
+      const picker = root.querySelector('.codec-picker');
+      picker.querySelectorAll('button').forEach(b => b.addEventListener('click', () => { barsG.querySelector('[data-codec="' + b.dataset.codec + '"]').dispatchEvent(new MouseEvent('click', { bubbles: true })); }));
+    })();
+  </script>
+</figure>
+
+<p>四種編碼加起來，原文給的整體上限是「TimescaleDB can achieve compression of up to 98% for typical time-series data」。注意這句的兩個限定：up to 是上限，typical time-series data 是條件。資料若不具備那種時間方向的冗餘——例如一排隨機亂數——這些編碼都使不上力，98% 拿不到。壓縮率不是引擎的固定屬性，是資料形狀的函式。</p>
+
+<h2>不解壓就跳過整批——segmentby 與 orderby 在管什麼</h2>
+
+<p>壓縮省了空間，但若每次查詢都得把整張表解壓回來才能過濾，那就得不償失。Hypercore 靠兩個設定參數讓查詢能在壓縮狀態下就剪掉大半資料：segmentby 與 orderby。</p>
+
+<p>segmentby 指定「整批共享同一個值」的欄位。原文說它是「the column whose values are shared across an entire batch (e.g. machine_id or sensor_id)」。把 machine_id 設成 segmentby，引擎就會讓每一批只裝同一台機器的列。這帶來兩個好處：machine_id 這欄整批同值，run-length 壓到極致；更重要的是，每一批可以掛一個 minmax 稀疏索引——記下這批的 machine_id 是哪台、時間戳範圍是多少。查「machine 7 上週的資料」時，原文說「the planner skips other machines' batches based on metadata」：planner 直接看索引的 metadata，跳過所有不是 machine 7 的批，完全不用解壓。</p>
+
+<figure class="vg-w-arch-batch-elimination-timescaledb" data-mobile="keep" data-svg-scroll="720">
+  <svg viewBox="0 0 720 300" preserveAspectRatio="xMidYMid meet" role="img" aria-label="minmax 稀疏索引讓 planner 跳過整批">
+    <text x="40" y="30" font-family="Manrope, sans-serif" font-size="12" letter-spacing="0.05em" fill="var(--muted)">查詢：WHERE machine_id = m7 AND time &gt;= 上週</text>
+
+    <g font-family="JetBrains Mono, monospace" font-size="11">
+      <rect x="40" y="50" width="300" height="34" rx="4" fill="var(--bg-soft)" stroke="var(--muted-2)" />
+      <text x="54" y="71" fill="var(--muted)">batch #1  id=m3  ts=[6/1..6/2]</text>
+      <text x="356" y="71" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">跳過（id 不符）</text>
+      <line x1="40" y1="67" x2="340" y2="67" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="3 3" />
+
+      <rect x="40" y="92" width="300" height="34" rx="4" fill="var(--bg-soft)" stroke="var(--muted-2)" />
+      <text x="54" y="113" fill="var(--muted)">batch #2  id=m7  ts=[5/1..5/3]</text>
+      <text x="356" y="113" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">跳過（時間範圍不符）</text>
+      <line x1="40" y1="109" x2="340" y2="109" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="3 3" />
+
+      <rect x="40" y="134" width="300" height="34" rx="4" fill="var(--accent)" fill-opacity="0.16" stroke="var(--accent)" stroke-width="1.5" />
+      <text x="54" y="155" fill="var(--ink)">batch #3  id=m7  ts=[上週]</text>
+      <text x="356" y="155" font-family="Manrope, sans-serif" font-size="11" fill="var(--accent-text)">命中 → 解壓這一批</text>
+
+      <rect x="40" y="176" width="300" height="34" rx="4" fill="var(--bg-soft)" stroke="var(--muted-2)" />
+      <text x="54" y="197" fill="var(--muted)">batch #4  id=m9  ts=[上週]</text>
+      <text x="356" y="197" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">跳過（id 不符）</text>
+      <line x1="40" y1="193" x2="340" y2="193" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="3 3" />
+    </g>
+
+    <rect x="40" y="234" width="640" height="50" rx="8" fill="none" stroke="var(--line)" stroke-width="1" />
+    <text x="58" y="256" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">每批掛 minmax 索引（id 範圍、時間範圍）。planner 只比對 metadata 就剪掉不相關的批，</text>
+    <text x="58" y="276" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">只有命中的 batch #3 才付出解壓成本。這就是 batch elimination。</text>
+  </svg>
+  <figcaption>稀疏索引的精神：不是替每一列建索引，而是替每一批記一個範圍。範圍對不上就整批跳過，連解壓都省了。</figcaption>
+</figure>
+
+<p>orderby 管的是另一件事——批內怎麼排。原文說它是「the sort order inside the batch (usually time DESC). Sorting by time gives delta encoding and delta-of-delta their maximum advantage」。為什麼排序會影響壓縮？回到 delta 編碼：它存的是相鄰兩值的差。若一批時間戳是亂序的，相鄰差忽大忽小忽正忽負，delta 編碼省不了多少；若按時間排好，相鄰差全是固定的正數，delta-of-delta 直接歸零。orderby 通常設 time DESC，就是替時間戳與其他隨時間平滑變化的欄位，把 delta 編碼的效果推到最大。</p>
+
+<p>值得把 segmentby 與 orderby 的分工再對齊一次，因為它們服務的是兩件不同的事。segmentby 決定「批要怎麼切」——它讓同一個過濾值的列聚在同一批，餵的是查詢時的 batch elimination：批分得對，planner 才有整批可跳。orderby 決定「批內怎麼排」——它讓相鄰值的關係穩定下來，餵的是壓縮時的 delta 與 delta-of-delta：排得對，差值才會塌成一串 0 與正負 1。一個面向讀取效率，一個面向儲存效率，兩者在同一份設定裡各管一頭，互不替代。把它們混為一談，是新手最容易踩的概念坑。</p>
+
+<p>這兩個參數不是隨便設的。原文給了量化守則：「each segment should contain at least 100 rows in a chunk, and optimally 100–10,000 unique segmentby values per chunk.」每個 segment 在一個 chunk 內至少要有 100 列——低於這個數，批太小、壓縮的固定成本攤不開；每個 chunk 最好有 100 到 10,000 個唯一的 segmentby 值——太少則 segment 過大失去過濾力，太多則每個 segment 列數不足。segmentby 通常選查詢最常拿來過濾的那個欄位（machine_id、sensor_id），這樣 batch elimination 才剪得到地方。這條守則的兩端其實是同一個張力的兩面：唯一值太少，每個 segment 塞了一大堆列、批變得巨大，過濾的解析度太粗；唯一值太多，每個 segment 攤不到 100 列、壓縮的固定開銷攤不平，省下的空間反被中繼資料吃掉。甜蜜點是讓 segmentby 的唯一值數量對齊你最常下的過濾條件——選欄位要從查詢長相回推。</p>
+
+<h2>什麼時候真的省到，什麼時候省不到——代價在哪</h2>
+
+<p>把上面的機制接到一個真實案例。原文記錄的一組數字是：壓縮比「42.8× (308 MB → 7.2 MB)」，同時查詢「28× faster in execution」。308 MB 的資料壓到 7.2 MB，而且查詢還快了二十八倍。空間與速度通常是 tradeoff，這裡卻同時改善——原因在前面都鋪好了：metadata 過濾讓 planner 不必碰大半資料，而「vectorized execution」讓命中的批以一千列為單位向量化處理，而非逐列。壓縮表的形狀（一批一列、欄位陣列）天生就適合向量化。</p>
+
+<p>這裡值得把「為什麼壓縮反而讓查詢更快」這件反直覺的事拆清楚。傳統印象裡，壓縮是拿 CPU 換空間——存得小，讀時要花時間解壓；Hypercore 兩頭都贏，靠的是它從不急著解壓。第一層省 I/O：磁碟上小了四十幾倍，掃同一段時間範圍要讀進來的位元組就少四十幾倍。第二層省「根本不必碰的資料」：minmax 稀疏索引讓 planner 在解壓前就剪掉不相關的整批，被剪掉的連讀都不用讀。第三層才是 vectorized execution：真要算的那幾批，值已是同型別連續陣列，CPU 一次處理一整排。三層疊起來，省的遠多於解壓那幾批的 CPU——這才是 28 倍的來源。</p>
+
+<p>但這組數字有它的條件。原文先把話講明：那個個案是特定查詢情境，並非通則，實際壓縮比與加速會隨 query pattern 與資料冗餘度變動——98% 也好、42.8 倍也好，都建立在「資料具備時間方向的冗餘」這個前提上。冗餘度低的資料壓不到那麼小；過濾條件跟 segmentby 對不上，batch elimination 剪不到，加速也跟著縮水。</p>
+
+<p>代價同樣具體。舊 chunk 一旦轉成 columnar，就不再是那個寫入/更新都快的 row 形態——改一筆壓縮過的舊資料，代價遠高於改一筆 row chunk。所以 Hypercore 才把新資料留在 row、只轉舊 chunk：它賭的是「舊資料幾乎只讀不改」。這個賭注對 metric、IoT、log 這類 append-only 時序工作負載成立，對「會頻繁回頭改歷史」的工作負載就不成立。合理的推測是，segmentby/orderby 選錯也有代價——選了一個查詢從不過濾的欄位當 segmentby，你付出了分批的成本，卻換不到 batch elimination 的好處。</p>
+
+<p class="vg-deep-closer"><strong>Take-away</strong>：Hypercore 的壓縮不是魔法，是兩步——先把列重排成「同型別的值排成一排」（每批 1000 列疊成壓縮表一列、欄位變陣列），再對每一排挑最省的編碼（時間戳 delta、浮點 Gorilla 式 XOR、重複值 run-length、字串字典）。你設 segmentby 與 orderby，其實就是在替這套編碼鋪路、並替查詢預留不解壓就跳過整批的捷徑。</p>
+
+</div>

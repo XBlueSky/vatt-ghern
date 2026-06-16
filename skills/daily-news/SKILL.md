@@ -1075,6 +1075,67 @@ sleep 2 && curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/
       collapsing the desktop grid to a single column so the SVG spans
       the full figure. Treat as Blocking.
 
+      **(iv) SVG text-vs-text collision** (added 2026-06-15): no two
+      `<text>` inside the same `vg-w-*` SVG may overlap by more than 1
+      AND 3 viewBox user-units (horizontal AND vertical). Overlap is
+      measured with `getBBox()` in the SVG's own viewBox space, so the
+      threshold is viewport-independent. The 3-unit vertical floor
+      tolerates a deliberate two-line description at the same cx (normal
+      line spacing). This catches the smear that legibility and overflow
+      scripts miss — two `text-anchor="middle"` labels placed at
+      hand-picked cx closer than they are wide.
+
+      ```bash
+      node ${CLAUDE_PLUGIN_ROOT}/skills/daily-news/scripts/check-svg-text-collision.mjs \
+        http://localhost:8080/YYYY/MM/DD/<deep-slug-1>/ \
+        http://localhost:8080/YYYY/MM/DD/<deep-slug-2>/ \
+        > /tmp/vg-collision.json
+      # exit 1 = at least one text-vs-text collision.
+      # stdout JSON carries figures_inspected; a "WARNING: inspected 0
+      # figures" on stderr means the page never loaded — not a real PASS.
+      ```
+
+      Fix by spreading anchors across the viewBox, staggering one label
+      above/below the axis with a leader line, or end-anchoring a single
+      colliding label. Treat as Blocking.
+
+      **(v) Drag-handle coordinate target** (added 2026-06-15): a widget
+      that does `getScreenCTM` coordinate math must NOT grab its svg with
+      a bare `querySelector('svg')` when its figure holds more than one
+      `<svg>` (e.g. an affordance-icon svg as the first svg). The bare
+      query grabs the wrong svg and the drag handle lands off the cursor.
+      Disambiguate by selecting a class-qualified svg
+      (`querySelector('svg.vg-w-<name>-main')`, or any `svg.<class>`).
+
+      ```bash
+      node ${CLAUDE_PLUGIN_ROOT}/skills/daily-news/scripts/check-svg-coordinate-target.mjs \
+        http://localhost:8080/YYYY/MM/DD/<deep-slug-1>/ \
+        http://localhost:8080/YYYY/MM/DD/<deep-slug-2>/ \
+        > /tmp/vg-coordinate.json
+      # exit 1 = a coord-transform widget with >1 svg uses a bare svg query
+      ```
+
+      Fix by giving the main svg a class and selecting it explicitly.
+      Treat as Blocking.
+
+      **(vi) Static widget scan** (added 2026-06-15): runs on the post
+      *source* files (no browser). Flags `vg-w-table-*` figures rendered
+      as `<pre>` instead of a real `<table>`, and SVG `role=button`
+      widgets with `data-target` rects but no bridge script. The dead-
+      button check is file-level — a clean result proves at least one
+      `getAttribute('data-target')` bridge exists in the file, not that
+      every SVG-button widget is individually wired.
+
+      ```bash
+      node ${CLAUDE_PLUGIN_ROOT}/skills/daily-news/scripts/check-widget-static.mjs \
+        src/posts/YYYY/MM/DD/ \
+        > /tmp/vg-widget-static.json
+      # exit 1 = at least one fake-table or dead-svg-button finding
+      ```
+
+      Fix the fake table by rebuilding it as a real `<table>`; fix the
+      dead button by adding the radio-bridge script. Treat as Blocking.
+
    f. **Touch-tier audit — true touch emulation** (added 2026-06-12,
       static-tier spec): the 375px *resize* in (a)–(c) does NOT trigger
       the touch CSS (`hover: none / pointer: coarse` is capability
