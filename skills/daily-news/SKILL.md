@@ -581,6 +581,15 @@ After all sub-agents return:
 6. The mechanical QA gate in Step 8 (`archetype-check`, `check-dup`,
    `html-validate`, `link-check`) is the formal validation. Step 7c is
    the first-pass sanity check before that.
+7. Read the sub-agent's `preflight` block. Each deep-story sub-agent
+   runs a mechanical self-audit (deep-story-brief Step 11.8) and reports
+   `em_dash_check`, `widget_count_match`, `placeholder_check`, and
+   `cjk_char_count_ok`. If a sub-agent reports `status: DONE` while any
+   preflight item is FAIL, that is contradictory — treat the story as
+   BLOCKED and re-dispatch it (the per-story re-dispatch path already
+   used for partial failures). The pre-flight front-loads mechanical
+   contract violations that Step 8 CI would otherwise catch on a
+   round-trip; it is NOT a substitute for the Step 7.5 judgment review.
 
 PR body must list:
 
@@ -634,7 +643,11 @@ the whole point of dispatching an independent Opus reviewer is to get
 a judgment the author cannot give itself. Wording like "the Step 7c
 sub-agent self-checks plus the Step 8 mechanical checks serve as the
 quality gate for this run" is a rationalization, not a substitution
-argument; reject it in your own routine output.
+argument; reject it in your own routine output. (The deep-story Step
+11.8 pre-flight is a different thing: it checks MECHANICAL contract
+compliance — em-dash, widget count, placeholders, length — which is
+countable, not a judgment. It is orthogonal to this clause and does not
+claim to replace the Step 7.5 quality review.)
 
 #### Step 7.5a: Dispatch dual reviewers (parallel)
 
