@@ -135,6 +135,25 @@ You are writing ONE deep-story for vatt'ghern's daily-news routine.
     fetch_status, perspective + archive_url) + notes. Leave `claims` as an empty
     array and `checker_rounds: 0` — the Step 7.6 checker fills them.
     Set `output_path` to {{output_path}}, `checked_at` to today.
+11.8 **Pre-flight self-audit (mechanical, before reporting back).**
+    Re-read your own written HTML + sidecar and check each item below.
+    This is a MECHANICAL contract check — count and grep, NOT a quality
+    judgment (quality is the Step 7.5 reviewer's job, downstream). If an
+    item fails, FIX it now; if it genuinely cannot be fixed, report
+    `DONE_WITH_CONCERNS` or `BLOCKED` and name the failing item. Record
+    each result in the `preflight` block of the status report (Step 12).
+    - `em_dash_check`: no Latin `—`/`–`, no half-width `：`, no
+      half-width `"`/`"` anywhere in `.vg-post-body` prose (persona
+      invariant). Widget code is exempt.
+    - `widget_count_match`: count `<figure class="vg-w-...">` blocks;
+      it MUST equal the sidecar's `widget_count`, `widget_questions.length`,
+      and `widget_templates.length`.
+    - `placeholder_check`: no `// ...`, `/* ... */`, `省略`, `以此類推`,
+      `為簡潔起見`, `for brevity`, "rest follows the same pattern", and
+      no unclosed `<script>`/`<svg>`/`<canvas>` in any widget (see the
+      Hard rule).
+    - `cjk_char_count_ok`: CJK chars in `.vg-post-body` (widget code
+      excluded) ≥ 4000.
 12. Report back: path written, character count, archetype deviations
     (if any) with reasoning, widget count, and widget templates used.
 
@@ -174,6 +193,11 @@ You are writing ONE deep-story for vatt'ghern's daily-news routine.
 - ONLY tools: WebFetch, Read, Write. No Bash, no Edit on other days'
   posts, no Agent (no nested dispatch), no git operations.
 - Do NOT read past posts; the parent already handled dedup in Step 3.
+- **No truncation placeholders.** Every widget `<script>`/`<svg>`/
+  `<canvas>` must be complete — no `// ...`, `/* ... */`, `省略`,
+  `以此類推`, `為簡潔起見`, `for brevity`, "rest follows the same
+  pattern", and no unclosed tag. A widget that reaches the prose floor
+  with text but ships a truncated chart is a failure.
 
 ## What "report back" means
 
@@ -192,6 +216,11 @@ Return a status block:
 - note_count: <number>
 - spine_points: <number>
 - concerns: <list or "none">
+- preflight:  (mechanical self-audit results — Step 11.8)
+    em_dash_check: PASS | FAIL (<what was found>)
+    widget_count_match: true | false (<figure count> vs <sidecar count>)
+    placeholder_check: PASS | FAIL (<what was found>)
+    cjk_char_count_ok: true | false (<count> vs 4000 floor)
 ````
 
 ## How the parent uses these briefs
@@ -206,7 +235,11 @@ with multiple Agent tool blocks) so they execute in parallel.
 
 In Step 7c, the parent reads back each output file, runs the existing
 archetype-check / html-validate / link-check / dedup tests, and folds
-all outputs into the same PR.
+all outputs into the same PR. The parent also reads each sub-agent's
+`preflight` block: a sub-agent that reports `DONE` while any preflight
+item is FAIL is treated as BLOCKED and re-dispatched. This pre-flight is
+mechanical contract compliance, front-loaded to save a review round; it
+does not substitute for the Step 7.5 judgment-quality review.
 
 ## Why parallelise
 
