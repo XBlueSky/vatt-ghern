@@ -1,0 +1,394 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">你撥的不是一台機器在網路上的位置，而是它的身分。IP 會在你毫無預警時失效、會被防火牆擋在外面，而公鑰是你自己造的、自己掌握的——iroh 1.0 把「撥號」這個動作從位址改成金鑰。</p>
+  <h1 class="vg-post-title">{{ title }}</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p><span class="vg-dropcap">i</span>roh 是一套用 Rust 寫的 P2P 連線函式庫，6 月 15 日發布 1.0。它的核心設計只有一句話：「Dial keys. Not IPs.」——你給的位址是一把公鑰，剩下「這把鑰匙今天在世界哪個角落、要走直連還是中繼」全由函式庫在底下處理。這篇拆開它怎麼把一把公鑰變成一條真的能傳資料的連線：用公鑰定址的 endpoint 與 NodeId、先打洞後走 relay 的連線建立順序、一條連線裡跑多條路的 QUIC multipath、不上網也能找到鄰居的 local discovery，最後是 1.0 對 wire protocol 與 API 的穩定性承諾。官方的一句話把目標講得最白：「It turns the internet into a secure localhost.」</p>
+
+  <figure class="vg-w-canvas-iroh-holepunch" data-mobile="swap" data-mobile-summary="兩端都在 NAT 後，iroh 讓雙方同時往對方候選位址送封包打洞；打通就直連、資料不經第三方，打不通才退回公開 relay 墊路。">
+    <style>
+      .vg-w-canvas-iroh-holepunch { display: grid; grid-template-rows: auto 1fr auto; gap: var(--s-2); }
+      .vg-w-canvas-iroh-holepunch .toolbar { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); flex-wrap: wrap; }
+      .vg-w-canvas-iroh-holepunch button { font-family: var(--sans); font-size: var(--fs-sm); padding: 6px 14px; min-height: 44px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); cursor: pointer; }
+      .vg-w-canvas-iroh-holepunch button:hover { border-color: var(--accent); color: var(--accent-text); }
+      .vg-w-canvas-iroh-holepunch canvas { width: 100%; height: auto; aspect-ratio: 2 / 1; display: block; }
+      .vg-w-canvas-iroh-holepunch figcaption { font-family: var(--scribed); font-style: italic; font-size: var(--fs-sm); color: var(--muted); }
+      .vg-w-canvas-iroh-holepunch .clock { margin-left: auto; font-variant-numeric: tabular-nums; }
+      @media (max-width: 720px) { .vg-w-canvas-iroh-holepunch canvas { aspect-ratio: 4 / 3; } }
+    </style>
+
+    <div class="toolbar" data-vg-controls>
+      <button data-act="toggle">▷ play</button>
+      <button data-act="reset">↺ reset</button>
+      <button data-act="mode">情境：NAT 可打洞</button>
+      <span class="clock" data-clock>t = 0.00s</span>
+    </div>
+
+    <canvas></canvas>
+
+    <figcaption>兩端各在一個 NAT 後。play 之後雙方同時往對方的候選位址送探測封包試圖打洞——綠線亮起表示直連成功、資料不再經過第三方；切到「NAT 不可打洞」情境時探測全被丟棄，連線退回上方那台公開 relay 墊著走（橘線）。直連與中繼的選擇是動態的，條件變了會重選。</figcaption>
+
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        const root = document.querySelector('.vg-w-canvas-iroh-holepunch');
+        const canvas = root.querySelector('canvas');
+        const ctx = canvas.getContext('2d');
+        const toggleBtn = root.querySelector('[data-act=toggle]');
+        const resetBtn = root.querySelector('[data-act=reset]');
+        const modeBtn = root.querySelector('[data-act=mode]');
+        const clock = root.querySelector('[data-clock]');
+
+        let cssW = 0, cssH = 0;
+        function resize() {
+          const dpr = window.devicePixelRatio || 1;
+          const rect = canvas.getBoundingClientRect();
+          cssW = rect.width; cssH = rect.height;
+          canvas.width = cssW * dpr; canvas.height = cssH * dpr;
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        }
+        new ResizeObserver(resize).observe(canvas);
+
+        function v(name, fb) { return getComputedStyle(root).getPropertyValue(name).trim() || fb; }
+
+        let running = false, t = 0, canPunch = true, established = null; // null|'direct'|'relay'
+        let probes = []; // {x,y,vx,vy,from}
+
+        function reset() {
+          running = false; t = 0; established = null; probes = [];
+          toggleBtn.textContent = '▷ play';
+        }
+
+        function spawnProbe(from) {
+          const A = { x: 0.18 * cssW, y: 0.72 * cssH };
+          const B = { x: 0.82 * cssW, y: 0.72 * cssH };
+          const src = from === 'A' ? A : B, dst = from === 'A' ? B : A;
+          const dx = dst.x - src.x, dy = dst.y - src.y;
+          const len = Math.hypot(dx, dy);
+          const sp = 220;
+          probes.push({ x: src.x, y: src.y, vx: dx / len * sp, vy: dy / len * sp, from });
+        }
+
+        let acc = 0;
+        function step(dt) {
+          t += dt; acc += dt;
+          if (established) return;
+          if (acc > 0.5) { acc = 0; spawnProbe('A'); spawnProbe('B'); }
+          probes.forEach(p => { p.x += p.vx * dt; p.y += p.vy * dt; });
+          const A = { x: 0.18 * cssW }, B = { x: 0.82 * cssW };
+          if (canPunch) {
+            // a probe reaching the far peer = punched
+            const reachedB = probes.some(p => p.from === 'A' && p.x > B.x - 8);
+            const reachedA = probes.some(p => p.from === 'B' && p.x < A.x + 8);
+            if (reachedB && reachedA) established = 'direct';
+          } else {
+            // probes die at the NAT boundary; after a timeout fall back to relay
+            probes = probes.filter(p => !(p.from === 'A' && p.x > 0.30 * cssW) && !(p.from === 'B' && p.x < 0.70 * cssW));
+            if (t > 2.4) established = 'relay';
+          }
+        }
+
+        function node(x, y, label) {
+          ctx.fillStyle = v('--bg-soft', '#eee');
+          ctx.strokeStyle = v('--ink', '#222'); ctx.lineWidth = 1.5;
+          ctx.beginPath(); ctx.arc(x, y, 16, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+          ctx.fillStyle = v('--muted', '#888');
+          ctx.font = '13px "EB Garamond", serif'; ctx.textAlign = 'center';
+          ctx.fillText(label, x, y + 34);
+        }
+
+        function draw() {
+          ctx.clearRect(0, 0, cssW, cssH);
+          const A = { x: 0.18 * cssW, y: 0.72 * cssH };
+          const B = { x: 0.82 * cssW, y: 0.72 * cssH };
+          const R = { x: 0.50 * cssW, y: 0.18 * cssH };
+
+          // NAT boundaries
+          ctx.strokeStyle = v('--muted-2', '#bbb'); ctx.setLineDash([4, 4]); ctx.lineWidth = 1;
+          ctx.beginPath(); ctx.moveTo(0.30 * cssW, 0.40 * cssH); ctx.lineTo(0.30 * cssW, cssH); ctx.stroke();
+          ctx.beginPath(); ctx.moveTo(0.70 * cssW, 0.40 * cssH); ctx.lineTo(0.70 * cssW, cssH); ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.fillStyle = v('--muted', '#999'); ctx.font = '11px "JetBrains Mono", monospace';
+          ctx.textAlign = 'left'; ctx.fillText('NAT', 0.30 * cssW + 6, 0.46 * cssH);
+          ctx.textAlign = 'right'; ctx.fillText('NAT', 0.70 * cssW - 6, 0.46 * cssH);
+
+          // relay (top center)
+          node(R.x, R.y, 'public relay');
+
+          // established paths
+          if (established === 'direct') {
+            ctx.strokeStyle = v('--sage-deep', '#5a7'); ctx.lineWidth = 3;
+            ctx.beginPath(); ctx.moveTo(A.x, A.y); ctx.lineTo(B.x, B.y); ctx.stroke();
+          } else if (established === 'relay') {
+            ctx.strokeStyle = v('--accent', '#e76'); ctx.lineWidth = 2.5;
+            ctx.beginPath(); ctx.moveTo(A.x, A.y); ctx.lineTo(R.x, R.y); ctx.lineTo(B.x, B.y); ctx.stroke();
+          }
+
+          // probes
+          probes.forEach(p => {
+            ctx.fillStyle = v('--accent', '#e76');
+            ctx.beginPath(); ctx.arc(p.x, p.y, 4, 0, Math.PI * 2); ctx.fill();
+          });
+
+          node(A.x, A.y, 'endpoint A');
+          node(B.x, B.y, 'endpoint B');
+
+          // verdict
+          ctx.textAlign = 'center'; ctx.font = '14px "EB Garamond", serif';
+          if (established === 'direct') {
+            ctx.fillStyle = v('--sage-deep', '#5a7');
+            ctx.fillText('打洞成功——直連，資料不經 relay', cssW / 2, cssH * 0.92);
+          } else if (established === 'relay') {
+            ctx.fillStyle = v('--accent-text', '#c54');
+            ctx.fillText('打洞失敗——退回公開 relay 中繼', cssW / 2, cssH * 0.92);
+          } else {
+            ctx.fillStyle = v('--muted', '#999');
+            ctx.fillText('雙方同時送探測封包，試圖在 NAT 上打出一條洞……', cssW / 2, cssH * 0.92);
+          }
+        }
+
+        let last = performance.now();
+        function frame(now) {
+          const dt = Math.min(0.1, (now - last) / 1000); last = now;
+          if (running) step(dt);
+          draw();
+          clock.textContent = 't = ' + t.toFixed(2) + 's';
+          requestAnimationFrame(frame);
+        }
+        requestAnimationFrame(frame);
+        resize();
+
+        toggleBtn.addEventListener('click', () => {
+          running = !running; toggleBtn.textContent = running ? '⏸ pause' : '▷ play';
+          last = performance.now();
+        });
+        resetBtn.addEventListener('click', reset);
+        modeBtn.addEventListener('click', () => {
+          canPunch = !canPunch;
+          modeBtn.textContent = canPunch ? '情境：NAT 可打洞' : '情境：NAT 不可打洞';
+          reset();
+        });
+      })();
+    </script>
+  </figure>
+
+  <p>底下五個小節順著「一把公鑰怎麼變成一條連線」的路徑走：先講位址本身（NodeId），再講連線怎麼建（打洞與 relay）、建好之後怎麼維持（multipath）、不上網的特例（local discovery），最後是 1.0 把哪些東西凍住不再動。</p>
+
+  <h2>NodeId——把公鑰當成位址撥</h2>
+
+  <p>傳統 socket 程式撥的是 <code>(IP, port)</code>。iroh 撥的是 NodeId——一把 Ed25519 公鑰。官方對這個選擇給的理由很直接：「IP addresses can break, without warning, and it's outside of your device's control. Keys, however, are created &amp; controlled by you.」IP 是租來的、是基礎設施分配給你的，換網路、換 NAT、裝置移動，位址就變了；公鑰是你在本機生出來的一段位元，只要私鑰不換，這個身分就不會變。</p>
+
+  <p>把同一把金鑰身兼兩職是這個設計的關鍵。官方的說法是：先用它「secure the connection」，然後「we can use that same key as an address we can dial, no matter where it is in the world.」同一把公鑰既是加密連線時驗證對方身分的憑證，又是你撥號的目標位址——位址與身分不再是兩件事。這也順手解掉 IP 的另一個老問題：「IP addresses can be private and inaccessible behind firewalls, but with iroh your device can be securely addressable no matter where it is.」防火牆後面的私有 IP 對外界沒有意義，但一把公鑰在哪都指得到同一個身分，剩下的是函式庫去找「這個身分現在實際在哪條路上」。</p>
+
+  <figure class="vg-w-arch-iroh-addressing" data-mobile="keep" data-svg-scroll="720">
+    <svg viewBox="0 0 720 300" role="img"
+         aria-label="IP 定址 vs NodeId 定址：IP 把身分與位置綁在一起、會隨網路變動；NodeId 用公鑰定址，身分與位置解耦"
+         style="width: 100%; height: auto; max-width: 720px;">
+      <style>
+        .vg-w-arch-iroh-addressing text { font-family: EB Garamond, serif; font-size: 13px; }
+        .vg-w-arch-iroh-addressing .label { font-family: IM Fell English, serif; font-style: italic; }
+        .vg-w-arch-iroh-addressing .mono { font-family: JetBrains Mono, monospace; font-size: 11px; }
+        .vg-w-arch-iroh-addressing .head { font-family: IM Fell English, serif; font-style: italic; font-size: 14px; }
+      </style>
+      <text x="180" y="28" text-anchor="middle" fill="var(--muted)" class="head">傳統：撥 IP</text>
+      <text x="540" y="28" text-anchor="middle" fill="var(--accent-text)" class="head">iroh：撥 NodeId（公鑰）</text>
+      <line x1="360" y1="44" x2="360" y2="280" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="3,3"/>
+
+      <!-- left: IP -->
+      <rect x="60" y="60" width="240" height="44" fill="none" stroke="var(--muted-2)" stroke-width="1.5"/>
+      <text x="72" y="80" fill="var(--ink)" class="label">身分＝位置</text>
+      <text x="72" y="98" fill="var(--muted)" class="mono">203.0.113.7 : 51820</text>
+
+      <text x="180" y="138" text-anchor="middle" fill="var(--muted)" class="label">換網路 / 移動 / NAT 重新分配</text>
+      <line x1="180" y1="104" x2="180" y2="150" stroke="var(--accent)" stroke-width="1.5" marker-end="url(#vg-w-arch-iroh-addressing-arr)"/>
+
+      <rect x="60" y="158" width="240" height="44" fill="none" stroke="var(--accent)" stroke-width="1.5" stroke-dasharray="4,3"/>
+      <text x="72" y="178" fill="var(--accent-text)" class="label">位址失效</text>
+      <text x="72" y="196" fill="var(--muted)" class="mono">198.51.100.9 : ????（變了）</text>
+      <text x="180" y="240" text-anchor="middle" fill="var(--muted)" class="label">連線必須重來，對端要重新得知新位址</text>
+
+      <!-- right: NodeId -->
+      <rect x="420" y="60" width="240" height="44" fill="var(--accent)" opacity="0.12" stroke="var(--accent)" stroke-width="1.5"/>
+      <text x="432" y="80" fill="var(--ink)" class="label">身分（本機生成、自己掌控）</text>
+      <text x="432" y="98" fill="var(--accent-text)" class="mono">NodeId = ed25519 pubkey</text>
+
+      <text x="540" y="138" text-anchor="middle" fill="var(--muted)" class="label">換網路 / 移動 / NAT 重新分配</text>
+      <line x1="540" y1="104" x2="540" y2="150" stroke="var(--sage-deep)" stroke-width="1.5" marker-end="url(#vg-w-arch-iroh-addressing-arr2)"/>
+
+      <rect x="420" y="158" width="240" height="44" fill="var(--sage)" opacity="0.18" stroke="var(--sage-deep)" stroke-width="1.5"/>
+      <text x="432" y="178" fill="var(--ink)" class="label">身分不變，只有底下的路換了</text>
+      <text x="432" y="196" fill="var(--sage-deep)" class="mono">NodeId 不變 → 函式庫重找路徑</text>
+      <text x="540" y="240" text-anchor="middle" fill="var(--muted)" class="label">同一把公鑰既是身分也是位址</text>
+
+      <text x="360" y="284" text-anchor="middle" fill="var(--muted)" class="label">IP 把身分與位置綁死；NodeId 解開兩者——位置可變，身分恆定</text>
+      <defs>
+        <marker id="vg-w-arch-iroh-addressing-arr" markerWidth="8" markerHeight="8" refX="4" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="var(--accent)"/></marker>
+        <marker id="vg-w-arch-iroh-addressing-arr2" markerWidth="8" markerHeight="8" refX="4" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="var(--sage-deep)"/></marker>
+      </defs>
+    </svg>
+    <figcaption>左邊 IP 把「你是誰」和「你在哪」綁成同一個字串，位置一動身分就跟著失效；右邊 NodeId 用公鑰當身分，位置改變時身分不動，函式庫負責重新找路。</figcaption>
+  </figure>
+
+  <p>對寫程式的人來說，這把「連線管理」從應用層搬到了函式庫層。過去你要自己處理「對方換了 IP 要怎麼通知」「裝置從 Wi-Fi 切到行動網路後 socket 斷掉要重連」這類事；改用 NodeId 撥號之後，這些都退到 iroh 底下，應用層拿到的是一個穩定的身分握把。endpoint 是你這端的本地物件，NodeId 是對端的公鑰位址——你說「連到這個 NodeId」，後面的找路、打洞、走 relay 都不必你管。</p>
+
+  <p>值得把這個取捨講透：傳統 socket 之所以撥 IP，是因為路由表認的就是 IP，封包要送到哪由 IP 決定。iroh 沒有取消 IP——封包最終還是靠 IP 在底下送——它做的是多加一層 indirection，把「你想連的對象」與「封包此刻該往哪個 IP 送」這兩件原本被綁死的事拆開。你面對的是穩定的 NodeId，函式庫面對的是隨時在變的一組候選位址。這層 indirection 的成本，是函式庫必須一直維護「這個 NodeId 現在可能在哪些位址上」這份對映，並在底下不斷地探測、更新、汰換；它換來的好處，是上層程式碼裡再也不會出現「對端 IP 變了」這個 case——因為對上層而言對端的位址從來沒變過，變的是它身分背後的那組路徑。合理的推測是：對長連線、需要跨網路存活的應用，這層 indirection 省下的重連與狀態同步邏輯，遠比它多花的探測成本值錢。</p>
+
+  <h2>打洞優先，relay 墊底</h2>
+
+  <p>有了 NodeId，下一個問題是：兩端各躲在 NAT 後面，公鑰指得到身分，但封包要怎麼真的送到對方？iroh 的順序是先試直連、連不上才走 relay。直連靠的是 NAT 打洞，官方把這件事包進 QUIC：「We implemented QUIC NAT traversal, so we can establish direct connections」，而且打洞建立的是「direct connections while keeping connection details encrypted」——連線細節在打洞過程中保持加密。打洞的基本動作是雙方同時往對方的候選位址送封包，讓各自的 NAT 在對應的孔上留下一條「我發起過、允許回來」的對映，兩邊的孔對上了，直連就成立。</p>
+
+  <p>為什麼打洞需要「雙方同時送」，而不是一端去敲對方就好？NAT 的本質是一張對映表：內網某個 socket 往外送封包時，NAT 才在表上記一筆「這條外部來源以後可以回來」。沒有這筆紀錄，從外面主動進來的封包會被直接丟掉，因為 NAT 不知道該轉給內網哪台機器。所以單向去敲一定失敗——對方的 NAT 上沒有你的紀錄。打洞的做法是讓兩端幾乎同時往對方各自的候選位址送封包：A 送出去這個動作在 A 的 NAT 上開了一個允許 B 回來的孔，B 送出去也在 B 的 NAT 上開了允許 A 的孔，兩個孔對上了，雙向就通。iroh 把這套流程實作進 QUIC，省去了應用層自己處理打洞狀態機的麻煩。</p>
+
+  <p>打不通的時候才退而求其次。官方的措辭是：當直連不可能，就用他們營運的公開 relay 伺服器。relay 的角色是「墊一條一定能走的路」——兩端都連得上同一台公開伺服器，資料就經它轉。這台 relay 的負載規模官方給了數字：「The public relays we run have seen more than 200 million endpoints created, in the last 30 days alone.」這是過去 30 天內在他們 relay 上建立的 endpoint 數，是一個瞬時量、會隨時間變，並非「同時線上」的併發量；它能說明的是這套基礎設施承接的 endpoint 規模，而不是某一刻的連線數。要記住 relay 是 fallback 而非主路徑——下面 multipath 那節會看到，連線可以同時握著直連與中繼兩條路，打洞一旦成功就把資料挪到直連上。把這兩件事擺在一起看：relay 的角色不是「轉發每一個 byte」，而是「在打洞還沒成功或永遠不會成功時，保證連線至少能起來」。</p>
+
+  <figure class="vg-w-arch-iroh-ladder" data-mobile="static" data-svg-scroll="720">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M9 18l6-6-6-6"/>
+      </svg>
+      <span>點任一階段看它負責什麼 · 連線建立的三個階段</span>
+    </p>
+    <style>
+      .vg-w-arch-iroh-ladder { display: grid; gap: var(--s-3); }
+      .vg-w-arch-iroh-ladder svg.vg-w-arch-iroh-ladder-main { width: 100%; height: auto; max-width: 720px; }
+      .vg-w-arch-iroh-ladder input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-arch-iroh-ladder .stage { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; transition: fill 200ms, stroke 200ms; }
+      .vg-w-arch-iroh-ladder .stage:hover { stroke: var(--accent); }
+      .vg-w-arch-iroh-ladder .st-text { pointer-events: none; font-family: EB Garamond, serif; font-size: 14px; }
+      .vg-w-arch-iroh-ladder .st-sub { pointer-events: none; font-family: IM Fell English, serif; font-style: italic; font-size: 11px; fill: var(--muted); }
+      .vg-w-arch-iroh-ladder .head { font-family: IM Fell English, serif; font-style: italic; font-size: 14px; }
+      .vg-w-arch-iroh-ladder:has(#vg-w-arch-iroh-ladder-r1:checked) .stage-1 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-arch-iroh-ladder:has(#vg-w-arch-iroh-ladder-r2:checked) .stage-2 { fill: var(--sage-deep); fill-opacity: 0.24; stroke: var(--sage-deep); }
+      .vg-w-arch-iroh-ladder:has(#vg-w-arch-iroh-ladder-r3:checked) .stage-3 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-arch-iroh-ladder .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+      .vg-w-arch-iroh-ladder .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-arch-iroh-ladder .detail p { margin: 0; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-arch-iroh-ladder:has(#vg-w-arch-iroh-ladder-r1:checked) .detail-1 { display: block; }
+      .vg-w-arch-iroh-ladder:has(#vg-w-arch-iroh-ladder-r2:checked) .detail-2 { display: block; }
+      .vg-w-arch-iroh-ladder:has(#vg-w-arch-iroh-ladder-r3:checked) .detail-3 { display: block; }
+      .vg-w-arch-iroh-ladder .hint { font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin: 0 0 var(--s-1) 0; }
+    </style>
+
+    <span data-vg-controls>
+      <input type="radio" id="vg-w-arch-iroh-ladder-r1" name="vg-w-arch-iroh-ladder-sel" aria-label="階段 1 直連" checked />
+      <input type="radio" id="vg-w-arch-iroh-ladder-r2" name="vg-w-arch-iroh-ladder-sel" aria-label="階段 2 打洞" />
+      <input type="radio" id="vg-w-arch-iroh-ladder-r3" name="vg-w-arch-iroh-ladder-sel" aria-label="階段 3 relay" />
+    </span>
+
+    <svg class="vg-w-arch-iroh-ladder-main" viewBox="0 0 720 230" role="img"
+         aria-label="iroh 連線建立階梯：先試直連、再試 NAT 打洞、最後退回公開 relay">
+      <text x="360" y="26" text-anchor="middle" fill="var(--ink)" class="head">撥一個 NodeId → 順著三階段找一條能走的路</text>
+
+      <rect class="stage stage-1" data-target="vg-w-arch-iroh-ladder-r1" x="40" y="56" width="200" height="120" role="button" tabindex="0" aria-label="選 直連"/>
+      <text x="60" y="92" fill="var(--ink)" class="st-text">① 直連</text>
+      <text x="60" y="116" fill="var(--muted)" class="st-sub">已知可達位址</text>
+      <text x="60" y="134" fill="var(--muted)" class="st-sub">同網段 / 公開 IP</text>
+
+      <path d="M240 116 L268 116" stroke="var(--muted-2)" stroke-width="1.5" marker-end="url(#vg-w-arch-iroh-ladder-arr)"/>
+
+      <rect class="stage stage-2" data-target="vg-w-arch-iroh-ladder-r2" x="268" y="56" width="200" height="120" role="button" tabindex="0" aria-label="選 NAT 打洞"/>
+      <text x="288" y="92" fill="var(--ink)" class="st-text">② NAT 打洞</text>
+      <text x="288" y="116" fill="var(--muted)" class="st-sub">QUIC NAT traversal</text>
+      <text x="288" y="134" fill="var(--muted)" class="st-sub">雙方同時探測</text>
+
+      <path d="M468 116 L496 116" stroke="var(--muted-2)" stroke-width="1.5" marker-end="url(#vg-w-arch-iroh-ladder-arr)"/>
+
+      <rect class="stage stage-3" data-target="vg-w-arch-iroh-ladder-r3" x="496" y="56" width="184" height="120" role="button" tabindex="0" aria-label="選 公開 relay"/>
+      <text x="516" y="92" fill="var(--ink)" class="st-text">③ public relay</text>
+      <text x="516" y="116" fill="var(--muted)" class="st-sub">墊一條一定能走的路</text>
+      <text x="516" y="134" fill="var(--muted)" class="st-sub">連不上才退到這</text>
+
+      <text x="360" y="206" text-anchor="middle" fill="var(--muted)" class="st-sub">三條路可同時握著（multipath）；打洞成功就把資料挪到直連</text>
+      <defs>
+        <marker id="vg-w-arch-iroh-ladder-arr" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="var(--muted-2)"/></marker>
+      </defs>
+    </svg>
+
+    <div>
+      <p class="hint">click a stage above</p>
+      <div class="detail detail-1">
+        <h3>① 直連 · 責任邊界</h3>
+        <p>當對端的位址已知且可達（同一區網、或對方有公開 IP），直接握手，最快、不需任何中介。這條路不一定存在——多數消費端裝置躲在 NAT 後，所以才需要下一階段。</p>
+      </div>
+      <div class="detail detail-2">
+        <h3>② NAT 打洞 · 責任邊界</h3>
+        <p>iroh 自己實作了 QUIC NAT traversal：「so we can establish direct connections」。雙方同時往對方候選位址送封包，在各自 NAT 上打出對映的孔；打通後是直連，且「keeping connection details encrypted」——連線細節在過程中保持加密。打洞不保證成功，對稱型 NAT 等情況仍可能失敗。</p>
+      </div>
+      <div class="detail detail-3">
+        <h3>③ public relay · 責任邊界</h3>
+        <p>直連不可能時的墊底：兩端都連得上同一台 iroh 營運的公開 relay，資料經它轉發。官方數字：過去 30 天內這些 relay 上「more than 200 million endpoints created」。relay 是 fallback——一旦打洞成功，資料就挪回直連。</p>
+      </div>
+    </div>
+
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        const root = document.querySelector('.vg-w-arch-iroh-ladder');
+        root.querySelectorAll('.stage').forEach((rect) => {
+          rect.addEventListener('click', () => {
+            const radio = root.querySelector('#' + rect.getAttribute('data-target'));
+            if (radio) radio.checked = true;
+          });
+          rect.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); rect.dispatchEvent(new MouseEvent('click', { bubbles: true })); } });
+        });
+      })();
+    </script>
+  </figure>
+
+  <p>這個順序的工程意義是：直連是省成本、省延遲的快樂路徑，relay 是保證可達的安全網。把 relay 當成永遠的主路徑，每一個 byte 都要過你的伺服器、付一次 egress；把 relay 當 fallback，你只在打不通的少數情況付這筆成本。延遲上也是同一個方向：直連是兩端之間的一跳，relay 至少多繞一台中介伺服器、多一段往返。對互動式場景（遊戲、語音、agent 對話），這多出來的一跳就是體感差別。下一節的效率數字正是這個取捨的結果。</p>
+
+  <p>還有一點容易被忽略：打洞會失敗，而且失敗不是 bug。對稱型 NAT、企業防火牆、某些 carrier-grade NAT 會讓兩端的候選位址無法對上，這時候 relay 不是「退化」，而是這套設計裡本來就準備好的那條路。一個健全的 P2P 函式庫的價值，正在於它把「打洞成功」當成最佳化、把「打洞失敗仍能連」當成保證——iroh 的階梯式順序就是把這兩個目標分層處理：能直連就直連，不能就一定有 relay 接住。</p>
+
+  <h2>QUIC multipath——一條連線同時走多條路</h2>
+
+  <p>iroh 沒有直接拿現成的 QUIC，而是自己實作了 multipath。官方的說法是：「We built our own implementation of QUIC multipath, so iroh can build &amp; manage multiple routes within the same connection」——同一條連線裡可以建立並管理多條路徑。再加上一句關鍵能力：可以「hot swap paths as conditions change.」條件變了，連線可以把資料從一條路熱切到另一條，而上層連線不中斷。</p>
+
+  <p>把這個能力跟上一節接起來就清楚了：連線一開始可能同時握著「relay 中繼」與「正在打洞中的直連」兩條候選路徑，先用 relay 把資料流起來、不必等打洞完成；打洞一旦成功，multipath 直接把資料熱切到直連，relay 那條路退居備援。這個「先頂後切」的順序很關鍵——它讓連線的建立時間不被打洞拖住：使用者按下連線的那一刻資料就能動（走 relay），打洞在背景慢慢談，談成了才無縫換到更快的直連。少了 multipath，你只能二選一：要嘛等打洞、首包延遲高，要嘛一路走 relay、永遠多一跳。</p>
+
+  <p>裝置移動的場景同理——從 Wi-Fi 切到行動網路，底下換的是路徑，上層那條 QUIC 連線連同它的 stream、狀態都還在。對應用層而言，連線是穩定的；對函式庫而言，底下的路一直在動。這正是「撥金鑰不撥 IP」這個抽象能成立的底層機制：身分恆定靠 NodeId，連線恆定靠 multipath 在多條路之間熱切。兩者缺一不可——光有穩定的身分而連線會斷，或光有穩定的連線而身分會變，都撐不起「在哪都能撥到同一個對象」這個承諾。</p>
+
+  <p>multipath 自己實作而非沿用現成方案，也有它的理由。標準 QUIC 一條連線綁一條路徑（一組四元組），路徑變了通常得靠 connection migration 之類的機制，能力有限；要在同一條連線裡同時持有多條路、還能即時切換，需要在 wire 層面就支援多路徑的封包編號與路徑驗證。iroh 把這套做進自己的實作，等於把「連線」與「路徑」徹底解耦——一條連線是一個邏輯通道，底下掛著一束隨時在增刪的物理路徑。這也解釋了為什麼 1.0 要把 wire protocol 凍住才有意義：multipath 的封包語意一旦變動，新舊 endpoint 就無法互通。</p>
+
+  <p>效率上的回報，官方給了一個數字：「It's normal to see 95% of data transferred in a connection pass directly between devices.」一條連線裡有約九成五的資料是直接在裝置之間流動的——這意味著只有少數資料真的走了 relay，雲端轉發的跳數與 egress 成本大幅下降。把這個數字放回商業現實：傳統做法若把所有流量都過自家伺服器，頻寬帳單跟使用量線性成長；當九成五的資料根本不碰你的伺服器，你的 relay 基礎設施只需要承載那「打不通的少數」加上「打洞前的短暫過渡」，成本曲線整個被壓平。官方列的使用場景——「stream video, train large language models, talk to agents, secure chats, play games, send files」——其中影片串流、訓練 LLM、傳檔都是會把頻寬帳單拉爆的大流量類型，正是這 95% 直連最有感的地方。剩下的加密聊天、遊戲、與 agent 對話則更吃延遲，受惠於少掉的那一跳。</p>
+
+  <figure class="vg-w-arch-iroh-direct" data-mobile="keep" data-svg-scroll="720">
+    <svg viewBox="0 0 720 180" role="img"
+         aria-label="一條連線中約 95% 資料直連、約 5% 走 relay 的比例條"
+         style="width: 100%; height: auto; max-width: 720px;">
+      <style>
+        .vg-w-arch-iroh-direct text { font-family: EB Garamond, serif; font-size: 13px; }
+        .vg-w-arch-iroh-direct .label { font-family: IM Fell English, serif; font-style: italic; }
+        .vg-w-arch-iroh-direct .num { font-family: JetBrains Mono, monospace; font-size: 14px; }
+        .vg-w-arch-iroh-direct .head { font-family: IM Fell English, serif; font-style: italic; font-size: 14px; }
+      </style>
+      <text x="360" y="28" text-anchor="middle" fill="var(--ink)" class="head">一條連線裡的資料流向——直連是常態，relay 是少數</text>
+      <rect x="40" y="60" width="608" height="44" fill="var(--sage-deep)" opacity="0.30" stroke="var(--sage-deep)" stroke-width="1.5"/>
+      <rect x="648" y="60" width="32" height="44" fill="var(--accent)" opacity="0.45" stroke="var(--accent)" stroke-width="1.5"/>
+      <text x="344" y="87" text-anchor="middle" fill="var(--ink)" class="num">~95% 直連</text>
+      <text x="344" y="128" text-anchor="middle" fill="var(--sage-deep)" class="label">資料直接在兩台裝置之間流動，不經第三方</text>
+      <text x="664" y="128" text-anchor="middle" fill="var(--accent-text)" class="num">~5%</text>
+      <text x="664" y="146" text-anchor="middle" fill="var(--accent-text)" class="label">relay</text>
+      <text x="360" y="170" text-anchor="middle" fill="var(--muted)" class="label">官方：「It's normal to see 95% of data transferred ... directly between devices.」——少掉的中繼跳數直接換成 egress 成本下降</text>
+    </svg>
+    <figcaption>比例條按官方說法視覺化：一條連線裡約九成五的資料直連，剩下少數走 relay。這是「打洞優先、relay 墊底」加上 multipath 熱切的直接結果。</figcaption>
+  </figure>
+
+  <h2>local discovery——不上網也能找到鄰居</h2>
+
+  <p>前面的路徑都假設至少有一端連得上網際網路（哪怕只是為了連 relay）。但有一類場景根本不該依賴外網：同一個區網裡的兩台裝置、或完全離線的環境。iroh 為此補了 local discovery。官方的描述是：「We added full local-first configurations so iroh can find &amp; connect to local devices, without internet access」——加了完整的 local-first 設定，讓 iroh 能在沒有網際網路的情況下找到並連上本地裝置。</p>
+
+  <p>這把「撥金鑰」的抽象推到一個有趣的邊界：你撥的還是同一個 NodeId，但底下找路的方式從「問 relay、打洞穿越外網」換成「在本地網段上廣播探查」。對使用者來說，撥號的介面沒變，仍是一個公鑰；對函式庫來說，這是又一條可以被 multipath 納入考量的路徑——而且通常是最快的那條，因為它根本不出區網。離線的協作工具、本地優先的同步、區網內的點對點傳檔，都落在這個能力上。</p>
+
+  <p>把這節跟前面接起來看，會發現一個一致的設計姿態：不論是公開 relay、NAT 打洞、還是區網廣播，對應用層暴露的介面始終是「撥這個 NodeId」這一件事。三種找路方式只是 multipath 眼中三種不同來源的候選路徑，函式庫挑能用的、挑最快的。local discovery 之所以重要，不只是多了一個離線場景，而是它證明了這個抽象的彈性——當連找路的根本前提（有沒有網際網路）都能換掉而上層介面不動，「撥金鑰不撥 IP」就不只是換個字串格式，而是真的把位址這件事從應用層的關注點裡拿掉了。</p>
+
+  <h2>1.0 的承諾——wire protocol 與 API 不再動</h2>
+
+  <p>一個 P2P 函式庫最現實的顧慮是：今天連得上的兩個版本，明天升級之後還連得上嗎？1.0 的核心承諾就是回答這個。官方明說：「Iroh version 1.0 asserts stability for both the wire protocol and language APIs」——wire protocol 與各語言 API 雙重穩定。對 wire 的具體保證是：「an iroh v1 endpoint will be able to communicate with another v1 endpoint, regardless of minor version」，只要同屬 v1，不管 minor 版本差多少都能互通。反過來，破壞 wire 相容性的改動有嚴格的門檻：「Any change that affects the wire stability of iroh will always coincide with a major release.」任何動到 wire 穩定性的改動，一定伴隨一次 major release——換句話說，minor 升級永遠不會把你既有的 endpoint 變得無法互通。</p>
+
+  <p>對混合版本的真實部署來說，這個保證很實在：你不可能讓散落各處的 peer 同時升級——使用者的手機、別人的伺服器、嵌入式裝置，各自升級的節奏完全不受你控制。wire 穩定性意味著新舊版本在升級的過渡期裡仍然講得通，你不必為了上一個新功能而擔心把舊 peer 全部踢下線。這正是 P2P 系統跟傳統 client-server 不一樣的地方：server 端你可以一次換掉，peer 端你永遠在跟一個版本參差的群體說話，wire 不破壞性變動是讓這個群體能持續互通的前提。</p>
+
+  <p>把這條承諾跟前面 multipath 自製 wire 的決定接起來，整件事就閉合了：因為連線語意、多路徑封包編號這些都寫死在自己的 wire 上，1.0 才有東西可以「凍住」；也因為凍住了，散落各處的 v1 endpoint 才敢放心升級 minor 版本。語言覆蓋面也擴大了——除了 Rust 本體，官方說「we now officially support Python, Node.js, Swift, and Kotlin」，桌面、後端、行動端都進得來，這也是 wire 穩定的延伸價值：不同語言實作的 endpoint 只要遵守同一份 wire，就能互通。支援時程方面，舊版有明確的落日：「Public relay support for 0.35x continues through Dec 31, 2026」，0.35x 的公開 relay 存取撐到 2026 年 12 月 31 日為止——還在用舊版的人有一條確定的遷移時間線，而不是某天 relay 無預警關閉。</p>
+
+  <p class="vg-deep-closer"><strong>What this enables</strong>：當位址是身分而不是位置、連線能在多條路之間熱切、而 1.0 又承諾 wire 不再破壞性變動，你就能把「兩個裝置之間穩定可達」當成一個函式庫保證、而不是自己要維運的基礎設施——iroh 1.0 想把這件事變成像撥 localhost 一樣理所當然。</p>
+</div>
