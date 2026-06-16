@@ -1,0 +1,482 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">在 CPU 上 Rust 用 ownership 擋掉 data race，但只要你自己寫一個 GPU kernel，整套保證就在啟動 kernel 的那一刻被丟在門外——成千上萬個 thread 同時往同一塊 device memory 寫，borrow checker 看不到、也管不著。cuTile Rust 的賭注是：如果可變輸出在型別層級就被切成互不重疊的 tile，那把保證接回來的不是執行期的鎖，而是「兩個 tile 在定義上就不會碰到同一個 byte」這件事。</p>
+  <h1 class="vg-post-title">{{ title }}</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p><span class="vg-dropcap">R</span>ust 在 CPU 上把安全系統程式設計變得實用，靠的是 ownership 與 borrow checker：同一份可變資料同一時間只能有一個可變借用，data race 在編譯期就被擋下。但一旦你要替 GPU 寫 custom kernel，這套規則就失效了——kernel body 裡是成千上萬個 thread 平行跑同一段程式碼，每個 thread 自己算出要寫哪個位址，編譯器無從得知這些位址會不會重疊。這篇〈Fearless Concurrency on the GPU〉提出 cuTile Rust，一個 tile-based 的系統，把 ownership 紀律延伸到 GPU kernel：可變輸出被切成互不重疊的片段、kernel 啟動仍維持 host 端的 ownership 契約、需要低階控制時可以局部 opt out。論文的核心主張是這些抽象「能在高階 GPU 上保住效能」——在 NVIDIA B200 上 element-wise 達 7 TB/s、GEMM 達 2 PFlop/s（cuBLAS 的 96%），與 cuTile Python 在量測誤差內持平。</p>
+
+  <p>先把問題講清楚：為什麼平常寫 GPU kernel 會跳出 Rust 的保證。Rust 的 ownership model 是針對「一個位址、一條控制流」設計的——某個 <code>&amp;mut T</code> 借用存在的期間，編譯器保證沒有別人能讀寫那塊記憶體。GPU 的執行模型剛好相反。一個 kernel launch 起的是一整個 grid，grid 裡是上萬個 thread，每個 thread 通常用自己的 <code>blockIdx</code>、<code>threadIdx</code> 算出一個 global 位址再寫下去。這個位址是執行期算出來的、跟 thread id 有關，編譯器在編譯 kernel body 時根本不知道 thread 17 跟 thread 4096 會不會寫到同一個 byte。傳統的 CUDA / 裸 Rust GPU 寫法因此只能交出一個 raw pointer 給 kernel，讓開發者自己保證不重疊——這正是 ownership 失守的地方：borrow checker 看到的是「一根指標」，看不到「上萬條同時往裡頭寫的控制流」。下面這個互動 demo 就是在演這件事的反面：如果輸出不是交一根指標，而是先在 host 端被切成一格一格互不重疊的 tile、每個 program instance 只拿到屬於自己那一格的可變借用，重疊在定義上就不可能發生。</p>
+
+  <figure class="vg-w-canvas-tile-ownership" data-mobile="swap" data-mobile-summary="每個 instance 只拿自己那格 tile 的可變借用，兩格 byte 互斥，data race 在型別層級就不可能。">
+    <style>
+      .vg-w-canvas-tile-ownership { display: grid; grid-template-rows: auto 1fr auto; gap: var(--s-2); }
+      .vg-w-canvas-tile-ownership .toolbar { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); flex-wrap: wrap; }
+      .vg-w-canvas-tile-ownership button { font-family: var(--sans); font-size: var(--fs-sm); padding: 6px 14px; min-height: 44px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); cursor: pointer; }
+      .vg-w-canvas-tile-ownership button:hover { border-color: var(--accent); color: var(--accent-text); }
+      .vg-w-canvas-tile-ownership canvas { width: 100%; height: auto; aspect-ratio: 16 / 9; display: block; }
+      .vg-w-canvas-tile-ownership .clock { margin-left: auto; font-family: JetBrains Mono, monospace; font-variant-numeric: tabular-nums; }
+      .vg-w-canvas-tile-ownership figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+      @media (max-width: 720px) {
+        .vg-w-canvas-tile-ownership canvas { aspect-ratio: 4 / 3; }
+      }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <polygon points="6 3 20 12 6 21 6 3"/>
+      </svg>
+      <span>play 看每個 program instance 只往自己的 tile 寫 · 16 個互不重疊的 tile</span>
+    </p>
+
+    <div class="toolbar">
+      <button data-toggle>play</button>
+      <button data-reset>reset</button>
+      <span class="clock" data-clock>tile 0 / 16 寫入完成</span>
+    </div>
+
+    <canvas data-canvas></canvas>
+
+    <figcaption>輸出矩陣（4×4 的 tile grid）。每個 program instance 拿到一格 tile 的可變借用，逐格把寫入填滿；任兩格 tile 的 byte 集合互斥，所以不論這些寫入是否同時發生，都不可能寫到同一個位址——這正是 cuTile 把 ownership 接回 GPU 的方式。</figcaption>
+
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        const root = document.querySelector('.vg-w-canvas-tile-ownership');
+        const canvas = root.querySelector('[data-canvas]');
+        const toggle = root.querySelector('[data-toggle]');
+        const reset = root.querySelector('[data-reset]');
+        const clock = root.querySelector('[data-clock]');
+        const ctx = canvas.getContext('2d');
+
+        function cssVar(name) {
+          return getComputedStyle(root).getPropertyValue(name).trim() || '#888';
+        }
+        function resize() {
+          const dpr = window.devicePixelRatio || 1;
+          const rect = canvas.getBoundingClientRect();
+          canvas.width = rect.width * dpr;
+          canvas.height = rect.height * dpr;
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        }
+        new ResizeObserver(resize).observe(canvas);
+        resize();
+
+        const N = 4;                // 4x4 tile grid
+        const TILES = N * N;        // 16 tiles
+        let running = false;
+        let t = 0;
+        let filled = 0;             // how many tiles fully written
+        let frac = 0;               // fill fraction of the in-progress tile
+        const PER_TILE = 0.45;      // seconds to fill one tile
+
+        function draw() {
+          const W = canvas.getBoundingClientRect().width;
+          const H = canvas.getBoundingClientRect().height;
+          ctx.clearRect(0, 0, W, H);
+          const pad = 18;
+          const gridW = Math.min(W - pad * 2, (H - pad * 2) * 1.3);
+          const ox = (W - gridW) / 2;
+          const cell = gridW / N;
+          const oy = (H - cell * N) / 2;
+
+          for (let r = 0; r < N; r++) {
+            for (let c = 0; c < N; c++) {
+              const idx = r * N + c;
+              const x = ox + c * cell;
+              const y = oy + r * cell;
+              // tile border
+              ctx.strokeStyle = cssVar('--muted-2');
+              ctx.lineWidth = 1;
+              ctx.strokeRect(x + 2, y + 2, cell - 4, cell - 4);
+              // fill state
+              let fillFrac = 0;
+              if (idx < filled) fillFrac = 1;
+              else if (idx === filled) fillFrac = frac;
+              if (fillFrac > 0) {
+                ctx.fillStyle = idx === filled ? cssVar('--accent') : cssVar('--sage');
+                ctx.globalAlpha = idx === filled ? 0.85 : 0.5;
+                const fh = (cell - 8) * fillFrac;
+                ctx.fillRect(x + 4, y + cell - 4 - fh, cell - 8, fh);
+                ctx.globalAlpha = 1;
+              }
+              // owner label
+              ctx.fillStyle = cssVar('--muted');
+              ctx.font = '13px "JetBrains Mono", monospace';
+              ctx.fillText('pid ' + idx, x + 8, y + 18);
+            }
+          }
+          // legend
+          ctx.fillStyle = cssVar('--ink');
+          ctx.font = '14px "EB Garamond", serif';
+          ctx.fillText('每格 = 一個 program instance 獨佔的 &mut tile', ox, oy - 8 < 16 ? H - 8 : oy - 8);
+        }
+
+        function step(dt) {
+          if (filled >= TILES) { running = false; toggle.textContent = 'play'; return; }
+          t += dt;
+          frac += dt / PER_TILE;
+          while (frac >= 1 && filled < TILES) {
+            frac -= 1;
+            filled += 1;
+          }
+          if (filled >= TILES) { frac = 0; }
+        }
+
+        let last = performance.now();
+        function frame(now) {
+          const dt = Math.min(0.05, (now - last) / 1000);
+          last = now;
+          if (running) step(dt);
+          draw();
+          clock.textContent = 'tile ' + Math.min(filled, TILES) + ' / ' + TILES + ' 寫入完成';
+          requestAnimationFrame(frame);
+        }
+        requestAnimationFrame(frame);
+
+        toggle.addEventListener('click', () => {
+          if (filled >= TILES) { filled = 0; frac = 0; t = 0; }
+          running = !running;
+          toggle.textContent = running ? 'pause' : 'play';
+          last = performance.now();
+        });
+        reset.addEventListener('click', () => {
+          running = false; toggle.textContent = 'play';
+          filled = 0; frac = 0; t = 0;
+        });
+      })();
+    </script>
+  </figure>
+
+  <p>底下四個小節依序拆 cuTile Rust 的四個面：tiling 怎麼把 ownership 接回 kernel、kernel 啟動如何維持 host 端的契約並允許局部 opt out、host 端三種執行模型、以及 B200 與 Grout 的端到端數字。順序是有意的——先講安全模型成立的機制，再講它怎麼跟既有的 host 編排組合，最後用效能數字證明這套抽象沒有付出代價。</p>
+
+  <h2>tiling：把不重疊變成型別層級的事實</h2>
+
+  <p>cuTile 的關鍵動作發生在 kernel body 之外。論文的講法是「mutable outputs are split into disjoint pieces」——可變的輸出在進 kernel 之前就被切成互不相交的片段。回想 ownership 失守的原因：傳統 kernel 拿到的是一根指向整塊輸出的 raw pointer，上萬個 thread 各自算位址往裡頭寫，編譯器看不出重疊。tiling 把這個結構顛倒過來。輸出不是一根指標，而是一個被切成 tile 的網格；每個 program instance 不是「拿到整塊、自己算偏移」，而是「拿到屬於自己那一格 tile 的可變借用」。兩個不同的 tile，它們的 byte 集合在定義上互斥——這不是執行期檢查出來的、也不是靠鎖維持的，而是切分本身就保證的。</p>
+
+  <p>這就是為什麼 ownership 能接回來。borrow checker 在 CPU 上保證的是「同一塊記憶體同一時間只有一個 <code>&amp;mut</code>」。在 cuTile 裡，因為每個 tile 是 disjoint 的片段、每個片段對應唯一一個可變借用，「同一時間只有一個 <code>&amp;mut</code> 指到這塊 byte」這條規則在每一格 tile 上分別成立。上萬個 program instance 同時跑，但它們各自的 <code>&amp;mut tile</code> 指向互不重疊的位址，所以聚合起來也沒有任何 byte 被兩個可變借用同時持有。data race 的定義——兩個未同步的存取至少一個是寫、且指向同一位址——在這個結構下無從發生，因為第三個條件「同一位址」被切分排除了。下面這個 demo 讓你直接調 tile 大小，看切分如何同時滿足 disjoint（互不重疊）與 exhaustive（覆蓋全部輸出）這兩個條件，以及兩者衝突時會發生什麼。</p>
+
+  <figure class="vg-w-param-tile-coverage" data-mobile="static" data-svg-scroll="720">
+    <style>
+      .vg-w-param-tile-coverage { display: grid; gap: var(--s-3); }
+      .vg-w-param-tile-coverage .ctl { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); flex-wrap: wrap; }
+      .vg-w-param-tile-coverage .ctl label { min-width: 7ch; }
+      .vg-w-param-tile-coverage .ctl input[type="range"] { flex: 1; min-width: 140px; height: 36px; accent-color: var(--accent); }
+      .vg-w-param-tile-coverage .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 6ch; text-align: right; font-family: JetBrains Mono, monospace; }
+      .vg-w-param-tile-coverage svg { width: 100%; height: auto; }
+      .vg-w-param-tile-coverage .verdict { font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink-soft); padding: var(--s-2); border-left: 2px solid var(--accent); background: var(--bg-soft); }
+      .vg-w-param-tile-coverage .verdict em { color: var(--accent-text); font-style: italic; }
+      .vg-w-param-tile-coverage .verdict strong { color: var(--sage-deep); font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M5 12h14"/><path d="m12 5 7 7-7 7"/>
+      </svg>
+      <span>拖動 tile 邊長，看切分能否同時 disjoint 又 exhaustive · 連續掃描</span>
+    </p>
+
+    <div class="ctl" data-vg-controls role="group" aria-label="tile 邊長控制">
+      <label for="vg-w-param-tile-coverage-t">tile 邊長</label>
+      <input id="vg-w-param-tile-coverage-t" type="range" min="1" max="16" step="1" value="4" />
+      <span class="readout" data-readout>4</span>
+    </div>
+
+    <svg viewBox="0 0 720 300" role="img" aria-label="48x48 輸出被 tile 切分的覆蓋示意，顯示是否整除以及邊緣 tile 的處理">
+      <text x="20" y="26" fill="var(--ink)" font-family="IM Fell English, serif" font-style="italic" font-size="15">輸出 48×48 elements，被 tile 邊長切分</text>
+      <g data-grid></g>
+      <text data-tilecount x="700" y="290" text-anchor="end" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="12"></text>
+    </svg>
+
+    <div class="verdict" data-verdict></div>
+
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        const root = document.querySelector('.vg-w-param-tile-coverage');
+        const inp = root.querySelector('input');
+        const out = root.querySelector('[data-readout]');
+        const grid = root.querySelector('[data-grid]');
+        const verdict = root.querySelector('[data-verdict]');
+        const tileCountLabel = root.querySelector('[data-tilecount]');
+        const SIZE = 48;          // logical output dimension
+        const PX = 240;           // drawn square side in svg units
+        const OX = 30, OY = 40;   // grid origin
+
+        function render() {
+          const t = Number(inp.value);
+          out.textContent = String(t);
+          while (grid.firstChild) grid.removeChild(grid.firstChild);
+          const tilesPerSide = Math.ceil(SIZE / t);
+          const scale = PX / SIZE;
+          const svgNS = 'http://www.w3.org/2000/svg';
+          const divides = (SIZE % t === 0);
+
+          for (let r = 0; r < tilesPerSide; r++) {
+            for (let c = 0; c < tilesPerSide; c++) {
+              const x0 = c * t, y0 = r * t;
+              const w = Math.min(t, SIZE - x0);
+              const h = Math.min(t, SIZE - y0);
+              const isEdge = (w < t || h < t);
+              const rect = document.createElementNS(svgNS, 'rect');
+              rect.setAttribute('x', String(OX + x0 * scale));
+              rect.setAttribute('y', String(OY + y0 * scale));
+              rect.setAttribute('width', String(w * scale - 1));
+              rect.setAttribute('height', String(h * scale - 1));
+              rect.setAttribute('fill', isEdge ? 'var(--accent)' : 'var(--sage)');
+              rect.setAttribute('fill-opacity', isEdge ? '0.5' : '0.32');
+              rect.setAttribute('stroke', isEdge ? 'var(--accent)' : 'var(--sage-deep)');
+              rect.setAttribute('stroke-width', '1');
+              grid.appendChild(rect);
+            }
+          }
+          // outline of true output
+          const outline = document.createElementNS(svgNS, 'rect');
+          outline.setAttribute('x', String(OX)); outline.setAttribute('y', String(OY));
+          outline.setAttribute('width', String(PX)); outline.setAttribute('height', String(PX));
+          outline.setAttribute('fill', 'none');
+          outline.setAttribute('stroke', 'var(--ink)');
+          outline.setAttribute('stroke-width', '1.5');
+          grid.appendChild(outline);
+
+          const total = tilesPerSide * tilesPerSide;
+          tileCountLabel.textContent = tilesPerSide + ' × ' + tilesPerSide + ' = ' + total + ' tiles';
+
+          if (divides) {
+            verdict.innerHTML = '<strong>整除</strong> tile 邊長 ' + t + ' 整除 48，' + total + ' 個 tile 大小一致、彼此互斥、剛好覆蓋全部輸出——<em>disjoint 與 exhaustive 同時成立</em>，這是 cuTile 切分最乾淨的情況。';
+          } else {
+            verdict.innerHTML = '<strong>不整除</strong> 48 不被 ' + t + ' 整除，最右與最下排出現較小的邊緣 tile（紅色）。cuTile 仍維持 disjoint，但每個 program instance 必須拿到自己 tile 的真實邊界、在邊緣做 bound check——<em>覆蓋全部輸出的代價是 kernel 要處理 ragged 邊界</em>，這也是 tiling 抽象要替你管的細節。';
+          }
+        }
+        inp.addEventListener('input', render);
+        render();
+      })();
+    </script>
+    <figcaption>tile 邊長整除輸出維度時，切分是均勻、disjoint、exhaustive 的；不整除時邊緣出現較小的 ragged tile——cuTile 仍保證互不重疊，但 kernel 必須處理邊界。disjoint 是安全的根據，exhaustive 是正確性的根據，兩者都由切分這一層負責，而不是 kernel body。</figcaption>
+  </figure>
+
+  <p>這裡有個容易被忽略的點：tiling 不只給安全，還給效能。tile 是「能放進 GPU on-chip 記憶體（shared memory / register file）的一塊資料」的自然單位。把運算組織成 tile，等於同時拿到兩件事——可變借用互斥（安全），以及資料局部性（每個 tile 在 SM 上被加載一次、重複使用）。這也是為什麼 tile-based 抽象不是把效能換成安全，而是兩者剛好對齊在同一個結構上。論文後面的 GEMM 數字（B200 上 2 PFlop/s）能逼近 cuBLAS，正是因為 tiling 是高效 GEMM 本來就在用的分塊策略，cuTile 只是把它變成型別系統認得的東西。</p>
+
+  <p>值得把「tile 是抽象單位」跟傳統 CUDA 的「thread/block 是抽象單位」對照著看，因為這是整套設計的心智模型轉折。在 thread/block 模型裡，你寫的是「單一 thread 的視角」——這個 thread 用 <code>blockIdx.x * blockDim.x + threadIdx.x</code> 算出自己負責的 index，再去 global memory 該位址讀寫。安全性完全壓在「每個 thread 算出來的 index 互不重疊」這個你得自己保證的不變數上，而這個不變數散落在算術裡，編譯器無從驗證。tile 模型把視角抬高一層：你寫的是「這一格 tile 怎麼算」，index 計算被收進框架，框架替你保證每格 tile 對應 disjoint 的位址範圍。轉換成本就在這裡——你得放棄 thread-level 的精細控制，改用 tile 的粗粒度去想問題；但換來的是 index 重疊這類最難抓的 bug 從你的責任範圍移到型別系統的責任範圍。論文的 idiomatic 一詞指的正是這個：寫起來像 Rust，而不是把 CUDA 的 thread 心智模型硬包一層 Rust 語法。</p>
+
+  <p>切分的兩個性質——disjoint 與 exhaustive——分別撐起安全與正確兩件事，這個區分很重要。disjoint（互不重疊）是安全的根據：任兩格 tile 的 byte 集合互斥，所以可變借用不會打架。exhaustive（覆蓋全部輸出）是正確的根據：如果切分漏了輸出的某個角落，那塊永遠不會被任何 program instance 寫到，結果就錯了，但這不是 race、是邏輯漏洞。上面那個 demo 把這兩件事拆開演——當 tile 邊長整除輸出維度，切分均勻、disjoint 且 exhaustive；不整除時，cuTile 仍維持 disjoint（這是安全底線，絕不放棄），但邊緣冒出較小的 ragged tile，每個 program instance 得拿到自己 tile 的真實邊界、在邊緣做 bound check 才能保住 exhaustive。換句話說，安全永遠在，但「覆蓋乾淨」這件事在不整除時要 kernel 多付一點邊界處理——這個細節正是 tiling 抽象要替你扛的，不然就是你自己在算術裡手刻邊界條件，又回到 bug 容易藏身的老路。</p>
+
+  <figure class="vg-w-compare-rawptr-tile" data-mobile="static" data-svg-scroll="880">
+    <style>
+      .vg-w-compare-rawptr-tile svg { width: 100%; height: auto; max-width: 880px; }
+      .vg-w-compare-rawptr-tile .col-title { font-family: IM Fell English, serif; font-style: italic; font-size: 15px; }
+      .vg-w-compare-rawptr-tile .row { font-family: EB Garamond, serif; font-size: 13px; }
+      .vg-w-compare-rawptr-tile .mono { font-family: JetBrains Mono, monospace; font-size: 11px; }
+      .vg-w-compare-rawptr-tile figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+    <svg viewBox="0 0 880 280" role="img"
+         aria-label="裸 CUDA raw pointer kernel 與 cuTile tile ownership 在記憶體安全保證上的逐項對照">
+      <text x="20" y="26" fill="var(--ink)" font-family="IM Fell English, serif" font-style="italic" font-size="16">同一塊輸出，兩種交法——誰來保證寫入不重疊</text>
+
+      <!-- column headers -->
+      <rect x="260" y="44" width="290" height="34" fill="var(--muted-2)" opacity="0.25" stroke="var(--muted-2)"/>
+      <text x="405" y="66" text-anchor="middle" class="col-title" fill="var(--ink)">unsafe raw CUDA kernel</text>
+      <rect x="560" y="44" width="300" height="34" fill="var(--accent)" opacity="0.18" stroke="var(--accent)"/>
+      <text x="710" y="66" text-anchor="middle" class="col-title" fill="var(--accent-text)">cuTile tile ownership</text>
+
+      <!-- row 1: 交給 kernel 的東西 -->
+      <text x="20" y="110" class="row" fill="var(--muted)">kernel 拿到的</text>
+      <text x="405" y="110" text-anchor="middle" class="mono" fill="var(--ink)">一根 *mut T（整塊輸出）</text>
+      <text x="710" y="110" text-anchor="middle" class="mono" fill="var(--ink)">&amp;mut tile（自己那一格）</text>
+
+      <!-- row 2: 不重疊由誰保證 -->
+      <text x="20" y="150" class="row" fill="var(--muted)">不重疊誰保證</text>
+      <text x="405" y="150" text-anchor="middle" class="row" fill="var(--ink)">開發者手算 index，編譯器看不到</text>
+      <text x="710" y="150" text-anchor="middle" class="row" fill="var(--ink)">切分本身，型別層級 disjoint</text>
+
+      <!-- row 3: race 何時被抓 -->
+      <text x="20" y="190" class="row" fill="var(--muted)">race 何時抓</text>
+      <text x="405" y="190" text-anchor="middle" class="row" fill="var(--ink)">執行期，且不穩定重現</text>
+      <text x="710" y="190" text-anchor="middle" class="row" fill="var(--ink)">編譯期，根本構造不出</text>
+
+      <!-- row 4: 逃生門 -->
+      <text x="20" y="230" class="row" fill="var(--muted)">低階控制</text>
+      <text x="405" y="230" text-anchor="middle" class="row" fill="var(--ink)">整個 kernel 都是 unsafe</text>
+      <text x="710" y="230" text-anchor="middle" class="row" fill="var(--ink)">局部 opt out，其餘仍 safe</text>
+
+      <line x1="20" y1="124" x2="860" y2="124" stroke="var(--line)" stroke-width="0.8"/>
+      <line x1="20" y1="164" x2="860" y2="164" stroke="var(--line)" stroke-width="0.8"/>
+      <line x1="20" y1="204" x2="860" y2="204" stroke="var(--line)" stroke-width="0.8"/>
+      <line x1="555" y1="90" x2="555" y2="248" stroke="var(--muted-2)" stroke-width="0.8"/>
+
+      <text x="20" y="266" class="mono" fill="var(--muted)">差別不在 checker 多聰明，而在交給 kernel 的是指標還是已切好的 tile</text>
+    </svg>
+    <figcaption>裸 raw pointer 把整塊輸出交給 kernel，不重疊全靠開發者手算 index、race 只在執行期偶發；cuTile 交的是已切好的 &amp;mut tile，互不重疊由切分這層在型別上保證，race 在編譯期就構造不出，需要低階控制時也只局部 opt out。安全不是靠更聰明的 borrow checker，而是靠換掉交給 kernel 的資料結構。</figcaption>
+  </figure>
+
+  <h2>kernel 啟動：契約守住，需要時才局部放手</h2>
+
+  <p>tiling 解決了 kernel body 內部的 race，但還有第二個邊界要守：host 與 device 之間。論文寫「kernel launches preserve the host-side ownership contract」——kernel 啟動這個動作本身要維持 host 端的 ownership 契約。這句話的份量在於，CUDA 的 kernel launch 在傳統寫法裡是個 ownership 黑洞：你把 buffer 的指標交給 launch、kernel 非同步在背景跑、host 端的程式碼繼續往下走。這段期間誰擁有那塊 buffer？傳統 API 不回答這個問題，於是 host 在 kernel 還沒跑完時就去讀寫同一塊 buffer 的 bug 屢見不鮮——這是 host 與 device 之間的 data race，跟 kernel 內部的 race 是兩回事。</p>
+
+  <p>cuTile 的處理是把 launch 納入 borrow 的生命週期。launch 一個會寫某塊輸出的 kernel，等於對那塊輸出取得了一個延伸到 kernel 完成為止的可變借用；在這個借用還在的期間，host 端不能再碰那塊 buffer——borrow checker 會擋下來。換句話說，host 與 device 之間的同步不再是「開發者要記得呼叫 <code>cudaStreamSynchronize</code>」的紀律問題，而是 ownership 規則的自然結果：你想在 host 讀那塊輸出，型別系統會要求那個可變借用先結束（也就是 kernel 先同步完）。這把 GPU 程式設計裡最隱晦的一類 bug——host/device 之間因為非同步而錯位的存取——搬到了編譯期。</p>
+
+  <p>把 launch 納入 borrow 生命週期，實際的效果是 host 端那些「忘了同步」的經典 bug 變成編譯不過。傳統寫法裡，<code>cudaMemcpyAsync</code> 把結果搬回 host、然後馬上去讀那塊記憶體，但 kernel 其實還沒寫完——這類 bug 不會穩定重現，只在 GPU 剛好慢一點時才爆，是 GPU 程式設計裡最折磨人的一種。cuTile 的處理把「kernel 還在跑」這個狀態編碼進型別：可變借用沒結束，host 對那塊 buffer 的讀取就不被允許。你想讀，就得讓借用結束，也就是讓 kernel 同步完——同步從一個「要記得做的動作」變成「型別系統會逼你做的前提」。這跟 Rust 在 CPU 上用生命週期管 thread 之間的資料共享是同一招，只是把 thread 換成了 device。</p>
+
+  <p>但 GPU 程式設計不可能全部用高階抽象——有時候你就是需要寫一段不符合 tile 模型的低階 code（手動管 shared memory、寫一個 warp-level 的 reduction、用一個 cuTile 還沒包的 intrinsic）。論文對這點的態度是「programmers can opt out locally when they need lower-level control」——可以局部 opt out 拿低階控制。這是 Rust <code>unsafe</code> 哲學在 GPU 上的延伸：安全是預設，但不是牢籠；當你需要繞過 tile 模型時，你明確標出那一小段、自己對那段負責，而程式其餘部分的 ownership 保證不受影響。「local」是關鍵字——opt out 的範圍被限制在你明確標出的區塊，不會像交出一根 raw pointer 那樣把整個 kernel 的安全性都放掉。這個設計取捨跟 Rust 對待 <code>unsafe</code> 的態度一致：與其因為極少數需要低階控制的場景就把整個系統設成 unsafe，不如讓 99% 的程式碼享有編譯期保證，把 unsafe 收斂成「需要審查的一小塊」。GPU kernel 尤其需要這個逃生門——硬體一直在出新指令、新的 tensor core 操作，框架不可能即時把每個 intrinsic 都包成安全 API，opt out 讓你不必等框架追上就能先用上新硬體能力。</p>
+
+  <pre data-kind="pseudocode"><code><em>// 概念示意：tiled kernel 的可變輸出被切成 disjoint tile</em>
+<em>// 每個 program instance 只拿到自己那一格的 &amp;mut</em>
+tiled_kernel(out: TileGridMut, a: TileGrid, b: TileGrid) {
+    let mut tile = out.this_program_instance();   <em>// 唯一可變借用、disjoint</em>
+    let lhs = a.this_program_instance();
+    let rhs = b.this_program_instance();
+    tile.copy_from(lhs.add(rhs));                  <em>// 安全：別的 instance 碰不到這格</em>
+
+    <em>// 局部 opt out：只有這個 block 跳出 tile 模型</em>
+    unsafe_tile! {
+        <em>// 手寫 warp-level reduction / 直接碰 shared memory</em>
+        <em>// 範圍只限這裡，kernel 其餘部分的保證不受影響</em>
+    }
+}
+
+<em>// host 端：launch 借走 out，直到 kernel 完成前 host 不能碰 out</em>
+let out_borrow = launch(tiled_kernel, out, a, b);  <em>// &amp;mut out 延伸到 kernel 完成</em>
+<em>// read(out) 在這裡會被 borrow checker 擋下——必須先讓借用結束</em></code></pre>
+
+  <h2>host 端執行模型：同步、pipeline、graph replay</h2>
+
+  <p>安全模型守住正確性，但一個推論引擎或訓練 loop 不會只發一個 kernel——它要編排成百上千個 kernel，而編排方式直接決定吞吐。論文說 cuTile Rust 提供「a composable host execution model spanning synchronous launches, asynchronous pipelines, and CUDA graph replay」——一個可組合的 host 執行模型，橫跨同步啟動、非同步 pipeline、以及 CUDA graph replay。這三者不是三個 API、而是同一套 ownership 規則下的三種編排粒度，差別在於「同步點放在哪裡」與「launch overhead 怎麼攤」。</p>
+
+  <p>同步 launch 是最直接的一檔：發一個 kernel、等它完成、host 拿回 ownership、再發下一個。語意清楚、好除錯，但每個 kernel 之間 host 都閒著等 GPU，而且每次 launch 都付一次 launch overhead——對「很多個小 kernel 串起來」的 workload，這個 overhead 會主導。非同步 pipeline 把同步點往後挪：連續發多個 kernel 進 stream、彼此用 ownership 表達依賴（前一個 kernel 對某 buffer 的借用結束，後一個才拿得到），host 不必每個都等，GPU 也能把前一個 kernel 的尾巴跟後一個的頭重疊起來跑。CUDA graph replay 則處理另一個維度的成本：如果同一串 kernel 序列要跑很多次（推論 decode 每生成一個 token 就是同一串 kernel 跑一遍），把這串序列「錄」成一張 CUDA graph、之後每次 replay 整張 graph，就把每個 kernel 個別 launch 的 CPU overhead 攤平成「replay 一次 graph」的單一成本。對 batch-1 decode 這種「kernel 小、launch 次數極多」的場景，graph replay 是把 CPU 端從瓶頸位置移開的關鍵。</p>
+
+  <figure data-mobile="keep">
+    <svg class="vg-w-exec-modes" viewBox="0 0 720 340" role="img"
+         aria-label="cuTile Rust 三種 host 執行模型：同步 launch、非同步 pipeline、CUDA graph replay 的時間軸對照"
+         style="width: 100%; height: auto; max-width: 720px;">
+      <style>
+        .vg-w-exec-modes text { font-family: EB Garamond, serif; font-size: 13px; }
+        .vg-w-exec-modes .label { font-family: IM Fell English, serif; font-style: italic; font-size: 13px; }
+        .vg-w-exec-modes .sub { font-family: IM Fell English, serif; font-style: italic; font-size: 11px; fill: var(--muted); }
+        .vg-w-exec-modes .k { font-family: JetBrains Mono, monospace; font-size: 11px; }
+      </style>
+
+      <text x="20" y="24" fill="var(--ink)" font-family="IM Fell English, serif" font-style="italic" font-size="15">同一串 kernel，三種編排——同步點與 launch overhead 的取捨</text>
+
+      <!-- Row 1: synchronous -->
+      <text x="20" y="64" fill="var(--accent-text)" class="label">synchronous launch</text>
+      <text x="20" y="80" fill="var(--muted)" class="sub">發一個 · 等完 · host 取回 ownership · 再發</text>
+      <rect x="200" y="52" width="70" height="20" fill="var(--accent)" opacity="0.5" stroke="var(--muted-2)"/>
+      <text x="235" y="66" text-anchor="middle" fill="var(--ink)" class="k">K1</text>
+      <rect x="270" y="52" width="24" height="20" fill="var(--muted-2)" opacity="0.4"/>
+      <text x="282" y="66" text-anchor="middle" fill="var(--muted)" class="sub">⏲</text>
+      <rect x="294" y="52" width="70" height="20" fill="var(--accent)" opacity="0.5" stroke="var(--muted-2)"/>
+      <text x="329" y="66" text-anchor="middle" fill="var(--ink)" class="k">K2</text>
+      <rect x="364" y="52" width="24" height="20" fill="var(--muted-2)" opacity="0.4"/>
+      <text x="376" y="66" text-anchor="middle" fill="var(--muted)" class="sub">⏲</text>
+      <rect x="388" y="52" width="70" height="20" fill="var(--accent)" opacity="0.5" stroke="var(--muted-2)"/>
+      <text x="423" y="66" text-anchor="middle" fill="var(--ink)" class="k">K3</text>
+      <text x="478" y="66" fill="var(--muted)" class="sub">⏲ = host 空等 + launch overhead</text>
+
+      <!-- Row 2: async pipeline -->
+      <text x="20" y="148" fill="var(--accent-text)" class="label">async pipeline</text>
+      <text x="20" y="164" fill="var(--muted)" class="sub">連發進 stream · ownership 表達依賴 · 尾頭重疊</text>
+      <rect x="200" y="136" width="80" height="20" fill="var(--sage)" opacity="0.6" stroke="var(--sage-deep)"/>
+      <text x="240" y="150" text-anchor="middle" fill="var(--ink)" class="k">K1</text>
+      <rect x="270" y="160" width="80" height="20" fill="var(--sage)" opacity="0.6" stroke="var(--sage-deep)"/>
+      <text x="310" y="174" text-anchor="middle" fill="var(--ink)" class="k">K2</text>
+      <rect x="340" y="136" width="80" height="20" fill="var(--sage)" opacity="0.6" stroke="var(--sage-deep)"/>
+      <text x="380" y="150" text-anchor="middle" fill="var(--ink)" class="k">K3</text>
+      <text x="440" y="160" fill="var(--muted)" class="sub">重疊區 = GPU 不空轉，host 不每個都等</text>
+
+      <!-- Row 3: graph replay -->
+      <text x="20" y="232" fill="var(--accent-text)" class="label">CUDA graph replay</text>
+      <text x="20" y="248" fill="var(--muted)" class="sub">錄一次 K1→K2→K3 · 之後 replay 整張 graph</text>
+      <rect x="200" y="220" width="220" height="20" fill="var(--ink-deep)" opacity="0.42" stroke="var(--ink-deep)"/>
+      <text x="310" y="234" text-anchor="middle" fill="var(--ink)" class="k">graph = [K1 · K2 · K3]</text>
+      <text x="200" y="270" fill="var(--muted)" class="sub">replay #1</text>
+      <rect x="270" y="258" width="40" height="14" fill="var(--ink-deep)" opacity="0.42"/>
+      <text x="320" y="270" fill="var(--muted)" class="sub">replay #2</text>
+      <rect x="382" y="258" width="40" height="14" fill="var(--ink-deep)" opacity="0.42"/>
+      <text x="432" y="270" fill="var(--muted)" class="sub">… 每 token 一次，per-launch CPU overhead 攤平成 replay 一次</text>
+
+      <line x1="200" y1="296" x2="700" y2="296" stroke="var(--muted-2)" stroke-width="0.8"/>
+      <text x="200" y="316" fill="var(--muted)" class="sub">時間 →</text>
+      <text x="700" y="316" text-anchor="end" fill="var(--muted)" class="sub">三者共用同一套 ownership 規則，差別只在同步點放哪、overhead 怎麼攤</text>
+    </svg>
+    <figcaption>三種執行模型的時間軸對照。同步 launch 在每個 kernel 之間留下 host 空等與 launch overhead；async pipeline 讓相鄰 kernel 的尾頭重疊；CUDA graph replay 把固定的 kernel 序列錄成一張 graph，之後每次 replay 把 per-launch 的 CPU 成本攤平——這正是 batch-1 decode 需要的編排。</figcaption>
+  </figure>
+
+  <p>三種模型可組合，是因為它們底下是同一套 borrow 規則：不論你選哪種編排，「誰在這個時間點擁有這塊 buffer」這個問題都由 ownership 回答。這讓你可以從同步 launch 起手（最好除錯），確認正確之後改成 async pipeline 拿吞吐，最後把穩定的序列收成 graph replay 砍掉 launch overhead——三步轉換都不必改 kernel、也不會引入新的 host/device race，因為轉換前後的 ownership 契約一致。</p>
+
+  <p>為什麼 graph replay 對推論這麼關鍵，值得多講一句。LLM 的 batch-1 decode 是「每生成一個 token 就把同一串 kernel 跑一遍」的循環——attention、各層的 matmul、normalization，序列固定不變，只有資料在變。在這種場景下，每個 kernel 本身很小（batch-1 的計算量不大），於是 CPU 端「準備並送出一次 launch」的固定成本反而可能比 kernel 在 GPU 上跑的時間還長。如果用同步 launch，CPU 會變成瓶頸：GPU 跑完一個小 kernel 就空著等 CPU 把下一個 launch 送過來。CUDA graph replay 的解法是把整串 kernel 序列的依賴關係、參數、啟動配置一次「錄」進一張 graph，之後每生成一個 token 就 replay 同一張 graph——CPU 只付一次「送出 replay」的成本，而不是 N 次「逐個 launch」的成本。這直接解釋了 Grout 的 decode 數字為什麼能撞在 HBM roofline 上：如果 CPU launch overhead 還在路上卡著，decode 吞吐會被壓在頻寬上限之下，而不是貼著它。</p>
+
+  <p>反過來說，這三種模型不是越「進階」越好，而是各有適用區間。同步 launch 在開發初期值得保留——它把不確定性壓到最低，哪個 kernel 算錯、哪塊 buffer 沒同步好，一步一停就抓得出來。async pipeline 適合 kernel 之間有真實 overlap 機會的 workload（前一個 kernel 在算、後一個的輸入已備好）。graph replay 的前提則是「序列穩定」——一旦控制流會因資料而變（例如動態形狀、條件分支改變 kernel 序列），錄好的 graph 就得重錄，replay 的省下來的成本反而被重錄吃掉。cuTile 把三者放在同一套 ownership 規則下，意義在於你可以按 workload 的成熟度與形狀自由換檔，而不必擔心換檔時把 host/device 的同步契約弄破。</p>
+
+  <h2>B200 與 Grout：抽象沒有付出代價</h2>
+
+  <p>安全抽象最常見的質疑是「保證好聽，效能呢」。cuTile Rust 的回答是 microbenchmark 加端到端兩層。microbenchmark 在 NVIDIA B200 上：element-wise 運算達 7 TB/s、GEMM 達 2 PFlop/s，論文明寫後者是「96% of cuBLAS」——也就是跟 NVIDIA 自家手調的 cuBLAS 比，只差 4%。而且這個成績「matching cuTile Python within measurement noise」，跟 cuTile 的 Python 前端在量測誤差內持平。這兩個對照各有意思：對 cuBLAS 的 96% 說明 tile-based 安全抽象不是把效能換來的（GEMM 本來就是分塊運算，cuTile 只是把分塊變成型別系統認得的事）；跟 cuTile Python 持平則說明把前端從 Python 換成 Rust、把 ownership 規則加上去，沒有在 kernel 產出的機器碼上留下額外成本。</p>
+
+  <p>端到端用 Grout——一個以 cuTile Rust 寫的推論引擎，跑完整的 Qwen3 推論路徑。論文報的是 batch-1 decode 的吞吐：Qwen3-4B 在 NVIDIA GeForce RTX 5090 上達 171 generated tokens/s，Qwen3-32B 在 B200 上達 82 generated tokens/s，並稱「competitive with vLLM and SGLang」——跟這兩個成熟引擎有競爭力。論文還補了一句「consistent with an HBM roofline sanity check」：這兩個數字跟 HBM 頻寬的 roofline 估算對得上。這個 sanity check 很要緊——batch-1 decode 是 memory-bandwidth-bound 的（每生成一個 token 要把整個模型權重從 HBM 讀一遍），所以理論上限就是 HBM 頻寬除以模型大小。數字落在 roofline 附近，意味著 Grout 沒有被 CPU launch overhead 或抽象開銷卡在頻寬上限之下——也就是前面那套 graph replay 的編排確實把 CPU 端移開了瓶頸位置。下面這張表把全部公開數字並排，點欄位標題可排序。</p>
+
+  <figure class="vg-w-table-b200-bench" data-mobile="keep">
+    <style>
+      .vg-w-table-b200-bench { overflow-x: auto; }
+      .vg-w-table-b200-bench table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-b200-bench thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; }
+      .vg-w-table-b200-bench thead th[data-sort] { color: var(--accent-text); }
+      .vg-w-table-b200-bench thead th[data-sort="asc"]::after { content: ' ▴'; font-size: 0.7em; }
+      .vg-w-table-b200-bench thead th[data-sort="desc"]::after { content: ' ▾'; font-size: 0.7em; }
+      .vg-w-table-b200-bench tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); }
+      .vg-w-table-b200-bench td.num { font-variant-numeric: tabular-nums; text-align: right; font-family: JetBrains Mono, monospace; }
+      .vg-w-table-b200-bench tbody tr:hover td { background: var(--bg-soft); }
+      .vg-w-table-b200-bench caption { text-align: left; caption-side: top; font-family: var(--scribed); font-style: italic; color: var(--muted); font-size: var(--fs-sm); padding: var(--s-1) 0; }
+    </style>
+    <table>
+      <caption>cuTile Rust 與 Grout 的公開數字（全部取自論文 abstract）。microbenchmark 在 B200，Grout 為 batch-1 decode 吞吐。點欄位標題排序。</caption>
+      <thead>
+        <tr>
+          <th data-key="what">量測</th>
+          <th data-key="hw">硬體</th>
+          <th data-key="val" class="num">數值</th>
+          <th data-key="ref">對照基準</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>element-wise 吞吐</td><td>B200</td><td class="num" data-val="7000">7 TB/s</td><td>—</td></tr>
+        <tr><td>GEMM 吞吐</td><td>B200</td><td class="num" data-val="2000">2 PFlop/s</td><td>cuBLAS 的 96%</td></tr>
+        <tr><td>Qwen3-4B batch-1 decode</td><td>RTX 5090</td><td class="num" data-val="171">171 tok/s</td><td>與 vLLM／SGLang 競爭</td></tr>
+        <tr><td>Qwen3-32B batch-1 decode</td><td>B200</td><td class="num" data-val="82">82 tok/s</td><td>符合 HBM roofline</td></tr>
+      </tbody>
+    </table>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-table-b200-bench');
+        const headers = root.querySelectorAll('thead th');
+        const tbody = root.querySelector('tbody');
+        let activeKey = null, asc = true;
+        headers.forEach((h, idx) => h.addEventListener('click', () => {
+          const key = h.dataset.key;
+          if (activeKey === key) asc = !asc; else { activeKey = key; asc = true; }
+          headers.forEach((x) => x.removeAttribute('data-sort'));
+          h.setAttribute('data-sort', asc ? 'asc' : 'desc');
+          const rows = Array.from(tbody.querySelectorAll('tr'));
+          rows.sort((a, b) => {
+            let av, bv;
+            if (key === 'val') {
+              av = Number(a.children[idx].getAttribute('data-val'));
+              bv = Number(b.children[idx].getAttribute('data-val'));
+            } else {
+              av = a.children[idx].textContent.trim();
+              bv = b.children[idx].textContent.trim();
+            }
+            const cmp = av < bv ? -1 : av > bv ? 1 : 0;
+            return asc ? cmp : -cmp;
+          });
+          rows.forEach((r) => tbody.appendChild(r));
+        }));
+      })();
+    </script>
+    <figcaption>四個數字分兩層：上兩列是 kernel 層級的 microbenchmark（證明 tile 抽象不吃效能），下兩列是 Grout 的端到端 decode 吞吐（證明整條推論路徑跑得起來）。GEMM 對 cuBLAS 的 96% 與 decode 對 HBM roofline 的吻合，是論文用來說「抽象沒有付出代價」的兩個錨點。</figcaption>
+  </figure>
+
+  <p>把這些數字放回安全模型的脈絡才看得出意義。一個把 Rust ownership 搬上 GPU 的系統，最大的風險是抽象稅——多一層 tile 包裝、多一套 borrow 檢查，可能在 kernel 機器碼裡留下額外的 bound check 或記憶體搬移。B200 上對 cuBLAS 的 96%、以及跟 cuTile Python 在量測誤差內持平，是直接反駁這個擔憂的兩個數字：安全是在編譯期與型別層級拿到的，不是用執行期的成本換的。Grout 的 decode 吞吐落在 HBM roofline 附近，再把這個結論從 microbenchmark 推到真實 workload——一條完整的 Qwen3 推論路徑，用一個 ownership-safe 的 Rust 引擎跑，仍然撞在物理頻寬上限而不是抽象的牆上。</p>
+
+  <p>這套東西對在 Rust 裡寫 GPU code 的人意味著什麼，值得直說。今天要在 Rust 裡寫一個 custom GPU kernel，要嘛接受 ownership 失守、自己用 raw pointer 保證不重疊，要嘛回去寫 CUDA C++。cuTile Rust 給的是第三條路：把運算組織成 tile，安全與資料局部性同時拿到，效能跟手調 cuBLAS 差 4%。代價是你得用 tile 的方式思考問題，而非用 thread/block 的方式——這對熟悉 CUDA 心智模型的人是一道轉換成本，但對「想用 Rust 的型別系統擋掉 GPU race」這個目標來說，tile 是目前唯一被證明效能站得住的切入點。</p>
+
+  <p class="vg-deep-closer"><strong>What this enables</strong>：把 ownership 從 CPU 延伸到 GPU 的關鍵不是更聰明的 borrow checker，而是換一個資料結構——當可變輸出在型別層級就被切成互不重疊的 tile，「同一塊 byte 被兩個可變借用同時持有」這件事在定義上就不可能，data race 因此在編譯期消失，而效能（B200 上 GEMM 達 cuBLAS 的 96%、Grout 的 decode 撞在 HBM roofline 上）證明這份安全沒有用執行期成本去換。</p>
+</div>
