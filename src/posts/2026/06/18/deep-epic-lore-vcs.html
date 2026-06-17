@@ -1,0 +1,427 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">「Storage cost grows with what changed, not with repository size.」——Lore 把這句話當成設計起點，倒推回去要求整套系統的每一個 byte 都用 content hash 定址。</p>
+  <h1 class="vg-post-title">{{ title }}</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p><span class="vg-dropcap">L</span>ore 是 Epic Games 開源的版本控制系統，定位很直白——既有的 VCS 沒有一套同時滿足「最大型開發 workload」要的所有性質。按官方 system design 文件的說法，這類 workload 同時是 content-agnostic（一個 repo 裡有原始碼、build input、設定、預編譯產物、大型資料檔、生成內容與任意 binary blob）、large on every axis（檔案數百萬、單檔到 TB 級、history 百萬 revision、每專案數百 branch、數千並行使用者）、以及 centrally coordinated（需要一個邏輯上的 single source of truth 做 access control、durability、audit 與衝突解決，但開發者仍要能離線工作）。Git 與 Perforce 各自滿足其中一部分，沒有一套全包。Lore 的回答是：centralized、content-addressed、把 binary 當一等公民、靠 sparse 與 on-demand hydration 撐住規模。底下逐塊拆。</p>
+
+  <p>先把這四個性質之間的張力講清楚，後面每一塊設計才有座標。content-agnostic 跟 large-on-every-axis 放在一起，等於要求系統不能假設內容可讀、可 diff、可 delta——一個 2 GB 的貼圖 atlas 跟一段 .cpp 在儲存層必須一視同仁，都是 opaque byte stream。而 centrally-coordinated 跟「開發者仍要能離線工作」放在一起，又等於要求系統同時是中央式與分散式：權威狀態集中在 remote，但日常操作不能每次都來回 remote。這兩組張力沒有現成解——Git 解了離線與內容無關的 hash 模型卻在大 binary 與 sparse 上掉鏈，Perforce 解了中央權威與大檔卻把離線做得 awkward。Lore 的整套架構可以讀成「同時化解這兩組張力」的一連串取捨，而不是某一個聰明的 data structure。</p>
+
+  <h2>content-addressed store：每個 byte 用 BLAKE3 定址</h2>
+
+  <p>Lore 的儲存模型核心是一句話——「Every piece of content is stored once in an immutable, content-addressed data store keyed by BLAKE3 hashes.」content-addressed 的意思是 storage key 就是內容本身的 hash，不是路徑、不是 commit、不是檔名。兩個 client 產出 byte-for-byte 相同的內容，就會算出相同 address、只存一份——文件原話是「Deduplication is automatic: two clients producing the same bytes produce the same address and store one copy.」dedup 在這個模型裡不是事後跑的 GC pass，而是寫入路徑的內建性質。</p>
+
+  <p>address 的構造值得看清楚，因為它解釋了 Lore 怎麼同時做到 dedup 與「保留檔案身分」這兩件看似衝突的事。完整 address 是一對 (hash, context)：「32 bytes for the BLAKE3 hash, 16 bytes for the context, 48 bytes total.」hash 認的是 byte，context 是「a 16-byte opaque tag carried alongside a content hash」，主要用途是 file identity。文件特別點出一個微妙處——兩個 fragment 若 hash 相同但 context 不同，視為不同 entity：「they share a payload (deduplicated under the hood) but track different identities.」也就是說 payload 仍只存一份，但兩個檔案的身分各自獨立。這讓「兩個不同檔案剛好有一段相同內容」既能省儲存、又不會在語意上被混為一談。</p>
+
+  <p>BLAKE3 本身是一個 256-bit 的 cryptographic hash——文件原話「Lore uses BLAKE3, a 256-bit cryptographic hash, as its address function.」官方對碰撞風險的說法是「The 256-bit output is large enough that collision risk is negligible across any plausible repository size.」合理的推測是，選 BLAKE3 而非 SHA-1（Git 早期）或 SHA-256，動機在於它對大檔的吞吐——BLAKE3 的設計可平行、對大 binary 算 hash 不容易變成 ingest 瓶頸，這對「單檔可達 TB 級」的 workload 很關鍵；不過官方文件並未把選型理由講到這麼細，這層是推測。content hash 同時兼了 integrity check 的角色：address 算得出來就代表內容沒被竄改，這也是官方對外宣傳裡那句「verifiable tamper-evident source of truth」的技術根據。</p>
+
+  <p>content-addressing 真正的威力，在於它讓「相等」變成 O(1) 的指標比較。要判斷兩個 directory、兩個 revision、甚至兩棵子樹是否完全相同，不必逐 byte 比，只要比 root hash 一個值——相等就是相等，整棵子樹都不必碰。這個性質往上傳遞：directory hash 由子節點 hash 推導，revision hash 由 tree 與 parent hash 推導，於是「這次 commit 跟上次差在哪」退化成沿著 hash 不同的節點往下走，相同 hash 的分支直接剪掉。合理的推測是，對百萬檔的 repo，diff 與 status 這類操作的成本因此更接近跟「改了多少」成正比、而非跟「repo 多大」成正比——這跟 opener 那句「storage cost grows with what changed」是同一個結構性質的兩面，不過具體的演算法複雜度官方文件沒有逐項給出，這裡標為推斷。</p>
+
+  <h2>chunked storage 與 FastCDC：插一個 byte 不必重存整檔</h2>
+
+  <p>content-addressing 在小檔上很美，套到大 binary 上卻有個致命問題：改一個 byte，整檔的 hash 就全變，等於整檔得重存。對 100 MB 的美術資產或 2 GB 的 build artifact，這代表每次微調都複製整檔——而遊戲開發裡「微調一張貼圖、重存一份」是天天發生的事。更糟的是版本越多、複製越多，repo 大小很快就跟版本數線性爆炸，這正是 Git＋LFS 在大型資產 repo 上會撞到的牆。Lore 的解法是 chunking——文件原話「Files larger than a threshold are split into chunks, content-defined via FastCDC or fixed-size depending on file type, so that a single edit inside a multi-gigabyte file re-uploads only the changed chunks and any byte range can be read without materializing the whole file.」大檔被切成多個可重用 chunk，各自獨立定址；改動只命中被改到的那幾個 chunk，其餘 chunk 的 hash 不變、直接共用既有儲存。</p>
+
+  <p>關鍵在切點怎麼決定。固定大小切（每隔 N bytes 切一刀）有個經典缺陷：在檔案開頭插入一個 byte，後面所有切點全部位移一格，等於每個 chunk 都變了——dedup 完全失效。Lore 預設用 content-defined chunking（FastCDC）：「A rolling hash slides over the file and a chunk boundary is placed wherever the hash matches a magic pattern, subject to minimum and maximum chunk sizes.」切點由內容決定而非位置決定，所以在中間插入 bytes 時，插入點之後的切點仍會落在同樣的內容特徵上——合理的推測是只有被改到的那一兩個 chunk 邊界需要重算、其餘維持原狀（這是 content-defined chunking 的一般性質，官方文件描述了機制但未逐例展開）。預設參數文件講得很明確：「FastCDC targets a 64 KiB average chunk with a 32 KiB floor and a 256 KiB ceiling; fixed-size chunking can be configured to any size up to that same 256 KiB ceiling.」下面這個 widget 讓你直接拖：在一條檔案上移動編輯點，看 FastCDC 的 chunk 邊界如何只重算附近區段。</p>
+
+  <figure class="vg-w-drag-lore-cdc" data-mobile="swap" data-svg-scroll="880" data-mobile-summary="固定切法插一個 byte 後續全位移整檔失效，FastCDC 切點跟著內容走只有被改的 chunk 重存。">
+    <style>
+      .vg-w-drag-lore-cdc { display: grid; gap: var(--s-2); }
+      .vg-w-drag-lore-cdc svg { width: 100%; height: auto; max-width: 880px; touch-action: none; }
+      .vg-w-drag-lore-cdc .cap { font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink-soft); }
+      .vg-w-drag-lore-cdc .cap em { color: var(--accent-text); font-style: italic; }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M18 8 22 12 18 16"/><path d="M6 8 2 12 6 16"/><path d="M2 12h20"/>
+      </svg>
+      <span>拖動紅色編輯點看 chunk 邊界如何重算 · 上排固定切、下排 FastCDC</span>
+    </p>
+    <svg class="vg-w-drag-lore-cdc-main" viewBox="0 0 880 320" role="img"
+         aria-label="固定大小切法與 FastCDC 對照——拖動編輯點，看哪一排只重算局部 chunk">
+      <text x="440" y="24" text-anchor="middle" fill="var(--ink)" font-family="IM Fell English, serif" font-style="italic" font-size="14">在檔案中間插入 bytes——哪一種切法只需重存一個 chunk？</text>
+
+      <text x="20" y="78" fill="var(--muted)" font-family="IM Fell English, serif" font-style="italic" font-size="13">fixed-size</text>
+      <g id="vg-w-drag-lore-cdc-fixed"></g>
+      <text x="20" y="150" fill="var(--accent-text)" font-family="JetBrains Mono, monospace" font-size="12" id="vg-w-drag-lore-cdc-fixed-count">重存 0 / 8 chunk</text>
+
+      <text x="20" y="220" fill="var(--muted)" font-family="IM Fell English, serif" font-style="italic" font-size="13">FastCDC</text>
+      <g id="vg-w-drag-lore-cdc-cdc"></g>
+      <text x="20" y="292" fill="var(--sage-deep)" font-family="JetBrains Mono, monospace" font-size="12" id="vg-w-drag-lore-cdc-cdc-count">重存 0 / 8 chunk</text>
+
+      <line id="vg-w-drag-lore-cdc-line" x1="440" y1="44" x2="440" y2="260" stroke="var(--accent)" stroke-width="1.5" stroke-dasharray="3,3"/>
+      <circle id="vg-w-drag-lore-cdc-h" cx="440" cy="44" r="11" fill="var(--accent)" cursor="grab"/>
+      <text id="vg-w-drag-lore-cdc-h-label" x="440" y="48" text-anchor="middle" fill="var(--bg)" font-family="JetBrains Mono, monospace" font-size="12" pointer-events="none">✎</text>
+    </svg>
+    <p class="cap" id="vg-w-drag-lore-cdc-verdict"><em>固定切</em>：插入點之後每個 chunk 邊界位移，後段全部變 hash。<em>FastCDC</em>：切點跟著內容走，只有編輯點所在那個 chunk 重算。</p>
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        const root = document.querySelector('.vg-w-drag-lore-cdc');
+        const svg = root.querySelector('svg.vg-w-drag-lore-cdc-main');
+        const handle = root.querySelector('#vg-w-drag-lore-cdc-h');
+        const line = root.querySelector('#vg-w-drag-lore-cdc-line');
+        const gFixed = root.querySelector('#vg-w-drag-lore-cdc-fixed');
+        const gCdc = root.querySelector('#vg-w-drag-lore-cdc-cdc');
+        const fixedCount = root.querySelector('#vg-w-drag-lore-cdc-fixed-count');
+        const cdcCount = root.querySelector('#vg-w-drag-lore-cdc-cdc-count');
+        const verdict = root.querySelector('#vg-w-drag-lore-cdc-verdict');
+        const X0 = 120, X1 = 840, Y_FIXED = 90, Y_CDC = 232, H = 44;
+        const fixedBounds = [];
+        for (let i = 0; i <= 8; i++) fixedBounds.push(X0 + (X1 - X0) * i / 8);
+        const cdcBounds = [X0, 205, 285, 360, 470, 560, 655, 760, X1];
+        const NS = 'http://www.w3.org/2000/svg';
+        function rect(x, w, y, fill, op) {
+          const r = document.createElementNS(NS, 'rect');
+          r.setAttribute('x', x); r.setAttribute('y', y);
+          r.setAttribute('width', Math.max(1, w)); r.setAttribute('height', H);
+          r.setAttribute('fill', fill); r.setAttribute('fill-opacity', op);
+          r.setAttribute('stroke', 'var(--muted-2)'); r.setAttribute('stroke-width', '1');
+          return r;
+        }
+        function drawRow(g, bounds, y, dirtyIdx, baseFill) {
+          while (g.firstChild) g.removeChild(g.firstChild);
+          for (let i = 0; i < bounds.length - 1; i++) {
+            const dirty = dirtyIdx.has(i);
+            g.appendChild(rect(bounds[i], bounds[i+1] - bounds[i], y,
+              dirty ? 'var(--accent)' : baseFill, dirty ? 0.6 : 0.16));
+          }
+        }
+        function clientToSvgX(clientX) {
+          const pt = svg.createSVGPoint();
+          pt.x = clientX; pt.y = 0;
+          const p = pt.matrixTransform(svg.getScreenCTM().inverse());
+          return Math.max(X0, Math.min(X1, p.x));
+        }
+        function update(x) {
+          handle.setAttribute('cx', x);
+          root.querySelector('#vg-w-drag-lore-cdc-h-label').setAttribute('x', x);
+          line.setAttribute('x1', x); line.setAttribute('x2', x);
+          const fDirty = new Set();
+          let fi = 0;
+          for (let i = 0; i < fixedBounds.length - 1; i++) { if (x >= fixedBounds[i]) fi = i; }
+          for (let i = fi; i < fixedBounds.length - 1; i++) fDirty.add(i);
+          const cDirty = new Set();
+          for (let i = 0; i < cdcBounds.length - 1; i++) { if (x >= cdcBounds[i] && x < cdcBounds[i+1]) cDirty.add(i); }
+          drawRow(gFixed, fixedBounds, Y_FIXED, fDirty, 'var(--muted)');
+          drawRow(gCdc, cdcBounds, Y_CDC, cDirty, 'var(--sage)');
+          fixedCount.textContent = '重存 ' + fDirty.size + ' / ' + (fixedBounds.length - 1) + ' chunk';
+          cdcCount.textContent = '重存 ' + cDirty.size + ' / ' + (cdcBounds.length - 1) + ' chunk';
+          verdict.innerHTML = '<em>固定切</em>：插入點之後 ' + fDirty.size + ' 個 chunk 邊界位移、全部重算 hash。<em>FastCDC</em>：切點跟內容走，只有 ' + cDirty.size + ' 個 chunk 重存——其餘 dedup 命中既有儲存。';
+        }
+        let dragging = false;
+        handle.addEventListener('pointerdown', (e) => { dragging = true; handle.setPointerCapture(e.pointerId); handle.setAttribute('cursor', 'grabbing'); });
+        handle.addEventListener('pointermove', (e) => { if (dragging) update(clientToSvgX(e.clientX)); });
+        handle.addEventListener('pointerup', (e) => { dragging = false; handle.setAttribute('cursor', 'grab'); });
+        update(440);
+      })();
+    </script>
+  </figure>
+
+  <p>FastCDC 預設之外還有 fixed-size chunking——「Boundaries are placed at fixed offsets regardless of content.」這兩種切法在「canonicality」上有取捨：CDC 為了保住 dedup 會「Reusing prior boundaries preserves dedup but costs canonicality... the same content can therefore have multiple legitimate addresses.」固定切則相反，「The address is canonical—one piece of content has exactly one address.」合理的推測是，對「整檔會一起被覆寫、不太會做局部插入」的內容，固定切的索引更簡單、且 address 唯一，而 CDC 的 rolling hash 計算不是免費的；不過官方文件是以 canonicality 而非「計算成本」來框這個取捨，這層成本判斷標為推斷。給兩種 chunking 策略而非只押 CDC，本身就是「content-agnostic」的一種體現：不同內容形狀配不同切法。</p>
+
+  <p>大檔還有一層遞迴處理。當一個檔案被切成的 fragment list 本身太長，「If a fragment list exceeds the threshold, the list is itself chunked and stored as a fragment with a flag marking it as a list.」——fragment list 也是內容，也照 chunk 規則切、也照 content hash 存，只是多一個 flag 標記它是 list。合理的推測是，這讓 TB 級單檔的索引不會退化成一個巨大的線性表，而是一棵層層套疊的樹：讀一個 byte range 時，沿著這棵 list 樹只展開覆蓋到該 range 的分支（官方確有「Reading a byte range fetches only the fragments that overlap the range」的描述，但「索引退化成樹」這個結構性結論是我的推斷）。dedup 的範圍同時跨檔與跨 history：「Identical regions across files dedupe.」相同的 byte 區段不論出現在哪個檔、哪個 revision，都只存一份。對遊戲 repo 那種「同一套 base texture 被多個 variant 引用、只有局部不同」的常見形狀，這層跨檔 dedup 省下的儲存往往很可觀——這點官方沒有給數字，屬於對機制的合理外推。</p>
+
+  <h2>Merkle tree 與 immutable revision chain：改一個檔，其餘節點原封不動</h2>
+
+  <p>單一檔案靠 chunk 定址，整個 repository 的狀態則靠 Merkle tree 組起來。「Each file node's hash derives from the file's content... Each directory node's hash derives from the sorted hash list of its children.」hash 由葉往根逐層推導，而「The root hash uniquely identifies the entire repository state.」這帶來一個結構性的 dedup：「Two revisions that differ in one file share every node not on the path from the root to that file, and 'share' here means the same hash, the same storage entry, no copy.」改一個檔，只有從 root 到該檔那條路徑上的 directory node 會換 hash，樹的其餘部分原封不動、直接共用。</p>
+
+  <p>這裡有個容易被忽略的層次：Merkle tree 解決的是「一個 revision 內部、跨檔的去重」，revision chain 解決的是「跨 revision、沿著時間的去重」，兩者用的是同一把鑰匙——content hash。一棵樹的 root hash 變了，只代表從某個葉到 root 那條路徑換了 hash；旁邊沒被碰到的整棵子樹，連同它底下成千上萬的檔案，hash 完全不動，於是新 revision 跟舊 revision 之間，這整棵子樹是「同一個 storage entry、零複製」——這正是上一段那句「share here means the same hash, the same storage entry, no copy」往多 revision 推的直接結果。合理的推測是：一次改動的儲存增量，約等於「被改的 chunk＋從那些 chunk 到 root 沿途重算的節點」，僅此而已；官方沒有把這條公式明寫出來，但它是 Merkle 結構的數學後果。</p>
+
+  <p>revision 之間靠 immutable revision chain 串起來。「Each revision references its parent or parents—one for an ordinary revision, two for a merge revision.」並且「Revisions form a directed acyclic graph in which every edge is a cryptographic link.」這跟 Git 的 commit 模型同構（commit 也是 hash-chain 的 DAG），差別在 Lore 把整套搬到 content-addressed + chunked 的底層上。「every edge is a cryptographic link」這句的份量在於：合理的推測是，要竄改任何一個歷史 revision 的內容，它的 hash 就變，所有指向它的後代 revision 的 hash 會連鎖全變，等於得改寫整條鏈——這跟 Git 用 commit hash 鎖住歷史是同一個 tamper-evident 保證（官方用「cryptographic link」與站台那句「verifiable tamper-evident source of truth」支撐這點，但連鎖失效的細節是我的推斷）。下面的圖把這兩層疊在一起看：上層是 revision DAG，下層是某一個 revision 指向的 Merkle tree，標出「改一個檔時哪些節點重算、哪些共用」。</p>
+
+  <figure data-mobile="keep">
+    <svg class="vg-w-merkle-lore-revision" viewBox="0 0 880 360" role="img"
+         aria-label="Lore 的 revision DAG 與 Merkle tree——改一個檔只重算 root 到該檔路徑上的節點，其餘共用"
+         style="width: 100%; height: auto; max-width: 880px;">
+      <style>
+        .vg-w-merkle-lore-revision text { font-family: EB Garamond, serif; font-size: 12px; }
+        .vg-w-merkle-lore-revision .lbl { font-family: IM Fell English, serif; font-style: italic; fill: var(--muted); }
+        .vg-w-merkle-lore-revision .mono { font-family: JetBrains Mono, monospace; font-size: 10px; }
+        .vg-w-merkle-lore-revision .head { font-family: IM Fell English, serif; font-style: italic; font-size: 13px; }
+      </style>
+      <defs>
+        <marker id="vg-w-merkle-lore-revision-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+        </marker>
+      </defs>
+
+      <text x="20" y="28" fill="var(--ink)" class="head">revision chain（DAG，每條 edge 是 cryptographic link）</text>
+      <circle cx="120" cy="64" r="16" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.5"/>
+      <text x="120" y="68" text-anchor="middle" fill="var(--ink)" class="mono">R0</text>
+      <circle cx="280" cy="64" r="16" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.5"/>
+      <text x="280" y="68" text-anchor="middle" fill="var(--ink)" class="mono">R1</text>
+      <circle cx="440" cy="64" r="16" fill="var(--accent)" fill-opacity="0.25" stroke="var(--accent)" stroke-width="1.5"/>
+      <text x="440" y="68" text-anchor="middle" fill="var(--ink)" class="mono">R2</text>
+      <line x1="136" y1="64" x2="262" y2="64" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-merkle-lore-revision-arrow)"/>
+      <line x1="296" y1="64" x2="422" y2="64" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-merkle-lore-revision-arrow)"/>
+      <text x="600" y="60" class="lbl">latest pointer ──&gt;</text>
+      <text x="600" y="76" class="mono" fill="var(--accent-text)">branch「main」= R2</text>
+      <text x="280" y="100" text-anchor="middle" class="lbl">parent hash 進入子 revision 的 hash</text>
+
+      <line x1="40" y1="120" x2="840" y2="120" stroke="var(--muted-2)" stroke-width="0.8" stroke-dasharray="2,3"/>
+      <text x="20" y="146" fill="var(--ink)" class="head">R2 的 Merkle tree——只改了 art/hero.png</text>
+
+      <rect x="400" y="160" width="80" height="34" fill="var(--accent)" fill-opacity="0.22" stroke="var(--accent)" stroke-width="1.5"/>
+      <text x="440" y="181" text-anchor="middle" fill="var(--ink)">root /</text>
+      <rect x="200" y="240" width="90" height="34" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.5"/>
+      <text x="245" y="261" text-anchor="middle" fill="var(--ink)">src/</text>
+      <rect x="420" y="240" width="90" height="34" fill="var(--accent)" fill-opacity="0.22" stroke="var(--accent)" stroke-width="1.5"/>
+      <text x="465" y="261" text-anchor="middle" fill="var(--ink)">art/</text>
+      <rect x="640" y="240" width="90" height="34" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.5"/>
+      <text x="685" y="261" text-anchor="middle" fill="var(--ink)">config/</text>
+      <line x1="424" y1="194" x2="270" y2="240" stroke="currentColor" stroke-width="1.2"/>
+      <line x1="450" y1="194" x2="460" y2="240" stroke="var(--accent)" stroke-width="1.6"/>
+      <line x1="458" y1="194" x2="675" y2="240" stroke="currentColor" stroke-width="1.2"/>
+
+      <rect x="180" y="312" width="110" height="30" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.2"/>
+      <text x="235" y="331" text-anchor="middle" fill="var(--ink)" class="mono">main.cpp</text>
+      <rect x="410" y="312" width="120" height="30" fill="var(--accent)" fill-opacity="0.35" stroke="var(--accent)" stroke-width="1.4"/>
+      <text x="470" y="331" text-anchor="middle" fill="var(--ink)" class="mono">hero.png ✎</text>
+      <line x1="465" y1="274" x2="470" y2="312" stroke="var(--accent)" stroke-width="1.6"/>
+      <line x1="245" y1="274" x2="235" y2="312" stroke="var(--muted-2)" stroke-width="1"/>
+
+      <text x="700" y="320" class="lbl">紅＝重算 hash</text>
+      <text x="700" y="338" class="lbl">灰＝同 hash、共用儲存</text>
+    </svg>
+    <figcaption>改 art/hero.png 一個檔：紅色路徑（hero.png → art/ → root → R2）重算 hash，src/、config/ 與其下所有節點維持原 hash、零複製。這就是「storage cost grows with what changed」的結構根據。</figcaption>
+  </figure>
+
+  <h2>centralized 但 offline-capable：immutable store 與 mutable store 的分工</h2>
+
+  <p>到這裡為止，Lore 的資料模型跟 Git 高度同構——都是 hash-chained 的 Merkle DAG。心智模型上真正的分岔在這一節：Lore 是 centralized by design，文件原話「A single logical source of truth must exist—for access control, durability, audit, and conflict resolution—but developers must still be able to work offline, queue revisions, and stage changes without a round-trip to the remote.」官方明確把 peer-to-peer decentralization 列為 non-goal：「Lore is centralized by design. Two clients communicate through the remote, not directly.」這跟 Git 的 DVCS 模型（每個 clone 都是完整 peer、可任意互相 pull）是兩種世界觀。但 Lore 不是回到純中央式——它要的是文件標題裡那句「Centralized but offline-capable.」為什麼堅持中央？官方點名的理由是 access control、durability、audit、conflict resolution 這四件事都需要一個權威點。合理的推測是，去中心模型裡，「誰能寫」「資料有沒有可靠備份」「誰在什麼時候改了什麼」「兩個人同時改怎麼定誰先」這些問題，要嘛沒有單一答案、要嘛得靠外掛的協作流程約定——對一家要管數千名開發者、數 TB 資產的公司，這些不是可選項；不過官方只列了那四個名詞，沒有展開到這個層次，故標為推斷。Lore 的選擇是把權威集中、但不讓集中拖慢日常操作：「Normal client operations (staging, committing, branching, switching, diffing) never require a round-trip.」</p>
+
+  <p>支撐這個「centralized 卻能離線」的關鍵，是把儲存切成兩個性質完全不同的 store。這是理解 Lore 最該先點開的一塊。下面的 widget 把四個元件擺出來——點任一個，看它負責什麼、不負責什麼。</p>
+
+  <figure class="vg-w-arch-lore-stores" data-mobile="static" data-svg-scroll="720">
+    <style>
+      .vg-w-arch-lore-stores { display: grid; grid-template-columns: 1fr; gap: var(--s-3); align-items: start; }
+      @media (min-width: 720px) { .vg-w-arch-lore-stores { grid-template-columns: 1fr; } }
+      .vg-w-arch-lore-stores svg { width: 100%; height: auto; max-width: 880px; }
+      .vg-w-arch-lore-stores .vg-w-arch-lore-stores-ctl { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+      .vg-w-arch-lore-stores input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-arch-lore-stores .component { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; transition: fill 200ms, stroke 200ms; }
+      .vg-w-arch-lore-stores .component:hover { stroke: var(--accent); }
+      .vg-w-arch-lore-stores .component:focus { outline: none; }
+      .vg-w-arch-lore-stores .component:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+      .vg-w-arch-lore-stores .component-text { pointer-events: none; font-family: EB Garamond, serif; font-size: 14px; }
+      .vg-w-arch-lore-stores .component-sub { pointer-events: none; font-family: IM Fell English, serif; font-style: italic; font-size: 11px; fill: var(--muted); }
+      .vg-w-arch-lore-stores .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+      .vg-w-arch-lore-stores .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-arch-lore-stores .detail p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-arch-lore-stores .hint { font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin: 0 0 var(--s-1) 0; }
+      .vg-w-arch-lore-stores:has(#vg-w-arch-lore-stores-r1:checked) .component-1 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-arch-lore-stores:has(#vg-w-arch-lore-stores-r2:checked) .component-2 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-arch-lore-stores:has(#vg-w-arch-lore-stores-r3:checked) .component-3 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-arch-lore-stores:has(#vg-w-arch-lore-stores-r4:checked) .component-4 { fill: var(--sage-deep); fill-opacity: 0.28; stroke: var(--sage-deep); }
+      .vg-w-arch-lore-stores:has(#vg-w-arch-lore-stores-r1:checked) .detail-1 { display: block; }
+      .vg-w-arch-lore-stores:has(#vg-w-arch-lore-stores-r2:checked) .detail-2 { display: block; }
+      .vg-w-arch-lore-stores:has(#vg-w-arch-lore-stores-r3:checked) .detail-3 { display: block; }
+      .vg-w-arch-lore-stores:has(#vg-w-arch-lore-stores-r4:checked) .detail-4 { display: block; }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M9 9a3 3 0 1 1 3.6 2.9"/><path d="M12 17h.01"/>
+      </svg>
+      <span>點任一元件看它的責任邊界 · 4 個元件</span>
+    </p>
+
+    <div data-vg-controls class="vg-w-arch-lore-stores-ctl">
+      <input type="radio" id="vg-w-arch-lore-stores-r1" aria-label="select immutable store" name="vg-w-arch-lore-stores-sel" checked />
+      <input type="radio" id="vg-w-arch-lore-stores-r2" aria-label="select mutable store" name="vg-w-arch-lore-stores-sel" />
+      <input type="radio" id="vg-w-arch-lore-stores-r3" aria-label="select packfiles" name="vg-w-arch-lore-stores-sel" />
+      <input type="radio" id="vg-w-arch-lore-stores-r4" aria-label="select client workspace" name="vg-w-arch-lore-stores-sel" />
+    </div>
+
+    <svg viewBox="0 0 720 320" role="img"
+         aria-label="Lore 儲存架構——client workspace、remote 上的 immutable store、mutable store 與磁碟 packfiles">
+      <text x="360" y="26" text-anchor="middle" fill="var(--ink)" font-family="IM Fell English, serif" font-style="italic" font-size="14">remote 是 source of truth，client 只保留用得到的資料</text>
+
+      <rect class="component component-4" data-target="vg-w-arch-lore-stores-r4" role="button" tabindex="0" aria-label="select client workspace" x="40" y="120" width="150" height="90"/>
+      <text class="component-text" x="115" y="158" text-anchor="middle" fill="var(--ink)">client workspace</text>
+      <text class="component-sub" x="115" y="178" text-anchor="middle">sparse · .lore/view</text>
+
+      <rect x="280" y="60" width="400" height="220" fill="none" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="4,4"/>
+      <text x="290" y="80" fill="var(--muted)" font-family="IM Fell English, serif" font-style="italic" font-size="12">remote（centralized）</text>
+
+      <rect class="component component-1" data-target="vg-w-arch-lore-stores-r1" role="button" tabindex="0" aria-label="select immutable store" x="310" y="100" width="160" height="70"/>
+      <text class="component-text" x="390" y="132" text-anchor="middle" fill="var(--ink)">immutable store</text>
+      <text class="component-sub" x="390" y="151" text-anchor="middle">BLAKE3-addressed</text>
+
+      <rect class="component component-2" data-target="vg-w-arch-lore-stores-r2" role="button" tabindex="0" aria-label="select mutable store" x="500" y="100" width="150" height="70"/>
+      <text class="component-text" x="575" y="132" text-anchor="middle" fill="var(--ink)">mutable store</text>
+      <text class="component-sub" x="575" y="151" text-anchor="middle">pointers · names</text>
+
+      <rect class="component component-3" data-target="vg-w-arch-lore-stores-r3" role="button" tabindex="0" aria-label="select packfiles" x="310" y="200" width="160" height="60"/>
+      <text class="component-text" x="390" y="228" text-anchor="middle" fill="var(--ink)">packfiles（on disk）</text>
+      <text class="component-sub" x="390" y="246" text-anchor="middle">append-only · index</text>
+
+      <line x1="190" y1="165" x2="310" y2="135" stroke="currentColor" stroke-width="1.5"/>
+      <line x1="390" y1="170" x2="390" y2="200" stroke="currentColor" stroke-width="1.2"/>
+    </svg>
+
+    <div>
+      <p class="hint">click a component（預設顯示 immutable store）</p>
+      <div class="detail detail-1">
+        <h3>immutable store · 責任邊界</h3>
+        <p>「The immutable store holds content. Every byte that is ever written... goes here.」只 append、不更新；同樣 byte 只進一次，entries 都用 BLAKE3 hash 定址。</p>
+        <p><strong>不負責</strong>：誰是 branch 的 latest、名字對應到哪個 id——那是 mutable store 的事。</p>
+      </div>
+      <div class="detail detail-2">
+        <h3>mutable store · 責任邊界</h3>
+        <p>「The mutable store holds pointers and names... anything that needs to be updated rather than appended to.」量小，但「it is where consistency, serialization, and contention live」都在這。branch latest 的原子推進靠這裡的 cas 操作。</p>
+        <p><strong>不負責</strong>：實際內容 byte——它只存指標。</p>
+      </div>
+      <div class="detail detail-3">
+        <h3>packfiles · 責任邊界</h3>
+        <p>immutable store 在磁碟上的落地形式：「fragments are stored in packfiles—large append-only files, each holding many fragments back-to-back, with an index from address to offset.」合理的推測是這把眾多小 fragment 打包成大檔，省去每個 chunk 一個檔的開銷（官方描述了 packfile 結構，未明寫此動機）。</p>
+        <p><strong>不負責</strong>：mutable pointer——pointer 不進 packfile。</p>
+      </div>
+      <div class="detail detail-4">
+        <h3>client workspace · 責任邊界</h3>
+        <p>「Clients hold only the data they actively use; the rest is fetched lazily from the remote.」靠 .lore/view 這個 inbound filter 宣告要 materialize 哪個 sparse 子集。離線時仍能查 local branch 的 latest、commit、開 branch、對任意 local cache 的 revision 做 diff。</p>
+        <p><strong>不負責</strong>：durable canonical state——那永遠在 remote。</p>
+      </div>
+    </div>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-arch-lore-stores');
+        root.querySelectorAll('.component').forEach((rect) => {
+          rect.addEventListener('click', () => {
+            const radio = root.querySelector('#' + rect.getAttribute('data-target'));
+            if (radio) radio.checked = true;
+          });
+          rect.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); rect.dispatchEvent(new MouseEvent('click', { bubbles: true })); }
+          });
+        });
+      })();
+    </script>
+  </figure>
+
+  <p>兩個 store 的分界線就是「append vs update」。immutable store 收下每一個寫過的 byte，永遠只 append、用 BLAKE3 定址；合理的推測是它因此天然可快取、可分散、無鎖——同一個 hash 永遠對應同一份內容，任何 cache 層都不必擔心 invalidation（官方明說 immutable + content-addressed，cache 無 invalidation 是這個性質的直接推論，但文件未逐字這樣下結論）。mutable store 反過來，「holds pointers and names」，是「where consistency, serialization, and contention live」的地方。Lore 把「難的部分」——也就是並行寫入的 serialization 與衝突——壓縮進這一塊很小的 mutable 表，其餘龐大的內容資料留在 immutable 世界。這是整個設計能 scale 的支點：規模在 immutable store，競爭在 mutable store（量小可集中處理）。合理的推測是，多個 repo 共用一套後端時，內容靠 hash 定址、彼此天然隔離，需要嚴格隔離的只剩 mutable store 那一小塊的命名空間；不過官方把 access boundary 歸給「partition」而非 context，多租戶隔離的細節文件沒展開，這層標為推斷。把「難而小」的部分跟「大而易」的部分拆開，是這套架構反覆出現的母題。</p>
+
+  <p>branch 在這個模型裡很輕。「A branch is a named, mutable pointer to a revision in this graph—the branch's latest revision, Lore's equivalent of Git's HEAD.」每個 branch 在 mutable store 裡只有「a latest pointer (most recent revision hash) and a metadata pointer」兩個指標。合理的推測是，建 branch 不複製任何內容、只是在 mutable store 寫一個新指標，所以開 branch 與切 branch 的成本都很低（官方明說 branch 是 mutable pointer、只含兩個指標，「建 branch 不複製內容」是此結構的直接推論，但文件未用「lightweight」這類字眼下定論）。</p>
+
+  <p>並行安全靠 compare-and-swap。文件原話「The cas operation (compare-and-swap) is what gives Lore its atomic state transitions.」合理的推測是，推進 branch latest 的典型操作就是「把這個 branch 的 latest 從 H_old 換成 H_new，但僅當它目前等於 H_old」這種 cas——兩個 client 同時想推進同一 branch，只有 H_old 對得上的那個成功，另一個拿到 conflict、需要 rebase 後重試（cas 語意是標準的，但「rebase 後重試」這個衝突處理流程是我對機制的外推，官方此處只給了 cas 一詞）。值得停下來看這個設計：因為內容早已躺在 immutable store、靠 hash 去重，真正要原子化的只剩「把一個指標從 H_old 換成 H_new」這件小事。把寫入競爭收斂到一個指標的 cas，合理推測是整套並行模型能在官方所說「thousands of concurrent users」下不爆炸的關鍵——衝突視窗小到只剩指標交換的瞬間。</p>
+
+  <p>離線能力也由此而來——離線時 client 仍能「look up the latest revision of a local branch, commit new revisions (advancing the local latest pointer), create or archive local branches, and diff against any locally cached revision.」等連上線再把本地推進的指標跟 remote 做 cas。換句話說，離線時你動的是本地那份 latest pointer 與本地 cache 的 immutable 內容；上線只是把本地累積的指標推進，跟 remote 的當前狀態做一次 cas 對賬。這跟 Git 的離線模型形似——都是先在本地推進、再跟遠端對齊——但底層的 source of truth 歸屬不同：Git 的每個 clone 都自認權威，Lore 始終認 remote 是 durability 與 conflict resolution 的權威，本地只是它的快取與暫存。對需要 access control 與 audit 的團隊，這個歸屬差異比表面操作體驗更重要。</p>
+
+  <h2>sparse workspace 與 on-demand hydration：不下載你用不到的 byte</h2>
+
+  <p>前面幾塊解決「儲存在 remote 怎麼省」，這一塊解決完全不同的問題：就算 remote 存得起整個 repo，client 端也不可能、也不需要把它整包拉下來。一個美術只改貼圖、一個工程師只動 gameplay 程式碼，兩個人都把含原始碼與全部資產的 TB 級 repo 完整 clone 到本機，既塞不下、也是浪費。傳統 DVCS 的前提是 full clone——把整個 history 拉到本地。合理的推測是，對官方所說「file counts in the millions, individual files in the terabyte range」的 repo，這個前提直接破產（官方陳述了規模，「full clone 放不下」是對該規模的常識性外推）。Lore 的做法是 sparse + lazy：「Clients hold only the data they actively use; the rest is fetched lazily from the remote.」client 透過一個 view（.lore/view）——「Inbound filter declaring the sparse subset of the repository materialized to disk」——宣告自己要把哪一塊 materialize 到磁碟，其餘的留在 remote。</p>
+
+  <p>更細的一層是 byte-range hydration。即使是一個被 materialize 的大檔，也不必整檔拉下：「Reading a byte range fetches only the fragments that overlap the range—typically a small fraction of the file.」因為檔案已經被 chunk 成 fragment，讀某個 byte range 只要抓覆蓋到那個 range 的 fragment。對「2 GB 的 level 檔，只想讀其中一個 section」這種場景，合理的推測是這帶來質的差別（官方說 byte range 只抓重疊 fragment，「質的差別」是我的判斷）。部署形態上，官方把 Lore 描述成「a deployment of one or more server processes with optional cache and replica tiers.」合理的推測是，因為 immutable store 是 content-addressed，這些 cache 層永遠不會髒——同一 hash 永遠同一內容，cache hit 不必回源驗證、也不必處理 invalidation；於是 cache 可以多層疊（記憶體、本機磁碟、區域節點），每一層命中都是淨賺。官方只列了「cache and replica tiers」這個事實，「cache 不需 invalidation」是 content-addressing 的推論，標為推斷。</p>
+
+  <p>把 sparse 與 lazy 兩件事分開看會更清楚它們各自擋掉什麼。sparse（.lore/view）擋的是「我根本不關心的子樹」——一個只做 audio 的工程師不必把美術資產 materialize 到磁碟。lazy hydration 擋的是「我關心、但此刻還沒讀到」的內容——合理的推測是 view 內的檔案也不是一次拉滿，而是讀到才抓。再加上 byte-range 粒度，第三層擋掉「我關心這個檔、但只讀其中一段」。三層篩下來，合理的推測是 client 端真正落地的資料量跟它實際碰到的工作面成正比，而不是跟 repo 的總大小成正比——這對「百萬檔、TB 單檔」的 repo 是能不能在一台普通開發機上開工的分水嶺。這幾層的相互關係官方沒有逐一拆解，是我把 sparse、lazy、byte-range 三個官方事實組起來的推斷。</p>
+
+  <h2>三套 VCS 的心智模型，並排對照</h2>
+
+  <p>把 Lore 放回 Git 與 Perforce 之間看，差異就清楚了。值得先說一句：合理的推測是，這三套的差異不在「誰功能多」，而在「source of truth 放在哪、內容怎麼定址、大 binary 算不算一等公民」這三個更底層的決定——這個框架是我的歸納，官方並沒有用這三軸來自我定位。Git 是 DVCS——每個 clone 都是完整 peer、binary 靠 LFS 在 first-class 之外處理（官方原話「multi-gigabyte files are still handled out of band via LFS rather than as first-class content; sparse checkout's sub-directory (file-pattern) granularity exists only in the deprecated non-cone mode」）。Perforce 是中央式——「Perforce requires server round-trips for normal operations: opening a file for edit, listing changes, syncing.」離線「possible but awkward」，儲存是「delta-encoded RCS for text and full-file for binaries」。Lore 想取兩者的長：合理的推測是它結合了 Git 的 hash-chained DAG 與離線能力、加上 Perforce 的中央 source of truth 與大 repo 取向，底層換成 content-addressed + chunked 的 binary-first store（這個「取兩者長」的歸納是我的，官方文件分別批評了 Git 與 Perforce，但沒有把自己框成兩者的合成）。下表把幾個關鍵維度並排。</p>
+
+  <figure class="vg-w-table-lore-vs" data-mobile="keep">
+    <style>
+      .vg-w-table-lore-vs { overflow-x: auto; }
+      .vg-w-table-lore-vs table { width: 100%; min-width: 560px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-lore-vs thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); }
+      .vg-w-table-lore-vs thead th.lore { color: var(--accent-text); }
+      .vg-w-table-lore-vs tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+      .vg-w-table-lore-vs td.dim { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); white-space: nowrap; }
+      .vg-w-table-lore-vs td.lore { color: var(--accent-text); }
+      .vg-w-table-lore-vs tbody tr:hover td { background: var(--bg-soft); }
+      .vg-w-table-lore-vs caption { text-align: left; caption-side: top; font-family: var(--scribed); font-style: italic; color: var(--muted); font-size: var(--fs-sm); padding: var(--s-1) 0; }
+    </style>
+    <table>
+      <caption>三套 VCS 心智模型對照——Lore 欄取自官方 system design，Git／Perforce 欄為其文件對兩者的描述。</caption>
+      <thead>
+        <tr>
+          <th>維度</th>
+          <th>Git（DVCS）</th>
+          <th>Perforce（中央式）</th>
+          <th class="lore">Lore</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td class="dim">拓樸</td><td>去中心，clone 即 peer</td><td>中央 server</td><td class="lore">中央 source of truth，但 client 可離線</td></tr>
+        <tr><td class="dim">內容定址</td><td>SHA hash 物件</td><td>delta-RCS（文字）／整檔（binary）</td><td class="lore">BLAKE3 content-addressed，48-byte address</td></tr>
+        <tr><td class="dim">大 binary</td><td>out of band（LFS）</td><td>整檔儲存</td><td class="lore">first-class，FastCDC chunk + dedup</td></tr>
+        <tr><td class="dim">sparse</td><td>sub-dir 僅 deprecated non-cone</td><td>client spec mapping</td><td class="lore">.lore/view，到 byte-range hydration</td></tr>
+        <tr><td class="dim">日常操作</td><td>本地，無需連線</td><td>需 server round-trip</td><td class="lore">本地可做，連線時 cas 推進</td></tr>
+        <tr><td class="dim">branch 成本</td><td>輕（指標）</td><td>較重（依設定）</td><td class="lore">輕，僅一個 mutable pointer</td></tr>
+      </tbody>
+    </table>
+  </figure>
+
+  <p>同一個「只改一個檔」的 commit，三套系統的儲存增量行為差很多。下面這個 before/after 把 Git 與 Lore 的處理疊起來——拖中間的分隔線，左邊是 Git 對一個改動過的 binary 的處理，右邊是 Lore 的處理。</p>
+
+  <figure class="vg-w-ba-lore-git" data-mobile="swap" data-svg-scroll="560" data-mobile-summary="改一個大 binary，Git 沿 LFS 另存整檔的新版本，Lore 只新增被改到的 chunk 其餘 dedup。">
+    <style>
+      .vg-w-ba-lore-git { position: relative; aspect-ratio: 16 / 9; overflow: hidden; max-width: 880px; }
+      .vg-w-ba-lore-git .layer { position: absolute; inset: 0; }
+      .vg-w-ba-lore-git .after { clip-path: polygon(50% 0, 100% 0, 100% 100%, 50% 100%); }
+      .vg-w-ba-lore-git .divider { position: absolute; top: 0; bottom: 0; left: 50%; width: 32px; transform: translateX(-50%); cursor: ew-resize; touch-action: none; }
+      .vg-w-ba-lore-git .divider::before { content: ''; position: absolute; left: 50%; top: 0; bottom: 0; width: 2px; transform: translateX(-50%); background: var(--accent); }
+      .vg-w-ba-lore-git .divider::after { content: '↔'; position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); background: var(--accent); color: var(--bg); width: 32px; height: 32px; border-radius: 50%; display: grid; place-items: center; font-family: var(--sans); font-size: 16px; }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M18 8 22 12 18 16"/><path d="M6 8 2 12 6 16"/><path d="M2 12h20"/>
+      </svg>
+      <span>拖分隔線比較 Git 與 Lore 對同一個改動的儲存增量</span>
+    </p>
+    <svg class="layer before" viewBox="0 0 440 248" role="img" aria-label="Git 對改動過 binary 的處理：LFS 另存整個新版本">
+      <rect width="440" height="248" fill="var(--bg-soft)"/>
+      <text x="24" y="36" fill="var(--ink)" font-family="IM Fell English, serif" font-style="italic" font-size="16">Git ＋ LFS</text>
+      <text x="24" y="58" fill="var(--muted)" font-family="EB Garamond, serif" font-size="12">改一行 → 新 object 是整個 blob</text>
+      <rect x="24" y="80" width="180" height="40" fill="var(--muted)" opacity="0.3" stroke="var(--muted-2)"/>
+      <text x="114" y="105" text-anchor="middle" fill="var(--ink)" font-family="JetBrains Mono, monospace" font-size="11">hero.png v1（120 MB）</text>
+      <rect x="24" y="140" width="180" height="40" fill="var(--accent)" opacity="0.4" stroke="var(--muted-2)"/>
+      <text x="114" y="165" text-anchor="middle" fill="var(--ink)" font-family="JetBrains Mono, monospace" font-size="11">hero.png v2（120 MB）</text>
+      <text x="24" y="210" fill="var(--accent-text)" font-family="JetBrains Mono, monospace" font-size="13">新增儲存 ≈ 120 MB（整檔）</text>
+      <text x="24" y="230" fill="var(--muted)" font-family="EB Garamond, serif" font-size="11">binary 非 first-class，走 LFS 旁路</text>
+    </svg>
+    <svg class="layer after" viewBox="0 0 440 248" id="vg-w-ba-lore-git-after" role="img" aria-label="Lore 對改動過 binary 的處理：只新增被改到的 chunk">
+      <rect width="440" height="248" fill="var(--bg)"/>
+      <text x="24" y="36" fill="var(--accent-text)" font-family="IM Fell English, serif" font-style="italic" font-size="16">Lore</text>
+      <text x="24" y="58" fill="var(--muted)" font-family="EB Garamond, serif" font-size="12">改一段 → 只有被改的 chunk 重存</text>
+      <g font-family="JetBrains Mono, monospace" font-size="9">
+        <rect x="24" y="80" width="34" height="40" fill="var(--sage)" opacity="0.35" stroke="var(--muted-2)"/>
+        <rect x="60" y="80" width="34" height="40" fill="var(--sage)" opacity="0.35" stroke="var(--muted-2)"/>
+        <rect x="96" y="80" width="34" height="40" fill="var(--accent)" opacity="0.55" stroke="var(--accent)"/>
+        <rect x="132" y="80" width="34" height="40" fill="var(--sage)" opacity="0.35" stroke="var(--muted-2)"/>
+        <rect x="168" y="80" width="34" height="40" fill="var(--sage)" opacity="0.35" stroke="var(--muted-2)"/>
+      </g>
+      <text x="114" y="138" text-anchor="middle" fill="var(--muted)" font-family="EB Garamond, serif" font-size="11">綠＝dedup 命中　紅＝新 chunk</text>
+      <text x="24" y="178" fill="var(--sage-deep)" font-family="JetBrains Mono, monospace" font-size="13">新增儲存 ≈ 1 chunk（~64 KiB 級）</text>
+      <text x="24" y="210" fill="var(--ink)" font-family="EB Garamond, serif" font-size="12">binary first-class，content-addressed</text>
+      <text x="24" y="230" fill="var(--muted)" font-family="EB Garamond, serif" font-size="11">其餘 chunk 與 tree 節點共用</text>
+    </svg>
+    <div class="divider" id="vg-w-ba-lore-git-divider"></div>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-ba-lore-git');
+        const after = root.querySelector('#vg-w-ba-lore-git-after');
+        const divider = root.querySelector('#vg-w-ba-lore-git-divider');
+        let dragging = false;
+        function setPct(pct) {
+          const c = Math.max(0, Math.min(100, pct));
+          after.style.clipPath = 'polygon(' + c + '% 0, 100% 0, 100% 100%, ' + c + '% 100%)';
+          divider.style.left = c + '%';
+        }
+        divider.addEventListener('pointerdown', (e) => { dragging = true; divider.setPointerCapture(e.pointerId); });
+        root.addEventListener('pointermove', (e) => { if (!dragging) return; const r = root.getBoundingClientRect(); setPct(((e.clientX - r.left) / r.width) * 100); });
+        root.addEventListener('pointerup', () => { dragging = false; });
+        root.addEventListener('pointercancel', () => { dragging = false; });
+      })();
+    </script>
+    <figcaption>同一次「改一個大 binary」的 commit：Git＋LFS 另存整個新版本（≈整檔大小），Lore 只新增被改到的 chunk，其餘 chunk 與未變的 tree 節點全部 dedup 共用。圖中數字為示意，用以說明機制；官方未提供 benchmark。</figcaption>
+  </figure>
+
+  <p>對正在評估大 repo 版控方案的人，合理的判斷角度是「我的 repo 形狀對不對得上 Lore 的假設」。如果你最頭痛的是「大量大型 binary、版本間只局部改動、團隊大且需要中央 access control」，Lore 的 content-addressed + FastCDC + 中央 source of truth 幾乎是照著這個 profile 設計的。反過來，如果你的 repo 以純文字原始碼為主、binary 不多、且高度依賴 Git 的去中心生態（fork、PR、各家 host），那 Lore 的中央式取向反而是要重新適應的成本。它不是 Git 的 drop-in 替代，是另一種世界觀——這點從它把 peer-to-peer decentralization 明列為 non-goal 就看得出來。以上是給讀者的取捨建議，屬於我的判斷而非官方背書。</p>
+
+  <p>有一點要誠實 hedge——Lore 自己標明「Lore is pre-1.0 and under active development. Interfaces, on-disk formats, and APIs may change between releases.」上面所有架構細節都來自官方 system design 文件的設計描述，不是經第三方壓測過的 production 數字；本文沒有引任何 benchmark，因為公開材料裡沒有可信的對照資料，許多「為什麼快、為什麼省」的論斷也已逐處標為推斷。它怎麼在真實的「百萬檔、TB 單檔、數千並行」上表現，還要看實際部署，on-disk format 也明說了可能改。SDK 目前涵蓋 C/C++、C#、Rust、Go、Python、JavaScript，採 MIT 授權，由 Epic Games 維護；想先摸清楚資料模型再決定要不要押注的人，system design 文件本身就是最該讀的一份。</p>
+
+  <p class="vg-deep-closer"><strong>What this enables</strong>：把「儲存規模」放進 content-addressed immutable store、把「並行競爭」壓進量小的 mutable store 用 cas 解決，Lore 讓一個同時塞滿原始碼與大型 binary 的 monorepo，能在 client 端只 hydrate 用得到的那一小塊就開工——而依官方那句設計起點，儲存成本只跟「改了什麼」成長，不跟「repo 多大」成長。</p>
+</div>
