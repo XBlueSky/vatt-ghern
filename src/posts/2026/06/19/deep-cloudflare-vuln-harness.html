@@ -1,0 +1,526 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">一條 pipeline 吐出 20,799 個 raw 漏洞候選，過完所有關卡只剩 7,245 個進到工程團隊手上。讓這條 funnel 站得住的，是把 LLM 降格成可替換算力、再讓兩個來歷不同的 model 互相反證的那層 harness——換掉任何一個 model，這層都原封不動。</p>
+  <h1 class="vg-post-title">{{ title }}</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p><span class="vg-dropcap">大</span>多數「AI 找漏洞」的敘事都押注在單一 frontier model 上：模型夠強，丟給它一個 codebase 就會吐出漏洞。Cloudflare 的這篇文章把賭注下在完全相反的地方——他們主張有效的 AI 安全靠的是一層 model-agnostic 的 orchestration，而不是某個最強的 model。用他們自己的話：「models should be frequently interchanged and cross-tested」，並且「By varying the models across the pipeline」，讓「vulnerabilities are cross-checked by distinct sets of logic.」結論一句話收尾：「The harness is the bit that lasts.」具體做法是兩件事：把所有 state externalise 出去、把 LLM 當成 stateless compute engine；再用兩個不同的 model 跨階段 cross-check。整套系統拆成負責 discovery 的 VDH（Vulnerability Discovery Harness）跟負責第二輪 triage 的 VVS（Vulnerability Validation System），兩者刻意用不同 model，互相 double-check。底下幾個小節分別講這套設計的支柱：八階段的 discovery pipeline、外部化的 state、對抗式驗證、以及一組反直覺的 production 數字。</p>
+
+  <p>先說清楚為什麼這個賭注值得一個工程師認真看。把 model 當主角的系統有一個結構性弱點：你的整套價值綁死在某一代 model 的能力與脾氣上，下一代 model 換上來、prompt 行為一變，你辛苦調出來的 pipeline 就可能整條失效。Cloudflare 反過來把 model 降格成「可替換的算力」，把所有會累積、會被 debug、會被優化的東西都留在 model 外面——stage 之間的 contract、SQLite 裡的 state、schema 強制的欄位順序、deterministic 的 dedup 索引。換句話說，當 model 是插槽裡的零件時，你能用工程的方式對待整個系統：可以 retry、可以 A/B、可以在 discovery 用一個 model 而 validation 用另一個，而不需要重寫任何一條 orchestration 邏輯。對任何要把 LLM 放進 production pipeline 的人，這個「把 state 跟 model 解耦」的決定，比「挑哪個 model」重要得多——因為前者是你能維護一年的資產，後者每三個月就會被刷新一次。</p>
+
+  <p>先把整條 funnel 的形狀放在眼前。下面這個互動圖把 Cloudflare 公布的幾個關卡數字串成一條過濾鏈——你可以一格一格往右推，看候選池在每一道關卡縮掉多少、survival rate 怎麼掉。這不是示意圖，每個節點都是文章裡的真實數字。</p>
+
+  <figure class="vg-w-chart-vdh-funnel" data-mobile="swap" data-mobile-summary="funnel 只放原文三關卡數：raw 20,799、survived 12,057、actionable 7,245，不放任何推算值。" data-svg-scroll="720">
+    <style>
+      .vg-w-chart-vdh-funnel { display: grid; gap: var(--s-3); }
+      .vg-w-chart-vdh-funnel .controls { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); }
+      .vg-w-chart-vdh-funnel .controls label { color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; font-size: var(--fs-xs); white-space: nowrap; }
+      .vg-w-chart-vdh-funnel input[type="range"] { flex: 1; accent-color: var(--accent); height: 36px; touch-action: none; }
+      .vg-w-chart-vdh-funnel .stage-name { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 11ch; text-align: right; font-family: var(--serif); }
+      .vg-w-chart-vdh-funnel svg { width: 100%; height: auto; }
+      .vg-w-chart-vdh-funnel .readout { display: grid; gap: var(--s-1); padding: var(--s-3); background: var(--bg-soft); border-left: 2px solid var(--accent); }
+      .vg-w-chart-vdh-funnel .big { font-family: EB Garamond, serif; font-size: 2rem; color: var(--ink); font-variant-numeric: tabular-nums; }
+      .vg-w-chart-vdh-funnel .big .unit { font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-left: 0.5ch; }
+      .vg-w-chart-vdh-funnel .desc { font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink-soft); }
+      .vg-w-chart-vdh-funnel .desc em { color: var(--accent-text); font-style: italic; }
+      .vg-w-chart-vdh-funnel figcaption { font-family: var(--scribed); font-style: italic; color: var(--muted); font-size: var(--fs-sm); }
+    </style>
+
+    <div class="controls" data-vg-controls>
+      <label for="vg-w-chart-vdh-funnel-x">stage</label>
+      <input id="vg-w-chart-vdh-funnel-x" type="range" min="0" max="2" step="1" value="2" aria-label="拖動以一格一格走過 funnel 的每道關卡" />
+      <span class="stage-name" data-stage-name>actionable</span>
+    </div>
+
+    <svg viewBox="0 0 720 300" preserveAspectRatio="xMidYMid meet" role="img" aria-label="VDH candidate funnel：raw 20,799 → survived 12,057 → actionable 7,245">
+      <g id="vg-w-chart-vdh-funnel-bars"></g>
+      <g id="vg-w-chart-vdh-funnel-axis"></g>
+    </svg>
+
+    <div class="readout">
+      <div class="big"><span data-big>7,245</span><span class="unit" data-bigunit>actionable findings</span></div>
+      <div class="desc" data-desc>整條 funnel 的終點——交給工程團隊的 <em>actionable findings</em>。</div>
+    </div>
+
+    <figcaption>三個節點都是 Cloudflare 直接公布的數字：raw 20,799、survived 12,057、actionable 7,245。這裡刻意只放原文逐字給出的關卡數，不放任何推算值——dedup 砍掉的 5,442 個 duplicate 與全系統 13,841／145 repo 的總量是另一個尺度的數字，留在正文裡單獨講，不混進這條 funnel。拖動滑桿走過每道關卡，右下角顯示該節點的絕對數與相對前一節點的比值（survived→actionable 跨了不同的池子，僅供視覺對照）。</figcaption>
+
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        const root = document.querySelector('.vg-w-chart-vdh-funnel');
+        const barsG = root.querySelector('#vg-w-chart-vdh-funnel-bars');
+        const axisG = root.querySelector('#vg-w-chart-vdh-funnel-axis');
+        const inp = root.querySelector('input');
+        const stageName = root.querySelector('[data-stage-name]');
+        const big = root.querySelector('[data-big]');
+        const bigUnit = root.querySelector('[data-bigunit]');
+        const desc = root.querySelector('[data-desc]');
+        const NS = 'http://www.w3.org/2000/svg';
+        function el(tag, attrs) { const e = document.createElementNS(NS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); return e; }
+
+        // Only numbers Cloudflare published verbatim. No derived/subtracted nodes.
+        const stages = [
+          { key: 'raw',        name: 'raw candidates', n: 20799, unit: 'raw candidates', desc: 'VDH 一輪掃描產出的 <em>raw candidate</em>——還沒過任何驗證關卡，noise 很高。' },
+          { key: 'survived',   name: 'survived',       n: 12057, unit: 'survived validation', desc: '通過 validation 的 <em>12,057</em> 個——對 raw 約 58%，這就是 high-integrity 佔比爬到 58% 的那個數字。' },
+          { key: 'actionable', name: 'actionable',     n: 7245,  unit: 'actionable findings', desc: '整條 funnel 的終點——交給工程團隊的 <em>actionable findings</em>。這個數字取自更大的 13,841 跨 145 repo 的總池、dedup 完才得出，並非從 12,057 線性砍下來的殘值。' },
+        ];
+        const X0 = 90, X1 = 690, Y0 = 250, Y1 = 40;
+        const maxN = 20799;
+        const barW = (X1 - X0) / stages.length * 0.62;
+        function xOf(i) { return X0 + (i + 0.5) * (X1 - X0) / stages.length; }
+        function hOf(n) { return (n / maxN) * (Y0 - Y1); }
+
+        function draw(active) {
+          barsG.textContent = ''; axisG.textContent = '';
+          // baseline
+          axisG.appendChild(el('line', { x1: X0, y1: Y0, x2: X1, y2: Y0, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+          // y axis ticks
+          for (let v = 0; v <= 20000; v += 5000) {
+            const y = Y0 - (v / maxN) * (Y0 - Y1);
+            axisG.appendChild(el('line', { x1: X0 - 4, y1: y, x2: X0, y2: y, stroke: 'var(--muted-2)' }));
+            const t = el('text', { x: X0 - 9, y: y + 4, 'text-anchor': 'end', 'font-family': 'JetBrains Mono, monospace', 'font-size': 10, fill: 'var(--muted)' });
+            t.textContent = (v / 1000) + 'k'; axisG.appendChild(t);
+          }
+          stages.forEach((s, i) => {
+            const h = hOf(s.n);
+            const on = i <= active;
+            const fill = i === active ? 'var(--accent)' : (on ? 'var(--accent)' : 'var(--muted-2)');
+            const op = i === active ? 0.85 : (on ? 0.38 : 0.22);
+            barsG.appendChild(el('rect', { x: xOf(i) - barW / 2, y: Y0 - h, width: barW, height: h, fill: fill, opacity: op }));
+            // value on top
+            const vt = el('text', { x: xOf(i), y: Y0 - h - 8, 'text-anchor': 'middle', 'font-family': 'JetBrains Mono, monospace', 'font-size': 12, fill: on ? 'var(--accent-text)' : 'var(--muted)' });
+            vt.textContent = s.n.toLocaleString('en-US'); barsG.appendChild(vt);
+            // stage label
+            const lt = el('text', { x: xOf(i), y: Y0 + 18, 'text-anchor': 'middle', 'font-family': 'Manrope, sans-serif', 'font-size': 11, fill: i === active ? 'var(--accent-text)' : 'var(--muted)' });
+            lt.textContent = s.name; barsG.appendChild(lt);
+            // survival rate vs previous
+            if (i > 0 && on) {
+              const rate = Math.round(s.n / stages[i - 1].n * 100);
+              const rt = el('text', { x: xOf(i), y: Y0 - h - 24, 'text-anchor': 'middle', 'font-family': 'Manrope, sans-serif', 'font-size': 10, fill: 'var(--sage-deep)' });
+              rt.textContent = (rate >= 100 ? '+' : '') + rate + '%'; barsG.appendChild(rt);
+            }
+          });
+        }
+
+        function update() {
+          const i = Number(inp.value);
+          const s = stages[i];
+          stageName.textContent = s.name;
+          big.textContent = s.n.toLocaleString('en-US');
+          bigUnit.textContent = s.unit;
+          desc.innerHTML = s.desc;
+          draw(i);
+        }
+        inp.addEventListener('input', update);
+        update();
+      })();
+    </script>
+  </figure>
+
+  <p>注意這條 funnel 的最後一格刻意標了一句話：actionable 的 7,245 取自更大的池子。Cloudflare 給的全系統規模是「13,841 findings across 145 repos in total」，其中「5,442 findings as duplicates」、最後「7,245 actionable findings for engineering teams」。換句話說 7,245 不是 20,799 一路線性砍下來的殘值，而是跨 145 個 repo、多輪 run 累積後 dedup 完的結果。重點不在算術，而在每一道關卡的存在本身——raw candidate 到 survivor、survivor 到去重、去重到 actionable，每一關都把一大塊 noise 擋在工程團隊之外。</p>
+
+  <h2>八階段的 discovery pipeline</h2>
+
+  <p>VDH 不是「把 repo 餵給 model、等它吐 bug」。它是一條八個 stage 的 pipeline，每個 stage 有明確職責、明確輸入輸出。順序是 recon → hunt → validate → gapfill → trace → feedback → dedup → report。Recon 先 map 出目標架構與潛在的 threat vector；hunt 跑 per-class 的攻擊、編譯 fragment、戳 binary；validate 先機械式檢查再對抗式反證；gapfill 針對覆蓋率空白的 cell 產新的 hunt task；trace 走 dependency graph、把 consumer repo 也拉進來掃；feedback 從既有 report 學、優化未來的 run；最後 report 把結果 render 成人看得懂的報告。值得停一下的是 gapfill 與 trace：前者把「哪裡還沒掃」當成一個可被生成 task 的 coverage 問題，後者把單 repo 的漏洞沿著 dependency graph 往上游 / 下游 propagate——一個 library 的 bug 會自動 spawn 它的 consumer repo task。</p>
+
+  <p>把這八個 stage 當成獨立卡片來看，會錯過真正的設計巧思——它們不是線性的一次性流水線，而是一條會自我餵食的迴路。gapfill 跟 feedback 兩個 stage 就是這條迴路的關節。gapfill 的職責是「Generates new hunt tasks for empty coverage cells」：它不直接找 bug，而是盯著一張覆蓋率矩陣，哪一格還空著就生成一個新的 hunt task 丟回 hunt——這把「我有沒有漏掃」從一個人類事後才會問的問題，變成 pipeline 內部一個可以被自動生成、自動排程的 task。feedback 則是「Learns from pre-existing reports and optimizes future runs」：它讓這次 run 的結論能影響下一次 run 的策略，pipeline 對自己的歷史有記憶。關鍵在於，這份記憶不在任何一個 model 的 context window 裡，而是落在外部的 report 與 SQLite，所以你換掉 model，這份累積的經驗一個 byte 都不會丟。對一個要 scale 的安全團隊來說，這正是分水嶺：靠 model 記憶的系統每換一代 model 就要重新教，靠外部 state 記憶的系統換 model 像換電池一樣便宜。</p>
+
+  <p>trace 這個 stage 還藏著一個多數人會低估的 scale 機制。一個被廣泛 import 的 library 出現漏洞，真正的爆炸半徑不在 library 自己，而在所有 consume 它的 repo。trace「Walks dependency graph; spawns consumer-repo tasks」——它沿著依賴圖往外走，把一個 finding 自動 fan-out 成它所有 downstream consumer 的掃描 task。這解釋了為什麼整個系統的數字會是「13,841 findings across 145 repos」這種跨 repo 的形狀：漏洞不是一個 repo 一個 repo 孤立地被找出來的，而是沿著真實的依賴關係 propagate 出去的。對工程師的啟發是——把「攻擊面」建模成一張圖、讓一個節點的發現自動觸發鄰居節點的掃描，比把每個 repo 當成獨立目標逐一掃，更貼近漏洞在真實系統裡傳播的方式。</p>
+
+  <p>下面把八個 stage 拆成可點選的卡片，每張卡片就是 Cloudflare 給的那一句職責描述。手機上是直排卡片、桌機上是橫向 pipeline——點任一張看它在整條鏈上的位置。</p>
+
+  <figure class="vg-w-stack-vdh-stages" data-mobile="keep">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M9 18l6-6-6-6"/>
+      </svg>
+      <span>點任一階段看它的職責 · 八個 stage 串成一條 pipeline</span>
+    </p>
+    <style>
+      .vg-w-stack-vdh-stages { display: flex; flex-direction: column; gap: var(--s-3); align-items: stretch; }
+      .vg-w-stack-vdh-stages input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-stack-vdh-stages .stack-title { font-family: IM Fell English, serif; font-style: italic; font-size: var(--fs-md); margin: 0; color: var(--ink); line-height: 1.4; }
+      .vg-w-stack-vdh-stages .stack-cards { display: flex; flex-direction: column; gap: var(--s-1); list-style: none; padding: 0; margin: 0; }
+      .vg-w-stack-vdh-stages .stack-cards label { display: block; padding: var(--s-2); border: 1px solid var(--muted-2); border-radius: 2px; cursor: pointer; transition: border-color 200ms, background 200ms; min-height: 44px; }
+      .vg-w-stack-vdh-stages .stack-cards label:hover { border-color: var(--accent); }
+      .vg-w-stack-vdh-stages .stack-cards .card-head { font-family: EB Garamond, serif; font-size: var(--fs-md); margin: 0 0 4px 0; color: var(--ink); display: flex; align-items: baseline; justify-content: space-between; gap: var(--s-2); flex-wrap: wrap; }
+      .vg-w-stack-vdh-stages .stack-cards .card-sub { font-family: IM Fell English, serif; font-style: italic; font-size: var(--fs-sm); color: var(--muted); margin: 0; line-height: 1.5; }
+      .vg-w-stack-vdh-stages .stack-cards .card-tag { font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); color: var(--accent-text); font-style: normal; }
+      .vg-w-stack-vdh-stages:has(#vg-w-stack-vdh-stages-r1:checked) .card-1,
+      .vg-w-stack-vdh-stages:has(#vg-w-stack-vdh-stages-r2:checked) .card-2,
+      .vg-w-stack-vdh-stages:has(#vg-w-stack-vdh-stages-r3:checked) .card-3,
+      .vg-w-stack-vdh-stages:has(#vg-w-stack-vdh-stages-r4:checked) .card-4,
+      .vg-w-stack-vdh-stages:has(#vg-w-stack-vdh-stages-r5:checked) .card-5,
+      .vg-w-stack-vdh-stages:has(#vg-w-stack-vdh-stages-r6:checked) .card-6,
+      .vg-w-stack-vdh-stages:has(#vg-w-stack-vdh-stages-r7:checked) .card-7,
+      .vg-w-stack-vdh-stages:has(#vg-w-stack-vdh-stages-r8:checked) .card-8 { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+
+      .vg-w-stack-vdh-stages svg.diagram { display: none; }
+      @media (min-width: 720px) {
+        .vg-w-stack-vdh-stages svg.diagram { display: block; width: 100%; height: auto; max-width: 880px; }
+        .vg-w-stack-vdh-stages .stack-title { display: none; }
+        .vg-w-stack-vdh-stages .stack-cards { display: none; }
+      }
+      .vg-w-stack-vdh-stages .node { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; }
+      .vg-w-stack-vdh-stages .node:hover { stroke: var(--accent); }
+      .vg-w-stack-vdh-stages:has(#vg-w-stack-vdh-stages-r1:checked) .node-1,
+      .vg-w-stack-vdh-stages:has(#vg-w-stack-vdh-stages-r2:checked) .node-2,
+      .vg-w-stack-vdh-stages:has(#vg-w-stack-vdh-stages-r3:checked) .node-3,
+      .vg-w-stack-vdh-stages:has(#vg-w-stack-vdh-stages-r4:checked) .node-4,
+      .vg-w-stack-vdh-stages:has(#vg-w-stack-vdh-stages-r5:checked) .node-5,
+      .vg-w-stack-vdh-stages:has(#vg-w-stack-vdh-stages-r6:checked) .node-6,
+      .vg-w-stack-vdh-stages:has(#vg-w-stack-vdh-stages-r7:checked) .node-7,
+      .vg-w-stack-vdh-stages:has(#vg-w-stack-vdh-stages-r8:checked) .node-8 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+
+      .vg-w-stack-vdh-stages .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+      .vg-w-stack-vdh-stages .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-stack-vdh-stages .detail p { margin: 0; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-stack-vdh-stages:has(#vg-w-stack-vdh-stages-r1:checked) .detail-1,
+      .vg-w-stack-vdh-stages:has(#vg-w-stack-vdh-stages-r2:checked) .detail-2,
+      .vg-w-stack-vdh-stages:has(#vg-w-stack-vdh-stages-r3:checked) .detail-3,
+      .vg-w-stack-vdh-stages:has(#vg-w-stack-vdh-stages-r4:checked) .detail-4,
+      .vg-w-stack-vdh-stages:has(#vg-w-stack-vdh-stages-r5:checked) .detail-5,
+      .vg-w-stack-vdh-stages:has(#vg-w-stack-vdh-stages-r6:checked) .detail-6,
+      .vg-w-stack-vdh-stages:has(#vg-w-stack-vdh-stages-r7:checked) .detail-7,
+      .vg-w-stack-vdh-stages:has(#vg-w-stack-vdh-stages-r8:checked) .detail-8 { display: block; }
+    </style>
+
+    <input type="radio" id="vg-w-stack-vdh-stages-r1" name="vg-w-stack-vdh-stages-sel" checked aria-label="recon" />
+    <input type="radio" id="vg-w-stack-vdh-stages-r2" name="vg-w-stack-vdh-stages-sel" aria-label="hunt" />
+    <input type="radio" id="vg-w-stack-vdh-stages-r3" name="vg-w-stack-vdh-stages-sel" aria-label="validate" />
+    <input type="radio" id="vg-w-stack-vdh-stages-r4" name="vg-w-stack-vdh-stages-sel" aria-label="gapfill" />
+    <input type="radio" id="vg-w-stack-vdh-stages-r5" name="vg-w-stack-vdh-stages-sel" aria-label="trace" />
+    <input type="radio" id="vg-w-stack-vdh-stages-r6" name="vg-w-stack-vdh-stages-sel" aria-label="feedback" />
+    <input type="radio" id="vg-w-stack-vdh-stages-r7" name="vg-w-stack-vdh-stages-sel" aria-label="dedup" />
+    <input type="radio" id="vg-w-stack-vdh-stages-r8" name="vg-w-stack-vdh-stages-sel" aria-label="report" />
+
+    <p class="stack-title" id="vg-w-stack-vdh-stages-title">VDH 八階段 pipeline——recon → hunt → validate → gapfill → trace → feedback → dedup → report</p>
+    <ul class="stack-cards" aria-labelledby="vg-w-stack-vdh-stages-title">
+      <li class="card-1"><label for="vg-w-stack-vdh-stages-r1"><p class="card-head"><span>1 · recon</span><code class="card-tag">map</code></p><p class="card-sub">Maps out the target architecture and maps potential threat vectors。</p></label></li>
+      <li class="card-2"><label for="vg-w-stack-vdh-stages-r2"><p class="card-head"><span>2 · hunt</span><code class="card-tag">attack</code></p><p class="card-sub">Runs per-class attacks, compiles fragments, probes binaries。</p></label></li>
+      <li class="card-3"><label for="vg-w-stack-vdh-stages-r3"><p class="card-head"><span>3 · validate</span><code class="card-tag">disprove</code></p><p class="card-sub">Mechanically checks the finding, then adversarially disproves it。</p></label></li>
+      <li class="card-4"><label for="vg-w-stack-vdh-stages-r4"><p class="card-head"><span>4 · gapfill</span><code class="card-tag">cover</code></p><p class="card-sub">Generates new hunt tasks for empty coverage cells。</p></label></li>
+      <li class="card-5"><label for="vg-w-stack-vdh-stages-r5"><p class="card-head"><span>5 · trace</span><code class="card-tag">graph</code></p><p class="card-sub">Walks dependency graph; spawns consumer-repo tasks。</p></label></li>
+      <li class="card-6"><label for="vg-w-stack-vdh-stages-r6"><p class="card-head"><span>6 · feedback</span><code class="card-tag">learn</code></p><p class="card-sub">Learns from pre-existing reports and optimizes future runs。</p></label></li>
+      <li class="card-7"><label for="vg-w-stack-vdh-stages-r7"><p class="card-head"><span>7 · dedup</span><code class="card-tag">merge</code></p><p class="card-sub">Identifies and consolidates overlapping findings。</p></label></li>
+      <li class="card-8"><label for="vg-w-stack-vdh-stages-r8"><p class="card-head"><span>8 · report</span><code class="card-tag">render</code></p><p class="card-sub">Renders human-readable report。</p></label></li>
+    </ul>
+
+    <svg class="diagram" viewBox="0 0 880 240" role="img" aria-label="VDH 八階段 pipeline 橫向圖：recon hunt validate gapfill trace feedback dedup report">
+      <text x="440" y="24" text-anchor="middle" fill="var(--ink)" font-family="IM Fell English, serif" font-style="italic" font-size="13">VDH pipeline——八個 stage 串成一條鏈，state 全寫進外部 SQLite</text>
+      <defs>
+        <marker id="vg-w-stack-vdh-stages-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="var(--muted-2)"/></marker>
+      </defs>
+      <!-- two rows of four -->
+      <g font-family="EB Garamond, serif">
+        <rect class="node node-1" data-target="vg-w-stack-vdh-stages-r1" x="40"  y="56" width="170" height="50" rx="3" role="button" tabindex="0"/>
+        <text x="125" y="80" text-anchor="middle" fill="var(--ink)" font-size="14">1 · recon</text>
+        <text x="125" y="98" text-anchor="middle" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="10">map architecture</text>
+
+        <rect class="node node-2" data-target="vg-w-stack-vdh-stages-r2" x="240" y="56" width="170" height="50" rx="3" role="button" tabindex="0"/>
+        <text x="325" y="80" text-anchor="middle" fill="var(--ink)" font-size="14">2 · hunt</text>
+        <text x="325" y="98" text-anchor="middle" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="10">per-class attacks</text>
+
+        <rect class="node node-3" data-target="vg-w-stack-vdh-stages-r3" x="440" y="56" width="170" height="50" rx="3" role="button" tabindex="0"/>
+        <text x="525" y="80" text-anchor="middle" fill="var(--ink)" font-size="14">3 · validate</text>
+        <text x="525" y="98" text-anchor="middle" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="10">disprove</text>
+
+        <rect class="node node-4" data-target="vg-w-stack-vdh-stages-r4" x="640" y="56" width="170" height="50" rx="3" role="button" tabindex="0"/>
+        <text x="725" y="80" text-anchor="middle" fill="var(--ink)" font-size="14">4 · gapfill</text>
+        <text x="725" y="98" text-anchor="middle" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="10">cover gaps</text>
+
+        <rect class="node node-5" data-target="vg-w-stack-vdh-stages-r5" x="40"  y="146" width="170" height="50" rx="3" role="button" tabindex="0"/>
+        <text x="125" y="170" text-anchor="middle" fill="var(--ink)" font-size="14">5 · trace</text>
+        <text x="125" y="188" text-anchor="middle" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="10">dep graph</text>
+
+        <rect class="node node-6" data-target="vg-w-stack-vdh-stages-r6" x="240" y="146" width="170" height="50" rx="3" role="button" tabindex="0"/>
+        <text x="325" y="170" text-anchor="middle" fill="var(--ink)" font-size="14">6 · feedback</text>
+        <text x="325" y="188" text-anchor="middle" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="10">learn from reports</text>
+
+        <rect class="node node-7" data-target="vg-w-stack-vdh-stages-r7" x="440" y="146" width="170" height="50" rx="3" role="button" tabindex="0"/>
+        <text x="525" y="170" text-anchor="middle" fill="var(--ink)" font-size="14">7 · dedup</text>
+        <text x="525" y="188" text-anchor="middle" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="10">consolidate</text>
+
+        <rect class="node node-8" data-target="vg-w-stack-vdh-stages-r8" x="640" y="146" width="170" height="50" rx="3" role="button" tabindex="0"/>
+        <text x="725" y="170" text-anchor="middle" fill="var(--ink)" font-size="14">8 · report</text>
+        <text x="725" y="188" text-anchor="middle" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="10">render</text>
+      </g>
+      <line x1="210" y1="81" x2="240" y2="81" stroke="var(--muted-2)" stroke-width="1.5" marker-end="url(#vg-w-stack-vdh-stages-arrow)"/>
+      <line x1="410" y1="81" x2="440" y2="81" stroke="var(--muted-2)" stroke-width="1.5" marker-end="url(#vg-w-stack-vdh-stages-arrow)"/>
+      <line x1="610" y1="81" x2="640" y2="81" stroke="var(--muted-2)" stroke-width="1.5" marker-end="url(#vg-w-stack-vdh-stages-arrow)"/>
+      <path d="M725 106 L725 126 L125 126 L125 146" fill="none" stroke="var(--muted-2)" stroke-width="1.5" marker-end="url(#vg-w-stack-vdh-stages-arrow)"/>
+      <line x1="210" y1="171" x2="240" y2="171" stroke="var(--muted-2)" stroke-width="1.5" marker-end="url(#vg-w-stack-vdh-stages-arrow)"/>
+      <line x1="410" y1="171" x2="440" y2="171" stroke="var(--muted-2)" stroke-width="1.5" marker-end="url(#vg-w-stack-vdh-stages-arrow)"/>
+      <line x1="610" y1="171" x2="640" y2="171" stroke="var(--muted-2)" stroke-width="1.5" marker-end="url(#vg-w-stack-vdh-stages-arrow)"/>
+    </svg>
+
+    <div>
+      <div class="detail detail-1"><h3>recon · 偵察</h3><p>Maps out the target architecture and maps potential threat vectors。先把目標架構與潛在 threat vector 攤開，後面的 hunt 才有方向。</p></div>
+      <div class="detail detail-2"><h3>hunt · 獵捕</h3><p>Runs per-class attacks, compiles fragments, probes binaries。針對每一類漏洞跑攻擊、編譯 fragment、戳 binary——真正生成 candidate 的就是這層。</p></div>
+      <div class="detail detail-3"><h3>validate · 驗證</h3><p>Mechanically checks the finding, then adversarially disproves it。先機械式查、再對抗式反證——這是整條 pipeline 砍 false positive 的關鍵閘。</p></div>
+      <div class="detail detail-4"><h3>gapfill · 補洞</h3><p>Generates new hunt tasks for empty coverage cells。把「哪裡還沒掃」當成 coverage 問題，自動生成新的 hunt task 填空白 cell。</p></div>
+      <div class="detail detail-5"><h3>trace · 追蹤</h3><p>Walks dependency graph; spawns consumer-repo tasks。沿 dependency graph 走，一個 library 的漏洞會自動 spawn 它的 consumer repo task。</p></div>
+      <div class="detail detail-6"><h3>feedback · 回饋</h3><p>Learns from pre-existing reports and optimizes future runs。從既有 report 學、優化未來的 run——pipeline 對自己的歷史有記憶，但記憶在外部不在 model。</p></div>
+      <div class="detail detail-7"><h3>dedup · 去重</h3><p>Identifies and consolidates overlapping findings。認出重疊的 finding 並合併，這就是砍掉 5,442 個 duplicate 的那一層。</p></div>
+      <div class="detail detail-8"><h3>report · 報告</h3><p>Renders human-readable report。把結構化結果 render 成人看得懂的報告，交到工程團隊手上。</p></div>
+    </div>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-stack-vdh-stages');
+        root.querySelectorAll('.node').forEach((rect) => {
+          rect.addEventListener('click', () => {
+            const radio = root.querySelector('#' + rect.getAttribute('data-target'));
+            if (radio) radio.checked = true;
+          });
+          rect.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); rect.dispatchEvent(new MouseEvent('click', { bubbles: true })); } });
+        });
+      })();
+    </script>
+  </figure>
+
+  <h2>把 state 從 model 裡搬出來</h2>
+
+  <p>這套設計真正的地基是一句樸素的工程決定：「Every stage writes to one SQLite database keyed by (run_id, repo, stage).」每個 stage 把自己的結構化結果寫進一個以 <code>(run_id, repo, stage)</code> 為 key 的 SQLite，下一個 stage 從那裡讀。Cloudflare 把這件事講成設計原則——「We broke this bottleneck by externalizing the state entirely, treating the LLM as a stateless compute engine.」 把 state 完全 externalise、把 LLM 當成 stateless compute engine。這句話的後果很實際：因為 state 不在任何一次對話的 context window 裡，你可以在兩個 stage 之間換掉 model 而不丟任何進度；可以 retry 一個失敗的 stage；可以拿同一份 run_id 的中間結果重跑後面的 stage；甚至可以讓 discovery 跑一個 model、validation 跑另一個 model，因為 state 是 model 之間的共用語言而不是某個 model 的私有記憶。</p>
+
+  <p>這個 key 的三個維度——<code>(run_id, repo, stage)</code>——每一個都對應一種 production 必須面對的失敗模式，值得逐一拆開。<code>run_id</code> 讓你能把「這一次完整的掃描」當成一個可被引用、可被重放的單位：worst case 一次 run 跑了「just over 14 hours」十四小時出頭，你絕對不想因為第七個 stage 掛了就把前面十幾個小時的 hunt 結果丟掉重來；有了 run_id 當 key，你只要從那一格 state 接著往下跑。<code>repo</code> 維度讓同一次 run 能平行掃 145 個 repo 而彼此 state 不互相污染，也讓 trace 把一個 repo 的漏洞 spawn 到另一個 repo 時，兩邊的中間結果能各自定位。<code>stage</code> 維度則把 pipeline 的每一步變成一個有明確輸入輸出 contract 的純函數：stage N 只讀 stage N-1 寫下的那格、只寫自己這格。一旦每個 stage 都是「讀上一格、寫這一格」的純函數，整條 pipeline 就獲得了分散式系統夢寐以求的性質——任一步可重試、可重放、可換實作，而 model 只是那個被注入到純函數裡的、可替換的算力。</p>
+
+  <p>把這件事翻譯成更普遍的工程語言：Cloudflare 其實是把「context window 當作 working memory」這個 LLM agent 的預設架構給拆掉了。多數 agent 框架把對話歷史當成狀態，於是 context 一長就撞牆、換 model 就失憶、平行化就要複製整段歷史。把 state externalise 進一個 keyed store 之後，這三個瓶頸同時消失：context 永遠只裝「這一格需要的最小輸入」，換 model 不丟記憶，平行化只要 fork 一個指標而不是 copy 一段對話。這是整篇文章對「建 agentic 系統的人」最可遷移的一課——它跟漏洞獵捕本身無關，而是一個關於「LLM 的記憶該放在哪裡」的架構判斷。</p>
+
+  <pre data-kind="pseudocode"><code><em>// state 是外部的、結構化的、可被任何 model 讀寫的</em>
+key = (run_id, repo, stage)
+
+stage_hunt(key):
+    candidates = model_A.run(read(prev_stage_key))   <em>// 用 model A</em>
+    write(key, candidates)                            <em>// 結果落 SQLite，不留在 context</em>
+
+stage_validate(key):
+    findings = read(hunt_key)
+    verdicts = model_B.disprove(findings)             <em>// 換 model B，state 不丟</em>
+    write(key, verdicts)
+
+<em>// LLM 本身不持有 state——換 model、retry、重跑後段都不影響進度</em></code></pre>
+
+  <p>把 LLM 當 stateless compute 還解開了另一個 scaling 維度：sibling forking。一個 task 跑到一半可以 fork 出 sibling task 平行探索不同假設，因為每個 fork 的起點就是 SQLite 裡一份明確的 state，不需要複製 context。Cloudflare 量到「Fleet-wide, this accounts for roughly 9% of tasks」——sibling forking 全 fleet 約佔 9% 的 task，但原文補了一句「the rate is highly model-dependent」，並把區間描述成「from near-zero to about a fifth」，從近零到約五分之一，高度取決於用哪個 model。這個區間本身就是「model 是可替換零件」的證據：同一條 harness、換個 model，行為分布就明顯不同，而 harness 不用改。如果你把 sibling forking 想成「探索預算的自動分配」，那麼這個 9% 對五分之一的落差等於在說：同一套 orchestration 接不同 model，等於接到不同的 risk appetite——保守的 model 幾乎不 fork、激進的 model 把五分之一的 task 都拿去平行下注，而你不用為了切換這種行為去動任何一行 harness 程式碼。</p>
+
+  <h2>對抗式驗證——validator 不能 file 自己的 finding</h2>
+
+  <p>整套系統最反直覺、也最關鍵的設計，是它對「誰能宣告漏洞成立」做了嚴格的權力切分。在 VDH 內部，validate 這個 stage 先機械式檢查再對抗式反證；但真正把對抗式推到底的是獨立的 VVS。Cloudflare 講得很白：「We use one model for VDH, but we use a completely different model for VVS, so the models are effectively double-checking each other.」 VDH 用一個 model，VVS 用一個完全不同的 model，兩者互相 double-check。為什麼一定要不同 model？因為同一個 model 既當 Hunter 又當 Validator 等於讓它批改自己的考卷——「If a Hunter is allowed to grade its own homework, it will confidently validate everything it outputs.」 Validator 的唯一工作被限縮成「aggressively disprove the Hunter's theory」，它不能 file 自己的 finding，只能反證 Hunter 的理論。</p>
+
+  <p>「用兩個不同 model」這件事不是省事的折衷，而是一個刻意付出的成本。同一個 model 既當 Hunter 又當 Validator 會省掉一次模型切換、省掉一份算力預算，但它會帶進一個致命的相關性：同一個 model 的盲點、同一套訓練資料留下的同一種錯覺，會在 hunt 跟 validate 兩端同步出現——它看不出自己看不見的東西。換上一個來歷不同的 model 當 Validator，等於引入一組「distinct sets of logic」，讓兩端的 error 不再相關。代價是 validation 這一輪要多燒一份不同 model 的算力，但換來的是 false positive 被一個不會跟 Hunter 共謀的第二意見擋下。對任何在 build LLM-judge 或 self-critique 迴路的人，這是最該記住的一條：讓打分的 model 跟被打分的 model 同源，幾乎等於沒在打分。</p>
+
+  <figure class="vg-w-diagram-adversarial" data-mobile="keep" data-svg-scroll="880">
+    <svg viewBox="0 0 880 300" role="img" aria-label="對抗式雙 model 設計：VDH (model A) 產生 finding，VVS (model B) 只能反證、不能 file 自己的 finding" style="width: 100%; height: auto; max-width: 880px;">
+      <style>
+        .vg-w-diagram-adversarial text { font-family: EB Garamond, serif; }
+        .vg-w-diagram-adversarial .lbl { font-family: IM Fell English, serif; font-style: italic; fill: var(--muted); }
+        .vg-w-diagram-adversarial .mono { font-family: JetBrains Mono, monospace; }
+      </style>
+      <defs>
+        <marker id="vg-w-diagram-adversarial-a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="var(--accent)"/></marker>
+        <marker id="vg-w-diagram-adversarial-s" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="var(--sage-deep)"/></marker>
+      </defs>
+
+      <text x="440" y="26" text-anchor="middle" fill="var(--ink)" font-family="IM Fell English, serif" font-style="italic" font-size="14">兩個不同 model 互相 double-check——權力刻意不對稱</text>
+
+      <!-- VDH box -->
+      <rect x="50" y="64" width="300" height="170" rx="4" fill="var(--accent)" fill-opacity="0.08" stroke="var(--accent)" stroke-width="1.5"/>
+      <text x="200" y="92" text-anchor="middle" fill="var(--accent-text)" font-size="16">VDH · Hunter</text>
+      <text x="200" y="112" text-anchor="middle" class="lbl" font-size="12">model A · discovery</text>
+      <text x="70" y="146" fill="var(--ink)" font-size="13">· 先寫 threat model 才能 file</text>
+      <text x="70" y="170" fill="var(--ink)" font-size="13">· 提出漏洞理論 + PoC</text>
+      <text x="70" y="194" fill="var(--ink)" font-size="13">· PoC 跑在原始未改 codebase</text>
+      <text x="70" y="218" class="mono" font-size="11" fill="var(--muted)">schema ordering 強制 threat-model-first</text>
+
+      <!-- VVS box -->
+      <rect x="530" y="64" width="300" height="170" rx="4" fill="var(--sage)" fill-opacity="0.12" stroke="var(--sage-deep)" stroke-width="1.5"/>
+      <text x="680" y="92" text-anchor="middle" fill="var(--sage-deep)" font-size="16">VVS · Validator</text>
+      <text x="680" y="112" text-anchor="middle" class="lbl" font-size="12">model B · validation</text>
+      <text x="550" y="146" fill="var(--ink)" font-size="13">· 唯一工作：反證 Hunter 理論</text>
+      <text x="550" y="170" fill="var(--ink)" font-size="13">· dedup：deterministic 倒排索引</text>
+      <text x="550" y="194" fill="var(--ink)" font-size="13">· reachability：MCP 拉 prod context</text>
+      <text x="550" y="218" class="mono" font-size="11" fill="var(--sage-deep)">不能 file 自己的 finding</text>
+
+      <!-- arrows -->
+      <line x1="350" y1="130" x2="528" y2="130" stroke="var(--accent)" stroke-width="2" marker-end="url(#vg-w-diagram-adversarial-a)"/>
+      <text x="440" y="122" text-anchor="middle" class="lbl" font-size="12">finding + PoC</text>
+      <path d="M528 168 L440 168 L440 168 L352 168" fill="none" stroke="var(--sage-deep)" stroke-width="2" stroke-dasharray="5,3" marker-end="url(#vg-w-diagram-adversarial-s)"/>
+      <text x="440" y="186" text-anchor="middle" fill="var(--sage-deep)" font-style="italic" font-family="IM Fell English, serif" font-size="12">disprove · 只能否決</text>
+
+      <!-- bottom note -->
+      <text x="440" y="270" text-anchor="middle" class="lbl" font-size="12">不對稱：Hunter 能提案、Validator 只能反證——避免「自己批改自己的考卷」</text>
+    </svg>
+    <figcaption>權力不對稱是這套設計的核心：Hunter（model A）能提出漏洞理論並附 PoC，Validator（model B）只能反證、不能 file 自己的 finding。dedup 用 deterministic 倒排索引、reachability 靠 MCP server 拉 deployment / environment / config context。</figcaption>
+  </figure>
+
+  <p>這個不對稱還靠兩個更細的機制鎖死。第一，「A Hunter has to state the threat model before it's allowed to file anything.」 Hunter file 任何東西之前必須先陳述 threat model；而且「The output schema ordering enforces it.」——是 output schema 的欄位順序在強制這件事，threat model 排在最前面，model 必須先填它才能往下填漏洞細節。Cloudflare 說這個要求「eliminates the vacuous findings」，消掉了空洞的 finding。第二，「Every confirmed finding ships with a PoC written as a test that runs against the original, untouched codebase.」 每個確認的 finding 都附一個寫成 test 的 PoC，跑在原始、未改動的 codebase 上——不是「model 說它是漏洞」，而是「這裡有一個 test，在沒被你動過的程式碼上會觸發」。</p>
+
+  <p>為什麼「欄位順序」這種看似微不足道的 schema 細節，能扛起「消掉空洞 finding」這麼大的責任？關鍵在於 LLM 是順著它正在生成的 token 往下推理的：如果你讓它先寫「我發現一個 SQL injection」，它會先承諾結論、再回頭硬湊一個 threat model 來自圓其說；但如果 schema 逼它先填 threat model 欄位、才能往下填漏洞細節，它就必須先把「誰是攻擊者、能控制什麼輸入、能達成什麼」想清楚，很多原本會被生成的空洞 finding 在這一步就因為「填不出像樣的 threat model」而胎死腹中。下面這個小工具讓你親手切換這個欄位順序，看同一個 model 在兩種 schema 下會 file 出什麼。</p>
+
+  <figure class="vg-w-toggle-schema" data-mobile="keep" data-svg-scroll="720">
+    <style>
+      .vg-w-toggle-schema { display: grid; gap: var(--s-3); }
+      .vg-w-toggle-schema svg { width: 100%; height: auto; max-width: 720px; }
+      .vg-w-toggle-schema .verdict { padding: var(--s-3); background: var(--bg-soft); border-left: 2px solid var(--accent); font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-toggle-schema .verdict.bad { border-left-color: var(--muted-2); }
+      .vg-w-toggle-schema .verdict em { color: var(--accent-text); font-style: italic; }
+      .vg-w-toggle-schema figcaption { font-family: var(--scribed); font-style: italic; color: var(--muted); font-size: var(--fs-sm); }
+    </style>
+
+    <svg viewBox="0 0 720 380" role="img" aria-label="output schema 欄位順序對比：上半是 threat-model-first（Cloudflare 做法），下半是 model 自由排序">
+      <style>
+        .vg-w-toggle-schema text { font-family: JetBrains Mono, monospace; }
+        .vg-w-toggle-schema .flbl { fill: var(--ink); }
+        .vg-w-toggle-schema .fnum { fill: var(--muted); }
+        .vg-w-toggle-schema .fhd { font-family: var(--sans); font-weight: 600; }
+      </style>
+      <text class="fhd" x="40" y="24" font-size="14" fill="var(--accent-text)">schema 強制 threat-model-first（Cloudflare 的做法）</text>
+      <rect x="40" y="36" width="640" height="34" rx="3" fill="var(--accent)" fill-opacity="0.16" stroke="var(--accent)" stroke-width="1.2"/>
+      <text class="fnum" x="56" y="57" font-size="13">1</text><text class="flbl" x="84" y="57" font-size="13">threat_model · 先講誰是攻擊者、能控制什麼輸入</text>
+      <rect x="40" y="80" width="640" height="34" rx="3" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1"/>
+      <text class="fnum" x="56" y="101" font-size="13">2</text><text class="flbl" x="84" y="101" font-size="13">vulnerability · 漏洞細節（必須跟上面的 threat model 對齊）</text>
+      <rect x="40" y="124" width="640" height="34" rx="3" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1"/>
+      <text class="fnum" x="56" y="145" font-size="13">3</text><text class="flbl" x="84" y="145" font-size="13">poc · 寫成 test，跑在原始未改的 codebase 上</text>
+
+      <text class="fhd" x="40" y="218" font-size="14" fill="var(--muted)">model 自由排序（沒有 schema 強制）</text>
+      <rect x="40" y="230" width="640" height="34" rx="3" fill="var(--muted-2)" fill-opacity="0.25" stroke="var(--muted-2)" stroke-width="1"/>
+      <text class="fnum" x="56" y="251" font-size="13">1</text><text class="flbl" x="84" y="251" font-size="13">vulnerability · 先喊出結論「我發現一個漏洞」</text>
+      <rect x="40" y="274" width="640" height="34" rx="3" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1"/>
+      <text class="fnum" x="56" y="295" font-size="13">2</text><text class="flbl" x="84" y="295" font-size="13">threat_model · 事後回頭硬湊一個自圓其說的故事</text>
+      <rect x="40" y="318" width="640" height="34" rx="3" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1"/>
+      <text class="fnum" x="56" y="339" font-size="13">3</text><text class="flbl" x="84" y="339" font-size="13">poc · 常常生不出來，因為漏洞根本不成立</text>
+    </svg>
+
+    <div class="verdict">上半：先填 threat model 才能往下填，model 被逼著先把攻擊者模型想清楚，<em>很多空洞 finding 在這一步就生不出來</em>——這正是 Cloudflare 說的「eliminates the vacuous findings」。</div>
+    <div class="verdict bad">下半：放任 model 先喊結論，它會先承諾「有漏洞」、再回頭硬湊 threat model 自圓其說，<em>空洞 finding 大量湧出</em>，把雜訊推給下游的 validator 與工程團隊。</div>
+
+    <figcaption>兩種 output schema 欄位順序並排對比。Cloudflare 的設計把 threat model 排在最前面，並讓「The output schema ordering enforces it」——靠生成順序本身強制 model 先建模、後下結論，這個要求「eliminates the vacuous findings」。</figcaption>
+  </figure>
+
+  <p>VVS 內部的三件事各自把對抗式延伸到不同維度。dedup 不靠 model 判斷誰跟誰重複，而是「deterministic code builds inverted indexes over the structured data (touched files/functions, trust boundary, rare tokens) to generate a short list of real candidates.」 用 deterministic 程式碼在結構化資料上建倒排索引（碰到的 file / function、trust boundary、rare token），先縮出一個真正的候選短清單，再讓 model 去判。reachability 的判斷則交給 agent 去拉真實環境：「The agent rechecks the latest information, pulling from deployment, environment, and config context to determine if the code path is reachable in prod.」——透過 MCP server 拉 deployment、environment、config context，判斷這條 code path 在 prod 是否真的可達。最後是 fix：自動修補的唯一驗收條件是 regression test 翻面，「A clean fail→pass flip is the ideal and the only auto-cleanup case; a failing post-patch test blocks the commit.」 fail→pass 才放行，patch 後 test 還 fail 就擋 commit。</p>
+
+  <p>下面這個小工具把對抗式驗證接上去前後的效果攤開：把這層加進 pipeline，Cloudflare 量到「initial validation rejection rate dropped from 40% down to 11%」。拖動滑桿在「沒有對抗式驗證」與「有」之間移動，看 rejection rate 怎麼掉。</p>
+
+  <figure class="vg-w-drag-rejection" data-mobile="swap" data-mobile-summary="接上對抗式 validation 後，initial rejection rate 從 40% 掉到 11%，三分之二的初始否決被前移消化掉。" data-svg-scroll="720">
+    <style>
+      .vg-w-drag-rejection { display: grid; gap: var(--s-3); }
+      .vg-w-drag-rejection svg { width: 100%; height: auto; touch-action: none; }
+      .vg-w-drag-rejection .readout { display: grid; gap: var(--s-1); padding: var(--s-3); background: var(--bg-soft); border-left: 2px solid var(--accent); }
+      .vg-w-drag-rejection .big { font-family: EB Garamond, serif; font-size: 2rem; color: var(--ink); font-variant-numeric: tabular-nums; }
+      .vg-w-drag-rejection .big .unit { font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-left: 0.5ch; }
+      .vg-w-drag-rejection .desc { font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink-soft); }
+      .vg-w-drag-rejection .desc em { color: var(--accent-text); font-style: italic; }
+      .vg-w-drag-rejection figcaption { font-family: var(--scribed); font-style: italic; color: var(--muted); font-size: var(--fs-sm); }
+    </style>
+
+    <svg viewBox="0 0 720 200" role="img" aria-label="拖動把手在沒有對抗式驗證 (rejection 40%) 與有對抗式驗證 (rejection 11%) 之間移動">
+      <line x1="80" y1="120" x2="640" y2="120" stroke="var(--muted-2)" stroke-width="2"/>
+      <text x="80" y="156" text-anchor="middle" fill="var(--muted)" font-family="IM Fell English, serif" font-style="italic" font-size="12">沒有對抗式驗證</text>
+      <text x="80" y="174" text-anchor="middle" fill="var(--accent-text)" font-family="JetBrains Mono, monospace" font-size="12">40% rejected</text>
+      <text x="640" y="156" text-anchor="middle" fill="var(--muted)" font-family="IM Fell English, serif" font-style="italic" font-size="12">有對抗式驗證</text>
+      <text x="640" y="174" text-anchor="middle" fill="var(--sage-deep)" font-family="JetBrains Mono, monospace" font-size="12">11% rejected</text>
+      <!-- gradient ticks -->
+      <g id="vg-w-drag-rejection-ticks"></g>
+      <circle id="vg-w-drag-rejection-h" cx="640" cy="120" r="13" fill="var(--accent)" cursor="grab" role="slider" tabindex="0" aria-label="對抗式驗證強度" aria-valuemin="11" aria-valuemax="40" aria-valuenow="11"/>
+      <text id="vg-w-drag-rejection-tip" x="640" y="100" text-anchor="middle" fill="var(--ink)" font-family="JetBrains Mono, monospace" font-size="14">11%</text>
+    </svg>
+
+    <div class="readout">
+      <div class="big"><span data-big>11</span><span class="unit">% initial rejection rate</span></div>
+      <div class="desc" data-desc>把對抗式 validation 接上後，initial rejection rate 落在 <em>11%</em>——三分之二的初始否決被前移消化。</div>
+    </div>
+
+    <figcaption>兩端是 Cloudflare 給的真實數字：未加對抗式驗證時 initial validation rejection rate 是 40%，加上後降到 11%。拖動把手在兩端之間移動觀察落差；中間值為線性插值，僅供視覺對照。</figcaption>
+
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        const root = document.querySelector('.vg-w-drag-rejection');
+        const svg = root.querySelector('svg');
+        const handle = root.querySelector('#vg-w-drag-rejection-h');
+        const tip = root.querySelector('#vg-w-drag-rejection-tip');
+        const ticksG = root.querySelector('#vg-w-drag-rejection-ticks');
+        const big = root.querySelector('[data-big]');
+        const desc = root.querySelector('[data-desc]');
+        const X_MIN = 80, X_MAX = 640;
+        const NS = 'http://www.w3.org/2000/svg';
+        // gradient ticks: rejection from 40 (left) to 11 (right)
+        for (let i = 0; i <= 10; i++) {
+          const x = X_MIN + (X_MAX - X_MIN) * i / 10;
+          const t = document.createElementNS(NS, 'line');
+          t.setAttribute('x1', x); t.setAttribute('y1', 112); t.setAttribute('x2', x); t.setAttribute('y2', 128);
+          t.setAttribute('stroke', 'var(--muted-2)'); t.setAttribute('stroke-width', '1');
+          ticksG.appendChild(t);
+        }
+        let dragging = false;
+        function clientToX(clientX) {
+          const pt = svg.createSVGPoint(); pt.x = clientX; pt.y = 0;
+          const p = pt.matrixTransform(svg.getScreenCTM().inverse());
+          return Math.max(X_MIN, Math.min(X_MAX, p.x));
+        }
+        function update(x) {
+          handle.setAttribute('cx', x);
+          tip.setAttribute('x', x);
+          const norm = (x - X_MIN) / (X_MAX - X_MIN); // 0 left -> 1 right
+          const rate = Math.round(40 - norm * (40 - 11));
+          tip.textContent = rate + '%';
+          big.textContent = String(rate);
+          handle.setAttribute('aria-valuenow', String(rate));
+          if (rate >= 38) {
+            desc.innerHTML = '幾乎沒有對抗式驗證——initial rejection rate <em>40%</em>，四成的初始判斷要被推翻，noise 直接灌到工程團隊。';
+          } else if (rate <= 13) {
+            desc.innerHTML = '完整對抗式 validation——initial rejection rate <em>11%</em>，三分之二的初始否決被前移消化。';
+          } else {
+            desc.innerHTML = '對抗式驗證接入中——rejection rate 約 <em>' + rate + '%</em>（線性插值，僅供視覺對照）。';
+          }
+        }
+        handle.addEventListener('pointerdown', (e) => { dragging = true; handle.setPointerCapture(e.pointerId); handle.setAttribute('cursor', 'grabbing'); });
+        handle.addEventListener('pointermove', (e) => { if (dragging) update(clientToX(e.clientX)); });
+        handle.addEventListener('pointerup', (e) => { dragging = false; handle.setAttribute('cursor', 'grab'); });
+        handle.addEventListener('keydown', (e) => {
+          const cx = Number(handle.getAttribute('cx'));
+          if (e.key === 'ArrowLeft') { e.preventDefault(); update(Math.max(X_MIN, cx - 28)); }
+          if (e.key === 'ArrowRight') { e.preventDefault(); update(Math.min(X_MAX, cx + 28)); }
+        });
+        update(640);
+      })();
+    </script>
+  </figure>
+
+  <h2>反直覺的 production 數字</h2>
+
+  <p>把整套東西放進 production 跑一個月，最有意思的不是漏洞數，而是工具使用分布完全違反直覺。第一個衝擊：傳統 static analysis 的主力 Semgrep 幾乎沒被用到——「Hunters invoked it zero times in a month of runs.」 一個月零次。反過來，最常用的 tool 是一個聽起來不像安全工具的東西：wishlist。「The wishlist, by contrast, was the single most-used tool in the system.」 而且「The wishlist has been written to 25,472 times.」 被寫入超過兩萬五千次。wishlist 是 agent 把「我想查但這輪沒查的東西」記下來的地方——它變成系統最常用的 tool，意味著 LLM-driven 的 hunt 更傾向「把待辦記在外部、之後 gapfill / 後續 run 再撿」，而不是套一條固定的 static rule。</p>
+
+  <figure class="vg-w-bars-tooluse" data-mobile="keep" data-svg-scroll="720">
+    <svg viewBox="0 0 720 220" role="img" aria-label="工具使用對比：Semgrep 在一個月的 run 裡被調用 0 次，wishlist 被寫入 25,472 次" style="width: 100%; height: auto; max-width: 720px;">
+      <style>
+        .vg-w-bars-tooluse text { font-family: EB Garamond, serif; }
+        .vg-w-bars-tooluse .mono { font-family: JetBrains Mono, monospace; }
+        .vg-w-bars-tooluse .lbl { font-family: IM Fell English, serif; font-style: italic; fill: var(--muted); }
+      </style>
+      <text x="360" y="26" text-anchor="middle" fill="var(--ink)" font-family="IM Fell English, serif" font-style="italic" font-size="14">傳統主力靜置、待辦清單被狂寫——工具使用完全違反直覺</text>
+
+      <!-- Semgrep row -->
+      <text x="40" y="78" fill="var(--ink)" font-size="14">Semgrep</text>
+      <text x="40" y="96" class="lbl" font-size="11">傳統 static analysis 主力</text>
+      <line x1="200" y1="74" x2="206" y2="74" stroke="var(--muted-2)" stroke-width="2"/>
+      <rect x="200" y="64" width="4" height="22" fill="var(--muted-2)" opacity="0.5"/>
+      <text x="220" y="80" class="mono" font-size="14" fill="var(--muted)">0 次調用 · invoked zero times</text>
+
+      <!-- wishlist row -->
+      <text x="40" y="148" fill="var(--ink)" font-size="14">wishlist</text>
+      <text x="40" y="166" class="lbl" font-size="11">系統最常用的 tool</text>
+      <rect x="200" y="134" width="480" height="22" fill="var(--accent)" opacity="0.8"/>
+      <text x="220" y="150" class="mono" font-size="14" fill="var(--bg)">25,472 次寫入 · most-used tool</text>
+
+      <text x="360" y="200" text-anchor="middle" class="lbl" font-size="12">LLM-driven hunt 把待辦記在外部、之後 gapfill 再撿——而不是套固定 static rule</text>
+    </svg>
+    <figcaption>兩個數字都直接取自 Cloudflare：Semgrep 在一個月的 run 裡被 Hunter 調用 0 次；wishlist 被寫入 25,472 次，是系統最常用的 tool。長條長度是視覺對比，不是線性比例（0 與 25,472 無法同尺度畫）。</figcaption>
+  </figure>
+
+  <p>wishlist 這個設計細節值得多想一層，因為它把「agentic hunt 跟 rule-based scan 到底差在哪」講得很具體。Semgrep 這類 static analysis 的世界觀是「我有一組規則，把它們套到整個 codebase 上」——規則是固定的，掃的範圍是窮舉的。LLM-driven 的 Hunter 不是這樣工作：它順著一條攻擊假設往下挖，挖的過程中會冒出一堆「這個地方看起來也可疑、但不在我這輪的主線上」的支線。wishlist 就是裝這些支線的盒子。把它寫進去，意味著 Hunter 承認「我現在不查這個，但我不想忘記它」，然後讓 gapfill 或後續 run 再回頭撿。一個月被寫入 25,472 次，等於 Hunter 平均每跑一段就在記一筆待辦——這正是為什麼 Semgrep 被調用 0 次：固定規則窮舉的價值，在一個會自己生成、排序、回收探索方向的系統裡，被一個更動態的「外部 todo queue」取代了。對建工具的人，這是一個反直覺但可遷移的觀察：給 agent 一個能寫待辦的外部結構，可能比給它更多固定工具更有用。</p>
+
+  <p>另外幾個數字幫忙把 scale 與品質一起標定。整套系統的 high-integrity finding 佔比「climbed from 35% to 58%」——從 35% 爬到 58%；單一 repo 的掃描「yields 100 initial findings」，被壓縮成「80 distinct, high-fidelity bugs」，約一百個初始 finding 變八十個 distinct 的高保真 bug。注意這兩個數字測的是不同層次：35%→58% 是整池 finding 裡「值得人看」的比例翻倍，而 100→80 是單一 repo 內把雜訊與重複壓掉後剩下的真貨密度。兩者合起來描述的是同一件事——這條 funnel 不只是把數量砍小，而是在每一道關卡把「訊號對雜訊的比例」往上推。runtime 上不是免費午餐：「The worst run took just over 14 hours.」 最壞的單次 run 花了 14 小時出頭——這提醒一件常被忽略的事，agentic pipeline 的 tail latency 可以很長，排程與成本控制得照著 worst case 設計而不是 median。如果你拿 median 去估算容量，遇到那條 14 小時的尾巴就會排程崩盤；對抗式驗證、sibling forking、trace 沿圖 fan-out 這些機制每一個都在替尾巴加長，所以「為 worst case 而非 median 配資源」不是保守，而是這類系統的必要前提。把這些放在一起，這篇文章真正的論點不是「Cloudflare 找到很多漏洞」，而是「找漏洞這件事的價值，被一層 model-agnostic、state-externalised、對抗式驗證的 harness 決定，而不是被某個 model 決定」。</p>
+
+  <p class="vg-deep-closer"><strong>The portable lesson</strong>：把 LLM 當可替換的 stateless compute、用 <code>(run_id, repo, stage)</code> 這類外部 key 持有 state、再用一個不同的 model 當只能反證的 validator——這套不只適用於漏洞獵捕，任何要壓 false positive 又要 scale 的 agentic 工具都能照搬；正如 Cloudflare 說的，「If you build your own system, design it to be model-agnostic from day one.」</p>
+</div>
