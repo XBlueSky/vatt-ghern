@@ -1,0 +1,710 @@
+{
+  "output_path": "src/posts/2026/06/20/deep-duckdb-internals.html",
+  "spine": [
+    "1. DuckDB 的定位是 in-process 分析資料庫——沒有 server，把 libduckdb 載進你的 process 裡直接呼叫；analytical 指它為「掃描上百萬列做 filter / aggregate / join」優化，不是用 primary key 撈單一筆。這個定位決定了底下所有設計。",
+    "2. 沒有 server 連帶取消了 client/server 之間的 serialize/deserialize 開銷：ODBC/JDBC 一次回一列一值，一億列就是上億次 function call；in-process 讓結果可以直接共用 buffer，最好情況下是 zero-copy。",
+    "3. 為了「掃很多列、只碰少數欄」這種 workload，DuckDB 用 columnar 儲存：一個 4 欄查詢打在 300 欄的表上，row store 要讀完 300 欄丟掉 296 欄，column store 只讀那 4 欄。",
+    "4. 欄資料切成 row group（最多 122,880 列），每個 column segment 通常對應一個 256 KB block；每個 row group 還帶一張 zone map（min/max + null count），讓帶 predicate 的掃描在讀資料前就先比 max、整段跳過。",
+    "5. 執行時資料以 chunk（DuckDB 的 2,048 列批次）為單位在 pipeline 裡流動，pipeline 是一條 assembly line，每個 thread 拿自己的一份 morsel 跨核心平行跑——細節留到 Part 2 / Part 3。",
+    "6. 一條 SQL 要先走完 setup：parse 成 AST、binding 對 catalog 解析每個名字、optimizer 走 logical plan 為每個節點挑 physical operator，整個 optimization phase 通常約一毫秒。",
+    "7. 結論：DuckDB 的「快」不是單一魔法，而是 in-process（省傳輸）+ columnar（省 I/O）+ zone map（省掃描）+ 批次化 pipeline（省 per-row overhead）四件事疊在同一個 single binary（<20 MB）裡；Part 1 講到引擎準備好執行為止，真正的 vectorized execution 留待 Part 2。"
+  ],
+  "sources": [
+    {
+      "url": "https://www.greybeam.ai/blog/duckdb-internals-part-1",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": "2026-05-04",
+      "perspective": {
+        "mechanism": "把分析查詢慢的三個來源各自拆掉：client/server 傳輸（用 in-process 取消）、讀太多用不到的欄（用 columnar 儲存）、掃描整個資料集（用 row group 上的 zone map 先比 min/max 跳過）；資料再以 2,048 列的 chunk 在 pipeline 裡批次流動，每個 thread 各拿一份 morsel 平行跑。",
+        "tradeoff": "columnar + 大 row group + 批次化對「掃描多列」的分析查詢是淨贏，但對「用 primary key 撈單筆」的交易型查詢不利——大 block 與欄分離意味著拼回一整列要碰多個 segment；in-process 也意味著沒有獨立 server 做多寫者隔離。Part 1 自己界定只講到引擎準備好執行為止。",
+        "reader_use": "台灣工程師在選嵌入式分析引擎、或想理解「為什麼同一份 parquet 用 DuckDB 跑 aggregate 比丟進 Postgres 快」時，可以用這四層心智模型去歸因；也能判斷 DuckDB 不適合當高併發點查的線上交易資料庫。"
+      }
+    }
+  ],
+  "notes": [
+    {
+      "id": "n01",
+      "url": "https://www.greybeam.ai/blog/duckdb-internals-part-1",
+      "quote": "DuckDB has gone from a research project at CWI Amsterdam in 2019 to one of the most widely adopted databases of the past decade.",
+      "hedge": "asserted",
+      "interpretation": "出身與普及度：2019 起源於 CWI Amsterdam 的研究專案，現在是過去十年最廣泛採用的資料庫之一。用於開場歸屬。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n02",
+      "url": "https://www.greybeam.ai/blog/duckdb-internals-part-1",
+      "quote": "DuckDB is an in-process analytical SQL database. Analytical means it's optimized for the kind of queries that scan millions of rows to filter, aggregate, and join — not the kind that look up a single record by primary key. In-process means there's no server.",
+      "hedge": "asserted",
+      "interpretation": "核心定位：in-process 分析型 SQL 資料庫。analytical = 為掃上百萬列做 filter/aggregate/join 優化、非 primary key 單筆撈；in-process = 沒有 server。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n03",
+      "url": "https://www.greybeam.ai/blog/duckdb-internals-part-1",
+      "quote": "You load libduckdb into your program and call functions directly against it.",
+      "hedge": "asserted",
+      "interpretation": "in-process 的具體含意：把 libduckdb 載進程式裡直接呼叫函式，沒有跨 process / 跨網路的連線。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n04",
+      "url": "https://www.greybeam.ai/blog/duckdb-internals-part-1",
+      "quote": "It ships as a single binary under 20 MB with no external dependencies.",
+      "hedge": "asserted",
+      "interpretation": "打包形態：單一 binary、小於 20 MB、無外部相依。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n05",
+      "url": "https://www.greybeam.ai/blog/duckdb-internals-part-1",
+      "quote": "ODBC and JDBC hand back results one row and one value at a time, which means the client makes a separate function call for every field in every row. On a 100-million-row result, that's hundreds of millions of function calls.",
+      "hedge": "asserted",
+      "interpretation": "傳統 client/server 取結果的開銷：一次一列一值、每個 field 一次 function call；一億列就是上億次呼叫。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n06",
+      "url": "https://www.greybeam.ai/blog/duckdb-internals-part-1",
+      "quote": "In 2017, Mark Raasveldt and Hannes Mühleisen published Don't Hold My Data Hostage, a paper measuring what actually happens when you pull a result set out of a warehouse.",
+      "hedge": "asserted",
+      "interpretation": "來源論文歸屬：2017 年 Raasveldt 與 Mühleisen 的《Don't Hold My Data Hostage》，量測把 result set 從 warehouse 拉出來實際發生什麼。用於歸屬傳輸開銷的研究根據。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n07",
+      "url": "https://www.greybeam.ai/blog/duckdb-internals-part-1",
+      "quote": "In the best case, DuckDB can read the same underlying buffers the Python process already owns, so it avoids materializing a second full copy of the data. This is zero-copy!",
+      "hedge": "hedged",
+      "interpretation": "in-process 的好處上限：最佳情況下可直接讀 Python process 已持有的 buffer、不複製第二份，即 zero-copy。語氣 hedged（'In the best case'），prose 不得上修成「一定 zero-copy」。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n08",
+      "url": "https://www.greybeam.ai/blog/duckdb-internals-part-1",
+      "quote": "In practice, whether the path is truly zero-copy depends on the dataframe's physical layout, column types, null representation, and string storage.",
+      "hedge": "hedged",
+      "interpretation": "zero-copy 的條件：實務上是否真 zero-copy 取決於 dataframe 的 physical layout、欄型別、null 表示、字串儲存。明確的 hedge，prose 要保留條件。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n09",
+      "url": "https://www.greybeam.ai/blog/duckdb-internals-part-1",
+      "quote": "A query that reads 4 columns from a 300 column table only needs to read those 4 columns. On a row store, all 300 columns would be read and 296 of those will need to be discarded.",
+      "hedge": "asserted",
+      "interpretation": "columnar 的核心優勢，具體例子：300 欄表的 4 欄查詢，columnar 只讀 4 欄，row store 讀 300 欄丟 296 欄。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n10",
+      "url": "https://www.greybeam.ai/blog/duckdb-internals-part-1",
+      "quote": "A row store keeps entire records contiguous on disk",
+      "hedge": "asserted",
+      "interpretation": "row store 定義：整筆 record 在 disk 上連續存放。用於對照 columnar。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n11",
+      "url": "https://www.greybeam.ai/blog/duckdb-internals-part-1",
+      "quote": "Inside the file, data is broken into fixed-size blocks. The default block size is 256 KB, though smaller block sizes (down to 16 KB) can be configured.",
+      "hedge": "asserted",
+      "interpretation": "儲存 block：固定大小，預設 256 KB，可調小至 16 KB。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n12",
+      "url": "https://www.greybeam.ai/blog/duckdb-internals-part-1",
+      "quote": "Each column is split into row groups of up to 122,880 rows, and within a row group, into column segments that typically map to a single 256 KB block.",
+      "hedge": "asserted",
+      "interpretation": "儲存階層：每欄切成最多 122,880 列的 row group，row group 內再切成 column segment，segment 通常對應單一 256 KB block。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n13",
+      "url": "https://www.greybeam.ai/blog/duckdb-internals-part-1",
+      "quote": "Each row group also carries a zone map. A zone map contains the min and max values in a row group, plus a null count.",
+      "hedge": "asserted",
+      "interpretation": "zone map 定義：每個 row group 帶一張，內含該 row group 的 min/max 值與 null count。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n14",
+      "url": "https://www.greybeam.ai/blog/duckdb-internals-part-1",
+      "quote": "When a scan runs with a predicate like WHERE event_date > '2026-01-01', DuckDB checks each row group's max value before reading in any of its data. Row groups whose max event_date is on or before '2026-01-01' are skipped entirely.",
+      "hedge": "asserted",
+      "interpretation": "zone map 的用法：帶 predicate 的掃描先比每個 row group 的 max，max 不可能符合的 row group 整段跳過、完全不讀資料。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n15",
+      "url": "https://www.greybeam.ai/blog/duckdb-internals-part-1",
+      "quote": "Think of a pipeline as an assembly line. Data enters at one end and passes through a chain of stations. Each station does one thing (drop a row, transform a column, look up a value in a hash table) and hands the result to the next station.",
+      "hedge": "asserted",
+      "interpretation": "pipeline 定義：assembly line，資料從一端進、流過一串 station，每個 station 做一件事再交給下一站。push-based 描述。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n16",
+      "url": "https://www.greybeam.ai/blog/duckdb-internals-part-1",
+      "quote": "Every thread accepts chunks (DuckDB's 2048 row batches) and writes them into its own local state",
+      "hedge": "asserted",
+      "interpretation": "chunk = DuckDB 的 2,048 列批次，是資料在 pipeline 裡流動的單位；每個 thread 收 chunk 寫進自己的 local state。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n17",
+      "url": "https://www.greybeam.ai/blog/duckdb-internals-part-1",
+      "quote": "A pipeline runs across all cores by giving each thread its own morsel of input.",
+      "hedge": "asserted",
+      "interpretation": "morsel-driven parallelism 的一句話：pipeline 跨所有核心跑，靠給每個 thread 自己的一份 morsel 輸入。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n18",
+      "url": "https://www.greybeam.ai/blog/duckdb-internals-part-1",
+      "quote": "This is a part of what makes morsel-driven parallelism (covered in Part 3) and vectorized execution (covered in Part 2) work.",
+      "hedge": "asserted",
+      "interpretation": "範圍宣告：morsel-driven parallelism 留到 Part 3、vectorized execution 留到 Part 2。Part 1 不展開這兩者的細節。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n19",
+      "url": "https://www.greybeam.ai/blog/duckdb-internals-part-1",
+      "quote": "This post covers the path from your SQL to the moment the engine is ready to run the query, plus the storage layer the query will read from. By the end you'll have a clear mental model of DuckDB's setup work and storage layout. Query execution is covered in Part 2 so make sure to subscribe!",
+      "hedge": "asserted",
+      "interpretation": "Part 1 的明確範圍：從 SQL 到引擎準備好執行的這段路徑，加上儲存層；query execution 本身留到 Part 2。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n20",
+      "url": "https://www.greybeam.ai/blog/duckdb-internals-part-1",
+      "quote": "The first step is to parse SQL into an abstract syntax tree (AST).",
+      "hedge": "asserted",
+      "interpretation": "查詢生命週期第一步：把 SQL parse 成 AST。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n21",
+      "url": "https://www.greybeam.ai/blog/duckdb-internals-part-1",
+      "quote": "The next step is binding, which resolves every name in the AST against the catalog.",
+      "hedge": "asserted",
+      "interpretation": "第二步 binding：把 AST 裡每個名字對 catalog 解析。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n22",
+      "url": "https://www.greybeam.ai/blog/duckdb-internals-part-1",
+      "quote": "The optimizer walks the logical plan and picks a physical operator for each node.",
+      "hedge": "asserted",
+      "interpretation": "optimizer：走 logical plan、為每個節點挑一個 physical operator。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n23",
+      "url": "https://www.greybeam.ai/blog/duckdb-internals-part-1",
+      "quote": "There are dozens more optimizations to explore and the entire optimization phase usually finishes in about a millisecond.",
+      "hedge": "hedged",
+      "interpretation": "優化階段耗時：整個 optimization phase 通常約一毫秒。語氣 'usually'（hedged），prose 保留「通常」。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n24",
+      "url": "https://www.greybeam.ai/blog/duckdb-internals-part-1",
+      "quote": "A query joining six tables has 30,240 possible tree shapes, and the difference between best and worst can be orders of magnitude in runtime.",
+      "hedge": "asserted",
+      "interpretation": "join order 的組合爆炸：6 表 join 有 30,240 種 tree shape，最好與最壞可差幾個數量級。用於說明 optimizer 為何重要。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n25",
+      "url": "https://www.greybeam.ai/blog/duckdb-internals-part-1",
+      "quote": "The default sample size is 20,480 rows. You can increase this, or set sample_size = -1 to inspect the whole file.",
+      "hedge": "asserted",
+      "interpretation": "CSV sniffer 預設抽樣 20,480 列，可調大或設 -1 看整個檔。",
+      "timeliness": "durable"
+    }
+  ],
+  "claims": [
+    {
+      "id": "c01",
+      "claim_text": "它「從 2019 年 CWI Amsterdam 的一個研究專案，變成過去十年最廣泛採用的資料庫之一」",
+      "location": "開場第二段",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n01"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "DuckDB has gone from a research project at CWI Amsterdam in 2019 to one of the most widely adopted databases of the past decade.",
+      "note": "中文轉述忠於 asserted 原文；未上修。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c02",
+      "claim_text": "「DuckDB is an in-process analytical SQL database. Analytical means it's optimized for the kind of queries that scan millions of rows to filter, aggregate, and join — not the kind that look up a single record by primary key. In-process means there's no server.」",
+      "location": "H2「in-process 與 analytical」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n02"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "DuckDB is an in-process analytical SQL database. Analytical means it's optimized for the kind of queries that scan millions of rows to filter, aggregate, and join — not the kind that look up a single record by primary key. In-process means there's no server.",
+      "note": "逐字引用，與來源完全相符。為全篇定位的根基主張。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c03",
+      "claim_text": "「You load libduckdb into your program and call functions directly against it.」",
+      "location": "H2「in-process 與 analytical」",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n03"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "You load libduckdb into your program and call functions directly against it.",
+      "note": "逐字相符。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c04",
+      "claim_text": "它「ships as a single binary under 20 MB with no external dependencies」——一個小於 20 MB、沒有外部相依的單一 binary。",
+      "location": "H2「in-process 與 analytical」",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n04"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "It ships as a single binary under 20 MB with no external dependencies.",
+      "note": "< 20 MB 的數字在 hook、表格、closer 反覆出現，高 load；逐字相符。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c05",
+      "claim_text": "「ODBC and JDBC hand back results one row and one value at a time, which means the client makes a separate function call for every field in every row. On a 100-million-row result, that's hundreds of millions of function calls.」",
+      "location": "H2「結果的搬運成本」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n05"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "ODBC and JDBC hand back results one row and one value at a time, which means the client makes a separate function call for every field in every row. On a 100-million-row result, that's hundreds of millions of function calls.",
+      "note": "逐字相符；數字（一億列、上億次呼叫）為 in-process 省傳輸論點的核心。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c06",
+      "claim_text": "「In 2017, Mark Raasveldt and Hannes Mühleisen published Don't Hold My Data Hostage, a paper measuring what actually happens when you pull a result set out of a warehouse.」",
+      "location": "H2「結果的搬運成本」",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n06"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "In 2017, Mark Raasveldt and Hannes Mühleisen published Don't Hold My Data Hostage, a paper measuring what actually happens when you pull a result set out of a warehouse.",
+      "note": "論文歸屬（年份、作者、標題）逐字相符。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c07",
+      "claim_text": "「In the best case, DuckDB can read the same underlying buffers the Python process already owns, so it avoids materializing a second full copy of the data. This is zero-copy!」",
+      "location": "H2「結果的搬運成本」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n07"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "In the best case, DuckDB can read the same underlying buffers the Python process already owns, so it avoids materializing a second full copy of the data. This is zero-copy!",
+      "note": "來源 hedge（'In the best case'）；post 逐字保留前綴並明說「注意『In the best case』這個前綴不能拿掉」，未上修。hedge_delta none。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c08",
+      "claim_text": "「In practice, whether the path is truly zero-copy depends on the dataframe's physical layout, column types, null representation, and string storage.」",
+      "location": "H2「結果的搬運成本」",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n08"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "In practice, whether the path is truly zero-copy depends on the dataframe's physical layout, column types, null representation, and string storage.",
+      "note": "hedge 條件逐字保留，prose 強調「能不能拿到看資料長相」，忠於來源。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c09",
+      "claim_text": "「A query that reads 4 columns from a 300 column table only needs to read those 4 columns. On a row store, all 300 columns would be read and 296 of those will need to be discarded.」",
+      "location": "H2「columnar 儲存」",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n09"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "A query that reads 4 columns from a 300 column table only needs to read those 4 columns. On a row store, all 300 columns would be read and 296 of those will need to be discarded.",
+      "note": "4 / 300 / 296 數字逐字相符；columnar 論點與 widget 的依據。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c10",
+      "claim_text": "row store 因為「A row store keeps entire records contiguous on disk」——整筆 record 在 disk 上是連續擺的",
+      "location": "H2「columnar 儲存」",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n10"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "A row store keeps entire records contiguous on disk",
+      "note": "逐字相符（來源句尾有句點，post 引用未含句點，不影響語意）。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c11",
+      "claim_text": "「The default block size is 256 KB, though smaller block sizes (down to 16 KB) can be configured.」預設 256 KB，可以調小到 16 KB。",
+      "location": "H2「row group 與 zone map」",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n11"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Inside the file, data is broken into fixed-size blocks. The default block size is 256 KB, though smaller block sizes (down to 16 KB) can be configured.",
+      "note": "256 KB / 16 KB 數字逐字相符；收進數字表。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c12",
+      "claim_text": "「Each column is split into row groups of up to 122,880 rows, and within a row group, into column segments that typically map to a single 256 KB block.」",
+      "location": "H2「row group 與 zone map」",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n12"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Each column is split into row groups of up to 122,880 rows, and within a row group, into column segments that typically map to a single 256 KB block.",
+      "note": "122,880 列 / 256 KB segment 逐字相符；儲存階層核心數字，widget 與數字表皆引用。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c13",
+      "claim_text": "「Each row group also carries a zone map. A zone map contains the min and max values in a row group, plus a null count.」",
+      "location": "H2「row group 與 zone map」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n13"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Each row group also carries a zone map. A zone map contains the min and max values in a row group, plus a null count.",
+      "note": "zone map 定義逐字相符；第四層機制的根基。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c14",
+      "claim_text": "「When a scan runs with a predicate like WHERE event_date > '2026-01-01', DuckDB checks each row group's max value before reading in any of its data. Row groups whose max event_date is on or before '2026-01-01' are skipped entirely.」",
+      "location": "H2「row group 與 zone map」",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [
+        "n14"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "When a scan runs with a predicate like WHERE event_date > '2026-01-01', DuckDB checks each row group's max value before reading in any of its data. Row groups whose max event_date is on or before '2026-01-01' are skipped entirely.",
+      "note": "zone map 跳過機制逐字相符；zone map widget 的依據。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c15",
+      "claim_text": "「Think of a pipeline as an assembly line. Data enters at one end and passes through a chain of stations. Each station does one thing (drop a row, transform a column, look up a value in a hash table) and hands the result to the next station.」",
+      "location": "H2「chunk 與 pipeline」",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n15"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Think of a pipeline as an assembly line. Data enters at one end and passes through a chain of stations. Each station does one thing (drop a row, transform a column, look up a value in a hash table) and hands the result to the next station.",
+      "note": "逐字相符。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c16",
+      "claim_text": "「Every thread accepts chunks (DuckDB's 2048 row batches) and writes them into its own local state」。chunk 就是 DuckDB 的 2,048 列批次",
+      "location": "H2「chunk 與 pipeline」",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n16"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Every thread accepts chunks (DuckDB's 2048 row batches) and writes them into its own local state",
+      "note": "2,048 列數字逐字相符；hook、數字表、closer 反覆出現，高 load。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c17",
+      "claim_text": "「A pipeline runs across all cores by giving each thread its own morsel of input.」",
+      "location": "H2「chunk 與 pipeline」",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n17"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "A pipeline runs across all cores by giving each thread its own morsel of input.",
+      "note": "逐字相符。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c18",
+      "claim_text": "明說「vectorized execution（covered in Part 2）」「morsel-driven parallelism（covered in Part 3）」，細節留到後面兩篇。",
+      "location": "H2「chunk 與 pipeline」/ 範圍宣告",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n18",
+        "n19"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "This is a part of what makes morsel-driven parallelism (covered in Part 3) and vectorized execution (covered in Part 2) work.",
+      "note": "範圍宣告逐字相符；支撐全篇「誠實停在來源停的地方」的框架。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c19",
+      "claim_text": "「from your SQL to the moment the engine is ready to run the query」……真正的 query execution……作者明說留到 Part 2",
+      "location": "開場第一段 / H2「從 SQL 到準備執行」",
+      "type": "attribution",
+      "load": "high",
+      "note_ids": [
+        "n19"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "This post covers the path from your SQL to the moment the engine is ready to run the query, plus the storage layer the query will read from. By the end you'll have a clear mental model of DuckDB's setup work and storage layout. Query execution is covered in Part 2 so make sure to subscribe!",
+      "note": "Part 1 範圍逐字相符；為全篇結構與自我設限的根據，高 load。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c20",
+      "claim_text": "「The first step is to parse SQL into an abstract syntax tree (AST).」",
+      "location": "H2「從 SQL 到準備執行」/ 第一步 parse",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n20"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The first step is to parse SQL into an abstract syntax tree (AST).",
+      "note": "逐字相符。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c21",
+      "claim_text": "「The next step is binding, which resolves every name in the AST against the catalog.」",
+      "location": "H2「從 SQL 到準備執行」/ 第二步 binding",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n21"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The next step is binding, which resolves every name in the AST against the catalog.",
+      "note": "逐字相符。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c22",
+      "claim_text": "「DuckDB walks the logical plan and picks a physical operator for each node based on the shape of its inputs and predicates.」optimizer 走過 logical plan，為每個節點挑一個 physical operator",
+      "location": "H2「從 SQL 到準備執行」/ 第三步 optimize（widget detail-3 與內文皆以「來源：」引號呈現）",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n22"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "DuckDB walks the logical plan and picks a physical operator for each node based on the shape of its inputs and predicates.",
+      "note": "Round 2 re-check：修正後 post 在 widget detail-3 與內文兩處皆改為逐字句「DuckDB walks the logical plan and picks a physical operator for each node based on the shape of its inputs and predicates.」。重新 WebFetch 來源確認此句逐字存在（主詞 'DuckDB'、句尾含 'based on the shape of its inputs and predicates'）。先前 round 1 的引號保真問題（主詞誤為 'The optimizer'、缺尾段）已解決，現為逐字相符的高 load 引用。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c23",
+      "claim_text": "「There are dozens more optimizations to explore and the entire optimization phase usually finishes in about a millisecond.」整個優化階段通常約一毫秒跑完。",
+      "location": "H2「從 SQL 到準備執行」",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n23"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "There are dozens more optimizations to explore and the entire optimization phase usually finishes in about a millisecond.",
+      "note": "來源 hedge（'usually'）；post 明說「注意『usually／約』這個語氣，它是來源自己收著講的，不是保證」並保留「通常／約」。約 1 ms 在 widget、數字表、串接段反覆出現，高 load；hedge 未上修。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c24",
+      "claim_text": "「A query joining six tables has 30,240 possible tree shapes, and the difference between best and worst can be orders of magnitude in runtime.」",
+      "location": "H2「從 SQL 到準備執行」/ widget detail-3",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n24"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "A query joining six tables has 30,240 possible tree shapes, and the difference between best and worst can be orders of magnitude in runtime.",
+      "note": "30,240 數字逐字相符；數字表收錄。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c25",
+      "claim_text": "「The default sample size is 20,480 rows. You can increase this, or set sample_size = -1 to inspect the whole file.」預設抽樣 20,480 列",
+      "location": "H2「從 SQL 到準備執行」/ CSV sniffer",
+      "type": "number",
+      "load": "medium",
+      "note_ids": [
+        "n25"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The default sample size is 20,480 rows. You can increase this, or set sample_size = -1 to inspect the whole file.",
+      "note": "20,480 列數字逐字相符；數字表收錄。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c26",
+      "claim_text": "前一節那個最多 122,880 列、256 KB block 的大粒度……點查卻會為了一個值被迫讀進一整個 256 KB block。",
+      "location": "H2「columnar 儲存」收尾段（取捨論述）",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [
+        "n11",
+        "n12"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Each column is split into row groups of up to 122,880 rows, and within a row group, into column segments that typically map to a single 256 KB block.",
+      "note": "數字（122,880 / 256 KB）由 n11、n12 支持；「點查為一個值讀進整個 block」為作者基於來源粒度的解讀，但所引數字本身有來源、且未捏造新數字，屬合理延伸而非新事實。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c27",
+      "claim_text": "合理的推測是，這也是 columnar 能在 disk 上少佔空間、進而少讀 block 的一部分原因——不過這點來源 Part 1 沒明寫機制，我只當作補充直覺，不算進它的主張。",
+      "location": "H2「columnar 儲存」末段（壓縮直覺）",
+      "type": "causal",
+      "load": "low",
+      "note_ids": [],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "作者明示為推測（「合理的推測是」「來源 Part 1 沒明寫機制，我只當作補充直覺，不算進它的主張」），符合出處四態的『推斷』且已標記。空 binding 因有 inference 標記而非 trace failure。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c28",
+      "claim_text": "合理的推測是：逐列處理的話，每一列都要付一次函式呼叫、分支判斷、邊界檢查的固定開銷，2,048 列一批就把這些 per-row 的零碎開銷攤平成 per-batch——但這層因果是我的推論，不是來源 Part 1 的明文主張，所以我把它標成推測。",
+      "location": "H2「chunk 與 pipeline」（為何批次）",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "作者明示為推論（「合理的推測是」「不是來源 Part 1 的明文主張，所以我把它標成推測」），符合『推斷』且已標記。空 binding 因 inference 標記而免除 trace failure。",
+      "action": "none",
+      "resolution": "none-needed"
+    }
+  ],
+  "checked_at": "2026-06-20",
+  "checker_rounds": 2,
+  "coverage": {
+    "candidate_claims": 30,
+    "checked": 28,
+    "dropped_low_load": 2
+  }
+}
