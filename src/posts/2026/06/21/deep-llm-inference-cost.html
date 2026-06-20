@@ -1,0 +1,309 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">同一張 NVIDIA B200，理論上算力吃滿要塞進 331 個併發使用者；真正開機跑起來，一張卡只服務得了 40 到 60 個——把這兩個數字分開的，不是算力，是那一份你可能從沒認真量過的 KV-cache。</p>
+  <h1 class="vg-post-title">用一張餐巾紙算清 LLM 推論的帳</h1>
+</header>
+
+<div class="vg-post-body">
+
+<p><span class="vg-dropcap">讀</span>完這篇，你會有一個能用一張餐巾紙就跑完的心算模型：給定一個模型大小、一張 GPU 的頻寬與算力，估出這張卡能同時服務幾個人、每生一個 token 要花多少時間、每個使用者攤到多少錢。injuly 那篇 napkin math 用一個 32B dense 模型配一張 B200 走完整套推導，最後落在每人一生約 133 美元。重點不是記住 133 這個數字——而是讓你能把自己的模型、自己的 GPU 代進同一條算式，自己重算一次。</p>
+
+<h2>你想自架一台卡對外服務——第一個要回答的問題</h2>
+
+<p>場景很具體。你手上有一個夠好的開源模型，想自己買卡、自己架推論服務，不再被雲端 API 的 per-token 報價綁住。買卡之前，第一個該回答的問題不是「快不快」，而是「一張卡能同時服務幾個人、每個人攤到多少成本」。這題決定了你的單位經濟學能不能成立——而它根本不需要跑 benchmark，一張餐巾紙就能估到量級。</p>
+
+<p>原文選的硬體與模型很明確：一個 32B dense 模型，作者的原話是「We'll assume a 32B dense model」，理由是這個尺寸已經夠好、生產可用，而且一張 B200 服務得了。模型維度方面，「A model of our size will typically have `d=8192` and `L=64`」——隱藏維度 8192、64 層。量化用 FP-8，每個參數 1 byte，所以 32B 參數佔的 VRAM 是「32GB (`32*10^9` bytes) in VRAM」。這三個數字後面會反覆用到，先記著。</p>
+
+<p>GPU 這邊只需要兩個規格。一個是記憶體頻寬，原文寫「Memory bandwidth: 8 TB/s (Or 8*10^12 bytes accessed per second)」；另一個是算力，「Compute intensity: 4500 TFLOP/s」。整套推導就建立在這兩個數字與上面三個模型參數上。沒有第六個輸入。</p>
+
+<h2>為什麼單一使用者卡在頻寬，不卡在算力</h2>
+
+<p>多數人對推論成本沒有直覺，因為唯一接觸到的價格是雲端 API 的 per-token 報價。那個價格是一個被層層攤提、加成、混了 margin 的終端數字，看不出底層的物理限制長什麼樣。要建立直覺，得先問一個更素的問題：生成一個 token，硬體到底做了什麼。</p>
+
+<p>autoregressive 生成是一個 token 一個 token 吐的。每吐一個，模型要做一次完整的前向傳播；而一次前向傳播，按原文的說法，「For a single forward pass we move all the model weights + KV-cache from VRAM to registers _once_」——要把全部模型權重加上 KV-cache，從 VRAM 搬到暫存器一次。對單一使用者來說，這就是關鍵：你搬了 32GB 的權重，卻只為了算這一個 token 的那幾十兆次乘加。</p>
+
+<p>把兩邊的時間擺在一起就看出問題。算力那側，矩陣乘法的浮點運算量是「Floating-point operations: 2BNd²」這個量級（B 是 batch、N 是序列長度、d 是維度）；頻寬那側，是搬 32GB 除以 8 TB/s。當 batch 只有一個人，算力幾乎是閒置的——卡花絕大部分時間在等記憶體把權重搬進來。這就是 memory-bound：瓶頸在頻寬，不在算力。一張要價數萬美元、號稱 4500 TFLOP/s 的卡，服務一個人的時候，那 4500 TFLOP/s 大半在發呆。</p>
+
+<p>值得把這個不對稱再嚼一次，因為它違反多數人的直覺。我們習慣以為「大模型很慢」是因為要算的東西多。但在單人推論這一格，算力幾乎不是限制——一次前向那 2BNd² 量級的浮點運算，對一張 4500 TFLOP/s 的卡來說是幾毫秒就吃完的小菜。真正花掉時間的，是把 32GB 權重從 VRAM 一路搬進暫存器。所以同一個 token，你付的是「搬運費」，不是「計算費」。記住這個區分，後面所有結論都從它長出來：誰決定速度？頻寬。誰決定併發上限？記憶體容量。算力反而是最不稀缺的那一項。</p>
+
+<p>這個事實直接指向解法：既然搬一次權重就只服務一個人太浪費，那就讓同一次搬運服務更多人。權重搬進來的那一瞬間，順手替第二、第三、第四個使用者也算一遍——這就是 batching。同一份權重只搬一次，卻同時推進 B 個人的生成，攤下來每個人的「搬運費」就降到原本的 B 分之一。問題只剩一個：到底要 batch 到多少人，才剛好把算力填滿、不再浪費頻寬。</p>
+
+<h2>arithmetic intensity——算力與頻寬的平衡點在哪</h2>
+
+<p>答案藏在一個比值裡：算力除以頻寬。B200 一秒能算 4500×10¹² 次浮點運算，一秒能搬 8×10¹² byte。兩者相除，原文給出一句很乾淨的結論：「A Blackwell class GPU can crunch bytes **562 times faster** than it can load them」——這張卡算 byte 的速度，是載 byte 的 562 倍。</p>
+
+<p>這個 562 就是這張卡的 arithmetic intensity 平衡點。它的意思是：每從記憶體載入一個 byte，你最好能在它身上做滿 562 次運算，才算把卡用滿；做不到，你就在浪費算力；超過，你就被頻寬卡住。推論的數學恰好讓每個 byte 的運算量正比於 batch size。原文的推導是這樣收的：每個 byte 目前做 2B 次運算（B 是併發人數），令它等於 562——「how many users should we serve to fully exhaust a B200's compute and bandwidth budget? \( 2B = 562 \implies B = 331 \)」。</p>
+
+<p>這個 562 是 B200 專屬的數字，但這條算式是通用的。換一張卡，你只要把它的 TFLOP/s 除以它的 TB/s，就得到那張卡自己的平衡點，再除以 2 就是它的理論併發。算力相對頻寬越高的卡，平衡點越大、越需要靠大 batch 才餵得飽；反過來，頻寬相對充裕的卡，少少幾個併發就吃滿了。所以「這張卡適合服務多少人」不是看單一規格，而是看算力與頻寬的比值——這正是 arithmetic intensity 這個詞要你盯著的東西。買卡前先算這一格，比看任何 marketing 數字都有用。</p>
+
+<p>解出來 B=331。也就是說，純從算力與頻寬的平衡看，一張 B200 要同時服務 331 個人，才剛好把算力與頻寬都吃滿。低於這個數，算力閒置；高於這個數，頻寬撐不住。下面這張圖把這條平衡線畫出來——橫軸是併發人數，兩條線分別是你需要的算力與你需要的頻寬，它們交會的地方就是 331。</p>
+
+<figure class="vg-w-roofline-balance" data-mobile="keep">
+  <style>
+    .vg-w-roofline-balance { display: grid; gap: var(--s-2); margin: var(--s-4) 0; }
+    .vg-w-roofline-balance svg { width: 100%; height: auto; }
+    .vg-w-roofline-balance figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+  </style>
+  <svg viewBox="0 0 720 360" preserveAspectRatio="xMidYMid meet" role="img" aria-label="算力需求與頻寬上限隨併發人數變化，交會於 331">
+    <line x1="64" y1="300" x2="700" y2="300" stroke="var(--muted-2)" stroke-width="1" />
+    <line x1="64" y1="28"  x2="64"  y2="300" stroke="var(--muted-2)" stroke-width="1" />
+    <text x="382" y="338" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--muted)">併發使用者數 B</text>
+    <text x="24" y="164" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--muted)" transform="rotate(-90 24 164)">每 byte 的運算需求</text>
+
+    <g font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">
+      <text x="58" y="304" text-anchor="end">0</text>
+      <text x="58" y="218" text-anchor="end">562</text>
+      <text x="58" y="120" text-anchor="end">1124</text>
+    </g>
+    <g font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">
+      <text x="64" y="318" text-anchor="middle">0</text>
+      <text x="382" y="318" text-anchor="middle">331</text>
+      <text x="700" y="318" text-anchor="middle">662</text>
+    </g>
+
+    <line x1="64" y1="218" x2="700" y2="218" stroke="var(--sage-deep)" stroke-width="2" stroke-dasharray="6 4" />
+    <text x="690" y="210" text-anchor="end" font-family="Manrope, sans-serif" font-size="12" fill="var(--sage-deep)">頻寬天花板：562 ops/byte</text>
+
+    <line x1="64" y1="300" x2="700" y2="36" stroke="var(--accent)" stroke-width="2.5" />
+    <text x="486" y="92" font-family="Manrope, sans-serif" font-size="12" fill="var(--accent-text)">算力需求 = 2B ops/byte</text>
+
+    <circle cx="382" cy="218" r="7" fill="var(--accent)" stroke="var(--bg)" stroke-width="2" />
+    <line x1="382" y1="218" x2="382" y2="300" stroke="var(--accent)" stroke-width="1" stroke-dasharray="3 3" />
+    <text x="392" y="200" font-family="EB Garamond, serif" font-size="14" font-style="italic" fill="var(--ink)">平衡點 B = 331</text>
+
+    <rect x="80" y="244" width="290" height="44" rx="6" fill="color-mix(in srgb, var(--accent) 8%, transparent)" />
+    <text x="92" y="262" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">B &lt; 331：算力閒置，頻寬撐得住</text>
+    <text x="92" y="280" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">每搬一份權重只服務少數人，浪費</text>
+  </svg>
+  <figcaption>橙線是 batch 到 B 人時每 byte 需要的運算量（2B），綠色虛線是這張卡每 byte 能負擔的運算量上限（562）。兩線交於 B=331——這是只看算力與頻寬時的理論併發數。但這張圖刻意沒畫記憶體容量，而那才是真正的牆。</figcaption>
+</figure>
+
+<p>到這裡，餐巾紙似乎給了一個漂亮的答案：331。如果故事在這裡結束，自架推論的單位經濟學會非常好看。但這張平衡圖藏了一個東西沒畫——它假設記憶體永遠裝得下 331 個人的資料。實際上裝不下，而裝不下的那一份，就是 KV-cache。</p>
+
+<h2>KV-cache——把 331 拉回 40 的那道牆</h2>
+
+<p>先講 KV-cache 是什麼，因為它是整篇成本帳裡最反直覺的一項。autoregressive 生成每吐一個新 token，理論上要重新看過前面所有 token 一遍。如果每次都從頭重算，長對話會慢到不能用。所以推論引擎會把已經算過的東西存起來——原文的說法是「To avoid re-processing the entire chat history _again_ for every new word, inference engines will cache the K,V pairs for reuse」，把每一層、每個 token 的 K 與 V 向量快取下來重用。這就是 KV-cache，它是讓長對話可行的關鍵最佳化。</p>
+
+<p>但它要錢，而且很貴。快取的大小正比於序列長度、層數、維度。公式裡那個 2 是因為每個位置要存 K 與 V 兩份向量；N 是序列裡的 token 數，每個 token 都得留一份；L 是層數，每一層都有自己獨立的一份 K、V；d 是這些向量的維度。四者相乘，cache 就是「每層、每 token、各存一對 d 維向量」的總和。假設一個 200k token 的 context window（「Let's assume a context window of \(N\)=200k tokens」），純 multi-head attention 下，原文直接給出公式與結果：「KV cache size = 2 * N * L * d = 2 * 200_000 * 64 * 8196 = 210 GB (!!)」。一個人的對話，KV-cache 就要 210GB。一張 B200 的整個記憶體都裝不下這一份——你還沒開始服務第二個人，光一個人的 context 就把卡塞爆了。後面那兩個驚嘆號不是誇張。</p>
+
+<p>救命的是 Grouped-Query Attention。它的想法是讓多個 query head 共用同一組 KV head。原文寫得很白：「It shares the same KV-head across multiple Query heads. So for 64 query heads, we'll use a total of only 8 KV-heads」——64 個 query head 只配 8 個 KV head，cache 因此縮小 64÷8 = 8 倍。GQA 論文對這個設計的定義是「a generalization of multi-query attention which uses an intermediate (more than one, less than number of query heads) number of key-value heads」，也就是在 multi-head 與 multi-query 兩個極端之間取一個中間值。套用之後，原文說「With GQA our KV-cache is now at ~26GB _per chat sequence (or per user)_」——每個使用者的 KV-cache 降到約 26GB。下面這張圖把這道牆的高度畫出來。</p>
+
+<figure class="vg-w-kvcache-wall" data-mobile="keep">
+  <style>
+    .vg-w-kvcache-wall { display: grid; gap: var(--s-2); margin: var(--s-4) 0; }
+    .vg-w-kvcache-wall svg { width: 100%; height: auto; }
+    .vg-w-kvcache-wall figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+  </style>
+  <svg viewBox="0 0 720 340" preserveAspectRatio="xMidYMid meet" role="img" aria-label="每個使用者的 KV-cache：純 MHA 210GB，GQA 後 26GB">
+    <line x1="120" y1="280" x2="700" y2="280" stroke="var(--muted-2)" stroke-width="1" />
+    <text x="36" y="160" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--muted)" transform="rotate(-90 36 160)">每位使用者 KV-cache (GB)</text>
+
+    <g font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">
+      <text x="112" y="284" text-anchor="end">0</text>
+      <text x="112" y="200" text-anchor="end">100</text>
+      <text x="112" y="116" text-anchor="end">200</text>
+    </g>
+
+    <rect x="160" y="73" width="150" height="207" rx="4" fill="color-mix(in srgb, var(--accent) 22%, transparent)" stroke="var(--accent)" stroke-width="1.5" />
+    <text x="235" y="64" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="15" fill="var(--accent-text)">210 GB</text>
+    <text x="235" y="300" text-anchor="middle" font-family="Manrope, sans-serif" font-size="12" fill="var(--ink)">純 MHA</text>
+    <text x="235" y="318" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">2·N·L·d</text>
+
+    <rect x="470" y="258" width="150" height="22" rx="4" fill="color-mix(in srgb, var(--sage-deep) 28%, transparent)" stroke="var(--sage-deep)" stroke-width="1.5" />
+    <text x="545" y="248" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="15" fill="var(--sage-deep)">26 GB</text>
+    <text x="545" y="300" text-anchor="middle" font-family="Manrope, sans-serif" font-size="12" fill="var(--ink)">GQA（8 個 KV head）</text>
+    <text x="545" y="318" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">縮小 8 倍</text>
+
+    <path d="M 318 150 C 400 150 390 250 462 262" fill="none" stroke="var(--ink-deep)" stroke-width="1.5" stroke-dasharray="4 3" />
+    <text x="390" y="140" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" font-style="italic" fill="var(--ink-deep)">÷ 8</text>
+
+    <line x1="120" y1="207" x2="700" y2="207" stroke="var(--ink)" stroke-width="1" stroke-dasharray="2 4" />
+    <text x="690" y="200" text-anchor="end" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">一張卡可用記憶體量級（扣掉 32GB 權重後）</text>
+  </svg>
+  <figcaption>純 multi-head 下單人 KV-cache 210GB，遠超一張卡裝得下的量；GQA 把 64 個 query head 收斂到 8 個 KV head，砍成 26GB。即使如此，扣掉 32GB 權重後，剩下的記憶體也只夠塞少數個 26GB——這就是為什麼實際併發遠低於算力允許的 331。</figcaption>
+</figure>
+
+<p>現在把帳算清楚。一張卡的記憶體先被 32GB 權重吃掉，剩下的空間每個使用者要 26GB。算力允許 331 人，但記憶體只夠塞幾十個人的 cache。兩個限制取較緊的那個，併發數就被記憶體拉了下來。原文的結論是「Depending on the median user activity, you can serve anywhere between **40-60 users per Blackwell chip**」——視使用者活躍度，一張 Blackwell 實務上服務 40 到 60 人。算力理論值 331 與這個 40-60 之間的鴻溝，整條都是 KV-cache 挖出來的。</p>
+
+<p>那要怎麼逼近理論值？靠 PagedAttention。它不假設每個使用者都用滿 200k context——大多數對話遠短於此。vLLM 論文把它描述成「an attention algorithm inspired by the classical virtual memory and paging techniques in operating systems」，仿作業系統的虛擬記憶體分頁：把 KV-cache 切成固定大小的 block，誰的對話長了就多配幾塊，短的就少配。不必為每個使用者預留最壞情況的整段空間。同一篇論文量化過效果——「vLLM improves the throughput of popular LLMs by 2-4× with the same level of latency compared to the state-of-the-art systems」，吞吐量在延遲不變的前提下提升 2 到 4 倍。下面這個 worked example 把三項最佳化各自鬆動哪一條限制攤開。</p>
+
+<figure class="vg-w-optstack" data-mobile="keep">
+  <style>
+    .vg-w-optstack { display: grid; gap: var(--s-2); margin: var(--s-4) 0; }
+    .vg-w-optstack svg { width: 100%; height: auto; }
+    .vg-w-optstack figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+  </style>
+  <svg viewBox="0 0 720 320" preserveAspectRatio="xMidYMid meet" role="img" aria-label="三項最佳化各自鬆動的限制">
+    <g font-family="Manrope, sans-serif">
+      <rect x="40" y="30" width="640" height="76" rx="8" fill="color-mix(in srgb, var(--accent) 8%, transparent)" stroke="var(--accent)" stroke-width="1.5" />
+      <text x="60" y="58" font-family="EB Garamond, serif" font-size="17" fill="var(--accent-text)">KV-caching</text>
+      <text x="60" y="80" font-size="12" fill="var(--ink)">鬆動：每生一 token 不必重算整段歷史</text>
+      <text x="60" y="98" font-size="11" fill="var(--muted)">代價：要存下每層每 token 的 K、V，記憶體開始吃緊</text>
+      <text x="664" y="72" text-anchor="end" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--accent-text)">省算力</text>
+
+      <rect x="40" y="122" width="640" height="76" rx="8" fill="color-mix(in srgb, var(--sage-deep) 10%, transparent)" stroke="var(--sage-deep)" stroke-width="1.5" />
+      <text x="60" y="150" font-family="EB Garamond, serif" font-size="17" fill="var(--sage-deep)">GQA</text>
+      <text x="60" y="172" font-size="12" fill="var(--ink)">鬆動：64 個 query head 共用 8 個 KV head，cache 砍 8 倍</text>
+      <text x="60" y="190" font-size="11" fill="var(--muted)">代價：表達能力下降，是 multi-head 與 multi-query 之間的折衷</text>
+      <text x="664" y="164" text-anchor="end" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--sage-deep)">省記憶體</text>
+
+      <rect x="40" y="214" width="640" height="76" rx="8" fill="color-mix(in srgb, var(--ink-deep) 10%, transparent)" stroke="var(--ink-deep)" stroke-width="1.5" />
+      <text x="60" y="242" font-family="EB Garamond, serif" font-size="17" fill="var(--ink-deep)">PagedAttention</text>
+      <text x="60" y="264" font-size="12" fill="var(--ink)">鬆動：分頁配置 cache，短對話不必預留 200k 的最壞空間</text>
+      <text x="60" y="282" font-size="11" fill="var(--muted)">代價：多一層 block table indirection；vLLM 量到吞吐 2-4 倍</text>
+      <text x="664" y="256" text-anchor="end" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--ink-deep)">提併發</text>
+    </g>
+  </svg>
+  <figcaption>三項最佳化不是疊在同一條限制上——KV-caching 省的是算力（不重算），GQA 省的是記憶體（cache 砍 8 倍），PagedAttention 提的是併發（不浪費預留空間）。把三者疊起來，才把一張卡從「只能服務一個人」推到實務的 40-60 人。</figcaption>
+</figure>
+
+<h2>一張餐巾紙的最後一行——時間與錢</h2>
+
+<p>限制理清了，把時間與成本算出來就只剩加減乘除。記憶體那側，一次 forward pass 要搬的是權重加上一個 batch 內所有人的 KV-cache。原文舉的例子加總約 190GB，除以頻寬：「= 190GB / (8*10**3) GBps = 0.02375 seconds = 23.75 ms」——每個 forward pass 約 23.75 毫秒。一個 forward pass 吐一個 token，所以這個 batch 內每個人每秒拿到的 token 數，原文算成「For 1s (=1000ms), we generate roughly 250 tokens for 6 users, or about 40 tokens per user per second」，每人約 40 tokens/s。差不多就是人能舒服讀完的速度。</p>
+
+<p>成本那側更直接。原文以服務 300 人來攤一張卡的硬體：「Realistically, serving 300 users per GPU you'll spend a lifetime cost of about $133 per user, plus the datacenter/upkeep bill」——每人一生攤到約 133 美元，外加機房維運。注意這裡的 300 跟前面瞬間併發的 40-60 是不同口徑：300 含了使用者大部分時間是閒置的這層 duty cycle 假設。如果你是租卡不是買卡，另一個口徑是「At an hourly rate of $4 ... For `num_users=300` you get an hourly rate of about $0.013 per user, or `$9.36` per month」——以 4 美元時租、攤到 300 人，每人每小時 0.013 美元、每月 9.36 美元。下面這張表把整條餐巾紙的數字按推導順序排好，給你一個可以照抄改數字的骨架。</p>
+
+<figure class="vg-w-napkin-table" data-mobile="keep">
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M3 3v18h18"/><path d="m7 14 4-4 4 4 4-6"/>
+    </svg>
+    <span>整條餐巾紙推導的數字鏈 · 7 行從輸入到每人成本</span>
+  </p>
+  <style>
+    .vg-w-napkin-table { overflow-x: auto; margin: var(--s-4) 0; }
+    .vg-w-napkin-table table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+    .vg-w-napkin-table thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); }
+    .vg-w-napkin-table tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+    .vg-w-napkin-table td.val { font-family: var(--mono); font-variant-numeric: tabular-nums; color: var(--accent-text); white-space: nowrap; }
+    .vg-w-napkin-table figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-2); }
+  </style>
+  <table>
+    <thead>
+      <tr><th>推導環節</th><th>數值</th><th>來源</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>模型權重（32B 參數 · FP-8）</td><td class="val">32 GB</td><td>32×10⁹ bytes</td></tr>
+      <tr><td>單人 KV-cache · 純 MHA（N=200k, L=64, d=8192）</td><td class="val">210 GB</td><td>2·N·L·d</td></tr>
+      <tr><td>單人 KV-cache · GQA（8 KV head）</td><td class="val">26 GB</td><td>÷ 8</td></tr>
+      <tr><td>算力 ÷ 頻寬（4500 TFLOP/s ÷ 8 TB/s）</td><td class="val">562 ×</td><td>arithmetic intensity</td></tr>
+      <tr><td>吃滿算力的理論併發（2B = 562）</td><td class="val">331 人</td><td>平衡點</td></tr>
+      <tr><td>受 KV-cache 限制的實務併發</td><td class="val">40–60 人</td><td>per Blackwell</td></tr>
+      <tr><td>每人一生成本（攤 300 人 · $40k 一張卡）</td><td class="val">$133</td><td>+ 機房維運</td></tr>
+    </tbody>
+  </table>
+  <figcaption>整條餐巾紙就是這七行。把第一欄換成你自己的模型與 GPU 規格、第二欄重算，最後一行就是你自架的每人成本量級。它不會給你精確報價，但會告訴你「這個規模的服務，自己養卡值不值得」。</figcaption>
+</figure>
+
+<p>現在輪到你自己跑這張餐巾紙。下面是一個可以拖的成本估算器：把模型大小、GPU 頻寬、攤提人數三個輸入拉一拉，看併發、單 token 時間與每人成本怎麼跟著動。它用的就是上面這條算式——不是預先算好的假數字，每次拖動都重新代入公式。</p>
+
+<figure class="vg-w-cost-estimator" data-mobile="swap" data-mobile-summary="自己拖三個輸入就懂：模型越大、頻寬越低，每人成本越高；真正壓低單價的是把更多人攤到同一張卡上，而能攤幾個人由 KV-cache 容量決定，不是算力。">
+  <style>
+    .vg-w-cost-estimator { display: grid; gap: var(--s-3); margin: var(--s-4) 0; }
+    .vg-w-cost-estimator .ctl { display: grid; grid-template-columns: 11rem 1fr 7rem; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+    .vg-w-cost-estimator .ctl input { width: 100%; height: 36px; accent-color: var(--accent); touch-action: none; }
+    .vg-w-cost-estimator .ctl .readout { font-variant-numeric: tabular-nums; color: var(--ink); text-align: right; }
+    .vg-w-cost-estimator .out { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--s-2); }
+    .vg-w-cost-estimator .card { border: 1px solid var(--line); border-radius: 8px; padding: var(--s-2); text-align: center; }
+    .vg-w-cost-estimator .card .k { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+    .vg-w-cost-estimator .card .v { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 1.4rem; color: var(--accent-text); margin-top: var(--s-1); }
+    .vg-w-cost-estimator .card .u { font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); }
+    .vg-w-cost-estimator .note { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    @media (max-width: 720px) {
+      .vg-w-cost-estimator .ctl { grid-template-columns: 1fr; gap: var(--s-1); }
+      .vg-w-cost-estimator .ctl .readout { text-align: left; }
+      .vg-w-cost-estimator .out { grid-template-columns: 1fr; }
+    }
+  </style>
+
+  <div class="ctl" data-vg-controls>
+    <label for="vg-w-cost-estimator-size">模型大小</label>
+    <input id="vg-w-cost-estimator-size" type="range" min="3" max="120" step="1" value="32" />
+    <span class="readout" id="vg-w-cost-estimator-size-out">32 B</span>
+  </div>
+  <div class="ctl" data-vg-controls>
+    <label for="vg-w-cost-estimator-bw">GPU 頻寬</label>
+    <input id="vg-w-cost-estimator-bw" type="range" min="1" max="12" step="0.5" value="8" />
+    <span class="readout" id="vg-w-cost-estimator-bw-out">8 TB/s</span>
+  </div>
+  <div class="ctl" data-vg-controls>
+    <label for="vg-w-cost-estimator-users">攤提人數</label>
+    <input id="vg-w-cost-estimator-users" type="range" min="20" max="500" step="10" value="300" />
+    <span class="readout" id="vg-w-cost-estimator-users-out">300 人</span>
+  </div>
+
+  <div class="out">
+    <div class="card"><div class="k">每 forward pass</div><div class="v" id="vg-w-cost-estimator-ms">23.8</div><div class="u">毫秒 / token</div></div>
+    <div class="card"><div class="k">每人 token 速度</div><div class="v" id="vg-w-cost-estimator-tps">40</div><div class="u">tokens / 秒</div></div>
+    <div class="card"><div class="k">每人一生成本</div><div class="v" id="vg-w-cost-estimator-cost">133</div><div class="u">美元（$40k 攤提）</div></div>
+  </div>
+
+  <p class="note" id="vg-w-cost-estimator-note">以原文基準（32B、8 TB/s、攤 300 人、batch 6）為預設，往兩側拖看每項怎麼動。</p>
+
+  <script>
+    (function () {
+      if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+      const root = document.querySelector('.vg-w-cost-estimator');
+      const sizeI = root.querySelector('#vg-w-cost-estimator-size');
+      const bwI = root.querySelector('#vg-w-cost-estimator-bw');
+      const usersI = root.querySelector('#vg-w-cost-estimator-users');
+      const sizeO = root.querySelector('#vg-w-cost-estimator-size-out');
+      const bwO = root.querySelector('#vg-w-cost-estimator-bw-out');
+      const usersO = root.querySelector('#vg-w-cost-estimator-users-out');
+      const msO = root.querySelector('#vg-w-cost-estimator-ms');
+      const tpsO = root.querySelector('#vg-w-cost-estimator-tps');
+      const costO = root.querySelector('#vg-w-cost-estimator-cost');
+      const noteO = root.querySelector('#vg-w-cost-estimator-note');
+
+      // 固定假設，與原文一致：FP-8（1 byte/param）、GQA 後每人 KV-cache 26GB、
+      // batch 6（原文 forward-pass 例子的 batch）、卡價 $40,000。
+      const BATCH = 6;           // 同一次 forward pass 內的併發人數
+      const KV_PER_USER = 26;    // GB，GQA 後每人
+      const CARD_PRICE = 40000;  // 美元一張卡
+
+      function update() {
+        const sizeB = Number(sizeI.value);          // 模型參數，單位 B
+        const bw = Number(bwI.value);               // 頻寬，TB/s
+        const users = Number(usersI.value);         // 攤提人數
+
+        const weightsGB = sizeB;                    // FP-8：1 byte/param → GB == B
+        const movedGB = weightsGB + BATCH * KV_PER_USER;  // 一次 forward pass 搬的量
+        const bwGBps = bw * 1000;                   // TB/s → GB/s
+        const ms = (movedGB / bwGBps) * 1000;       // 毫秒/token
+        const tps = 1000 / ms;                      // 每 batch 每秒 token，≈ 每人速度
+        const cost = CARD_PRICE / users;            // 每人一生成本
+
+        sizeO.textContent = sizeB + ' B';
+        bwO.textContent = bw + ' TB/s';
+        usersO.textContent = users + ' 人';
+        msO.textContent = ms.toFixed(1);
+        tpsO.textContent = Math.round(tps);
+        costO.textContent = Math.round(cost);
+
+        let msg;
+        if (sizeB >= 64) {
+          msg = '模型一變大，每次搬的權重就變多，單 token 變慢、速度掉——大模型往往得跨多卡，餐巾紙到這裡開始失準。';
+        } else if (bw <= 4) {
+          msg = '頻寬一掉，memory-bound 的本質立刻現形：token 速度幾乎與頻寬成正比，這才是單人推論的真瓶頸。';
+        } else if (users <= 60) {
+          msg = '攤提人數壓到實務併發 40-60 這一帶，每人成本跳上去——這正是 KV-cache 容量把單位經濟學頂回來的地方。';
+        } else {
+          msg = '攤的人越多、每人越便宜，但能攤幾個人受 KV-cache 限制，不是把滑桿拉到底就成立。';
+        }
+        noteO.textContent = msg;
+      }
+
+      [sizeI, bwI, usersI].forEach(function (el) { el.addEventListener('input', update); });
+      update();
+    })();
+  </script>
+</figure>
+
+<p>這裡有一個容易踩的坑，得特別點出來：成本帳用的 300 人，跟前面瞬間併發的 40-60 人，是兩個不同口徑，不能混為一談。40-60 是任一瞬間真正在同時生成 token 的人數，受 KV-cache 容量硬限。300 則是「同時掛在這個服務上」的帳號數——因為聊天場景裡，使用者大部分時間在讀、在想、在打字，並沒有真的在吐 token。一張卡靠著這層閒置時間的稀釋，可以掛住遠多於瞬間併發數的帳號。攤提成本算的是後者，因為帳是按「養活了多少使用者」分的，不是按「同一瞬間擠了多少人」。把這兩個數字弄混，你會把每人成本高估好幾倍。</p>
+
+<p>拖過一輪你會抓到三件事。模型一變大，搬的權重變多、單 token 變慢——而真正大的模型得跨多卡，原文也明說到那裡「our math is still directionally valid, but the use of napkins is ill-advised」，方向仍對但餐巾紙不再可靠。頻寬一掉，token 速度幾乎等比例往下掉，把 memory-bound 的本質暴露得一清二楚。攤提人數往 40-60 那帶壓，每人成本立刻跳高——這條曲線就是 KV-cache 容量在單位經濟學上的投影。</p>
+
+<p>這張餐巾紙不會給你精確報價。它給你的是量級判斷力：自架 32B、服務幾百人這個規模，每人成本落在百元美金量級而非千元，所以值不值得買卡，取決於你的使用者數能不能撐到讓硬體攤得開。換個模型、換張卡，七行重算一次，答案就出來——而你不再需要先簽一張雲端帳單才知道自己在跟什麼樣的物理在打交道。</p>
+
+<p class="vg-deep-closer"><strong>Take-away</strong>：LLM 推論成本是兩個物理量的拉鋸——權重搬運的頻寬，與 KV-cache 佔的記憶體。算力幾乎從不是瓶頸；真正決定一張卡服務幾個人、每人多少錢的，是那份你得親手量一次的 KV-cache。</p>
+
+</div>
