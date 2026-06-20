@@ -1,0 +1,432 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">同一份資料，丟進 Postgres 跑 aggregate 慢吞吞，換 DuckDB 卻像換了一台機器——可是它連 server 都沒有，就是一個小於 20 MB 的 binary 載進你的 process 裡。如果你以為這是因為「它比較新、比較會調 cache」，那這篇要拆給你看：它的快是四件事疊出來的，每一件都直接對著「分析查詢慢在哪」這個問題下手。</p>
+  <h1 class="vg-post-title">DuckDB 為何快——把一個 in-process 分析引擎從零拆開</h1>
+</header>
+
+<div class="vg-post-prose">
+
+<p><span class="vg-dropcap">先</span>講清楚這篇會給你什麼：讀完之後，看到「DuckDB 跑分析查詢很快」這句話，你腦子裡會浮出一張具體的圖，而不是一句「因為它是 columnar 嘛」。這張圖有四層——in-process 省掉資料傳輸、columnar 省掉讀不到的欄、zone map 省掉掃不到的資料、批次化 pipeline 省掉 per-row 的零碎開銷。底下會從你已經熟的東西（一條 SQL、一張表、一個 WHERE）開始，一層一層往上爬，每一層都對應 DuckDB 文件裡一個具體的數字或機制。要先標清楚範圍：這篇講的是 greybeam 那篇 DuckDB Internals 的 Part 1——從 SQL 字串到「引擎準備好執行」這段路、加上底下的儲存層；真正的 query execution（怎麼把資料一個 chunk 一個 chunk 算出來）作者明說留到 Part 2，所以下面凡是碰到執行細節，我會誠實地停在來源停的地方，不替它編。</p>
+
+<p>DuckDB 本身的來歷值得先擺一句：按來源的說法，它「從 2019 年 CWI Amsterdam 的一個研究專案，變成過去十年最廣泛採用的資料庫之一」。一個從學術機構長出來的嵌入式資料庫能跑到這個普及度，靠的不是行銷，是它對「分析型 workload」這件事做對了一連串結構選擇。我們從第一個、也是最根本的那個選擇講起。</p>
+
+<h2>in-process 與 analytical——這兩個詞先定義清楚，後面全建立在它們上面</h2>
+
+<p>來源開宗明義給了定義，逐字是這樣：「DuckDB is an in-process analytical SQL database. Analytical means it's optimized for the kind of queries that scan millions of rows to filter, aggregate, and join — not the kind that look up a single record by primary key. In-process means there's no server.」這句話塞了兩個關鍵詞，拆開講。</p>
+
+<p>先講 <em>analytical</em>。它是相對於 transactional 講的。交易型查詢的典型長相是「給我 user_id = 8472 那一筆」——用一個 key 撈一筆、改一筆，碰的資料量小但要求即時、要求一致。分析型查詢的長相完全相反：「過去一年每個地區的營收加總」——它要掃過上百萬列，做 filter、aggregate、join，碰的資料量大但通常一次跑完就好。這兩種 workload 對儲存與執行的要求是衝突的，沒有一套設計能同時把兩邊都做到最好。DuckDB 明確選了分析這一邊，所以底下每一個設計，你都要放在「它在為掃描很多列優化」這個前提下看，才會看懂它為什麼那樣選。</p>
+
+<p>再講 <em>in-process</em>。Postgres、Snowflake、BigQuery 這些都是 server——你的程式透過網路（或 socket）連到一個獨立跑著的 database process，把 query 送過去、把結果拉回來。DuckDB 沒有這個 server。來源的講法很直接：「You load libduckdb into your program and call functions directly against it.」你把 libduckdb 這個函式庫載進自己的程式，直接呼叫它的函式，資料庫就活在你的 process 裡，跟你的程式共用同一塊記憶體位址空間。它「ships as a single binary under 20 MB with no external dependencies」——一個小於 20 MB、沒有外部相依的單一 binary。這就是為什麼你 <code>pip install duckdb</code> 之後不用起任何 daemon、不用配 port、不用管連線池。</p>
+
+<p>這裡要先擋掉一個常見的誤會：in-process 不等於「就是 SQLite」。SQLite 同樣是嵌入式、同樣沒有 server、同樣是一個小 binary 載進你的程式——這部分兩者一樣。差別在另一個詞：SQLite 是為交易型 workload 設計的 row store，DuckDB 是為分析型 workload 設計的 column store。同樣都活在你的 process 裡，一個擅長「用 primary key 撈一筆、改一筆」，一個擅長「掃幾百萬列做 aggregate」。所以「嵌入式」是它們的共同點，「為哪種 workload 排佈資料」才是它們分道揚鑣的地方——而那正是下面三層要講的。把這兩個維度分開看很重要：是否有 server，跟資料怎麼排，是兩件獨立的事，DuckDB 剛好在前者選了「無」、在後者選了「columnar」。</p>
+
+<p>「沒有 server」聽起來只是部署上的方便，但它在效能上連帶解決了一個分析查詢特有的、很容易被忽略的開銷——下一節就是它。</p>
+
+<h2>結果的搬運成本——為什麼「沒有 server」本身就是一種加速</h2>
+
+<p>想像一個 server 型資料庫算完了一個一億列的結果。算完不等於結束——這一億列還得從 database process 搬到你的 client process。來源點出傳統介面在這一步有多貴：「ODBC and JDBC hand back results one row and one value at a time, which means the client makes a separate function call for every field in every row. On a 100-million-row result, that's hundreds of millions of function calls.」一次回一列一值，每個 field 都是一次 function call，一億列的結果就是上億次跨界呼叫。對點查（回一筆）這完全無所謂；對分析查詢（動輒回幾百萬幾千萬列）這個搬運成本可以很驚人。</p>
+
+<p>這不是隨口一說。來源把它掛到一份具體研究上：「In 2017, Mark Raasveldt and Hannes Mühleisen published Don't Hold My Data Hostage, a paper measuring what actually happens when you pull a result set out of a warehouse.」2017 年 Raasveldt 與 Mühleisen 那篇〈Don't Hold My Data Hostage〉，量的就是「把一個 result set 從 warehouse 拉出來，實際上發生了什麼」。這兩個名字正是 DuckDB 的作者——他們先量到了痛，才做了藥。</p>
+
+<p>in-process 怎麼治這個痛？因為資料庫跟你的程式在同一個位址空間，結果根本不必序列化、不必跨 process 複製。來源講了它的上限，但語氣是收著的：「In the best case, DuckDB can read the same underlying buffers the Python process already owns, so it avoids materializing a second full copy of the data. This is zero-copy!」最佳情況下，DuckDB 能直接讀 Python process 本來就持有的那塊 buffer，省掉複製第二份——這就是 zero-copy。注意「In the best case」這個前綴不能拿掉。緊接著作者自己補了條件：「In practice, whether the path is truly zero-copy depends on the dataframe's physical layout, column types, null representation, and string storage.」實務上是不是真的 zero-copy，要看 dataframe 的實體佈局、欄型別、null 怎麼表示、字串怎麼存。所以正確的心智模型不是「DuckDB 一定 zero-copy」，而是「in-process 讓 zero-copy 變成可能，能不能拿到看資料長相」。這層省下的，是把答案從引擎搬到你手上的那段路。</p>
+
+<p>下一層往更裡面走：就算不算搬運，光是「從 disk 讀出要算的資料」這一步，row store 與 column store 的成本就差得很遠。</p>
+
+<h2>columnar 儲存——一個 4 欄查詢，不該為另外 296 欄付錢</h2>
+
+<p>這是分析資料庫最常被提到、卻最常被講得很糊的一層。把它具體化。來源給的對照例子是這樣：一張 300 欄的表，你的查詢只 SELECT 其中 4 欄。「A query that reads 4 columns from a 300 column table only needs to read those 4 columns. On a row store, all 300 columns would be read and 296 of those will need to be discarded.」column store 只讀那 4 欄；row store 因為「A row store keeps entire records contiguous on disk」——整筆 record 在 disk 上是連續擺的——你要拿到任何一欄，都得把整列（含另外 296 欄）讀進來，再把用不到的 296 欄丟掉。</p>
+
+<p>為什麼 row store 不能只挑那 4 欄讀？因為實體佈局決定了你能跳著讀的單位。row store 把「第一列的全部 300 欄、第二列的全部 300 欄……」這樣相鄰擺，第 5 欄的值散落在每一列裡、彼此隔著另外 299 欄的距離；disk 與 OS 又是以 block 為單位搬資料的，你為了那 4 欄碰到的每個 block 裡，塞著一大堆你不要的欄。column store 反過來：把「全部列的第 1 欄擺一起、全部列的第 2 欄擺一起……」，於是「只讀 4 欄」變成「只碰 4 段連續區域」，I/O 量直接正比於你查的欄數，而不是表的總欄數。</p>
+
+<p>下面這個 widget 把這個關係做成可以拖的：拉動「查詢選取的欄數」，看 row store 與 columnar 各自要碰多少資料。row store 那條線是平的——不管你選幾欄，它永遠讀滿 300 欄；columnar 那條線跟著你選的欄數走。兩條線之間的縫，就是 columnar 在分析 workload 上省下的東西。</p>
+
+<figure class="vg-w-param-demo-scan-cost" data-mobile="static" data-svg-scroll="720">
+  <style>
+    .vg-w-param-demo-scan-cost { display: grid; grid-template-rows: auto 1fr auto; gap: var(--s-2); }
+    .vg-w-param-demo-scan-cost .controls { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+    .vg-w-param-demo-scan-cost .controls input { flex: 1; height: 36px; accent-color: var(--accent); touch-action: none; }
+    .vg-w-param-demo-scan-cost .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 18ch; text-align: right; }
+    .vg-w-param-demo-scan-cost svg { width: 100%; height: auto; }
+    .vg-w-param-demo-scan-cost figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+  </style>
+
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M5 9l-3 3 3 3"/><path d="M9 5l3-3 3 3"/><path d="M15 19l-3 3-3-3"/><path d="M19 9l3 3-3 3"/><path d="M2 12h20"/><path d="M12 2v20"/>
+    </svg>
+    <span>拖滑桿改變查詢選取的欄數 · 對照一張 300 欄的表</span>
+  </p>
+
+  <div class="controls" data-vg-controls>
+    <label for="vg-w-param-demo-scan-cost-x">SELECT 的欄數 =</label>
+    <input id="vg-w-param-demo-scan-cost-x" type="range" min="1" max="300" value="4" />
+    <span class="readout" id="vg-w-param-demo-scan-cost-readout">4 欄</span>
+  </div>
+
+  <svg class="vg-w-param-demo-scan-cost-main" viewBox="0 0 720 300" preserveAspectRatio="xMidYMid meet" role="img" aria-label="row store 與 columnar 讀取量對照圖">
+    <line x1="64" y1="250" x2="700" y2="250" stroke="var(--muted-2)" stroke-width="1" />
+    <line x1="64" y1="24"  x2="64"  y2="250" stroke="var(--muted-2)" stroke-width="1" />
+    <text x="382" y="284" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--muted)">查詢選取的欄數（共 300 欄）</text>
+    <text x="22"  y="137" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--muted)" transform="rotate(-90 22 137)">實際讀進的欄數</text>
+
+    <g font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">
+      <text x="60" y="254" text-anchor="end">0</text>
+      <text x="60" y="175" text-anchor="end">100</text>
+      <text x="60" y="100" text-anchor="end">200</text>
+      <text x="60" y="28" text-anchor="end">300</text>
+    </g>
+
+    <line id="vg-w-param-demo-scan-cost-rowline" x1="64" y1="26" x2="700" y2="26" stroke="var(--accent)" stroke-width="2" stroke-dasharray="6 4" />
+    <path id="vg-w-param-demo-scan-cost-colline" fill="none" stroke="var(--sage-deep)" stroke-width="2.5" />
+
+    <line id="vg-w-param-demo-scan-cost-vline" y1="24" y2="250" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="3 3" />
+    <circle id="vg-w-param-demo-scan-cost-dot-row" r="5" fill="var(--accent)" />
+    <circle id="vg-w-param-demo-scan-cost-dot-col" r="5" fill="var(--sage-deep)" />
+
+    <g font-family="Manrope, sans-serif" font-size="13">
+      <rect x="470" y="46" width="14" height="3" fill="var(--accent)" />
+      <text x="492" y="51" fill="var(--ink)">row store（永遠讀 300）</text>
+      <rect x="470" y="68" width="14" height="3" fill="var(--sage-deep)" />
+      <text x="492" y="73" fill="var(--ink)">columnar（= 你選的欄數）</text>
+    </g>
+  </svg>
+
+  <figcaption>row store 的成本是常數，跟你查幾欄無關；columnar 的成本是斜線。表越寬、查的欄越少，兩條線的縫越大——這正是分析查詢的常態。</figcaption>
+
+  <script>
+  (function () {
+    if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+    const root = document.querySelector('.vg-w-param-demo-scan-cost');
+    if (!root) return;
+    const input = root.querySelector('input');
+    const readout = root.querySelector('.readout');
+    const colline = root.querySelector('#vg-w-param-demo-scan-cost-colline');
+    const vline = root.querySelector('#vg-w-param-demo-scan-cost-vline');
+    const dotRow = root.querySelector('#vg-w-param-demo-scan-cost-dot-row');
+    const dotCol = root.querySelector('#vg-w-param-demo-scan-cost-dot-col');
+
+    const X0 = 64, X1 = 700, Y0 = 250, Y1 = 26, TOTAL = 300;
+    const xOf = (c) => X0 + (c / TOTAL) * (X1 - X0);
+    const yOf = (cols) => Y0 - (cols / TOTAL) * (Y0 - Y1);
+
+    // columnar line: y = x (read exactly the selected columns)
+    const pts = [];
+    for (let c = 0; c <= TOTAL; c += 5) {
+      pts.push(`${c === 0 ? 'M' : 'L'} ${xOf(c).toFixed(1)} ${yOf(c).toFixed(1)}`);
+    }
+    colline.setAttribute('d', pts.join(' '));
+
+    function update() {
+      const c = Number(input.value);
+      const wasted = TOTAL - c;
+      readout.textContent = `${c} 欄（丟 ${wasted}）`;
+      const x = xOf(c);
+      vline.setAttribute('x1', x); vline.setAttribute('x2', x);
+      dotRow.setAttribute('cx', x); dotRow.setAttribute('cy', yOf(TOTAL));
+      dotCol.setAttribute('cx', x); dotCol.setAttribute('cy', yOf(c));
+    }
+    input.addEventListener('input', update);
+    update();
+  })();
+  </script>
+</figure>
+
+<p>反過來看，columnar 對交易型查詢是淨虧。如果你要「給我 user_id = 8472 那一整筆」，row store 把整列連續擺好，一次連續讀取就拿到全部欄；column store 卻得到每一段欄區域裡各撈一個值，再把它們拼回一列——欄越多，要碰的不連續位置越多。再加上前一節那個最多 122,880 列、256 KB block 的大粒度：分析查詢樂見大 block（一次 I/O 搬很多有用的同類資料），點查卻會為了一個值被迫讀進一整個 256 KB block。這就是為什麼沒有一套儲存能同時把兩種 workload 做到最好——你在 row 與 column 之間的選擇，本質上是在賭你的查詢長什麼樣。DuckDB 賭的是分析，所以它在點查上的相對弱勢不是 bug，是它換來分析強勢付出的對價。理解這個取捨，你才知道什麼時候該選它、什麼時候不該——把它拿去當高併發線上交易的主庫，就是站錯了它被優化的那一邊。</p>
+
+<p>但 columnar 還有第二個好處，跟壓縮有關，雖然 Part 1 沒展開講壓縮的演算法：同一欄的值型別一致、分佈相近（一整欄都是日期、一整欄都是國家代號），壓縮率天生比「一列裡塞著各種型別」高。合理的推測是，這也是 columnar 能在 disk 上少佔空間、進而少讀 block 的一部分原因——不過這點來源 Part 1 沒明寫機制，我只當作補充直覺，不算進它的主張。</p>
+
+<h2>row group 與 zone map——比「只讀對的欄」更進一步：連讀都不讀</h2>
+
+<p>columnar 解決的是「不要讀錯的欄」。zone map 解決的是更強的問題：「對的欄裡面，不符合條件的那段，連讀都不要讀」。要看懂它，先看 DuckDB 把欄資料切成什麼形狀。</p>
+
+<p>來源描述了三層階層，逐字是：「Each column is split into row groups of up to 122,880 rows, and within a row group, into column segments that typically map to a single 256 KB block.」每一欄先切成 row group，每個 row group 最多 122,880 列；row group 裡面再切成 column segment，每個 segment 通常對應一個 256 KB 的 block。而整個檔案的 block 大小，「The default block size is 256 KB, though smaller block sizes (down to 16 KB) can be configured.」預設 256 KB，可以調小到 16 KB。這些不是隨便挑的數字，它們是「一次 I/O 搬多少、一張 zone map 蓋多少列」的單位。</p>
+
+<p>關鍵在 zone map。來源的定義很簡潔：「Each row group also carries a zone map. A zone map contains the min and max values in a row group, plus a null count.」每個 row group 還帶一張 zone map，裡面記了這個 row group 的最小值、最大值、還有 null 的數量。就這麼一點 metadata，但它能做的事很大。</p>
+
+<p>來源舉的例子直接給你看它怎麼跳過資料：「When a scan runs with a predicate like WHERE event_date > '2026-01-01', DuckDB checks each row group's max value before reading in any of its data. Row groups whose max event_date is on or before '2026-01-01' are skipped entirely.」當掃描帶著 <code>WHERE event_date &gt; '2026-01-01'</code> 這種 predicate，DuckDB 在讀任何資料之前，先看每個 row group 的 max。如果某個 row group 的最大 event_date 還在 2026-01-01 之前或剛好等於，那這個 row group 裡<em>不可能</em>有任何一列符合條件——整段直接跳過，一個 byte 都不讀。</p>
+
+<p>這裡的省法跟 columnar 是疊加的，不是重複的。columnar 讓你只碰對的欄；zone map 讓你在對的欄裡，只碰可能命中的 row group。一張按時間大致排序的事件表，查最近一週的資料，可能 99% 的 row group 連碰都不碰。下面這個 widget 讓你拖動 predicate 的門檻——把 <code>event_date &gt;</code> 的那個日期往右移，看有多少個 row group 被整段跳過。每個格子是一個 row group（標了它的 min/max 區間），門檻掃過去，max 落在門檻左邊的格子全暗下來。</p>
+
+<figure class="vg-w-param-demo-zonemap" data-mobile="static" data-svg-scroll="720">
+  <style>
+    .vg-w-param-demo-zonemap { display: grid; grid-template-rows: auto auto 1fr auto; gap: var(--s-2); }
+    .vg-w-param-demo-zonemap .controls { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+    .vg-w-param-demo-zonemap .controls input { flex: 1; height: 36px; accent-color: var(--accent); touch-action: none; }
+    .vg-w-param-demo-zonemap .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 16ch; text-align: right; }
+    .vg-w-param-demo-zonemap svg { width: 100%; height: auto; }
+    .vg-w-param-demo-zonemap figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+  </style>
+
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M5 9l-3 3 3 3"/><path d="M19 9l3 3-3 3"/><path d="M2 12h20"/>
+    </svg>
+    <span>拖滑桿移動 predicate 門檻 · 看 max 落在門檻左邊的 row group 被整段跳過</span>
+  </p>
+
+  <div class="controls" data-vg-controls>
+    <label for="vg-w-param-demo-zonemap-x">WHERE event_date &gt;</label>
+    <input id="vg-w-param-demo-zonemap-x" type="range" min="0" max="120" value="55" />
+    <span class="readout" id="vg-w-param-demo-zonemap-readout">第 55 天</span>
+  </div>
+
+  <svg class="vg-w-param-demo-zonemap-main" viewBox="0 0 720 240" preserveAspectRatio="xMidYMid meet" role="img" aria-label="zone map 跳過 row group 示意圖">
+    <text x="360" y="22" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--muted)">一張按 event_date 大致排序的表 · 每格 = 一個 row group（122,880 列）</text>
+    <g id="vg-w-param-demo-zonemap-cells"></g>
+    <line id="vg-w-param-demo-zonemap-threshold" y1="44" y2="176" stroke="var(--accent)" stroke-width="2" />
+    <text id="vg-w-param-demo-zonemap-thlabel" y="40" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--accent-text)">門檻</text>
+    <text id="vg-w-param-demo-zonemap-summary" x="360" y="214" text-anchor="middle" font-family="Manrope, sans-serif" font-size="14" fill="var(--ink)"></text>
+  </svg>
+
+  <figcaption>暗格 = max 不可能符合、整段跳過、零 I/O；亮格 = 至少要讀進來再逐列比對。門檻越靠右，能跳過的越多——這就是 zone map 把掃描成本壓下去的方式。</figcaption>
+
+  <script>
+  (function () {
+    if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+    const root = document.querySelector('.vg-w-param-demo-zonemap');
+    if (!root) return;
+    const input = root.querySelector('input');
+    const readout = root.querySelector('.readout');
+    const cellsG = root.querySelector('#vg-w-param-demo-zonemap-cells');
+    const thLine = root.querySelector('#vg-w-param-demo-zonemap-threshold');
+    const thLabel = root.querySelector('#vg-w-param-demo-zonemap-thlabel');
+    const summary = root.querySelector('#vg-w-param-demo-zonemap-summary');
+    const NS = 'http://www.w3.org/2000/svg';
+
+    const N = 12;            // 12 row groups
+    const SPAN = 10;         // each covers ~10 days
+    const X0 = 30, X1 = 690, W = (X1 - X0) / N, GAP = 6;
+    const Y = 50, H = 110;
+
+    const rects = [], labels = [];
+    for (let i = 0; i < N; i++) {
+      const r = document.createElementNS(NS, 'rect');
+      const x = X0 + i * W;
+      r.setAttribute('x', x + GAP / 2);
+      r.setAttribute('y', Y);
+      r.setAttribute('width', W - GAP);
+      r.setAttribute('height', H);
+      r.setAttribute('rx', 2);
+      r.setAttribute('stroke', 'var(--muted-2)');
+      r.setAttribute('stroke-width', 1.5);
+      cellsG.appendChild(r);
+      rects.push(r);
+
+      const t = document.createElementNS(NS, 'text');
+      t.setAttribute('x', x + W / 2);
+      t.setAttribute('y', Y + H / 2 + 4);
+      t.setAttribute('text-anchor', 'middle');
+      t.setAttribute('font-family', 'JetBrains Mono, monospace');
+      t.setAttribute('font-size', '10');
+      t.textContent = `${i * SPAN}–${i * SPAN + SPAN}`;
+      cellsG.appendChild(t);
+      labels.push(t);
+    }
+
+    function dayToX(d) { return X0 + (d / (N * SPAN)) * (X1 - X0); }
+
+    function update() {
+      const day = Number(input.value);
+      readout.textContent = `第 ${day} 天`;
+      const tx = dayToX(day);
+      thLine.setAttribute('x1', tx); thLine.setAttribute('x2', tx);
+      thLabel.setAttribute('x', Math.max(X0 + 14, Math.min(X1 - 14, tx)));
+      thLabel.textContent = `> 第 ${day} 天`;
+
+      let skipped = 0;
+      for (let i = 0; i < N; i++) {
+        const maxDay = i * SPAN + SPAN;     // this row group's max value
+        const skip = maxDay <= day;          // max can't satisfy the predicate
+        if (skip) skipped++;
+        rects[i].setAttribute('fill', skip ? 'var(--bg-soft)' : 'color-mix(in srgb, var(--sage-deep) 22%, transparent)');
+        rects[i].setAttribute('stroke', skip ? 'var(--muted-2)' : 'var(--sage-deep)');
+        rects[i].setAttribute('fill-opacity', skip ? '0.5' : '1');
+        labels[i].setAttribute('fill', skip ? 'var(--muted)' : 'var(--ink)');
+      }
+      summary.textContent = `跳過 ${skipped} / ${N} 個 row group，只讀進 ${N - skipped} 個`;
+    }
+    input.addEventListener('input', update);
+    update();
+  })();
+  </script>
+</figure>
+
+<p>但 zone map 不是免費午餐裡的萬靈丹，它的效果完全取決於資料的排列。如果你的事件表是按 event_date 大致遞增寫進去的，那「最近一週」的查詢能跳過幾乎所有舊 row group——因為舊 row group 的 max 都遠在門檻左邊。可是如果同樣的日期被隨機打散在每個 row group 裡，每一段的 min/max 區間就會橫跨整個值域，沒有一段的 max 落在門檻左邊，於是<em>一段都跳不掉</em>，zone map 退化成純粹的額外負擔。這給了你一個很實際的判斷：要讓 zone map 發揮，常被 filter 的那一欄最好跟資料的物理順序相關（時間序、遞增 id 都是天然的好例子）。這也解釋了為什麼同一份資料，光是改變寫入順序，分析查詢的速度就可能差很多——你不是在調引擎，你是在調資料對 zone map 的友善程度。</p>
+
+<p>注意 zone map 的便宜：它只要存三個值（min、max、null count），成本相對於整段資料微不足道，卻能在最幸運的情況下省掉一整段 row group 的讀取。這是分析資料庫一個反覆出現的母題——花極小的 metadata，換掉大量的 I/O。Part 1 沒提的進一步技巧（例如更細粒度的索引、或在 segment 內的進一步跳過）作者沒寫，這裡就停在 row group 這一層。</p>
+
+<h2>chunk 與 pipeline——資料準備好之後，是怎麼一批一批流動的</h2>
+
+<p>前三層都在講「怎麼少讀資料」。這一層講讀進來之後資料怎麼動——但要先把範圍講死：來源 Part 1 對執行只給了骨架，明說「vectorized execution（covered in Part 2）」「morsel-driven parallelism（covered in Part 3）」，細節留到後面兩篇。所以下面只講 Part 1 真的給了的東西，不替它補。</p>
+
+<p>第一個概念是 pipeline。來源用了 assembly line 的比喻：「Think of a pipeline as an assembly line. Data enters at one end and passes through a chain of stations. Each station does one thing (drop a row, transform a column, look up a value in a hash table) and hands the result to the next station.」把 pipeline 想成生產線：資料從一端進來，流過一串工作站，每站只做一件事（丟掉一列、轉換一欄、去 hash table 查一個值），做完交給下一站。注意這是 push 式的描述——資料被推著往前流，不是後面的站回頭去拉。</p>
+
+<p>第二個、也是這篇唯一給了具體數字的執行細節，是資料在生產線上流動的<em>單位</em>。它不是一列一列流，是一批一批流。來源逐字：「Every thread accepts chunks (DuckDB's 2048 row batches) and writes them into its own local state」。chunk 就是 DuckDB 的 2,048 列批次——每個 thread 收 chunk、寫進自己的 local state。為什麼是批次而不是逐列？來源 Part 1 沒有展開解釋（這正是 Part 2 的 vectorized execution 主題）。合理的推測是：逐列處理的話，每一列都要付一次函式呼叫、分支判斷、邊界檢查的固定開銷，2,048 列一批就把這些 per-row 的零碎開銷攤平成 per-batch——但這層因果是我的推論，不是來源 Part 1 的明文主張，所以我把它標成推測，等 Part 2 才有來源能背書。</p>
+
+<p>第三件事是平行。來源給了一句話的版本：「A pipeline runs across all cores by giving each thread its own morsel of input.」一條 pipeline 能跑滿所有核心，靠的是給每個 thread 自己的一份 morsel（一小塊輸入）。morsel 跟 chunk 不是同一個粒度——chunk 是流動單位，morsel 是切給某個 thread 去吃的那塊輸入——但這兩者怎麼配合、morsel 多大、怎麼動態分配，作者明白寫了「covered in Part 3」。我們停在這：你現在知道資料以 2,048 列為批流動、以 morsel 為塊分給各核心，剩下的等後續兩篇。</p>
+
+<h2>從 SQL 到準備執行——前面四層之前，引擎先做了哪些 setup</h2>
+
+<p>到這裡你已經有了儲存與流動的圖。但在任何資料被讀之前，一條 SQL 字串得先被翻譯成「引擎準備好執行」的狀態——這正是 Part 1 標題說的「from your SQL to the moment the engine is ready to run the query」。這段 setup 有三站，資料在這幾站還沒被碰，被翻譯的是「意圖」。先看這條翻譯線的整體形狀，每一站點開看它把什麼具體東西定下來、又在這站擋掉什麼。</p>
+
+<figure class="vg-w-stack-query-lifecycle" data-mobile="keep">
+  <style>
+    .vg-w-stack-query-lifecycle { display: flex; flex-direction: column; gap: var(--s-3); align-items: stretch; }
+    .vg-w-stack-query-lifecycle input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+    .vg-w-stack-query-lifecycle .stack-title { font-family: IM Fell English, serif; font-style: italic; font-size: var(--fs-md); margin: 0 0 var(--s-1) 0; color: var(--ink); line-height: 1.4; }
+    .vg-w-stack-query-lifecycle .stack-cards { display: flex; flex-direction: column; gap: var(--s-1); list-style: none; padding: 0; margin: 0; }
+    .vg-w-stack-query-lifecycle .stack-cards label { display: block; padding: var(--s-2); border: 1px solid var(--muted-2); border-radius: 2px; cursor: pointer; min-height: 44px; }
+    .vg-w-stack-query-lifecycle .stack-cards label:hover { border-color: var(--accent); }
+    .vg-w-stack-query-lifecycle .stack-cards .card-head { font-family: EB Garamond, serif; font-size: var(--fs-md); margin: 0 0 4px 0; color: var(--ink); display: flex; align-items: baseline; justify-content: space-between; gap: var(--s-2); flex-wrap: wrap; }
+    .vg-w-stack-query-lifecycle .stack-cards .card-sub { font-family: IM Fell English, serif; font-style: italic; font-size: var(--fs-sm); color: var(--muted); margin: 0; line-height: 1.5; }
+    .vg-w-stack-query-lifecycle .stack-cards .card-tag { font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); color: var(--accent-text); font-style: normal; }
+    .vg-w-stack-query-lifecycle:has(#vg-w-stack-query-lifecycle-r1:checked) .card-1,
+    .vg-w-stack-query-lifecycle:has(#vg-w-stack-query-lifecycle-r2:checked) .card-2,
+    .vg-w-stack-query-lifecycle:has(#vg-w-stack-query-lifecycle-r3:checked) .card-3 { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+    .vg-w-stack-query-lifecycle svg.diagram { display: none; }
+    @media (min-width: 720px) {
+      .vg-w-stack-query-lifecycle svg.diagram { display: block; width: 100%; height: auto; max-width: 880px; }
+      .vg-w-stack-query-lifecycle .stack-title { display: none; }
+      .vg-w-stack-query-lifecycle .stack-cards { display: none; }
+    }
+    .vg-w-stack-query-lifecycle .stage { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; }
+    .vg-w-stack-query-lifecycle:has(#vg-w-stack-query-lifecycle-r1:checked) .stage-1,
+    .vg-w-stack-query-lifecycle:has(#vg-w-stack-query-lifecycle-r2:checked) .stage-2,
+    .vg-w-stack-query-lifecycle:has(#vg-w-stack-query-lifecycle-r3:checked) .stage-3 { fill: color-mix(in srgb, var(--accent) 22%, transparent); stroke: var(--accent); }
+    .vg-w-stack-query-lifecycle .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+    .vg-w-stack-query-lifecycle:has(#vg-w-stack-query-lifecycle-r1:checked) .detail-1,
+    .vg-w-stack-query-lifecycle:has(#vg-w-stack-query-lifecycle-r2:checked) .detail-2,
+    .vg-w-stack-query-lifecycle:has(#vg-w-stack-query-lifecycle-r3:checked) .detail-3 { display: block; }
+    .vg-w-stack-query-lifecycle .detail h3 { font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.06em; color: var(--accent-text); margin: 0 0 4px 0; }
+    .vg-w-stack-query-lifecycle .detail p { margin: 0; font-size: var(--fs-sm); color: var(--ink-soft); line-height: 1.6; }
+  </style>
+
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M9 3H5a2 2 0 0 0-2 2v4m6-6h10a2 2 0 0 1 2 2v4M9 3v18m0 0H5a2 2 0 0 1-2-2v-4m6 6h10a2 2 0 0 0 2-2v-4"/>
+    </svg>
+    <span>點任一站看它定下什麼、擋掉什麼 · 共 3 站</span>
+  </p>
+
+  <input type="radio" id="vg-w-stack-query-lifecycle-r1" name="vg-w-stack-query-lifecycle-sel" checked aria-label="parse" />
+  <input type="radio" id="vg-w-stack-query-lifecycle-r2" name="vg-w-stack-query-lifecycle-sel" aria-label="bind" />
+  <input type="radio" id="vg-w-stack-query-lifecycle-r3" name="vg-w-stack-query-lifecycle-sel" aria-label="optimize" />
+
+  <p class="stack-title" id="vg-w-stack-query-lifecycle-title">SQL 字串 → 引擎準備好執行：三站</p>
+  <ul class="stack-cards" aria-labelledby="vg-w-stack-query-lifecycle-title">
+    <li class="card-1"><label for="vg-w-stack-query-lifecycle-r1">
+      <p class="card-head"><span>1 · parse</span><code class="card-tag">SQL → AST</code></p>
+      <p class="card-sub">把 SQL 文字變成抽象語法樹，只認語法結構，還不知道哪張表、哪個型別。</p>
+    </label></li>
+    <li class="card-2"><label for="vg-w-stack-query-lifecycle-r2">
+      <p class="card-head"><span>2 · bind</span><code class="card-tag">AST × catalog</code></p>
+      <p class="card-sub">把每個名字對 catalog 解析，綁到具體的欄與型別；名字打錯、型別對不上都在這站擋。</p>
+    </label></li>
+    <li class="card-3"><label for="vg-w-stack-query-lifecycle-r3">
+      <p class="card-head"><span>3 · optimize</span><code class="card-tag">logical → physical</code></p>
+      <p class="card-sub">走 logical plan，為每個節點挑一個 physical operator；整段通常約一毫秒。</p>
+    </label></li>
+  </ul>
+
+  <svg class="diagram" viewBox="0 0 880 230" role="img" aria-label="查詢從 SQL 到準備執行的三站">
+    <defs>
+      <marker id="vg-w-stack-query-lifecycle-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0 0 L10 5 L0 10 z" fill="var(--muted)" />
+      </marker>
+    </defs>
+    <text x="40" y="30" font-family="EB Garamond, serif" font-size="17" fill="var(--ink)">SQL 字串 → 引擎準備好執行（資料還沒被碰）</text>
+
+    <text x="40" y="68" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--muted)">SELECT …</text>
+    <line x1="120" y1="62" x2="168" y2="62" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#vg-w-stack-query-lifecycle-arrow)" />
+
+    <rect class="stage stage-1" x="176" y="44" width="200" height="60" rx="3" role="button" tabindex="0" aria-label="parse 站" />
+    <text x="276" y="72" text-anchor="middle" font-family="EB Garamond, serif" font-size="16" fill="var(--ink)">1 · parse</text>
+    <text x="276" y="92" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">SQL → AST</text>
+    <line x1="376" y1="74" x2="424" y2="74" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#vg-w-stack-query-lifecycle-arrow)" />
+
+    <rect class="stage stage-2" x="432" y="44" width="200" height="60" rx="3" role="button" tabindex="0" aria-label="bind 站" />
+    <text x="532" y="72" text-anchor="middle" font-family="EB Garamond, serif" font-size="16" fill="var(--ink)">2 · bind</text>
+    <text x="532" y="92" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">AST × catalog</text>
+    <line x1="632" y1="74" x2="680" y2="74" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#vg-w-stack-query-lifecycle-arrow)" />
+
+    <rect class="stage stage-3" x="688" y="44" width="160" height="60" rx="3" role="button" tabindex="0" aria-label="optimize 站" />
+    <text x="768" y="72" text-anchor="middle" font-family="EB Garamond, serif" font-size="16" fill="var(--ink)">3 · optimize</text>
+    <text x="768" y="92" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">→ physical plan</text>
+
+    <text x="440" y="150" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="14" fill="var(--muted)">這三站合計通常約一毫秒——引擎於是知道要讀哪些欄、用哪種 operator，接著才輪到前面講的儲存層。</text>
+  </svg>
+
+  <div>
+    <div class="detail detail-1">
+      <h3>parse · SQL → AST</h3>
+      <p>來源：「The first step is to parse SQL into an abstract syntax tree (AST).」這時候引擎只認得語法結構，還不知道 users 是哪張表、id 是什麼型別。語法寫錯在這站被擋。</p>
+    </div>
+    <div class="detail detail-2">
+      <h3>bind · AST 對 catalog 解析</h3>
+      <p>來源：「The next step is binding, which resolves every name in the AST against the catalog.」每個名字綁到具體的欄與型別之後，名字打錯、欄不存在、型別對不上，都在這站被擋下。</p>
+    </div>
+    <div class="detail detail-3">
+      <h3>optimize · 挑 physical operator</h3>
+      <p>來源：「DuckDB walks the logical plan and picks a physical operator for each node based on the shape of its inputs and predicates.」同樣是 join，挑 hash join 還是別的由 optimizer 決定；六表 join 有 30,240 種樹形，挑錯可慢上幾個數量級。</p>
+    </div>
+  </div>
+
+  <script>
+  (function () {
+    if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+    const root = document.querySelector('.vg-w-stack-query-lifecycle');
+    if (!root) return;
+    const map = { 'stage-1': 'r1', 'stage-2': 'r2', 'stage-3': 'r3' };
+    root.querySelectorAll('.stage').forEach((rect) => {
+      const cls = Array.from(rect.classList).find((c) => map[c]);
+      if (!cls) return;
+      const radio = root.querySelector('#vg-w-stack-query-lifecycle-' + map[cls]);
+      const fire = () => { if (radio) radio.checked = true; };
+      rect.addEventListener('click', fire);
+      rect.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fire(); }
+      });
+    });
+  })();
+  </script>
+</figure>
+
+<p>第一步 parse。「The first step is to parse SQL into an abstract syntax tree (AST).」把 SQL 文字 parse 成一棵抽象語法樹（AST）——這時候引擎只認得語法結構，還不知道 <code>users</code> 是哪張表、<code>id</code> 是什麼型別。</p>
+
+<p>第二步 binding。「The next step is binding, which resolves every name in the AST against the catalog.」binding 把 AST 裡每一個名字，對 catalog（資料庫的型錄，記著有哪些表、哪些欄、什麼型別）解析。這步之後，<code>users.id</code> 不再只是兩個字串，而是綁定到一個具體的欄、具體的型別。名字打錯、欄不存在、型別對不上，都在這步被擋下。</p>
+
+<p>第三步 optimize 與挑 physical operator。「DuckDB walks the logical plan and picks a physical operator for each node based on the shape of its inputs and predicates.」optimizer 走過 logical plan（邏輯上要做什麼），為每個節點挑一個 physical operator（實際上用哪種演算法做）。同樣是 join，可以是 hash join 也可以是別的；挑哪個，optimizer 說了算。</p>
+
+<p>optimizer 為什麼是門大學問？來源用 join order 的組合爆炸給了個量級：「A query joining six tables has 30,240 possible tree shapes, and the difference between best and worst can be orders of magnitude in runtime.」六張表的 join 有 30,240 種樹形，而最好跟最壞的那一種，執行時間可以差好幾個數量級。挑錯 join order 不是慢一點，是慢上百倍。即便如此，這整段 setup 是很快的——「There are dozens more optimizations to explore and the entire optimization phase usually finishes in about a millisecond.」還有好幾十種優化沒列，但整個優化階段通常約一毫秒跑完。注意「usually／約」這個語氣，它是來源自己收著講的，不是保證。</p>
+
+<p>順帶一個你可能會碰到的具體數字：DuckDB 讀 CSV 時要先猜每欄型別，「The default sample size is 20,480 rows. You can increase this, or set sample_size = -1 to inspect the whole file.」預設抽樣 20,480 列來判斷，你可以調大、或設 <code>sample_size = -1</code> 掃整個檔。猜錯型別導致 load 失敗時，這個旋鈕就是你要動的。下面這張表把這篇出現過的內部數字收在一起，方便你日後回查——它們不是花絮，每一個都對應前面一層的設計決定。</p>
+
+<figure class="vg-w-table-numbers" data-mobile="keep">
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M3 9h18"/><path d="M3 15h18"/><path d="M9 3v18"/><path d="M15 3v18"/>
+    </svg>
+    <span>DuckDB Part 1 出現的內部數字 · 對照它各自落在哪一層</span>
+  </p>
+  <table>
+    <caption>每個數字都不是隨手挑的——它是某一層設計的具體刻度。</caption>
+    <thead>
+      <tr><th scope="col">數字</th><th scope="col">是什麼</th><th scope="col">對應哪一層</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>&lt; 20 MB</td><td>整個 DuckDB 的 single binary 大小、無外部相依</td><td>in-process</td></tr>
+      <tr><td>2,048 列</td><td>chunk（DuckDB 的批次）一批的列數</td><td>pipeline 流動</td></tr>
+      <tr><td>122,880 列</td><td>一個 row group 最多涵蓋的列數</td><td>儲存階層</td></tr>
+      <tr><td>256 KB</td><td>預設 block 大小、一個 column segment 通常對應一個</td><td>儲存階層</td></tr>
+      <tr><td>16 KB</td><td>可調的最小 block 大小</td><td>儲存階層</td></tr>
+      <tr><td>20,480 列</td><td>CSV sniffer 預設抽樣判斷型別的列數</td><td>setup（讀檔）</td></tr>
+      <tr><td>30,240</td><td>六表 join 的可能樹形數量</td><td>setup（optimizer）</td></tr>
+      <tr><td>約 1 ms</td><td>整個 optimization phase 通常的耗時</td><td>setup（optimizer）</td></tr>
+    </tbody>
+  </table>
+</figure>
+
+<p>把這六節串起來，就是開頭那張圖的全貌。一條 SQL 進來，先 parse 成 AST、binding 對 catalog 解析、optimizer 挑好 physical operator（這段約一毫秒）；引擎於是知道要讀哪些欄——columnar 讓它只碰那幾欄、不為另外 296 欄付錢；要讀的欄裡，zone map 用每個 row group 的 min/max 先擋掉不可能命中的整段；真的要算的資料以 2,048 列的 chunk 在 pipeline 裡流動、每個 thread 各拿一份 morsel 跨核心跑；算完的結果，因為資料庫就活在你的 process 裡，最好情況下連複製都省了。每一層省的東西都不一樣，疊起來才是你看到的那個「快」。</p>
+
+<p class="vg-deep-closer"><strong>Take-away</strong>：DuckDB 的快不是一個魔法開關，是四個獨立的省——省傳輸（in-process）、省讀的欄（columnar）、省掃的段（zone map）、省 per-row 開銷（2,048 列批次）——剛好都對著分析 workload 最痛的幾個地方，再一起裝進一個小於 20 MB 的 binary 裡。真正的 vectorized execution 怎麼把那 2,048 列算得飛快，是 Part 2 的事；這篇只負責讓你在引擎按下執行鍵之前，把那張圖看清楚。</p>
+
+</div>

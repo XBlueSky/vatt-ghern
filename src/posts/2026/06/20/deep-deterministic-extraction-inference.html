@@ -1,0 +1,496 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">同一套提示詞，輸出「100% 是合法 JSON，0% 符合資料契約」。格式檢查全過、欄位卻系統性地缺漏——微軟 ISE 的修法不是改提示詞，而是承認：讓一個機率模型在同一次推論裡同時負責抄寫與推理，本來就不該指望它穩定。</p>
+  <h1 class="vg-post-title">{{ title }}</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p><span class="vg-dropcap">微</span>軟 ISE 團隊接手一個把工業 operational shift log 轉成結構化摘要的系統。第一版是最直覺的做法：把整份 shift log 丟給 LLM，一次 call 產出完整的 JSON。評測結果是一個刺眼的對照——「100% of our outputs were valid JSON. 0% met the data contract.」每一份輸出都能通過 JSON parser，卻沒有一份滿足下游需要的資料契約。這篇文章的價值不在那個模型有多差，而在拆解「為什麼 one-pass LLM 抽取在結構上就不可靠」，以及他們怎麼把它重構成一條四段 pipeline，把 schema 合規率從 0% 推到 100%。</p>
+
+  <h2>lossy serializer：一次 call 同時做抄寫與推理</h2>
+
+  <p>先界定「schema compliance」在他們語境裡是什麼。它量的不是「能不能被 parse」，而是內容層面的契約：「does each required section exist? Are arrays non-empty, values non-null?」required section 要在、陣列不能空、值不能是 null。單體式 prototype 在這個定義下全軍覆沒，具體形態是「The LLM was producing JSON where required sections were missing their subfields entirely or contained empty arrays.」——required section 的子欄位整個不見，或者裝著一個空陣列交差。</p>
+
+  <p>更糟的是這個失敗沒有規律可循。作者寫得很直接：「Required sections appeared in some outputs and vanished in others with no diagnosable pattern.」同樣形狀的輸入跑兩次，某個 section 這次在、下次消失，找不到可診斷的模式。對一個要進 production 的系統，這比「穩定地錯」還難處理——穩定的錯至少能寫規則擋掉，隨機的缺漏只能靠人工逐筆對。</p>
+
+  <p>問題的根在於這台 LLM 被賦予的角色。它一次讀完整份 shift log、自己決定哪些內容要收進輸出、哪些丟掉，然後生成整份 JSON，中間沒有任何驗證機制。作者給這個角色一個名字：「This makes the LLM a lossy serializer: it reads, decides, and generates everything.」一個會掉資料的序列化器。序列化器的工作本該是確定性的——輸入有什麼欄位，輸出就照搬什麼欄位，一個 timestamp 不會「有時候出現」。但機率模型沒有這個保證：它在 decode 每個 token 時都在做機率抽樣，把一個 operator 已經填好的 severity 欄位「重新生成」一次，就有非零機率生成成別的值，或者乾脆漏掉。</p>
+
+  <p>把這件事翻譯成 Responsible AI 的語言，單體式違反了三條原則，作者一條一條列：「it lacked transparency (no way to know which parts came from source data vs. model inference), accountability (when a field was wrong, no way to trace it to a specific decision point), and reliability (the model silently dropped required content with no detection mechanism).」透明性——分不清哪部分來自來源、哪部分是模型編的；可問責性——某個欄位錯了，無法追到是哪一個決策點出錯；可靠性——模型默默丟掉 required 內容，而且沒有任何偵測機制會喊停。這三條失效是同一個根因的三個切面：把確定性的抄寫工作，交給了一個機率性的、不可內省的黑盒子。</p>
+
+  <p>值得停下來想清楚的是：這不是 prompt engineering 能修的問題。再怎麼在提示詞裡寫「請務必包含所有 required section、不要輸出空陣列」，都只是在降低違規機率，而不是消除它。只要抄寫這個動作還在 decode loop 裡，違規機率就永遠是非零的。要把機率歸零，唯一的路是把抄寫整個移出模型。這也是為什麼加大模型、調溫度、加 few-shot example 都救不了根本——它們動的是機率分布的形狀，而不是「抄寫到底要不要走機率」這個更上層的決定。一個 timestamp 是 08:14 就是 08:14，這件事不該有任何「分布」可言。</p>
+
+  <p>把這個失敗模式放回 shift log 的場景就更清楚它的代價。一份 operational shift log 是輪班交接的依據：上一班發生了哪些 incident、每個 incident 的 severity 是多少、valve 在幾點 trip、誰簽核了哪筆 handover。下游讀這份摘要的人要據此決定要不要停機、要不要叫人、要不要升級事件。如果某次摘要默默把一個 high severity 的 incident 漏成空陣列，讀的人不會知道有東西被吞了——他看到的是一份「看起來完整、parse 得過」的 JSON。這就是為什麼「100% 合法 JSON、0% 合規」比「明顯壞掉」更危險：它把錯誤藏進了一個看似正常的外殼裡，而且每次藏的位置還不一樣。一個會穩定壞在同一個欄位的系統，至少能寫個 assertion 擋住；一個隨機在不同 required section 上掉資料、又沒有偵測機制的系統，等於把驗證責任整個推給了讀摘要的人工。</p>
+
+  <p>後面那條四段 pipeline 每一段都對著其中一條原則修。</p>
+
+  <figure class="vg-w-rai-extract-infer" data-mobile="keep">
+    <style>
+      .vg-w-rai-extract-infer { display: grid; gap: var(--s-2); }
+      .vg-w-rai-extract-infer .row { position: relative; padding: var(--s-2); border: 1px solid var(--line); background: var(--bg-soft); }
+      .vg-w-rai-extract-infer .principle { font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); text-decoration: underline dotted var(--muted); cursor: help; }
+      .vg-w-rai-extract-infer .gloss-anchor-1 { anchor-name: --vgw-rai-a1; }
+      .vg-w-rai-extract-infer .gloss-anchor-2 { anchor-name: --vgw-rai-a2; }
+      .vg-w-rai-extract-infer .gloss-anchor-3 { anchor-name: --vgw-rai-a3; }
+      .vg-w-rai-extract-infer .pop { position: absolute; top: anchor(bottom); left: anchor(center); translate: -50% var(--s-1); z-index: 4; padding: var(--s-1) var(--s-2); background: var(--bg); border: 1px solid var(--accent); border-left-width: 2px; font-family: var(--scribed); font-style: italic; font-size: var(--fs-sm); color: var(--ink); max-width: 36ch; opacity: 0; transition: opacity 120ms; pointer-events: none; }
+      .vg-w-rai-extract-infer .pop-1 { position-anchor: --vgw-rai-a1; }
+      .vg-w-rai-extract-infer .pop-2 { position-anchor: --vgw-rai-a2; }
+      .vg-w-rai-extract-infer .pop-3 { position-anchor: --vgw-rai-a3; }
+      .vg-w-rai-extract-infer .principle:hover ~ .pop,
+      .vg-w-rai-extract-infer .principle:focus ~ .pop { opacity: 1; }
+      .vg-w-rai-extract-infer .pop code { font-family: JetBrains Mono, monospace; font-style: normal; }
+      @supports not (anchor-name: --x) {
+        .vg-w-rai-extract-infer .pop { position: static; opacity: 1; pointer-events: auto; translate: none; margin-top: var(--s-1); max-width: none; }
+      }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/>
+      </svg>
+      <span>把游標移到任一條原則看哪段 pipeline 賺回它 · 手機點一下</span>
+    </p>
+
+    <div class="row">
+      <span class="principle gloss-anchor-1" tabindex="0">透明性 transparency</span>
+      <span class="pop pop-1">由 Pass 1 賺回：軟體複製 ground-truth 欄位、另存 raw source record，來源值與模型推論因此分得開。</span>
+    </div>
+    <div class="row">
+      <span class="principle gloss-anchor-2" tabindex="0">可問責性 accountability</span>
+      <span class="pop pop-2">由 Pass 4 賺回：摘要組好後模型才掛 evidence，連回特定 source record 並附 confidence，錯了能追回是哪筆。</span>
+    </div>
+    <div class="row">
+      <span class="principle gloss-anchor-3" tabindex="0">可靠性 reliability</span>
+      <span class="pop pop-3">由 Pass 3 賺回：以 <code>log_entry_id</code> 守衛式合併、source 值優先，模型無法默默覆蓋或漏掉確定性欄位。</span>
+    </div>
+    <figcaption>透明性歸 Pass 1、可問責性歸 Pass 4、可靠性歸 Pass 3。</figcaption>
+  </figure>
+
+  <h2>二元分類：每個欄位先問一句話</h2>
+
+  <p>重構的第一步不是改架構，是對輸出 schema 裡的每一個欄位問同一個問題：「Does this field have a 1:1 mapping to a value that already exists in the input?」這個欄位有沒有 1:1 對應到輸入裡已經存在的某個值？這是一個二元判斷，把所有欄位切成兩堆。</p>
+
+  <p>第一堆是答「有」的欄位——timestamp、log entry 的 id、operator 當場填的 severity。這些值在輸入裡就以最終形態存在，輸出要做的只是把它搬過去。對這堆欄位，模型的推理能力不只是多餘，而是有害：任何「生成」都引入了它本來不該承擔的機率。第二堆是答「沒有」的欄位——一筆 record 該歸到哪個 output section（routing）、一段自由文字描述的事件屬於什麼類別（classification、event 分類）、跨多筆 record 的 timeline 怎麼推理。這些才是真正需要判斷、輸入裡沒有現成答案的欄位。</p>
+
+  <p>這個分類動作本身就是整個重構的核心 insight。它把「LLM 該做什麼」這個模糊的設計問題，化約成一張可以逐欄填的表——一個 field registry，每個欄位標上 deterministic 或 <code>llm_required</code>。這張表的價值在於它把判斷從「下筆寫 prompt 那一刻的直覺」前移到「設計 schema 那一刻的審查」。設計者必須對著每個欄位停下來，明確回答那個二元問題；答完之後，哪些欄位永遠不該進模型、哪些才需要，就被釘死在 registry 裡，而不是散落在某段提示詞的措辭裡。這也讓後續 code review 有了著力點——多了一個輸出欄位，第一個要問的就是「它進不進 registry 的 llm_required？依據是什麼？」</p>
+
+  <p>邊界案例才是這個二元問題真正吃力的地方。有些欄位看似有 1:1 對應、實際沒有：比如一個「事件摘要標題」可能直接複用某筆 record 的描述文字（看似抄寫），但若它需要從多筆 record 裡挑一筆當代表，那挑選本身就是判斷，得標 <code>llm_required</code>。反過來，event class 看似要推理，但如果輸入的某個欄位已經帶了結構化的 category code，那它其實是抄寫。判斷的依據不是「這個欄位的語意聽起來像不像推理」，而是嚴格地問「輸出的這個值，是不是輸入裡某個位置已經以最終形態存在的值」。只要答案是肯定的，就交給軟體；只要中間夾了任何挑選、合併、改寫、分類，就交給模型。下面這個小工具讓你親手做一次這個分類：把幾個典型欄位指派到 deterministic 或 llm，看合規風險如何隨著「交給模型的欄位數」變化。</p>
+
+  <figure class="vg-w-classifier-extract-infer" data-mobile="static" data-svg-scroll="720">
+    <style>
+      .vg-w-classifier-extract-infer { display: grid; gap: var(--s-3); }
+      .vg-w-classifier-extract-infer .ctl { display: grid; gap: var(--s-2); }
+      .vg-w-classifier-extract-infer .field-row { display: flex; align-items: center; gap: var(--s-2); flex-wrap: wrap; padding: var(--s-1) var(--s-2); border: 1px solid var(--line); }
+      .vg-w-classifier-extract-infer .field-name { font-family: JetBrains Mono, monospace; font-size: var(--fs-sm); color: var(--ink); min-width: 16ch; }
+      .vg-w-classifier-extract-infer .field-truth { font-family: var(--scribed); font-style: italic; font-size: var(--fs-sm); color: var(--muted); flex: 1; min-width: 18ch; }
+      .vg-w-classifier-extract-infer .seg { display: inline-flex; border: 1px solid var(--muted-2); border-radius: 2px; overflow: hidden; }
+      .vg-w-classifier-extract-infer .seg button { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; padding: var(--s-1) var(--s-2); min-height: 36px; border: none; background: var(--bg); color: var(--muted); cursor: pointer; }
+      .vg-w-classifier-extract-infer .seg button[aria-pressed="true"][data-side="det"] { background: var(--sage-deep); color: var(--bg); }
+      .vg-w-classifier-extract-infer .seg button[aria-pressed="true"][data-side="llm"] { background: var(--accent); color: var(--bg); }
+      .vg-w-classifier-extract-infer .readout { display: grid; gap: var(--s-2); padding: var(--s-3); background: var(--bg-soft); border-left: 2px solid var(--accent); }
+      .vg-w-classifier-extract-infer .verdict { font-family: var(--scribed); font-style: italic; font-size: var(--fs-md); color: var(--ink-soft); }
+      .vg-w-classifier-extract-infer .verdict em { color: var(--accent-text); font-style: italic; }
+      .vg-w-classifier-extract-infer svg { width: 100%; height: auto; max-width: 720px; }
+      @media (max-width: 720px) { .vg-w-classifier-extract-infer .field-name { min-width: 12ch; } }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>
+      </svg>
+      <span>把每個欄位指派給 deterministic 或 llm，看合規風險怎麼變 · 6 個欄位</span>
+    </p>
+
+    <div class="ctl" data-vg-controls role="group" aria-label="欄位分類開關">
+      <div class="field-row">
+        <span class="field-name">log_entry_id</span>
+        <span class="field-truth">輸入裡已存在的主鍵</span>
+        <span class="seg"><button type="button" data-field="id" data-side="det" aria-pressed="true">deterministic</button><button type="button" data-field="id" data-side="llm" aria-pressed="false">llm</button></span>
+      </div>
+      <div class="field-row">
+        <span class="field-name">timestamp</span>
+        <span class="field-truth">source array 裡的原始時間</span>
+        <span class="seg"><button type="button" data-field="ts" data-side="det" aria-pressed="true">deterministic</button><button type="button" data-field="ts" data-side="llm" aria-pressed="false">llm</button></span>
+      </div>
+      <div class="field-row">
+        <span class="field-name">operator_severity</span>
+        <span class="field-truth">operator 當場填好的值</span>
+        <span class="seg"><button type="button" data-field="sev" data-side="det" aria-pressed="true">deterministic</button><button type="button" data-field="sev" data-side="llm" aria-pressed="false">llm</button></span>
+      </div>
+      <div class="field-row">
+        <span class="field-name">output_section</span>
+        <span class="field-truth">這筆 record 該歸哪一節，無現成答案</span>
+        <span class="seg"><button type="button" data-field="route" data-side="det" aria-pressed="false">deterministic</button><button type="button" data-field="route" data-side="llm" aria-pressed="true">llm</button></span>
+      </div>
+      <div class="field-row">
+        <span class="field-name">event_class</span>
+        <span class="field-truth">自由文字描述的事件類別，需推理</span>
+        <span class="seg"><button type="button" data-field="cls" data-side="det" aria-pressed="false">deterministic</button><button type="button" data-field="cls" data-side="llm" aria-pressed="true">llm</button></span>
+      </div>
+      <div class="field-row">
+        <span class="field-name">timeline_order</span>
+        <span class="field-truth">跨多筆 record 的時間推理</span>
+        <span class="seg"><button type="button" data-field="tl" data-side="det" aria-pressed="false">deterministic</button><button type="button" data-field="tl" data-side="llm" aria-pressed="true">llm</button></span>
+      </div>
+    </div>
+
+    <svg viewBox="0 0 720 120" role="img" aria-label="六個欄位的分類分布與合規風險指示條">
+      <text x="20" y="28" fill="var(--muted)" font-family="IM Fell English, serif" font-style="italic" font-size="13">交給模型的欄位數越多，模型每多接一個確定性欄位就多扛一份非零違規機率</text>
+      <rect x="20" y="44" width="680" height="26" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1"/>
+      <rect data-risk-bar x="20" y="44" width="170" height="26" fill="var(--accent)" opacity="0.5"/>
+      <text data-risk-label x="30" y="62" fill="var(--ink)" font-family="JetBrains Mono, monospace" font-size="13">3 / 6 交給 LLM</text>
+      <text x="20" y="98" fill="var(--sage-deep)" font-family="IM Fell English, serif" font-style="italic" font-size="12">左：sage = 軟體保證的欄位（零違規機率）</text>
+      <text x="380" y="98" fill="var(--accent-text)" font-family="IM Fell English, serif" font-style="italic" font-size="12">右：terracotta = 交給模型判斷的欄位</text>
+    </svg>
+
+    <div class="readout">
+      <p class="verdict" data-verdict>目前 6 個欄位裡有 <em>3 個</em> 交給確定性軟體、<em>3 個</em> 交給模型。這正是 registry 切出來的理想分界：三個 1:1 對應輸入的欄位由軟體保證，三個需要判斷的欄位才上模型。</p>
+    </div>
+
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        const root = document.querySelector('.vg-w-classifier-extract-infer');
+        const buttons = root.querySelectorAll('.seg button');
+        const bar = root.querySelector('[data-risk-bar]');
+        const label = root.querySelector('[data-risk-label]');
+        const verdict = root.querySelector('[data-verdict]');
+        // truth: which side each field SHOULD be on per the 1:1-mapping test
+        const truth = { id: 'det', ts: 'det', sev: 'det', route: 'llm', cls: 'llm', tl: 'llm' };
+        const state = { id: 'det', ts: 'det', sev: 'det', route: 'llm', cls: 'llm', tl: 'llm' };
+        function recompute() {
+          const fields = Object.keys(state);
+          const llmCount = fields.filter((f) => state[f] === 'llm').length;
+          // misassigned deterministic fields: should be det but sent to llm
+          const leaked = fields.filter((f) => truth[f] === 'det' && state[f] === 'llm');
+          const x = 20 + (llmCount / 6) * 680;
+          bar.setAttribute('width', String(Math.max(8, x - 20)));
+          label.textContent = llmCount + ' / 6 交給 LLM';
+          if (leaked.length === 0 && llmCount === 3) {
+            verdict.innerHTML = '目前 6 個欄位裡有 <em>3 個</em> 交給確定性軟體、<em>3 個</em> 交給模型。這正是 registry 切出來的理想分界：三個 1:1 對應輸入的欄位由軟體保證，三個需要判斷的欄位才上模型。';
+          } else if (leaked.length > 0) {
+            verdict.innerHTML = '你把 <em>' + leaked.length + ' 個有 1:1 對應的確定性欄位</em>（' + leaked.map((f) => '<code>' + f + '</code>').join('、') + '）交給了模型。每一個都讓模型重新生成一個本該直接抄的值，違規機率從零變成非零——這就是 one-pass 的失敗來源。';
+          } else {
+            verdict.innerHTML = '你把全部需要推理的欄位都留給模型、確定性欄位都留給軟體，但 <em>' + llmCount + ' 個</em> 欄位上模型。原則沒違反，但把過多判斷塞給單次 call 仍會放大 routing 與 classification 的出錯面。';
+          }
+        }
+        buttons.forEach((btn) => {
+          btn.addEventListener('click', () => {
+            const f = btn.getAttribute('data-field');
+            const side = btn.getAttribute('data-side');
+            state[f] = side;
+            root.querySelectorAll('.seg button[data-field="' + f + '"]').forEach((b) => {
+              b.setAttribute('aria-pressed', String(b.getAttribute('data-side') === side));
+            });
+            recompute();
+          });
+        });
+        recompute();
+      })();
+    </script>
+    <figcaption>六個欄位對照 field registry 的二元分類：前三個有 1:1 對應輸入的值、屬 deterministic；後三個需要 routing / classification / timeline 推理、屬 <code>llm_required</code>。把確定性欄位錯交給模型，就是 one-pass 違規的微觀來源。</figcaption>
+  </figure>
+
+  <p>有了這張表，整個系統的形狀就確定了：deterministic 那堆欄位由程式碼處理，永遠不進模型；<code>llm_required</code> 那堆才送進去，而且只問那幾個決策。模型不再「讀整份輸入、生成整份輸出」，它只回答幾個被框死的小問題。這就把 lossy serializer 拆掉了——抄寫歸軟體，判斷歸模型。</p>
+
+  <h2>四段 pipeline：抄寫、判斷、合併、溯源各自一段</h2>
+
+  <p>分類表落地成一條四段 pipeline，四段的順序對應一筆資料從原始到成品的加工流程：先把確定的部分搭好骨架，再請模型填判斷，接著守衛式地把判斷併回骨架，最後才產溯源。下面這張圖把四段攤開，每一段標明它做什麼、以及它「不負責」什麼——點任一段看責任邊界。</p>
+
+  <figure class="vg-w-pipeline-extract-infer" data-mobile="static" data-svg-scroll="720">
+    <style>
+      .vg-w-pipeline-extract-infer { display: flex; flex-direction: column; gap: var(--s-3); align-items: stretch; }
+      .vg-w-pipeline-extract-infer svg { width: 100%; height: auto; max-width: 720px; }
+      .vg-w-pipeline-extract-infer input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-pipeline-extract-infer .pass { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; transition: fill 200ms, stroke 200ms; }
+      .vg-w-pipeline-extract-infer .pass:hover { stroke: var(--accent); }
+      .vg-w-pipeline-extract-infer .pass:focus { outline: none; }
+      .vg-w-pipeline-extract-infer .pass:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+      .vg-w-pipeline-extract-infer .pass-text { pointer-events: none; font-family: EB Garamond, serif; font-size: 15px; }
+      .vg-w-pipeline-extract-infer .pass-sub { pointer-events: none; font-family: IM Fell English, serif; font-style: italic; font-size: 12px; fill: var(--muted); }
+      .vg-w-pipeline-extract-infer .tag { pointer-events: none; font-family: JetBrains Mono, monospace; font-size: 11px; }
+      .vg-w-pipeline-extract-infer .head { font-family: IM Fell English, serif; font-style: italic; font-size: 13px; }
+      .vg-w-pipeline-extract-infer:has(#vg-w-pipeline-extract-infer-r1:checked) .pass-1 { fill: var(--sage-deep); fill-opacity: 0.28; stroke: var(--sage-deep); }
+      .vg-w-pipeline-extract-infer:has(#vg-w-pipeline-extract-infer-r2:checked) .pass-2 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+      .vg-w-pipeline-extract-infer:has(#vg-w-pipeline-extract-infer-r3:checked) .pass-3 { fill: var(--sage-deep); fill-opacity: 0.28; stroke: var(--sage-deep); }
+      .vg-w-pipeline-extract-infer:has(#vg-w-pipeline-extract-infer-r4:checked) .pass-4 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+      .vg-w-pipeline-extract-infer .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+      .vg-w-pipeline-extract-infer .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-pipeline-extract-infer .detail p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-pipeline-extract-infer:has(#vg-w-pipeline-extract-infer-r1:checked) .detail-1 { display: block; }
+      .vg-w-pipeline-extract-infer:has(#vg-w-pipeline-extract-infer-r2:checked) .detail-2 { display: block; }
+      .vg-w-pipeline-extract-infer:has(#vg-w-pipeline-extract-infer-r3:checked) .detail-3 { display: block; }
+      .vg-w-pipeline-extract-infer:has(#vg-w-pipeline-extract-infer-r4:checked) .detail-4 { display: block; }
+      .vg-w-pipeline-extract-infer .hint { font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin: 0 0 var(--s-1) 0; }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M9 9h6v6H9z"/><path d="m3 9 6-6"/><path d="M21 15l-6 6"/><path d="M3 15l6 6"/><path d="m21 9-6-6"/>
+      </svg>
+      <span>點任一段看它的責任邊界 · 4 段 pipeline</span>
+    </p>
+
+    <div data-vg-controls role="group" aria-label="四段 pipeline 選擇器">
+      <input type="radio" id="vg-w-pipeline-extract-infer-r1" name="vg-w-pipeline-extract-infer-sel" aria-label="select Pass 1" checked />
+      <input type="radio" id="vg-w-pipeline-extract-infer-r2" name="vg-w-pipeline-extract-infer-sel" aria-label="select Pass 2" />
+      <input type="radio" id="vg-w-pipeline-extract-infer-r3" name="vg-w-pipeline-extract-infer-sel" aria-label="select Pass 3" />
+      <input type="radio" id="vg-w-pipeline-extract-infer-r4" name="vg-w-pipeline-extract-infer-sel" aria-label="select Pass 4" />
+    </div>
+
+    <svg viewBox="0 0 720 380" role="img"
+         aria-label="四段 pipeline——Pass 1 確定性抽取、Pass 2 受限模型判斷、Pass 3 守衛式合併、Pass 4 evidence mapping，點任一段看責任邊界">
+      <text x="360" y="26" text-anchor="middle" fill="var(--ink)" class="head">shift log ——&gt; 四段加工 ——&gt; schema 合規的結構化摘要</text>
+
+      <rect class="pass pass-1" data-target="vg-w-pipeline-extract-infer-r1" x="40" y="48" width="640" height="64" role="button" tabindex="0"/>
+      <text x="60" y="78" fill="var(--ink)" class="pass-text">Pass 1 · 確定性抽取</text>
+      <text x="60" y="98" fill="var(--muted)" class="pass-sub">複製 ground-truth 欄位、合併排序 timeline、保留 raw record 供稽核</text>
+      <text x="660" y="84" text-anchor="end" fill="var(--sage-deep)" class="tag">NO LLM</text>
+
+      <line x1="360" y1="112" x2="360" y2="136" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-pipeline-extract-infer-arrow)"/>
+
+      <rect class="pass pass-2" data-target="vg-w-pipeline-extract-infer-r2" x="40" y="136" width="640" height="64" role="button" tabindex="0"/>
+      <text x="60" y="166" fill="var(--ink)" class="pass-text">Pass 2 · 受限模型判斷</text>
+      <text x="60" y="186" fill="var(--muted)" class="pass-sub">只問 registry 標 llm_required 的決策：routing 與 classification</text>
+      <text x="660" y="172" text-anchor="end" fill="var(--accent-text)" class="tag">LLM</text>
+
+      <line x1="360" y1="200" x2="360" y2="224" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-pipeline-extract-infer-arrow)"/>
+
+      <rect class="pass pass-3" data-target="vg-w-pipeline-extract-infer-r3" x="40" y="224" width="640" height="64" role="button" tabindex="0"/>
+      <text x="60" y="254" fill="var(--ink)" class="pass-text">Pass 3 · 守衛式合併</text>
+      <text x="60" y="274" fill="var(--muted)" class="pass-sub">以 log_entry_id 為 join key 把 AI 輸出併回 scaffold，source 值優先</text>
+      <text x="660" y="260" text-anchor="end" fill="var(--sage-deep)" class="tag">NO LLM</text>
+
+      <line x1="360" y1="288" x2="360" y2="312" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-pipeline-extract-infer-arrow)"/>
+
+      <rect class="pass pass-4" data-target="vg-w-pipeline-extract-infer-r4" x="40" y="312" width="640" height="56" role="button" tabindex="0"/>
+      <text x="60" y="338" fill="var(--ink)" class="pass-text">Pass 4 · evidence mapping</text>
+      <text x="60" y="357" fill="var(--muted)" class="pass-sub">把每個結論連回特定 source record，附 confidence（最新、最少驗證）</text>
+      <text x="660" y="344" text-anchor="end" fill="var(--accent-text)" class="tag">LLM</text>
+
+      <defs>
+        <marker id="vg-w-pipeline-extract-infer-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+        </marker>
+      </defs>
+    </svg>
+
+    <div>
+      <p class="hint">click a pass above</p>
+      <div class="detail detail-1">
+        <h3>Pass 1 · 責任邊界</h3>
+        <p>「Software builds the contract scaffold: copies all ground-truth fields directly from the input, merges and chronologically orders timelines from source arrays, and preserves raw source records for auditability.」軟體建契約 scaffold——直接從輸入複製所有 ground-truth 欄位、把 source array 的 timeline 合併並按時間排序、保留 raw source record 供稽核。</p>
+        <p><strong>不負責</strong>：任何需要判斷的事。這一段沒有 LLM，所以 deterministic 欄位的違規機率是零。</p>
+      </div>
+      <div class="detail detail-2">
+        <h3>Pass 2 · 責任邊界</h3>
+        <p>「The model receives raw input arrays plus the Pass 1 timeline and is asked only for decisions the registry marked as llm_required.」模型收到 raw input array 加 Pass 1 的 timeline，只被問兩類決策——routing（每筆 record 歸哪個 output section）、classification（每筆 record 的 AI-required 欄位值）。</p>
+        <p><strong>不負責</strong>：抄寫確定性欄位、組裝最終 JSON。模型的職責被框到只剩它真正擅長的判斷。</p>
+      </div>
+      <div class="detail detail-3">
+        <h3>Pass 3 · 責任邊界</h3>
+        <p>「AI outputs from Pass 2 are merged into the deterministic scaffold using log_entry_id as the join key.」Pass 2 的 AI 輸出以 <code>log_entry_id</code> 為 join key 併回 Pass 1 的 scaffold。系統按設計讓 source data 優先——deterministic 欄位永遠用 source 值，絕不用 LLM 輸出。</p>
+        <p><strong>不負責</strong>：產生新內容。它只是 join，是一個守衛——擋住模型試圖覆蓋確定性欄位的任何嘗試。</p>
+      </div>
+      <div class="detail detail-4">
+        <h3>Pass 4 · 責任邊界</h3>
+        <p>「Only once the summary is assembled does the model generate traceability, linking each conclusion back to specific source records with confidence assessments.」摘要組好後，模型才產 traceability，把每個結論連回特定 source record 並附 confidence。作者自承「This pass is the newest and least validated.」這段最新、也最少驗證。</p>
+        <p><strong>不負責</strong>：改動已組好的摘要。它只在旁邊掛溯源資訊，不回頭動 Pass 1–3 的結果。</p>
+      </div>
+
+      <script>
+        (function () {
+          const root = document.querySelector('.vg-w-pipeline-extract-infer');
+          root.querySelectorAll('.pass').forEach((rect) => {
+            rect.addEventListener('click', () => {
+              const targetId = rect.getAttribute('data-target');
+              const radio = root.querySelector('#' + targetId);
+              if (radio) radio.checked = true;
+            });
+            rect.addEventListener('keydown', (e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                rect.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+              }
+            });
+          });
+        })();
+      </script>
+    </div>
+    <figcaption>四段順序對應一筆資料的加工流程：先搭確定性骨架（NO LLM），再請模型填判斷（LLM），守衛式合併回骨架（NO LLM），最後掛溯源（LLM）。兩段有 LLM、兩段沒有——抄寫與判斷被物理隔開。</figcaption>
+  </figure>
+
+  <p>看這張圖最該注意的是 <code>NO LLM</code> 與 <code>LLM</code> 交錯的節奏。Pass 1 與 Pass 3 完全沒有模型，它們是純程式碼，輸出可以被單元測試逐欄驗證；Pass 2 與 Pass 4 才上模型，而模型每次被呼叫時面對的都是一個邊界清楚的小問題，而不是「請生成整份 JSON」。這種交錯把不可內省的黑盒子夾在兩層確定性程式碼之間——進模型前 scaffold 已經建好，出模型後合併會擋掉任何越界。</p>
+
+  <p>Pass 2 那句「is asked only for decisions the registry marked as llm_required」裡的 only 是整段設計的承重點。模型不是收到「這是一份 shift log，請摘要」，而是收到一組被框死的問句：這筆 record 屬於哪個 output section？這筆 record 的 event class 是什麼？它甚至已經拿到 Pass 1 整理好、按時間排序的 timeline 當 context，不必自己重建時間順序。問題越窄，模型能搞砸的面就越小——它沒有機會去動一個它根本沒被問到的 timestamp，因為那個欄位壓根不在它的輸出 schema 裡。這跟把整份 JSON 的生成權交給它，是兩種完全不同的失敗面：前者最壞是某筆 record 被 route 錯 section，後者最壞是整個 required section 消失。前者可以靠 schema 限制 enum 值再加一層驗證收斂，後者連「少了什麼」都偵測不到。</p>
+
+  <p>把 routing 與 classification 拆成模型唯一的兩件事，還有一個副作用：它讓模型輸出的形狀本身變得可驗證。routing 的答案必為「某個已知的 output section 名稱」，classification 的答案必為「某個已知 class 的 enum 值」——兩者都是封閉集合，pipeline 可以在 Pass 2 之後立刻檢查模型有沒有吐出集合外的值，吐了就重試或退回預設。這就是把 47% 推到 100% 的那些驗證 pass 之所以能存在的前提：當模型只被允許在封閉集合裡選，「合不合規」才有一個機械可判的定義。one-pass 下模型可以輸出任意形狀的 JSON，根本沒有一個封閉集合能拿來比對。</p>
+
+  <p>Pass 3 的「守衛式」三個字值得單獨講。它以 <code>log_entry_id</code> 為 join key，意思是模型的判斷只能「附加」到對應的 record 上，沒辦法新增一筆 record、也沒辦法覆蓋確定性欄位的值。即使 Pass 2 的模型在 routing 時順手「腦補」了一個 timestamp，Pass 3 合併時也會用 source 的 timestamp 蓋回去。這一層讓「source 值優先」從一個口頭原則變成程式碼裡的硬約束。</p>
+
+  <h2>0% → 47% → 100%：合規率走過的三個數字</h2>
+
+  <p>重構的效果不是一步到位。下面這張表是 monolithic、modular（初版）、modular（現版）三個階段的對照——三欄都是 100% format valid，差別全在 schema compliance 那一列。</p>
+
+  <figure class="vg-w-table-extract-infer" data-mobile="keep">
+    <style>
+      .vg-w-table-extract-infer { overflow-x: auto; }
+      .vg-w-table-extract-infer table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-extract-infer thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); }
+      .vg-w-table-extract-infer tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); }
+      .vg-w-table-extract-infer td.metric { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+      .vg-w-table-extract-infer td.num { font-variant-numeric: tabular-nums; text-align: right; font-family: JetBrains Mono, monospace; }
+      .vg-w-table-extract-infer td.good { color: var(--sage-deep); }
+      .vg-w-table-extract-infer td.bad { color: var(--accent-text); }
+      .vg-w-table-extract-infer tbody tr:hover td { background: var(--bg-soft); }
+      .vg-w-table-extract-infer caption { text-align: left; caption-side: top; font-family: var(--scribed); font-style: italic; color: var(--muted); font-size: var(--fs-sm); padding: var(--s-1) 0; }
+    </style>
+    <table>
+      <caption>三階段合規對照，數字直接取自 Microsoft ISE blog 的比較表。format valid 三欄全是 100%，schema compliance 才是真正分出高下的那一列。</caption>
+      <thead>
+        <tr>
+          <th>指標</th>
+          <th>Monolithic</th>
+          <th>Modular（初版）</th>
+          <th>Modular（現版）</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="metric">Format valid</td>
+          <td class="num">100%</td>
+          <td class="num">100%</td>
+          <td class="num">100%</td>
+        </tr>
+        <tr>
+          <td class="metric">Schema compliance</td>
+          <td class="num bad">0%</td>
+          <td class="num">47%</td>
+          <td class="num good">100%</td>
+        </tr>
+        <tr>
+          <td class="metric">Deterministic 欄位與 source 吻合</td>
+          <td class="num bad">未驗證</td>
+          <td class="num good">100%（已測）</td>
+          <td class="num good">100%（已測）</td>
+        </tr>
+      </tbody>
+    </table>
+    <figcaption>「The modular pipeline brought schema compliance from 0% to 47%.」——光是拆成模組化還不夠，從 47% 推到 100% 靠的是後續加進來的驗證 pass。Monolithic 下 deterministic 欄位是否與 source 吻合根本「未驗證」，因為當時沒有任何機制能分辨。</figcaption>
+  </figure>
+
+  <p>47% 這個中間值是整篇最該被記住的數字。它說明「把工作拆成模組」本身不是銀彈——模組化讓系統可驗證了，但要真的把合規拉到 100%，還得在每段之間補上驗證 pass，把不合規的輸出擋下來重試或修補。一個常見的誤讀是把 0%→100% 想成「拆開就好了」；真相是「拆開 + 驗證」。</p>
+
+  <p>另一列也別放過：deterministic 欄位與 source 吻合，monolithic 是「未驗證」，模組化兩版都是「100%（已測）」。這裡的「未驗證」不是說它一定錯，而是說當時系統根本沒有能力分辨——因為 source 值和模型生成值混在同一份輸出裡，無從比對。一旦 Pass 1 把確定性欄位獨立抄出來、Pass 3 守衛式合併，這些欄位就能被逐一比對回 source，從「無法驗證」變成「可測且 100% 吻合」。透明性與可問責性就是在這裡被結構性地賺回來的。</p>
+
+  <p>這三條 metric 放在一起讀，會發現它們其實在量三件不同的事，而 one-pass 只回答得了第一件。format valid 量的是「parser 過不過」，這是最低的門檻，三個版本都滿分，所以它對判斷系統好壞幾乎沒有資訊量——這也正是 one-pass 最危險的地方，它在唯一全綠的那一列表現完美，足以騙過一個只看 parser 是否報錯的粗糙監控。schema compliance 量的是「內容契約滿不滿足」，這才是下游真正在乎的；deterministic 欄位吻合度量的是「抄寫有沒有出錯」。把後兩件事從第一件裡拆出來單獨量，本身就是這次重構帶來的能力——monolithic 連量都量不了，因為它沒有一個地方能讓你指著說「這個值應該等於 source 的哪個值」。能定義一個 metric，往往比把它優化到 100% 還難。</p>
+
+  <p>對著這張表，工程上最該記住的一課是：合規率的提升有兩段不同性質的功勞。從 0% 到 47% 是「拆分」的功勞——把抄寫移出模型，deterministic 那堆欄位的違規機率直接歸零，光這一步就把近半數欄位救回來。從 47% 到 100% 是「驗證」的功勞——在 Pass 2 之後檢查模型輸出是否落在封閉集合裡、在 Pass 3 守衛合併、不合規就重試或修補，把剩下那些真的需要模型判斷、模型偶爾會判錯的欄位也收斂到合規。把這兩段混為一談，就會誤以為「只要把系統拆成模組就會合規」，而實際上模組化只是讓驗證變得可能，真正把數字補滿的是逐段加上的驗證邏輯。</p>
+
+  <h2>同一筆 log，one-pass 與 four-pass 的輸出差在哪</h2>
+
+  <p>把抽象原則落到一份具體輸出上最直觀。下面這個對照拖把把同一筆 shift log 的兩種產物疊在一起——左邊是 one-pass LLM 直接生成的 JSON（required section 缺子欄位、裝空陣列），右邊是四段 pipeline 的產物（每個 deterministic 欄位都從 source 抄來、可溯源）。拖動分隔線看同一個位置兩邊各長什麼樣。</p>
+
+  <figure class="vg-w-slider-extract-infer" data-mobile="swap" data-mobile-summary="one-pass 默默漏掉 required 子欄位、丟空陣列；four-pass 把確定性欄位釘死在 source 上，差別在資料契約而非格式。">
+    <style>
+      .vg-w-slider-extract-infer { display: grid; gap: var(--s-2); }
+      .vg-w-slider-extract-infer .stage { position: relative; overflow: hidden; border: 1px solid var(--line); background: var(--bg-soft); aspect-ratio: 16 / 10; }
+      @media (max-width: 720px) { .vg-w-slider-extract-infer .stage { aspect-ratio: 3 / 4; } }
+      .vg-w-slider-extract-infer .pane { position: absolute; inset: 0; padding: var(--s-3); font-family: JetBrains Mono, monospace; font-size: 12px; line-height: 1.7; white-space: pre; overflow: hidden; }
+      .vg-w-slider-extract-infer .pane-before { color: var(--ink-soft); }
+      .vg-w-slider-extract-infer .pane-after { color: var(--ink); clip-path: inset(0 0 0 50%); }
+      .vg-w-slider-extract-infer .pane .bad { color: var(--accent-text); }
+      .vg-w-slider-extract-infer .pane .good { color: var(--sage-deep); }
+      .vg-w-slider-extract-infer .pane .cmt { color: var(--muted); font-style: italic; }
+      .vg-w-slider-extract-infer .tagline { position: absolute; top: var(--s-1); font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.06em; padding: 2px 6px; background: var(--bg); border: 1px solid var(--line); }
+      .vg-w-slider-extract-infer .tag-before { left: var(--s-1); color: var(--accent-text); }
+      .vg-w-slider-extract-infer .tag-after { right: var(--s-1); color: var(--sage-deep); }
+      .vg-w-slider-extract-infer .divider { position: absolute; top: 0; bottom: 0; left: 50%; width: 32px; transform: translateX(-50%); cursor: ew-resize; touch-action: none; z-index: 3; }
+      .vg-w-slider-extract-infer .divider::before { content: ''; position: absolute; left: 50%; top: 0; bottom: 0; width: 2px; transform: translateX(-50%); background: var(--accent); }
+      .vg-w-slider-extract-infer .divider::after { content: '⇆'; position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); width: 28px; height: 28px; line-height: 28px; text-align: center; border-radius: 50%; background: var(--accent); color: var(--bg); font-family: var(--sans); font-size: 14px; }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M8 7 3 12l5 5"/><path d="m16 7 5 5-5 5"/><path d="M3 12h18"/>
+      </svg>
+      <span>拖分隔線比較 one-pass 與 four-pass 的同位置輸出 · 拖動</span>
+    </p>
+
+    <div class="stage" data-stage>
+      <div class="pane pane-before"><span class="tagline tag-before">one-pass</span>{
+  "shift_id": "S-4471",
+  "incidents": {
+    <span class="bad">"records": []</span>            <span class="cmt">// 空陣列</span>
+  },
+  "handover": {
+    <span class="bad">// severity 子欄位整個缺</span>
+  },
+  "timeline": [
+    { "t": "08:14", "e": "valve trip" }
+  ]
+  <span class="cmt">// 哪些來自 source？無從得知</span>
+}</div>
+      <div class="pane pane-after" data-pane-after><span class="tagline tag-after">four-pass</span>{
+  "shift_id": <span class="good">"S-4471"</span>,    <span class="cmt">// Pass1 抄自 source</span>
+  "incidents": {
+    "records": [
+      { "id": <span class="good">"L-9</span>", <span class="good">"sev": "high"</span>,
+        "class": "mechanical" }   <span class="cmt">// Pass2 判斷</span>
+    ]
+  },
+  "handover": {
+    "severity": <span class="good">"high"</span>      <span class="cmt">// source 值，非生成</span>
+  },
+  "timeline": [
+    { "t": <span class="good">"08:14"</span>, "e": "valve trip",
+      "evidence": "L-9" }        <span class="cmt">// Pass4 溯源</span>
+  ]
+}</div>
+      <div class="divider" data-divider role="slider" tabindex="0" aria-label="拖動比較兩種輸出" aria-valuemin="0" aria-valuemax="100" aria-valuenow="50"></div>
+    </div>
+
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        const root = document.querySelector('.vg-w-slider-extract-infer');
+        const stage = root.querySelector('[data-stage]');
+        const after = root.querySelector('[data-pane-after]');
+        const divider = root.querySelector('[data-divider]');
+        let pct = 50;
+        function apply(p) {
+          pct = Math.max(0, Math.min(100, p));
+          after.style.clipPath = 'inset(0 0 0 ' + pct + '%)';
+          divider.style.left = pct + '%';
+          divider.setAttribute('aria-valuenow', String(Math.round(pct)));
+        }
+        function fromEvent(e) {
+          const rect = stage.getBoundingClientRect();
+          const x = (e.clientX - rect.left) / rect.width * 100;
+          apply(x);
+        }
+        divider.addEventListener('pointerdown', (e) => {
+          divider.setPointerCapture(e.pointerId);
+          fromEvent(e);
+        });
+        divider.addEventListener('pointermove', (e) => {
+          if (divider.hasPointerCapture(e.pointerId)) fromEvent(e);
+        });
+        divider.addEventListener('keydown', (e) => {
+          if (e.key === 'ArrowLeft') { apply(pct - 4); e.preventDefault(); }
+          if (e.key === 'ArrowRight') { apply(pct + 4); e.preventDefault(); }
+        });
+        apply(50);
+      })();
+    </script>
+    <figcaption>左 one-pass：<code>incidents.records</code> 是空陣列、<code>handover</code> 的 severity 子欄位整個缺，而且分不清哪個值來自 source。右 four-pass：deterministic 欄位（shift_id、severity、timestamp）標綠表示直接抄自 source，event class 是 Pass 2 判斷、timeline 掛上 Pass 4 的 evidence。示意輸出，形態對應原文描述的失敗模式與 pipeline 產物。</figcaption>
+  </figure>
+
+  <p>這份對照刻意只是示意——原文沒有公布逐欄的 JSON sample，具體欄位是按原文描述的失敗形態與 pipeline 結構復現的。真實輸出大概欄位更多、巢狀更深，但差異性質不變：one-pass 的不合規來自模型生成時默默丟東西，four-pass 把確定性欄位釘死在 source 上、把模型限制在它該判斷的格子裡。</p>
+
+  <p>右邊那個 <code>evidence</code> 欄位是 Pass 4 的產物，也是最值得單獨看的一塊。前三段把摘要組裝完之後，模型才被請來做最後一件事：替每個結論標出它是根據哪幾筆 source record 得出的，並附上 confidence。這等於把「這句話憑什麼這樣說」這個追問，從讀者的腦袋裡前移到輸出本身——讀摘要的人不必再回頭翻原始 log 去核對，溯源連結就掛在結論旁邊。它呼應的是文章開頭那三條 Responsible AI 原則裡的可問責性：一個結論錯了，現在能順著 evidence 連結追回到具體是哪筆 record、哪個決策點。不過這也是整條 pipeline 裡作者最沒把握的一段，理由下面會講。</p>
+
+  <p>值得把 four-pass 的代價也擺上檯面，免得讀成「拆開全是好處」。它換來合規與可驗證性，付出的是系統複雜度：要維護一個 field registry、要寫並測試 Pass 1 的確定性抽取與 Pass 3 的守衛式合併、要為 Pass 2 的封閉集合輸出加驗證、要處理模型偶爾吐出集合外值時的重試。對一個欄位數不多、容錯也高的場景，這套機制可能是 over-engineering；它真正划算的前提是「輸出有明確資料契約、下游對缺漏零容忍」——shift log 摘要正好落在這個前提裡。判斷要不要照搬這套架構，第一個該問的不是「它效果多好」，而是「我的輸出有沒有一個必須被機械保證的契約」。</p>
+
+  <p>最後要把限制講清楚，免得把這個案例讀成普世真理。原文自己標了兩條 caveat。第一，「all evaluation ran against synthetic logs designed to cover structural diversity, not real operational data」——所有評測跑在為涵蓋結構多樣性而設計的 synthetic log 上，不是真實 operational data。0%→100% 是在這個受控前提下量到的，真實世界的噪訊、缺漏、格式漂移會不會讓 100% 退下來，文章沒有回答。第二，Pass 4 evidence mapping 是「the newest and least validated」——它把溯源這件事也交回給模型，而這恰恰是整篇論證「別讓模型負責它不擅長的事」之後，唯一一段把判斷以外的工作（連結 source record）也壓在模型身上的地方，作者自己也標了它驗證最少。</p>
+
+  <p class="vg-deep-closer"><strong>What this enables</strong>：把每個輸出欄位先問一句「有沒有 1:1 對應的輸入值」，再讓軟體保證確定性事實、讓模型只做明確且狹窄的機率性判斷——「Deterministic facts should be guaranteed by software. Probabilistic judgments should be delegated to the model, explicitly and narrowly.」這條原則適用於任何 LLM 結構化抽取，不只 shift log。</p>
+</div>
