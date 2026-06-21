@@ -1,0 +1,472 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">在同步訓練的叢集裡，一張變慢的 GPU 不會只拖慢自己——它會把整步迭代的所有 rank 一起按在原地。ARGUS 要做的，是在超過一萬張卡上把那一張揪出來，而且常開、開銷壓在 2% 以下。它沒有把 profiler 做快，而是把觀測拆成三維、把每步事件壓掉約 3,700 倍。</p>
+  <h1 class="vg-post-title">{{ title }}</h1>
+</header>
+
+<div class="vg-post-body">
+  <p><span class="vg-dropcap">大</span>規模 LLM 訓練的可觀測性有個結構性的兩難。論文開頭把它講得很直接：「Coarse resource monitors alone cannot localize root causes, and fine-grained profilers incur prohibitive (5%-30%) overheads and massive trace volumes, making always-on deployment impractical in large production clusters.」一邊是粗粒度的資源監控——GPU 使用率、頻寬、溫度這類儀表，便宜到可以一直開著，但它只告訴你「這一步比上一步慢了」，告訴不了你慢在誰、慢在哪一段。另一邊是細粒度的 profiler，能把每個 kernel 攤開來看，代價是 5% 到 30% 的開銷加上巨量的 trace 資料，在 production 叢集裡根本不可能常開。ARGUS 解的就是這個夾在中間的問題：always-on，又能定位根因，combined overhead 壓在 2% 以下。</p>
+
+  <p>要理解為什麼這件事難，得先看清楚它要抓的是哪一種故障。節點直接掛掉（fail-stop）反而好處理——心跳斷了、process 死了，監控立刻知道，剩下的是換卡與 checkpoint 重新啟動這類有標準流程的工作。難的是 fail-slow：卡沒掛，只是變慢。一張 GPU 因為散熱不良而降頻、一條網路鏈路因為光模組劣化而吞吐掉一截、一次 JIT 編譯卡住主執行緒，單看那個元件的儀表可能都還在正常範圍內——溫度沒破表、鏈路沒斷、process 還活著。fail-slow 最棘手的地方正在於此：每一項指標都「還算正常」，卻在合起來的端到端時間上現形。</p>
+
+  <p>而在資料平行加管線平行的同步訓練裡，這種輕微的變慢會被一個結構放大：每一步迭代結束都要做一次全域同步——梯度要 all-reduce、參數要對齊，所有 rank 必須等最慢的那一個才能進下一步。這是同步 SGD 的定義使然，不是實作的缺陷。於是一張慢卡的延遲不是被平均掉、攤薄到可忽略，而是被原封不動地放大成整步的延遲：barrier 之後的所有 rank 都得空等，算力照樣在燒，產出卻被那一張卡封頂。一張卡慢 20%，往往不是讓全叢集慢 0.002%，而是讓這一步整個慢 20%。下面的互動小工具就是在演這件事。</p>
+
+  <figure class="vg-w-canvas-argus-straggler" data-mobile="swap" data-mobile-summary="同步訓練每步要等最慢的 rank，一張 straggler 的延遲被 barrier 放大成整步延遲，粗粒度監控只看得到整步變慢、指不出是哪張卡。">
+    <style>
+      .vg-w-canvas-argus-straggler { display: grid; grid-template-rows: auto 1fr auto; gap: var(--s-2); }
+      .vg-w-canvas-argus-straggler .toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+      .vg-w-canvas-argus-straggler button { font-family: var(--sans); font-size: var(--fs-sm); padding: 6px 14px; min-height: 44px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); cursor: pointer; }
+      .vg-w-canvas-argus-straggler button:hover { border-color: var(--accent); color: var(--accent-text); }
+      .vg-w-canvas-argus-straggler button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent-text); background: color-mix(in srgb, var(--accent) 10%, transparent); }
+      .vg-w-canvas-argus-straggler canvas { width: 100%; height: auto; aspect-ratio: 16 / 9; display: block; }
+      .vg-w-canvas-argus-straggler .clock { margin-left: auto; font-family: JetBrains Mono, monospace; font-variant-numeric: tabular-nums; }
+      .vg-w-canvas-argus-straggler figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+      @media (max-width: 720px) {
+        .vg-w-canvas-argus-straggler canvas { aspect-ratio: 4 / 3; }
+      }
+    </style>
+
+    <div class="toolbar">
+      <button id="vg-w-canvas-argus-straggler-toggle" aria-label="play or pause">▷ play</button>
+      <button id="vg-w-canvas-argus-straggler-reset" aria-label="reset">↺ reset</button>
+      <button id="vg-w-canvas-argus-straggler-inject" aria-pressed="false" aria-label="toggle straggler">注入 straggler</button>
+      <span class="clock" id="vg-w-canvas-argus-straggler-clock">step 0 · 0 ms</span>
+    </div>
+
+    <canvas id="vg-w-canvas-argus-straggler-canvas"></canvas>
+
+    <figcaption>八個 rank 同步跑迭代，每步結束撞一次全域 barrier。注入 straggler 後其中一個 rank 的 compute 段被拉長，barrier 等到它才放行——整步時間被一張卡決定。粗粒度監控看得到「step 變慢」，指不出是哪個 rank。</figcaption>
+
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        const root = document.querySelector('.vg-w-canvas-argus-straggler');
+        const canvas = root.querySelector('canvas');
+        const toggle = root.querySelector('#vg-w-canvas-argus-straggler-toggle');
+        const reset = root.querySelector('#vg-w-canvas-argus-straggler-reset');
+        const inject = root.querySelector('#vg-w-canvas-argus-straggler-inject');
+        const clock = root.querySelector('#vg-w-canvas-argus-straggler-clock');
+        const ctx = canvas.getContext('2d');
+
+        function cssVar(name) {
+          return getComputedStyle(root).getPropertyValue(name).trim() || '#888';
+        }
+        function resize() {
+          const dpr = window.devicePixelRatio || 1;
+          const rect = canvas.getBoundingClientRect();
+          canvas.width = Math.max(1, rect.width * dpr);
+          canvas.height = Math.max(1, rect.height * dpr);
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        }
+        new ResizeObserver(resize).observe(canvas);
+        resize();
+
+        const N = 8;
+        const COMPUTE = 60;          // base compute units per step
+        const STRAGGLER_EXTRA = 55;  // extra units the slow rank adds
+        const STRAGGLER_RANK = 5;    // which rank is slow
+        let running = false;
+        let straggler = false;
+        let t = 0;                   // ms accumulated this step
+        let stepDuration = COMPUTE;  // recomputed each step
+        let stepIndex = 0;
+        let phase = 'compute';       // compute -> barrier
+        const SPEED = 70;            // units per second
+        let computeDone = new Array(N).fill(0); // 0..1 progress per rank
+
+        function rankCompute(i) {
+          return (straggler && i === STRAGGLER_RANK) ? COMPUTE + STRAGGLER_EXTRA : COMPUTE;
+        }
+        function startStep() {
+          t = 0; phase = 'compute';
+          computeDone = new Array(N).fill(0);
+          stepDuration = 0;
+          for (let i = 0; i < N; i++) stepDuration = Math.max(stepDuration, rankCompute(i));
+        }
+        startStep();
+
+        function step(dt) {
+          t += dt * SPEED;
+          let allDone = true;
+          for (let i = 0; i < N; i++) {
+            const c = rankCompute(i);
+            computeDone[i] = Math.min(1, t / c);
+            if (computeDone[i] < 1) allDone = false;
+          }
+          phase = allDone ? 'barrier' : 'compute';
+          if (allDone && t > stepDuration + 12) {
+            stepIndex++;
+            startStep();
+          }
+        }
+
+        function draw() {
+          const W = canvas.getBoundingClientRect().width;
+          const H = canvas.getBoundingClientRect().height;
+          ctx.clearRect(0, 0, W, H);
+
+          const padL = 64, padR = 90, padT = 28, padB = 28;
+          const lane = (H - padT - padB) / N;
+          const trackW = W - padL - padR;
+          const maxUnits = COMPUTE + STRAGGLER_EXTRA;
+
+          ctx.font = '13px "JetBrains Mono", monospace';
+          ctx.textBaseline = 'middle';
+
+          // barrier line target = slowest finish position
+          const barrierX = padL + (stepDuration / maxUnits) * trackW;
+
+          for (let i = 0; i < N; i++) {
+            const y = padT + i * lane + lane / 2;
+            // rank label
+            ctx.fillStyle = cssVar('--muted');
+            ctx.textAlign = 'right';
+            ctx.fillText('rank ' + i, padL - 10, y);
+            // track baseline
+            ctx.strokeStyle = cssVar('--line');
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(padL, y);
+            ctx.lineTo(padL + trackW, y);
+            ctx.stroke();
+            // compute bar
+            const c = rankCompute(i);
+            const w = (c / maxUnits) * trackW * computeDone[i];
+            const isSlow = straggler && i === STRAGGLER_RANK;
+            ctx.fillStyle = isSlow ? cssVar('--accent') : cssVar('--sage-deep');
+            ctx.globalAlpha = isSlow ? 0.85 : 0.7;
+            ctx.fillRect(padL, y - lane * 0.28, w, lane * 0.56);
+            ctx.globalAlpha = 1;
+            // finished marker
+            if (computeDone[i] >= 1) {
+              ctx.fillStyle = isSlow ? cssVar('--accent-text') : cssVar('--sage-deep');
+              ctx.beginPath();
+              ctx.arc(padL + (c / maxUnits) * trackW, y, 4, 0, Math.PI * 2);
+              ctx.fill();
+            }
+          }
+
+          // barrier line
+          ctx.strokeStyle = cssVar('--ink');
+          ctx.setLineDash([4, 4]);
+          ctx.lineWidth = 1.4;
+          ctx.beginPath();
+          ctx.moveTo(barrierX, padT - 6);
+          ctx.lineTo(barrierX, H - padB + 6);
+          ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.fillStyle = cssVar('--ink');
+          ctx.font = '12px "IM Fell English", serif';
+          ctx.textAlign = 'left';
+          ctx.fillText('barrier', barrierX + 6, padT - 12);
+
+          // phase tag
+          ctx.font = '12px "JetBrains Mono", monospace';
+          ctx.textAlign = 'right';
+          ctx.fillStyle = phase === 'barrier' ? cssVar('--accent-text') : cssVar('--muted');
+          ctx.fillText(phase === 'barrier' ? 'all-reduce / sync' : 'compute', W - 12, padT - 12);
+        }
+
+        let lastT = performance.now();
+        function frame(now) {
+          const dt = Math.min(0.05, (now - lastT) / 1000);
+          lastT = now;
+          if (running) step(dt);
+          draw();
+          const ms = Math.round(stepDuration * (straggler ? 2.3 : 1.4)); // arbitrary display scale to ms
+          clock.textContent = 'step ' + stepIndex + ' · 每步 ' + ms + ' ms' + (straggler ? ' · rank 5 拖慢' : '');
+          requestAnimationFrame(frame);
+        }
+        requestAnimationFrame(frame);
+
+        toggle.addEventListener('click', () => {
+          running = !running;
+          toggle.textContent = running ? '⏸ pause' : '▷ play';
+          lastT = performance.now();
+        });
+        reset.addEventListener('click', () => {
+          running = false; toggle.textContent = '▷ play';
+          stepIndex = 0; startStep();
+        });
+        inject.addEventListener('click', () => {
+          straggler = !straggler;
+          inject.setAttribute('aria-pressed', straggler ? 'true' : 'false');
+          inject.textContent = straggler ? '移除 straggler' : '注入 straggler';
+          startStep();
+        });
+      })();
+    </script>
+  </figure>
+
+  <p>注入那一刻，rank 5 的 compute 段被拉長，barrier 那條虛線往右移——而它一移，全部八個 rank 的這一步都跟著延後。這就是 fail-slow 在同步訓練裡的殺傷力：損失不是線性的，一張卡的延遲直接變成全叢集的延遲。粗粒度監控站在 barrier 後面，只看得到「每步從 1.4 變成 2.3」，看不到是 rank 5 還是 rank 3 的問題，更看不到 rank 5 是 compute 慢還是在等別人。要回答這些，得把觀測本身拆開。</p>
+
+  <p>圖裡只有八個 rank，真實情況是上萬張。規模一放大，這個放大效應就更兇——一萬張卡等於有一萬個機會出現那張拖慢全場的卡，而只要任何一張在任何一步慢下來，那一步的一萬張卡就全被它綁住。卡數越多，撞上 fail-slow 的機率越高、浪費也越貴：被空等掉的不是一張卡的時間，而是另外九千多張卡同一段時間的算力。於是問題就從「找一張慢卡」變成「在每步上千個 kernel 事件、乘以一萬張卡的資料海裡找那一張慢卡，而且要在不影響訓練本身的前提下找」。</p>
+
+  <p>這正是論文點出的兩難為什麼是結構性的，而不是工具不夠好。細粒度 profiler 看得到 rank 5 在哪個 kernel 上慢，但它的 5% 到 30% 開銷意味著你為了找那張慢卡，得先讓全叢集慢了一截——在這種規模下，光是「打開 profiler 來找問題」就是一筆可觀的成本，更別說累積的 trace 量大到無法長期留存。傳統做法因此退而求其次：等問題發生、再臨時開 profiler 重現。可是 fail-slow 偏偏常常是間歇的——降頻隨溫度來回、鏈路劣化時好時壞——等你接到告警、登入、把 profiler 掛上去，它很可能又恢復正常，你抓到的是一段健康的 trace。這種「停下世界來量一量」的做法，在這個規模上既貴又抓不準。ARGUS 的整個設計就是要繞開這個兩難：讓觀測便宜到可以一直開著，異常發生的當下就已經被記在案，不必賭它願意在你看的時候重現一次。</p>
+
+  <h2>三維分解：沿著訓練呼叫階層切開</h2>
+
+  <p>ARGUS 的第一個設計決定，是不要把訓練當成一條黑箱時間軸，而是沿著它真正的呼叫階層切開。論文的講法是：「ARGUS decomposes observation along the training call hierarchy into CPU call stacks, framework semantics, and GPU kernel execution.」一個訓練步驟其實有三層在同時發生——CPU 上的 Python／framework 程式碼在排程、framework 把它翻成一個個 operator 與 collective 的語意、GPU 上實際執行的 kernel。把這三層分開記錄，等於給每個觀測到的延遲一個「它屬於哪一層」的座標。一個延遲如果只出現在 GPU kernel 層、CPU call stack 卻很乾淨，那是 device 端的問題；如果 CPU 在某個 framework 呼叫上卡住、GPU 反而 idle，那是 host 端或編譯端的問題。沒有這個維度，所有延遲都長得一樣。</p>
+
+  <figure class="vg-w-stack-argus-dims" data-mobile="keep">
+    <style>
+      .vg-w-stack-argus-dims { display: flex; flex-direction: column; gap: var(--s-3); align-items: stretch; }
+      .vg-w-stack-argus-dims input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-stack-argus-dims .stack-title { font-family: IM Fell English, serif; font-style: italic; font-size: var(--fs-md); margin: 0 0 var(--s-1) 0; color: var(--ink); line-height: 1.4; }
+      .vg-w-stack-argus-dims .stack-cards { display: flex; flex-direction: column; gap: var(--s-1); list-style: none; padding: 0; margin: 0; }
+      .vg-w-stack-argus-dims .stack-cards label { display: block; padding: var(--s-2); border: 1px solid var(--muted-2); border-radius: 2px; cursor: pointer; transition: border-color 200ms, background 200ms; min-height: 44px; }
+      .vg-w-stack-argus-dims .stack-cards label:hover { border-color: var(--accent); }
+      .vg-w-stack-argus-dims .stack-cards .card-head { font-family: EB Garamond, serif; font-size: var(--fs-md); margin: 0 0 4px 0; color: var(--ink); display: flex; align-items: baseline; justify-content: space-between; gap: var(--s-2); flex-wrap: wrap; }
+      .vg-w-stack-argus-dims .stack-cards .card-sub { font-family: IM Fell English, serif; font-style: italic; font-size: var(--fs-sm); color: var(--muted); margin: 0; line-height: 1.5; }
+      .vg-w-stack-argus-dims .stack-cards .card-tag { font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); color: var(--accent-text); font-style: normal; }
+      .vg-w-stack-argus-dims:has(#vg-w-stack-argus-dims-r1:checked) .card-1 { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+      .vg-w-stack-argus-dims:has(#vg-w-stack-argus-dims-r2:checked) .card-2 { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+      .vg-w-stack-argus-dims:has(#vg-w-stack-argus-dims-r3:checked) .card-3 { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+
+      .vg-w-stack-argus-dims svg.diagram { display: none; }
+      @media (min-width: 720px) {
+        .vg-w-stack-argus-dims svg.diagram { display: block; width: 100%; height: auto; max-width: 880px; }
+        .vg-w-stack-argus-dims .stack-title { display: none; }
+        .vg-w-stack-argus-dims .stack-cards { display: none; }
+      }
+      .vg-w-stack-argus-dims .layer { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; transition: fill 200ms, stroke 200ms; }
+      .vg-w-stack-argus-dims .layer:hover { stroke: var(--accent); }
+      .vg-w-stack-argus-dims .layer-text { pointer-events: none; font-family: EB Garamond, serif; font-size: 15px; }
+      .vg-w-stack-argus-dims .layer-sub { pointer-events: none; font-family: IM Fell English, serif; font-style: italic; font-size: 12px; fill: var(--muted); }
+      .vg-w-stack-argus-dims .layer-tag { pointer-events: none; font-family: JetBrains Mono, monospace; font-size: 11px; fill: var(--accent-text); }
+      .vg-w-stack-argus-dims .head { font-family: IM Fell English, serif; font-style: italic; font-size: 13px; }
+      .vg-w-stack-argus-dims:has(#vg-w-stack-argus-dims-r1:checked) .layer-1 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-stack-argus-dims:has(#vg-w-stack-argus-dims-r2:checked) .layer-2 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-stack-argus-dims:has(#vg-w-stack-argus-dims-r3:checked) .layer-3 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+
+      .vg-w-stack-argus-dims .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+      .vg-w-stack-argus-dims .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-stack-argus-dims .detail p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-stack-argus-dims:has(#vg-w-stack-argus-dims-r1:checked) .detail-1 { display: block; }
+      .vg-w-stack-argus-dims:has(#vg-w-stack-argus-dims-r2:checked) .detail-2 { display: block; }
+      .vg-w-stack-argus-dims:has(#vg-w-stack-argus-dims-r3:checked) .detail-3 { display: block; }
+      .vg-w-stack-argus-dims .hint { font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin: 0 0 var(--s-1) 0; }
+    </style>
+
+    <input type="radio" id="vg-w-stack-argus-dims-r1" name="vg-w-stack-argus-dims-sel" checked aria-label="CPU call stacks" />
+    <input type="radio" id="vg-w-stack-argus-dims-r2" name="vg-w-stack-argus-dims-sel" aria-label="framework semantics" />
+    <input type="radio" id="vg-w-stack-argus-dims-r3" name="vg-w-stack-argus-dims-sel" aria-label="GPU kernel execution" />
+
+    <p class="stack-title" id="vg-w-stack-argus-dims-title">沿訓練呼叫階層的三個觀測維度——每層回答不同的「慢在哪」</p>
+    <ul class="stack-cards" aria-labelledby="vg-w-stack-argus-dims-title">
+      <li class="card-1"><label for="vg-w-stack-argus-dims-r1">
+        <p class="card-head"><span>D1 · CPU call stacks</span><code class="card-tag">host</code></p>
+        <p class="card-sub">host 端在排程什麼、卡在哪個 Python／framework 呼叫——延遲若在這層、GPU 卻 idle，問題在 host 或編譯。</p>
+      </label></li>
+      <li class="card-2"><label for="vg-w-stack-argus-dims-r2">
+        <p class="card-head"><span>D2 · framework semantics</span><code class="card-tag">semantic</code></p>
+        <p class="card-sub">把底層事件對回 framework 的語意——這個 kernel 屬於哪個 operator、哪次 collective、哪一個 phase。</p>
+      </label></li>
+      <li class="card-3"><label for="vg-w-stack-argus-dims-r3">
+        <p class="card-head"><span>D3 · GPU kernel execution</span><code class="card-tag">device</code></p>
+        <p class="card-sub">device 端實際跑的 kernel 事件——延遲若只在這層、CPU stack 乾淨，問題在 GPU 或鏈路。</p>
+      </label></li>
+    </ul>
+
+    <svg class="diagram" viewBox="0 0 880 340" role="img"
+         aria-label="ARGUS 沿訓練呼叫階層分成三個觀測維度：CPU call stacks、framework semantics、GPU kernel execution，點任一層看它回答的問題">
+      <text x="440" y="26" text-anchor="middle" fill="var(--ink)" class="head">一個訓練步驟，三層同時在跑——分開記錄，延遲才有座標</text>
+
+      <rect class="layer layer-1" data-target="vg-w-stack-argus-dims-r1" x="60" y="56" width="760" height="76" role="button" tabindex="0" aria-label="CPU call stacks" />
+      <text x="80" y="84" class="layer-text" fill="var(--ink)">D1 · CPU call stacks</text>
+      <text x="80" y="106" class="layer-sub">host 端排程：卡在哪個 Python／framework 呼叫</text>
+      <text x="80" y="124" class="layer-tag">host</text>
+      <text x="800" y="98" text-anchor="end" class="layer-sub" fill="var(--muted)">GPU idle 而這層卡 → host／編譯問題</text>
+
+      <line x1="440" y1="132" x2="440" y2="150" stroke="var(--muted-2)" stroke-width="1.2"/>
+
+      <rect class="layer layer-2" data-target="vg-w-stack-argus-dims-r2" x="60" y="150" width="760" height="76" role="button" tabindex="0" aria-label="framework semantics" />
+      <text x="80" y="178" class="layer-text" fill="var(--ink)">D2 · framework semantics</text>
+      <text x="80" y="200" class="layer-sub">把底層事件對回語意：哪個 operator、哪次 collective、哪個 phase</text>
+      <text x="80" y="218" class="layer-tag">semantic</text>
+      <text x="800" y="192" text-anchor="end" class="layer-sub" fill="var(--muted)">是這層把 D1、D3 接起來的橋</text>
+
+      <line x1="440" y1="226" x2="440" y2="244" stroke="var(--muted-2)" stroke-width="1.2"/>
+
+      <rect class="layer layer-3" data-target="vg-w-stack-argus-dims-r3" x="60" y="244" width="760" height="76" role="button" tabindex="0" aria-label="GPU kernel execution" />
+      <text x="80" y="272" class="layer-text" fill="var(--ink)">D3 · GPU kernel execution</text>
+      <text x="80" y="294" class="layer-sub">device 端實際執行的 kernel 事件序列</text>
+      <text x="80" y="312" class="layer-tag">device</text>
+      <text x="800" y="286" text-anchor="end" class="layer-sub" fill="var(--muted)">只有這層慢、CPU 乾淨 → GPU／鏈路問題</text>
+    </svg>
+
+    <div>
+      <p class="hint">點任一維度看它回答什麼</p>
+      <div class="detail detail-1">
+        <h3>D1 · CPU call stacks</h3>
+        <p>記錄 host 端的呼叫堆疊——訓練迴圈在哪個 Python／framework 函式上耗時。當 GPU 明明 idle、整步卻變慢，答案多半在這層：dataloader 卡住、某個 host 端同步點塞住、或一次編譯把主執行緒擋下。</p>
+        <p>單獨看 GPU kernel 永遠看不到這種延遲，因為 device 端根本沒事做。</p>
+      </div>
+      <div class="detail detail-2">
+        <h3>D2 · framework semantics</h3>
+        <p>這層是橋。原始的 CPU 與 GPU 事件本身沒有語意——一個 kernel 名稱不會告訴你它屬於 forward 還是 backward、屬於哪一次 all-reduce。framework semantics 把事件對回訓練的語意結構，才讓「phase-level 診斷」這件事成立。</p>
+        <p>沒有這層，三維分解只是三堆互不相干的時間戳。</p>
+      </div>
+      <div class="detail detail-3">
+        <h3>D3 · GPU kernel execution</h3>
+        <p>device 端實際跑的 kernel 事件序列——這是資料量最大的一維，也是壓縮要對付的主要對象。當延遲只落在這層、CPU call stack 乾淨，問題在 GPU 本身（降頻、compute straggler）或它依賴的鏈路（link degradation）。</p>
+        <p>論文提到有些問題會被通訊層的症狀掩蓋（masked by communication symptoms）——表面像網路慢，根因卻在這層的某個 kernel。</p>
+      </div>
+    </div>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-stack-argus-dims');
+        root.querySelectorAll('.layer').forEach((rect) => {
+          rect.addEventListener('click', () => {
+            const id = rect.getAttribute('data-target');
+            const radio = root.querySelector('#' + id);
+            if (radio) radio.checked = true;
+          });
+          rect.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); rect.dispatchEvent(new MouseEvent('click', { bubbles: true })); }
+          });
+        });
+      })();
+    </script>
+  </figure>
+
+  <p>三維裡資料量最大的是 GPU kernel execution。一萬張卡、每張卡每一步、每一步上百到上千個 kernel 事件——這就是細粒度 profiler「massive trace volumes」這個詞背後的東西。如果照原樣存，常開根本不用談。所以三維分解只是讓問題有座標，真正讓它能常開的，是壓縮。</p>
+
+  <h2>約 3,700 倍壓縮：常開的真正前提</h2>
+
+  <p>論文給的數字很具體：每個 rank 每步的原始 kernel 事件，從約 10 MB 壓到 2.7 KB——「approximately 3,700x from 10 MB to 2.7 KB per rank per step」。這個比例不是錦上添花，它是 always-on 與否的分水嶺。把一萬張卡每步 10 MB 的原始事件全留下，產生的 trace 量在 production 叢集裡是不可承受的；壓到 2.7 KB，同樣的卡數、同樣的頻率，trace 量回到可以長期保存、可以拿來做歷史比對的尺度。</p>
+
+  <figure class="vg-w-compress-argus" data-mobile="static" data-svg-scroll="880">
+    <svg class="vg-w-compress-argus-main" viewBox="0 0 880 260" role="img"
+         aria-label="ARGUS 壓縮：每 rank 每步從約 10 MB 原始 kernel 事件壓到 2.7 KB，約 3700 倍" style="width: 100%; height: auto; max-width: 880px;">
+      <style>
+        .vg-w-compress-argus text { font-family: EB Garamond, serif; }
+        .vg-w-compress-argus .lbl { font-family: IM Fell English, serif; font-style: italic; font-size: 13px; fill: var(--muted); }
+        .vg-w-compress-argus .num { font-family: JetBrains Mono, monospace; font-variant-numeric: tabular-nums; }
+        .vg-w-compress-argus .head { font-family: IM Fell English, serif; font-style: italic; font-size: 13px; fill: var(--ink); }
+      </style>
+
+      <text x="440" y="28" text-anchor="middle" class="head">per rank · per step——原始事件 vs ARGUS 壓縮後</text>
+
+      <!-- raw block -->
+      <text x="60" y="70" class="lbl">raw kernel events</text>
+      <rect x="60" y="84" width="700" height="56" fill="var(--accent)" opacity="0.5" stroke="var(--muted-2)"/>
+      <text x="410" y="118" text-anchor="middle" class="num" font-size="20" fill="var(--ink)">≈ 10 MB</text>
+      <text x="770" y="116" class="num" font-size="12" fill="var(--muted)">上百～上千個 kernel 事件</text>
+
+      <!-- compressed block: 700 * (2.7/10000) ≈ 0.19px → render a minimum-visible sliver -->
+      <text x="60" y="174" class="lbl">ARGUS compressed</text>
+      <rect x="60" y="188" width="6" height="56" fill="var(--sage-deep)" opacity="0.9" stroke="var(--sage-deep)"/>
+      <text x="78" y="222" class="num" font-size="20" fill="var(--sage-deep)">2.7 KB</text>
+      <text x="200" y="222" class="num" font-size="13" fill="var(--accent-text)">≈ 3,700×</text>
+      <text x="770" y="222" text-anchor="end" class="lbl">同樣的卡數、同樣的頻率，trace 量回到可長期保存的尺度</text>
+
+      <line x1="60" y1="150" x2="820" y2="150" stroke="var(--line)" stroke-width="0.8"/>
+    </svg>
+    <figcaption>等比例畫：上方一條 700 px 的 raw 事件，下方壓縮後的 2.7 KB 若照同比例只剩不到 0.2 px，這裡放大成一條可見的細條——3,700 倍的差距大到無法在同一張圖上等比並排。數字取自論文 abstract。</figcaption>
+  </figure>
+
+  <p>壓縮之所以能達到這個量級，關鍵在前一節的 framework semantics。原始 kernel 事件之所以肥，是因為每步迭代其實高度重複——同一個 model、同一個 batch shape，每步跑的 kernel 序列幾乎一樣，差別只在少數的時間量與偶發的異常。一旦事件被對回 framework 語意（這是第 N 個 operator、這是哪次 collective），重複的結構就能被摺疊成「模式加上偏差」，而不是逐筆原始時間戳。換句話說，三維分解的 framework 那一維，不只是診斷時的座標系，它同時是壓縮的字典。這也是為什麼 ARGUS 不是先做一個普通 profiler、再外掛一個壓縮器——分解與壓縮是同一個設計決定的兩面。</p>
+
+  <p>值得停下來想一下這個壓縮為什麼可能。表面上「把 10 MB 壓成 2.7 KB」像是某種神乎其技的編碼，其實前提很樸素：訓練本身是極度重複的。一個訓練步驟跑的是同一個 model、同一種 batch shape、同一串固定的 forward／backward／optimizer 流程，所以每一步攤開來的那上千個 kernel 事件，序列幾乎一模一樣，耗時也落在很窄的範圍內。把這些逐筆原始時間戳存下來，等於把同一句話一字不差地抄了一千遍——而且還要跨一萬張卡、跨數週每一步都抄。冗餘不只在步與步之間，也在卡與卡之間：做同樣 data-parallel 工作的那些 rank，彼此的 kernel 序列也高度相似。壓縮要對付的，正是這兩個方向上的大量重複。</p>
+
+  <p>所以這個壓縮不是無損地把資訊塞小——那違反資訊理論——而是先認清被丟掉的本來就不是資訊。ARGUS 存的是「這一步跟典型模式相比偏了多少」，模式本身只需存一次。於是這 2.7 KB 裡裝的不是被壓爛的原始事件，而更像是「異常的指紋」：跟模式幾乎一樣的正常步驟被壓得最兇，真正出狀況的步驟反而會留下較多偏差訊號，而那些偏差恰好就是診斷要找的東西——壓縮在過濾重複的同時，順手凸顯了不尋常的部分。這也帶出一個副作用：壓縮率本身就是訊號。壓得越乾淨，說明訓練越穩定地在重複；當某段時間壓縮率忽然掉下來，意味著有東西開始偏離模式，這件事本身就值得看一眼。</p>
+
+  <p>合起來看開銷帳：always-on 採集、三維都記、再壓縮，combined overhead「less than 2%」。為什麼這個 2% 是整套設計的硬約束，而不是事後可優化的數字？因為它是「常開」能不能成立的閘門。觀測本身一定要佔用算力，而這筆開銷會直接從訓練吞吐裡扣掉，乘上整個叢集、乘上數週，就是一筆實打實的算力成本。開銷一旦高到某個程度，理性的做法就是把觀測關掉、只在出事時才開，於是又退回間歇 profiling 的老路。低於 2%，意味著這筆常駐成本小到可以被當成背景雜訊接受，沒有人會為了省這 2% 去把唯一能定位 fail-slow 的工具關掉。換句話說，2% 不是效能指標，而是一張「可以一直開著」的許可證。</p>
+
+  <p>對照論文點名的細粒度 profiler 的 5% 到 30%，這條線的意義就不在「比較快」，而在「跨過了能不能常開的門檻」。2% 跟 5% 看起來只差三個百分點，但這三個百分點落在門檻的兩側：一邊值得常開、一邊貴到只能偶爾開。而常開與否，決定的是你有沒有那筆連續的歷史資料——能不能拿今天的某一步去跟三天前的同一步比、看出某張卡是不是在沿著一條緩慢的曲線劣化。fail-slow 的劣化往往是漸進的，今天比昨天慢一點點，單看任何一天都正常，只有把連續數天、數週的同一個 phase 疊在一起，那條向下的趨勢線才看得出來。一次性開 profiler 拿到的永遠是一張快照，拼不出這種跨時間的對照——而那條趨勢線常常才是真正的早期警訊。</p>
+
+  <figure class="vg-w-overhead-argus" data-mobile="static" data-svg-scroll="880">
+    <svg class="vg-w-overhead-argus-main" viewBox="0 0 880 240" role="img"
+         aria-label="開銷對照：ARGUS 常開低於 2%，細粒度 profiler 為 5% 到 30%，粗粒度監控定位不到根因" style="width: 100%; height: auto; max-width: 880px;">
+      <style>
+        .vg-w-overhead-argus text { font-family: EB Garamond, serif; }
+        .vg-w-overhead-argus .lbl { font-family: IM Fell English, serif; font-style: italic; font-size: 13px; }
+        .vg-w-overhead-argus .num { font-family: JetBrains Mono, monospace; font-variant-numeric: tabular-nums; font-size: 13px; }
+        .vg-w-overhead-argus .axis { font-family: JetBrains Mono, monospace; font-size: 11px; fill: var(--muted); }
+        .vg-w-overhead-argus .head { font-family: IM Fell English, serif; font-style: italic; font-size: 13px; fill: var(--ink); }
+      </style>
+
+      <text x="440" y="26" text-anchor="middle" class="head">採集開銷 vs 能否定位根因——ARGUS 想佔的是右下角那個位置</text>
+
+      <!-- axis: 0% at x=120, 30% at x=820 -->
+      <line x1="120" y1="200" x2="820" y2="200" stroke="var(--muted-2)" stroke-width="1"/>
+      <text x="120" y="220" text-anchor="middle" class="axis">0%</text>
+      <text x="120" y="220" class="axis"></text>
+      <text x="166" y="220" text-anchor="middle" class="axis">2%</text>
+      <text x="236" y="220" text-anchor="middle" class="axis">5%</text>
+      <text x="820" y="220" text-anchor="middle" class="axis">30%</text>
+      <text x="470" y="236" text-anchor="middle" class="lbl" fill="var(--muted)">always-on overhead（越左越能常開）</text>
+
+      <!-- coarse monitor: tiny overhead but cannot localize -->
+      <rect x="120" y="56" width="14" height="34" fill="var(--muted)" opacity="0.45"/>
+      <text x="142" y="78" class="lbl" fill="var(--ink)">coarse 資源監控</text>
+      <text x="142" y="96" class="num" fill="var(--muted)">便宜，但定位不到根因</text>
+
+      <!-- ARGUS: <2% and localizes -->
+      <rect x="120" y="110" width="46" height="34" fill="var(--sage-deep)" opacity="0.85"/>
+      <text x="176" y="132" class="lbl" fill="var(--ink)">ARGUS always-on</text>
+      <text x="176" y="150" class="num" fill="var(--sage-deep)">&lt; 2% · 三維分解可定位根因</text>
+
+      <!-- fine profiler: 5%-30%, localizes but cannot stay on -->
+      <rect x="236" y="160" width="584" height="34" fill="var(--accent)" opacity="0.45" stroke="var(--muted-2)"/>
+      <text x="244" y="182" class="lbl" fill="var(--ink)">fine-grained profiler</text>
+      <text x="700" y="182" text-anchor="end" class="num" fill="var(--accent-text)">5% – 30% · 巨量 trace，無法常開</text>
+    </svg>
+    <figcaption>三種觀測手段的位置：粗粒度監控開銷極低卻定位不到根因；細粒度 profiler 開銷 5%-30%、trace 量巨大、無法常開；ARGUS 想同時拿到「低於 2% 可常開」與「定位得到根因」。百分比區間取自論文 abstract。</figcaption>
+  </figure>
+
+  <h2>漸進式診斷：iteration → phase → kernel</h2>
+
+  <p>有了常開的三維 trace，剩下的問題是怎麼從一萬張卡的資料裡找到那一張慢卡，而不是一開始就把所有 kernel 攤開來掃。ARGUS 的答案是漸進式診斷，按三個層級由粗到細：「iteration-time, phase-level, and kernel-level analysis」。先在 iteration-time 看哪些步、哪些 rank 偏離正常；鎖定之後再下到 phase-level，看是哪一段（forward、backward、某次 collective）出問題；最後才到 kernel-level，定位到具體的 kernel 與根因。每一層都把搜尋空間縮一個數量級，所以不需要對每張卡的每個 kernel 做全量分析。</p>
+
+  <div class="vg-w-tabs-argus-diag">
+    <style>
+      .vg-w-tabs-argus-diag { display: grid; gap: var(--s-2); margin: var(--s-4) 0; }
+      .vg-w-tabs-argus-diag input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-tabs-argus-diag .tabs { display: flex; flex-wrap: wrap; gap: var(--s-2); border-bottom: 1px solid var(--line); }
+      .vg-w-tabs-argus-diag .tab { font-family: var(--sans); font-size: var(--fs-sm); padding: var(--s-1) var(--s-2); cursor: pointer; color: var(--muted); min-height: 44px; display: flex; align-items: center; }
+      .vg-w-tabs-argus-diag .panel { display: none; padding: var(--s-3); border-left: 2px solid var(--accent); background: var(--bg-soft); }
+      .vg-w-tabs-argus-diag .panel h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-tabs-argus-diag .panel p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-tabs-argus-diag .panel .scope { font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); color: var(--muted); }
+      .vg-w-tabs-argus-diag:has(#vg-w-tabs-argus-diag-t1:checked) .panel-1 { display: block; }
+      .vg-w-tabs-argus-diag:has(#vg-w-tabs-argus-diag-t1:checked) [for="vg-w-tabs-argus-diag-t1"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-argus-diag:has(#vg-w-tabs-argus-diag-t2:checked) .panel-2 { display: block; }
+      .vg-w-tabs-argus-diag:has(#vg-w-tabs-argus-diag-t2:checked) [for="vg-w-tabs-argus-diag-t2"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-argus-diag:has(#vg-w-tabs-argus-diag-t3:checked) .panel-3 { display: block; }
+      .vg-w-tabs-argus-diag:has(#vg-w-tabs-argus-diag-t3:checked) [for="vg-w-tabs-argus-diag-t3"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    </style>
+    <input type="radio" id="vg-w-tabs-argus-diag-t1" name="vg-w-tabs-argus-diag-sel" checked />
+    <input type="radio" id="vg-w-tabs-argus-diag-t2" name="vg-w-tabs-argus-diag-sel" />
+    <input type="radio" id="vg-w-tabs-argus-diag-t3" name="vg-w-tabs-argus-diag-sel" />
+    <div class="tabs">
+      <label class="tab" for="vg-w-tabs-argus-diag-t1">L1 · iteration-time</label>
+      <label class="tab" for="vg-w-tabs-argus-diag-t2">L2 · phase-level</label>
+      <label class="tab" for="vg-w-tabs-argus-diag-t3">L3 · kernel-level</label>
+    </div>
+    <div class="panel panel-1">
+      <h3>L1 · iteration-time</h3>
+      <p>最粗的一層：看每步迭代的整體時間，找出哪些 step、哪些 rank 偏離正常分布。前面那張 straggler 圖看到的「每步從 1.4 變 2.3」就停在這一層——它告訴你「有問題、而且大概在哪些 rank」，但還沒下到原因。</p>
+      <p class="scope">搜尋空間：整個叢集 × 所有 step → 縮到幾個可疑 rank／step</p>
+    </div>
+    <div class="panel panel-2">
+      <h3>L2 · phase-level</h3>
+      <p>鎖定可疑 rank 後，下到 phase。靠的是 framework semantics 那一維——把事件對回 forward、backward、optimizer、各次 collective。一個 link degradation 會讓某次 all-reduce 的 phase 特別長；一個 host 端卡頓會讓 compute phase 之間出現空檔。phase-level 把問題收斂到「哪一段」。</p>
+      <p class="scope">搜尋空間：可疑 rank 的整步 → 縮到某個 phase</p>
+    </div>
+    <div class="panel panel-3">
+      <h3>L3 · kernel-level</h3>
+      <p>最細的一層，只在前兩層鎖定的範圍內展開。到這裡才真正攤開 GPU kernel 事件，定位到具體 kernel 與根因——是 compute straggler 把某個 GEMM 拖長，還是 FlashAttention 的 JIT 編譯把第一次呼叫卡住。因為前兩層已經把範圍縮了兩個數量級，這裡的全量分析才負擔得起。</p>
+      <p class="scope">搜尋空間：某個 phase 的少數 kernel → 定位到根因</p>
+    </div>
+  </div>
+
+  <p>這個由粗到細的順序，正好對上前面兩節。iteration-time 用的是最摘要的訊號；phase-level 靠 framework semantics 把事件分段；kernel-level 才碰那一維被壓縮過的 GPU 事件。三維分解不只給了診斷座標，還決定了診斷的順序——你不會在第一步就去掃被壓縮的 kernel 細節，而是等前兩層把範圍縮夠小才展開。論文點名抓到的 fail-slow 類型——compute straggler、link degradation、pipeline-bubble amplification、FlashAttention JIT stall——每一種都落在不同的維度與層級，這也說明了為什麼缺了任何一維都會有一類問題定位不到。compute straggler 顯在 kernel-level 的 GPU 維、link degradation 顯在某次 collective 的 phase、JIT stall 顯在 CPU call stack 的編譯卡頓。論文特別提到有些問題會被通訊症狀掩蓋（masked by communication symptoms）——表面是某次通訊慢，根因卻在算力或編譯，少了能交叉比對的三維就會誤判。</p>
+
+  <p>這套系統不是停在 paper 上的設計：論文標題寫的是「over 10,000-GPU Clusters」，內文說它已在一個一萬張 GPU 以上的 production cluster 部署了六個月（six months），在這段期間實際抓出上述各種 fail-slow 異常。六個月的 production 紀錄，比任何 benchmark 都更能說明「always-on under 2%」這個宣稱站得住——因為它本身就是常開跑了半年的結果。</p>
+
+  <p>對在台灣做大模型訓練或營運 GPU 叢集的團隊，這篇論文真正可借鏡的不是某個現成工具，而是一個取捨的拆法。過去「常開的細粒度可觀測性」之所以被否決，幾乎都卡在同一個地方：開銷與 trace 量。ARGUS 給的答案是把這兩個障礙分別交給兩個設計決定——overhead 交給三維分解（只記必要的語意、而非無差別全量），trace 量交給壓縮（把高度重複的每步事件摺成模式加偏差）。把「能不能常開」這個原本含糊的工程感覺，拆成「採集開銷低於 2% 嗎」與「每 rank 每步的 trace 壓得夠小嗎」兩個可量化的子問題，是這套系統最值得抄的地方。至於它抓到的那幾類異常——compute straggler、link degradation、pipeline-bubble amplification、FlashAttention JIT stall——任何跑過多機多卡訓練的人都不陌生，差別只在過去多半靠人盯儀表加經驗猜，現在被收進一個能在上萬張卡上常開、按層自動定位的系統裡。</p>
+
+  <p class="vg-deep-closer"><strong>What this enables</strong>：把「常開的細粒度可觀測性」從一個被開銷與 trace 量否決的選項，變成一個在上萬張 GPU 上實際可行的預設——靠的不是更快的 profiler，而是三維分解、約 3,700 倍壓縮、與由粗到細的漸進診斷這三者咬合成同一個設計。</p>
+</div>
