@@ -1,0 +1,529 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">一支手寫的 SIMD kernel 可能塞著「hundreds upon hundreds of bespoke unsafe blocks」——每個 intrinsic call 各包一層 unsafe，安全性無從審起。新的做法不是把這些 unsafe 藏到抽象底下，而是讓型別系統證明 CPU 能力、把整段不安全壓進唯一一個 macro：你要 audit 的只剩「this one macro」，不是上百個。</p>
+  <h1 class="vg-post-title">{{ title }}</h1>
+</header>
+
+<div class="vg-post-body">
+  <p><span class="vg-dropcap">手</span>寫平台 SIMD intrinsic 在 Rust 裡向來醜——作者對那段程式碼的評語直接是「It's hideous. And the whole thing is wrapped in <code>unsafe</code>!」。問題不在於難寫，而在於 unsafe 的散布方式：一個跨 x86、ARM 的數值 kernel，光是 <code>_mm256_add_ps</code> 這類 intrinsic 的呼叫點就可能上百個，每一個按語言規則都得包在 <code>unsafe</code> 裡。先前那些「safe SIMD」crate 多半只是把這些 unsafe 藏到抽象底下，沒有真的消掉它——表面乾淨，底下仍有大量 unsafe 潛伏。這篇文章講的，是一套讓 unsafe「even on the inside」也收斂到單一可審點的組裝方式，由四個彼此咬合的型別系統機制構成。</p>
+
+  <p>四個機制依序是：不可偽造的 zero-sized CPU 能力 token、Rust 1.87 起編譯器自己追蹤 target feature、把唯一 unsafe 封進一個 macro、以及泛型 SIMD 型別 <code>f32x8&lt;L: Level&gt;</code> 對每個指令集 level 各給一份運算實作。最後留一個沒解掉的張力：operator overloading 的 <code>a + b</code> 跟保留 inlining 效益之間，作者自己也說不確定能怎麼辦。先看這套組裝到底把「要審多少 unsafe」這個量壓到哪裡——下面這張圖讓你拖動 kernel 規模，看兩種寫法的審查面積怎麼分岔。</p>
+
+  <p>先把「為什麼 intrinsic 一定 unsafe」這件事講清楚，後面四層才有對照。SIMD intrinsic 例如 <code>_mm256_add_ps</code>，對應的是一條只有在 CPU 支援 AVX2 時才存在的機器指令；放到一台沒有 AVX2 的機器上執行，得到的不是慢、是 illegal instruction 直接掛掉。Rust 的型別系統無法在編譯期知道「跑這支 binary 的那台機器有沒有 AVX2」——同一份 binary 可能被搬到 server、筆電、容器裡任何一代 CPU 上跑。所以 Rust 把這類 intrinsic 一律標成 unsafe：呼叫它等於跟編譯器簽一份「我保證執行時 feature 真的在」的切結書，責任轉嫁給程式設計師。問題就出在「每個 intrinsic 都要簽一次」——一支認真的數值 kernel，加法、乘法、shuffle、load、store 全是 intrinsic，再乘上 x86 與 ARM 兩套指令集各一份，切結書的份數很快堆到上百。這套組裝要做的，是讓你只簽一次、而且簽在一個看得清楚的地方。</p>
+
+  <figure class="vg-w-chart-simd-audit-surface" data-mobile="static" data-svg-scroll="720">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M21 12a9 9 0 1 1-6.219-8.56"/><path d="m8 12 3 3 5-6"/>
+      </svg>
+      <span>拖動滑桿改變 kernel 的 intrinsic 呼叫數——比較兩種寫法要 audit 的 unsafe 區塊數 · 1 條曲線 vs 1 條水平線</span>
+    </p>
+    <style>
+      .vg-w-chart-simd-audit-surface { display: grid; gap: var(--s-3); }
+      .vg-w-chart-simd-audit-surface .controls { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); }
+      .vg-w-chart-simd-audit-surface .controls input { flex: 1; accent-color: var(--accent); height: 36px; touch-action: none; }
+      .vg-w-chart-simd-audit-surface .controls .readout { font-family: JetBrains Mono, monospace; font-variant-numeric: tabular-nums; color: var(--ink); min-width: 10ch; text-align: right; }
+      .vg-w-chart-simd-audit-surface svg { width: 100%; height: auto; }
+      .vg-w-chart-simd-audit-surface figcaption { font-family: var(--scribed); font-style: italic; font-size: var(--fs-sm); color: var(--muted); }
+      .vg-w-chart-simd-audit-surface .verdict { padding: var(--s-2) var(--s-3); background: var(--bg-soft); border-left: 2px solid var(--accent); font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink-soft); }
+      .vg-w-chart-simd-audit-surface .verdict em { color: var(--accent-text); font-style: italic; }
+    </style>
+
+    <div class="controls" data-vg-controls>
+      <label for="vg-w-chart-simd-audit-surface-n">kernel 的 intrinsic 呼叫數 N =</label>
+      <input id="vg-w-chart-simd-audit-surface-n" type="range" min="8" max="600" step="4" value="240" />
+      <span class="readout">240</span>
+    </div>
+
+    <svg viewBox="0 0 720 320" preserveAspectRatio="xMidYMid meet" role="img"
+         aria-label="audit 面積對照——naive 手寫每個 intrinsic 一個 unsafe（線性成長），macro 方案恆為 1。">
+      <g id="vg-w-chart-simd-audit-surface-axes"></g>
+      <g id="vg-w-chart-simd-audit-surface-series"></g>
+    </svg>
+
+    <div class="verdict" data-verdict></div>
+
+    <figcaption>縱軸是「需要人工 audit 的 unsafe 區塊數」。naive 線是 <em>y = N</em>（每個 intrinsic 一個 unsafe）；macro 線恆為 <em>1</em>（整段不安全封在單一 macro）。數字依文章對問題與方案的描述計算，非實測 benchmark。</figcaption>
+
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        const root = document.querySelector('.vg-w-chart-simd-audit-surface');
+        const axesG = root.querySelector('#vg-w-chart-simd-audit-surface-axes');
+        const seriesG = root.querySelector('#vg-w-chart-simd-audit-surface-series');
+        const inp = root.querySelector('input');
+        const out = root.querySelector('.readout');
+        const verdict = root.querySelector('[data-verdict]');
+        const NS = 'http://www.w3.org/2000/svg';
+        function el(tag, attrs) {
+          const e = document.createElementNS(NS, tag);
+          for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+          return e;
+        }
+        const X0 = 70, X1 = 690, Y0 = 280, Y1 = 36;
+        const MAXN = 600, MAXY = 600;
+        const xOf = n => X0 + (n / MAXN) * (X1 - X0);
+        const yOf = v => Y0 - (v / MAXY) * (Y0 - Y1);
+
+        // Static axes (drawn once)
+        axesG.appendChild(el('line', { x1: X0, y1: Y0, x2: X1, y2: Y0, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+        axesG.appendChild(el('line', { x1: X0, y1: Y0, x2: X0, y2: Y1, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+        for (let v = 0; v <= MAXY; v += 100) {
+          const y = yOf(v);
+          axesG.appendChild(el('line', { x1: X0 - 4, y1: y, x2: X0, y2: y, stroke: 'var(--muted-2)' }));
+          const t = el('text', { x: X0 - 8, y: y + 4, 'text-anchor': 'end', 'font-family': 'JetBrains Mono, monospace', 'font-size': 11, fill: 'var(--muted)' });
+          t.textContent = String(v);
+          axesG.appendChild(t);
+        }
+        for (let n = 0; n <= MAXN; n += 100) {
+          const x = xOf(n);
+          axesG.appendChild(el('line', { x1: x, y1: Y0, x2: x, y2: Y0 + 4, stroke: 'var(--muted-2)' }));
+          const t = el('text', { x: x, y: Y0 + 18, 'text-anchor': 'middle', 'font-family': 'JetBrains Mono, monospace', 'font-size': 11, fill: 'var(--muted)' });
+          t.textContent = String(n);
+          axesG.appendChild(t);
+        }
+        const yl = el('text', { x: 18, y: (Y0 + Y1) / 2 - 22, 'text-anchor': 'middle', 'font-family': 'EB Garamond, serif', 'font-size': 13, fill: 'var(--muted)', transform: `rotate(-90 18 ${(Y0 + Y1) / 2 - 22})` });
+        yl.textContent = '要 audit 的 unsafe 區塊數';
+        axesG.appendChild(yl);
+        const xl = el('text', { x: (X0 + X1) / 2, y: 312, 'text-anchor': 'middle', 'font-family': 'EB Garamond, serif', 'font-size': 13, fill: 'var(--muted)' });
+        xl.textContent = 'kernel 內 intrinsic 呼叫數 N';
+        axesG.appendChild(xl);
+
+        // naive line: y = N (clamped at MAXY)
+        const naivePath = `M ${xOf(0)} ${yOf(0)} L ${xOf(MAXN)} ${yOf(Math.min(MAXN, MAXY))}`;
+        seriesG.appendChild(el('path', { d: naivePath, fill: 'none', stroke: 'var(--accent)', 'stroke-width': 1.5 }));
+        // macro line: y = 1 (flat, drawn at y=1 ~ baseline)
+        seriesG.appendChild(el('path', { d: `M ${xOf(0)} ${yOf(1)} L ${xOf(MAXN)} ${yOf(1)}`, fill: 'none', stroke: 'var(--sage-deep)', 'stroke-width': 1.5, 'stroke-dasharray': '6,4' }));
+
+        // legend
+        seriesG.appendChild(el('rect', { x: 470, y: 56, width: 14, height: 2, fill: 'var(--accent)' }));
+        const lg1 = el('text', { x: 492, y: 60, 'font-family': 'Manrope, sans-serif', 'font-size': 12, fill: 'var(--ink)' });
+        lg1.textContent = 'naive：每個 intrinsic 一個 unsafe';
+        seriesG.appendChild(lg1);
+        seriesG.appendChild(el('rect', { x: 470, y: 76, width: 14, height: 2, fill: 'var(--sage-deep)' }));
+        const lg2 = el('text', { x: 492, y: 80, 'font-family': 'Manrope, sans-serif', 'font-size': 12, fill: 'var(--ink)' });
+        lg2.textContent = 'macro：恆為 1';
+        seriesG.appendChild(lg2);
+
+        // moving markers + readout
+        const naiveDot = el('circle', { r: 4.5, fill: 'var(--accent)' });
+        const macroDot = el('circle', { r: 4.5, fill: 'var(--sage-deep)' });
+        const naiveLbl = el('text', { 'font-family': 'JetBrains Mono, monospace', 'font-size': 12, fill: 'var(--accent-text)' });
+        seriesG.appendChild(naiveDot);
+        seriesG.appendChild(macroDot);
+        seriesG.appendChild(naiveLbl);
+
+        function update() {
+          const n = Number(inp.value);
+          out.textContent = String(n);
+          const ny = Math.min(n, MAXY);
+          naiveDot.setAttribute('cx', xOf(n)); naiveDot.setAttribute('cy', yOf(ny));
+          macroDot.setAttribute('cx', xOf(n)); macroDot.setAttribute('cy', yOf(1));
+          naiveLbl.setAttribute('x', Math.min(xOf(n) + 8, 640));
+          naiveLbl.setAttribute('y', yOf(ny) - 8);
+          naiveLbl.textContent = n + ' unsafe';
+          verdict.innerHTML = '同一支 kernel，naive 寫法要逐一檢查 <em>' + n + '</em> 個 unsafe 區塊；macro 方案要審的恆為 <em>1</em>——而且每多接一個平台、多一條 intrinsic，naive 那條線就往上爬一格，macro 那條線不動。';
+        }
+        inp.addEventListener('input', update);
+        update();
+      })();
+    </script>
+  </figure>
+
+  <h2>不可偽造的 token：把「這台機器有 AVX2」變成型別</h2>
+
+  <p>第一塊地基是一個小到不能再小的型別。它的定義是 <code>pub struct Avx2(());</code>——一個包了 unit 的 newtype，唯一的 field 是 private。private 這件事是重點：module 外面的任何人都無法憑空 <code>Avx2(())</code> 寫出一個值，只能透過 module 提供的建構路徑拿到它。而那條路徑唯一的入口，是 runtime 的 CPU feature detection：</p>
+
+  <pre><code class="language-rust">pub struct Avx2(());
+
+fn detect_avx2() -> Option&lt;Avx2&gt; {
+    if is_x86_feature_detected!("avx2") {
+        Some(Avx2(()))      // 偵測到才發證
+    } else {
+        None
+    }
+}</code></pre>
+
+  <p>於是這個值本身就是一張證明：你手上若有一個 <code>Avx2</code>，就代表程式在執行期確認過這台機器支援 AVX2。它無法被偽造，因為偽造它的唯一方法是繞過 <code>detect_avx2</code> 去寫 <code>Avx2(())</code>，而 private field 把這條路堵死了。型別系統不知道「AVX2 是什麼」，但它知道「這個值只能從那個函式流出來」，這就夠了——能力檢查被編碼成型別的存在性。</p>
+
+  <p>第二個關鍵性質是成本。作者明說：「because it's a zero-sized type, passing this token around has no runtime overhead」。<code>Avx2(())</code> 是 zero-sized type，在記憶體裡不佔任何 byte，把它當參數傳進千百層函式呼叫，編譯出來不會多一個 register、不會多一條 mov 指令。這就是為什麼可以放心讓每一個 SIMD 運算都吃一個 token 參數——證明在型別層走遍全程，在機器碼層完全消失。</p>
+
+  <p>值得停一下體會這個設計的精巧：型別系統在這裡完全不理解「AVX2」的語意，它對指令集、暫存器寬度、SIMD 一無所知。它只懂一件事——某個型別的值，能不能在這個 scope 被建構出來。把 field 設成 private，等於宣告「這個值只能由我這個 module 發放」；把唯一的發放路徑接到 runtime detection，等於宣告「拿到這個值代表偵測通過」。整個能力系統就靠 Rust 最基本的可見性規則撐起來，沒有用到任何特殊的 compiler magic。這也是為什麼這個 pattern 不必等語言加新功能就能用——它把一個執行期的事實（CPU 支援某 feature）借型別的存在性，搬進編譯器能推理的世界。這個技巧不是新發明，pulp 這個 crate 已經用 CPU feature token 用了好幾年；新的地方在後面三層怎麼接上它，把「token 內部那層 wrapper」也做安全。</p>
+
+  <h2>Rust 1.87：編譯器自己追蹤 target feature</h2>
+
+  <p>有了 token 還不夠。intrinsic 之所以 unsafe，本質原因是：在一台沒有 AVX2 的機器上執行 <code>_mm256_add_ps</code> 會直接觸發 illegal instruction。Rust 用 <code>#[target_feature(enable = "avx2")]</code> 這個標記告訴編譯器「這個函式假設 AVX2 存在」，但在 1.87 之前，即使函式帶了這個標記，函式體內呼叫 intrinsic 仍然得自己再包一層 <code>unsafe</code>——編譯器沒把「函式已宣告 feature」跟「intrinsic 需要 feature」這兩件事連起來。</p>
+
+  <p>2025 年 5 月 15 日發布的 Rust 1.87.0 補上了這條連線。官方 release note 的原文是：「Most <code>std::arch</code> intrinsics that are unsafe only due to requiring target features to be enabled are now callable in safe code that has those features enabled.」翻成白話：只因為「需要某個 target feature」才被標成 unsafe 的那些 intrinsic，現在在「已經 enable 該 feature」的安全程式碼裡可以直接呼叫，不必再寫 <code>unsafe</code>。注意官方用的是「Most」而不是「All」——這是一個有範圍的改善，不是全面解除。</p>
+
+  <pre><code class="language-rust">#[target_feature(enable = "avx2")]
+fn add_avx2(a: __m256, b: __m256) -> __m256 {
+    _mm256_add_ps(a, b)   // 1.87 起：函式已標 avx2，這行不必 unsafe
+}</code></pre>
+
+  <p>看起來 unsafe 消失了，但作者立刻補一句誠實的話：「This only shifts the <code>unsafe</code> up a layer.」unsafe 沒有不見，它從 intrinsic 的呼叫點往上搬到了函式的呼叫點——現在不安全的不是 <code>_mm256_add_ps</code> 這一行，而是「在不確定有沒有 AVX2 的情況下去呼叫 <code>add_avx2</code>」這個動作。呼叫一個帶 <code>#[target_feature]</code> 的函式本身才是 unsafe 的來源。1.87 給的是地基，不是屋頂——它讓 kernel 內部可以脫掉 unsafe，但「誰來保證進入這個函式時 feature 真的可用」這個問題還懸著。</p>
+
+  <p>這個「往上搬一層」的設計其實是對的方向，不是退而求其次。把 unsafe 留在 intrinsic 呼叫點，意味著每一條 intrinsic 都是一個獨立的不安全來源，散在 kernel 各處；把它搬到函式邊界，意味著一整支 kernel 不管裡面有多少條 intrinsic，只共用一個不安全來源——進入這個函式這件事。審查的單位從「每條指令」變成「每個 feature gate 的入口」，數量級立刻下來。但「搬一層」本身不會自動讓入口安全，它只是把問題收斂到一個值得認真處理的地方。誰來保證進入時 feature 可用？答案就是前一節那張不可偽造的 token——它在型別層攜帶「偵測通過」這個事實。下一層要做的，就是把 token 跟這個 <code>#[target_feature]</code> 入口接在一起，讓「有證明才能進」這件事由型別系統強制執行。</p>
+
+  <h2>一個 macro：把唯一的 unsafe 封起來</h2>
+
+  <p>把前兩層接起來：token 是「feature 可用」的證明，<code>#[target_feature]</code> 函式是「假設 feature 可用」的程式碼。中間缺的那一步——「拿著證明、安全地進入假設」——就是整套設計收斂 unsafe 的地方。作法是寫一個 macro，把這一步封進去：要 token 當參數（逼呼叫者先拿到證明）、內含唯一的 <code>unsafe</code> 區塊、區塊裡呼叫一個帶 <code>#[target_feature]</code> 的內層函式。</p>
+
+  <pre><code class="language-rust">fn add_avx2(token: Avx2, a: __m256, b: __m256) -> __m256 {
+    // SAFETY: token 的存在證明 avx2 可用，進入內層函式因此安全
+    unsafe { inner(token, a, b) }
+
+    #[target_feature(enable = "avx2")]
+    fn inner(token: Avx2, a: __m256, b: __m256) -> __m256 {
+        _mm256_add_ps(a, b)
+    }
+}</code></pre>
+
+  <p>讀這段 code 要抓的是責任怎麼分配。外層 <code>add_avx2</code> 是普通的安全函式，它收一個 <code>Avx2</code> token——這個型別簽名等於在編譯期強制：沒有 token 的人根本叫不動它，而 token 只能從 runtime detection 流出來。函式體裡那個 <code>unsafe</code> 區塊是整段唯一的不安全點，它的 SAFETY 註解只需要論證一件事：token 的存在保證了 feature 可用，所以進入內層 <code>#[target_feature]</code> 函式是安全的。內層的 <code>inner</code> 帶 <code>#[target_feature(enable = "avx2")]</code>，享受 1.87 的好處——裡面的 intrinsic 不必再寫 unsafe。三層各司其職：token 管證明、unsafe 區塊管「把證明兌現成進入許可」、target_feature 函式管實際運算。</p>
+
+  <p>整套方案的賣點就在這裡。作者寫道：「you only ever need to review and audit <em>this one macro</em>, not hundreds upon hundreds of bespoke unsafe blocks」。原本散落在上百個呼叫點、各自不同、各自可能寫錯的 unsafe，被 macro 收成一份。你的 reviewer 只要把這一個 macro 看對——確認「有 token 才能進、token 只能從 detection 拿到」這條鏈成立——其餘所有用 macro 生成的 SIMD 運算就都是安全的。這就是標題「even on the inside」的意思：不只 API 表面安全，連抽象的內部也只有一個可審點。對照前作的價值在這裡才看得出來：pulp 早就有 token，但它的 intrinsic wrapper 是一條條手寫的 unsafe——換句話說，pulp 把「表面」做安全了，「內部」每個 wrapper 仍是獨立的不安全來源、仍會偶爾寫錯。macro 方案的差別是把那一層也收斂掉。</p>
+
+  <p>下面的 tab 把這條收斂鏈攤成四步，可以一格一格切換看每一步的程式碼長相——從最原始的滿地 unsafe，到 token，到 macro 封裝，再到後面要講的泛型運算。</p>
+
+  <div class="vg-w-tabs-simd-ladder">
+    <style>
+      .vg-w-tabs-simd-ladder { display: grid; gap: var(--s-2); margin: var(--s-4) 0; }
+      .vg-w-tabs-simd-ladder input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-tabs-simd-ladder .tabs { display: flex; flex-wrap: wrap; gap: var(--s-1); border-bottom: 1px solid var(--line); }
+      .vg-w-tabs-simd-ladder .tab { font-family: var(--sans); font-size: var(--fs-sm); padding: var(--s-1) var(--s-2); cursor: pointer; color: var(--muted); border-bottom: 2px solid transparent; user-select: none; }
+      .vg-w-tabs-simd-ladder .tab:hover { color: var(--accent-text); }
+      .vg-w-tabs-simd-ladder .panel { display: none; }
+      .vg-w-tabs-simd-ladder .panel p { font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink-soft); margin: var(--s-1) 0 0 0; }
+      .vg-w-tabs-simd-ladder .panel p .unsafe-ct { font-family: JetBrains Mono, monospace; color: var(--accent-text); }
+      .vg-w-tabs-simd-ladder:has(#vg-w-tabs-simd-ladder-t1:checked) .panel-1 { display: block; }
+      .vg-w-tabs-simd-ladder:has(#vg-w-tabs-simd-ladder-t1:checked) [for="vg-w-tabs-simd-ladder-t1"] { color: var(--accent-text); border-bottom-color: var(--accent); }
+      .vg-w-tabs-simd-ladder:has(#vg-w-tabs-simd-ladder-t2:checked) .panel-2 { display: block; }
+      .vg-w-tabs-simd-ladder:has(#vg-w-tabs-simd-ladder-t2:checked) [for="vg-w-tabs-simd-ladder-t2"] { color: var(--accent-text); border-bottom-color: var(--accent); }
+      .vg-w-tabs-simd-ladder:has(#vg-w-tabs-simd-ladder-t3:checked) .panel-3 { display: block; }
+      .vg-w-tabs-simd-ladder:has(#vg-w-tabs-simd-ladder-t3:checked) [for="vg-w-tabs-simd-ladder-t3"] { color: var(--accent-text); border-bottom-color: var(--accent); }
+      .vg-w-tabs-simd-ladder:has(#vg-w-tabs-simd-ladder-t4:checked) .panel-4 { display: block; }
+      .vg-w-tabs-simd-ladder:has(#vg-w-tabs-simd-ladder-t4:checked) [for="vg-w-tabs-simd-ladder-t4"] { color: var(--accent-text); border-bottom-color: var(--accent); }
+    </style>
+    <input type="radio" id="vg-w-tabs-simd-ladder-t1" name="vg-w-tabs-simd-ladder-sel" checked />
+    <input type="radio" id="vg-w-tabs-simd-ladder-t2" name="vg-w-tabs-simd-ladder-sel" />
+    <input type="radio" id="vg-w-tabs-simd-ladder-t3" name="vg-w-tabs-simd-ladder-sel" />
+    <input type="radio" id="vg-w-tabs-simd-ladder-t4" name="vg-w-tabs-simd-ladder-sel" />
+    <div class="tabs" role="tablist">
+      <label class="tab" for="vg-w-tabs-simd-ladder-t1">① naive</label>
+      <label class="tab" for="vg-w-tabs-simd-ladder-t2">② token</label>
+      <label class="tab" for="vg-w-tabs-simd-ladder-t3">③ macro 封裝</label>
+      <label class="tab" for="vg-w-tabs-simd-ladder-t4">④ 泛型運算</label>
+    </div>
+    <div class="panel panel-1">
+<pre><code class="language-rust">// 滿地 unsafe：每個 intrinsic 自己包一層
+unsafe { let s = _mm256_add_ps(a, b); }
+unsafe { let p = _mm256_mul_ps(s, c); }
+unsafe { _mm256_storeu_ps(out, p); }
+// ……再乘上 x86 / ARM 每個平台一份</code></pre>
+      <p>要審的 unsafe 數量：<span class="unsafe-ct">hundreds upon hundreds</span>。每一個都可能把 feature 假設寫錯。</p>
+    </div>
+    <div class="panel panel-2">
+<pre><code class="language-rust">// token 是不可偽造的 ZST 證明
+pub struct Avx2(());
+
+fn detect_avx2() -> Option&lt;Avx2&gt; {
+    if is_x86_feature_detected!("avx2") { Some(Avx2(())) }
+    else { None }
+}</code></pre>
+      <p>token 把「這台機器有 AVX2」變成型別層的存在性。傳遞它<span class="unsafe-ct"> no runtime overhead</span>，因為它是 zero-sized。</p>
+    </div>
+    <div class="panel panel-3">
+<pre><code class="language-rust">fn add_avx2(token: Avx2, a: __m256, b: __m256) -> __m256 {
+    // SAFETY: token 證明 avx2 可用
+    unsafe { inner(token, a, b) }
+
+    #[target_feature(enable = "avx2")]
+    fn inner(token: Avx2, a: __m256, b: __m256) -> __m256 {
+        _mm256_add_ps(a, b)
+    }
+}</code></pre>
+      <p>整段不安全收進這一個 macro。要審的 unsafe 數量：<span class="unsafe-ct">this one macro</span>。</p>
+    </div>
+    <div class="panel panel-4">
+<pre><code class="language-rust">pub trait Level {}
+
+pub struct f32x8&lt;L: Level&gt; {
+    data: [f32; 8],
+    token: L,
+}
+
+impl std::ops::Add for f32x8&lt;Avx2&gt; {
+    type Output = Self;
+    fn add(self, rhs: Self) -> Self::Output { /* avx2 path */ }
+}</code></pre>
+      <p>把 token 塞進泛型型別參數，<span class="unsafe-ct">a + b</span> 對 Avx2 與 fallback 各有一份最佳實作——使用端寫的是普通加法。</p>
+    </div>
+  </div>
+
+  <h2>泛型 SIMD 型別：f32x8&lt;L: Level&gt; 與每個 level 的運算</h2>
+
+  <p>token 解決了「證明」，macro 解決了「審查面積」，但使用端還是得自己拿著 <code>add_avx2(token, a, b)</code> 這種帶 token 的函式呼叫到處跑。下一層把 token 收進型別參數，讓使用者寫回普通的 <code>a + b</code>。作法是一個泛型 marker trait <code>Level</code>，跟一個帶 level 參數的向量型別：</p>
+
+  <pre><code class="language-rust">pub trait Level {}
+
+pub struct f32x8&lt;L: Level&gt; {
+    data:  [f32; 8],
+    token: L,          // level 證明跟著資料走
+}
+
+impl std::ops::Add for f32x8&lt;Avx2&gt; {
+    type Output = Self;
+    fn add(self, rhs: Self) -> Self::Output { /* 用 avx2 path */ }
+}
+// 另對 f32x8&lt;Fallback&gt; 給一份純量實作</code></pre>
+
+  <p><code>f32x8&lt;L&gt;</code> 把八個 <code>f32</code> 打包成一個向量，型別參數 <code>L</code> 記住它是哪個 instruction-set level 的證明。對每個 level 各寫一份 <code>impl Add</code>：<code>f32x8&lt;Avx2&gt;</code> 的 <code>+</code> 走 AVX2 路徑、<code>f32x8&lt;Fallback&gt;</code> 的 <code>+</code> 退回純量。這就是「multi-versioning」——同一段高階演算法用泛型寫一次，編譯器替每個 level 各 monomorphize 一份最佳碼。使用者面看到的是乾淨的 <code>a + b</code>，背後的 token 與 macro 都被泛型機制吸收了。</p>
+
+  <p>把 token 收進型別參數 <code>L</code> 而不是當一般欄位傳，這個選擇有它的好處。型別參數是編譯期的東西，<code>f32x8&lt;Avx2&gt;</code> 跟 <code>f32x8&lt;Fallback&gt;</code> 是兩個不同的型別，編譯器在 monomorphize 時就替它們各生成一份專屬機器碼——AVX2 那份直接是緊湊的向量指令，Fallback 那份是純量迴圈，兩者之間沒有任何 runtime 的 if 判斷。dispatch 的決策被前移到「你拿什麼 level 的 token 建構向量」那一刻，之後整條運算鏈都是該 level 的專屬碼。這跟「每次運算都 runtime 檢查一次 CPU feature」的傳統做法是兩個世界：傳統做法把 branch 留在 hot loop 裡，泛型做法把 branch 消滅在型別實例化的瞬間。代價是要對每個 level 各維護一份 <code>impl</code>，而且 level 集合是離散、封閉的——你不能在跑的時候動態長出一個新 level。下面這張圖把這四層機制怎麼咬合、<code>a + b</code> 怎麼依 level dispatch 攤開來看。</p>
+
+  <figure class="vg-w-arch-simd-dispatch" data-mobile="keep" data-svg-scroll="720">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/>
+      </svg>
+      <span>四層機制如何把不可偽造 token 一路接到 a + b dispatch · 4 個機制 + 2 條 level 分支</span>
+    </p>
+    <svg viewBox="0 0 720 380" role="img"
+         aria-label="安全 SIMD 的四層結構：runtime detection 發 token、token 進泛型型別、a+b 依 level 走 AVX2 或 fallback、底層 macro 封住唯一 unsafe。" style="width: 100%; height: auto; max-width: 880px;">
+      <style>
+        .vg-w-arch-simd-dispatch text { font-family: EB Garamond, serif; font-size: 13px; }
+        .vg-w-arch-simd-dispatch .box { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; }
+        .vg-w-arch-simd-dispatch .box-accent { fill: var(--accent); fill-opacity: 0.14; stroke: var(--accent); stroke-width: 1.5; }
+        .vg-w-arch-simd-dispatch .box-sage { fill: var(--sage); fill-opacity: 0.2; stroke: var(--sage-deep); stroke-width: 1.5; }
+        .vg-w-arch-simd-dispatch .ttl { font-family: var(--sans); font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; fill: var(--accent-text); }
+        .vg-w-arch-simd-dispatch .sub { font-family: IM Fell English, serif; font-style: italic; font-size: 12px; fill: var(--muted); }
+        .vg-w-arch-simd-dispatch .mono { font-family: JetBrains Mono, monospace; font-size: 11px; fill: var(--ink); }
+        .vg-w-arch-simd-dispatch .flow { stroke: var(--muted-2); stroke-width: 1.4; fill: none; }
+        .vg-w-arch-simd-dispatch .head { font-family: IM Fell English, serif; font-style: italic; font-size: 13px; fill: var(--ink); }
+      </style>
+      <defs>
+        <marker id="vg-w-arch-simd-dispatch-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--muted-2)"/>
+        </marker>
+      </defs>
+
+      <text x="360" y="26" text-anchor="middle" class="head">runtime detection ——&gt; token ——&gt; 泛型型別 ——&gt; a + b dispatch ——&gt; 唯一 unsafe</text>
+
+      <!-- 1. runtime detection -->
+      <rect class="box-sage" x="30" y="56" width="180" height="64" rx="3"/>
+      <text x="40" y="78" class="ttl">runtime detection</text>
+      <text x="40" y="98" class="mono">is_x86_feature_detected!</text>
+      <text x="40" y="114" class="sub">偵測到才發證，否則 None</text>
+
+      <!-- 2. token -->
+      <rect class="box-accent" x="270" y="56" width="170" height="64" rx="3"/>
+      <text x="280" y="78" class="ttl">token (ZST)</text>
+      <text x="280" y="98" class="mono">Avx2(())</text>
+      <text x="280" y="114" class="sub">不可偽造、傳遞零成本</text>
+
+      <!-- 3. generic type -->
+      <rect class="box" x="500" y="56" width="190" height="64" rx="3"/>
+      <text x="510" y="78" class="ttl">generic type</text>
+      <text x="510" y="98" class="mono">f32x8&lt;L: Level&gt;</text>
+      <text x="510" y="114" class="sub">token 收進型別參數 L</text>
+
+      <line class="flow" x1="210" y1="88" x2="266" y2="88" marker-end="url(#vg-w-arch-simd-dispatch-arrow)"/>
+      <line class="flow" x1="440" y1="88" x2="496" y2="88" marker-end="url(#vg-w-arch-simd-dispatch-arrow)"/>
+
+      <!-- a+b dispatch -->
+      <rect class="box" x="270" y="170" width="170" height="50" rx="3"/>
+      <text x="355" y="192" text-anchor="middle" class="mono">a + b</text>
+      <text x="355" y="210" text-anchor="middle" class="sub">使用端寫普通加法</text>
+      <path class="flow" d="M 595 120 L 595 145 L 355 145 L 355 166" marker-end="url(#vg-w-arch-simd-dispatch-arrow)"/>
+
+      <!-- branch: AVX2 path -->
+      <rect class="box-accent" x="90" y="262" width="240" height="58" rx="3"/>
+      <text x="100" y="284" class="ttl">impl Add for f32x8&lt;Avx2&gt;</text>
+      <text x="100" y="304" class="sub">monomorphize 成 avx2 path</text>
+
+      <!-- branch: fallback path -->
+      <rect class="box-sage" x="380" y="262" width="240" height="58" rx="3"/>
+      <text x="390" y="284" class="ttl">impl Add for f32x8&lt;Fallback&gt;</text>
+      <text x="390" y="304" class="sub">退回純量實作</text>
+
+      <path class="flow" d="M 320 220 L 210 220 L 210 258" marker-end="url(#vg-w-arch-simd-dispatch-arrow)"/>
+      <path class="flow" d="M 390 220 L 500 220 L 500 258" marker-end="url(#vg-w-arch-simd-dispatch-arrow)"/>
+
+      <!-- the one macro at the bottom -->
+      <rect class="box" x="150" y="340" width="420" height="30" rx="3" stroke-dasharray="5,3"/>
+      <text x="360" y="360" text-anchor="middle" class="mono">底層：唯一 unsafe macro（兩條 path 共用，只此一處要 audit）</text>
+      <path class="flow" d="M 210 320 L 210 332 L 355 332 L 355 338" marker-end="url(#vg-w-arch-simd-dispatch-arrow)"/>
+      <path class="flow" d="M 500 320 L 500 332 L 365 332" />
+    </svg>
+    <figcaption>四層咬合：detection 發 token、token 進 <code>f32x8&lt;L&gt;</code> 的型別參數、<code>a + b</code> 依 level 各自 monomorphize、兩條 path 最終都落到同一個封了唯一 unsafe 的 macro。</figcaption>
+  </figure>
+
+  <h2>歷史與現況：從 pulp 到 fearless_simd v0.5</h2>
+
+  <p>這套組裝不是憑空長出來的。CPU feature token 這個點子，pulp 這個 crate 已經用了好幾年；但作者點出它的不完整：pulp「relied on handwritten <code>unsafe</code> wrappers around intrinsics, and occasionally got them wrong」——token 機制有了，可是包 intrinsic 的那層仍是手寫 unsafe，偶爾還寫錯。simdeez 走的路線類似，也是替多個 instruction set 各生成一份實作。而 safe_unaligned_simd 處理的是另一個切面（unaligned load/store 的安全包裝），原版的 unsafe 量偏高。這些前作各補一塊，但沒有人把「連內部也只剩一個可審 unsafe」這件事做齊。</p>
+
+  <figure class="vg-w-table-simd-landscape" data-mobile="keep">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/><path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+      </svg>
+      <span>點欄位標題排序 · 4 個 crate × 4 欄</span>
+    </p>
+    <style>
+      .vg-w-table-simd-landscape { overflow-x: auto; }
+      .vg-w-table-simd-landscape table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-simd-landscape thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; }
+      .vg-w-table-simd-landscape thead th[data-sort] { color: var(--accent-text); }
+      .vg-w-table-simd-landscape thead th[data-sort="asc"]::after { content: ' ▴'; font-size: 0.7em; }
+      .vg-w-table-simd-landscape thead th[data-sort="desc"]::after { content: ' ▾'; font-size: 0.7em; }
+      .vg-w-table-simd-landscape tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+      .vg-w-table-simd-landscape td.name { font-family: JetBrains Mono, monospace; color: var(--ink); }
+      .vg-w-table-simd-landscape tbody tr:hover td { background: var(--bg-soft); }
+      .vg-w-table-simd-landscape caption { text-align: left; caption-side: top; font-family: var(--scribed); font-style: italic; color: var(--muted); font-size: var(--fs-sm); padding: var(--s-1) 0; }
+    </style>
+    <table>
+      <caption>safe SIMD 生態的四個前後作——token 機制、intrinsic wrapper 的安全程度、處理範圍各不同。點欄位標題排序。</caption>
+      <thead>
+        <tr>
+          <th data-key="name">crate</th>
+          <th data-key="token">CPU feature token</th>
+          <th data-key="wrap">intrinsic wrapper</th>
+          <th data-key="note">定位 / 文章評語</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td class="name">pulp</td><td>有（用了多年）</td><td>手寫 unsafe</td><td>token 機制成熟，但「occasionally got them wrong」——wrapper 仍是手寫 unsafe。</td></tr>
+        <tr><td class="name">simdeez</td><td>類似機制</td><td>多版本生成</td><td>替多個 instruction set 各生成一份實作，路線與 fearless_simd 相近。</td></tr>
+        <tr><td class="name">safe_unaligned_simd</td><td>—</td><td>原版 unsafe 量高</td><td>專注 unaligned load/store 的安全包裝，功能後被 fearless_simd 以更低 unsafe 量整合。</td></tr>
+        <tr><td class="name">fearless_simd</td><td>marker value + Simd trait</td><td>kernel! macro 封裝</td><td>v0.5：safe SIMD with ergonomic multi-versioning；f32x8/f64x4 等實作 + 與 *。</td></tr>
+      </tbody>
+    </table>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-table-simd-landscape');
+        const headers = root.querySelectorAll('thead th');
+        const tbody = root.querySelector('tbody');
+        let activeKey = null, asc = true;
+        headers.forEach((h, idx) => h.addEventListener('click', () => {
+          const key = h.dataset.key;
+          if (activeKey === key) asc = !asc; else { activeKey = key; asc = true; }
+          headers.forEach((x) => x.removeAttribute('data-sort'));
+          h.setAttribute('data-sort', asc ? 'asc' : 'desc');
+          const rows = Array.from(tbody.querySelectorAll('tr'));
+          rows.sort((a, b) => {
+            const av = a.children[idx].textContent.trim();
+            const bv = b.children[idx].textContent.trim();
+            const cmp = av.localeCompare(bv, 'en');
+            return asc ? cmp : -cmp;
+          });
+          rows.forEach((r) => tbody.appendChild(r));
+        }));
+      })();
+    </script>
+  </figure>
+
+  <p>這些前作的關係不是互相取代，而是各補一塊拼圖。token 是 pulp 證明可行的、編譯器層的 target_feature 追蹤是 Rust 1.87 補上的、把唯一 unsafe 封進 macro 是讓「內部」也安全的最後一塊，泛型 <code>f32x8&lt;L&gt;</code> 則是把這些接成乾淨 API 的黏著層。一個生態要走到「safe SIMD even on the inside」，這幾塊得同時到位——任何一塊缺了，要嘛使用者面不夠乾淨、要嘛內部仍漏 unsafe、要嘛效能打折。這也解釋了為什麼這篇文章現在才出現，而不是三年前：它需要的最後一塊地基（1.87 的 intrinsic 安全化）才剛落地不久。</p>
+
+  <p>把這套設計收成 production crate 的是 fearless_simd，目前版本 0.5.0，自我定位是「safe SIMD with ergonomic multi-versioning in Rust」。它的 token 機制以 marker value 實作 <code>Simd</code> trait，提供 <code>f32x8</code>、<code>f64x4</code>、<code>i32x8</code> 等泛型 packed vector 型別，並實作標準算術 trait——文件明說這些型別「can be added together using <code>+</code>, multiplied by a scalar using <code>*</code>」，背後「implemented as efficiently as possible using SIMD instructions」。支援的 level 是離散集合：<code>Sse4_2</code> 對應 x86-64-v2、<code>Avx2</code> 對應 x86-64-v3，外加純量 <code>Fallback</code>。要混用高階運算與平台特定 intrinsic 時，它公開 <code>dispatch!</code> macro（依 level 選實作）跟 <code>kernel!</code> macro——依文件，當 portable API 不夠用時，你可以透過 <code>kernel!()</code> macro 安全地呼叫平台特定的 intrinsic，也就是前面講的「把唯一 unsafe 封進 macro」在真實 crate 裡的對應物。</p>
+
+  <h2>沒解掉的張力：a + b 與 inlining 不可兼得</h2>
+
+  <p>到這裡聽起來很完美：安全、零成本、使用端寫普通 <code>a + b</code>。但有個 caveat 把整套設計拉回現實，而且作者沒有假裝它不存在。根源是 inlining 規則：「The compiler cannot inline a function that has a <code>#[target_feature]</code> annotation into one that doesn't.」帶 <code>#[target_feature]</code> 的函式無法被 inline 進一個沒有該標記的函式。</p>
+
+  <p>對 SIMD 來說 inlining 不是可有可無的優化——它是效能本身。SIMD 的價值在於把連續的向量運算融成緊湊的指令流，一旦每個 <code>a + b</code> 都變成一次真正的 function call（push 參數、跳轉、回返），向量化帶來的好處會被 call overhead 吃掉一大塊。要量化這個傷害：一條 AVX2 加法本身可能只有一兩個 cycle，但一次未被 inline 的函式呼叫，光是參數搬進暫存器、跳轉、回返、可能的 register spill，就能輕鬆吃掉十幾個 cycle。把運算包成函式呼叫，等於在每條一兩 cycle 的指令外面套一層十幾 cycle 的殼——向量化算出來的加速被殼直接吞掉。更糟的是它阻斷了下游優化：編譯器看不穿函式邊界，就沒辦法把相鄰的幾個 <code>a + b</code> 合併、沒辦法把載入跟運算交錯排程、沒辦法把迴圈展開。inlining 一斷，後面一整串優化全部失效。</p>
+
+  <p>所以這個 inlining 限制直接威脅到整套抽象的存在理由——一個讓你寫得安全又漂亮、但跑起來比手寫 unsafe 慢一截的抽象，沒有人會用。具體的約束是：「whenever you call <code>a + b</code> on SIMD types, you have to do it from a function with either <code>#[inline(always)]</code> or <code>#[target_feature]</code> on it」——你呼叫 <code>a + b</code> 的那個函式，本身必須帶 <code>#[inline(always)]</code> 或 <code>#[target_feature]</code> 其中之一，inline 鏈才接得起來。這是一個會洩漏出去的抽象：理想上使用者不該需要知道底下有 <code>#[target_feature]</code> 這回事，但這個 inlining 規則逼著他在自己的函式上掛標記。漂亮的 <code>a + b</code> 語法守住了，代價是呼叫脈絡的一個隱性紀律——忘了掛，編譯器不會報錯，只會默默生出慢的碼。下面這張圖把「呼叫端有沒有帶對標記」這件事的後果並排攤開。</p>
+
+  <figure class="vg-w-bar-simd-inline" data-mobile="static" data-svg-scroll="720">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M21 12a9 9 0 1 1-6.219-8.56"/><path d="m8 12 3 3 5-6"/>
+      </svg>
+      <span>切換呼叫端有沒有帶 #[inline(always)] / #[target_feature]——看 a + b 能不能 inline · 2 種呼叫脈絡</span>
+    </p>
+    <style>
+      .vg-w-bar-simd-inline { display: grid; gap: var(--s-3); }
+      .vg-w-bar-simd-inline .switches { display: flex; gap: var(--s-2); flex-wrap: wrap; }
+      .vg-w-bar-simd-inline .sw { font-family: var(--sans); font-size: var(--fs-sm); padding: var(--s-1) var(--s-2); border: 1px solid var(--line); cursor: pointer; user-select: none; color: var(--muted); min-height: 44px; display: flex; align-items: center; }
+      .vg-w-bar-simd-inline .sw input { display: none; }
+      .vg-w-bar-simd-inline .sw:has(input:checked) { border-color: var(--accent); color: var(--accent-text); }
+      .vg-w-bar-simd-inline svg { width: 100%; height: auto; }
+      .vg-w-bar-simd-inline .verdict { padding: var(--s-2) var(--s-3); background: var(--bg-soft); border-left: 2px solid var(--accent); font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink-soft); }
+      .vg-w-bar-simd-inline .verdict em { color: var(--accent-text); font-style: italic; }
+      .vg-w-bar-simd-inline figcaption { font-family: var(--scribed); font-style: italic; font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+    <div class="switches" role="group" aria-label="呼叫端標記切換" data-vg-controls>
+      <label class="sw"><input type="radio" name="vg-w-bar-simd-inline-sel" value="bad" checked />呼叫端：無標記</label>
+      <label class="sw"><input type="radio" name="vg-w-bar-simd-inline-sel" value="good" />呼叫端：帶 #[inline(always)]</label>
+    </div>
+    <svg viewBox="0 0 720 230" role="img"
+         aria-label="呼叫端標記決定 a+b 能否 inline——無標記時 #[target_feature] 函式無法被 inline、退化成 function call。" style="width: 100%; height: auto; max-width: 880px;">
+      <style>
+        .vg-w-bar-simd-inline svg text { font-family: EB Garamond, serif; font-size: 13px; }
+        .vg-w-bar-simd-inline .mono { font-family: JetBrains Mono, monospace; font-size: 12px; }
+        .vg-w-bar-simd-inline .lbl { font-family: IM Fell English, serif; font-style: italic; font-size: 12px; fill: var(--muted); }
+      </style>
+      <text x="40" y="40" fill="var(--ink)" class="mono">do_stuff() { c = a + b; }</text>
+      <text x="40" y="60" fill="var(--muted)" class="lbl">↑ 你寫的呼叫端</text>
+
+      <!-- inline boundary visual -->
+      <rect data-callsite x="40" y="86" width="300" height="44" rx="3" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.5"/>
+      <text data-callsite-label x="50" y="106" fill="var(--ink)" class="mono">do_stuff()</text>
+      <text data-callsite-tag x="50" y="122" fill="var(--muted)" class="lbl">無 #[inline(always)] / #[target_feature]</text>
+
+      <!-- arrow -->
+      <line data-arrow x1="345" y1="108" x2="395" y2="108" stroke="var(--muted-2)" stroke-width="1.4" marker-end="url(#vg-w-bar-simd-inline-arrow)"/>
+      <defs>
+        <marker id="vg-w-bar-simd-inline-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--muted-2)"/>
+        </marker>
+      </defs>
+
+      <rect x="400" y="86" width="280" height="44" rx="3" fill="var(--accent)" fill-opacity="0.12" stroke="var(--accent)" stroke-width="1.5"/>
+      <text x="410" y="106" fill="var(--ink)" class="mono">add_avx2() #[target_feature]</text>
+      <text x="410" y="122" fill="var(--muted)" class="lbl">內含 SIMD intrinsic</text>
+
+      <text data-result x="40" y="172" fill="var(--accent-text)" class="mono">結果：無法 inline ——&gt; 真正的 function call</text>
+      <text data-result-2 x="40" y="194" fill="var(--muted)" class="lbl">每個 a + b 都付一次 call overhead，向量化效益被吃掉</text>
+    </svg>
+    <div class="verdict" data-verdict></div>
+    <figcaption>規則：<code>#[target_feature]</code> 函式不能被 inline 進無標記的函式。呼叫端自己帶 <code>#[inline(always)]</code> 或 <code>#[target_feature]</code>，inline 鏈才接得起來。</figcaption>
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        const root = document.querySelector('.vg-w-bar-simd-inline');
+        const inputs = root.querySelectorAll('input[name="vg-w-bar-simd-inline-sel"]');
+        const callsite = root.querySelector('[data-callsite]');
+        const tag = root.querySelector('[data-callsite-tag]');
+        const result = root.querySelector('[data-result]');
+        const result2 = root.querySelector('[data-result-2]');
+        const verdict = root.querySelector('[data-verdict]');
+        function update() {
+          const v = root.querySelector('input:checked').value;
+          if (v === 'bad') {
+            callsite.setAttribute('stroke', 'var(--muted-2)');
+            tag.textContent = '無 #[inline(always)] / #[target_feature]';
+            result.setAttribute('fill', 'var(--accent-text)');
+            result.textContent = '結果：無法 inline ——> 真正的 function call';
+            result2.textContent = '每個 a + b 都付一次 call overhead，向量化效益被吃掉';
+            verdict.innerHTML = '呼叫端沒帶標記：<code>add_avx2()</code> 帶著 <em>#[target_feature]</em>，無法被 inline 進無標記的 <code>do_stuff()</code>。每個 <code>a + b</code> 退化成一次真正的呼叫，效能崩。';
+          } else {
+            callsite.setAttribute('stroke', 'var(--sage-deep)');
+            tag.textContent = '帶 #[inline(always)]——inline 鏈接得起來';
+            result.setAttribute('fill', 'var(--sage-deep)');
+            result.textContent = '結果：可以 inline ——> 緊湊的向量指令流';
+            result2.textContent = 'a + b 融進呼叫端，沒有 call overhead，SIMD 效益保住';
+            verdict.innerHTML = '呼叫端帶 <em>#[inline(always)]</em>：inline 鏈接得起來，<code>add_avx2()</code> 被融進 <code>do_stuff()</code>，向量運算回到緊湊指令流——這是用安全換效能不打折的前提。';
+          }
+        }
+        inputs.forEach((i) => i.addEventListener('change', update));
+        update();
+      })();
+    </script>
+  </figure>
+
+  <p>對要動手的工程師，這個限制有兩個務實的讀法。第一，它把「安全」跟「快」分成兩件要分別確認的事——換用 fearless_simd 之類的 crate 確實把 unsafe 的 audit 面積壓到一個 macro，但效能不是自動到手的，得確認 hot path 上呼叫 <code>a + b</code> 的每一層都掛了對的標記。第二，這個紀律無法靠編譯器報錯來提醒，只能靠 benchmark 抓——忘了掛標記，程式照樣編得過、跑得對，只是慢。所以導入這類 crate 的正確姿勢是：先讓它正確，再用 profiler 確認 inline 鏈沒斷，兩步分開做。把這件事跟前面的審查面積放在一起看，這套設計給的交換很清楚——拿確定的安全收益，換一個需要主動守住的效能紀律。</p>
+
+  <p>有沒有出路？部分有。作者提到 Struct Target Features RFC：「The Struct Target Features RFC solves this for <code>add_avx2(token, a, b)</code> and <code>add&lt;S: Simd&gt;(token, a, b)</code> but I don't see a path to <code>a + b</code> just yet.」對於顯式傳 token 的函式呼叫形式，RFC 能解；但對 operator overloading 的 <code>a + b</code>，作者明說「目前還看不到路」。而且他不只是說現在沒解，他懷疑這是根本性的：「I'm not sure what can be done about this. The limitation seems quite fundamental for any approach that implements <code>a + b</code> with SIMD.」——任何想用 <code>a + b</code> 實作 SIMD 的方案，可能都會撞到同一面牆。這是 hedge，不是定論，但它把整套設計的邊界劃得很清楚：你可以拿到安全與乾淨語法，但要保住效能，呼叫端的 inlining 紀律得自己守。</p>
+
+  <p class="vg-deep-closer"><strong>What this enables</strong>：一支跨平台的 SIMD kernel，原本散在上百個呼叫點的 unsafe，現在收斂成單一一個可審的 macro——配上 Rust 1.87 的 target_feature 追蹤、不可偽造的 ZST token 與 <code>f32x8&lt;L: Level&gt;</code> 泛型，fearless_simd v0.5 把它變成 <code>cargo add</code> 就能用的東西；代價是 <code>a + b</code> 的呼叫端得自己守住 inlining 紀律，這道牆作者自己也還沒看到繞過去的路。</p>
+</div>
