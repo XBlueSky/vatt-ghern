@@ -1,0 +1,411 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">你讓 LLM 寫了一個 GPU kernel，跑了 benchmark，綠燈，allclose 通過——你以為它對了。論文《The Correctness Illusion in LLM-Generated GPU Kernels》說：綠燈只代表那一個固定輸入沒抓到 bug，不代表 kernel 是對的。</p>
+  <h1 class="vg-post-title">LLM 產的 GPU kernel 看起來對——是測試在說謊</h1>
+</header>
+
+<div class="vg-post-body">
+
+<p><span class="vg-dropcap">讀</span>完這篇之後，你會分得清「一個 GPU kernel 通過了 allclose 測試」和「一個 GPU kernel 是正確的」這兩句話差在哪——以及為什麼把它們當成同一句話，是 2026 年評測 LLM 生成 kernel 時最常見的陷阱。Dipankar Sarkar 這篇 2026 年 6 月 18 日掛上 arXiv 的論文，做的事情很單純：他把幾個主流 benchmark 用的正確性 oracle 拿出來，實測它到底有多容易被騙，然後給了一個更難騙的替代方案。結論用他自己的詞講，叫「正確性的錯覺」。</p>
+
+<h2>先說清楚：一個 GPU kernel「對」是什麼意思</h2>
+
+<p>GPU kernel 是一段在 GPU 上平行跑的小程式。你寫一個 matmul kernel、一個 softmax kernel、一個 flash-attention kernel，輸入是幾塊 tensor，輸出是另一塊 tensor。Triton 是現在很多人拿來寫這種 kernel 的語言，因為它讓你用接近 Python 的寫法控制 tile、控制 memory access，而不必直接寫 CUDA。</p>
+
+<p>那「對」是什麼意思？直覺上很簡單：給同一組輸入，你的 kernel 算出來的結果，要跟「正確答案」一樣。問題在「一樣」這兩個字。GPU 上跑的幾乎都是浮點運算，浮點運算不滿足結合律——同一串加法換個順序相加，結果的最後幾個 bit 會不同。GPU 把一個 reduction 拆成幾千個 thread 平行做、再合併，合併順序跟單執行緒的 CPU 不一樣，所以 bit-for-bit 相等這個標準從一開始就用不上。你不能要求 GPU 的輸出跟 reference 完全相等，你只能要求它「夠接近」。</p>
+
+<p>這裡值得把「為什麼不能要求完全相等」再講細一點，因為它是整套測法的地基。浮點數是用有限的 bit 去逼近實數，每做一次運算就要把結果捨入回最接近的可表示值，這個捨入誤差會一路累積。更麻煩的是浮點加法不滿足結合律：<code>(a + b) + c</code> 跟 <code>a + (b + c)</code> 在實數上相等，在 fp16 或 fp32 上可能差最後幾個 bit，因為中間那次捨入發生的位置不同。一個 reduction——把一整列幾千個數加起來——在 GPU 上是先讓每個 thread 各加一段、再把這些部分和兩兩合併成樹狀，合併的順序跟 CPU 上由左到右一個一個加完全不同。順序不同，捨入累積的路徑就不同，最後那幾個 bit 也就不同。這不是哪一邊算錯，是浮點本身的性質。所以「對」永遠只能定義成「夠接近」，這也是 allclose 這個工具存在的理由：它不問兩個數是否相等，只問它們的差是否落在一條事先講好的容差線以內。</p>
+
+<p>於是正確性的定義被迫變成這樣：對一個 op，存在一個可信的 reference 實作；對任何合法輸入，kernel 的輸出與 reference 的輸出之間的差距，要小於某個容差。這就帶出三個必須有人來定的東西——哪些輸入算「任何合法輸入」、reference 從哪來、容差設多少。整篇論文的爭點，全在這三個東西被設得太隨便。</p>
+
+<p>難測的地方也在這裡。一個 matmul kernel 的合法輸入包含各種 shape、各種 dtype、各種數值範圍，邊界上還有零、有 NaN、有 Inf、有剛好踩到 tile 邊界不整除的尺寸。你不可能把所有輸入都跑一遍，所以任何測試都是抽樣。抽得好不好，決定了你抓不抓得到 bug。一個只在某個特定 shape、某個特定數值才會錯的 kernel，用對的輸入測會立刻現形，用錯的輸入測就一路綠燈。</p>
+
+<h2>allclose-on-one-shape：被一個固定輸入騙過去</h2>
+
+<p>論文點名的對象很具體。它說現有的 benchmark——KernelBench、TritonBench、GEAK——「score correctness through fixed-shape, small-sample allclose-style checks」，也就是用固定 shape、小樣本的 allclose 風格檢查來評正確性。再往下一句講得更死：「The shape, dtype, and tolerance are fixed for each kernel.」對每一個 kernel，shape、dtype、tolerance 三件事都是固定的，只有輸入的數量在各 benchmark 間略有不同。</p>
+
+<p>把這句話翻成操作步驟，就是所謂的 allclose-on-one-shape：挑一個 shape（比如 1024×1024）、一個 dtype（比如 fp16）、設一個容差，隨機生幾組輸入，跑 kernel，跟 reference 做一次 <code>torch.allclose</code>，過了就標正確。allclose 本身只是逐元素檢查 <code>|a - b| ≤ atol + rtol × |b|</code>，是個合理的工具——問題不在 allclose，問題在「on-one-shape」：你只在一個固定的座標上比了一次。</p>
+
+<p>下面這個 widget 把這件事做成可以親手玩的東西。左邊是一個刻意有 bug 的 kernel（這是為了說明用的假想例子，不是論文裡的特定數字）：它只在某些輸入上算錯。你可以選評測它的方式，看兩個 oracle 給出的判決怎麼分歧。</p>
+
+<figure class="vg-w-param-demo-oracle" data-mobile="static" data-svg-scroll="720">
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
+      <path d="m3.3 7 8.7 5 8.7-5"/><path d="M12 22V12"/>
+    </svg>
+    <span>拖滑桿掃過 16 種測試輸入 · 看兩個 oracle 判決怎麼分歧</span>
+  </p>
+  <style>
+    .vg-w-param-demo-oracle { display: grid; grid-template-rows: auto auto 1fr; gap: var(--s-2); }
+    .vg-w-param-demo-oracle .controls { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+    .vg-w-param-demo-oracle .controls input { flex: 1; height: 36px; accent-color: var(--accent); touch-action: none; }
+    .vg-w-param-demo-oracle .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 16ch; text-align: right; }
+    .vg-w-param-demo-oracle svg { width: 100%; height: auto; }
+    .vg-w-param-demo-oracle figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+  </style>
+
+  <div class="controls" data-vg-controls>
+    <label for="vg-w-param-demo-oracle-x">測試輸入 #</label>
+    <input id="vg-w-param-demo-oracle-x" type="range" min="0" max="15" value="0" step="1" />
+    <span class="readout" id="vg-w-param-demo-oracle-readout">#0</span>
+  </div>
+
+  <svg viewBox="0 0 720 340" preserveAspectRatio="xMidYMid meet" role="img" aria-label="oracle verdict comparison">
+    <text x="30" y="34" font-family="Manrope, sans-serif" font-size="12" letter-spacing="0.06em" fill="var(--muted)">被測 KERNEL · 只在邊界輸入算錯（假想 bug）</text>
+
+    <g font-family="JetBrains Mono, monospace" font-size="12">
+      <text x="30" y="70" fill="var(--ink)" id="vg-w-param-demo-oracle-input-line">input：shape 1024×1024 · fp16 · 一般隨機值</text>
+      <text x="30" y="94" fill="var(--muted)" id="vg-w-param-demo-oracle-diff-line">max |kernel − ref| ＝ 0.0003</text>
+    </g>
+
+    <rect x="30" y="120" width="320" height="170" rx="8" fill="var(--bg-soft)" stroke="var(--line)" stroke-width="1" />
+    <text x="50" y="148" font-family="Manrope, sans-serif" font-size="12" letter-spacing="0.05em" fill="var(--muted)">ALLCLOSE-ON-ONE-SHAPE</text>
+    <text x="50" y="170" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">固定 shape · 固定 dtype · 一次比對</text>
+    <text x="50" y="226" font-family="EB Garamond, serif" font-size="40" id="vg-w-param-demo-oracle-weak-verdict" fill="var(--sage-deep)">PASS</text>
+    <text x="50" y="262" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)" id="vg-w-param-demo-oracle-weak-note">永遠看同一格 · 抓不到</text>
+
+    <rect x="370" y="120" width="320" height="170" rx="8" fill="var(--bg-soft)" stroke="var(--line)" stroke-width="1" id="vg-w-param-demo-oracle-strong-box" />
+    <text x="390" y="148" font-family="Manrope, sans-serif" font-size="12" letter-spacing="0.05em" fill="var(--muted)">SCHEMA-FUZZ ＋ fp64 參考</text>
+    <text x="390" y="170" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">掃多形狀／多 dtype／邊界值</text>
+    <text x="390" y="226" font-family="EB Garamond, serif" font-size="40" id="vg-w-param-demo-oracle-strong-verdict" fill="var(--sage-deep)">PASS</text>
+    <text x="390" y="262" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)" id="vg-w-param-demo-oracle-strong-note">尚未掃到觸發 bug 的輸入</text>
+
+    <text x="360" y="320" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" font-style="italic" fill="var(--muted)" id="vg-w-param-demo-oracle-caption-svg">前幾格兩邊都 PASS · 拖到邊界輸入看右邊翻臉</text>
+  </svg>
+
+  <figcaption>左邊永遠只看 #0 那一格，所以永遠 PASS；右邊掃過全部 16 個輸入，掃到觸發 bug 的那格就翻成 FAIL。同一個 kernel，兩個 oracle，兩種結論。</figcaption>
+
+  <script>
+    (function () {
+      if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+      const root = document.querySelector('.vg-w-param-demo-oracle');
+      const input = root.querySelector('input');
+      const readout = root.querySelector('.readout');
+      const inputLine = root.querySelector('#vg-w-param-demo-oracle-input-line');
+      const diffLine = root.querySelector('#vg-w-param-demo-oracle-diff-line');
+      const strongVerdict = root.querySelector('#vg-w-param-demo-oracle-strong-verdict');
+      const strongNote = root.querySelector('#vg-w-param-demo-oracle-strong-note');
+      const strongBox = root.querySelector('#vg-w-param-demo-oracle-strong-box');
+      const captionSvg = root.querySelector('#vg-w-param-demo-oracle-caption-svg');
+
+      // 16 個測試輸入：前面是一般隨機值（bug 不觸發），後段是 schema-fuzz 才會生的邊界輸入
+      const cases = [
+        { desc: 'shape 1024×1024 · fp16 · 一般隨機值', diff: 0.0003, trig: false },
+        { desc: 'shape 1024×1024 · fp16 · 另一組隨機 seed', diff: 0.0004, trig: false },
+        { desc: 'shape 1024×1024 · fp16 · 第三組隨機 seed', diff: 0.0002, trig: false },
+        { desc: 'shape 512×2048 · fp16 · 一般隨機值', diff: 0.0005, trig: false },
+        { desc: 'shape 768×1280 · fp16 · 非 2 的冪 shape', diff: 0.0006, trig: false },
+        { desc: 'shape 1000×1000 · fp16 · tile 不整除', diff: 0.0009, trig: false },
+        { desc: 'shape 1024×1024 · bf16 · 換 dtype', diff: 0.0007, trig: false },
+        { desc: 'shape 1024×1024 · fp32 · 換 dtype', diff: 0.0001, trig: false },
+        { desc: 'shape 1024×1024 · fp16 · 含 0 列', diff: 0.0008, trig: false },
+        { desc: 'shape 17×4096 · fp16 · 極瘦 shape', diff: 0.0011, trig: false },
+        { desc: 'shape 1024×1024 · fp16 · 含 +Inf 元素', diff: 7.4, trig: true },
+        { desc: 'shape 1024×1024 · fp16 · 含 NaN 元素', diff: 99.0, trig: true },
+        { desc: 'shape 1×1048576 · fp16 · 單列極長 reduction', diff: 3.2, trig: true },
+        { desc: 'shape 1024×1024 · fp16 · 全部極大值近上溢', diff: 5.1, trig: true },
+        { desc: 'shape 3×3 · fp16 · 極小 tile 邊界', diff: 2.6, trig: true },
+        { desc: 'shape 1024×1024 · fp16 · 負值密集近下溢', diff: 1.9, trig: true },
+      ];
+      const TOL = 0.01;
+
+      function update() {
+        const i = Number(input.value);
+        const c = cases[i];
+        readout.textContent = '#' + i;
+        inputLine.textContent = 'input：' + c.desc;
+        diffLine.textContent = 'max |kernel − ref| ＝ ' + c.diff;
+
+        // 強 oracle：累積掃到 0..i，只要其中有 trig 就 FAIL
+        let caught = false;
+        for (let k = 0; k <= i; k++) if (cases[k].trig) caught = true;
+
+        if (caught) {
+          strongVerdict.textContent = 'FAIL';
+          strongVerdict.setAttribute('fill', 'var(--accent-text)');
+          strongNote.textContent = 'diff ＞ tol · 從 seed 可 byte-for-byte 重播';
+          strongNote.setAttribute('fill', 'var(--accent-text)');
+          strongBox.setAttribute('stroke', 'var(--accent)');
+          strongBox.setAttribute('stroke-width', '2');
+          captionSvg.textContent = '右邊掃到邊界輸入 · 判決翻成 FAIL · 左邊還在 PASS';
+        } else {
+          strongVerdict.textContent = 'PASS';
+          strongVerdict.setAttribute('fill', 'var(--sage-deep)');
+          strongNote.textContent = '尚未掃到觸發 bug 的輸入';
+          strongNote.setAttribute('fill', 'var(--muted)');
+          strongBox.setAttribute('stroke', 'var(--line)');
+          strongBox.setAttribute('stroke-width', '1');
+          captionSvg.textContent = '前幾格兩邊都 PASS · 拖到邊界輸入看右邊翻臉';
+        }
+      }
+      input.addEventListener('input', update);
+      update();
+    })();
+  </script>
+</figure>
+
+<p>玩過一輪你會抓到關鍵：左邊那個 allclose-on-one-shape 永遠只盯著 #0 那一格，不管你怎麼拖，它的判決都是 PASS——因為它從頭到尾只比那一個固定輸入。bug 確實在 kernel 裡，只是它選的那格剛好沒踩到。右邊把輸入空間掃過去，掃到含 Inf、含 NaN、極長 reduction 那些格子，差距瞬間從 0.0003 暴增到遠超容差，判決翻成 FAIL。同一個 kernel，沒有改一行 code，結論卻相反。論文把「allclose-on-one-shape 認證為正確、其實有 bug」的這種 kernel 叫做 illusion——正確性的錯覺。</p>
+
+<h2>脆弱在哪四個維度</h2>
+
+<p>「只比一格」這件事可以拆成四個獨立的失效來源。把它們分開看，你會發現每一個都對應到一個你以為 benchmark 幫你顧到、其實沒有的東西。下面四個 tab 各講一個。</p>
+
+<div class="vg-w-tabs-fragile">
+  <style>
+    .vg-w-tabs-fragile { display: grid; gap: var(--s-2); margin: var(--s-3) 0; }
+    .vg-w-tabs-fragile input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+    .vg-w-tabs-fragile .tabs { display: flex; flex-wrap: wrap; gap: var(--s-2); border-bottom: 1px solid var(--line); }
+    .vg-w-tabs-fragile .tab { font-family: var(--sans); font-size: var(--fs-sm); padding: var(--s-1) var(--s-2); cursor: pointer; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+    .vg-w-tabs-fragile .panel { display: none; padding: var(--s-2) 0; }
+    .vg-w-tabs-fragile .panel p { margin: 0 0 var(--s-2) 0; }
+    .vg-w-tabs-fragile:has(#vg-w-tabs-fragile-t1:checked) .panel-1 { display: block; }
+    .vg-w-tabs-fragile:has(#vg-w-tabs-fragile-t1:checked) [for="vg-w-tabs-fragile-t1"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    .vg-w-tabs-fragile:has(#vg-w-tabs-fragile-t2:checked) .panel-2 { display: block; }
+    .vg-w-tabs-fragile:has(#vg-w-tabs-fragile-t2:checked) [for="vg-w-tabs-fragile-t2"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    .vg-w-tabs-fragile:has(#vg-w-tabs-fragile-t3:checked) .panel-3 { display: block; }
+    .vg-w-tabs-fragile:has(#vg-w-tabs-fragile-t3:checked) [for="vg-w-tabs-fragile-t3"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    .vg-w-tabs-fragile:has(#vg-w-tabs-fragile-t4:checked) .panel-4 { display: block; }
+    .vg-w-tabs-fragile:has(#vg-w-tabs-fragile-t4:checked) [for="vg-w-tabs-fragile-t4"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+  </style>
+  <input type="radio" id="vg-w-tabs-fragile-t1" name="vg-w-tabs-fragile-sel" checked />
+  <input type="radio" id="vg-w-tabs-fragile-t2" name="vg-w-tabs-fragile-sel" />
+  <input type="radio" id="vg-w-tabs-fragile-t3" name="vg-w-tabs-fragile-sel" />
+  <input type="radio" id="vg-w-tabs-fragile-t4" name="vg-w-tabs-fragile-sel" />
+  <div class="tabs">
+    <label class="tab" for="vg-w-tabs-fragile-t1">形狀</label>
+    <label class="tab" for="vg-w-tabs-fragile-t2">隨機性</label>
+    <label class="tab" for="vg-w-tabs-fragile-t3">精度</label>
+    <label class="tab" for="vg-w-tabs-fragile-t4">邊界</label>
+  </div>
+  <div class="panel panel-1">
+    <p><strong>固定 shape 漏掉的東西</strong>：kernel 通常把輸出切成一塊塊 tile，每個 thread block 算一塊。如果你只用 1024×1024 這種剛好被 tile size 整除的 shape 測，那段「最後一塊 tile 不滿、要做邊界處理」的程式碼根本沒被執行到。一個在 mask 邊界寫錯的 kernel，在整除的 shape 上完全正確，換成 1000×1000 或 17×4096 就開始算錯。論文點名的固定 shape，就是固定在這種好看的尺寸上。</p>
+    <p>broadcast、stride、非連續 memory layout 也一樣——它們都跟 shape 綁在一起。一個 shape 等於把這些維度全部釘死成一個值。</p>
+  </div>
+  <div class="panel panel-2">
+    <p><strong>固定隨機分布抽不到的值</strong>：allclose 餵進去的輸入通常是 <code>torch.randn</code> 那種標準常態分布的隨機值，集中在 0 附近的一般範圍。但會觸發 bug 的往往是分布尾巴上的值——非常大、非常小、剛好抵消成 0。標準常態幾乎抽不到這些。</p>
+    <p>更隱蔽的是：同一個 seed 每次跑出同一組「一般」的值，於是 bug 永遠在同一個地方躲過。你以為跑了很多次很安全，其實每次都在問同一個問題。隨機不等於有覆蓋率。</p>
+  </div>
+  <div class="panel panel-3">
+    <p><strong>固定 tolerance 兩面都會錯</strong>：容差設太鬆，真正的 bug 造成的偏差被吞進容差裡，FAIL 變成 PASS——漏抓。設太緊，fp16 本身正常的捨入誤差就超過容差，對的 kernel 被判 FAIL——誤殺。</p>
+    <p>關鍵在於，正確的容差跟 op 與 dtype 有關：一個 fp16 的長 reduction 累積的誤差，本來就比一個 fp32 的逐元素 op 大得多。用一個固定的 tolerance 套所有 kernel，等於假設所有 op 的數值行為一樣——它們不一樣。</p>
+  </div>
+  <div class="panel panel-4">
+    <p><strong>不測邊界就是不測最容易壞的地方</strong>：NaN、+Inf、−Inf、0、subnormal、剛好溢位的極大值——這些是浮點程式最常出錯的輸入。softmax 要減最大值防溢位、attention 要處理 −Inf 的 mask，這些路徑只有邊界輸入會走到。</p>
+    <p>標準隨機分布永遠不會自己生出一個 NaN 或一個 Inf。所以 allclose-on-one-shape 不是「邊界測得不夠」，是「根本沒測邊界」。最容易壞的地方，剛好是它完全沒看的地方。</p>
+  </div>
+</div>
+
+<p>四個維度合起來，allclose-on-one-shape 的問題就清楚了：它把一個高維的輸入空間壓成一個點，在那個點上比一次。只要 bug 不住在那個點上——而 bug 幾乎都住在邊界、住在尾巴、住在不整除的 shape 上——它就抓不到。論文做的，是把那個點換成一張覆蓋這四個維度的網。</p>
+
+<p>把四個維度擺成一張表會更清楚：每一行是一個失效來源，左邊是 allclose-on-one-shape 在那個維度上釘死成什麼，中間是因此漏掉的東西、也就是 bug 躲藏的地方，右邊是論文的強 oracle 用哪個機制把那個洞補起來。讀的時候可以橫著看一行，把「釘死成一個值」「於是漏掉一整片」「換成主動覆蓋」這條因果串起來。</p>
+
+<figure class="vg-w-failuremode-grid" data-mobile="keep">
+  <style>
+    .vg-w-failuremode-grid { margin: var(--s-3) 0; overflow-x: auto; }
+    .vg-w-failuremode-grid table { width: 100%; border-collapse: collapse; font-family: var(--sans); font-size: var(--fs-sm); }
+    .vg-w-failuremode-grid caption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); text-align: left; padding-bottom: var(--s-2); }
+    .vg-w-failuremode-grid th { text-align: left; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; font-size: var(--fs-xs); padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: bottom; }
+    .vg-w-failuremode-grid td { padding: var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; color: var(--ink); }
+    .vg-w-failuremode-grid td:first-child { font-weight: 600; color: var(--accent-text); white-space: nowrap; }
+    .vg-w-failuremode-grid tbody tr:last-child td { border-bottom: none; }
+  </style>
+  <table>
+    <caption>四個失效維度 · 弱 oracle 釘死成一個值，bug 躲進它沒看的那一片，強 oracle 用對應機制把網張開。</caption>
+    <thead>
+      <tr>
+        <th>維度</th>
+        <th>allclose-on-one-shape 釘死成</th>
+        <th>於是漏掉（bug 躲在這）</th>
+        <th>強 oracle 怎麼補</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>形狀</td>
+        <td>一個好看的 shape，多半被 tile size 整除</td>
+        <td>最後一塊不滿的 tile、邊界 mask、broadcast 與非連續 stride 的路徑從沒被執行</td>
+        <td>schema 生多形狀，刻意包含不整除 tile 與極瘦極長的尺寸</td>
+      </tr>
+      <tr>
+        <td>隨機性</td>
+        <td>固定 seed 的標準常態分布，集中在 0 附近</td>
+        <td>分布尾巴上極大／極小／剛好抵消的值，每次都被同一個 seed 跳過</td>
+        <td>seeded fuzzing 主動往尾巴與極端尺寸生輸入，且每組可重播</td>
+      </tr>
+      <tr>
+        <td>精度</td>
+        <td>一個全域容差，套到所有 op 與 dtype</td>
+        <td>太鬆吞掉真 bug、太緊誤殺 fp16 正常誤差，兩面都會錯</td>
+        <td>per-(op, dtype) 各設一個絕對容差，跟著數值特性走</td>
+      </tr>
+      <tr>
+        <td>邊界</td>
+        <td>不主動生任何特殊值</td>
+        <td>NaN、±Inf、0、subnormal、近溢位的極值——浮點最常壞的輸入</td>
+        <td>fuzzer 把這些邊界值當成必生的測試點，搭配 fp64 參考解判對錯</td>
+      </tr>
+    </tbody>
+  </table>
+</figure>
+
+<p>這張表也順手點出一件事：強 oracle 的四個機制不是隨意疊上去的功能，而是一對一去堵這四個洞。下一節把這四個機制逐一拆開，正好對應表格右欄那四格。</p>
+
+<h2>把點換成網：op-schema 感知的 fuzzing</h2>
+
+<p>論文提出的測法，用它原文的描述，是「op-schema-aware seeded fuzzing with a high-precision (fp64) CPU reference and per-(op, dtype) absolute tolerances」。拆成三塊看。</p>
+
+<p>第一塊，<strong>op-schema-aware seeded fuzzing</strong>。每個 op 有一個 schema——它吃幾個 tensor、各自的 rank 與 dtype 約束、哪些參數合法。fuzzer 不再固定一個 shape，而是照 schema 去生成大量合法輸入：各種 shape（包含不整除 tile 的、極瘦極長的）、各種 dtype、各種數值範圍，而且刻意塞進 NaN、Inf、0 這些邊界值。schema 感知的意思是 fuzzer 知道這個 op 接受什麼，所以生的每個輸入都合法、又盡量打到角落。</p>
+
+<p>seeded 是另一個關鍵字。每組輸入由一個 seed 決定，所以整個 fuzzing 是可重現的。論文最後一句講得很明白：「Every flagged failure replays byte-for-byte from a stored seed.」每個被標記的失敗，都能從存下的 seed byte-for-byte 重播。這把 fuzzing 從「跑一次運氣好抓到、再跑一次又不見了」變成「抓到就釘死、可以丟給人去 debug」。</p>
+
+<p>可重現這件事在實務上比它聽起來重要。一般 fuzzing 的難處不是抓不到 bug，是抓到了卻交不出來——你看到某一次跑出了異常，但用的是當下的隨機狀態，下一次換個 seed 就再也重現不了，工程師收到一張「某處可能有錯」的單子卻無從下手。把每組輸入綁死在一個 seed 上，等於把測試結果從一次性的觀察變成一份可以反覆執行的證據：報 bug 時附上 seed，對方在自己機器上跑同一個 seed，會生出同一組 byte 完全一樣的輸入、走同一條路徑、踩到同一個錯。抓得到只是第一步，能原封不動交給別人重現，才讓這個失敗有修的價值。</p>
+
+<p>第二塊，<strong>fp64 CPU 參考解</strong>。前面說過正確性需要一個 reference，但 reference 自己也是浮點算的，也有誤差。論文用 fp64 在 CPU 上算 reference——雙精度的誤差比 GPU 上的 fp16/bf16 小好幾個數量級，所以可以當成接近 ground truth 的標準答案。被測的 GPU kernel 跟這個高精度解比，差距才有意義。</p>
+
+<p>第三塊，<strong>per-(op, dtype) 絕對容差</strong>。不再用一個全域 tolerance，而是針對每一組（op, dtype）各設一個絕對容差。一個 fp16 的 reduction 容差設得寬一點是合理的，一個 fp32 的逐元素 op 容差就該緊。容差跟著 op 與 dtype 的數值特性走，這樣既不會把 fp16 正常的誤差誤判成 bug，也不會讓 fp32 的真 bug 躲在過寬的容差裡。</p>
+
+<p>下面這張圖把弱 oracle 與強 oracle 的流程並排畫出來。上排是 allclose-on-one-shape，下排是論文的方法。點下排任何一個階段，看它負責擋掉哪一類失效。</p>
+
+<figure class="vg-w-annotated-oracle-pipeline" data-mobile="static" data-svg-scroll="800">
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M9 9h6v6H9z"/><path d="M3 9h2"/><path d="M19 9h2"/><path d="M3 15h2"/><path d="M19 15h2"/><path d="M9 3v2"/><path d="M15 3v2"/><path d="M9 19v2"/><path d="M15 19v2"/>
+    </svg>
+    <span>點下排任一階段 · 看它負責擋哪一類失效 · 共 4 階段</span>
+  </p>
+  <style>
+    .vg-w-annotated-oracle-pipeline { display: grid; gap: var(--s-2); margin: var(--s-3) 0; }
+    .vg-w-annotated-oracle-pipeline svg { width: 100%; height: auto; }
+    .vg-w-annotated-oracle-pipeline .stage { cursor: pointer; }
+    .vg-w-annotated-oracle-pipeline .stage:focus { outline: none; }
+    .vg-w-annotated-oracle-pipeline figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+  </style>
+  <svg viewBox="0 0 800 380" preserveAspectRatio="xMidYMid meet" role="img" aria-label="weak oracle versus strong oracle pipeline">
+    <defs>
+      <marker id="vg-w-annotated-oracle-pipeline-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0 0 L10 5 L0 10 z" fill="var(--muted-2)" />
+      </marker>
+    </defs>
+
+    <text x="30" y="34" font-family="Manrope, sans-serif" font-size="12" letter-spacing="0.06em" fill="var(--muted)">弱 ORACLE — allclose-on-one-shape</text>
+    <rect x="30" y="48" width="150" height="56" rx="6" fill="var(--bg-soft)" stroke="var(--line)" stroke-width="1" />
+    <text x="105" y="72" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--ink)">一個固定 shape</text>
+    <text x="105" y="90" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">+ 一個 dtype</text>
+    <line x1="180" y1="76" x2="240" y2="76" stroke="var(--muted-2)" stroke-width="1.5" marker-end="url(#vg-w-annotated-oracle-pipeline-arrow)" />
+    <rect x="240" y="48" width="150" height="56" rx="6" fill="var(--bg-soft)" stroke="var(--line)" stroke-width="1" />
+    <text x="315" y="72" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--ink)">少量隨機輸入</text>
+    <text x="315" y="90" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">標準常態分布</text>
+    <line x1="390" y1="76" x2="450" y2="76" stroke="var(--muted-2)" stroke-width="1.5" marker-end="url(#vg-w-annotated-oracle-pipeline-arrow)" />
+    <rect x="450" y="48" width="150" height="56" rx="6" fill="var(--bg-soft)" stroke="var(--line)" stroke-width="1" />
+    <text x="525" y="72" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--ink)">一次 allclose</text>
+    <text x="525" y="90" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">固定 tolerance</text>
+    <line x1="600" y1="76" x2="660" y2="76" stroke="var(--muted-2)" stroke-width="1.5" marker-end="url(#vg-w-annotated-oracle-pipeline-arrow)" />
+    <rect x="660" y="48" width="110" height="56" rx="6" fill="color-mix(in srgb, var(--sage-deep) 14%, var(--bg-soft))" stroke="var(--sage-deep)" stroke-width="1" />
+    <text x="715" y="80" text-anchor="middle" font-family="EB Garamond, serif" font-size="20" fill="var(--sage-deep)">PASS</text>
+
+    <text x="30" y="170" font-family="Manrope, sans-serif" font-size="12" letter-spacing="0.06em" fill="var(--muted)">強 ORACLE — schema-fuzz ＋ fp64 參考（點階段看細節）</text>
+
+    <g class="stage" data-stage="0" role="button" tabindex="0" aria-label="op schema 階段">
+      <rect x="30" y="190" width="160" height="60" rx="6" fill="var(--bg-soft)" stroke="var(--accent)" stroke-width="1.5" id="vg-w-annotated-oracle-pipeline-s0" />
+      <text x="110" y="216" text-anchor="middle" font-family="Manrope, sans-serif" font-size="12" fill="var(--ink)">op schema</text>
+      <text x="110" y="236" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" fill="var(--muted)">合法輸入的形狀</text>
+    </g>
+    <line x1="190" y1="220" x2="220" y2="220" stroke="var(--muted-2)" stroke-width="1.5" marker-end="url(#vg-w-annotated-oracle-pipeline-arrow)" />
+    <g class="stage" data-stage="1" role="button" tabindex="0" aria-label="seeded fuzzing 階段">
+      <rect x="220" y="190" width="160" height="60" rx="6" fill="var(--bg-soft)" stroke="var(--line)" stroke-width="1" id="vg-w-annotated-oracle-pipeline-s1" />
+      <text x="300" y="216" text-anchor="middle" font-family="Manrope, sans-serif" font-size="12" fill="var(--ink)">seeded fuzzing</text>
+      <text x="300" y="236" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" fill="var(--muted)">多形狀 + 邊界值</text>
+    </g>
+    <line x1="380" y1="220" x2="410" y2="220" stroke="var(--muted-2)" stroke-width="1.5" marker-end="url(#vg-w-annotated-oracle-pipeline-arrow)" />
+    <g class="stage" data-stage="2" role="button" tabindex="0" aria-label="fp64 CPU 參考解階段">
+      <rect x="410" y="190" width="160" height="60" rx="6" fill="var(--bg-soft)" stroke="var(--line)" stroke-width="1" id="vg-w-annotated-oracle-pipeline-s2" />
+      <text x="490" y="216" text-anchor="middle" font-family="Manrope, sans-serif" font-size="12" fill="var(--ink)">fp64 CPU 參考</text>
+      <text x="490" y="236" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" fill="var(--muted)">接近 ground truth</text>
+    </g>
+    <line x1="570" y1="220" x2="600" y2="220" stroke="var(--muted-2)" stroke-width="1.5" marker-end="url(#vg-w-annotated-oracle-pipeline-arrow)" />
+    <g class="stage" data-stage="3" role="button" tabindex="0" aria-label="per op dtype 容差階段">
+      <rect x="600" y="190" width="170" height="60" rx="6" fill="var(--bg-soft)" stroke="var(--line)" stroke-width="1" id="vg-w-annotated-oracle-pipeline-s3" />
+      <text x="685" y="216" text-anchor="middle" font-family="Manrope, sans-serif" font-size="12" fill="var(--ink)">per-(op,dtype) 容差</text>
+      <text x="685" y="236" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" fill="var(--muted)">逐 op 設絕對容差</text>
+    </g>
+
+    <rect x="30" y="280" width="740" height="76" rx="8" fill="var(--bg-soft)" stroke="var(--line)" stroke-width="1" id="vg-w-annotated-oracle-pipeline-detail-box" />
+    <text x="50" y="306" font-family="Manrope, sans-serif" font-size="12" letter-spacing="0.05em" fill="var(--accent-text)" id="vg-w-annotated-oracle-pipeline-detail-title">op schema</text>
+    <text x="50" y="330" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)" id="vg-w-annotated-oracle-pipeline-detail-line1">每個 op 宣告它接受的 tensor rank、dtype、參數約束。</text>
+    <text x="50" y="350" font-family="EB Garamond, serif" font-size="14" fill="var(--muted)" id="vg-w-annotated-oracle-pipeline-detail-line2">擋掉「形狀」維度的盲點：fuzzer 知道合法範圍，才敢生不整除 tile 的 shape。</text>
+  </svg>
+  <figcaption>上排弱 oracle 一路到 PASS，因為它從沒生過會觸發 bug 的輸入。下排四個階段各補一個盲點——schema 補形狀、fuzzing 補隨機性與邊界、fp64 補參考解、per-(op,dtype) 補容差。</figcaption>
+  <script>
+    (function () {
+      if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+      const root = document.querySelector('.vg-w-annotated-oracle-pipeline');
+      const stages = root.querySelectorAll('.stage');
+      const title = root.querySelector('#vg-w-annotated-oracle-pipeline-detail-title');
+      const line1 = root.querySelector('#vg-w-annotated-oracle-pipeline-detail-line1');
+      const line2 = root.querySelector('#vg-w-annotated-oracle-pipeline-detail-line2');
+      const boxes = [
+        root.querySelector('#vg-w-annotated-oracle-pipeline-s0'),
+        root.querySelector('#vg-w-annotated-oracle-pipeline-s1'),
+        root.querySelector('#vg-w-annotated-oracle-pipeline-s2'),
+        root.querySelector('#vg-w-annotated-oracle-pipeline-s3'),
+      ];
+      const data = [
+        { t: 'op schema', a: '每個 op 宣告它接受的 tensor rank、dtype、參數約束。', b: '擋掉「形狀」維度的盲點：fuzzer 知道合法範圍，才敢生不整除 tile 的 shape。' },
+        { t: 'seeded fuzzing', a: '照 schema 大量生成輸入，刻意塞進 NaN、Inf、0 與極端尺寸；每組由 seed 決定。', b: '擋掉「隨機性」與「邊界」維度：分布尾巴與特殊值都被主動覆蓋，且可 byte-for-byte 重播。' },
+        { t: 'fp64 CPU 參考', a: '在 CPU 用雙精度算同一個 op，當成接近 ground truth 的標準答案。', b: '擋掉「參考解自己也有誤差」的問題：fp64 誤差比 fp16/bf16 小數個數量級。' },
+        { t: 'per-(op,dtype) 容差', a: '針對每一組（op, dtype）各設一個絕對容差，不用全域單一數字。', b: '擋掉「精度」維度：fp16 reduction 容差寬、fp32 逐元素 op 容差緊，誤殺與漏抓都減少。' },
+      ];
+      function select(i) {
+        boxes.forEach((b, k) => {
+          b.setAttribute('stroke', k === i ? 'var(--accent)' : 'var(--line)');
+          b.setAttribute('stroke-width', k === i ? '1.5' : '1');
+        });
+        title.textContent = data[i].t;
+        line1.textContent = data[i].a;
+        line2.textContent = data[i].b;
+      }
+      stages.forEach((s, i) => {
+        s.addEventListener('click', () => select(i));
+        s.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); select(i); }
+        });
+      });
+      select(0);
+    })();
+  </script>
+</figure>
+
+<p>這四塊不是各自獨立的優化，而是分別堵住前一節那四個維度的洞：schema 生多形狀堵「形狀」，fuzzing 主動塞邊界值堵「隨機性」與「邊界」，fp64 參考解堵「reference 自己也不準」，per-(op, dtype) 容差堵「精度」。換句話說，論文的方法不是把 allclose 調得更嚴，而是把「在一個點上比一次」改成「在一張覆蓋四個維度的網上比，每個點都跟高精度解對照」。</p>
+
+<h2>跑出來的數字，以及作者自己畫的那條線</h2>
+
+<p>方法講完，看它在受控語料上的表現。作者刻意建了一個能驗證 oracle 的語料，而不是直接拿線上 LLM 的輸出來測——因為他要回答的是「oracle 強不強」，不是「某個 LLM 爛不爛」。語料的組成是這樣：「a controlled corpus of 24 Triton and CPU stand-in kernels (15 correct controls and 9 LLM-style buggy variants seeded with documented transcription errors)」。24 個 kernel，15 個正確控制組，9 個刻意埋了 transcription error 的壞變體。transcription error 就是 LLM 抄寫時常犯的那種錯——index 算錯、邊界少減一、把某個 dim 弄反。</p>
+
+<p>第一輪結果：「The seeded oracle flags 9 of 9 buggy kernels and passes 15 of 15 correct controls, at zero precision cost on controls.」9 個壞的全抓出來，15 個對的全放行，而且控制組零精度代價——也就是換成這個嚴格 oracle 並沒有誤殺任何一個正確 kernel。這一點很重要：一個會把對的也判錯的嚴格 oracle 沒有用，論文的方法在抓全部壞的同時，沒有製造誤殺。</p>
+
+<p>然後是規模化驗證。作者把語料擴到 26 個 op（加了一對 flash-attention），在五種 GPU 上重跑同一套協定：「five GPU classes (RTX 3060, A10, L40S, A100 SXM4, H100 NVL)」。這五張卡橫跨消費級到資料中心級。結果是：「The verdicts are identical across all five GPUs: 10 of 10 illusions caught and 16 of 16 controls clean.」五張卡判決完全一致，10 個 illusion 全抓、16 個控制組全乾淨。跨硬體一致這件事說明這個 oracle 不是靠某張卡的特性碰運氣，而是穩定的。</p>
+
+<pre data-kind="output"><code>controlled corpus（第一輪）
+  24 kernels = 15 correct + 9 buggy
+  seeded oracle：9/9 壞的抓到 · 15/15 對的放行 · 控制組零精度代價
+
+擴大重跑（26 ops · 5 GPU classes）
+  GPUs：RTX 3060 / A10 / L40S / A100 SXM4 / H100 NVL
+  五張卡判決一致：10/10 illusion 抓到 · 16/16 控制組乾淨
+  每個 failure 可從 stored seed byte-for-byte 重播</code></pre>
+
+<p>這裡要把作者自己畫的那條線講清楚，不然很容易把這篇讀成「LLM 寫的 kernel 有很多 bug」。論文白紙黑字寫：「The corpus result is about LLM-style transcription bugs that the allclose-on-one-shape oracle certifies as correct, not about the bug rate of any specific deployed LLM.」這個語料結果講的是「allclose-on-one-shape 會把這類 transcription bug 認證為正確」這件事，不是在量某個實際部署的 LLM 出 bug 的比率。換句話說，這篇不是在攻擊 LLM 的 kernel 寫得多差——9 個壞 kernel 是作者自己手動埋進去的——而是在示範：就算 bug 明明在那裡，弱 oracle 也照樣發綠燈。它測的是測試本身，不是被測的模型。</p>
+
+<h2>所以你下週該改什麼</h2>
+
+<p>如果你的工作牽涉到讓 LLM 生成 Triton 或 CUDA kernel、或是你在用這些 benchmark 的數字做決策，這篇的可操作結論有三條。</p>
+
+<p>第一，把 benchmark 的 pass 當成「還沒被那個固定輸入抓到」，不是「正確」。KernelBench、TritonBench、GEAK 的分數是在 allclose-on-one-shape 下產生的，一個在這些 benchmark 上滿分的 kernel，完全可能在邊界 shape 或特殊值上崩掉。要上線的 kernel，benchmark 的綠燈只是入場券，不是證明。</p>
+
+<p>第二，自己的驗證流程往這三個方向補：用 op schema 生多形狀、多 dtype、含邊界值的輸入，而不是單一固定 shape；用 fp64 的 CPU 參考解當 ground truth，而不是拿另一個也有誤差的 GPU 實作互比；容差按（op, dtype）分開設，而不是一個數字套到底。這三件事都不需要新硬體，是測試流程的改法。</p>
+
+<p>第三，讓失敗可重播。論文整套方法的可信度很大一部分來自「Every flagged failure replays byte-for-byte from a stored seed」——抓到 bug 就把 seed 存下來，任何人都能 byte-for-byte 重現。一個抓得到但重現不了的 bug，工程上幾乎沒用；seeded fuzzing 把「抓到」和「能丟給人 debug」連起來。</p>
+
+<p class="vg-deep-closer"><strong>Take-away</strong>：allclose-on-one-shape 通過，只證明 kernel 在那一個固定輸入上沒被抓到——要證明它對，得用 op-schema 感知的 seeded fuzzing，掃過多形狀與邊界值，每個點都跟 fp64 參考解比，容差按 op 與 dtype 分開設。</p>
+
+</div>
