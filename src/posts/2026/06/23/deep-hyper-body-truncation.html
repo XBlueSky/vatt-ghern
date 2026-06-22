@@ -1,0 +1,666 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">客戶端收到一個乾淨的 HTTP 200，沒有任何 error log，body 卻只有 219 KB——剩下的 14.8 MB 還躺在 hyper 的 buffer 裡，而連線已經被 SHUT_WR 關掉了。這個 bug 已經在 hyper 裡跨多個大版本活了好幾年。</p>
+  <h1 class="vg-post-title">{{ title }}</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p>
+    <span class="vg-dropcap">這</span>是 Cloudflare Images 團隊一次 silent truncation 的獵 bug 過程。表面症狀矛盾到讓人懷疑工具壞了：回應狀態碼是 <code>200</code>、沒有錯誤、圖片就是少了一截；本地怎麼壓測都打不出來、用 <code>curl</code> 也重現不了；越是仔細觀察，failure 越是消失。最後落在 hyper 的 HTTP/1 dispatch loop 裡一行 <code>let _</code>——它把 <code>poll_flush</code> 回傳的 <code>Poll::Pending</code> 丟掉了，於是在 flush 真正完成前就把連線關了。
+  </p>
+
+  <p>
+    值得記下的不只是那一行 bug，而是整條路徑：為什麼一個存在多年的缺陷，偏偏在這次重構之後才浮出來；為什麼 application 層的所有觀測工具都對它視而不見；以及為什麼最後的修法只動了四行、卻刻意不去碰 dispatch loop 本身。先把根因的 mechanism 攤開——下面這個模擬讓你直接控制下游讀取的速度，看 socket buffer 在什麼條件下會在 flush 完成前填滿。
+  </p>
+
+  <figure class="vg-w-canvas-flush-shutdown-race" data-mobile="swap" data-mobile-summary="下游讀得慢，send buffer 在 flush 完成前填滿，dispatch loop 丟掉 Pending、提早關連線，剩下的 body 就此遺失。">
+    <style>
+      .vg-w-canvas-flush-shutdown-race { display: grid; grid-template-rows: auto 1fr auto; gap: var(--s-2); margin: var(--s-4) 0; }
+      .vg-w-canvas-flush-shutdown-race .toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+      .vg-w-canvas-flush-shutdown-race button { font-family: var(--sans); font-size: var(--fs-sm); padding: 6px 14px; min-height: 44px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); cursor: pointer; }
+      .vg-w-canvas-flush-shutdown-race button:hover { border-color: var(--accent); color: var(--accent-text); }
+      .vg-w-canvas-flush-shutdown-race .drain { display: flex; align-items: center; gap: var(--s-1); }
+      .vg-w-canvas-flush-shutdown-race input[type="range"] { height: 36px; accent-color: var(--accent); touch-action: none; min-width: 120px; }
+      .vg-w-canvas-flush-shutdown-race .clock { margin-left: auto; font-variant-numeric: tabular-nums; }
+      .vg-w-canvas-flush-shutdown-race canvas { width: 100%; height: auto; aspect-ratio: 16 / 9; display: block; }
+      .vg-w-canvas-flush-shutdown-race figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+      @media (max-width: 720px) {
+        .vg-w-canvas-flush-shutdown-race canvas { aspect-ratio: 4 / 3; }
+      }
+    </style>
+
+    <div class="toolbar">
+      <button id="vg-w-canvas-flush-shutdown-race-toggle" type="button">&#9655; play</button>
+      <button id="vg-w-canvas-flush-shutdown-race-reset" type="button">&#8635; reset</button>
+      <label class="drain">下游讀取速率
+        <input type="range" id="vg-w-canvas-flush-shutdown-race-drain" min="0" max="100" value="22" />
+      </label>
+      <span class="clock" id="vg-w-canvas-flush-shutdown-race-clock">sent 0 KB</span>
+    </div>
+
+    <canvas id="vg-w-canvas-flush-shutdown-race-canvas"></canvas>
+
+    <figcaption>14.9 MB 的回應被 hyper 一次寫進內部 buffer。把「下游讀取速率」拖低，send buffer 會在 flush 完成前填滿——kernel 回 Poll::Pending，dispatch loop 卻丟掉這個訊號，提早送出 SHUT_WR。拖高讓下游讀得夠快，buffer 就不會在回應期間滿，bug 不觸發。</figcaption>
+
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        const root = document.querySelector('.vg-w-canvas-flush-shutdown-race');
+        if (!root) return;
+        const canvas = root.querySelector('#vg-w-canvas-flush-shutdown-race-canvas');
+        const toggle = root.querySelector('#vg-w-canvas-flush-shutdown-race-toggle');
+        const reset = root.querySelector('#vg-w-canvas-flush-shutdown-race-reset');
+        const drain = root.querySelector('#vg-w-canvas-flush-shutdown-race-drain');
+        const clock = root.querySelector('#vg-w-canvas-flush-shutdown-race-clock');
+        const ctx = canvas.getContext('2d');
+
+        function cssVar(name) {
+          return getComputedStyle(root).getPropertyValue(name).trim() || '#888';
+        }
+        function resize() {
+          const dpr = window.devicePixelRatio || 1;
+          const rect = canvas.getBoundingClientRect();
+          canvas.width = Math.max(1, rect.width * dpr);
+          canvas.height = Math.max(1, rect.height * dpr);
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        }
+        new ResizeObserver(resize).observe(canvas);
+        resize();
+
+        const TOTAL = 14900;       // KB — the full response body
+        const BUF_CAP = 219;       // KB — socket send buffer capacity (mirrors the post's 219 KB)
+        const WRITE_RATE = 5200;   // KB/s hyper pushes from its own buffer toward the socket
+        let running = false;
+        let t = 0;
+        let appBuffer = TOTAL;     // KB still in hyper's internal buffer, unsent
+        let sockBuffer = 0;        // KB currently sitting in the kernel send buffer
+        let sent = 0;              // KB the client has actually received
+        let shutdown = false;      // SHUT_WR issued?
+        let lost = 0;              // KB stranded in hyper's buffer at shutdown
+
+        function drainRate() {
+          // 0..100 slider -> 0..7000 KB/s the downstream reader consumes
+          return (Number(drain.value) / 100) * 7000;
+        }
+
+        function step(dt) {
+          t += dt;
+          if (shutdown) return;
+          // downstream consumes from the kernel socket buffer -> client receives
+          const consumed = Math.min(sockBuffer, drainRate() * dt);
+          sockBuffer -= consumed;
+          sent += consumed;
+          // hyper flushes from its app buffer into the kernel buffer, up to capacity
+          const room = BUF_CAP - sockBuffer;
+          const flushed = Math.min(appBuffer, WRITE_RATE * dt, room);
+          appBuffer -= flushed;
+          sockBuffer += flushed;
+          // dispatch-loop check: request fully read, so wants_read_again() == false.
+          // poll_flush returned Pending (room == 0) but `let _` discarded it.
+          // loop returns Ready -> poll_shutdown fires SHUT_WR.
+          const flushPending = (BUF_CAP - sockBuffer) < 0.5 && appBuffer > 0.5;
+          if (flushPending) {
+            shutdown = true;
+            lost = appBuffer;
+            running = false;
+            toggle.textContent = '▷ play';
+          }
+          if (appBuffer <= 0.5 && sockBuffer <= 0.5) {
+            running = false;
+            toggle.textContent = '▷ play';
+          }
+        }
+
+        function bar(x, y, w, h, frac, fill, label, sub) {
+          ctx.strokeStyle = cssVar('--muted-2');
+          ctx.lineWidth = 1;
+          ctx.strokeRect(x, y, w, h);
+          ctx.fillStyle = fill;
+          ctx.globalAlpha = 0.85;
+          ctx.fillRect(x, y + h * (1 - frac), w, h * frac);
+          ctx.globalAlpha = 1;
+          ctx.fillStyle = cssVar('--ink');
+          ctx.font = '13px "EB Garamond", serif';
+          ctx.textAlign = 'center';
+          ctx.fillText(label, x + w / 2, y - 8);
+          ctx.fillStyle = cssVar('--muted');
+          ctx.font = '11px Manrope, sans-serif';
+          ctx.fillText(sub, x + w / 2, y + h + 16);
+        }
+
+        function draw() {
+          const W = canvas.getBoundingClientRect().width;
+          const H = canvas.getBoundingClientRect().height;
+          ctx.clearRect(0, 0, W, H);
+          const margin = 24;
+          const barW = Math.min(70, (W - margin * 2) / 5);
+          const barH = H - 80;
+          const top = 44;
+          const gap = (W - margin * 2 - barW * 3) / 2;
+          const x1 = margin;
+          const x2 = margin + barW + gap;
+          const x3 = margin + (barW + gap) * 2;
+
+          bar(x1, top, barW, barH, appBuffer / TOTAL, cssVar('--accent'),
+              'hyper buffer', Math.round(appBuffer) + ' KB');
+          bar(x2, top, barW, barH, sockBuffer / BUF_CAP, cssVar('--ink-deep'),
+              'socket buffer', Math.round(sockBuffer) + ' / ' + BUF_CAP + ' KB');
+          bar(x3, top, barW, barH, sent / TOTAL, cssVar('--sage-deep'),
+              'client got', Math.round(sent) + ' KB');
+
+          // verdict banner
+          ctx.textAlign = 'left';
+          ctx.font = '13px Manrope, sans-serif';
+          if (shutdown) {
+            ctx.fillStyle = cssVar('--accent-text');
+            ctx.fillText('SHUT_WR → ' + Math.round(lost) + ' KB 遺失', margin, H - 8);
+          } else if (appBuffer <= 0.5 && sockBuffer <= 0.5 && sent > 0) {
+            ctx.fillStyle = cssVar('--sage-deep');
+            ctx.fillText('flush 完成，14.9 MB 全數送達', margin, H - 8);
+          } else {
+            ctx.fillStyle = cssVar('--muted');
+            ctx.fillText('flushing… 拖動下方滑桿調下游讀取速率', margin, H - 8);
+          }
+        }
+
+        let last = performance.now();
+        function frame(now) {
+          const dt = Math.min(0.05, (now - last) / 1000);
+          last = now;
+          if (running) step(dt);
+          draw();
+          let label;
+          if (shutdown) label = 'lost ' + Math.round(lost) + ' KB';
+          else label = 'sent ' + Math.round(sent) + ' KB';
+          clock.textContent = label;
+          requestAnimationFrame(frame);
+        }
+        requestAnimationFrame(frame);
+
+        function resetState() {
+          running = false;
+          toggle.textContent = '▷ play';
+          t = 0;
+          appBuffer = TOTAL;
+          sockBuffer = 0;
+          sent = 0;
+          shutdown = false;
+          lost = 0;
+        }
+
+        toggle.addEventListener('click', () => {
+          if (shutdown || (appBuffer <= 0.5 && sockBuffer <= 0.5 && sent > 0)) resetState();
+          running = !running;
+          toggle.textContent = running ? '⏸ pause' : '▷ play';
+          last = performance.now();
+        });
+        reset.addEventListener('click', resetState);
+        drain.addEventListener('input', () => { if (!running) draw(); });
+      })();
+    </script>
+  </figure>
+
+  <h2>把 FL 換成 Unix socket 之後</h2>
+
+  <p>
+    故事的起點是一次本來該是純收益的重構。Cloudflare 的 Images binding 讓 Workers runtime 呼叫 Images service 做圖片轉換，原本這條路徑會繞過一個叫 FL 的內部中介。按 Cloudflare 的說法，「At the end of 2025, we rearchitected the binding to provide a more direct, local connection between the Workers runtime and the Images service.」——2025 年底他們重構這個 binding，要在 Workers runtime 與 Images service 之間做出更直接的本機連線。
+  </p>
+
+  <p>
+    具體的改動在 2025 年 12 月：「In December 2025, the Images team replaced FL with a new intermediary service, an internal worker binding that runs on the same machine.」FL 被換成一個跑在同一台機器上的內部 worker binding 中介。連線方式也跟著變——「The internal binding replaced these with Unix sockets to directly connect the services on the same machine, bypassing FL and the overhead of the network stack.」改用 Unix socket 在同機直連，繞掉 FL 與整個網路堆疊的 overhead。
+  </p>
+
+  <p>
+    這類重構的預期是延遲下降、吞吐上升，沒有人會把它跟「圖片開始少一截」聯想在一起。事實上，後來證明這個改動並沒有引入任何新 bug——它只是換掉了一個讀取端的角色，而那個角色的讀取速度，恰好決定了一個躺在 hyper 裡多年的缺陷會不會被觸發。重構上線之後，異常才開始出現。
+  </p>
+
+  <p>
+    這裡有一個容易被忽略的因果順序值得先講清楚。Unix socket 與一個普通的 TCP socket 在「寫入端被讀取端的速度反向約束」這件事上沒有本質差別：兩者都有一個有上限的 kernel send buffer，寫入方一旦把 buffer 填滿，後續的 write 就只能等讀取方把資料收走、騰出空間才能繼續。換句話說，繞掉網路堆疊降低了 overhead，卻沒有、也不可能取消 backpressure 這個機制本身。真正改變的是時序的分布：FL 與新中介在「把 socket 裡的資料收走」這個動作上，速度落在不同的區間，而這個區間恰好橫跨了那條早就埋好的錯誤路徑的觸發門檻。一次重構若只看吞吐與延遲的平均值，很容易忽略它對尾端時序的擾動——而 race condition 偏偏只活在尾端。
+  </p>
+
+  <h2>200 OK，body 卻少了一截</h2>
+
+  <p>
+    第一個矛盾的訊號就足夠讓人皺眉：「the responses for these requests returned a <code>200</code> status without any errors logged. The image data was simply cut short」。回應碼是 200、沒有任何 error log，圖片資料就是被截短了。對一個習慣「壞了就會有 5xx 或 exception」的後端工程師來說，這是最難查的一類問題——成功的狀態碼會讓所有監控指標看起來健康。
+  </p>
+
+  <p>
+    截斷的規模不小。Cloudflare 給的例子是「A response that should have been two megabytes might arrive with a few hundred kilobytes instead.」本該兩 MB 的回應，可能只到幾百 KB。更具體的一個數字：「In one request, only ~200 KB arrived out of an expected 3.3 MB.」一個請求只收到約 200 KB，預期是 3.3 MB。客戶端那一側偶爾會看到一行錯誤——「error reading a body from connection: end of file before message length reached」，在達到宣告的 message length 之前就先遇到了 EOF。
+  </p>
+
+  <p>
+    截斷的比例本身就是一條線索。下面這張圖把 Cloudflare 給的幾個數字並排——同樣的錯誤路徑，截掉的不是固定的 bytes，而是「socket 一次能吞下的量」與「實際 body 大小」之間的差。body 越大，遺失的比例越高。
+  </p>
+
+  <figure class="vg-w-bars-truncation-scale" data-mobile="keep" data-svg-scroll="720">
+    <style>
+      .vg-w-bars-truncation-scale { margin: var(--s-4) 0; }
+      .vg-w-bars-truncation-scale svg.vg-w-bars-truncation-scale-main { width: 100%; height: auto; }
+      .vg-w-bars-truncation-scale figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-1); }
+    </style>
+    <svg class="vg-w-bars-truncation-scale-main" viewBox="0 0 720 280" role="img"
+         aria-label="三個 Cloudflare 提到的截斷例子：實際送達 vs 預期大小">
+      <style>
+        .vg-w-bars-truncation-scale text { font-family: EB Garamond, serif; font-size: 13px; fill: var(--ink); }
+        .vg-w-bars-truncation-scale .sub { font-family: Manrope, sans-serif; font-size: 11px; fill: var(--muted); }
+        .vg-w-bars-truncation-scale .axis { font-family: Manrope, sans-serif; font-size: 11px; fill: var(--muted); }
+      </style>
+      <text x="360" y="24" text-anchor="middle" font-size="15">三個被截斷的回應——送達的只是 socket 一次吞得下的那一截</text>
+
+      <!-- row 1: 3.3 MB expected, ~200 KB arrived -->
+      <text x="20" y="76" class="sub">預期 3.3 MB</text>
+      <rect x="20" y="84" width="680" height="18" fill="none" stroke="var(--muted-2)" stroke-width="1"/>
+      <rect x="20" y="84" width="40" height="18" fill="var(--accent)" fill-opacity="0.85"/>
+      <text x="68" y="98" class="sub">送達 ~200 KB（約 6%）</text>
+
+      <!-- row 2: 2 MB expected, few hundred KB -->
+      <text x="20" y="136" class="sub">預期 2 MB（舉例）</text>
+      <rect x="20" y="144" width="680" height="18" fill="none" stroke="var(--muted-2)" stroke-width="1"/>
+      <rect x="20" y="144" width="92" height="18" fill="var(--accent)" fill-opacity="0.85"/>
+      <text x="120" y="158" class="sub">送達 幾百 KB</text>
+
+      <!-- row 3: 14.9 MB expected, 219 KB -->
+      <text x="20" y="196" class="sub">預期 14.9 MB</text>
+      <rect x="20" y="204" width="680" height="18" fill="none" stroke="var(--muted-2)" stroke-width="1"/>
+      <rect x="20" y="204" width="10" height="18" fill="var(--accent)" fill-opacity="0.85"/>
+      <text x="38" y="218" class="sub">送達 219 KB（約 1.5%）</text>
+
+      <text x="20" y="256" class="sub">空心框＝宣告的 Content-Length；實心＝socket 在關連線前實際吞下的量。</text>
+      <text x="20" y="272" class="sub">body 越大，固定容量的 send buffer 占的比例越小，遺失也就越多。</text>
+    </svg>
+    <figcaption>三個 Cloudflare 提到的截斷例子。送達量大致鎖在 socket 一次能接收的量級，與 body 大小無關，於是 body 越大、遺失比例越高。資料來源：Cloudflare blog post。</figcaption>
+  </figure>
+
+  <p>
+    這行錯誤其實已經把方向指出來了：發送端宣告了一個 body 長度（HTTP 回應帶 <code>Content-Length</code>），卻在送完那麼多 bytes 之前就關掉了連線。但「誰提早關了連線、為什麼關」這兩個問題，要再花相當的工夫才答得出來。這個 failure 還有一組讓人抓狂的特徵：「The failure occurred intermittently, scaled with response size, couldn't be reproduced with simple tools like curl, and disappeared when we observed the system more closely.」間歇發生、隨回應大小放大、用 curl 重現不出來、而且觀察得越仔細就越不出現。最後一點是 timing-dependent bug 的典型指紋——你一旦放慢系統去看它，那扇時間窗就關上了。
+  </p>
+
+  <h2>從 timeout 假設一路追到 strace</h2>
+
+  <p>
+    定位的過程是一連串的排除。下面這條時間線把八個關鍵步驟攤開——拖動把手，看每一步排除了什麼、又把截斷點往哪裡縮。
+  </p>
+
+  <figure class="vg-w-scrub-hyper-debug-hunt" data-mobile="swap" data-svg-scroll="720" data-mobile-summary="剝到只用 binding 能觸發、排除 timeout、三版皆重現、本地打不出來，最後靠 strace 看 socket syscall 定位。">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M5 9l-3 3 3 3"/><path d="M9 5l3-3 3 3"/><path d="M15 19l-3 3-3-3"/><path d="M19 9l3 3-3 3"/><path d="M2 12h20"/><path d="M12 2v20"/>
+      </svg>
+      <span>drag handle along the timeline · 8 steps of the debug hunt</span>
+    </p>
+    <style>
+      .vg-w-scrub-hyper-debug-hunt { display: grid; gap: var(--s-2); margin: var(--s-4) 0; }
+      .vg-w-scrub-hyper-debug-hunt svg.vg-w-scrub-hyper-debug-hunt-main { width: 100%; height: auto; }
+      .vg-w-scrub-hyper-debug-hunt .state { font-family: var(--serif); font-size: var(--fs-sm); padding: var(--s-2); background: var(--bg-soft); border-left: 2px solid var(--accent); min-height: 4.4em; }
+      .vg-w-scrub-hyper-debug-hunt .state strong { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); display: block; margin-bottom: 2px; }
+    </style>
+
+    <svg class="vg-w-scrub-hyper-debug-hunt-main" viewBox="0 0 720 96" role="img" aria-label="Cloudflare 偵錯時間線：八個排除步驟，拖把手檢視每一步">
+      <line x1="40" y1="48" x2="680" y2="48" stroke="var(--muted-2)" stroke-width="1.5" />
+      <g id="vg-w-scrub-hyper-debug-hunt-events"></g>
+      <line id="vg-w-scrub-hyper-debug-hunt-handle-line" x1="40" y1="26" x2="40" y2="70" stroke="var(--accent)" stroke-width="2" />
+      <circle id="vg-w-scrub-hyper-debug-hunt-handle" cx="40" cy="48" r="9" fill="var(--accent)" cursor="grab" role="slider" tabindex="0" aria-label="偵錯步驟把手" aria-valuemin="1" aria-valuemax="8" aria-valuenow="1" />
+      <text id="vg-w-scrub-hyper-debug-hunt-step" x="40" y="18" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--ink)">step 1</text>
+    </svg>
+
+    <div class="state" id="vg-w-scrub-hyper-debug-hunt-state"></div>
+
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        const root = document.querySelector('.vg-w-scrub-hyper-debug-hunt');
+        if (!root) return;
+        const svg = root.querySelector('svg.vg-w-scrub-hyper-debug-hunt-main');
+        const handle = root.querySelector('#vg-w-scrub-hyper-debug-hunt-handle');
+        const handleLine = root.querySelector('#vg-w-scrub-hyper-debug-hunt-handle-line');
+        const stepLabel = root.querySelector('#vg-w-scrub-hyper-debug-hunt-step');
+        const stateDiv = root.querySelector('#vg-w-scrub-hyper-debug-hunt-state');
+        const eventsG = root.querySelector('#vg-w-scrub-hyper-debug-hunt-events');
+        const NS = 'http://www.w3.org/2000/svg';
+
+        const steps = [
+          ['重現', '建一個模仿客戶 nested setup 的 worker，逐層剝離直到只用 binding 就能觸發。早期一次跑 25 個請求壞了 19 個。'],
+          ['排除 timeout', '早期懷疑截斷跟 timeout 有關——連線被某個時限關掉。但這個理論站不住。'],
+          ['試多版 hyper', '跨 hyper 0.14、1.7、1.8 測試，賭最明顯的答案就是對的。結果 bug 在每一版都出現，代表 upstream 沒有現成修法。'],
+          ['本地重現失敗', '在 macOS 與 Debian VM 跑本地整合測試，即使加大負載，本地請求從未觸發任何失敗。'],
+          ['排除 client', '檢查 Workers runtime 用來經由 binding socket 與 Images 溝通的 HTTP client，觀察到 client 行為正確。'],
+          ['distributed tracing', '端到端檢視 request trace，確認截斷的 body 在抵達外層轉換之前就已經存在。'],
+          ['instrument 中介', '在中介服務加 instrumentation 量轉發前的 body 大小，發現資料離開 Images service 時就已被截斷。'],
+          ['strace', '為了看系統實際在做什麼，對 Images service 掛上 strace——唯一記錄 socket 上真正發生什麼的一層。']
+        ];
+        const N = steps.length;
+        const X0 = 40, X1 = 680;
+        const xOf = i => X0 + (i / (N - 1)) * (X1 - X0);
+
+        steps.forEach((s, i) => {
+          const c = document.createElementNS(NS, 'circle');
+          c.setAttribute('cx', xOf(i)); c.setAttribute('cy', 48); c.setAttribute('r', 4);
+          c.setAttribute('fill', 'var(--muted)');
+          eventsG.appendChild(c);
+          const tx = document.createElementNS(NS, 'text');
+          tx.setAttribute('x', xOf(i)); tx.setAttribute('y', 84);
+          tx.setAttribute('text-anchor', 'middle');
+          tx.setAttribute('font-family', 'Manrope, sans-serif');
+          tx.setAttribute('font-size', 11);
+          tx.setAttribute('fill', 'var(--muted)');
+          tx.textContent = (i + 1);
+          eventsG.appendChild(tx);
+        });
+
+        function clamp(x) { return Math.max(X0, Math.min(X1, x)); }
+        function nearestIndex(x) {
+          let best = 0, bestD = Infinity;
+          for (let i = 0; i < N; i++) {
+            const d = Math.abs(xOf(i) - x);
+            if (d < bestD) { bestD = d; best = i; }
+          }
+          return best;
+        }
+        function clientToSvgX(clientX) {
+          const pt = svg.createSVGPoint();
+          pt.x = clientX; pt.y = 0;
+          const p = pt.matrixTransform(svg.getScreenCTM().inverse());
+          return clamp(p.x);
+        }
+        function show(i) {
+          const x = xOf(i);
+          handle.setAttribute('cx', x);
+          handle.setAttribute('aria-valuenow', i + 1);
+          handleLine.setAttribute('x1', x); handleLine.setAttribute('x2', x);
+          stepLabel.setAttribute('x', x);
+          stepLabel.textContent = 'step ' + (i + 1);
+          stateDiv.innerHTML = '<strong>' + steps[i][0] + '</strong>' + steps[i][1];
+        }
+
+        let dragging = false;
+        handle.addEventListener('pointerdown', (e) => {
+          dragging = true; handle.setPointerCapture(e.pointerId);
+        });
+        handle.addEventListener('pointermove', (e) => {
+          if (!dragging) return;
+          show(nearestIndex(clientToSvgX(e.clientX)));
+        });
+        handle.addEventListener('pointerup', () => { dragging = false; });
+        svg.addEventListener('click', (e) => {
+          show(nearestIndex(clientToSvgX(e.clientX)));
+        });
+        handle.addEventListener('keydown', (e) => {
+          const cur = Number(handle.getAttribute('aria-valuenow')) - 1;
+          if (e.key === 'ArrowRight' || e.key === 'ArrowUp') { e.preventDefault(); show(Math.min(N - 1, cur + 1)); }
+          else if (e.key === 'ArrowLeft' || e.key === 'ArrowDown') { e.preventDefault(); show(Math.max(0, cur - 1)); }
+        });
+
+        show(0);
+      })();
+    </script>
+  </figure>
+
+  <p>
+    最值得學的是排除的次序。第一步是把問題從「客戶複雜的 nested setup」剝乾淨——他們「built a worker that mimicked the customer's nested setup, then stripped away layers until we could trigger the bug with the binding alone」，逐層剝離到只剩 binding 還能觸發。剝乾淨之後出現了一個可量化的 baseline：「In one early run, 19 out of 25 requests failed.」25 個請求壞 19 個，這種失敗率高到足以拿來驗證任何假設。
+  </p>
+
+  <p>
+    接著是兩個被否定的方向。timeout：「we suspected the truncation might be related to timeout behavior... This theory didn't hold.」連線是被某個時限關掉的嗎？不是。然後是 hyper 版本——他們「tested across hyper versions 0.14, 1.7, and 1.8, just in case the most obvious answer was the correct (and easiest) one. But the bug appeared in each version」。賭最省事的答案（某版的 regression）結果落空：三個版本都中，意味著這不是哪一版引入的、upstream 也沒有現成修法可升級。
+  </p>
+
+  <p>
+    最折磨人的是本地環境的沉默：「We ran local integration tests on macOS and a Debian VM. Even under considerable load, our local requests never triggered any failure.」macOS 與 Debian VM 上加大負載也打不出失敗。一個只在 production 流量形態下才出現的 bug，把開發者最依賴的快速 reproduce-fix 迴圈整個拿掉了。原因仍然是時序：本地測試的讀取端往往一啟動就把資料收得飛快，send buffer 還來不及滿，那扇幾毫秒的窗根本沒打開。把負載加大改變的是請求數，不是單一連線上讀取端的相對慢速——而後者才是觸發條件。這也是為什麼 curl 重現不出來：curl 讀得太爽快，從不讓 buffer 在回應期間填滿。
+  </p>
+
+  <p>
+    剩下的步驟是把「截斷發生在哪一層」一格一格往下推。distributed tracing 確認「the truncated body was already present before it reached the outer transformation layer」——截斷在抵達外層轉換前就已存在；對中介服務加 instrumentation 後更精確：「The bodies were already truncated by the time they left the Images service」，資料離開 Images service 時就已經少了。到這裡 application 層的每一個觀測點都用過了，卻都只能說「它離開我這層時就壞了」。於是只剩最後一招：「To see what the system was actually doing, we attached <code>strace</code> to the Images service.」掛上 strace，去看 socket 上的 syscall 序列。
+  </p>
+
+  <h2>那一行 let _，與 shutdown 早於 flush 的競賽</h2>
+
+  <p>
+    strace 看到的，是一個 <code>write</code> 把約 219 KB 推進 socket、接著一個 <code>shutdown(SHUT_WR)</code> 把寫入方向關掉——而那時 body 還遠遠沒送完。問題不在 socket、不在 kernel，而在 hyper 決定「這條連線寫完了、可以關了」的那段邏輯。下面這張圖把 HTTP/1 dispatch loop 的關鍵幾步畫出來，紅色標記就是 bug 所在。
+  </p>
+
+  <figure class="vg-w-arch-hyper-dispatch-loop" data-mobile="keep" data-svg-scroll="720">
+    <svg viewBox="0 0 720 360" role="img" aria-label="hyper HTTP/1 dispatch loop 的關鍵步驟，標出 let _ 丟棄 Poll::Pending 的位置"
+         style="width: 100%; height: auto;">
+      <style>
+        .vg-w-arch-hyper-dispatch-loop text { font-family: EB Garamond, serif; font-size: 13px; }
+        .vg-w-arch-hyper-dispatch-loop .sub { fill: var(--muted); font-size: 11px; font-family: Manrope, sans-serif; }
+        .vg-w-arch-hyper-dispatch-loop .bug { fill: var(--accent-text); font-family: Manrope, sans-serif; font-size: 11px; }
+      </style>
+      <defs>
+        <marker id="vg-w-arch-hyper-dispatch-loop-arr" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+          <path d="M0,0 L7,3.5 L0,7 Z" fill="var(--muted)"/>
+        </marker>
+      </defs>
+
+      <text x="360" y="26" text-anchor="middle" fill="var(--ink)" font-size="15">dispatch loop——寫回應到 socket 的那一段</text>
+
+      <rect x="40" y="48" width="200" height="52" rx="5" fill="none" stroke="var(--muted-2)" stroke-width="1.2"/>
+      <text x="140" y="72" text-anchor="middle" fill="var(--ink)">寫入內部 buffer</text>
+      <text x="140" y="90" text-anchor="middle" class="sub">write state = Writing::Closed</text>
+
+      <line x1="140" y1="100" x2="140" y2="128" stroke="var(--muted)" stroke-width="1" marker-end="url(#vg-w-arch-hyper-dispatch-loop-arr)"/>
+
+      <rect x="40" y="130" width="200" height="60" rx="5" fill="var(--accent)" fill-opacity="0.08" stroke="var(--accent)" stroke-width="1.5"/>
+      <text x="140" y="152" text-anchor="middle" fill="var(--accent-text)">let _ = poll_flush(cx)</text>
+      <text x="140" y="170" text-anchor="middle" class="sub">socket 滿 &#8594; 收下 219 KB</text>
+      <text x="140" y="184" text-anchor="middle" class="sub">回 Poll::Pending（被丟掉）</text>
+
+      <line x1="140" y1="190" x2="140" y2="218" stroke="var(--muted)" stroke-width="1" marker-end="url(#vg-w-arch-hyper-dispatch-loop-arr)"/>
+
+      <rect x="40" y="220" width="200" height="58" rx="5" fill="none" stroke="var(--muted-2)" stroke-width="1.2"/>
+      <text x="140" y="242" text-anchor="middle" fill="var(--ink)">wants_read_again()?</text>
+      <text x="140" y="260" text-anchor="middle" class="sub">request 已收完 &#8594; false</text>
+      <text x="140" y="274" text-anchor="middle" class="sub">loop 回 Poll::Ready(Ok)</text>
+
+      <line x1="240" y1="249" x2="300" y2="249" stroke="var(--muted)" stroke-width="1" marker-end="url(#vg-w-arch-hyper-dispatch-loop-arr)"/>
+
+      <rect x="300" y="220" width="200" height="58" rx="5" fill="var(--ink-deep)" fill-opacity="0.08" stroke="var(--ink-deep)" stroke-width="1.5"/>
+      <text x="400" y="244" text-anchor="middle" fill="var(--ink-deep)">poll_shutdown()</text>
+      <text x="400" y="262" text-anchor="middle" class="sub">發出 SHUT_WR syscall</text>
+      <text x="400" y="276" text-anchor="middle" class="sub">在 flush 完成之前</text>
+
+      <line x1="400" y1="220" x2="400" y2="150" stroke="var(--muted)" stroke-width="1" marker-end="url(#vg-w-arch-hyper-dispatch-loop-arr)"/>
+
+      <rect x="300" y="100" width="240" height="62" rx="5" fill="none" stroke="var(--accent)" stroke-width="1.5" stroke-dasharray="4,3"/>
+      <text x="420" y="124" text-anchor="middle" fill="var(--accent-text)">client 收到 219 KB + EOF</text>
+      <text x="420" y="142" text-anchor="middle" class="sub">~14.8 MB 仍在 hyper buffer</text>
+      <text x="420" y="156" text-anchor="middle" class="sub">預期 14.9 MB</text>
+
+      <text x="560" y="150" fill="var(--accent-text)" class="bug">bug 所在：</text>
+      <text x="560" y="168" fill="var(--muted)" class="sub">Poll::Pending 是「flush</text>
+      <text x="560" y="182" fill="var(--muted)" class="sub">還沒做完」的訊號，</text>
+      <text x="560" y="196" fill="var(--muted)" class="sub">let _ 把它丟掉了。</text>
+
+      <text x="360" y="318" text-anchor="middle" class="sub">wants_read_again() 只問「還要不要讀 request」，不問「buffer 還有沒有沒送出的 response」</text>
+      <text x="360" y="338" text-anchor="middle" class="sub">兩個獨立的條件被當成同一件事，於是 loop 在 flush 未竟時就判定收工</text>
+    </svg>
+    <figcaption>
+      根因不是某個 syscall 失敗，而是 dispatch loop 把「request 讀完」誤當成「response 寫完」。資料來源：Cloudflare blog post（2026 年 6 月）。
+    </figcaption>
+  </figure>
+
+  <p>
+    根因的句子 Cloudflare 寫得很白：「In Rust, <code>let _ = expr</code> discards the expression's result, including <code>Poll::Pending</code>, the signal that the flush isn't done yet... the <code>let _</code> before <code>poll_flush</code> is where the bug lives.」在 Rust 裡 <code>let _ = expr</code> 會丟掉表達式的結果，包含 <code>Poll::Pending</code>——那正是「flush 還沒完成」的訊號。<code>poll_flush</code> 前面那個 <code>let _</code> 就是 bug 住的地方。
+  </p>
+
+  <p>
+    把整段時序拆開看，每一步單獨都合理，錯在它們被串成一條不該成立的因果。回應太大、一次寫不完，所以「Hyper writes the block into its internal buffer and marks its write state as <code>Writing::Closed</code>.」——資料先進 hyper 自己的 buffer，write state 標成 <code>Writing::Closed</code>。接著 hyper 嘗試把 buffer 推進 socket，但 socket send buffer 有上限：「The socket accepted about 219 KB. The remaining ~14.8 MB stays in hyper's buffer. The socket is full, so the kernel returns <code>Poll::Pending</code>.」socket 只收下約 219 KB，剩下約 14.8 MB 留在 hyper buffer；socket 滿了，kernel 回 <code>Poll::Pending</code>。這個 Pending 是 backpressure，意思是「等 socket 排空再來」。
+  </p>
+
+  <p>
+    然後關鍵的誤判發生。loop 不看 flush 還沒完成，轉頭去問另一個問題：「It checks <code>wants_read_again()</code>. The full request was already received, so this returns <code>false</code>. <code>poll_loop</code> returns <code>Poll::Ready(Ok(()))</code>, signaling that the loop is finished, even though the flush is not.」它檢查 <code>wants_read_again()</code>——還需要再讀 request 嗎？整個 request 早就收完了，所以回 <code>false</code>。於是 <code>poll_loop</code> 回 <code>Poll::Ready(Ok(()))</code>，宣告 loop 結束，儘管 flush 根本還沒做完。「讀完 request」和「寫完 response」是兩個獨立的條件，這裡卻被當成同一件事。
+  </p>
+
+  <p>
+    這裡值得停下來想清楚 <code>Poll::Pending</code> 在 async Rust 裡到底是什麼意思。它不是錯誤，也不是「失敗」——它是一個契約：被呼叫的 future 告訴呼叫方「我這次沒做完，請先別管我，等我準備好會透過 waker 叫醒你」。對 <code>poll_flush</code> 來說，回 Pending 等同於說「socket 現在滿了，buffer 裡還有沒送出去的資料，等 socket 排空再回來繼續 flush」。一個正確處理 backpressure 的呼叫方，看到 Pending 就應該把自己的進度也停在這裡、把 Pending 一路往上傳，直到最外層的 executor 安排重試。問題出在 <code>let _</code> 把這個訊號吞掉了——它讓 <code>poll_flush</code> 的副作用（盡量把資料推進 socket）發生，卻丟掉了它的回傳值，於是「還沒做完」這個資訊在這一行就斷了。程式繼續往下走，彷彿 flush 已經完成。
+  </p>
+
+  <p>
+    更精確地說，bug 的本質是兩個獨立狀態被一個布林條件混為一談。一邊是 read side：request 收完了沒？另一邊是 write side：response 送完了沒？這兩件事在 HTTP/1 的一來一回裡時序上很接近，但它們是不同的問題，由不同的緩衝區、不同的 syscall 推動。<code>wants_read_again()</code> 只回答前者，dispatch loop 卻把它的 <code>false</code> 當成「整條連線都收工了」的同義詞。在 FL 那個年代，因為讀取端夠快、<code>poll_flush</code> 幾乎總是當場就能完成、回 Ready，這個混淆從來不會顯現——write side 永遠在 read side 收工前就先一步完成了。一旦讀取端慢下來、<code>poll_flush</code> 開始回 Pending，被混為一談的兩個狀態才第一次分了岔，而那行 <code>let _</code> 確保程式選了錯的那一邊。
+  </p>
+
+  <p>
+    loop 一旦判定收工，shutdown 就接著發生，連線被關，最後客戶端拿到的是「The client receives 219 KB and an EOF (end-of-file) indicating that the connection is closed, even though it expects 14.9 MB.」——219 KB 加一個 EOF，連線已關，而它預期 14.9 MB。那行 <code>end of file before message length reached</code> 至此完全對上了：客戶端按 <code>Content-Length</code> 知道還該有 14.7 MB 沒到，卻先讀到了連線關閉的 EOF，於是報出「在 message length 達成前就遇到 EOF」。這也解釋了為什麼狀態碼是乾淨的 200——status line 與 header 早在 body 開始 flush 之前就送出去了，截斷只發生在 body 後段，HTTP 的回應狀態在語義上「已經成功」了。
+  </p>
+
+  <p>
+    那為什麼這個 bug 存在多年、偏偏現在才爆？答案在讀取端的速度。Cloudflare 的解釋是「FL, the previous intermediary, consumed data fast enough that the socket buffer rarely filled during a response. The new reader read at a pace that occasionally let the buffer fill during larger responses.」舊中介 FL 消費資料夠快，socket buffer 在一次回應期間幾乎不會滿；換成新 reader 後，它讀的速度偶爾會在較大回應期間讓 buffer 填滿——而 buffer 一滿，<code>poll_flush</code> 就回 Pending，那條早就埋好的錯誤路徑才被走到。Cloudflare 明說：「The December rearchitecture didn't introduce this bug, which had been present in hyper for years across multiple major versions.」這次重構沒有引入 bug，它只是把觸發條件變得夠常見。上面那個模擬裡，你把下游讀取速率拖低，就是在重現「新 reader 讀得慢一點」這件事。
+  </p>
+
+  <h2>四行修法，與它刻意不碰的地方</h2>
+
+  <p>
+    最直覺的修法是在 dispatch loop 裡把那個被丟掉的 Pending 接住：<code>poll_flush</code> 若回 pending 就讓整個 loop 也回 <code>Poll::Pending</code>、不要往下走到 shutdown。但 Cloudflare 沒有選這條。最終的修法下在更精準的位置：「we applied the fix at the point where shutdown is actually called. Before shutting down the socket, hyper should first flush any remaining data in its buffer」——下在真正呼叫 shutdown 的地方，在關 socket 之前先把 buffer 裡剩餘的資料 flush 掉。
+  </p>
+
+  <p>
+    具體就是讓 <code>poll_shutdown</code> 在發 <code>SHUT_WR</code> 之前先 <code>ready!(self.poll_flush(cx)?)</code>：flush 若還沒完成，<code>ready!</code> 會直接讓 <code>poll_shutdown</code> 回傳 Pending、等下次再來，直到 buffer 清空才真正 shutdown。
+  </p>
+
+  <pre data-kind="pseudocode"><code><em>// 最終修法：在 poll_shutdown 內，先 flush 再 SHUT_WR</em>
+pub(crate) fn poll_shutdown(
+    &amp;mut self, cx: &amp;mut Context&lt;'_&gt;,
+) -&gt; Poll&lt;io::Result&lt;()&gt;&gt; {
+    ready!(self.poll_flush(cx)?);   <em>// flush 沒完成就回 Pending、等下次</em>
+    Pin::new(&amp;mut self.io).poll_shutdown(cx)
+}
+</code></pre>
+
+  <p>
+    為什麼不選 dispatch loop 那條更顯眼的修法？理由有兩層。Cloudflare 給的是設計上的：「This leaves the dispatch loop unchanged. It adds a flush only at the exact point where data loss would otherwise occur」，也就是 shutdown 之前那一刻。修法保持 dispatch loop 不動，只在「原本會發生資料遺失的那一刻」補一次 flush——把改動的 blast radius 壓到最小，不去動那段被多個程式碼路徑共用的核心迴圈。
+  </p>
+
+  <p>
+    另一層理由在 upstream PR #4018 的討論裡。這個 PR 的標題就是症狀本身：「h1 servers can shutdown connections with pending buffered data on filled sockets」——HTTP/1 server 會在 socket 填滿、buffer 還有未送資料時關掉連線。作者提到，他考慮過在 poll loop 內回傳 pending flush，但選了現在的做法。理由在這段討論裡也看得出來：在 loop 裡反覆回 Pending、若 waker 安排不當，是有 busy-spin、把 CPU 吃滿風險的；把 flush 收進 shutdown 這個只走一次的點，可以繞開那個風險。
+  </p>
+
+  <p>
+    這個取捨值得拆開看，因為它是底層網路程式庫常見的兩難。dispatch loop 是一段被多個程式碼路徑共用的核心，任何在它中段插入 early return 的改動，都要保證新加的 Pending 一定伴隨一個會被叫醒的 waker——否則 future 回了 Pending 卻沒人安排它重試，輕則卡死、重則因為立刻又被 poll 而 busy-spin 把 CPU 吃滿。要在共用迴圈裡把這件事做對，需要對整段控制流重新推理一遍，回歸測試的面也大。相對地，<code>poll_shutdown</code> 是一個語義單純、只在連線收尾時走一次的點：在這裡用 <code>ready!</code> 接住 flush 的 Pending，<code>poll_shutdown</code> 本來就會被 executor 在 socket 可寫時重新 poll，waker 的問題已經由 IO driver 處理好了。同樣是「flush 沒完成就回 Pending」，放在不同的位置，一個要連帶解決 CPU 與 waker，一個幾乎免費——這就是為什麼修法 B 只動四行，而修法 A 雖然更直觀卻被放棄。
+  </p>
+
+  <p>
+    這個四行修法是止血，不是終局。hyper 維護者 seanmonstar 在討論裡指出更乾淨的長期方向（原文用了 likely，屬建議）：「the <code>Write</code> enum should likely get a new <code>Flushing</code> state, so that <code>is_done</code> isn't true until all expected bytes for a message are flushed.」——<code>Write</code> enum 應該多一個 <code>Flushing</code> 狀態，讓 <code>is_done</code> 在一則 message 所有預期 bytes 都 flush 完之前都不為 true。換句話說，從根上把「讀完 request」與「寫完 response」徹底分成兩個狀態，而不是靠在 shutdown 前補 flush 來繞過混淆。
+  </p>
+
+  <p>
+    這個建議的精神，正好對照出當前 bug 的結構性病灶。今天 hyper 的 write state 從 <code>Writing</code> 走到 <code>Writing::Closed</code> 就算「寫這一側的事做完了」，而 <code>Closed</code> 只代表「該寫的都已經交給了內部 buffer」，並不代表「buffer 裡的東西都已經離開了這台機器」。<code>is_done</code> 在這個定義下可能在資料還躺在 buffer 時就為 true。seanmonstar 提的 <code>Flushing</code> 狀態，就是在 <code>Closed</code> 與「真正完成」之間插進一個中繼態：只要還有 bytes 沒 flush 出去，狀態就停在 <code>Flushing</code>、<code>is_done</code> 維持 false，shutdown 自然無從觸發。下面這張圖把現況與這個建議方向並排——左邊是今天會漏掉 flush 的兩態，右邊是補上中繼態之後的三態。
+  </p>
+
+  <figure class="vg-w-states-write-enum" data-mobile="keep" data-svg-scroll="720">
+    <style>
+      .vg-w-states-write-enum { margin: var(--s-4) 0; }
+      .vg-w-states-write-enum svg.vg-w-states-write-enum-main { width: 100%; height: auto; }
+      .vg-w-states-write-enum figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-1); }
+    </style>
+    <svg class="vg-w-states-write-enum-main" viewBox="0 0 720 320" role="img"
+         aria-label="hyper Write 狀態：現況兩態 vs seanmonstar 建議的三態（多一個 Flushing）">
+      <style>
+        .vg-w-states-write-enum text { font-family: EB Garamond, serif; font-size: 13px; fill: var(--ink); }
+        .vg-w-states-write-enum .sub { font-family: Manrope, sans-serif; font-size: 11px; fill: var(--muted); }
+        .vg-w-states-write-enum .hd { font-family: Manrope, sans-serif; font-size: 12px; fill: var(--accent-text); text-transform: uppercase; letter-spacing: 0.05em; }
+        .vg-w-states-write-enum .good { fill: var(--sage-deep); }
+      </style>
+      <defs>
+        <marker id="vg-w-states-write-enum-arr" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+          <path d="M0,0 L7,3.5 L0,7 Z" fill="var(--muted)"/>
+        </marker>
+      </defs>
+
+      <line x1="360" y1="44" x2="360" y2="300" stroke="var(--line)" stroke-width="1" stroke-dasharray="3,3"/>
+
+      <!-- LEFT: current two-state -->
+      <text x="40" y="36" class="hd">現況：兩態</text>
+      <rect x="60" y="56" width="200" height="44" rx="5" fill="none" stroke="var(--muted-2)" stroke-width="1.2"/>
+      <text x="160" y="83" text-anchor="middle">Writing</text>
+      <line x1="160" y1="100" x2="160" y2="128" stroke="var(--muted)" stroke-width="1" marker-end="url(#vg-w-states-write-enum-arr)"/>
+      <rect x="60" y="130" width="200" height="56" rx="5" fill="var(--accent)" fill-opacity="0.08" stroke="var(--accent)" stroke-width="1.4"/>
+      <text x="160" y="154" text-anchor="middle" fill="var(--accent-text)">Writing::Closed</text>
+      <text x="160" y="172" text-anchor="middle" class="sub">is_done = true（但 buffer 可能還沒空）</text>
+      <line x1="160" y1="186" x2="160" y2="214" stroke="var(--muted)" stroke-width="1" marker-end="url(#vg-w-states-write-enum-arr)"/>
+      <rect x="60" y="216" width="200" height="44" rx="5" fill="none" stroke="var(--muted-2)" stroke-width="1.2"/>
+      <text x="160" y="243" text-anchor="middle">shutdown（SHUT_WR）</text>
+      <text x="160" y="288" text-anchor="middle" class="sub">buffer 未清 → 截斷</text>
+
+      <!-- RIGHT: proposed three-state -->
+      <text x="420" y="36" class="hd">建議：多一個 Flushing</text>
+      <rect x="440" y="56" width="200" height="44" rx="5" fill="none" stroke="var(--muted-2)" stroke-width="1.2"/>
+      <text x="540" y="83" text-anchor="middle">Writing</text>
+      <line x1="540" y1="100" x2="540" y2="120" stroke="var(--muted)" stroke-width="1" marker-end="url(#vg-w-states-write-enum-arr)"/>
+      <rect x="440" y="122" width="200" height="56" rx="5" fill="var(--sage-deep)" fill-opacity="0.1" stroke="var(--sage-deep)" stroke-width="1.4"/>
+      <text x="540" y="146" text-anchor="middle" class="good">Flushing（新增）</text>
+      <text x="540" y="164" text-anchor="middle" class="sub">還有 bytes 沒 flush → is_done = false</text>
+      <line x1="540" y1="178" x2="540" y2="198" stroke="var(--muted)" stroke-width="1" marker-end="url(#vg-w-states-write-enum-arr)"/>
+      <rect x="440" y="200" width="200" height="44" rx="5" fill="none" stroke="var(--muted-2)" stroke-width="1.2"/>
+      <text x="540" y="227" text-anchor="middle">Closed（buffer 已空）</text>
+      <line x1="540" y1="244" x2="540" y2="262" stroke="var(--muted)" stroke-width="1" marker-end="url(#vg-w-states-write-enum-arr)"/>
+      <rect x="440" y="264" width="200" height="40" rx="5" fill="none" stroke="var(--muted-2)" stroke-width="1.2"/>
+      <text x="540" y="289" text-anchor="middle">shutdown（資料已全送）</text>
+    </svg>
+    <figcaption>左為現況：Closed 即 is_done，buffer 未空也可能 shutdown。右為 seanmonstar 建議的方向：插入 Flushing 中繼態，buffer 清空前 is_done 不為 true。原文用 likely，屬建議。資料來源：hyperium/hyper PR #4018 討論。</figcaption>
+  </figure>
+
+  <p>
+    下面這張表把受影響的版本、與兩種修法路徑並排起來。
+  </p>
+
+  <figure class="vg-w-table-hyper-versions-fix" data-mobile="keep">
+    <style>
+      .vg-w-table-hyper-versions-fix { overflow-x: auto; margin: var(--s-4) 0; }
+      .vg-w-table-hyper-versions-fix table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-hyper-versions-fix thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); }
+      .vg-w-table-hyper-versions-fix tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+      .vg-w-table-hyper-versions-fix tbody th { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); text-align: left; font-family: var(--sans); font-size: var(--fs-xs); color: var(--accent-text); white-space: nowrap; }
+    </style>
+    <table>
+      <thead>
+        <tr>
+          <th scope="col">面向</th>
+          <th scope="col">內容</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <th scope="row">受影響版本</th>
+          <td>實測 hyper 0.14、1.7、1.8 三版皆重現，bug 已跨多個大版本存在多年。</td>
+        </tr>
+        <tr>
+          <th scope="row">觸發條件</th>
+          <td>HTTP/1 server 回大 body，且下游讀取速度慢到讓 socket send buffer 在 flush 完成前填滿（backpressure）。</td>
+        </tr>
+        <tr>
+          <th scope="row">症狀</th>
+          <td>HTTP 200、無 error log、body 被截斷；client 端偶見 end of file before message length reached。</td>
+        </tr>
+        <tr>
+          <th scope="row">修法 A（未採用）</th>
+          <td>在 dispatch loop 內接住 poll_flush 的 pending、讓 loop 回 Poll::Pending。顯眼但動到共用迴圈，且有 busy-spin、耗 CPU 風險。</td>
+        </tr>
+        <tr>
+          <th scope="row">修法 B（採用）</th>
+          <td>在 poll_shutdown 內先 ready!(poll_flush) 再 SHUT_WR。dispatch loop 不動，只在 shutdown 前補 flush。以 PR #4018 合併。</td>
+        </tr>
+        <tr>
+          <th scope="row">長期方向</th>
+          <td>seanmonstar 建議 Write enum 增 Flushing state，讓 is_done 在所有 bytes flush 完前不為 true（原文 likely，屬建議）。</td>
+        </tr>
+      </tbody>
+    </table>
+    <figcaption>受影響版本與兩種修法路徑。最終採用的是 blast radius 最小的修法 B；資料來源：Cloudflare blog post 與 hyperium/hyper PR #4018。</figcaption>
+  </figure>
+
+  <p>
+    Cloudflare 把修法與一個 deterministic test 一起送上游：「We merged our fix and the deterministic test into <code>hyperium/hyper</code> via PR #4018. It will be available in a future hyper release」——修法與測試已透過 PR #4018 合併進 hyperium/hyper，會出現在未來的 hyper release。對正在用 hyper 0.14 或 1.x 當 HTTP/1 server 的人來說，這意味著在那個 release 之前，只要你的下游消費速度可能慢於回應產生速度，silent truncation 在理論上就有可能發生。
+  </p>
+
+  <p>
+    對正在用 hyper 當 HTTP/1 server 的人，這裡有兩個可操作的判斷。其一，這個 bug 的觸發條件不挑業務邏輯，只挑時序：只要你回的 body 大到一次 write 塞不滿 socket、而下游消費的速度又可能慢於 hyper 產生資料的速度，理論上就有機會踩到。慢下游不必是異常——它可能只是一個忙碌的反向代理、一條壅塞的鏈路、或一個本身就在做 CPU 密集轉換的中介。其二，這個 bug 在三個大版本（0.14、1.7、1.8）上都在，所以「升級到最新版」在 fix 釋出之前並不能解決它；真正的緩解只有等帶 PR #4018 的 release，或在那之前自行 backport 那段 <code>poll_shutdown</code> 的 flush。在那之前，把它當成一個已知的 silent failure mode 放進心裡：200 不等於 body 完整。
+  </p>
+
+  <p>
+    這次獵 bug 留下兩個能直接帶走的判斷。一個是觀測層的盲點：「Application-level observability can have a blind spot for bugs that live below its awareness.」application 層的 observability 對活在它感知層之下的 bug 會有盲點——這次所有 application 工具都只能說「資料離開我這層時就壞了」，真正的突破來自 kernel 層，「Our breakthrough came from using kernel-level tooling with <code>strace</code>, the one layer that records what actually happened on the socket.」strace 是唯一記錄 socket 上真正發生什麼的一層。當監控全綠、症狀卻真實存在時，往下掉一層去看 syscall，往往比在原地加更多 application log 更快。
+  </p>
+
+  <p>
+    另一個更微妙：把系統變快，可能反而打開一扇原本關著的時間窗。Cloudflare 的結語是「The underlying bug lived in the few milliseconds between a partial flush and a premature shutdown」，按原文的說法，那是一扇只在他們把系統變快之後才打開的窗（a window that opened only after we made the system faster）。底層 bug 就活在 partial flush 與 premature shutdown 之間那幾毫秒。重構本身沒有引入缺陷，它只是改變了讀取端的時序，讓一條早就存在的錯誤路徑變得常被走到。效能優化改的不只是速度，還有所有與時序相關的邊緣條件——舊的 race 可能因此被觸發，也可能被掩蓋。
+  </p>
+
+  <p class="vg-deep-closer"><strong>The lesson</strong>：當 200 OK 的 body 卻短少、application log 一片乾淨，別急著加更多 log——往下掉到 strace 那一層看 socket syscall；而每一次讓系統變快的重構，都要重新檢視它動到的時序邊緣，因為被掩蓋多年的 race，往往就在那幾毫秒裡重新打開。</p>
+</div>

@@ -1,0 +1,769 @@
+{
+  "output_path": "src/posts/2026/06/23/deep-hyper-body-truncation.html",
+  "spine": [
+    "1. 背景：2025 年底 Cloudflare 重構 Images binding，把 FL 中介換成同機 Unix-socket reader，目的是繞過 FL 與網路堆疊的 overhead。",
+    "2. 異常：圖片以 HTTP 200 回傳卻被截斷，沒有錯誤 log；一個請求只到 ~200 KB，預期 3.3 MB；客戶端報 end of file before message length reached。",
+    "3. 定位：先排除 timeout 假設、跨 hyper 0.14/1.7/1.8 三版都重現、本地壓測卻打不出來、用 distributed tracing 與 instrumentation 把截斷點縮到 Images service，最後 strace 看 socket syscall。",
+    "4. 根因：hyper HTTP/1 dispatch loop 用 let _ 丟掉 poll_flush 的 Poll::Pending，socket buffer 因 backpressure 滿時，wants_read_again 回 false，loop 提早 Ready，poll_shutdown 發 SHUT_WR，留下未送出的 buffered data。",
+    "5. 為何現在才爆：FL 消費夠快、socket buffer 很少在回應期間填滿；新 reader 讀得慢一點，大回應期間 buffer 偶爾填滿，才打開了那扇幾毫秒的窗。",
+    "6. 修復：最終修法在 poll_shutdown 內先 ready!(poll_flush) 完成 flush 再送 SHUT_WR，dispatch loop 不動；以 PR #4018 合併進 hyperium/hyper。",
+    "7. 教訓：application-level observability 對活在它感知層之下的 bug 有盲點，突破來自 kernel 層的 strace；把系統變快反而打開了 partial flush 與 premature shutdown 之間那扇窗。"
+  ],
+  "sources": [
+    {
+      "url": "https://blog.cloudflare.com/hyper-bug/",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": "2026-06-22",
+      "perspective": {
+        "mechanism": "Rust 的 let _ = expr 會丟掉表達式結果，包含 Poll::Pending；hyper 的 HTTP/1 dispatch loop 在判斷連線是否寫完時，沒有把 poll_flush 尚未完成的 backpressure 訊號納入，導致 socket buffer 滿時仍判定 loop 結束、提早觸發 poll_shutdown 的 SHUT_WR。",
+        "tradeoff": "在 poll_loop 內回傳 pending 會有 CPU spin 風險（PR 作者說 to avoid exhausting the CPU），所以最終修法選在 poll_shutdown 內 flush，dispatch loop 不動，只在資料會遺失的那一刻補一次 flush。",
+        "reader_use": "用 hyper 0.14/1.x 當 HTTP/1 server、且下游消費速度可能慢於產生速度（large body、backpressure）的人，要知道在 fix 釋出前可能 silent truncation；遇到 200 卻 body 短少、無 error，先用 strace 看 socket 層而不是只看 application log。"
+      }
+    },
+    {
+      "url": "https://github.com/hyperium/hyper/pull/4018",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": "2026-06-11",
+      "perspective": {
+        "mechanism": "修法把 poll_flush 補進 Buffered 的 poll_shutdown，在 shutdown 之前先清掉 buffer 內未 flush 的資料，若仍 pending 就 early return。",
+        "tradeoff": "作者考慮過在 poll loop 內回傳 pending flush，但選了 poll_shutdown 內 flush 的做法以避免耗盡 CPU；seanmonstar 提到更乾淨的長期解是 Write enum 增一個 Flushing state，讓 is_done 在所有 bytes flush 完前不為 true。",
+        "reader_use": "想追修法本體與 upstream 討論的人可看 PR #4018，修法已合併、會出現在未來的 hyper release。"
+      }
+    }
+  ],
+  "notes": [
+    {
+      "id": "n01",
+      "url": "https://blog.cloudflare.com/hyper-bug/",
+      "quote": "In December 2025, the Images team replaced FL with a new intermediary service, an internal worker binding that runs on the same machine.",
+      "hedge": "asserted",
+      "interpretation": "2025 年 12 月把 FL 換成同機運行的內部 worker binding 中介。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n02",
+      "url": "https://blog.cloudflare.com/hyper-bug/",
+      "quote": "The internal binding replaced these with Unix sockets to directly connect the services on the same machine, bypassing FL and the overhead of the network stack.",
+      "hedge": "asserted",
+      "interpretation": "新 binding 用 Unix socket 同機直連，繞過 FL 與網路堆疊 overhead。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n03",
+      "url": "https://blog.cloudflare.com/hyper-bug/",
+      "quote": "the responses for these requests returned a `200` status without any errors logged. The image data was simply cut short",
+      "hedge": "asserted",
+      "interpretation": "回應是 200、沒有 error log，圖片資料就是被截短。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n04",
+      "url": "https://blog.cloudflare.com/hyper-bug/",
+      "quote": "A response that should have been two megabytes might arrive with a few hundred kilobytes instead.",
+      "hedge": "hedged",
+      "interpretation": "本該兩 MB 的回應可能只到幾百 KB。原文用 might，屬舉例式描述。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n05",
+      "url": "https://blog.cloudflare.com/hyper-bug/",
+      "quote": "error reading a body from connection: end of file before message length reached",
+      "hedge": "asserted",
+      "interpretation": "客戶端觀察到的錯誤訊息：在達到 message length 前就遇到 EOF。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n06",
+      "url": "https://blog.cloudflare.com/hyper-bug/",
+      "quote": "In one request, only ~200 KB arrived out of an expected 3.3 MB.",
+      "hedge": "asserted",
+      "interpretation": "一個請求只到約 200 KB，預期 3.3 MB。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n07",
+      "url": "https://blog.cloudflare.com/hyper-bug/",
+      "quote": "We built a worker that mimicked the customer's nested setup, then stripped away layers until we could trigger the bug with the binding alone... In one early run, 19 out of 25 requests failed.",
+      "hedge": "asserted",
+      "interpretation": "建一個模仿客戶 nested setup 的 worker，逐層剝離直到只用 binding 就能觸發；早期一次跑 25 個請求壞了 19 個。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n08",
+      "url": "https://blog.cloudflare.com/hyper-bug/",
+      "quote": "Early on, we suspected the truncation might be related to timeout behavior (i.e., the connection was being closed after a time limit). This theory didn't hold",
+      "hedge": "asserted",
+      "interpretation": "早期懷疑截斷與 timeout 有關，但這個理論站不住。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n09",
+      "url": "https://blog.cloudflare.com/hyper-bug/",
+      "quote": "We tested across hyper versions 0.14, 1.7, and 1.8, just in case the most obvious answer was the correct (and easiest) one. But the bug appeared in each version",
+      "hedge": "asserted",
+      "interpretation": "跨 hyper 0.14、1.7、1.8 測試，bug 在每一版都出現。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n10",
+      "url": "https://blog.cloudflare.com/hyper-bug/",
+      "quote": "We ran local integration tests on macOS and a Debian VM. Even under considerable load, our local requests never triggered any failure.",
+      "hedge": "asserted",
+      "interpretation": "在 macOS 與 Debian VM 跑本地整合測試，即使加大負載，本地請求也從未觸發失敗。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n11",
+      "url": "https://blog.cloudflare.com/hyper-bug/",
+      "quote": "We added instrumentation to the intermediary service to measure body sizes before forwarding the response data. The bodies were already truncated by the time they left the Images service",
+      "hedge": "asserted",
+      "interpretation": "在中介服務加 instrumentation 量 body 大小，發現資料離開 Images service 時就已被截斷。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n12",
+      "url": "https://blog.cloudflare.com/hyper-bug/",
+      "quote": "To see what the system was actually doing, we attached `strace` to the Images service.",
+      "hedge": "asserted",
+      "interpretation": "為了看系統實際在做什麼，對 Images service 掛上 strace。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n13",
+      "url": "https://blog.cloudflare.com/hyper-bug/",
+      "quote": "In Rust, `let _ = expr` discards the expression's result, including `Poll::Pending`, the signal that the flush isn't done yet... the `let _` before `poll_flush` is where the bug lives.",
+      "hedge": "asserted",
+      "interpretation": "Rust 的 let _ = expr 丟掉表達式結果，包含代表 flush 還沒完成的 Poll::Pending；poll_flush 前的 let _ 就是 bug 所在。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n14",
+      "url": "https://blog.cloudflare.com/hyper-bug/",
+      "quote": "Hyper writes the block into its internal buffer and marks its write state as `Writing::Closed`.",
+      "hedge": "asserted",
+      "interpretation": "hyper 把該 block 寫進內部 buffer，並把 write state 標成 Writing::Closed。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n15",
+      "url": "https://blog.cloudflare.com/hyper-bug/",
+      "quote": "The socket accepted about 219 KB. The remaining ~14.8 MB stays in hyper's buffer. The socket is full, so the kernel returns `Poll::Pending`.",
+      "hedge": "asserted",
+      "interpretation": "socket 只收下約 219 KB，剩下約 14.8 MB 留在 hyper buffer；socket 滿，kernel 回 Poll::Pending。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n16",
+      "url": "https://blog.cloudflare.com/hyper-bug/",
+      "quote": "It checks `wants_read_again()`. The full request was already received, so this returns `false`. `poll_loop` returns `Poll::Ready(Ok(()))`, signaling that the loop is finished, even though the flush is not.",
+      "hedge": "asserted",
+      "interpretation": "它檢查 wants_read_again()，因為完整 request 已收完所以回 false；poll_loop 回 Poll::Ready(Ok(()))，宣告 loop 結束，儘管 flush 尚未完成。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n17",
+      "url": "https://blog.cloudflare.com/hyper-bug/",
+      "quote": "The client receives 219 KB and an EOF (end-of-file) indicating that the connection is closed, even though it expects 14.9 MB.",
+      "hedge": "asserted",
+      "interpretation": "客戶端收到 219 KB 與一個 EOF（表示連線已關），儘管它預期 14.9 MB。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n18",
+      "url": "https://blog.cloudflare.com/hyper-bug/",
+      "quote": "FL, the previous intermediary, consumed data fast enough that the socket buffer rarely filled during a response. The new reader read at a pace that occasionally let the buffer fill during larger responses.",
+      "hedge": "asserted",
+      "interpretation": "舊中介 FL 消費夠快，socket buffer 在回應期間很少填滿；新 reader 讀的速度偶爾會在較大回應期間讓 buffer 填滿。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n19",
+      "url": "https://blog.cloudflare.com/hyper-bug/",
+      "quote": "The December rearchitecture didn't introduce this bug, which had been present in hyper for years across multiple major versions.",
+      "hedge": "asserted",
+      "interpretation": "12 月的重構沒有引入這個 bug，它已在 hyper 跨多個大版本存在多年。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n20",
+      "url": "https://blog.cloudflare.com/hyper-bug/",
+      "quote": "we applied the fix at the point where shutdown is actually called. Before shutting down the socket, hyper should first flush any remaining data in its buffer",
+      "hedge": "asserted",
+      "interpretation": "修法下在真正呼叫 shutdown 的地方；關閉 socket 前，hyper 應先 flush buffer 內剩餘資料。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n21",
+      "url": "https://blog.cloudflare.com/hyper-bug/",
+      "quote": "This leaves the dispatch loop unchanged. It adds a flush only at the exact point where data loss would otherwise occur — the moment before shutdown.",
+      "hedge": "asserted",
+      "interpretation": "這保持 dispatch loop 不動，只在原本會發生資料遺失的那一刻（shutdown 之前）補一次 flush。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n22",
+      "url": "https://blog.cloudflare.com/hyper-bug/",
+      "quote": "Application-level observability can have a blind spot for bugs that live below its awareness.",
+      "hedge": "asserted",
+      "interpretation": "application 層的 observability 對活在它感知層之下的 bug 會有盲點。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n23",
+      "url": "https://blog.cloudflare.com/hyper-bug/",
+      "quote": "Our breakthrough came from using kernel-level tooling with `strace`, the one layer that records what actually happened on the socket.",
+      "hedge": "asserted",
+      "interpretation": "突破來自用 kernel 層工具 strace，那是唯一記錄 socket 上真正發生什麼的一層。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n24",
+      "url": "https://blog.cloudflare.com/hyper-bug/",
+      "quote": "The underlying bug lived in the few milliseconds between a partial flush and a premature shutdown — a window that opened only after we made the system faster.",
+      "hedge": "asserted",
+      "interpretation": "底層 bug 活在 partial flush 與 premature shutdown 之間那幾毫秒——一扇只在我們把系統變快之後才打開的窗。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n25",
+      "url": "https://blog.cloudflare.com/hyper-bug/",
+      "quote": "We merged our fix and the deterministic test into `hyperium/hyper` via [PR #4018](https://github.com/hyperium/hyper/pull/4018). It will be available in a future hyper release",
+      "hedge": "asserted",
+      "interpretation": "把修法與 deterministic test 透過 PR #4018 合併進 hyperium/hyper，會出現在未來的 hyper release。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n26",
+      "url": "https://blog.cloudflare.com/hyper-bug/",
+      "quote": "At the end of 2025, we rearchitected the binding to provide a more direct, local connection between the Workers runtime and the Images service.",
+      "hedge": "asserted",
+      "interpretation": "2025 年底重構 binding，讓 Workers runtime 與 Images service 之間有更直接的本機連線。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n27",
+      "url": "https://blog.cloudflare.com/hyper-bug/",
+      "quote": "The failure occurred intermittently, scaled with response size, couldn't be reproduced with simple tools like curl, and disappeared when we observed the system more closely.",
+      "hedge": "asserted",
+      "interpretation": "失敗是間歇性的、隨回應大小放大、用 curl 這種簡單工具重現不出來、而且觀察得越仔細就越不出現。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n28",
+      "url": "https://github.com/hyperium/hyper/pull/4018",
+      "quote": "h1 servers can shutdown connections with pending buffered data on filled sockets",
+      "hedge": "asserted",
+      "interpretation": "PR #4018 標題：HTTP/1 server 會在 socket 填滿、buffer 還有未送資料時關掉連線。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n29",
+      "url": "https://github.com/hyperium/hyper/pull/4018",
+      "quote": "rather than exhausting the CPU",
+      "hedge": "asserted",
+      "interpretation": "PR 討論裡提到 poll-loop 內反覆回 pending 會有耗 CPU 風險；本文據此把『選 poll_shutdown 內 flush』讀為避開該風險（標為推斷，非作者直引）。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n30",
+      "url": "https://github.com/hyperium/hyper/pull/4018",
+      "quote": "the `Write` enum should likely get a new `Flushing` state, so that `is_done` isn't true until all expected bytes for a message are flushed.",
+      "hedge": "hedged",
+      "interpretation": "seanmonstar 提的長期方向：Write enum 應加一個 Flushing state，讓 is_done 在一則 message 所有預期 bytes flush 完前不為 true。原文用 likely，屬建議。",
+      "timeliness": "durable"
+    }
+  ],
+  "claims": [
+    {
+      "id": "c01",
+      "claim_text": "2025 年底重構 binding",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n26"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "At the end of 2025, we rearchitected the binding to provide a more direct, local connection between the Workers runtime and the Images service."
+    },
+    {
+      "id": "c02",
+      "claim_text": "2025 年 12 月把 FL 換成同機 internal worker binding",
+      "type": "date-version",
+      "load": "high",
+      "note_ids": [
+        "n01"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "In December 2025, the Images team replaced FL with a new intermediary service, an internal worker binding that runs on the same machine."
+    },
+    {
+      "id": "c03",
+      "claim_text": "改用 Unix socket 同機直連，繞過網路堆疊 overhead",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n02"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "The internal binding replaced these with Unix sockets to directly connect the services on the same machine, bypassing FL and the overhead of the network stack."
+    },
+    {
+      "id": "c04",
+      "claim_text": "回應 200、無 error log，圖片資料被截短",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n03"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "the responses for these requests returned a `200` status without any errors logged. The image data was simply cut short"
+    },
+    {
+      "id": "c05",
+      "claim_text": "本該兩 MB 的回應可能只到幾百 KB",
+      "type": "number",
+      "load": "medium",
+      "note_ids": [
+        "n04"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "A response that should have been two megabytes might arrive with a few hundred kilobytes instead."
+    },
+    {
+      "id": "c06",
+      "claim_text": "一個請求只到約 200 KB，預期 3.3 MB",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n06"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "In one request, only ~200 KB arrived out of an expected 3.3 MB."
+    },
+    {
+      "id": "c07",
+      "claim_text": "錯誤訊息：end of file before message length reached",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n05"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "error reading a body from connection: end of file before message length reached"
+    },
+    {
+      "id": "c08",
+      "claim_text": "間歇、隨大小放大、curl 重現不出、觀察越仔細越不出現",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n27"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "The failure occurred intermittently, scaled with response size, couldn't be reproduced with simple tools like curl, and disappeared when we observed the system more closely."
+    },
+    {
+      "id": "c09",
+      "claim_text": "逐層剝離至 binding 單獨觸發；25 個請求壞 19 個",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n07"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "We built a worker that mimicked the customer's nested setup, then stripped away layers until we could trigger the bug with the binding alone. ... In one early run, 19 out of 25 requests failed."
+    },
+    {
+      "id": "c10",
+      "claim_text": "timeout 假設站不住",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n08"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "we suspected the truncation might be related to timeout behavior ... This theory didn't hold"
+    },
+    {
+      "id": "c11",
+      "claim_text": "跨 hyper 0.14/1.7/1.8 三版都重現",
+      "type": "date-version",
+      "load": "high",
+      "note_ids": [
+        "n09"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "We tested across hyper versions 0.14, 1.7, and 1.8 ... But the bug appeared in each version"
+    },
+    {
+      "id": "c12",
+      "claim_text": "本地 macOS/Debian VM 加負載也打不出來",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n10"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "We ran local integration tests on macOS and a Debian VM. Even under considerable load, our local requests never triggered any failure."
+    },
+    {
+      "id": "c13",
+      "claim_text": "tracing 確認截斷在離開外層轉換前已存在",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n11"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "the truncated body was already present before it reached the outer transformation layer"
+    },
+    {
+      "id": "c14",
+      "claim_text": "資料離開 Images service 時就已截斷",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n11"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "The bodies were already truncated by the time they left the Images service"
+    },
+    {
+      "id": "c15",
+      "claim_text": "掛 strace 看實際行為",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n12"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "To see what the system was actually doing, we attached `strace` to the Images service."
+    },
+    {
+      "id": "c16",
+      "claim_text": "let _ 丟掉含 Poll::Pending 的結果；poll_flush 前的 let _ 是 bug 所在",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n13"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "In Rust, `let _ = expr` discards the expression's result, including `Poll::Pending` ... the `let _` before `poll_flush` is where the bug lives."
+    },
+    {
+      "id": "c17",
+      "claim_text": "hyper 把 block 寫進 buffer 並標 Writing::Closed",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n14"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "Hyper writes the block into its internal buffer and marks its write state as `Writing::Closed`."
+    },
+    {
+      "id": "c18",
+      "claim_text": "socket 收下約 219 KB，剩約 14.8 MB 留在 buffer，kernel 回 Poll::Pending",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n15"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "The socket accepted about 219 KB. The remaining ~14.8 MB stays in hyper's buffer. The socket is full, so the kernel returns `Poll::Pending`."
+    },
+    {
+      "id": "c19",
+      "claim_text": "wants_read_again 回 false，poll_loop 回 Ready 宣告結束，儘管 flush 未完",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n16"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "It checks `wants_read_again()` ... returns `false`. `poll_loop` returns `Poll::Ready(Ok(()))`, signaling that the loop is finished, even though the flush is not."
+    },
+    {
+      "id": "c20",
+      "claim_text": "客戶端收 219 KB 與 EOF，儘管預期 14.9 MB",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n17"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "The client receives 219 KB and an EOF (end-of-file) indicating that the connection is closed, even though it expects 14.9 MB."
+    },
+    {
+      "id": "c21",
+      "claim_text": "FL 消費夠快 buffer 少滿；新 reader 慢一點，大回應偶爾填滿",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [
+        "n18"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "FL, the previous intermediary, consumed data fast enough that the socket buffer rarely filled during a response. The new reader read at a pace that occasionally let the buffer fill during larger responses."
+    },
+    {
+      "id": "c22",
+      "claim_text": "12 月重構沒引入 bug，它已跨多個大版本存在多年",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [
+        "n19"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "The December rearchitecture didn't introduce this bug, which had been present in hyper for years across multiple major versions."
+    },
+    {
+      "id": "c23",
+      "claim_text": "修法下在真正 shutdown 的地方，先 flush 剩餘資料",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n20"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "Before shutting down the socket, hyper should first flush any remaining data in its buffer ... we applied the fix at the point where shutdown is actually called."
+    },
+    {
+      "id": "c24",
+      "claim_text": "dispatch loop 不動，只在會遺失資料的那一刻補 flush",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n21"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "This leaves the dispatch loop unchanged. It adds a flush only at the exact point where data loss would otherwise occur — the moment before shutdown."
+    },
+    {
+      "id": "c25",
+      "claim_text": "PR #4018 標題即症狀",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n28"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "h1 servers can shutdown connections with pending buffered data on filled sockets"
+    },
+    {
+      "id": "c26",
+      "claim_text": "作者選 poll_shutdown 內 flush 而非 poll-loop pending，本文讀為避開 busy-spin/耗 CPU 風險（已改為推斷、去除直引）",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [
+        "n29"
+      ],
+      "independence": "single-source",
+      "verdict": "unverifiable",
+      "hedge_delta": "none",
+      "action": "correct",
+      "resolution": "corrected",
+      "evidence": "rather than exhausting the CPU",
+      "note": "Original draft quoted '\"to avoid exhausting the CPU\"' as the author's verbatim rationale; that exact string is not in PR #4018 and 'exhausting the CPU' appears re: an earlier approach. Fixed by de-quoting and restating as the post's reading of the discussion; n29 quote updated to the verbatim fragment."
+    },
+    {
+      "id": "c27",
+      "claim_text": "seanmonstar：Write enum 應加 Flushing state（原文 likely，屬建議）",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n30"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "the `Write` enum should likely get a new `Flushing` state, so that `is_done` isn't true until all expected bytes for a message are flushed."
+    },
+    {
+      "id": "c28",
+      "claim_text": "fix 與 deterministic test 經 PR #4018 合併，會出現在未來 release",
+      "type": "attribution",
+      "load": "high",
+      "note_ids": [
+        "n25"
+      ],
+      "independence": "corroborated",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "We merged our fix and the deterministic test into `hyperium/hyper` via [PR #4018] ... It will be available in a future hyper release"
+    },
+    {
+      "id": "c29",
+      "claim_text": "application 層 observability 對下層 bug 有盲點",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n22"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "Application-level observability can have a blind spot for bugs that live below its awareness."
+    },
+    {
+      "id": "c30",
+      "claim_text": "突破來自 kernel 層 strace",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n23"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "Our breakthrough came from using kernel-level tooling with `strace`, the one layer that records what actually happened on the socket."
+    },
+    {
+      "id": "c31",
+      "claim_text": "bug 活在 partial flush 與 premature shutdown 間幾毫秒，把系統變快才打開那扇窗",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n24"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "The underlying bug lived in the few milliseconds between a partial flush and a premature shutdown — a window that opened only after we made the system faster."
+    },
+    {
+      "id": "c32",
+      "claim_text": "14.9 MB 預期 / 14.8 MB 滯留（hero+widget 一致）",
+      "type": "number",
+      "load": "medium",
+      "note_ids": [
+        "n15",
+        "n17"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "The remaining ~14.8 MB stays in hyper's buffer. ... even though it expects 14.9 MB."
+    }
+  ],
+  "checked_at": "2026-06-23",
+  "checker_rounds": 2,
+  "coverage": {
+    "candidate_claims": 34,
+    "checked": 32,
+    "dropped_low_load": 2
+  }
+}
