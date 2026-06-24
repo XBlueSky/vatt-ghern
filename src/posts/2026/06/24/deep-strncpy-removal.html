@@ -1,0 +1,482 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">一個四十年前就被寫進 C 標準函式庫的字串複製函式，在 Linux kernel 裡花了六年、三百六十多個 patch 才被徹底拔乾淨。它的罪狀只有一條，但這條足夠致命：當來源跟目的一樣長，<code>strncpy()</code> 不會幫你補上字串結尾的那個 NUL。</p>
+  <h1 class="vg-post-title">{{ title }}</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p>
+    <span class="vg-dropcap">這</span>是一場慢得幾乎不像新聞的工程戰役。據 Phoronix 報導，Linux 7.2 成為第一個 <code>strncpy()</code> 呼叫點掛零的 kernel 版本，而把它推到零的，是一支從 2020 年就開始逐一清點呼叫點的隊伍。值得記下的不是「又一個 unsafe API 被換掉」，而是這件事怎麼在數千萬行程式碼上被做到底——以及一個被誤用了幾十年的 C 字串 API，要怎麼才能真正退場。
+  </p>
+
+  <h2>先看清楚 strncpy 的契約到底承諾了什麼</h2>
+
+  <p>
+    多數人對 <code>strncpy(dst, src, n)</code> 的直覺是「把 src 複製到 dst，最多 n 個位元組，順便保證安全」。前半對，後半是幻覺。kernel 的官方棄用文件把問題講得很白：「Use of strncpy() does not guarantee that the destination buffer will be NUL terminated.」——使用 <code>strncpy()</code> 並不保證目的緩衝區會以 NUL 結尾。對一個被當成字串函式來用的 API 來說，這幾乎是契約的反面。
+  </p>
+
+  <p>
+    真正反直覺的地方在於它的兩種行為是分裂的。同一份文件接著說：「It also NUL-pads the destination buffer if the source contents are shorter than the destination buffer size, which may be a needless performance penalty for callers using only NUL-terminated strings.」——當來源內容比目的緩衝區短，它會用 NUL 把整個緩衝區補滿；對只想要 NUL 結尾字串的呼叫者來說，這是不必要的效能負擔。把兩句話合起來看，<code>strncpy()</code> 的行為依來源長度而分歧：來源比目的短，它補一堆 NUL；來源等於或超過目的，它一個 NUL 都不補。
+  </p>
+
+  <p>
+    換句話說，唯一會讓你拿到一個正常 C 字串的情況，恰好是來源「短於」目的的時候——而這正是你最不需要長度保護的情況。當你真的撞到邊界、來源把緩衝區塞滿，保護消失了，你得到一個沒有終止符的字元陣列。後面任何一個把它當字串讀的 <code>strlen</code>、<code>printk("%s")</code>、<code>strcpy</code>，都會一路讀過緩衝區邊界，直到撞上記憶體裡下一個剛好是零的位元組。下面這張表把同一次呼叫在三種來源長度下的結果並排，點欄位標頭可以排序。
+  </p>
+
+  <figure class="vg-w-table-strncpy-contract" data-mobile="keep">
+    <style>
+      .vg-w-table-strncpy-contract { overflow-x: auto; margin: var(--s-4) 0; }
+      .vg-w-table-strncpy-contract table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-strncpy-contract thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; }
+      .vg-w-table-strncpy-contract thead th[data-sort] { color: var(--accent-text); }
+      .vg-w-table-strncpy-contract tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+      .vg-w-table-strncpy-contract td.danger { color: var(--accent-text); }
+      .vg-w-table-strncpy-contract td code { white-space: nowrap; }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/>
+        <path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+      </svg>
+      <span>click column header to sort · 4 columns × 3 rows</span>
+    </p>
+    <table>
+      <thead>
+        <tr>
+          <th data-key="case">case（strncpy(dst, src, n)）</th>
+          <th data-key="copied">實際複製進去的</th>
+          <th data-key="nul">NUL 結尾？</th>
+          <th data-key="pad">補 NUL？</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>strlen(src) &lt; n</code></td>
+          <td>src 全部</td>
+          <td>有</td>
+          <td>把剩餘空間全補滿 NUL</td>
+        </tr>
+        <tr>
+          <td><code>strlen(src) == n</code></td>
+          <td>前 n 個字元（src 全部）</td>
+          <td class="danger">沒有</td>
+          <td>無空間可補</td>
+        </tr>
+        <tr>
+          <td><code>strlen(src) &gt; n</code></td>
+          <td>前 n 個字元（被截斷）</td>
+          <td class="danger">沒有</td>
+          <td>無空間可補</td>
+        </tr>
+      </tbody>
+    </table>
+    <figcaption>
+      同一次呼叫，行為依 <code>strlen(src)</code> 與 <code>n</code> 的關係分裂。NUL 結尾只在來源短於目的時成立——也就是你最不需要長度保護的那一格。
+    </figcaption>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-table-strncpy-contract');
+        if (!root) return;
+        const headers = root.querySelectorAll('thead th');
+        const tbody = root.querySelector('tbody');
+        let activeKey = null, asc = true;
+        headers.forEach(h => h.addEventListener('click', () => {
+          const key = h.dataset.key;
+          if (activeKey === key) asc = !asc; else { activeKey = key; asc = true; }
+          headers.forEach(x => x.removeAttribute('data-sort'));
+          h.setAttribute('data-sort', asc ? 'asc' : 'desc');
+          const rows = [...tbody.querySelectorAll('tr')];
+          const idx = [...headers].indexOf(h);
+          rows.sort((a, b) => {
+            const av = a.children[idx].textContent.trim();
+            const bv = b.children[idx].textContent.trim();
+            return asc ? av.localeCompare(bv) : bv.localeCompare(av);
+          });
+          rows.forEach(r => tbody.appendChild(r));
+        }));
+      })();
+    </script>
+  </figure>
+
+  <p>
+    Kernel Self-Protection Project（KSPP）在追蹤這件事的 issue 裡，把這個契約的後果寫成一句沒有 hedge 的話：「The strncpy() function is actively dangerous to use since it may not NUL-terminate the destination string, resulting in potential memory content exposures, unbounded reads, or crashes.」——<code>strncpy()</code> 用起來是有實際危險性的，因為它可能不替目的字串補上 NUL，導致記憶體內容外洩、無界讀取或崩潰。注意這裡列的三個後果不是抽象風險：記憶體內容外洩是把緩衝區後面的鄰居資料當成字串印出去，無界讀取是讀過界，崩潰是讀到沒對映的頁面。一個字串複製函式能同時引發這三種，問題不在誰用錯，而在這個 API 的預設行為本身就是陷阱。
+  </p>
+
+  <p>
+    為什麼這個陷阱這麼難自己暴露？因為它幾乎不會在開發或測試階段觸發。日常測資裡的名字、路徑、識別字大多遠短於緩衝區，落在表格的第一格——複製正確、結尾正常、補零照做，一切看起來都對。只有當某個來源剛好把緩衝區塞滿、落到第二或第三格時，缺少的那個 NUL 才會讓後面某次讀取走過界，而那個讀取往往離出事的 <code>strncpy</code> 隔了好幾個函式、甚至好幾個 subsystem。bug 的因與果在時間和空間上都被拉開，這正是這類記憶體安全問題最難在 code review 裡被肉眼抓到的原因——你看著那行 <code>strncpy</code>，它長得跟對的一模一樣。
+  </p>
+
+  <h2>替代函式不是一個，而是一張按目的契約分流的表</h2>
+
+  <p>
+    如果只是把每個 <code>strncpy()</code> 機械地換成某個「安全版」，這個遷移會很快、也會錯。問題是 <code>strncpy()</code> 的呼叫點其實在做三件不同的事，被同一個函式名混在一起：有些要的是 NUL 結尾字串、有些要的是 NUL 結尾且補零、有些根本要的是定寬的非字串欄位（例如塞進一個固定大小的 protocol header field，刻意不要結尾符）。把它們分清楚，才知道該換成哪個函式。
+  </p>
+
+  <p>
+    HN 上對這次遷移的討論把替代方案的分流講得很精準：「strscpy() for NUL terminated destinations, strscpy_pad() for NUl-terminated destinations with zero-padding, strtomem_pad() for non-NUL-terminated fixed-width fields.」——<code>strscpy()</code> 給需要 NUL 結尾的目的、<code>strscpy_pad()</code> 給需要 NUL 結尾且補零的、<code>strtomem_pad()</code> 給非 NUL 結尾的定寬欄位。kernel 文件同向地寫道：「When the destination is required to be NUL-terminated, the replacement is strscpy()」，而「Any cases still needing NUL-padding should instead use strscpy_pad().」下面這張圖把目的緩衝區的契約當成入口，點任一塊看它該交給哪個函式、那個函式保證什麼、又刻意不保證什麼。
+  </p>
+
+  <figure class="vg-w-annotated-strcpy-family" data-mobile="keep" data-svg-scroll="560">
+    <style>
+      .vg-w-annotated-strcpy-family { display: grid; grid-template-columns: 1fr; gap: var(--s-3); align-items: start; margin: var(--s-4) 0; }
+      .vg-w-annotated-strcpy-family svg { width: 100%; height: auto; }
+      .vg-w-annotated-strcpy-family input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-annotated-strcpy-family .component { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; transition: fill 200ms, stroke 200ms; }
+      .vg-w-annotated-strcpy-family .component:hover { stroke: var(--accent); }
+      .vg-w-annotated-strcpy-family .component:focus { outline: none; }
+      .vg-w-annotated-strcpy-family .component:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+      .vg-w-annotated-strcpy-family .component-text { pointer-events: none; }
+      .vg-w-annotated-strcpy-family .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+      .vg-w-annotated-strcpy-family .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-annotated-strcpy-family .detail p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-annotated-strcpy-family:has(#vg-w-annotated-strcpy-family-r1:checked) .component-1,
+      .vg-w-annotated-strcpy-family:has(#vg-w-annotated-strcpy-family-r2:checked) .component-2,
+      .vg-w-annotated-strcpy-family:has(#vg-w-annotated-strcpy-family-r3:checked) .component-3,
+      .vg-w-annotated-strcpy-family:has(#vg-w-annotated-strcpy-family-r4:checked) .component-4,
+      .vg-w-annotated-strcpy-family:has(#vg-w-annotated-strcpy-family-r5:checked) .component-5 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-annotated-strcpy-family:has(#vg-w-annotated-strcpy-family-r1:checked) .detail-1,
+      .vg-w-annotated-strcpy-family:has(#vg-w-annotated-strcpy-family-r2:checked) .detail-2,
+      .vg-w-annotated-strcpy-family:has(#vg-w-annotated-strcpy-family-r3:checked) .detail-3,
+      .vg-w-annotated-strcpy-family:has(#vg-w-annotated-strcpy-family-r4:checked) .detail-4,
+      .vg-w-annotated-strcpy-family:has(#vg-w-annotated-strcpy-family-r5:checked) .detail-5 { display: block; }
+      @media (max-width: 720px) {
+        .vg-w-annotated-strcpy-family { grid-template-columns: 1fr; }
+      }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M9 9h6v6"/><path d="m9 15 6-6"/>
+        <circle cx="12" cy="12" r="9"/>
+      </svg>
+      <span>click any destination contract to see which function owns it · 5 cases</span>
+    </p>
+
+    <input type="radio" id="vg-w-annotated-strcpy-family-r1" name="vg-w-annotated-strcpy-family-sel" checked />
+    <input type="radio" id="vg-w-annotated-strcpy-family-r2" name="vg-w-annotated-strcpy-family-sel" />
+    <input type="radio" id="vg-w-annotated-strcpy-family-r3" name="vg-w-annotated-strcpy-family-sel" />
+    <input type="radio" id="vg-w-annotated-strcpy-family-r4" name="vg-w-annotated-strcpy-family-sel" />
+    <input type="radio" id="vg-w-annotated-strcpy-family-r5" name="vg-w-annotated-strcpy-family-sel" />
+
+    <svg viewBox="0 0 480 360" role="img" aria-label="依目的緩衝區契約分流到不同替代函式的決策圖">
+      <text x="240" y="24" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">問目的緩衝區的契約，再選函式</text>
+
+      <rect class="component component-1" data-target="vg-w-annotated-strcpy-family-r1" role="button" tabindex="0" aria-label="要 NUL 結尾字串" x="30" y="50" width="190" height="58" rx="5" />
+      <text class="component-text" x="125" y="76" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">要 NUL 結尾字串</text>
+      <text class="component-text" x="125" y="94" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--accent-text)">strscpy()</text>
+
+      <rect class="component component-2" data-target="vg-w-annotated-strcpy-family-r2" role="button" tabindex="0" aria-label="要 NUL 結尾且補零" x="260" y="50" width="190" height="58" rx="5" />
+      <text class="component-text" x="355" y="76" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">要 NUL 結尾且補零</text>
+      <text class="component-text" x="355" y="94" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--accent-text)">strscpy_pad()</text>
+
+      <rect class="component component-3" data-target="vg-w-annotated-strcpy-family-r3" role="button" tabindex="0" aria-label="定寬非字串欄位" x="30" y="135" width="190" height="58" rx="5" />
+      <text class="component-text" x="125" y="161" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">定寬非字串欄位</text>
+      <text class="component-text" x="125" y="179" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--accent-text)">strtomem() / _pad()</text>
+
+      <rect class="component component-4" data-target="vg-w-annotated-strcpy-family-r4" role="button" tabindex="0" aria-label="要新配一份字串" x="260" y="135" width="190" height="58" rx="5" />
+      <text class="component-text" x="355" y="161" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">要新配一份字串</text>
+      <text class="component-text" x="355" y="179" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--accent-text)">kstrndup()</text>
+
+      <rect class="component component-5" data-target="vg-w-annotated-strcpy-family-r5" role="button" tabindex="0" aria-label="為什麼不是 strlcpy" x="145" y="220" width="190" height="58" rx="5" />
+      <text class="component-text" x="240" y="246" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">那 strlcpy 呢？</text>
+      <text class="component-text" x="240" y="264" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--accent-text)">也被勸退</text>
+
+      <text x="240" y="320" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="13" fill="var(--muted)">一個 strncpy 被拆成五種意圖，遷移的工作量正來自這裡</text>
+    </svg>
+
+    <div>
+      <div class="detail detail-1">
+        <h3>strscpy() · 多數呼叫點該去的地方</h3>
+        <p>kernel 文件：「When the destination is required to be NUL-terminated, the replacement is strscpy().」目的字串要 NUL 結尾，就用它。</p>
+        <p><strong>它保證的</strong>：永遠 NUL 結尾。截斷時回傳 <code>-E2BIG</code>，呼叫者拿得到「有沒有放不下」這個信號。</p>
+        <p><strong>它刻意不做的</strong>：不像 <code>strncpy</code> 那樣把剩餘空間全補滿 NUL。</p>
+      </div>
+      <div class="detail detail-2">
+        <h3>strscpy_pad() · 真的需要補零時</h3>
+        <p>kernel 文件：「Any cases still needing NUL-padding should instead use strscpy_pad().」少數呼叫點是真的依賴「剩餘位元組為零」這個語意（例如要把整個緩衝區寫進磁碟或送上線、不想洩漏舊內容）。</p>
+        <p><strong>它保證的</strong>：NUL 結尾 ＋ 把剩餘空間補零。</p>
+        <p><strong>合理的推測是</strong>：這類呼叫點是少數，多數舊 <code>strncpy</code> 的補零行為其實沒人依賴，只是順帶發生。</p>
+      </div>
+      <div class="detail detail-3">
+        <h3>strtomem() / strtomem_pad() · 根本不是字串</h3>
+        <p>HN 討論：「strtomem_pad() for non-NUL-terminated fixed-width fields.」有些目的根本是定寬二進位欄位，刻意不要結尾符。</p>
+        <p><strong>它保證的</strong>：把來源搬進一個編譯期已知大小的目的，<code>_pad</code> 版補零。</p>
+        <p><strong>它解決的真問題</strong>：把「我要的就是定寬欄位」這個意圖，從「我忘了加 NUL」這個 bug 裡分離出來。</p>
+      </div>
+      <div class="detail detail-4">
+        <h3>kstrndup() · 連配置一起做掉</h3>
+        <p>KSPP issue 把它列為 NUL 結尾目的的替代之一。當目的緩衝區本來就要新配一塊（而不是寫進既有固定陣列），<code>kstrndup()</code> 一次把「配記憶體 ＋ 複製 ＋ 補 NUL」做完。</p>
+        <p><strong>它換掉的</strong>：那種「先 kmalloc 再 strncpy」的兩步式樣板，少一個容易忘記補 NUL 的中間態。</p>
+      </div>
+      <div class="detail detail-5">
+        <h3>strlcpy() · 一個常見的「假安全」答案</h3>
+        <p>很多人第一反應是改用 <code>strlcpy</code>，但 kernel 文件把它也勸退了：「strlcpy() reads the entire source buffer first ... This read may exceed the destination size limit. This is both inefficient and can lead to linear read overflows ... The safe replacement is strscpy().」</p>
+        <p><strong>關鍵</strong>：<code>strlcpy</code> 為了回傳來源長度，會先讀完整個來源——當來源不保證在目的大小內結尾，這個讀本身就會越界。安全的替代仍是 <code>strscpy()</code>。</p>
+      </div>
+    </div>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-annotated-strcpy-family');
+        if (!root) return;
+        root.querySelectorAll('.component').forEach((rect) => {
+          rect.addEventListener('click', () => {
+            const targetId = rect.getAttribute('data-target');
+            const radio = root.querySelector('#' + targetId);
+            if (radio) radio.checked = true;
+          });
+          rect.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              rect.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            }
+          });
+        });
+      })();
+    </script>
+  </figure>
+
+  <p>
+    這張圖其實就是整場遷移困難度的來源。如果 <code>strncpy</code> 只對應一種正確替代，這會是一個 <code>sed</code> 腳本能跑完的事；但它對應到五種意圖，每一個呼叫點都得有人讀懂「這裡到底想幹嘛」，才能判斷該換成哪個。把判斷塞進工具是做不到的——工具看不出某個塞進 header 的 <code>strncpy</code> 是刻意要定寬欄位、還是單純忘了結尾符。這一步只能靠人，逐個 subsystem 讀過去。
+  </p>
+
+  <p>
+    <code>strlcpy</code> 那一格特別值得台灣這邊寫 kernel 或 driver 的人記住。它在 BSD 世界長年被當成「<code>strncpy</code> 的安全升級版」推廣，直覺上把它當答案很自然。但 kernel 的判斷是：<code>strlcpy</code> 為了回傳「來源原本多長」而先掃完整個來源，這個掃描在來源不保證結尾的情境下本身就是 linear read overflow。換句話說，從一個會越界寫的函式逃到一個會越界讀的函式，不算逃出來。正確的終點是 <code>strscpy()</code>。
+  </p>
+
+  <h2>六年、三百六十多個 patch——退場是怎麼一版一版走完的</h2>
+
+  <p>
+    把這件事推到底的是 Kernel Self-Protection Project。追蹤用的 issue（KSPP issue #90，標題「Remove all strncpy() uses」）在 2020 年 8 月 11 日開出，指派給 Kees Cook。從那天到 Linux 7.2，跨度大約六年——HN 上這則新聞的標題直接寫成「Linux eliminates the strncpy API after six years of work, 360 patches」，六年、三百六十個 patch。Phoronix 的報導把 <code>strncpy</code> 形容為「a persistent source of bugs」，多年來持續產 bug 的源頭。
+  </p>
+
+  <p>
+    這種規模的清理不可能一刀切。它的節奏是逐版倒數呼叫點：每個 merge window 修掉一批，把全 tree 的 <code>strncpy()</code> 數量往下壓一截，下一版再壓一截，直到 7.2 歸零。下面這條時間軸把這場戰役的幾個錨點攤開，拖動把手看每個時點的狀態——中間的呼叫點數字沒有逐版的公開精確值，標成合理推測，錨定的是兩端確定的事實（2020 年開 issue、7.2 歸零）。
+  </p>
+
+  <figure class="vg-w-scrub-strncpy-countdown" data-mobile="swap" data-svg-scroll="720" data-mobile-summary="2020 年 8 月開 issue 追蹤，逐版倒數呼叫點，六年三百六十多個 patch，到 Linux 7.2 全 tree 歸零。">
+    <style>
+      .vg-w-scrub-strncpy-countdown { display: grid; gap: var(--s-2); margin: var(--s-4) 0; }
+      .vg-w-scrub-strncpy-countdown svg { width: 100%; height: auto; }
+      .vg-w-scrub-strncpy-countdown .state { font-family: var(--serif); font-size: var(--fs-sm); padding: var(--s-2); background: var(--bg-soft); border-left: 2px solid var(--accent); }
+      .vg-w-scrub-strncpy-countdown .state strong { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); display: block; margin-bottom: var(--s-1); }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M5 9l-3 3 3 3"/><path d="M9 5l3-3 3 3"/>
+        <path d="M15 19l-3 3-3-3"/><path d="M19 9l3 3-3 3"/>
+        <path d="M2 12h20"/><path d="M12 2v20"/>
+      </svg>
+      <span>drag the handle along the timeline · 5 anchors over six years</span>
+    </p>
+
+    <svg class="vg-w-scrub-strncpy-countdown-main" viewBox="0 0 720 110" role="img" aria-label="strncpy 退場時間軸，可拖動把手檢視每個時點的狀態">
+      <line x1="50" y1="46" x2="670" y2="46" stroke="var(--muted-2)" stroke-width="1.5" />
+      <g id="vg-w-scrub-strncpy-countdown-events"></g>
+      <line id="vg-w-scrub-strncpy-countdown-handle-line" x1="50" y1="26" x2="50" y2="66" stroke="var(--accent)" stroke-width="2" />
+      <circle id="vg-w-scrub-strncpy-countdown-handle" cx="50" cy="46" r="9" fill="var(--accent)" cursor="grab" />
+      <text id="vg-w-scrub-strncpy-countdown-clock" x="50" y="18" text-anchor="middle" font-family="Manrope, sans-serif" font-size="12" fill="var(--ink)">2020.08</text>
+    </svg>
+
+    <div class="state" id="vg-w-scrub-strncpy-countdown-state">拖動把手檢視每個時點的狀態。</div>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-scrub-strncpy-countdown');
+        if (!root) return;
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        const svg = root.querySelector('svg.vg-w-scrub-strncpy-countdown-main');
+        const handle = root.querySelector('#vg-w-scrub-strncpy-countdown-handle');
+        const handleLine = root.querySelector('#vg-w-scrub-strncpy-countdown-handle-line');
+        const clock = root.querySelector('#vg-w-scrub-strncpy-countdown-clock');
+        const stateDiv = root.querySelector('#vg-w-scrub-strncpy-countdown-state');
+        const eventsG = root.querySelector('#vg-w-scrub-strncpy-countdown-events');
+
+        // [t in 0..100, clock label, state title, state body]
+        const events = [
+          [0,   '2020.08', '開 issue 追蹤',   'KSPP issue #90「Remove all strncpy() uses」開出，指派給 Kees Cook。全 tree 仍有大量 strncpy 呼叫點。'],
+          [25,  '逐版倒數', '逐 subsystem 清理', '每個 merge window 修掉一批呼叫點，把全 tree 數量往下壓。每個呼叫點都要人讀懂意圖再選替代函式。〔中間數字為合理推測〕'],
+          [55,  '逐版倒數', '替代 API 補齊',   'strscpy / strscpy_pad / strtomem / strtomem_pad 等替代函式逐步定型，分流不同目的契約。'],
+          [80,  '收尾',     '剩零星 holdout',  '主流 subsystem 清完，剩下散在邊角的呼叫點，逐一收尾。〔合理推測〕'],
+          [100, 'Linux 7.2', '呼叫點歸零',     'Linux 7.2 成為第一個 strncpy() 呼叫點掛零的 kernel 版本。累計六年、約 360 個 patch。'],
+        ];
+        const T_MAX = 100, X0 = 50, X1 = 670;
+        const xOf = t => X0 + (t / T_MAX) * (X1 - X0);
+        const NS = 'http://www.w3.org/2000/svg';
+        for (const [t, label] of events) {
+          const c = document.createElementNS(NS, 'circle');
+          c.setAttribute('cx', xOf(t)); c.setAttribute('cy', 46); c.setAttribute('r', 4);
+          c.setAttribute('fill', 'var(--muted)');
+          eventsG.appendChild(c);
+          const tx = document.createElementNS(NS, 'text');
+          tx.setAttribute('x', xOf(t)); tx.setAttribute('y', 86);
+          tx.setAttribute('text-anchor', 'middle');
+          tx.setAttribute('font-family', 'Manrope, sans-serif');
+          tx.setAttribute('font-size', 11);
+          tx.setAttribute('fill', 'var(--muted)');
+          tx.textContent = label;
+          eventsG.appendChild(tx);
+        }
+        function clamp(x) { return Math.max(X0, Math.min(X1, x)); }
+        function clientToSvgX(clientX) {
+          const pt = svg.createSVGPoint();
+          pt.x = clientX; pt.y = 0;
+          return clamp(pt.matrixTransform(svg.getScreenCTM().inverse()).x);
+        }
+        function update(x) {
+          handle.setAttribute('cx', x);
+          handleLine.setAttribute('x1', x); handleLine.setAttribute('x2', x);
+          clock.setAttribute('x', x);
+          const t = ((x - X0) / (X1 - X0)) * T_MAX;
+          let active = events[0];
+          for (const e of events) if (e[0] <= t) active = e;
+          clock.textContent = active[1];
+          stateDiv.innerHTML = '<strong>' + active[2] + '</strong>' + active[3];
+        }
+        let dragging = false;
+        handle.addEventListener('pointerdown', (e) => { dragging = true; handle.setPointerCapture(e.pointerId); });
+        handle.addEventListener('pointermove', (e) => { if (dragging) update(clientToSvgX(e.clientX)); });
+        handle.addEventListener('pointerup', () => { dragging = false; });
+        svg.addEventListener('pointerdown', (e) => { if (e.target !== handle) update(clientToSvgX(e.clientX)); });
+        update(X0);
+      })();
+    </script>
+  </figure>
+
+  <p>
+    六年這個數字本身就是這篇值得寫的理由。一個 API 退場，難的從來不是技術——換成 <code>strscpy</code> 的機械動作很簡單。難的是規模乘上判斷：數千萬行裡的每一個呼叫點都要被人看過，判斷它屬於前面那五格的哪一格，而且不能一次全改、得跟著 kernel 正常的 merge 節奏一版一版滲透進各 subsystem，每個 subsystem 有自己的 maintainer、自己的 review 週期、自己的 regression 風險。三百六十個 patch 不是三百六十個機械替換，是三百六十次「讀懂、判斷、送審、過 review」。
+  </p>
+
+  <p>
+    這種隊伍要怎麼確定「真的清完了」，而不是漏掉散在某個冷門 driver 裡的最後幾個？關鍵是把判斷的負擔從人腦移回工具，但移的方式很講究。對那些「目的確實是定寬非字串欄位」的呼叫點，正確做法不是繼續用 <code>strncpy</code>，而是給那個欄位標上 <code>__nonstring</code> 屬性，明白告訴編譯器「這塊記憶體不是 C 字串，不要期待它有結尾符」。標完之後，編譯器就能把「對一個 <code>__nonstring</code> 欄位仍當字串處理」當成警告報出來。這一步把原本只存在於原作者腦中的意圖，固化成程式碼裡可被機器檢查的標註——一旦所有合法的非字串用法都標好，剩下任何一個 <code>strncpy</code> 就都是該換成 <code>strscpy</code> 系列的字串用法，工具能逐個盯著、不讓新呼叫點偷偷長回來。
+  </p>
+
+  <p>
+    這就是大規模清理的真正形狀：不是一次性的 grep-and-replace，而是「先用標註把意圖顯式化、再讓編譯器當守門員」的雙軌。先標 <code>__nonstring</code> 把刻意的定寬欄位分離出去，剩下的字串用法逐版換成 <code>strscpy</code>／<code>strscpy_pad</code>，每換掉一批就把對應的呼叫點從 issue 上勾掉；等到全 tree 一個都不剩，再把「禁止新增 <code>strncpy</code> 呼叫」變成可以長期執行的規則。歸零不是終點上的一刀，是六年裡持續把計數往下壓、同時把守門機制立起來的累積結果。
+  </p>
+
+  <h2>同一個呼叫點，換之前換之後到底差在哪</h2>
+
+  <p>
+    把抽象的契約落到一行真實程式碼上，差異會更清楚。考慮一個常見樣板：把某個名字複製進一個固定大小的緩衝區。舊寫法用 <code>strncpy</code>，傳 <code>sizeof(buf)</code> 當長度，看起來人畜無害；但只要 <code>name</code> 的長度剛好等於或超過 <code>sizeof(buf)</code>，<code>buf</code> 就沒有結尾符，下一個把它當字串讀的人就會越界。新寫法換成 <code>strscpy</code>，行為兩處改變：保證結尾，而且截斷時回傳 <code>-E2BIG</code>，把「放不下」這件事變成呼叫者能檢查的回傳值，而不是一個埋著的記憶體 bug。拖動分隔線比較同一段邏輯的前後。
+  </p>
+
+  <figure class="vg-w-ba-strncpy-fix" data-mobile="swap" data-svg-scroll="560" data-mobile-summary="舊用 strncpy 在來源填滿緩衝區時不補結尾符，後續讀取越界；改成 strscpy 後保證結尾，截斷時回傳 -E2BIG 讓呼叫者檢查。">
+    <style>
+      .vg-w-ba-strncpy-fix { position: relative; aspect-ratio: 16 / 9; overflow: hidden; margin: var(--s-4) 0; border: 1px solid var(--line); }
+      .vg-w-ba-strncpy-fix .layer { position: absolute; inset: 0; }
+      .vg-w-ba-strncpy-fix .after { clip-path: polygon(50% 0, 100% 0, 100% 100%, 50% 100%); }
+      .vg-w-ba-strncpy-fix .divider {
+        position: absolute; top: 0; bottom: 0; left: 50%;
+        width: 32px; transform: translateX(-50%);
+        cursor: ew-resize; touch-action: none; z-index: 3;
+      }
+      .vg-w-ba-strncpy-fix .divider::before {
+        content: ''; position: absolute; left: 50%; top: 0; bottom: 0;
+        width: 2px; transform: translateX(-50%); background: var(--accent);
+      }
+      .vg-w-ba-strncpy-fix .divider::after {
+        content: '↔'; position: absolute; left: 50%; top: 50%;
+        transform: translate(-50%, -50%);
+        background: var(--accent); color: var(--bg);
+        width: 32px; height: 32px; border-radius: 50%;
+        display: grid; place-items: center;
+        font-family: var(--sans); font-size: 16px;
+      }
+      @media (max-width: 720px) { .vg-w-ba-strncpy-fix { aspect-ratio: 4 / 3; } }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M21 8V5a2 2 0 0 0-2-2h-3"/>
+        <path d="M3 16v3a2 2 0 0 0 2 2h3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/>
+        <path d="M12 3v18"/>
+      </svg>
+      <span>drag the divider to compare the same call before and after the fix</span>
+    </p>
+
+    <svg class="layer before" viewBox="0 0 440 248" preserveAspectRatio="xMidYMid meet">
+      <rect width="440" height="248" fill="var(--bg-soft)" />
+      <text x="20" y="34" font-family="Manrope, sans-serif" font-size="13" fill="var(--accent-text)" letter-spacing="0.04em">BEFORE · strncpy</text>
+      <text x="20" y="66" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--ink)">char buf[16];</text>
+      <text x="20" y="90" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--ink)">strncpy(buf, name,</text>
+      <text x="20" y="110" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--ink)">        sizeof(buf));</text>
+      <text x="20" y="148" font-family="EB Garamond, serif" font-size="13" fill="var(--muted)">name 長 16 時：</text>
+      <text x="20" y="170" font-family="EB Garamond, serif" font-size="13" fill="var(--accent-text)">buf 沒有結尾 NUL</text>
+      <text x="20" y="192" font-family="EB Garamond, serif" font-size="13" fill="var(--muted)">下個 strlen(buf) 讀過界</text>
+      <text x="20" y="220" font-family="IM Fell English, serif" font-style="italic" font-size="12" fill="var(--muted)">沒有任何回傳值告訴你被截斷了</text>
+    </svg>
+    <svg class="layer after" viewBox="0 0 440 248" preserveAspectRatio="xMidYMid meet" id="vg-w-ba-strncpy-fix-after">
+      <rect width="440" height="248" fill="var(--accent)" fill-opacity="0.06" />
+      <text x="232" y="34" font-family="Manrope, sans-serif" font-size="13" fill="var(--sage-deep)" letter-spacing="0.04em">AFTER · strscpy</text>
+      <text x="232" y="66" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--ink)">char buf[16];</text>
+      <text x="232" y="90" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--ink)">ssize_t r = strscpy(</text>
+      <text x="232" y="110" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--ink)">  buf, name, sizeof(buf));</text>
+      <text x="232" y="148" font-family="EB Garamond, serif" font-size="13" fill="var(--muted)">name 長 16 時：</text>
+      <text x="232" y="170" font-family="EB Garamond, serif" font-size="13" fill="var(--sage-deep)">buf 保證 NUL 結尾</text>
+      <text x="232" y="192" font-family="EB Garamond, serif" font-size="13" fill="var(--sage-deep)">r == -E2BIG（被截斷）</text>
+      <text x="232" y="220" font-family="IM Fell English, serif" font-style="italic" font-size="12" fill="var(--muted)">截斷變成可檢查的回傳值</text>
+    </svg>
+    <div class="divider" id="vg-w-ba-strncpy-fix-divider"></div>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-ba-strncpy-fix');
+        if (!root) return;
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        const after = root.querySelector('#vg-w-ba-strncpy-fix-after');
+        const divider = root.querySelector('#vg-w-ba-strncpy-fix-divider');
+        let dragging = false;
+        function setPct(pct) {
+          const c = Math.max(0, Math.min(100, pct));
+          after.style.clipPath = `polygon(${c}% 0, 100% 0, 100% 100%, ${c}% 100%)`;
+          divider.style.left = `${c}%`;
+        }
+        divider.addEventListener('pointerdown', (e) => { dragging = true; divider.setPointerCapture(e.pointerId); });
+        root.addEventListener('pointermove', (e) => {
+          if (!dragging) return;
+          const rect = root.getBoundingClientRect();
+          setPct(((e.clientX - rect.left) / rect.width) * 100);
+        });
+        root.addEventListener('pointerup', () => { dragging = false; });
+        root.addEventListener('pointercancel', () => { dragging = false; });
+      })();
+    </script>
+  </figure>
+
+  <p>
+    這個對照裡藏著為什麼 <code>strscpy</code> 是對的終點，而不只是「另一個複製函式」。它把兩個原本隱形的事實變成顯式的：結尾這件事不再依賴來源長度，永遠成立；截斷這件事不再是無聲的，而是一個 <code>-E2BIG</code> 回傳值，呼叫者可以選擇報錯、截斷後繼續、或重新配更大的緩衝區。<code>strncpy</code> 的世界裡，這兩個事實都得靠呼叫者自己記得去處理，而幾十年的 CVE 史證明了人記不住。把安全性從「靠紀律」改成「靠 API 預設行為」，這才是整場遷移真正換掉的東西。
+  </p>
+
+  <h2>一個被誤用幾十年的 API，退場給其他語言社群留下了什麼</h2>
+
+  <p>
+    把 <code>strncpy</code> 想成「壞函式」其實不太準。它在 1980 年代被設計出來時有它的用途——填寫定寬的、不需要結尾符的欄位，例如早期 Unix 檔案系統裡的目錄項。在那個情境下，「來源剛好填滿就不補 NUL」「來源較短就補滿剩餘空間」這兩個今天看來分裂的行為，其實是同一個目標的兩半：把一塊定寬空間完整寫好，結尾符不在需求裡。問題出在它的名字以 <code>str</code> 開頭、長得像 <code>strcpy</code> 的安全版，於是被當成字串函式來用了四十年，而它對字串的契約恰好在邊界上失效。這不是某個糟糕實作，是一個語意被誤讀的 API 在巨大程式庫裡複利累積的代價。
+  </p>
+
+  <p>
+    這也是為什麼替代方案要拆成一整排、而不是一個更安全的 <code>strncpy</code>。真正的修法不是把舊函式補強，而是承認「定寬欄位」與「NUL 結尾字串」從一開始就是兩種不同的需求，硬塞進同一個 API 才是錯誤的源頭。<code>strtomem</code> 系列把定寬那一半接走、<code>strscpy</code> 系列把字串那一半接走，每個函式只承諾一種契約、不再依來源長度改變行為。當一個函式只做一件事，呼叫點看一眼函式名就知道意圖，code review 也才有辦法在「這裡該不該結尾」上給出確定的判斷——而不是像面對 <code>strncpy</code> 時那樣，得先猜原作者當初想的是哪一種。
+  </p>
+
+  <p>
+    HN 上有人把這類工作稱為「the real work of systems engineering」，並說它是「on the scale of decades」——以數十年為尺度的系統工程真功夫。也有人指出更底層的問題出在 C 沒有像樣的 string buffer 與 string view 型別，逼得每個呼叫點自己手動處理長度與結尾。這兩個觀察其實是同一件事的兩面：當語言不在型別層面把「這塊記憶體是不是 NUL 結尾字串」表達出來，這個資訊就只能散在每一次呼叫的腦袋裡，而散出去的東西遲早會錯。
+  </p>
+
+  <p>
+    對在台灣寫系統軟體的人，這場戰役有兩個可以直接帶走的東西。第一，下次想用 <code>strncpy</code> 或反射性地改用 <code>strlcpy</code> 時，先問目的緩衝區的契約是哪一格——要 NUL 結尾就 <code>strscpy</code>，要定寬欄位就 <code>strtomem</code>，別讓一個函式名同時承擔互斥的意圖。第二，退役一個被廣泛誤用的 API，預算要按「年」抓而不是按「sprint」抓：真正的成本不在改，在於替每一個呼叫點重建當初寫它的人省略掉的判斷，而這件事規模一大就只能靠一支隊伍長期一版一版磨。
+  </p>
+
+  <p>
+    還有一個容易被忽略的層面：維護自己的 out-of-tree 模組或 driver 的人，現在等於繼承了這套規則。kernel 把 <code>strncpy</code> 的去留寫進 <code>Documentation/process/deprecated.rst</code> 這份活文件裡，它不只是歷史記錄，而是會被工具拿來檢查、會被 maintainer 拿來擋 patch 的依據。當主線把字串複製的正確做法收斂到 <code>strscpy</code> 一族，任何還停在舊寫法的程式碼，往後每次 rebase 上新版核心都會更顯眼、更可能撞上新的編譯器警告。與其等到那時候被動處理，不如趁早把自己這邊的呼叫點按同一張契約表盤點一遍——這場清理對主線是六年的終點，對下游卻是一個剛開始的維護義務。
+  </p>
+
+  <p>
+    退一步看，這件事真正示範的是 kernel 怎麼對待一個錯誤的預設值。它沒有發一封「請大家不要再用」的公告就當解決了，而是把「禁止」變成可執行的機制——文件、編譯器標註、issue 上逐項勾選、merge window 裡逐版推進——讓正確做法成為阻力最小的那條路，讓錯誤做法逐漸變得寫不出來。一個 API 能不能真的退場，從來不取決於大家是否認同它危險，而取決於有沒有人願意把這套機制建起來、再花數年盯著它跑完。
+  </p>
+
+  <p class="vg-deep-closer"><strong>The lesson</strong>：一個 unsafe API 不會因為大家知道它危險就自己消失——它需要一支隊伍花六年、三百六十個 patch，把每個呼叫點背後的意圖重新讀一遍，才換得到 Linux 7.2 那個漂亮的零。</p>
+</div>
