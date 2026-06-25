@@ -1,0 +1,543 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">追一條 ClickHouse Cloud 查詢，越來越慢的那一段不再是「一個 thread 算了很多東西」，而是「一萬個小操作以某種順序完成，最慢的那個塑造了 tail」。Silk 的回答不是把任何一步加速，而是換掉併發單位本身——把 OS thread 從前線退到後方，讓上千個 fiber 在固定的幾條 worker thread 上排隊。</p>
+  <h1 class="vg-post-title">{{ title }}</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p><span class="vg-dropcap">S</span>ilk 是 ClickHouse 公開的一個 C++ library，用 ClickHouse 自己的話說，它「gives you a cooperative fiber scheduler, backed by a per-CPU scheduler that uses io_uring for asynchronous I/O and steals work between cores when local queues run dry」。換句話說，它是一個 M:N 的 fiber runtime：M 個 fiber 對映到 N 條 OS thread，而 N 不是 fiber 的數量，是 CPU 的數量。這篇要拆的是它的內部結構——scheduler 怎麼把 fiber 對映到 worker thread、stack 與同步原語的記憶體怎麼管、它跟既有 thread pool 與 async I/O 怎麼整合，以及它為了做到這些放棄了什麼。</p>
+
+  <p>先把問題講清楚。ClickHouse 觀察到的瓶頸，原話是「If you trace a query through ClickHouse Cloud, increasingly the long pole is not 'a thread did a lot of computation,' it is 'ten thousand tiny operations completed in a particular order, and the slowest of them shaped the tail.'」一條雲端分散式查詢被拆成大量小工作——讀某個 part 的某個 column、向某個 replica 要一段資料、等某個 I/O 完成——這些工作彼此有順序依賴，整體延遲被「最慢完成的那一個」決定，也就是被 99 與 99.9 百分位拉著走。這種工作負載是 I/O-bound 且高度併發的，真正的成本不在算力，在於「同時有幾萬件待辦、誰先誰後、誰卡住了大家」的協調。</p>
+
+  <p>在這種負載下，把 OS thread 當作主要的併發單位太貴。ClickHouse 列了三筆帳：「A few microseconds per context switch, kilobytes of stack, and a finite number of them before the kernel starts context-switching itself to death.」每次 context switch 幾微秒、每條 thread 數 KB 的 stack、而且 thread 的總數有上限——多到一個程度，kernel 光是在這些 thread 之間切換就把自己拖死了。如果你想用「一個查詢子任務一條 thread」的天真模型撐起幾萬件併發小工作，這三筆成本會在 tail 上集體現形。fiber 的存在就是為了把這個併發單位換成一個便宜很多的東西：一條 fiber 的切換是 user-space 的暫存器存取與 stack 切換，不進 kernel；它的 stack 來自預先配好的池子；而它的數量可以多到上千，全部對映到固定的幾條 OS thread 上。</p>
+
+  <p>下面這個小工具把 M:N 的核心動態畫出來：上排是固定數量、pin 在各自 CPU 上的 worker thread，下方源源不絕產生的小方塊是 fiber。每條 fiber 跑一小段就撞上一個 I/O、主動 yield，worker thread 立刻抓下一條來跑——你會看到少少幾條 worker thread 始終忙著，而 fiber 的「同時在飛」數量遠大於 thread 數。拉動兩個滑桿，感受 fiber 數與 yield 頻率怎麼影響「worker 利用率」與「等待中的 fiber 堆積」。</p>
+
+  <figure class="vg-w-canvas-silk-mn" data-mobile="swap" data-mobile-summary="固定四條 worker thread 撐起上千條 fiber，一撞 I/O 就 yield，worker 立刻抓下一條，OS thread 預算不變。">
+    <style>
+      .vg-w-canvas-silk-mn { display: grid; grid-template-rows: auto auto auto; gap: var(--s-2); }
+      .vg-w-canvas-silk-mn .toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+      .vg-w-canvas-silk-mn button { font-family: var(--sans); font-size: var(--fs-sm); padding: 6px 14px; min-height: 44px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); cursor: pointer; }
+      .vg-w-canvas-silk-mn button:hover { border-color: var(--accent); color: var(--accent-text); }
+      .vg-w-canvas-silk-mn .sliders { display: grid; grid-template-columns: 1fr; gap: var(--s-2); }
+      @media (min-width: 720px) { .vg-w-canvas-silk-mn .sliders { grid-template-columns: 1fr 1fr; } }
+      .vg-w-canvas-silk-mn .slider { display: flex; flex-direction: column; gap: 2px; }
+      .vg-w-canvas-silk-mn .slider label { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); display: flex; justify-content: space-between; }
+      .vg-w-canvas-silk-mn .slider label .val { font-family: JetBrains Mono, monospace; color: var(--accent-text); }
+      .vg-w-canvas-silk-mn input[type="range"] { width: 100%; height: 36px; accent-color: var(--accent); touch-action: none; }
+      .vg-w-canvas-silk-mn canvas { width: 100%; height: auto; aspect-ratio: 16 / 9; display: block; }
+      @media (max-width: 720px) { .vg-w-canvas-silk-mn canvas { aspect-ratio: 4 / 3; } }
+      .vg-w-canvas-silk-mn .readout { font-family: var(--sans); font-size: var(--fs-sm); color: var(--ink-soft); display: flex; gap: var(--s-3); flex-wrap: wrap; }
+      .vg-w-canvas-silk-mn .readout b { font-family: JetBrains Mono, monospace; color: var(--accent-text); font-variant-numeric: tabular-nums; }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m18 8 4 4-4 4"/><path d="M2 12h20"/><path d="m6 8-4 4 4 4"/>
+      </svg>
+      <span>play the loop · drag the two sliders to change fiber count and yield rate · 4 worker threads</span>
+    </p>
+
+    <div class="toolbar">
+      <button id="vg-w-canvas-silk-mn-toggle">play</button>
+      <button id="vg-w-canvas-silk-mn-reset">reset</button>
+      <span style="margin-left: auto" id="vg-w-canvas-silk-mn-clock">t = 0.0s</span>
+    </div>
+
+    <div class="sliders">
+      <div class="slider">
+        <label>fibers in flight 上限 <span class="val" id="vg-w-canvas-silk-mn-fval">800</span></label>
+        <input type="range" id="vg-w-canvas-silk-mn-fibers" min="40" max="2000" step="40" value="800" aria-label="fiber 上限" />
+      </div>
+      <div class="slider">
+        <label>每段工作多快撞 I/O（yield 頻率）<span class="val" id="vg-w-canvas-silk-mn-yval">中</span></label>
+        <input type="range" id="vg-w-canvas-silk-mn-yield" min="1" max="5" step="1" value="3" aria-label="yield 頻率" />
+      </div>
+    </div>
+
+    <canvas id="vg-w-canvas-silk-mn-canvas"></canvas>
+
+    <div class="readout">
+      <span>worker 利用率 <b id="vg-w-canvas-silk-mn-util">0%</b></span>
+      <span>在飛的 fiber <b id="vg-w-canvas-silk-mn-flight">0</b></span>
+      <span>ready queue 等待 <b id="vg-w-canvas-silk-mn-ready">0</b></span>
+      <span>worker threads <b>4（固定）</b></span>
+    </div>
+
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        const root = document.querySelector('.vg-w-canvas-silk-mn');
+        const canvas = root.querySelector('#vg-w-canvas-silk-mn-canvas');
+        const ctx = canvas.getContext('2d');
+        const toggle = root.querySelector('#vg-w-canvas-silk-mn-toggle');
+        const reset = root.querySelector('#vg-w-canvas-silk-mn-reset');
+        const clock = root.querySelector('#vg-w-canvas-silk-mn-clock');
+        const fibersInput = root.querySelector('#vg-w-canvas-silk-mn-fibers');
+        const yieldInput = root.querySelector('#vg-w-canvas-silk-mn-yield');
+        const fval = root.querySelector('#vg-w-canvas-silk-mn-fval');
+        const yval = root.querySelector('#vg-w-canvas-silk-mn-yval');
+        const utilEl = root.querySelector('#vg-w-canvas-silk-mn-util');
+        const flightEl = root.querySelector('#vg-w-canvas-silk-mn-flight');
+        const readyEl = root.querySelector('#vg-w-canvas-silk-mn-ready');
+
+        const NWORKERS = 4;
+        const YIELD_LABELS = { 1: '很慢', 2: '慢', 3: '中', 4: '快', 5: '很快' };
+
+        function cssVar(name) { return getComputedStyle(root).getPropertyValue(name).trim() || '#888'; }
+        function resize() {
+          const dpr = window.devicePixelRatio || 1;
+          const rect = canvas.getBoundingClientRect();
+          canvas.width = Math.max(1, rect.width * dpr);
+          canvas.height = Math.max(1, rect.height * dpr);
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        }
+        new ResizeObserver(resize).observe(canvas);
+        resize();
+
+        let running = false, t = 0;
+        let workers, ready, inFlightCount;
+        let utilAccum, utilWindow;
+
+        function fiberCap() { return Number(fibersInput.value); }
+        function yieldRate() { return Number(yieldInput.value); } // 1..5
+        // 期望一段工作的時間：yield 越快 => 每段越短 => 更頻繁回 scheduler
+        function workSlice() { return 0.9 - 0.13 * (yieldRate() - 1); } // 0.9s..0.38s
+
+        function reseed() {
+          t = 0;
+          ready = [];
+          inFlightCount = 0;
+          utilAccum = 0; utilWindow = 0;
+          workers = [];
+          for (let i = 0; i < NWORKERS; i++) workers.push({ fiber: null, idleFlash: 0 });
+        }
+        reseed();
+
+        function spawnFiber() {
+          inFlightCount++;
+          ready.push({ remaining: workSlice() * (0.6 + Math.random() * 0.8), phase: Math.random() * 6.28 });
+        }
+
+        function step(dt) {
+          t += dt;
+          // keep the in-flight pool near the cap
+          const cap = fiberCap();
+          let guard = 0;
+          while (inFlightCount < cap && guard++ < 80) spawnFiber();
+
+          let busy = 0;
+          for (const w of workers) {
+            if (w.fiber) {
+              w.fiber.remaining -= dt;
+              busy++;
+              if (w.fiber.remaining <= 0) {
+                // fiber 撞到 I/O：主動 yield，回到 ready（換成新一段工作），worker 空出
+                w.fiber.remaining = workSlice() * (0.6 + Math.random() * 0.8);
+                ready.push(w.fiber);
+                w.fiber = null;
+              }
+            }
+          }
+          // cooperative dispatch：空 worker 抓 ready queue 隊首
+          for (const w of workers) {
+            if (!w.fiber && ready.length > 0) {
+              w.fiber = ready.shift();
+              w.idleFlash = 0.12;
+            } else if (w.idleFlash > 0) {
+              w.idleFlash -= dt;
+            }
+          }
+          utilAccum += busy; utilWindow += NWORKERS;
+        }
+
+        function draw() {
+          const W = canvas.getBoundingClientRect().width;
+          const H = canvas.getBoundingClientRect().height;
+          ctx.clearRect(0, 0, W, H);
+          ctx.font = '13px "EB Garamond", serif';
+
+          // ---- worker lane (top) ----
+          const laneY = H * 0.20;
+          ctx.fillStyle = cssVar('--muted');
+          ctx.fillText('N = 4 OS worker threads（pinned, 固定預算）', 12, laneY - 18);
+          const slotW = Math.min(120, (W - 40) / NWORKERS - 12);
+          const gap = ((W - 40) - slotW * NWORKERS) / (NWORKERS - 1);
+          for (let i = 0; i < NWORKERS; i++) {
+            const x = 20 + i * (slotW + gap);
+            const w = workers[i];
+            ctx.strokeStyle = cssVar('--ink');
+            ctx.lineWidth = 1.5;
+            ctx.strokeRect(x, laneY, slotW, 46);
+            if (w.fiber) {
+              ctx.fillStyle = cssVar('--accent');
+              ctx.globalAlpha = 0.75;
+              ctx.fillRect(x + 4, laneY + 4, slotW - 8, 38);
+              ctx.globalAlpha = 1;
+              ctx.fillStyle = cssVar('--bg');
+              ctx.fillText('running', x + 10, laneY + 27);
+            } else {
+              ctx.fillStyle = cssVar('--muted');
+              ctx.fillText('idle', x + 10, laneY + 27);
+            }
+            ctx.fillStyle = cssVar('--muted');
+            ctx.fillText('CPU ' + i, x + slotW - 44, laneY - 4);
+          }
+
+          // ---- ready queue (middle band) ----
+          const qY = H * 0.56;
+          ctx.fillStyle = cssVar('--muted');
+          ctx.fillText('ready queue（等 worker 抓走的 fiber）', 12, qY - 8);
+          const shown = Math.min(ready.length, Math.floor((W - 30) / 9));
+          for (let i = 0; i < shown; i++) {
+            ctx.fillStyle = cssVar('--ink-deep');
+            ctx.globalAlpha = 0.55;
+            ctx.fillRect(16 + i * 9, qY, 6, 16);
+          }
+          ctx.globalAlpha = 1;
+
+          // ---- in-flight cloud (bottom) ----
+          const cloudY = H * 0.82;
+          ctx.fillStyle = cssVar('--muted');
+          ctx.fillText('在飛的 fiber（M，遠大於 N）', 12, cloudY - 8);
+          const dots = Math.min(inFlightCount, Math.floor((W - 30) / 6));
+          for (let i = 0; i < dots; i++) {
+            const x = 16 + i * 6;
+            const yy = cloudY + 6 + Math.sin(t * 1.6 + i * 0.5) * 4;
+            ctx.fillStyle = cssVar('--sage-deep');
+            ctx.globalAlpha = 0.6;
+            ctx.fillRect(x, yy, 3, 3);
+          }
+          ctx.globalAlpha = 1;
+        }
+
+        let last = performance.now();
+        function frame(now) {
+          const dt = Math.min(0.05, (now - last) / 1000);
+          last = now;
+          if (running) step(dt);
+          draw();
+          const util = utilWindow > 0 ? Math.round((utilAccum / utilWindow) * 100) : 0;
+          utilEl.textContent = util + '%';
+          flightEl.textContent = String(inFlightCount);
+          readyEl.textContent = String(ready.length);
+          clock.textContent = 't = ' + t.toFixed(1) + 's';
+          // 滑動視窗，避免利用率被歷史鎖死
+          if (utilWindow > NWORKERS * 240) { utilAccum *= 0.5; utilWindow *= 0.5; }
+          requestAnimationFrame(frame);
+        }
+        requestAnimationFrame(frame);
+
+        toggle.addEventListener('click', () => {
+          running = !running;
+          toggle.textContent = running ? 'pause' : 'play';
+          last = performance.now();
+        });
+        reset.addEventListener('click', () => { running = false; toggle.textContent = 'play'; reseed(); });
+        fibersInput.addEventListener('input', () => { fval.textContent = fibersInput.value; });
+        yieldInput.addEventListener('input', () => { yval.textContent = YIELD_LABELS[yieldInput.value]; });
+      })();
+    </script>
+    <figcaption>M:N 的直覺：worker thread 數固定（這裡是 4），但「同時在飛」的 fiber 可以拉到上千。fiber 一撞 I/O 就主動 yield、回到 ready queue，worker 立刻抓下一條——thread 永遠不閒著，併發量靠 fiber 池放大。yield 越快，單一 fiber 占用 worker 的時間越短，worker 利用率與 fiber 流動都升高。</figcaption>
+  </figure>
+
+  <h2>scheduler：每 CPU 一條 pinned thread，各擁一個 ProcessorState</h2>
+
+  <p>Silk 的調度核心不是「一個全域 run queue 加一群搶工作的 thread」，而是把調度狀態切到每顆 CPU 上。原話是「The scheduler runs one OS thread per CPU, pinned. Each scheduler thread owns a per-CPU ProcessorState containing a bounded ready queue (a Vyukov MPMC queue with cache-line-aligned producer/consumer slots), an io_uring ring for asynchronous I/O and timer expiry, a sleep tree ordered by deadline, and an eventfd that doubles as a wakeup doorbell.」拆開看，每顆 CPU 上 pin 一條 OS thread，這條 thread 獨佔一個 ProcessorState，裡面裝四樣東西。</p>
+
+  <p>「pinned」這個詞要當真。把 worker thread 釘死在特定 CPU 上，是為了讓「一個 fiber 在哪顆核心上跑、它碰的資料就在那顆核心的 cache 裡」這件事穩定下來。如果 OS scheduler 可以隨意把 worker thread 在核心之間搬，剛暖好的 L1/L2 cache 就跟著作廢，下一段執行要重新從 L3 甚至記憶體把 working set 拉回來——這正是 ClickHouse 列的第一筆成本「a few microseconds per context switch」在實務上放大的形式。pin 之後，調度狀態與它服務的資料共處一顆 CPU，per-CPU 的 ProcessorState 就有意義了：ready queue、io_uring ring、sleep tree、eventfd 全部是這顆核心的本地資料，worker 取下一條 fiber 不需要去碰別人的 cache line。換句話說，per-CPU pinning 不是效能微調，它是讓「不碰全域鎖、不跨核心搬狀態」這個調度模型能成立的前提。代價是 OS 失去了「把忙的 thread 搬到閒核心」這個自動平衡手段——那份責任改由 Silk 自己的 work stealing 接手，這也是為什麼下一節的偷工作邏輯必須 topology-aware。</p>
+
+  <p>第一樣是 bounded ready queue，用的是 Vyukov 的 MPMC（multi-producer multi-consumer）queue，producer 與 consumer 的 slot 按 cache line 對齊。這個對齊不是裝飾——多個核心同時往 queue 寫，如果 producer index 與 consumer index 共用一條 cache line，就會 false sharing：A 核心改 producer index，B 核心的 consumer index 那條 cache line 被 invalidate，明明沒碰到同一個欄位卻互相拖慢。把它們分到不同 cache line 是這類 lock-free queue 的標準功夫。queue 是 bounded 的，意味著它有固定容量、滿了要有 back-pressure 策略，而不是無限長到吃光記憶體。第二樣是一個 io_uring ring，async I/O 與 timer expiry 都掛在它上面——也就是說 I/O 完成事件與「某個 fiber 該醒了」這兩件事走同一條 completion 通道。第三樣是按 deadline 排序的 sleep tree，管理那些「睡到某個時間點才要被喚醒」的 fiber。第四樣是一個 eventfd，它兼當 wakeup doorbell——當別的核心想叫醒這條在 io_uring 上等的 worker thread，往 eventfd 寫一下就行，這個寫入會出現在 io_uring 的 completion 上，worker 醒來一次處理完所有待辦。</p>
+
+  <p>把這四樣放在一起看，這條 worker thread 的主迴圈就很清楚了：從 ready queue 取一條 fiber 來跑、跑到它 yield（通常是發了一個 I/O）、把這個 I/O 提交給 io_uring、再去 ready queue 取下一條；ready queue 空了就去 io_uring 收割完成事件、把對應的 fiber 放回 ready queue；都沒事做就在 io_uring 上 block 等 completion（包含 eventfd 的 doorbell）。整條迴圈不離開這顆 CPU、不碰全域鎖。下面這個工具把 ProcessorState 的四個元件攤開——點任一張卡，看它各自負責什麼、不負責什麼。</p>
+
+  <figure class="vg-w-stack-silk-procstate" data-mobile="keep">
+    <style>
+      .vg-w-stack-silk-procstate { display: flex; flex-direction: column; gap: var(--s-3); align-items: stretch; }
+      .vg-w-stack-silk-procstate input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-stack-silk-procstate .stack-title { font-family: IM Fell English, serif; font-style: italic; font-size: var(--fs-md); margin: 0 0 var(--s-1) 0; color: var(--ink); line-height: 1.4; }
+      .vg-w-stack-silk-procstate .stack-cards { display: flex; flex-direction: column; gap: var(--s-1); list-style: none; padding: 0; margin: 0; }
+      .vg-w-stack-silk-procstate .stack-cards label { display: block; padding: var(--s-2); border: 1px solid var(--muted-2); border-radius: 2px; cursor: pointer; transition: border-color 200ms, background 200ms; min-height: 44px; }
+      .vg-w-stack-silk-procstate .stack-cards label:hover { border-color: var(--accent); }
+      .vg-w-stack-silk-procstate .stack-cards .card-head { font-family: EB Garamond, serif; font-size: var(--fs-md); margin: 0 0 4px 0; color: var(--ink); display: flex; align-items: baseline; justify-content: space-between; gap: var(--s-2); flex-wrap: wrap; }
+      .vg-w-stack-silk-procstate .stack-cards .card-sub { font-family: IM Fell English, serif; font-style: italic; font-size: var(--fs-sm); color: var(--muted); margin: 0; line-height: 1.5; }
+      .vg-w-stack-silk-procstate .stack-cards .card-tag { font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); color: var(--accent-text); font-style: normal; }
+      .vg-w-stack-silk-procstate:has(#vg-w-stack-silk-procstate-r1:checked) .card-1,
+      .vg-w-stack-silk-procstate:has(#vg-w-stack-silk-procstate-r2:checked) .card-2,
+      .vg-w-stack-silk-procstate:has(#vg-w-stack-silk-procstate-r3:checked) .card-3,
+      .vg-w-stack-silk-procstate:has(#vg-w-stack-silk-procstate-r4:checked) .card-4 { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+      .vg-w-stack-silk-procstate svg.diagram { display: none; }
+      @media (min-width: 720px) {
+        .vg-w-stack-silk-procstate svg.diagram { display: block; width: 100%; height: auto; max-width: 880px; }
+        .vg-w-stack-silk-procstate .stack-title { display: none; }
+        .vg-w-stack-silk-procstate .stack-cards { display: none; }
+      }
+      .vg-w-stack-silk-procstate .head { font-family: IM Fell English, serif; font-style: italic; font-size: 13px; }
+      .vg-w-stack-silk-procstate .layer { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; transition: fill 200ms, stroke 200ms; }
+      .vg-w-stack-silk-procstate .layer:hover { stroke: var(--accent); }
+      .vg-w-stack-silk-procstate .layer-text { pointer-events: none; font-family: EB Garamond, serif; font-size: 14px; }
+      .vg-w-stack-silk-procstate .layer-sub { pointer-events: none; font-family: IM Fell English, serif; font-style: italic; font-size: 11px; fill: var(--muted); }
+      .vg-w-stack-silk-procstate .num { pointer-events: none; font-family: JetBrains Mono, monospace; font-size: 11px; }
+      .vg-w-stack-silk-procstate:has(#vg-w-stack-silk-procstate-r1:checked) .layer-1,
+      .vg-w-stack-silk-procstate:has(#vg-w-stack-silk-procstate-r2:checked) .layer-2,
+      .vg-w-stack-silk-procstate:has(#vg-w-stack-silk-procstate-r3:checked) .layer-3,
+      .vg-w-stack-silk-procstate:has(#vg-w-stack-silk-procstate-r4:checked) .layer-4 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+      .vg-w-stack-silk-procstate .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+      .vg-w-stack-silk-procstate:has(#vg-w-stack-silk-procstate-r1:checked) .detail-1,
+      .vg-w-stack-silk-procstate:has(#vg-w-stack-silk-procstate-r2:checked) .detail-2,
+      .vg-w-stack-silk-procstate:has(#vg-w-stack-silk-procstate-r3:checked) .detail-3,
+      .vg-w-stack-silk-procstate:has(#vg-w-stack-silk-procstate-r4:checked) .detail-4 { display: block; }
+      .vg-w-stack-silk-procstate .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-stack-silk-procstate .detail p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-stack-silk-procstate .hint { font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin: 0 0 var(--s-1) 0; }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M9 12h.01"/><path d="M15 12h.01"/><path d="M10 16c.5.3 1.2.5 2 .5s1.5-.2 2-.5"/><circle cx="12" cy="12" r="10"/>
+      </svg>
+      <span>click any component to read what it owns · 4 components in one ProcessorState</span>
+    </p>
+
+    <input type="radio" id="vg-w-stack-silk-procstate-r1" name="vg-w-stack-silk-procstate-sel" checked aria-label="ready queue" />
+    <input type="radio" id="vg-w-stack-silk-procstate-r2" name="vg-w-stack-silk-procstate-sel" aria-label="io_uring ring" />
+    <input type="radio" id="vg-w-stack-silk-procstate-r3" name="vg-w-stack-silk-procstate-sel" aria-label="sleep tree" />
+    <input type="radio" id="vg-w-stack-silk-procstate-r4" name="vg-w-stack-silk-procstate-sel" aria-label="eventfd doorbell" />
+
+    <p class="stack-title" id="vg-w-stack-silk-procstate-title">一個 ProcessorState ＝ 一顆 CPU 的全部調度狀態（pin 在這條 worker thread 上，不碰全域鎖）</p>
+    <ul class="stack-cards" aria-labelledby="vg-w-stack-silk-procstate-title">
+      <li class="card-1"><label for="vg-w-stack-silk-procstate-r1">
+        <p class="card-head"><span>ready queue</span><code class="card-tag">Vyukov MPMC</code></p>
+        <p class="card-sub">可被多核心 push/pop 的有界佇列，producer/consumer slot 按 cache line 對齊以避免 false sharing。worker 從這裡取下一條 fiber。</p>
+      </label></li>
+      <li class="card-2"><label for="vg-w-stack-silk-procstate-r2">
+        <p class="card-head"><span>io_uring ring</span><code class="card-tag">async I/O + timer</code></p>
+        <p class="card-sub">async I/O 與 timer expiry 共用的 completion 通道。fiber 的 I/O 從這裡提交、完成事件從這裡收割。</p>
+      </label></li>
+      <li class="card-3"><label for="vg-w-stack-silk-procstate-r3">
+        <p class="card-head"><span>sleep tree</span><code class="card-tag">ordered by deadline</code></p>
+        <p class="card-sub">按 deadline 排序的結構，管理「睡到某個時間點才喚醒」的 fiber。取最近 deadline 就是下一個 timer。</p>
+      </label></li>
+      <li class="card-4"><label for="vg-w-stack-silk-procstate-r4">
+        <p class="card-head"><span>eventfd</span><code class="card-tag">wakeup doorbell</code></p>
+        <p class="card-sub">兼當喚醒門鈴。別的核心想叫醒在 io_uring 上等的這條 worker，往 eventfd 寫一下，completion 上就會冒出來。</p>
+      </label></li>
+    </ul>
+
+    <svg class="diagram" viewBox="0 0 880 360" role="img"
+         aria-label="per-CPU ProcessorState 的四個元件：ready queue、io_uring ring、sleep tree、eventfd doorbell">
+      <text x="440" y="26" text-anchor="middle" fill="var(--ink)" class="head">per-CPU ProcessorState——一條 pinned worker thread 獨佔，調度不離開這顆 CPU</text>
+
+      <rect class="layer layer-1" data-target="vg-w-stack-silk-procstate-r1" x="60" y="60" width="760" height="58" role="button" tabindex="0" aria-label="ready queue" />
+      <text x="80" y="86" fill="var(--ink)" class="layer-text">ready queue · Vyukov MPMC（cache-line-aligned slots）</text>
+      <text x="80" y="106" fill="var(--muted)" class="layer-sub">有界佇列；worker 從隊首取下一條 fiber；多核心 push/pop 但 producer/consumer 不 false-share</text>
+
+      <rect class="layer layer-2" data-target="vg-w-stack-silk-procstate-r2" x="60" y="132" width="760" height="58" role="button" tabindex="0" aria-label="io_uring ring" />
+      <text x="80" y="158" fill="var(--ink)" class="layer-text">io_uring ring · async I/O ＋ timer expiry</text>
+      <text x="80" y="178" fill="var(--muted)" class="layer-sub">I/O 提交與完成走同一條 completion 通道；timer 到期也從這裡冒出來</text>
+
+      <rect class="layer layer-3" data-target="vg-w-stack-silk-procstate-r3" x="60" y="204" width="760" height="58" role="button" tabindex="0" aria-label="sleep tree" />
+      <text x="80" y="230" fill="var(--ink)" class="layer-text">sleep tree · ordered by deadline</text>
+      <text x="80" y="250" fill="var(--muted)" class="layer-sub">管理睡眠中的 fiber；最近 deadline 就是要 arm 給 io_uring 的下一個 timer</text>
+
+      <rect class="layer layer-4" data-target="vg-w-stack-silk-procstate-r4" x="60" y="276" width="760" height="58" role="button" tabindex="0" aria-label="eventfd doorbell" />
+      <text x="80" y="302" fill="var(--ink)" class="layer-text">eventfd · doubles as a wakeup doorbell</text>
+      <text x="80" y="322" fill="var(--muted)" class="layer-sub">跨核心喚醒：寫 eventfd → io_uring completion → 在 ring 上 block 的 worker 醒來</text>
+    </svg>
+
+    <div>
+      <p class="hint">click a component above</p>
+      <div class="detail detail-1">
+        <h3>ready queue · 它管什麼</h3>
+        <p>一個有界（bounded）的 Vyukov MPMC queue。worker 的主迴圈從這裡取下一條可跑的 fiber；fiber yield 後也回到這裡。producer/consumer slot 按 cache line 對齊，避免多核心同時讀寫 index 時的 false sharing。</p>
+        <p><strong>它不管</strong>：睡眠中的 fiber（那是 sleep tree）、I/O 完成（那是 io_uring）。它只回答「現在誰可以馬上跑」。</p>
+      </div>
+      <div class="detail detail-2">
+        <h3>io_uring ring · 它管什麼</h3>
+        <p>async I/O 與 timer expiry 的單一 completion 通道。fiber 發 I/O 時提交 SQE、worker 沒事做時在這裡 block 等 CQE。ClickHouse 把 io_uring 當作「I/O ground truth rather than as a backend bolted onto an older reactor design」——它是底層事實，不是接在舊 reactor 上的後端。</p>
+        <p><strong>它不管</strong>：誰先誰後地被排程（那是 ready queue 的事）。它只把「外界發生了什麼」變成事件。</p>
+      </div>
+      <div class="detail detail-3">
+        <h3>sleep tree · 它管什麼</h3>
+        <p>按 deadline 排序的資料結構，裝著所有「睡到某時間點才醒」的 fiber。worker 每輪取最近的 deadline，據此 arm 一個 io_uring timer——時間到，對應 fiber 從 sleep tree 移回 ready queue。</p>
+        <p><strong>它不管</strong>：立即可跑的 fiber。它只處理「未來某一刻」這個維度。</p>
+      </div>
+      <div class="detail detail-4">
+        <h3>eventfd · 它管什麼</h3>
+        <p>當 worker 在 io_uring 上 block、卻有別的核心 push 了工作給它或要叫它醒，光靠它自己收 I/O 事件醒不過來。eventfd 兼當 doorbell：別人往它寫一個 byte，這個寫入變成 io_uring 的一個 completion，block 中的 worker 因此醒來、處理完所有待辦。</p>
+        <p><strong>它不管</strong>：工作內容。它只是「有事，醒一下」這個訊號本身。</p>
+      </div>
+    </div>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-stack-silk-procstate');
+        root.querySelectorAll('.layer').forEach((rect) => {
+          rect.addEventListener('click', () => {
+            const radio = root.querySelector('#' + rect.getAttribute('data-target'));
+            if (radio) radio.checked = true;
+          });
+          rect.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); rect.dispatchEvent(new MouseEvent('click', { bubbles: true })); }
+          });
+        });
+      })();
+    </script>
+    <figcaption>一個 ProcessorState 就是一顆 CPU 的全部調度狀態。四個元件分工明確：ready queue 答「現在誰能跑」、io_uring 答「外界發生什麼」、sleep tree 答「未來誰該醒」、eventfd 答「有人要叫我醒」。元件名稱與分工取自 ClickHouse 對 Silk 的描述。</figcaption>
+  </figure>
+
+  <h2>work stealing：local queue 乾了，就按 CPU 拓樸去鄰居那偷</h2>
+
+  <p>per-CPU 的設計把調度局部化，代價是會出現負載不均：某顆 CPU 的 ready queue 排了一堆 fiber，另一顆卻空著。Silk 的定義句裡那半句「steals work between cores when local queues run dry」就是補這個洞——一條 worker thread 把自己的 local ready queue 跑乾了，不是乾等，而是去別的核心的 queue 尾端偷一條來跑。</p>
+
+  <p>關鍵在「去哪偷」。從別的核心搬一條 fiber 過來，要把它的狀態（至少是 ready queue 裡的那個節點，以及之後它要碰的 cache line）帶到自己這顆 CPU——這個搬遷的成本完全取決於兩顆 CPU 在記憶體拓樸上有多近。Silk 的 work stealing 因此是 topology-aware 的：「sorted by estimated cost: hyperthread siblings first (about a microsecond), same-socket cores next (about fifty microseconds), and cross-socket cores last (about five hundred microseconds)」。先偷 hyperthread 兄弟（兩個邏輯核共用同一個實體核的 L1/L2，搬遷大約一微秒），再偷同 socket 的核心（共用 L3，大約五十微秒），最後才跨 socket（要走 interconnect、可能跨 NUMA node，大約五百微秒）。</p>
+
+  <p>這三個數字之間差了兩到三個數量級，所以「偷的順序」不是微調而是決策骨幹：寧可多試幾次近處、也不要一次就把工作從一個 NUMA node 拖到另一個。下面把這個成本階梯畫出來——同一條 fiber 被偷到不同距離，搬遷成本如何跳級。</p>
+
+  <figure class="vg-w-steal-silk-topology" data-mobile="keep" data-svg-scroll="720">
+    <svg viewBox="0 0 720 320" role="img"
+         aria-label="work stealing 的拓樸成本階梯：hyperthread sibling 約一微秒、same-socket 約五十微秒、cross-socket 約五百微秒"
+         style="width: 100%; height: auto; max-width: 880px;">
+      <style>
+        .vg-w-steal-silk-topology text { font-family: EB Garamond, serif; font-size: 13px; }
+        .vg-w-steal-silk-topology .label { font-family: IM Fell English, serif; font-style: italic; }
+        .vg-w-steal-silk-topology .num { font-family: JetBrains Mono, monospace; font-size: 12px; }
+        .vg-w-steal-silk-topology .head { font-family: IM Fell English, serif; font-style: italic; font-size: 14px; }
+      </style>
+
+      <text x="360" y="26" text-anchor="middle" fill="var(--ink)" class="head">偷工作的優先順序——先近後遠，成本每跳一階就 ×10 級</text>
+
+      <!-- thief core marker -->
+      <text x="40" y="62" fill="var(--accent-text)" class="label">thief：local queue 乾了的 worker</text>
+
+      <!-- step 1: HT sibling -->
+      <rect x="40" y="84" width="200" height="56" fill="var(--accent)" opacity="0.55" stroke="var(--accent)"/>
+      <text x="56" y="108" fill="var(--ink)" class="label">1 · hyperthread sibling</text>
+      <text x="56" y="128" fill="var(--ink)" class="num">~1 µs</text>
+      <text x="260" y="116" fill="var(--muted)" class="label">共用同一實體核的 L1 / L2，搬遷幾乎免費——最先試</text>
+
+      <!-- step 2: same socket -->
+      <rect x="40" y="152" width="320" height="56" fill="var(--ink-deep)" opacity="0.5" stroke="var(--ink-deep)"/>
+      <text x="56" y="176" fill="var(--ink)" class="label">2 · same-socket core</text>
+      <text x="56" y="196" fill="var(--ink)" class="num">~50 µs</text>
+      <text x="380" y="184" fill="var(--muted)" class="label">共用 L3，但要跨核心搬 cache line——約 50 倍於 HT</text>
+
+      <!-- step 3: cross socket -->
+      <rect x="40" y="220" width="520" height="56" fill="var(--sage-deep)" opacity="0.5" stroke="var(--sage-deep)"/>
+      <text x="56" y="244" fill="var(--ink)" class="label">3 · cross-socket core</text>
+      <text x="56" y="264" fill="var(--ink)" class="num">~500 µs</text>
+      <text x="580" y="252" fill="var(--muted)" class="label">走 interconnect、可能跨 NUMA——最後手段</text>
+
+      <text x="360" y="304" text-anchor="middle" fill="var(--muted)" class="label">寬度按成本量級畫；數字為 ClickHouse 給的 estimated cost，啟動時讀 /sys 的 CPU topology 建出此清單</text>
+    </svg>
+    <figcaption>work stealing 的 steal-candidate 清單在啟動時依 CPU 拓樸建好，按估計成本排序：HT 兄弟（~1µs）→ 同 socket（~50µs）→ 跨 socket（~500µs）。差兩到三個數量級，所以「先近後遠」是這套設計的硬規則，不是優化選項。三個數字皆為 ClickHouse 公布。</figcaption>
+  </figure>
+
+  <p>把 work stealing 跟 bounded ready queue 一起看，這套設計的取捨就完整了。如果用一個全域 run queue，負載天生平衡——任何 worker 閒了就去同一個地方拿，根本不需要偷。但全域 queue 是所有核心爭搶的單點，在高併發下每次 push/pop 都是跨核心的 cache line 來回，正是 Silk 想避開的 contention。改成 per-CPU 的 bounded queue，平常路徑變成純本地操作、零跨核心，代價就是會失衡，於是需要 work stealing 這個補償機制。而既然偷工作本身要付跨核心搬遷的成本，偷的策略就不能盲目：先掏最近的 hyperthread 兄弟（約一微秒、L1/L2 還共用），其次同 socket（約五十微秒、共用 L3），跨 socket 那約五百微秒的代價只在真的沒得選時才付。這條 steal-candidate 清單在啟動時讀 /sys 的 CPU topology 建好，順序固定。而跨 socket 往往也跨 NUMA node——把一條 fiber 從一個 NUMA node 偷到另一個，不只是搬那個 queue node，它之後存取的記憶體可能整段都在遠端 node 上，後續每次 access 都比本地慢。所以那兩到三個數量級的成本階梯，量到的其實是「這次偷會在多久之內持續拖慢這條 fiber」，而不只是搬遷瞬間的開銷。</p>
+
+  <h2>stack 與同步原語：init 之後，hot path 一次配置都不做</h2>
+
+  <p>fiber 便宜不便宜，很大一部分取決於記憶體配置。如果每生出一條 fiber 就要 malloc 一塊 stack、每次它進 queue 或等鎖就要配一個節點，那 fiber 的「輕」就被 allocator 吃掉了。Silk 的立場非常硬：「After init, the hot path does no allocation at all. Not less than other libraries, zero.」init 之後 hot path 完全不配置——不是比別的 library 少，是零。</p>
+
+  <p>做到零配置靠兩個手段。第一是 stack 走預配池。每條 fiber 的 stack「is mmap'd from a per-fiber pool with guard pages on either side」——從一個 per-fiber 的池子用 mmap 取，兩側各夾一個 guard page。guard page 是沒有讀寫權限的頁，stack 萬一 overflow 或 underflow 碰到它就立刻 fault，把「stack 寫過頭悄悄踩爛鄰居記憶體」這種最難查的 bug 變成當場崩潰。池子的記憶體 mmap 出來之後就留著重用，不還給 OS，所以生 fiber、回收 fiber 都不觸發 syscall。代價是這塊位址空間被長期占住——這是後面要算的一筆 stack 記憶體帳。</p>
+
+  <p>第二是同步與調度用的資料結構全部 intrusive。原話：「Every container is intrusive: the queue node, suspended-list entry, lock-free-stack hook, and waiter-table hook are _fields inside the Fiber object itself_, not separate allocations.」一條 fiber 進 ready queue 需要一個 queue node、掛到 suspended list 需要一個 entry、進 lock-free stack 需要一個 hook、登記到 waiter table（等某個鎖或事件）需要一個 hook——這些全部是 Fiber 物件裡的欄位，不是另外配的物件。fiber 物件本身在它的 stack 池一併生出來，這些 hook 就跟著它走，永遠不需要為「把 fiber 放進某個資料結構」這件事再 malloc 一次。intrusive container 在 C++ 系統程式裡是熟手套路（Boost.Intrusive 就是幹這個的），Silk 把它用到極致：fiber 走到哪、它的 hook 就在哪，配置全部前置到 init。</p>
+
+  <p>這兩個手段加起來，hot path——也就是 fiber 切換、進出 queue、等待與喚醒——完全不碰 allocator。對一個目標是「上千 fiber 高頻 yield」的 runtime，這很關鍵：allocator 在高併發下本身就是 contention 來源，hot path 一旦零配置，就把這個不確定性從 tail latency 裡整段拿掉了。這跟 io_uring「as the I/O ground truth rather than as a backend bolted onto an older reactor design」是同一種設計姿態——I/O、記憶體、調度都是從底層事實長出來的，不是疊在舊抽象上的修補程式。</p>
+
+  <h2>取捨：沒有 preemption、綁死 Linux、工具還不成熟</h2>
+
+  <p>Silk 的便宜全部建立在 cooperative 上。ClickHouse 寫得很白：fiber「participate in cooperative multitasking instead of the preemptive multitasking that threads use; allowing fibers to yield their work instead of block on it」。fiber 主動 yield、不被搶佔——這是低 context-switch 成本的來源，也是它最大的取捨。一條 fiber 如果跑進一段純 CPU 的長計算、中間都不 yield，它會一直霸著那條 worker thread，同一顆 CPU 上其他 ready 的 fiber 全部排在後面餓著。OS thread 不會這樣：kernel 的 timer interrupt 會強制把 CPU 從不肯讓的 thread 手上拿走。換成 cooperative，這個保護沒了，責任回到寫程式碼的人身上——你得確保長計算被切段、或者本來就不要把 CPU-bound 的重活塞進 fiber。這就是為什麼 Silk 的甜蜜區是 I/O-bound：I/O-bound 工作天生頻繁 yield（每個 I/O 都是一個自然的 yield 點），cooperative 的弱點剛好踩不到。</p>
+
+  <p>其餘的限制比較硬性，但都需要先看清楚才好決定要不要上。下面這張表把幾個關鍵約束與它們的 reader 影響並排——欄位皆可點擊排序。</p>
+
+  <figure class="vg-w-table-silk-tradeoffs" data-mobile="keep">
+    <style>
+      .vg-w-table-silk-tradeoffs { overflow-x: auto; }
+      .vg-w-table-silk-tradeoffs table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-silk-tradeoffs caption { text-align: left; caption-side: top; font-family: var(--scribed); font-style: italic; color: var(--muted); font-size: var(--fs-sm); padding: var(--s-1) 0; }
+      .vg-w-table-silk-tradeoffs thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; }
+      .vg-w-table-silk-tradeoffs thead th[data-sort] { color: var(--accent-text); }
+      .vg-w-table-silk-tradeoffs thead th[data-sort="asc"]::after { content: ' ▴'; font-size: 0.7em; }
+      .vg-w-table-silk-tradeoffs thead th[data-sort="desc"]::after { content: ' ▾'; font-size: 0.7em; }
+      .vg-w-table-silk-tradeoffs tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+      .vg-w-table-silk-tradeoffs td.dim { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); white-space: nowrap; }
+      .vg-w-table-silk-tradeoffs tbody tr:hover td { background: var(--bg-soft); }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/><path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+      </svg>
+      <span>click a column header to sort · 3 columns × 5 rows</span>
+    </p>
+
+    <table>
+      <caption>Silk 現階段的硬性約束與它對 reader 的意義——約束敘述取自 ClickHouse 對 Silk 的說明。點欄位標題排序。</caption>
+      <thead>
+        <tr>
+          <th data-key="dim">面向</th>
+          <th data-key="limit">約束</th>
+          <th data-key="impact">對你的影響</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="dim">排程模型</td>
+          <td>cooperative，沒有 preemption；fiber 必須主動 yield 而非被搶佔</td>
+          <td>純 CPU-bound 的重活會霸住 worker、餓死同 CPU 的其他 fiber；甜蜜區是頻繁 yield 的 I/O-bound 負載</td>
+        </tr>
+        <tr>
+          <td class="dim">平台</td>
+          <td>Linux-only；依賴 io_uring、eventfd、帶 guard page 的 mmap、rseq、現代 Linux capability model</td>
+          <td>需要 macOS / Windows、或卡在舊 kernel（無 io_uring / rseq）的團隊直接出局</td>
+        </tr>
+        <tr>
+          <td class="dim">scheduler 範圍</td>
+          <td>process-wide singleton，經 FiberScheduler 的 static method 取用；同 process 無法開兩個隔離的 scheduler</td>
+          <td>無法在一個 process 內為不同子系統各跑一個隔離 runtime；整個 process 共用一套調度</td>
+        </tr>
+        <tr>
+          <td class="dim">API 形狀</td>
+          <td>fiber entry-point 參數要塞進 64 bytes（FIBER_PARAMETERS_SIZE）</td>
+          <td>較大的 payload 得 heap 配置後傳指標，多一層 ownership 與生命週期要顧</td>
+        </tr>
+        <tr>
+          <td class="dim">可觀測性</td>
+          <td>隨附 profiler 目前還不認得 fiber identity；有支援 x86_64 與 aarch64 的 GDB extension</td>
+          <td>fiber-level 的 profiling 與除錯工具仍在早期；上 production 前要評估你能不能接受</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-table-silk-tradeoffs');
+        const headers = root.querySelectorAll('thead th');
+        const tbody = root.querySelector('tbody');
+        let activeKey = null, asc = true;
+        headers.forEach((h, idx) => h.addEventListener('click', () => {
+          const key = h.dataset.key;
+          if (activeKey === key) asc = !asc; else { activeKey = key; asc = true; }
+          headers.forEach((x) => x.removeAttribute('data-sort'));
+          h.setAttribute('data-sort', asc ? 'asc' : 'desc');
+          const rows = Array.from(tbody.querySelectorAll('tr'));
+          rows.sort((a, b) => {
+            const av = a.children[idx].textContent.trim();
+            const bv = b.children[idx].textContent.trim();
+            const cmp = av.localeCompare(bv, 'zh-Hant');
+            return asc ? cmp : -cmp;
+          });
+          rows.forEach((r) => tbody.appendChild(r));
+        }));
+      })();
+    </script>
+  </figure>
+
+  <p>那條平台依賴清單不是隨手列的，每一項都對應前面拆過的某個機制。「It depends on io_uring, eventfd, mmap with guard pages, rseq, and the modern Linux capability model.」io_uring 是 ProcessorState 裡那條 I/O 與 timer 的 completion 通道；eventfd 是跨核心喚醒的 doorbell；帶 guard page 的 mmap 是 stack 池偵測 overflow 的手段；rseq（restartable sequences）讓 user-space 能安全地做 per-CPU 的無鎖操作——在 thread 隨時可能被搶佔的前提下知道「我剛剛是不是還在原本那顆 CPU 上」，正是 per-CPU ready queue 這類資料結構要的保證。換句話說，Silk 的 Linux-only 不是「還沒 port」的暫時狀態，而是它把整套設計直接長在這幾個 Linux 專屬原語上——要搬到別的平台，等於每一層都得換一個底座。process-wide singleton 也是同一種徹底：scheduler 經 FiberScheduler 的 static method 取用、同一 process 開不出第二個隔離的 scheduler，這讓 library 內部不必處理「多個 runtime 共存」的複雜度，但也意味著你沒辦法在一個 process 裡為不同子系統各跑一套調度。連 64-byte 的參數上限（FIBER_PARAMETERS_SIZE）都是這個取向的延伸：entry-point 參數塞得進去就能直接放進 fiber 物件、不必額外配置，超過就得 heap 配置後傳指標——又把一個常見路徑釘回「零配置」那條線上。這些都是把彈性換確定性的決定，而確定性正是 tail latency 的朋友。</p>
+
+  <p>還有一筆要自己算的帳：stack 記憶體。fiber stack 從 mmap 池取、永不釋放，意味著你的 fiber 上限乘上每條 stack 的大小，就是這套 runtime 長期占住的位址空間。stackful fiber（每條有獨立的真 stack，能在任意深度 yield）正是因此比 stackless coroutine 吃記憶體——後者把續延編譯成狀態機、不需要常駐 stack，但只能在編譯器看得見的 suspend 點 yield。Silk 選 stackful，換來的是「任意呼叫深度都能 yield」的彈性與貼近 thread 的程式碼寫法，付出的是這筆 stack 帳。上千條 fiber、每條哪怕只配幾十 KB，加起來就是可觀的 RSS——這在規劃 fiber 上限時要先量。</p>
+
+  <p>把這些取捨收斂成一個給工程師的判斷：什麼時候該認真考慮 fiber runtime？當你在 Linux server-class 機器上、寫的是高併發、I/O-bound、tail latency 敏感的 C++ 服務——大量連線、大量小 I/O、每個請求被「一堆小操作的協調」而非「一段重計算」主導，這正是 OS thread 的三筆成本（context switch、stack、數量上限）集體咬人的場景，fiber 把併發單位換便宜剛好對症。什麼時候不該？工作是 CPU-bound（沒有自然 yield 點，cooperative 會餓死彼此）、需要跨平台（Silk 綁死 Linux）、或團隊還吃不下「沒有 preemption 保護＋ profiler 尚未 fiber-aware」這組現實——這些情況下，OS thread 的「貴」可能比 fiber 的「不成熟」便宜。ClickHouse 自己也把 Silk 放在「歡迎被踩」的位置：「silk is in a state where it would value being kicked at」，而它內部「the first probable target is our distributed cache」——一個典型的高併發、I/O-bound 子系統。</p>
+
+  <p class="vg-deep-closer"><strong>What this enables</strong>：在固定不變的 OS thread 預算下，把查詢併發從「被 context switch 與 stack 成本卡住」解放到「被 fiber 池大小決定」——前提是你的工作負載頻繁 yield、跑在 Linux、而且你願意把 preemption 的保護換成自己切段長計算的紀律。</p>
+</div>

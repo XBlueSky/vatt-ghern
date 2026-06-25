@@ -1,0 +1,411 @@
+{
+  "output_path": "src/posts/2026/06/26/deep-cloudflare-saga-rollbacks.html",
+  "spine": [
+    "1. durable execution 保證每個 step 最終跑完一次、崩潰後 replay 不重跑——但它只保證『每步跑完』，不保證『整條 workflow 是一個原子可回滾的單元』。",
+    "2. 失敗模式：跨行轉帳 step 1 扣款已 commit、step 2 入帳、step 3 失敗，前面的副作用落在別人系統裡收不回；retry 救不了，因為要的是反向抵銷不是再前進。",
+    "3. saga pattern：每個有副作用的操作成對帶一個補償邏輯（退款抵銷扣款），補償是另一個正向業務操作，語意上沖銷前者。",
+    "4. 在 Workflows 裡補償作為 metadata 掛在 step.do() 上、不是全域 error handler；只在 workflow 要 terminal fail 時啟動，被 catch 的錯誤不觸發；失敗那步若登記補償也 eligible，output 可能 undefined。",
+    "5. 反向順序用 reverse step-start order 而非 reverse completion order——並行 step 完成順序不穩定，啟動順序被持久化、穩定，也符合『後堆的先拆』的依賴直覺。",
+    "6. 接回 durable：Workflows 每步記 started/completed/returned/skip-on-resume，rollback 加一欄 registered；replay 讀持久化結果不重跑 body，只替有補償且 eligible 的 step 重建 handler。",
+    "7. 後果與責任：補償是個會 retry/timeout 的 durable step，所以必須 idempotent（用 payment provider 的 idempotency key）、要處理 undefined output、要配 rollbackConfig、並接受補償自身也可能失敗。"
+  ],
+  "sources": [
+    {
+      "url": "https://blog.cloudflare.com/rollbacks-for-workflows/",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": "2026-06-25",
+      "perspective": {
+        "mechanism": "saga 式 compensating action 與 durable execution 整合：補償作為 step metadata、依 reverse step-start order 反向執行、與 replay 共用持久化記錄、只替 eligible 且登記補償的 step 重建 handler。",
+        "tradeoff": "framework 提供可靠的反向執行機制，但把 idempotency、undefined output、補償自身失敗、以及『哪些副作用該被反向』的業務判斷留給開發者；API 形態上選 metadata-on-step 而否決 fluent（promise pipelining）與 builder（.run() 易漏）。",
+        "reader_use": "用 durable workflow / orchestration（Temporal、Workflows、Step Functions 之類）做跨系統交易的工程師，可借這套『補償綁 step + reverse start order + idempotent 補償』的模型設計自家的跨服務一致性，並知道哪些保證要自己守。"
+      }
+    }
+  ],
+  "notes": [
+    {
+      "id": "n01",
+      "url": "https://blog.cloudflare.com/rollbacks-for-workflows/",
+      "quote": "if one step fails, it may leave earlier work from completed steps in an inconsistent or partial state.",
+      "hedge": "hedged",
+      "interpretation": "失敗模式定義：一步失敗會讓前面已完成步驟的工作停在不一致或半成品狀態。原文用 may，描述可能性。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n02",
+      "url": "https://blog.cloudflare.com/rollbacks-for-workflows/",
+      "quote": "Once the debit succeeds at Bank A, the transaction is committed and the money has left its system. As the orchestrator of the transaction, you cannot simply 'undo' the operation in Bank A's system.",
+      "hedge": "asserted",
+      "interpretation": "副作用收不回的核心：A 銀行扣款一旦成功就 commit、錢離開其系統，orchestrator 無法在 A 的系統裡直接 undo。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n03",
+      "url": "https://blog.cloudflare.com/rollbacks-for-workflows/",
+      "quote": "This pairing of an operation and its compensation logic is called the saga pattern.",
+      "hedge": "asserted",
+      "interpretation": "saga pattern 定義：操作與其補償邏輯成對。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n04",
+      "url": "https://blog.cloudflare.com/rollbacks-for-workflows/",
+      "quote": "Rollback is not a separate global error handler — it is metadata attached to the durable unit of work Workflows already understands.",
+      "hedge": "asserted",
+      "interpretation": "設計支點：rollback 不是獨立的全域 error handler，而是掛在 Workflows 已理解的 durable 工作單元上的 metadata。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n05",
+      "url": "https://blog.cloudflare.com/rollbacks-for-workflows/",
+      "quote": "Completion order can differ from start order, so Workflows uses reverse step-start order instead of reverse completion order.",
+      "hedge": "asserted",
+      "interpretation": "反向順序的依據：完成順序可能不同於啟動順序，所以用 reverse step-start order 而非 reverse completion order。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n06",
+      "url": "https://blog.cloudflare.com/rollbacks-for-workflows/",
+      "quote": "Rollback starts when the Workflow itself is about to fail terminally.",
+      "hedge": "asserted",
+      "interpretation": "觸發時機：只有 workflow 本身要 terminal 失敗時補償才啟動；被 catch 後繼續的錯誤不觸發。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n07",
+      "url": "https://blog.cloudflare.com/rollbacks-for-workflows/",
+      "quote": "Rollback handlers receive output, but must handle output === undefined.",
+      "hedge": "asserted",
+      "interpretation": "補償 handler 收到的 output 可能是 undefined（登記補償的那步可能沒成功），必須正面處理。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n08",
+      "url": "https://blog.cloudflare.com/rollbacks-for-workflows/",
+      "quote": "Workflows records that the step started, whether it completed, what it returned, and whether it should be skipped instead of repeated if the Workflow resumes later.",
+      "hedge": "asserted",
+      "interpretation": "Workflows 為每步持久化：是否啟動、是否完成、回傳了什麼、resume 時該不該跳過。rollback 在此之上加『是否登記補償』一欄。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n09",
+      "url": "https://blog.cloudflare.com/rollbacks-for-workflows/",
+      "quote": "When replay reaches a completed step.do(), Workflows reads the persisted result instead of running the step body again.",
+      "hedge": "asserted",
+      "interpretation": "replay 語意：觸及已完成的 step.do() 時讀持久化結果、不重跑 body——這保證正向 step 不被重複執行（不會又扣一次錢）。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n10",
+      "url": "https://blog.cloudflare.com/rollbacks-for-workflows/",
+      "quote": "Rollback functions should be idempotent, just like regular Workflow steps. If you refund a charge, use the payment provider's idempotency key.",
+      "hedge": "asserted",
+      "interpretation": "責任推回開發者：補償函式應 idempotent；退款用 payment provider 的 idempotency key 折疊重複退款。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n11",
+      "url": "https://blog.cloudflare.com/rollbacks-for-workflows/",
+      "quote": "await step.do(\"debit-bank-a\", () => bankA.debit(from, amount), {\n  rollback: async ({ output }) => bankA.credit(from, amount, output.id),\n});",
+      "hedge": "asserted",
+      "interpretation": "API 形態與參數：補償作為 step.do() 第三參數 options 的 rollback 欄位，是 async 函式，destructure 出 output。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n12",
+      "url": "https://blog.cloudflare.com/rollbacks-for-workflows/",
+      "quote": "rollbackConfig: {\n    retries: { limit: 10, delay: '30 seconds', backoff: 'exponential' },\n    timeout: '2 minutes',\n  },",
+      "hedge": "asserted",
+      "interpretation": "補償有自己的 retry/timeout 設定，欄位名為 rollbackConfig，含 retries（limit/delay/backoff）與 timeout——意味補償本身會 retry、會 timeout、會失敗。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n13",
+      "url": "https://blog.cloudflare.com/rollbacks-for-workflows/",
+      "quote": "Promise pipelining lets code call a method on a future value before that value has fully returned to the caller.",
+      "hedge": "asserted",
+      "interpretation": "否決 fluent API（step.do(...).rollback(...)）的理由：會牽動 promise pipelining——在 future 值尚未完全回到呼叫端前對它呼叫方法，讓 step 時序難預測。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n14",
+      "url": "https://blog.cloudflare.com/rollbacks-for-workflows/",
+      "quote": "Every step needs a final `.run()`, forgetting `.run()` would be easy and hard to spot without tooling, and simple one-step cases start to look like configuration chains.",
+      "hedge": "asserted",
+      "interpretation": "否決 builder API（step.saga().do().rollback().run()）的理由：每步要收 .run()、易漏難察、簡單情況也變成設定鏈。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n15",
+      "url": "https://blog.cloudflare.com/rollbacks-for-workflows/",
+      "quote": "Any started or completed steps with rollback handlers are eligible. The failing step.do() is also eligible if it registered a rollback handler.",
+      "hedge": "asserted",
+      "interpretation": "eligible 集合：所有開始過或完成過、且登記了 rollback 的 step 都 eligible，包含正在失敗的那一個（若它登記了補償）。",
+      "timeliness": "durable"
+    }
+  ],
+  "claims": [
+    {
+      "id": "c01",
+      "claim_text": "原文的說法是「if one step fails, it may leave earlier work from completed steps in an inconsistent or partial state」",
+      "location": "under H2「錢已經離開 A 銀行——retry 為什麼救不了半成品」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n01"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "if one step fails, it may leave earlier work from completed steps in an inconsistent or partial state.",
+      "note": "Direct attributed quote; post preserves the source's 'may' hedge inside 「」, no inflation.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c02",
+      "claim_text": "Cloudflare 的描述是「Once the debit succeeds at Bank A, the transaction is committed and the money has left its system. As the orchestrator of the transaction, you cannot simply 'undo' the operation in Bank A's system.」",
+      "location": "under H2「錢已經離開 A 銀行——retry 為什麼救不了半成品」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n02"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Once the debit succeeds at Bank A, the transaction is committed and the money has left its system. As the orchestrator of the transaction, you cannot simply \"undo\" the operation in Bank A's system.",
+      "note": "Verbatim; only difference is straight vs curly quotes around 'undo', not a meaning change.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c03",
+      "claim_text": "「This pairing of an operation and its compensation logic is called the saga pattern.」",
+      "location": "under H2「saga pattern——替每一步配一個反向動作」",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n03"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "This pairing of an operation and its compensation logic is called the saga pattern.",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c04",
+      "claim_text": "rollback 不是「a separate global error handler」，而是「metadata attached to the durable unit of work Workflows already understands」",
+      "location": "under H2「saga pattern——替每一步配一個反向動作」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n04"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Rollback is not a separate global error handler — it is metadata attached to the durable unit of work Workflows already understands.",
+      "note": "Post splits the source sentence into two attributed fragments; both verbatim.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c05",
+      "claim_text": "「Completion order can differ from start order, so Workflows uses reverse step-start order instead of reverse completion order.」",
+      "location": "under H2「反向執行的順序——為什麼是 step-start order 而不是完成順序」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n05"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Completion order can differ from start order, so Workflows uses reverse step-start order instead of reverse completion order.",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c06",
+      "claim_text": "原文是「Rollback starts when the Workflow itself is about to fail terminally.」",
+      "location": "under H2「saga pattern——替每一步配一個反向動作」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n06"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Rollback starts when the Workflow itself is about to fail terminally.",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c07",
+      "claim_text": "Cloudflare 明說「Rollback handlers receive output, but must handle output === undefined.」",
+      "location": "under H2「saga pattern——替每一步配一個反向動作」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n07"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Rollback handlers receive output, but must handle output === undefined.",
+      "note": "Source full sentence prefixed 'That is why rollback handlers receive output...'; quoted span verbatim.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c08",
+      "claim_text": "原文列得很清楚：「Workflows records that the step started, whether it completed, what it returned, and whether it should be skipped instead of repeated if the Workflow resumes later.」",
+      "location": "under H2「接回 durable execution——replay、idempotency、與補償的重建」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n08"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Workflows records that the step started, whether it completed, what it returned, and whether it should be skipped instead of repeated if the Workflow resumes later.",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c09",
+      "claim_text": "「When replay reaches a completed step.do(), Workflows reads the persisted result instead of running the step body again.」",
+      "location": "under H2「接回 durable execution——replay、idempotency、與補償的重建」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n09"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "When replay reaches a completed step.do(), Workflows reads the persisted result instead of running the step body again.",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c10",
+      "claim_text": "原文是「Rollback functions should be idempotent, just like regular Workflow steps. If you refund a charge, use the payment provider's idempotency key.」",
+      "location": "under H2「接回 durable execution——replay、idempotency、與補償的重建」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n10"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Rollback functions should be idempotent, just like regular Workflow steps. If you refund a charge, use the payment provider's idempotency key.",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c11",
+      "claim_text": "補償邏輯作為 metadata 掛在 step.do() 上 ... await step.do(\"debit-bank-a\", () => bankA.debit(from, amount), { rollback: async ({ output }) => bankA.credit(from, amount, output.id) })",
+      "location": "under H2「saga pattern」, pseudocode block (data-kind=\"pseudocode\")",
+      "type": "number",
+      "load": "medium",
+      "note_ids": [
+        "n11"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "await step.do(\"debit-bank-a\", () => bankA.debit(from, amount), {\n  rollback: async ({ output }) => bankA.credit(from, amount, output.id),\n});",
+      "note": "Matches the source's 'With rollbacks' simplified code block verbatim (step name debit-bank-a, short body, rollback async ({ output }) => bankA.credit(..., output.id)). The article also has a separate elaborate 'Try it out' block using debit-account-a/idempotencyKey; an early fetch conflated the two — the simplified block confirms the quote. Post labels this pseudocode, an additional safeguard.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c12",
+      "claim_text": "rollbackConfig: { retries: { limit: 10, delay: '30 seconds', backoff: 'exponential' }, timeout: '2 minutes' }",
+      "location": "under H2「saga pattern」, pseudocode block",
+      "type": "number",
+      "load": "medium",
+      "note_ids": [
+        "n12"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "rollbackConfig: {\n    retries: { limit: 10, delay: '30 seconds', backoff: 'exponential' },\n    timeout: '2 minutes',\n  },",
+      "note": "Numeric config values (limit 10, 30 seconds, exponential, 2 minutes) all verbatim in source.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c13",
+      "claim_text": "會牽動 promise pipelining——在 future 值尚未完全回到呼叫端前就對它呼叫方法，讓 step 時序變得難以預測",
+      "location": "under H2「給開發者的後果」, API design table (fluent row)",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n13"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Promise pipelining lets code call a method on a future value before that value has fully returned to the caller.",
+      "note": "Post paraphrases the source's promise-pipelining rationale for rejecting the fluent API; faithful to source meaning.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c14",
+      "claim_text": "每個 step 都要收一個 .run()，忘了收很容易、又難用工具察覺；連單步的簡單情況都長得像一串設定鏈",
+      "location": "under H2「給開發者的後果」, API design table (builder row)",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n14"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Every step needs a final `.run()`, forgetting `.run()` would be easy and hard to spot without tooling, and simple one-step cases start to look like configuration chains.",
+      "note": "Post paraphrases the source's builder-API rejection rationale; faithful.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c15",
+      "claim_text": "unwind 的範圍是「所有開始過或完成過、且登記了 rollback 的 step」，包含正在失敗的那一個",
+      "location": "under H2「saga pattern——替每一步配一個反向動作」",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n15"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Any started or completed steps with rollback handlers are eligible. The failing step.do() is also eligible if it registered a rollback handler.",
+      "note": "Post paraphrases the eligibility rule including the failing step; faithful to source.",
+      "action": "none",
+      "resolution": "none-needed"
+    }
+  ],
+  "checked_at": "2026-06-26",
+  "checker_rounds": 1,
+  "coverage": {
+    "candidate_claims": 19,
+    "checked": 15,
+    "dropped_low_load": 4
+  }
+}
