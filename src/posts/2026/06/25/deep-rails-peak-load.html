@@ -1,0 +1,589 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">2025 聖誕節那天，Aura Frames 的 Rails app 在尖峰一小時內扛下 4100 萬次 API 請求，叢集裡所有資料庫的每秒交易數加總頂到 22.6 萬。一台 primary 早就裝不下這個量——但他們沒有把單體 app 拆成微服務，仍然只有一份 Rails codebase。那這個量是被切到哪裡去了？</p>
+  <h1 class="vg-post-title">{{ title }}</h1>
+</header>
+
+<div class="vg-post-body">
+  <p><span class="vg-dropcap">這</span>是一個關於「不重寫」的擴展故事。Andy Atkinson 拆解了相框公司 Aura Frames 怎麼撐過 2025 聖誕節的流量尖峰——按原文，那段時間「the app reached a peak rank of #1 among all free apps in the U.S. and Canadian App Stores」，衝上美加 App Store 免費榜第一，流量自然跟著暴漲。尖峰的數字很硬：一小時 4100 萬次 API 請求、約每秒 11.4K，背景工作另外 1180 萬件/小時、約每秒 3300 件。任何單一資料庫節點，到了這個量級都會先在連線、鎖、或單機 CPU 上撞牆。</p>
+
+  <p>有趣的地方不在數字本身，而在他們選的解法。面對「單一 primary 撐不住」這個老問題，常見的反射動作是把單體拆成一堆服務、每個服務管自己的資料庫。Aura 沒走這條路。他們的答案是：把資料水平拆到 8 個各自獨立的 primary 資料庫，但維持一份 Rails codebase 不動。這聽起來矛盾——多個獨立資料庫，照理會逼出跨庫 join、分散式交易、一堆只有微服務架構才會碰到的麻煩。這篇值得拆開來讀的地方，正是他們怎麼在不離開 Rails 的前提下，把這些麻煩一個個拆掉。</p>
+
+  <p>整篇調查的形狀是：先把負載量級講清楚（為什麼一台不夠），再排除兩條看似順手卻走不通的路（繼續垂直擴、跨庫直接 join），最後拼出三支柱組成的解法（disable_joins、Multiple Databases、physical replication）。先講清楚一件事——這不是一個「發現 bug」式的調查，而是一個「為什麼能成立」式的調查：謎題是「單一 codebase 怎麼可能水平擴到 8 個 primary」，每一節都在回答這個結構為什麼站得住。</p>
+
+  <h2>謎題：4100 萬請求／小時，卻只有一份 codebase</h2>
+
+  <p>先把負載攤開看。原文列出的尖峰數字有四個維度：HTTP 請求「serving a peak of 41 million API requests per hour (~11.4K requests per second)」；背景工作「11.8 million jobs/hour (~3300 jobs/second)」；資料庫端「the sum of DB peak transactions per second (TPS) was 226K」；而尖峰時段（CT 10 點到 21 點）的「Average Response Time (10am to 9pm CT): 650 milliseconds」。注意第三個數字的措辭——「the sum of」，加總。一個還沒拆庫的系統不會這樣描述自己的 TPS，因為它只有一台、沒有什麼好加總的。光是這個詞，就把謎底透露了一半：這 22.6 萬 TPS 是攤在多台資料庫上的總和。</p>
+
+  <p>下面這張圖把四個尖峰數字擺在一起，並讓你切換兩種視角：一種是「假設全部壓在單一 primary 上」的投影，另一種是「實際攤到 8 個 primary」的分佈。重點不是哪根 bar 比較高，而是同一個 22.6 萬 TPS 的總量，落在一台上是一根頂破天花板的柱子，落在八台上就成了八根都在安全線以下的柱子。這就是水平拆庫在做的事——它不改變總工作量，只改變這份工作量壓在幾個節點上。</p>
+
+  <figure class="vg-w-chart-peak-load" data-mobile="static" data-svg-scroll="720">
+    <style>
+      .vg-w-chart-peak-load { display: grid; gap: var(--s-2); }
+      .vg-w-chart-peak-load svg { width: 100%; height: auto; }
+      .vg-w-chart-peak-load .controls { display: flex; gap: var(--s-2); flex-wrap: wrap; font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); align-items: center; }
+      .vg-w-chart-peak-load .controls button { font-family: var(--sans); font-size: var(--fs-sm); padding: 8px 14px; min-height: 44px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); cursor: pointer; border-radius: 2px; }
+      .vg-w-chart-peak-load .controls button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent-text); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+      .vg-w-chart-peak-load figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/>
+      </svg>
+      <span data-vg-controls>切換「全壓單一 primary」與「攤到 8 個 primary」兩種視角 · 同一份 22.6 萬 TPS 總量</span>
+    </p>
+
+    <div class="controls" data-vg-controls>
+      <button data-view="single" aria-pressed="true">全壓單一 primary</button>
+      <button data-view="sharded" aria-pressed="false">攤到 8 個 primary</button>
+    </div>
+
+    <svg class="vg-w-chart-peak-load-main" viewBox="0 0 720 360" preserveAspectRatio="xMidYMid meet" role="img" aria-label="尖峰四項負載數字，並比較同一份 22.6 萬 TPS 壓在一台與攤到八台的形狀">
+      <g id="vg-w-chart-peak-load-axes"></g>
+      <g id="vg-w-chart-peak-load-series"></g>
+      <g id="vg-w-chart-peak-load-anno"></g>
+    </svg>
+
+    <figcaption>尖峰負載四維度（左三根為 HTTP 請求、背景工作、平均回應，數值取自原文）。最右為資料庫 TPS：「全壓單一 primary」視角把 22.6 萬 TPS 畫成一根頂破示意天花板的柱子；「攤到 8 個 primary」把同一總量等分成八根。八等分為示意，原文僅給出加總 22.6 萬與 8 個 primary 的事實，未逐台拆分。</figcaption>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-chart-peak-load');
+        const svg = root.querySelector('svg.vg-w-chart-peak-load-main');
+        const axesG = root.querySelector('#vg-w-chart-peak-load-axes');
+        const seriesG = root.querySelector('#vg-w-chart-peak-load-series');
+        const annoG = root.querySelector('#vg-w-chart-peak-load-anno');
+        const NS = 'http://www.w3.org/2000/svg';
+        function el(tag, attrs) {
+          const e = document.createElementNS(NS, tag);
+          for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+          return e;
+        }
+        const X0 = 64, X1 = 700, Y0 = 300, Y1 = 44;
+
+        // Three fixed metric bars (normalized to their own ceilings, shown as labels),
+        // plus the TPS bar that changes shape between the two views.
+        const metrics = [
+          { label: 'HTTP 請求', val: '41M/hr', frac: 0.62 },
+          { label: '背景工作', val: '11.8M/hr', frac: 0.34 },
+          { label: '平均回應', val: '650ms', frac: 0.27 }
+        ];
+        const slotW = (X1 - X0) / 4;
+        const barW = slotW * 0.46;
+
+        function axes() {
+          axesG.replaceChildren();
+          axesG.appendChild(el('line', { x1: X0, y1: Y0, x2: X1, y2: Y0, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+          axesG.appendChild(el('line', { x1: X0, y1: Y0, x2: X0, y2: Y1, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+          // ceiling line for the TPS slot - the single-machine capacity wall
+          const cy = Y1 + 18;
+          const wall = el('line', { x1: X0 + slotW * 3, y1: cy, x2: X1, y2: cy, stroke: 'var(--accent)', 'stroke-width': 1.2, 'stroke-dasharray': '5 4' });
+          axesG.appendChild(wall);
+          const wt = el('text', { x: X1, y: cy - 6, 'text-anchor': 'end', 'font-family': 'Manrope, sans-serif', 'font-size': 11, fill: 'var(--accent-text)' });
+          wt.textContent = '單機 TPS 天花板（示意）';
+          axesG.appendChild(wt);
+        }
+
+        function bar(slot, frac, color, topLabel) {
+          const cx = X0 + slotW * slot + slotW / 2;
+          const h = frac * (Y0 - Y1 - 18);
+          const y = Y0 - h;
+          seriesG.appendChild(el('rect', { x: cx - barW / 2, y: y, width: barW, height: h, fill: color, rx: 1 }));
+          const t = el('text', { x: cx, y: y - 8, 'text-anchor': 'middle', 'font-family': 'JetBrains Mono, monospace', 'font-size': 12, fill: 'var(--ink)' });
+          t.textContent = topLabel;
+          seriesG.appendChild(t);
+        }
+
+        function labels() {
+          metrics.forEach((m, i) => {
+            const cx = X0 + slotW * i + slotW / 2;
+            const t = el('text', { x: cx, y: Y0 + 20, 'text-anchor': 'middle', 'font-family': 'Manrope, sans-serif', 'font-size': 12, fill: 'var(--muted)' });
+            t.textContent = m.label;
+            axesG.appendChild(t);
+          });
+          const cx = X0 + slotW * 3 + slotW / 2;
+          const t = el('text', { x: cx, y: Y0 + 20, 'text-anchor': 'middle', 'font-family': 'Manrope, sans-serif', 'font-size': 12, fill: 'var(--muted)' });
+          t.textContent = '資料庫 TPS';
+          axesG.appendChild(t);
+        }
+
+        function render(view) {
+          axes();
+          seriesG.replaceChildren();
+          annoG.replaceChildren();
+          metrics.forEach((m, i) => bar(i, m.frac, 'var(--sage-deep)', m.val));
+
+          const slot = 3;
+          const cx = X0 + slotW * slot + slotW / 2;
+          if (view === 'single') {
+            // one tall bar that exceeds the ceiling
+            const frac = 1.18; // overshoot
+            const fullH = (Y0 - Y1 - 18);
+            const h = frac * fullH;
+            const y = Y0 - h;
+            seriesG.appendChild(el('rect', { x: cx - barW / 2, y: Math.max(y, Y1 - 14), width: barW, height: Y0 - Math.max(y, Y1 - 14), fill: 'var(--accent)', rx: 1, 'fill-opacity': 0.85 }));
+            const t = el('text', { x: cx, y: Y1 - 22, 'text-anchor': 'middle', 'font-family': 'JetBrains Mono, monospace', 'font-size': 12, fill: 'var(--accent-text)' });
+            t.textContent = '226K TPS';
+            seriesG.appendChild(t);
+            const a = el('text', { x: cx, y: Y1 - 4, 'text-anchor': 'middle', 'font-family': 'EB Garamond, serif', 'font-size': 12, fill: 'var(--accent-text)' });
+            a.textContent = '撞穿天花板';
+            annoG.appendChild(a);
+          } else {
+            // eight short bars side by side within the slot
+            const n = 8;
+            const each = 226 / n; // ~28.25K each
+            const gw = (slotW * 0.86) / n;
+            const x0 = cx - (gw * n) / 2;
+            const per = 28.25 / 226 * 1.18; // proportional to the single bar's scale, below ceiling
+            const fullH = (Y0 - Y1 - 18);
+            for (let k = 0; k < n; k++) {
+              const h = per * fullH;
+              seriesG.appendChild(el('rect', { x: x0 + k * gw + gw * 0.12, y: Y0 - h, width: gw * 0.76, height: h, fill: 'var(--accent)', rx: 1, 'fill-opacity': 0.8 }));
+            }
+            const t = el('text', { x: cx, y: Y0 - per * fullH - 10, 'text-anchor': 'middle', 'font-family': 'JetBrains Mono, monospace', 'font-size': 11, fill: 'var(--accent-text)' });
+            t.textContent = '8 × ~28K TPS';
+            seriesG.appendChild(t);
+            const a = el('text', { x: cx, y: Y1 + 2, 'text-anchor': 'middle', 'font-family': 'EB Garamond, serif', 'font-size': 12, fill: 'var(--sage-deep)' });
+            a.textContent = '每根都在天花板以下';
+            annoG.appendChild(a);
+          }
+          labels();
+        }
+
+        const buttons = root.querySelectorAll('.controls button');
+        buttons.forEach(b => b.addEventListener('click', () => {
+          buttons.forEach(x => x.setAttribute('aria-pressed', x === b ? 'true' : 'false'));
+          render(b.dataset.view);
+        }));
+        render('single');
+      })();
+    </script>
+  </figure>
+
+  <p>值得停下來看一眼這四個數字之間的關係，因為它們不是各自獨立的尖峰，而是同一條負載鏈上的不同切面。每秒 11.4K 的 HTTP 請求進來，其中一部分會展開成需要非同步處理的工作，於是另一條軸上長出每秒 3300 件的背景工作；這兩股流量最後都壓到資料庫，匯成每秒 22.6 萬筆交易。而在這整條鏈被推到極限的同時，系統對外的平均回應仍守在 650ms——這個數字是整套架構的體檢報告：它證明拆庫之後系統沒有因為查詢變多條 SELECT、連線分散到八台而崩潰，反而把一個會壓垮單機的負載，攤成了每台都還喘得過氣的形狀。如果拆庫的代價是回應時間飆到好幾秒，那這套方案就失敗了；650ms 說明它沒有。</p>
+
+  <p>再把流量暴增的來由補上，謎題的脈絡才完整。這不是一次可預期的、緩慢爬升的成長，而是一個季節性的、被排行榜放大的尖峰——原文寫 app「reached a peak rank of #1 among all free apps in the U.S. and Canadian App Stores」，聖誕節這種「全家一起設定相框、上傳照片」的場景，疊上榜首帶來的新使用者湧入，把平日的負載一口氣推到 4 到 5 倍。一個會在固定時間、以固定倍數爆發的尖峰，跟那種「使用者數每月穩定成長 10%」的曲線完全不同：你沒有時間慢慢一台台加機器、邊跑邊調，你必須在尖峰來臨之前，就把容量準備到位。這也是為什麼「每台 primary 之後還能各自垂直擴」這個性質這麼重要——它讓團隊能在尖峰前，對每一台都預留好餘裕。</p>
+
+  <p>把「sum of」這個措辭追到底，謎題就清楚了：問題不是「怎麼讓一台資料庫更快」，而是「怎麼合法地把資料切到很多台、又不讓上層應用碎掉」。後面三節，就是這個切法的三個零件。</p>
+
+  <h2>走不通的兩條路：再垂直擴一台、跨庫直接 join</h2>
+
+  <p>在講對的解法之前，先看兩條為什麼走不通的路——這是 investigation 的標準動作：先排除順手的假設，剩下的才是真正的答案。</p>
+
+  <p>第一條路是繼續垂直擴。這不是空想，它是 Aura 前一年實際做過的事——2024 聖誕節，他們就是靠把單一 primary 一路換更大的機器硬撐過去。問題是這條路有個寫死的盡頭：原文點名「The largest instance available for RDS at the time was the 48x family (192 vCPU, 1.5 TB RAM)」。當你已經跑在雲端供應商當時最大的那個機型上，再想要更多 CPU、更多記憶體，市場上沒有更大的單機可買。垂直擴是一條會撞牆的路，而 2024 那次他們已經摸到牆了；2025 的量再往上，這條路直接斷掉。</p>
+
+  <p>這裡值得想清楚為什麼垂直擴注定會撞牆，而不只是「暫時不夠快」。垂直擴是把更多 CPU、記憶體、I/O 塞進同一個節點，但它受制於兩個你買不過的上限：一是硬體本身的物理極限——單顆主機板能掛多少核心、多少記憶體有其盡頭；二是供應商在某個時間點願意賣給你的最大機型。Aura 撞到的是後者：當你已經跑在 48x、192 vCPU、1.5 TB RAM 上，要更大，市場上當下沒有。垂直擴的本質是「把雞蛋全放一個越來越大的籃子」，而籃子的大小不由你決定。水平擴則是換一種思路——不再追求一個更大的籃子，而是要更多籃子。這個轉向聽起來簡單，難的全在「怎麼把資料分到多個籃子又不破壞應用邏輯」。</p>
+
+  <p>第二條路是：好，那我把資料切到多台，但查詢時就跨庫 join 把它們接回來。這條路在多 primary 前提下根本走不通。SQL 的 join 是在單一資料庫內、由那台資料庫的 query planner 執行的；一旦兩張表分屬兩個獨立的 primary，沒有一個 planner 能同時看到兩邊的資料頁、也沒有跨機器的 join 演算法可用。換句話說，你不是「join 變慢」，而是「join 這個操作在跨資料庫邊界時不存在」。這就把問題逼到一個很尖的點上：要拆庫，就得先讓應用層不再依賴跨表 join。而這，正是第一支柱要解決的事。</p>
+
+  <p>這兩條死路其實互為因果，這也是這個謎題最精巧的地方。垂直擴撞牆，逼你走水平拆庫；而一旦你水平拆庫，跨表 join 又立刻失效。換句話說，逼你拆庫的那個壓力，跟拆庫之後冒出來的那個新問題，是同一個方向的——你不能只解決一半。真正的解法必須同時回答「資料怎麼分到多台」和「查詢怎麼在不跨庫的前提下還能取得需要的資料」這兩件事，而它們的答案，分別藏在三支柱的不同零件裡。</p>
+
+  <h2>第一支柱：disable_joins 把一次 join 拆成兩條 SELECT</h2>
+
+  <p>Rails 7 引入了一個叫 <code>disable_joins: true</code> 的選項。它的作用，原文一句話講完——「The disable_joins feature replaces SQL joins, issuing multiple SELECT statements to combine」：把一次 SQL join 換成多條 SELECT，再在應用層把資料拼回來。這個 feature 是針對 <code>has_many :through</code> 這類關聯設計的（原文：「the `disable_joins` feature for `has_many :through`」），也就是那種「透過一張中介表把兩端接起來」的關聯。</p>
+
+  <p>原文給了一個具體例子，把這個改寫講得很清楚。假設你要從某個 author 拿到他所有的 posts，中間隔著一張 <code>author_posts</code> 中介表。傳統做法是一次 join：在同一條 SQL 裡把 <code>author_posts</code> 和 <code>posts</code> 接起來。開了 disable_joins 之後，Rails 改成兩步——「One queries `author_posts` by `author_id` to get post `id` values. Then a second query to the」 posts 表，用剛拿到的那串 id 去查。第一條查中介表拿到一串 post id，第二條拿這串 id 回 posts 表撈內容；中間的「拼接」從資料庫的 join 操作，搬到了 Ruby 這一側。</p>
+
+  <p>這個改寫看似只是把一條查詢變兩條，實際上是整個拆庫方案的地基。一旦每一條查詢都只碰一張表（或都落在同一個資料庫內），查詢就再也不會跨越資料庫邊界——<code>author_posts</code> 可以住在一個 primary、<code>posts</code> 住在另一個，兩條 SELECT 各自打各自的庫，誰也不需要看到對方的資料頁。下面這個 widget 把同一個查詢的兩種形狀並排，拖動中間的分隔線就能從「一次 join」滑到「兩條 SELECT」，看清楚被搬走的是哪一塊。</p>
+
+  <figure class="vg-w-ba-disablejoins" data-mobile="swap" data-mobile-summary="把跨表 join 改寫成兩條 SELECT，拼接搬到應用層，查詢就不跨資料庫邊界，這是拆成八個 primary 的前提。" data-svg-scroll="720">
+    <style>
+      .vg-w-ba-disablejoins { position: relative; aspect-ratio: 16 / 9; overflow: hidden; border: 1px solid var(--line); border-radius: 2px; }
+      .vg-w-ba-disablejoins .layer { position: absolute; inset: 0; }
+      .vg-w-ba-disablejoins .after { clip-path: polygon(50% 0, 100% 0, 100% 100%, 50% 100%); }
+      .vg-w-ba-disablejoins .divider {
+        position: absolute; top: 0; bottom: 0; left: 50%;
+        width: 32px; transform: translateX(-50%);
+        cursor: ew-resize; touch-action: none; z-index: 3;
+      }
+      .vg-w-ba-disablejoins .divider::before {
+        content: ''; position: absolute; left: 50%; top: 0; bottom: 0;
+        width: 2px; transform: translateX(-50%); background: var(--accent);
+      }
+      .vg-w-ba-disablejoins .divider::after {
+        content: '↔'; position: absolute; left: 50%; top: 50%;
+        transform: translate(-50%, -50%);
+        background: var(--accent); color: var(--bg);
+        width: 32px; height: 32px; border-radius: 50%;
+        display: grid; place-items: center;
+        font-family: var(--sans); font-size: 16px;
+      }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m18 8 4 4-4 4"/><path d="m6 8-4 4 4 4"/><path d="M2 12h20"/>
+      </svg>
+      <span>拖動中間分隔線 · 左半是一次 SQL join、右半是 disable_joins 拆出的兩條 SELECT</span>
+    </p>
+
+    <svg class="layer before" viewBox="0 0 480 270" role="img" aria-label="一次跨表 join 的形狀">
+      <rect width="480" height="270" fill="var(--bg-soft)" />
+      <text x="24" y="40" font-family="Manrope, sans-serif" font-size="15" fill="var(--muted)">傳統：一次 join</text>
+      <rect x="24" y="64" width="170" height="44" rx="3" fill="none" stroke="var(--ink)" stroke-width="1.4" />
+      <text x="36" y="91" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--ink)">author_posts</text>
+      <rect x="286" y="64" width="170" height="44" rx="3" fill="none" stroke="var(--ink)" stroke-width="1.4" />
+      <text x="332" y="91" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--ink)">posts</text>
+      <line x1="194" y1="86" x2="286" y2="86" stroke="var(--accent)" stroke-width="2" />
+      <text x="240" y="78" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--accent-text)">JOIN</text>
+      <text x="24" y="160" font-family="EB Garamond, serif" font-size="14" fill="var(--ink-soft)">資料庫的 query planner 在</text>
+      <text x="24" y="182" font-family="EB Garamond, serif" font-size="14" fill="var(--ink-soft)">同一條 SQL 內接起兩張表——</text>
+      <text x="24" y="204" font-family="EB Garamond, serif" font-size="14" fill="var(--ink-soft)">前提是兩張表在同一個資料庫。</text>
+    </svg>
+
+    <svg class="layer after" viewBox="0 0 480 270" id="vg-w-ba-disablejoins-after" role="img" aria-label="disable_joins 拆成兩條 SELECT 的形狀">
+      <rect width="480" height="270" fill="var(--bg)" />
+      <text x="24" y="40" font-family="Manrope, sans-serif" font-size="15" fill="var(--accent-text)">disable_joins：兩條 SELECT</text>
+      <rect x="24" y="64" width="200" height="44" rx="3" fill="none" stroke="var(--accent)" stroke-width="1.4" />
+      <text x="36" y="84" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--ink)">SELECT id FROM</text>
+      <text x="36" y="100" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--ink)">author_posts WHERE author_id</text>
+      <line x1="124" y1="108" x2="124" y2="140" stroke="var(--accent)" stroke-width="1.5" marker-end="url(#vg-w-ba-disablejoins-arr)" />
+      <defs>
+        <marker id="vg-w-ba-disablejoins-arr" viewBox="0 0 10 10" refX="5" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M0,0 L10,5 L0,10 z" fill="var(--accent)" />
+        </marker>
+      </defs>
+      <text x="150" y="130" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">一串 post id</text>
+      <rect x="24" y="148" width="220" height="44" rx="3" fill="none" stroke="var(--accent)" stroke-width="1.4" />
+      <text x="36" y="168" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--ink)">SELECT * FROM posts</text>
+      <text x="36" y="184" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--ink)">WHERE id IN (...)</text>
+      <text x="24" y="232" font-family="EB Garamond, serif" font-size="13" fill="var(--ink-soft)">拼接搬到應用層 → 兩條查詢</text>
+      <text x="24" y="252" font-family="EB Garamond, serif" font-size="13" fill="var(--ink-soft)">可落在不同 primary。</text>
+    </svg>
+
+    <div class="divider" id="vg-w-ba-disablejoins-divider"></div>
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        const root = document.querySelector('.vg-w-ba-disablejoins');
+        if (!root) return;
+        const after = root.querySelector('#vg-w-ba-disablejoins-after');
+        const divider = root.querySelector('#vg-w-ba-disablejoins-divider');
+        let dragging = false;
+        function setPct(pct) {
+          const clamped = Math.max(0, Math.min(100, pct));
+          after.style.clipPath = `polygon(${clamped}% 0, 100% 0, 100% 100%, ${clamped}% 100%)`;
+          divider.style.left = `${clamped}%`;
+        }
+        divider.addEventListener('pointerdown', (e) => { dragging = true; divider.setPointerCapture(e.pointerId); });
+        root.addEventListener('pointermove', (e) => {
+          if (!dragging) return;
+          const rect = root.getBoundingClientRect();
+          setPct(((e.clientX - rect.left) / rect.width) * 100);
+        });
+        root.addEventListener('pointerup', () => { dragging = false; });
+        root.addEventListener('pointercancel', () => { dragging = false; });
+      })();
+    </script>
+  </figure>
+
+  <p>這個改寫之所以是「地基」而不只是「一個優化」，在於它把一個原本由資料庫保證的不變式，轉移成了應用層自己負責的事。傳統 join 裡，兩張表的關聯是在同一條 SQL、同一個交易快照下解析的——資料庫保證你看到的是一致的一刻。拆成兩條 SELECT 之後，這個保證沒了：第一條查 <code>author_posts</code> 拿到 id 串，到第二條查 <code>posts</code> 之間，資料有可能變動。對絕大多數讀路徑來說，這點時間差無關緊要；但它確實是 disable_joins 拿走的東西之一，也是「為什麼這個 feature 要你主動開、而不是預設行為」的原因。Rails 把這個取捨的決定權交回給你，因為只有你知道哪些關聯查詢能容忍這種鬆動。</p>
+
+  <p>當然，這個改寫也不是免費的。一次 join 變兩條 SELECT，意味著多一趟資料庫往返、應用層多一段拼接邏輯；對於那種「在資料庫裡 join 過濾掉大量列、只回少數結果」的查詢，先撈一整串 id 再回查，反而可能搬更多資料——你把資料庫原本能在內部用索引一次搞定的事，拆成了兩次網路往返加一次應用層的記憶體拼接。disable_joins 不是「永遠更好」，它是用查詢效率換掉「不能跨庫」這個硬約束——付這個代價，是為了讓拆庫這件事在結構上變得可能。對於一個被尖峰逼到非拆不可的系統來說，這個交易划算；對於一個單庫還游刃有餘的系統，貿然開它只是憑空多兩次往返。</p>
+
+  <h2>三支柱：查詢改寫、多庫管理、資料搬遷各管一段</h2>
+
+  <p>disable_joins 解決了「查詢不跨邊界」，但要真的跑 8 個 primary，還缺兩塊：誰來管這多個資料庫的連線、schema、migration？資料又怎麼從一台搬到另一台？這就是另外兩支柱。三者合起來，剛好對應「拆庫」這件事的三個階段——讓查詢能拆、讓 codebase 能同時管多庫、讓資料能搬。</p>
+
+  <p>第二支柱是 Rails 的 Multiple Databases。原文點出它的起點——「Multiple Databases launched in 6.0」，從 Rails 6.0 起內建。它讓一份 codebase 在設定層面認得多個資料庫：每個 primary 各自有獨立的 schema 與 migration 流程，應用程式碼可以指定某類查詢走哪個資料庫。這是「8 個 primary 共用一份 Rails 程式碼」之所以可能的框架——沒有它，多資料庫就得靠手刻連線管理，那才真的會把單一 codebase 撐破。</p>
+
+  <p>第三支柱是搬資料。把一張表從舊 primary 挪到新 primary，最笨的辦法是 dump 出來再 load 進去，慢且要長時間停機。Aura 用的是 physical replication：原文寫「use physical replication from the original primary instance to create a read only replica, then promote it」——從原 primary 拉出一個唯讀 replica，等它追上資料，再把這個 replica「promote」成可寫的 writer。實體複製是按資料庫的 WAL／資料頁層級同步的，比邏輯逐筆搬快得多，而 promote 是一個相對快速的切換動作。下面這個 stack 把三支柱攤開，點任一層看它各自負責哪一段。</p>
+
+  <figure class="vg-w-stack-pillars" data-mobile="keep">
+    <style>
+      .vg-w-stack-pillars { display: flex; flex-direction: column; gap: var(--s-3); align-items: stretch; }
+      .vg-w-stack-pillars input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-stack-pillars .stack-title { font-family: IM Fell English, serif; font-style: italic; font-size: var(--fs-md); margin: 0 0 var(--s-1) 0; color: var(--ink); line-height: 1.4; }
+      .vg-w-stack-pillars .stack-cards { display: flex; flex-direction: column; gap: var(--s-1); list-style: none; padding: 0; margin: 0; }
+      .vg-w-stack-pillars .stack-cards label { display: block; padding: var(--s-2); border: 1px solid var(--muted-2); border-radius: 2px; cursor: pointer; transition: border-color 200ms, background 200ms; min-height: 44px; }
+      .vg-w-stack-pillars .stack-cards label:hover { border-color: var(--accent); }
+      .vg-w-stack-pillars .stack-cards .card-head { font-family: EB Garamond, serif; font-size: var(--fs-md); margin: 0 0 4px 0; color: var(--ink); display: flex; align-items: baseline; justify-content: space-between; gap: var(--s-2); flex-wrap: wrap; }
+      .vg-w-stack-pillars .stack-cards .card-sub { font-family: IM Fell English, serif; font-style: italic; font-size: var(--fs-sm); color: var(--muted); margin: 0; line-height: 1.5; }
+      .vg-w-stack-pillars .stack-cards .card-tag { font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); color: var(--accent-text); font-style: normal; }
+      .vg-w-stack-pillars:has(#vg-w-stack-pillars-r1:checked) .card-1,
+      .vg-w-stack-pillars:has(#vg-w-stack-pillars-r2:checked) .card-2,
+      .vg-w-stack-pillars:has(#vg-w-stack-pillars-r3:checked) .card-3 { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+      .vg-w-stack-pillars svg.diagram { display: none; }
+      @media (min-width: 720px) {
+        .vg-w-stack-pillars svg.diagram { display: block; width: 100%; height: auto; max-width: 880px; }
+        .vg-w-stack-pillars .stack-title { display: none; }
+        .vg-w-stack-pillars .stack-cards { display: none; }
+      }
+      .vg-w-stack-pillars .layer { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; }
+      .vg-w-stack-pillars:has(#vg-w-stack-pillars-r1:checked) .layer-1,
+      .vg-w-stack-pillars:has(#vg-w-stack-pillars-r2:checked) .layer-2,
+      .vg-w-stack-pillars:has(#vg-w-stack-pillars-r3:checked) .layer-3 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+      .vg-w-stack-pillars .layer-text { font-family: EB Garamond, serif; font-size: 15px; fill: var(--ink); pointer-events: none; }
+      .vg-w-stack-pillars .layer-sub { font-family: JetBrains Mono, monospace; font-size: 11px; fill: var(--muted); pointer-events: none; }
+      .vg-w-stack-pillars .head { font-family: Manrope, sans-serif; font-size: 13px; fill: var(--muted); }
+      .vg-w-stack-pillars .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+      .vg-w-stack-pillars .detail h3 { font-family: EB Garamond, serif; font-size: var(--fs-md); margin: 0 0 var(--s-1) 0; color: var(--ink); }
+      .vg-w-stack-pillars .detail p { margin: 0; font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink-soft); line-height: 1.7; }
+      .vg-w-stack-pillars .hint { font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); margin: 0 0 var(--s-1) 0; }
+      .vg-w-stack-pillars:has(#vg-w-stack-pillars-r1:checked) .hint,
+      .vg-w-stack-pillars:has(#vg-w-stack-pillars-r2:checked) .hint,
+      .vg-w-stack-pillars:has(#vg-w-stack-pillars-r3:checked) .hint { display: none; }
+      .vg-w-stack-pillars:has(#vg-w-stack-pillars-r1:checked) .detail-1,
+      .vg-w-stack-pillars:has(#vg-w-stack-pillars-r2:checked) .detail-2,
+      .vg-w-stack-pillars:has(#vg-w-stack-pillars-r3:checked) .detail-3 { display: block; }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M9 9h6v6H9z"/><path d="m3 9 3-3 3 3"/><path d="M21 15l-3 3-3-3"/>
+      </svg>
+      <span>點任一支柱看它在拆庫流程裡負責哪一段 · 3 支柱</span>
+    </p>
+
+    <input type="radio" id="vg-w-stack-pillars-r1" name="vg-w-stack-pillars-sel" checked aria-label="支柱一 disable_joins" />
+    <input type="radio" id="vg-w-stack-pillars-r2" name="vg-w-stack-pillars-sel" aria-label="支柱二 Multiple Databases" />
+    <input type="radio" id="vg-w-stack-pillars-r3" name="vg-w-stack-pillars-sel" aria-label="支柱三 physical replication" />
+
+    <p class="stack-title" id="vg-w-stack-pillars-title">拆成 8 個 primary 的三支柱</p>
+    <ul class="stack-cards" aria-labelledby="vg-w-stack-pillars-title">
+      <li class="card-1"><label for="vg-w-stack-pillars-r1">
+        <p class="card-head"><span>支柱一 · 讓查詢能拆</span><code class="card-tag">disable_joins</code></p>
+        <p class="card-sub">把 has_many :through 的 join 改寫成多條 SELECT，查詢不再跨資料庫邊界</p>
+      </label></li>
+      <li class="card-2"><label for="vg-w-stack-pillars-r2">
+        <p class="card-head"><span>支柱二 · 讓一份 codebase 管多庫</span><code class="card-tag">Multiple Databases</code></p>
+        <p class="card-sub">Rails 6.0 起內建：每個 primary 各有獨立 schema 與 migration</p>
+      </label></li>
+      <li class="card-3"><label for="vg-w-stack-pillars-r3">
+        <p class="card-head"><span>支柱三 · 讓資料能搬</span><code class="card-tag">physical replication</code></p>
+        <p class="card-sub">拉出唯讀 replica、追上後 promote 成新的 writer</p>
+      </label></li>
+    </ul>
+
+    <svg class="diagram" viewBox="0 0 880 360" role="img" aria-label="拆成 8 個 primary 的三支柱：查詢改寫、多庫管理、資料搬遷">
+      <text x="60" y="30" class="head">拆成 8 個 primary 的三支柱 —— 點任一層看它負責哪一段</text>
+      <rect class="layer layer-1" x="60" y="56" width="760" height="78" rx="3" role="button" tabindex="0" aria-label="支柱一 disable_joins" />
+      <text x="84" y="92" class="layer-text">支柱一 · 讓查詢能拆 —— disable_joins</text>
+      <text x="84" y="116" class="layer-sub">has_many :through 的 join → 多條 SELECT，查詢不跨邊界</text>
+      <rect class="layer layer-2" x="60" y="146" width="760" height="78" rx="3" role="button" tabindex="0" aria-label="支柱二 Multiple Databases" />
+      <text x="84" y="182" class="layer-text">支柱二 · 讓一份 codebase 管多庫 —— Multiple Databases</text>
+      <text x="84" y="206" class="layer-sub">Rails 6.0 起內建：每個 primary 各有獨立 schema 與 migration</text>
+      <rect class="layer layer-3" x="60" y="236" width="760" height="78" rx="3" role="button" tabindex="0" aria-label="支柱三 physical replication" />
+      <text x="84" y="272" class="layer-text">支柱三 · 讓資料能搬 —— physical replication</text>
+      <text x="84" y="296" class="layer-sub">拉出唯讀 replica → 追上後 promote 成新的 writer</text>
+    </svg>
+
+    <div>
+      <p class="hint">點任一支柱看它負責哪一段</p>
+      <div class="detail detail-1">
+        <h3>支柱一 · disable_joins</h3>
+        <p>原文：「The disable_joins feature replaces SQL joins, issuing multiple SELECT statements to combine」。它是地基——只要查詢還依賴跨表 join，資料就無法安全切到不同 primary。它把拼接從資料庫搬到應用層，換取「每條查詢只碰單一資料庫」這個性質。Rails 7 起可用。</p>
+      </div>
+      <div class="detail detail-2">
+        <h3>支柱二 · Multiple Databases</h3>
+        <p>原文：「Multiple Databases launched in 6.0」。它讓一份 Rails codebase 在設定層認得多個資料庫，每個 primary 各有獨立 schema 與 migration。沒有它，8 個 primary 就得靠手刻連線管理；有了它，多庫成了框架內建能力，單一 codebase 不被撐破。</p>
+      </div>
+      <div class="detail detail-3">
+        <h3>支柱三 · physical replication</h3>
+        <p>原文：「use physical replication from the original primary instance to create a read only replica, then promote it」。搬資料不靠逐筆 dump/load，而是用實體複製拉出唯讀 replica，等它追上後 promote 成可寫 writer。資料頁層級的同步比邏輯複製快，promote 是相對快速的切換。</p>
+      </div>
+    </div>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-stack-pillars');
+        if (!root) return;
+        const layers = root.querySelectorAll('svg.diagram .layer');
+        layers.forEach((rect, i) => {
+          const radio = root.querySelector('#vg-w-stack-pillars-r' + (i + 1));
+          if (!radio) return;
+          rect.addEventListener('click', () => { radio.checked = true; });
+          rect.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); radio.checked = true; }
+          });
+        });
+      })();
+    </script>
+  </figure>
+
+  <h2>把唯讀 replica 升格成新 primary 的那一刻</h2>
+
+  <p>三支柱裡，physical replication 那一步最容易被輕輕帶過，但它其實是整個拆庫動作的關鍵節拍——資料要從一台 primary「分裂」出去，靠的就是這個 replica-then-promote 的把戲。把它的時序拆開看會更清楚：為什麼要先做一個 replica，而不是直接開一台空白資料庫往裡灌。</p>
+
+  <p>答案是「追資料」這件事的成本。一個唯讀 replica 透過實體複製，會持續地把原 primary 的變更套到自己身上，直到兩邊資料一致。這個追趕過程可以在系統照常服務的同時進行——原 primary 持續接受讀寫，replica 在背後默默跟上。等到 replica 追到夠近，promote 這個動作把它從「唯讀的跟隨者」切成「可寫的 primary」，新的資料庫就此誕生，原本壓在一台上的某一塊資料，從此由它獨立承擔。下面這張時序圖把這四拍畫出來。</p>
+
+  <p>為什麼非得是 physical replication，而不是把資料 dump 出來再 load 進新庫？關鍵在停機時間與資料新鮮度。dump/load 是邏輯層的搬法：它把資料一筆筆讀出、再一筆筆寫入，過程中那段資料通常得凍結不能寫，否則 dump 完成的當下資料就已經過時。對一個尖峰期每秒要吞 22.6 萬筆交易的系統來說，凍結任何一塊熱資料哪怕幾分鐘都是災難。physical replication 走的是另一條路：它在資料頁與 WAL 的層級持續同步，replica 永遠只落後原 primary 一點點，而 promote 是一個秒級的角色切換，不需要長時間停寫。換句話說，replica-then-promote 之所以划算，不是因為它總搬運量更小，而是因為它把「需要停機的那一刻」壓縮到了最短——這正是一個不能停的系統最在乎的事。</p>
+
+  <figure class="vg-w-diagram-promote" data-mobile="keep" data-svg-scroll="720">
+    <style>
+      .vg-w-diagram-promote svg { width: 100%; height: auto; }
+      .vg-w-diagram-promote figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+      .vg-w-diagram-promote .ph-box { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.4; }
+      .vg-w-diagram-promote .ph-box-hot { fill: color-mix(in srgb, var(--accent) 14%, transparent); stroke: var(--accent); stroke-width: 1.6; }
+      .vg-w-diagram-promote .ph-label { font-family: EB Garamond, serif; font-size: 14px; fill: var(--ink); }
+      .vg-w-diagram-promote .ph-tag { font-family: JetBrains Mono, monospace; font-size: 11px; fill: var(--muted); }
+      .vg-w-diagram-promote .ph-step { font-family: Manrope, sans-serif; font-size: 12px; fill: var(--accent-text); }
+      .vg-w-diagram-promote .ph-note { font-family: EB Garamond, serif; font-size: 12px; fill: var(--ink-soft); }
+    </style>
+
+    <svg viewBox="0 0 720 300" preserveAspectRatio="xMidYMid meet" role="img" aria-label="physical replication 把唯讀 replica promote 成新 primary 的四拍時序">
+      <defs>
+        <marker id="vg-w-diagram-promote-arr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M0,0 L10,5 L0,10 z" fill="var(--accent)" />
+        </marker>
+      </defs>
+
+      <text x="20" y="28" class="ph-step">① 起點：一台 primary 扛全部</text>
+      <rect class="ph-box ph-box-hot" x="20" y="40" width="120" height="56" rx="4" />
+      <text x="34" y="66" class="ph-label">primary A</text>
+      <text x="34" y="84" class="ph-tag">read + write</text>
+
+      <text x="200" y="28" class="ph-step">② 拉出唯讀 replica</text>
+      <rect class="ph-box ph-box-hot" x="200" y="40" width="116" height="56" rx="4" />
+      <text x="214" y="66" class="ph-label">primary A</text>
+      <text x="214" y="84" class="ph-tag">read + write</text>
+      <line x1="316" y1="68" x2="368" y2="68" stroke="var(--accent)" stroke-width="1.6" marker-end="url(#vg-w-diagram-promote-arr)" />
+      <text x="318" y="58" class="ph-note">physical</text>
+      <rect class="ph-box" x="372" y="40" width="116" height="56" rx="4" />
+      <text x="386" y="66" class="ph-label">replica</text>
+      <text x="386" y="84" class="ph-tag">read only</text>
+
+      <text x="20" y="150" class="ph-step">③ replica 追上 A 的資料（系統照常服務）</text>
+      <rect class="ph-box ph-box-hot" x="20" y="164" width="116" height="56" rx="4" />
+      <text x="34" y="190" class="ph-label">primary A</text>
+      <text x="34" y="208" class="ph-tag">read + write</text>
+      <line x1="136" y1="192" x2="208" y2="192" stroke="var(--accent)" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#vg-w-diagram-promote-arr)" />
+      <text x="140" y="182" class="ph-note">持續套用 WAL</text>
+      <rect class="ph-box" x="212" y="164" width="116" height="56" rx="4" />
+      <text x="226" y="190" class="ph-label">replica</text>
+      <text x="226" y="208" class="ph-tag">追到一致</text>
+
+      <text x="400" y="150" class="ph-step">④ promote：replica 變新 primary B</text>
+      <rect class="ph-box ph-box-hot" x="400" y="164" width="116" height="56" rx="4" />
+      <text x="414" y="190" class="ph-label">primary A</text>
+      <text x="414" y="208" class="ph-tag">留一半資料</text>
+      <rect class="ph-box ph-box-hot" x="560" y="164" width="120" height="56" rx="4" />
+      <text x="574" y="190" class="ph-label">primary B</text>
+      <text x="574" y="208" class="ph-tag">read + write</text>
+      <text x="400" y="248" class="ph-note">兩台各自承擔一塊資料，之後各自還能再垂直擴。</text>
+    </svg>
+
+    <figcaption>physical replication 的四拍：A 拉出唯讀 replica → replica 在系統照常服務時追上 → promote 切成可寫的 primary B。時序與「create a read only replica, then promote it」一句對齊；各拍的資料切分比例為示意，原文未給逐台明細。</figcaption>
+  </figure>
+
+  <p>重複這個動作，一台 primary 就能裂成兩台、四台、八台。原文對最終狀態的描述是「With 8 primary databases in total, each server instance can be vertically scaled ahead」——8 個 primary，而且每一個之後還能各自再垂直擴。水平拆庫沒有取代垂直擴，它是把垂直擴的天花板複製了 8 份：每台都能再長大，總容量於是不再被任何單一機型的上限卡死。</p>
+
+  <h2>負載往上推，一台撞牆、八台分攤</h2>
+
+  <p>把前面所有零件接起來，整個架構的價值用一個動作就能感覺到：把負載往上推，看單一 primary 和 8 個 primary 各自在什麼時候撞牆。下面這個 widget 讓你拖動負載倍率——以正常日為基準往上加。單一 primary 是一條會碰到天花板的線；8 個 primary 把同樣的負載除以八，每台承受的壓力始終低得多。</p>
+
+  <figure class="vg-w-param-ceiling" data-mobile="static" data-svg-scroll="720">
+    <style>
+      .vg-w-param-ceiling { display: grid; grid-template-rows: auto auto 1fr auto; gap: var(--s-2); }
+      .vg-w-param-ceiling .controls { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+      .vg-w-param-ceiling .controls input { flex: 1; height: 36px; accent-color: var(--accent); touch-action: none; }
+      .vg-w-param-ceiling .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 12ch; text-align: right; font-family: var(--mono); font-size: var(--fs-xs); }
+      .vg-w-param-ceiling svg { width: 100%; height: auto; }
+      .vg-w-param-ceiling figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M5 12h14"/><path d="m12 5 7 7-7 7" transform="rotate(90 12 12)"/>
+      </svg>
+      <span data-vg-controls>拖動負載倍率（以正常日為 1×），看單一 primary 何時撞天花板、8 個 primary 怎麼分攤</span>
+    </p>
+
+    <div class="controls" data-vg-controls>
+      <label for="vg-w-param-ceiling-range">負載倍率</label>
+      <input id="vg-w-param-ceiling-range" type="range" min="1" max="6" step="0.1" value="4.5" aria-label="負載倍率，以正常日為基準" />
+      <span class="readout" id="vg-w-param-ceiling-readout">4.5×</span>
+    </div>
+
+    <svg class="vg-w-param-ceiling-main" viewBox="0 0 720 320" preserveAspectRatio="xMidYMid meet" role="img" aria-label="負載倍率對單一 primary 與 8 個 primary 各自負載的影響">
+      <g id="vg-w-param-ceiling-axes"></g>
+      <g id="vg-w-param-ceiling-bars"></g>
+    </svg>
+
+    <figcaption>橫軸是兩種架構，縱軸是「相對於單機天花板的負載比例」。單一 primary 隨倍率線性逼近並超過天花板；8 個 primary 把同一負載除以八，每台都遠在天花板以下。聖誕尖峰約為正常日的 4–5 倍（原文：「4-5x」量級），預設停在 4.5×。比例曲線為示意，量級錨點（4–5 倍、單機天花板、8 台）取自原文。</figcaption>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-param-ceiling');
+        const svg = root.querySelector('svg.vg-w-param-ceiling-main');
+        const axesG = root.querySelector('#vg-w-param-ceiling-axes');
+        const barsG = root.querySelector('#vg-w-param-ceiling-bars');
+        const range = root.querySelector('#vg-w-param-ceiling-range');
+        const readout = root.querySelector('#vg-w-param-ceiling-readout');
+        const NS = 'http://www.w3.org/2000/svg';
+        function el(tag, attrs) {
+          const e = document.createElementNS(NS, tag);
+          for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+          return e;
+        }
+        const X0 = 80, X1 = 660, Y0 = 270, Y1 = 40;
+        // capacity ceiling at "1.0" of single-machine capacity.
+        // baseline (1x load) consumes ~0.22 of a single machine; scales linearly.
+        const BASE = 0.22;
+        const ceilingY = Y1 + (Y0 - Y1) * 0.0; // ceiling drawn at top region
+        const CEIL = 1.0;
+        const yOf = v => Y0 - Math.min(v, 1.25) / 1.25 * (Y0 - Y1);
+
+        function drawAxes() {
+          axesG.replaceChildren();
+          axesG.appendChild(el('line', { x1: X0, y1: Y0, x2: X1, y2: Y0, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+          axesG.appendChild(el('line', { x1: X0, y1: Y0, x2: X0, y2: Y1, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+          // ceiling line
+          const cy = yOf(CEIL);
+          axesG.appendChild(el('line', { x1: X0, y1: cy, x2: X1, y2: cy, stroke: 'var(--accent)', 'stroke-width': 1.2, 'stroke-dasharray': '6 4' }));
+          const ct = el('text', { x: X1, y: cy - 8, 'text-anchor': 'end', 'font-family': 'Manrope, sans-serif', 'font-size': 12, fill: 'var(--accent-text)' });
+          ct.textContent = '單機容量天花板';
+          axesG.appendChild(ct);
+          // x labels
+          [['single', '單一 primary'], ['sharded', '8 個 primary（每台）']].forEach(([k, lbl], i) => {
+            const cx = X0 + (i + 0.5) * (X1 - X0) / 2;
+            const t = el('text', { x: cx, y: Y0 + 22, 'text-anchor': 'middle', 'font-family': 'Manrope, sans-serif', 'font-size': 13, fill: 'var(--muted)' });
+            t.textContent = lbl;
+            axesG.appendChild(t);
+          });
+          const yl = el('text', { x: 22, y: (Y0 + Y1) / 2, 'text-anchor': 'middle', 'font-family': 'EB Garamond, serif', 'font-size': 13, fill: 'var(--muted)', transform: `rotate(-90 22 ${(Y0 + Y1) / 2})` });
+          yl.textContent = '單機容量比例';
+          axesG.appendChild(yl);
+        }
+
+        function render(mult) {
+          barsG.replaceChildren();
+          const single = BASE * mult;
+          const sharded = single / 8;
+          const barW = 110;
+          const slots = [[single, 'single'], [sharded, 'sharded']];
+          slots.forEach(([v, kind], i) => {
+            const cx = X0 + (i + 0.5) * (X1 - X0) / 2;
+            const over = v > CEIL;
+            const drawn = Math.min(v, 1.25);
+            const y = yOf(drawn);
+            const color = over ? 'var(--accent)' : 'var(--sage-deep)';
+            barsG.appendChild(el('rect', { x: cx - barW / 2, y: y, width: barW, height: Y0 - y, fill: color, 'fill-opacity': 0.85, rx: 2 }));
+            const t = el('text', { x: cx, y: y - 10, 'text-anchor': 'middle', 'font-family': 'JetBrains Mono, monospace', 'font-size': 13, fill: over ? 'var(--accent-text)' : 'var(--ink)' });
+            t.textContent = (v * 100).toFixed(0) + '%';
+            barsG.appendChild(t);
+            if (over) {
+              const w = el('text', { x: cx, y: Y1 - 6, 'text-anchor': 'middle', 'font-family': 'EB Garamond, serif', 'font-size': 13, fill: 'var(--accent-text)' });
+              w.textContent = '撞牆';
+              barsG.appendChild(w);
+            }
+          });
+        }
+
+        function update() {
+          const mult = parseFloat(range.value);
+          readout.textContent = mult.toFixed(1) + '×';
+          drawAxes();
+          render(mult);
+        }
+        range.addEventListener('input', update);
+        update();
+      })();
+    </script>
+  </figure>
+
+  <p>這個對比也說明了為什麼「先拆庫、每台再垂直擴」是有意義的順序，而不是冗餘。拆成 8 台之後，每台承受的不再是全部負載，而是八分之一；這個八分之一還遠在單機天花板之下，於是每台都還有垂直擴的空間可用——原文那句「each server instance can be vertically scaled ahead」講的就是這個。水平拆庫把問題從「一台無論多大都不夠」變回「每台都還有餘裕」。</p>
+
+  <p>最後值得誠實標一筆：這套方案的代價，原文著墨不多，但從機制推得出來。<strong>合理的推測是</strong>，跨 shard 的強一致 join 與交易在這個架構下基本被放棄了——一旦兩張表分屬不同 primary，你不能在一條交易裡同時改它們、也不能用 join 一次過濾。換句話說，Aura 換來的水平擴展能力，是用「不再依賴跨庫的關聯查詢與分散式交易」這個約束買來的。對讀者來說，這正是評估這條路時要先問自己的問題：你的資料模型，能不能接受熱路徑上的 join 被拆成多條單庫 SELECT？</p>
+
+  <p class="vg-deep-closer"><strong>Take-away</strong>：下次單一 primary 逼近垂直擴極限、又不想重寫成微服務時，先檢查熱路徑的 has_many :through——能用 disable_joins 把它拆成單庫 SELECT，水平切到多個 primary 這條路才走得通，而搬資料用 physical replication 的 replica-then-promote 遠比逐筆遷移划算。</p>
+</div>
