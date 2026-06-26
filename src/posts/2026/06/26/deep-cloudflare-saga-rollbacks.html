@@ -1,0 +1,538 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">一個轉帳 workflow 跑到第三步才失敗。錢已經離開 A 銀行，C 確認信還沒寄出，而你不能對 A 的系統說一句「當作沒發生」——一筆已 commit 的交易，沒有 undo 鍵。Cloudflare 替 Workflows 補的這塊，正是這個「跑了一半、收不回來」的洞。</p>
+  <h1 class="vg-post-title">{{ title }}</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p><span class="vg-dropcap">d</span>urable execution 解決的是「程式中途掛掉怎麼接續」：每個 step 的結果都被持久化，機器重新啟動、worker 換手、process crash 之後，workflow 從上次的進度 replay 回來，已完成的 step 不會重跑。但 durable 只保證「每一步最終會跑完一次」，它不保證「整條 workflow 語意上是一個原子操作」。當第 N 步成功、把錢從 A 銀行扣走、寫進對方系統，然後第 N+1 步失敗時，durable execution 會忠實地把「A 已扣款」這個事實保留下來——它本來就是設計來保留事實的。問題是，這個事實此刻是個半成品。Cloudflare 這次替 Workflows 加上 saga 式的 rollback，補的就是 durable execution 天生補不了的那一段：外部副作用的回收。</p>
+
+  <p>這篇是一個關於「收不回來的副作用」的故事。先看那個經典的失敗模式長什麼樣、為什麼 retry 救不了它；再看 saga pattern 怎麼替每一步配一個補償動作、失敗時反向執行；然後是這套機制怎麼和 Workflows 既有的 durable execution、replay、idempotency 接在一起；最後是它落到開發者手上時，多了哪些責任、又少了哪些保證。先從下面這個可以一步步推的 saga stepper 開始——按 forward 推進工作流，在第三步觸發失敗，再看補償動作如何反向把已生效的副作用一個個拆回去。</p>
+
+  <figure class="vg-w-stepper-saga-unwind" data-mobile="swap" data-mobile-summary="三步轉帳第三步失敗，saga 補償按 step 開始的順序反向執行——先補 step2、再補 step1，而不是按完成順序，因為啟動順序才是被持久化的穩定依據。" data-svg-scroll="720">
+    <style>
+      .vg-w-stepper-saga-unwind { display: grid; gap: var(--s-3); margin: var(--s-4) 0; }
+      .vg-w-stepper-saga-unwind svg { width: 100%; height: auto; }
+      .vg-w-stepper-saga-unwind .ctl { display: flex; gap: var(--s-2); flex-wrap: wrap; align-items: center; padding: var(--s-2); background: var(--bg-soft); border-left: 2px solid var(--accent); }
+      .vg-w-stepper-saga-unwind button { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; min-height: 44px; min-width: 44px; padding: var(--s-1) var(--s-3); cursor: pointer; background: var(--bg); color: var(--ink); border: 1px solid var(--muted-2); border-radius: 2px; }
+      .vg-w-stepper-saga-unwind button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent-text); }
+      .vg-w-stepper-saga-unwind button:disabled { opacity: 0.4; cursor: not-allowed; }
+      .vg-w-stepper-saga-unwind button.primary { border-color: var(--accent); color: var(--accent-text); }
+      .vg-w-stepper-saga-unwind .phase { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin-left: auto; }
+      .vg-w-stepper-saga-unwind .log { font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); line-height: 1.7; padding: var(--s-2) var(--s-3); border-left: 2px solid var(--muted-2); background: var(--bg-soft); min-height: 5.5em; }
+      .vg-w-stepper-saga-unwind .log .fwd { color: var(--ink-deep); }
+      .vg-w-stepper-saga-unwind .log .bwd { color: var(--accent-text); }
+      .vg-w-stepper-saga-unwind .log .fail { color: var(--accent-text); font-weight: 600; }
+      .vg-w-stepper-saga-unwind .log .done { color: var(--sage-deep); }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor"
+           stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M5 12h14"/><path d="m12 5 7 7-7 7"/>
+      </svg>
+      <span>按 forward 推進工作流、在 step 3 觸發失敗、再 unwind 補償 · 3 步 + 反向補償</span>
+    </p>
+
+    <div class="ctl">
+      <button type="button" class="primary" data-act="forward">forward ▸</button>
+      <button type="button" data-act="reset">reset</button>
+      <span class="phase" data-role="phase">尚未開始</span>
+    </div>
+
+    <svg class="vg-w-stepper-saga-unwind-main" viewBox="0 0 720 300" role="img"
+         aria-label="三步轉帳 workflow 的 saga 補償流程——前進三步、第三步失敗、補償反向執行">
+      <defs>
+        <marker id="vg-w-stepper-saga-unwind-arr" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+          <path d="M0,0 L7,3.5 L0,7 Z" fill="var(--muted)"/>
+        </marker>
+        <marker id="vg-w-stepper-saga-unwind-arr-back" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+          <path d="M0,0 L7,3.5 L0,7 Z" fill="var(--accent)"/>
+        </marker>
+      </defs>
+
+      <text x="360" y="28" text-anchor="middle" fill="var(--ink)" font-family="EB Garamond, serif" font-size="15">forward 工作流（上排）· 補償 unwind（下排，反向）</text>
+
+      <!-- forward row -->
+      <g data-role="fwd-step" data-step="1">
+        <rect x="40" y="60" width="180" height="64" rx="6" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.5"/>
+        <text x="130" y="86" text-anchor="middle" fill="var(--ink)" font-family="JetBrains Mono, monospace" font-size="12">step 1</text>
+        <text x="130" y="106" text-anchor="middle" fill="var(--muted)" font-family="EB Garamond, serif" font-size="12">debit Bank A</text>
+      </g>
+      <line x1="220" y1="92" x2="266" y2="92" stroke="var(--muted)" stroke-width="1.4" marker-end="url(#vg-w-stepper-saga-unwind-arr)"/>
+      <g data-role="fwd-step" data-step="2">
+        <rect x="270" y="60" width="180" height="64" rx="6" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.5"/>
+        <text x="360" y="86" text-anchor="middle" fill="var(--ink)" font-family="JetBrains Mono, monospace" font-size="12">step 2</text>
+        <text x="360" y="106" text-anchor="middle" fill="var(--muted)" font-family="EB Garamond, serif" font-size="12">credit Bank B</text>
+      </g>
+      <line x1="450" y1="92" x2="496" y2="92" stroke="var(--muted)" stroke-width="1.4" marker-end="url(#vg-w-stepper-saga-unwind-arr)"/>
+      <g data-role="fwd-step" data-step="3">
+        <rect x="500" y="60" width="180" height="64" rx="6" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.5"/>
+        <text x="590" y="86" text-anchor="middle" fill="var(--ink)" font-family="JetBrains Mono, monospace" font-size="12">step 3</text>
+        <text x="590" y="106" text-anchor="middle" fill="var(--muted)" font-family="EB Garamond, serif" font-size="12">send confirmation</text>
+      </g>
+
+      <!-- compensation row -->
+      <g data-role="bwd-step" data-step="1" opacity="0.25">
+        <rect x="40" y="176" width="180" height="64" rx="6" fill="none" stroke="var(--accent)" stroke-width="1.5" stroke-dasharray="5,3"/>
+        <text x="130" y="202" text-anchor="middle" fill="var(--accent-text)" font-family="JetBrains Mono, monospace" font-size="12">rollback 1</text>
+        <text x="130" y="222" text-anchor="middle" fill="var(--muted)" font-family="EB Garamond, serif" font-size="12">credit A back</text>
+      </g>
+      <g data-role="bwd-step" data-step="2" opacity="0.25">
+        <rect x="270" y="176" width="180" height="64" rx="6" fill="none" stroke="var(--accent)" stroke-width="1.5" stroke-dasharray="5,3"/>
+        <text x="360" y="202" text-anchor="middle" fill="var(--accent-text)" font-family="JetBrains Mono, monospace" font-size="12">rollback 2</text>
+        <text x="360" y="222" text-anchor="middle" fill="var(--muted)" font-family="EB Garamond, serif" font-size="12">debit B back</text>
+      </g>
+      <g data-role="bwd-step" data-step="3" opacity="0.25">
+        <rect x="500" y="176" width="180" height="64" rx="6" fill="none" stroke="var(--muted-2)" stroke-width="1.2" stroke-dasharray="5,3"/>
+        <text x="590" y="202" text-anchor="middle" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="12">（無補償）</text>
+        <text x="590" y="222" text-anchor="middle" fill="var(--muted)" font-family="EB Garamond, serif" font-size="12">step 3 未 commit</text>
+      </g>
+
+      <line x1="590" y1="124" x2="590" y2="170" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="3,3"/>
+      <line x1="360" y1="124" x2="360" y2="170" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="3,3"/>
+      <line x1="130" y1="124" x2="130" y2="170" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="3,3"/>
+
+      <text x="360" y="270" text-anchor="middle" fill="var(--muted)" font-family="IM Fell English, serif" font-style="italic" font-size="12" data-role="caption">補償順序：step 2 先補、step 1 後補——反向於 step 開始的順序。</text>
+    </svg>
+
+    <div class="log" data-role="log">按 <strong>forward</strong> 開始推進工作流。</div>
+
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        const root = document.querySelector('.vg-w-stepper-saga-unwind');
+        if (!root) return;
+        const fwd = {
+          1: root.querySelector('[data-role="fwd-step"][data-step="1"]'),
+          2: root.querySelector('[data-role="fwd-step"][data-step="2"]'),
+          3: root.querySelector('[data-role="fwd-step"][data-step="3"]'),
+        };
+        const bwd = {
+          1: root.querySelector('[data-role="bwd-step"][data-step="1"]'),
+          2: root.querySelector('[data-role="bwd-step"][data-step="2"]'),
+        };
+        const fwdBtn = root.querySelector('[data-act="forward"]');
+        const resetBtn = root.querySelector('[data-act="reset"]');
+        const phase = root.querySelector('[data-role="phase"]');
+        const log = root.querySelector('[data-role="log"]');
+
+        // sequence: forward 1,2,3(fail) then compensate 2,1
+        const seq = [
+          { kind: 'f', step: 1, html: '<span class="fwd">step 1 · debit Bank A → 已 commit，錢離開 A。</span>', phase: 'forward · step 1' },
+          { kind: 'f', step: 2, html: '<span class="fwd">step 2 · credit Bank B → 已 commit，錢進入 B。</span>', phase: 'forward · step 2' },
+          { kind: 'fail', step: 3, html: '<span class="fail">step 3 · send confirmation → 失敗，workflow 即將 terminal fail。</span>', phase: 'step 3 失敗' },
+          { kind: 'b', step: 2, html: '<span class="bwd">rollback 2 · debit B back → 把入帳退回 B。</span>', phase: 'compensate · step 2' },
+          { kind: 'b', step: 1, html: '<span class="bwd">rollback 1 · credit A back → 把錢退回 A。</span>', phase: 'compensate · step 1' },
+          { kind: 'end', html: '<span class="done">unwind 完成 · 外部副作用全部回收，workflow 以失敗收場但狀態一致。</span>', phase: '已 unwind' },
+        ];
+        let i = -1;
+
+        function paint() {
+          // forward boxes
+          for (const k of [1, 2, 3]) {
+            const g = fwd[k];
+            const rect = g.querySelector('rect');
+            if (i >= 0 && seq.slice(0, i + 1).some(s => (s.kind === 'f' || s.kind === 'fail') && s.step === k)) {
+              const failed = seq[i] && seq[i].kind === 'fail' && seq[i].step === k;
+              rect.setAttribute('fill', failed ? 'var(--accent)' : 'var(--ink-deep)');
+              rect.setAttribute('fill-opacity', '0.14');
+              rect.setAttribute('stroke', failed ? 'var(--accent)' : 'var(--ink-deep)');
+            } else {
+              rect.setAttribute('fill', 'var(--bg-soft)');
+              rect.removeAttribute('fill-opacity');
+              rect.setAttribute('stroke', 'var(--muted-2)');
+            }
+          }
+          // compensation boxes
+          for (const k of [1, 2]) {
+            const g = bwd[k];
+            const active = i >= 0 && seq.slice(0, i + 1).some(s => s.kind === 'b' && s.step === k);
+            g.setAttribute('opacity', active ? '1' : '0.25');
+            const rect = g.querySelector('rect');
+            rect.setAttribute('fill', active ? 'var(--accent)' : 'none');
+            if (active) rect.setAttribute('fill-opacity', '0.12'); else rect.removeAttribute('fill-opacity');
+          }
+          if (i < 0) {
+            phase.textContent = '尚未開始';
+            log.innerHTML = '按 <strong>forward</strong> 開始推進工作流。';
+          } else {
+            phase.textContent = seq[i].phase;
+            log.innerHTML = seq[i].html;
+          }
+          fwdBtn.disabled = i >= seq.length - 1;
+          fwdBtn.textContent = (i >= 1 && i < seq.length - 1) ? 'unwind ▸' : 'forward ▸';
+        }
+
+        fwdBtn.addEventListener('click', () => { if (i < seq.length - 1) { i++; paint(); } });
+        resetBtn.addEventListener('click', () => { i = -1; paint(); });
+        paint();
+      })();
+    </script>
+  </figure>
+
+  <h2>錢已經離開 A 銀行——retry 為什麼救不了半成品</h2>
+
+  <p>失敗的場景很具體。Cloudflare 用一個跨行轉帳當例子：step 1 從 A 銀行扣款、step 2 對 B 銀行入帳、step 3 寄出確認。中間任何一步失敗，前面已完成的步驟就會把整條交易卡在一個半成品狀態——原文的說法是「if one step fails, it may leave earlier work from completed steps in an inconsistent or partial state」。錢扣了、沒到帳，這不是「還沒做完」，是「做了一半、而且做掉的那一半生效了」。</p>
+
+  <p>關鍵在於 step 1 一旦成功就無法簡單撤銷。Cloudflare 的描述是「Once the debit succeeds at Bank A, the transaction is committed and the money has left its system. As the orchestrator of the transaction, you cannot simply 'undo' the operation in Bank A's system.」你是這筆交易的 orchestrator，但 A 銀行的帳本不歸你管——對它而言那筆扣款是一筆已 commit 的合法交易，沒有 rollback API 讓你把它當作沒發生過。這跟資料庫 transaction 的 rollback 是兩回事：DB 的 rollback 靠的是還沒 commit 的 undo log，而這裡的副作用早就跨出了你的事務邊界，落在別人的系統裡。</p>
+
+  <p>retry 在這裡幫不上忙，甚至會把事情弄得更糟。durable execution 的 retry 是針對「同一步沒成功、再試一次」設計的；但 step 3 失敗時，問題不在 step 3 本身要不要再試，而在 step 1 和 step 2 已經生效的副作用要不要收回。重試 step 3 一萬次也改變不了「A 的錢已經出去了」這個事實。你需要的不是「往前再推一次」，而是「往回把已生效的動作一個個抵銷掉」——這是一個方向相反的操作，durable execution 原本的詞彙裡沒有它。</p>
+
+  <p>值得停下來想清楚 durable execution 到底承諾了什麼、又沒承諾什麼。它承諾的是「at-least-once 而且事實上 exactly-once 地把每一步跑完」：機器掛了、worker 漂移了、process 被 OOM kill 了，workflow 都能從持久化記錄接續回來，已完成的 step 讀結果而不重跑。這是一個關於「執行」的保證——它讓你不必自己寫 checkpoint、不必擔心一個長流程跑到一半斷電後從頭再來。但它對「跨系統的副作用是否語意一致」完全沉默。錢扣了、貨發了、第三方 API 已經回了 200，這些在 durable execution 眼裡都只是「某一步成功了」的事實記錄，它沒有義務、也沒有能力判斷這些事實合在一起是不是一個合理的最終狀態。</p>
+
+  <p>這也是為什麼這個洞拖到現在才補：它不是 bug，是 durable execution 抽象的邊界。持久化每一步、保證最終一致地把每一步跑完一次，這個保證本身是對的；它只是不延伸到「整條 workflow 是一個可復原的單元」。傳統上開發者怎麼補這一段？多半是手寫——在 workflow 外層包一個大的 try/catch，catch 到失敗後，自己按記憶把前面做過的事一件件反做回去。問題是這段「反做」邏輯散落在錯誤處理路徑上、跟正向邏輯離得很遠，又通常缺乏 durable execution 的 retry 與持久化保護：如果反做到一半又崩潰，前面反做過的部分會不會再反做一次？這段善後程式碼自己有沒有 durable？多數手寫版本對這些問題沒有好答案。要把這層補上，需要一個和「前進」對稱、而且同樣 durable 的概念。</p>
+
+  <h2>saga pattern——替每一步配一個反向動作</h2>
+
+  <p>saga 的想法不新，但 Cloudflare 給它一個乾淨的定義：每個會產生副作用的操作，都成對地帶一個「補償邏輯」——「This pairing of an operation and its compensation logic is called the saga pattern.」step 1 扣款，它的補償就是把錢退回去；step 2 入帳，它的補償就是把入帳沖銷掉。補償不是「undo」那種乾淨的時光倒流，它是另一個正向的業務操作，只是語意上抵銷前一個。退款本身也是一筆要 commit 的交易，只是它讓帳對得回來。</p>
+
+  <p>在 Workflows 裡，這對「操作 + 補償」被綁在同一個 step 上。補償邏輯作為 metadata 掛在 <code>step.do()</code> 上，跟著那一步走，而不是放在一個全域的 error handler 裡。Cloudflare 特別強調這個設計選擇：rollback 不是「a separate global error handler」，而是「metadata attached to the durable unit of work Workflows already understands」。這句話是整個機制的支點——rollback 不是事後補的災難處理，它是 durable execution 已經在追蹤的那個工作單元的一部分。寫起來大致是這樣：</p>
+
+  <pre data-kind="pseudocode"><code><em>// 每個 step 把自己的補償邏輯帶在身上</em>
+await step.do("debit-bank-a", () =&gt; bankA.debit(from, amount), {
+  rollback: async ({ output }) =&gt; bankA.credit(from, amount, output.id),
+});
+
+<em>// rollback 拿得到原始 output、觸發失敗的 error、以及 stepContext</em>
+<em>// 補償可以配自己的 retry / timeout 策略：</em>
+await step.do("credit-bank-b", () =&gt; bankB.credit(to, amount), {
+  rollback: async ({ output }) =&gt; {
+    if (output === undefined) return;        <em>// 這一步可能根本沒成功過</em>
+    await bankB.debit(to, amount);
+  },
+  rollbackConfig: {
+    retries: { limit: 10, delay: '30 seconds', backoff: 'exponential' },
+    timeout: '2 minutes',
+  },
+});
+</code></pre>
+
+  <p>觸發補償的時機很講究：不是「任何一步報錯就 unwind」。Cloudflare 的規則是——如果你的程式碼自己 catch 了錯誤並繼續往下走，workflow 就繼續，補償不啟動；只有當 workflow 本身要 terminal 地失敗時，補償才開始。原文是「Rollback starts when the Workflow itself is about to fail terminally.」這個區分讓 rollback 不會被中途的、被妥善處理掉的錯誤誤觸發。換句話說，rollback 是「workflow 認輸」這一刻的善後機制，不是每一步的 try/catch。</p>
+
+  <p>還有一個容易被忽略的細節：失敗的那一步自己也可能需要補償。如果 step 3 在失敗前已經產生了部分副作用、而它登記了 rollback handler，那它一樣是 rollback-eligible 的。所以 unwind 的範圍是「所有開始過或完成過、且登記了 rollback 的 step」，包含正在失敗的那一個。補償 handler 收到的 <code>output</code> 因此可能是 <code>undefined</code>——那一步也許根本沒跑成功、沒有產出。Cloudflare 明說「Rollback handlers receive <code>output</code>, but must handle <code>output === undefined</code>.」這個 undefined 不是 edge case，是補償邏輯必須正面處理的常態輸入。</p>
+
+  <h2>反向執行的順序——為什麼是 step-start order 而不是完成順序</h2>
+
+  <p>補償反向執行聽起來理所當然，但「反向於什麼」這個問題比想像中微妙。step 之間可以並行：step A 先開始、step B 後開始，但 B 可能先完成。如果用「完成順序的反向」來 unwind，順序會依賴執行時的時序，而時序是不穩定的——同一條 workflow 跑兩次，完成順序可能不同。Cloudflare 的選擇是用 step 開始的順序：「Completion order can differ from start order, so Workflows uses reverse step-start order instead of reverse completion order.」補償一律按「step 被啟動的順序」反向走，而這個啟動順序是被持久化下來的、穩定的事實。</p>
+
+  <p>用 start order 還有一層語意上的道理。後啟動的 step 通常建立在先啟動的 step 之上——step 2 的入帳依賴 step 1 的扣款先發生。要拆解這種依賴，自然要從最後堆上去的那塊開始拆：先補 step 2、再補 step 1，跟疊盤子反過來收是同一個直覺。如果反過來、先補 step 1 再補 step 2，就可能在 step 1 的前提已經被抹掉之後，才去執行依賴那個前提的 step 2 補償，邏輯上站不住。reverse start order 不只是「一個穩定的順序」，它還是「尊重依賴方向」的那個順序。</p>
+
+  <p>要特別說明的是，「補償」和「資料庫 rollback」是兩種完全不同的東西，名字相近容易混淆。DB transaction 的 rollback 靠的是還沒 commit 的 undo log，撤銷之後外界根本看不到任何痕跡，彷彿那段交易從未發生。saga 的補償做不到這種乾淨——step 1 的扣款已經 commit、已經被對方系統看見、可能已經觸發了對方的通知與帳務，補償能做的只是再發一筆語意相反的交易把帳對回來。對外界而言，發生的是「扣款，然後退款」兩筆事件，而不是「什麼都沒發生」。這個差別在審計、對帳、以及使用者體驗上都是實的：saga 給的是最終一致，不是原子性。下面這張圖把「Workflows 為每個 step 持久化了什麼」攤開——正是這份記錄讓 replay 之後還知道該補哪些、按什麼順序補。</p>
+
+  <figure class="vg-w-stack-saga-step-record" data-mobile="keep">
+    <style>
+      .vg-w-stack-saga-step-record { display: flex; flex-direction: column; gap: var(--s-3); align-items: stretch; margin: var(--s-4) 0; }
+      .vg-w-stack-saga-step-record input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-stack-saga-step-record .stack-title { font-family: IM Fell English, serif; font-style: italic; font-size: var(--fs-md); margin: 0 0 var(--s-1) 0; color: var(--ink); line-height: 1.4; }
+      .vg-w-stack-saga-step-record .stack-cards { display: flex; flex-direction: column; gap: var(--s-1); list-style: none; padding: 0; margin: 0; }
+      .vg-w-stack-saga-step-record .stack-cards label { display: block; padding: var(--s-2); border: 1px solid var(--muted-2); border-radius: 2px; cursor: pointer; transition: border-color 200ms, background 200ms; min-height: 44px; }
+      .vg-w-stack-saga-step-record .stack-cards label:hover { border-color: var(--accent); }
+      .vg-w-stack-saga-step-record .stack-cards .card-head { font-family: EB Garamond, serif; font-size: var(--fs-md); margin: 0 0 4px 0; color: var(--ink); display: flex; align-items: baseline; justify-content: space-between; gap: var(--s-2); flex-wrap: wrap; }
+      .vg-w-stack-saga-step-record .stack-cards .card-sub { font-family: IM Fell English, serif; font-style: italic; font-size: var(--fs-sm); color: var(--muted); margin: 0; line-height: 1.5; }
+      .vg-w-stack-saga-step-record .stack-cards .card-tag { font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); color: var(--accent-text); font-style: normal; }
+      .vg-w-stack-saga-step-record:has(#vg-w-stack-saga-step-record-r1:checked) .card-1,
+      .vg-w-stack-saga-step-record:has(#vg-w-stack-saga-step-record-r2:checked) .card-2,
+      .vg-w-stack-saga-step-record:has(#vg-w-stack-saga-step-record-r3:checked) .card-3,
+      .vg-w-stack-saga-step-record:has(#vg-w-stack-saga-step-record-r4:checked) .card-4,
+      .vg-w-stack-saga-step-record:has(#vg-w-stack-saga-step-record-r5:checked) .card-5 {
+        border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent);
+      }
+      .vg-w-stack-saga-step-record svg.diagram { display: none; }
+      @media (min-width: 720px) {
+        .vg-w-stack-saga-step-record svg.diagram { display: block; width: 100%; height: auto; max-width: 880px; }
+        .vg-w-stack-saga-step-record .stack-title { display: none; }
+        .vg-w-stack-saga-step-record .stack-cards { display: none; }
+      }
+      .vg-w-stack-saga-step-record .layer { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; }
+      .vg-w-stack-saga-step-record:has(#vg-w-stack-saga-step-record-r1:checked) .layer-1,
+      .vg-w-stack-saga-step-record:has(#vg-w-stack-saga-step-record-r2:checked) .layer-2,
+      .vg-w-stack-saga-step-record:has(#vg-w-stack-saga-step-record-r3:checked) .layer-3,
+      .vg-w-stack-saga-step-record:has(#vg-w-stack-saga-step-record-r4:checked) .layer-4,
+      .vg-w-stack-saga-step-record:has(#vg-w-stack-saga-step-record-r5:checked) .layer-5 {
+        fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent);
+      }
+      .vg-w-stack-saga-step-record .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+      .vg-w-stack-saga-step-record:has(#vg-w-stack-saga-step-record-r1:checked) .detail-1,
+      .vg-w-stack-saga-step-record:has(#vg-w-stack-saga-step-record-r2:checked) .detail-2,
+      .vg-w-stack-saga-step-record:has(#vg-w-stack-saga-step-record-r3:checked) .detail-3,
+      .vg-w-stack-saga-step-record:has(#vg-w-stack-saga-step-record-r4:checked) .detail-4,
+      .vg-w-stack-saga-step-record:has(#vg-w-stack-saga-step-record-r5:checked) .detail-5 { display: block; }
+      .vg-w-stack-saga-step-record .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--ink); }
+      .vg-w-stack-saga-step-record .detail p { margin: 0; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-stack-saga-step-record .hint { font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); margin: 0 0 var(--s-1) 0; }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor"
+           stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>
+      </svg>
+      <span>點任一欄看 Workflows 替每個 step 持久化了什麼 · 5 個欄位</span>
+    </p>
+
+    <input type="radio" id="vg-w-stack-saga-step-record-r1" name="vg-w-stack-saga-step-record-sel" checked aria-label="started"/>
+    <input type="radio" id="vg-w-stack-saga-step-record-r2" name="vg-w-stack-saga-step-record-sel" aria-label="completed"/>
+    <input type="radio" id="vg-w-stack-saga-step-record-r3" name="vg-w-stack-saga-step-record-sel" aria-label="returned"/>
+    <input type="radio" id="vg-w-stack-saga-step-record-r4" name="vg-w-stack-saga-step-record-sel" aria-label="skip flag"/>
+    <input type="radio" id="vg-w-stack-saga-step-record-r5" name="vg-w-stack-saga-step-record-sel" aria-label="rollback registered"/>
+
+    <p class="stack-title" id="vg-w-stack-saga-step-record-title">每個 step 的持久化記錄——replay 與 unwind 都讀這份</p>
+    <ul class="stack-cards" aria-labelledby="vg-w-stack-saga-step-record-title">
+      <li class="card-1"><label for="vg-w-stack-saga-step-record-r1">
+        <p class="card-head"><span>started</span><code class="card-tag">order</code></p>
+        <p class="card-sub">step 是否已啟動，以及啟動的順序——unwind 反向走的就是這個順序。</p>
+      </label></li>
+      <li class="card-2"><label for="vg-w-stack-saga-step-record-r2">
+        <p class="card-head"><span>completed</span><code class="card-tag">bool</code></p>
+        <p class="card-sub">step 是否完成。決定它在 replay 時要不要 skip、是否進入 rollback-eligible 集合。</p>
+      </label></li>
+      <li class="card-3"><label for="vg-w-stack-saga-step-record-r3">
+        <p class="card-head"><span>returned</span><code class="card-tag">output</code></p>
+        <p class="card-sub">step 回傳了什麼。replay 時直接讀這份持久化結果而不重跑 body；補償 handler 也拿它當 output。</p>
+      </label></li>
+      <li class="card-4"><label for="vg-w-stack-saga-step-record-r4">
+        <p class="card-head"><span>skip-on-resume</span><code class="card-tag">flag</code></p>
+        <p class="card-sub">workflow 之後 resume 時，這一步該被跳過而不是重做——durable execution 不重跑已完成步驟的依據。</p>
+      </label></li>
+      <li class="card-5"><label for="vg-w-stack-saga-step-record-r5">
+        <p class="card-head"><span>rollback registered</span><code class="card-tag">new</code></p>
+        <p class="card-sub">這一步有沒有登記補償邏輯——rollback 新加的欄位，unwind 只需替「有補償且 eligible」的 step 重建 handler。</p>
+      </label></li>
+    </ul>
+
+    <svg class="diagram" viewBox="0 0 880 320" role="img"
+         aria-label="Workflows 為每個 step 持久化的五個欄位">
+      <text x="60" y="30" fill="var(--ink)" font-family="EB Garamond, serif" font-size="15">每個 step 的持久化記錄——replay 與 unwind 都讀這份</text>
+
+      <rect class="layer layer-1" x="60" y="50" width="760" height="46" rx="4" role="button" tabindex="0" aria-label="started"/>
+      <text x="80" y="72" fill="var(--ink)" font-family="JetBrains Mono, monospace" font-size="13">started · order</text>
+      <text x="80" y="89" fill="var(--muted)" font-family="EB Garamond, serif" font-size="12.5">step 是否啟動 + 啟動順序——unwind 反向依據的穩定來源</text>
+
+      <rect class="layer layer-2" x="60" y="104" width="760" height="46" rx="4" role="button" tabindex="0" aria-label="completed"/>
+      <text x="80" y="126" fill="var(--ink)" font-family="JetBrains Mono, monospace" font-size="13">completed · bool</text>
+      <text x="80" y="143" fill="var(--muted)" font-family="EB Garamond, serif" font-size="12.5">是否完成——決定 replay 是否 skip、是否 rollback-eligible</text>
+
+      <rect class="layer layer-3" x="60" y="158" width="760" height="46" rx="4" role="button" tabindex="0" aria-label="returned"/>
+      <text x="80" y="180" fill="var(--ink)" font-family="JetBrains Mono, monospace" font-size="13">returned · output</text>
+      <text x="80" y="197" fill="var(--muted)" font-family="EB Garamond, serif" font-size="12.5">回傳值——replay 直接讀它、不重跑 body；補償拿它當 output</text>
+
+      <rect class="layer layer-4" x="60" y="212" width="760" height="46" rx="4" role="button" tabindex="0" aria-label="skip on resume"/>
+      <text x="80" y="234" fill="var(--ink)" font-family="JetBrains Mono, monospace" font-size="13">skip-on-resume · flag</text>
+      <text x="80" y="251" fill="var(--muted)" font-family="EB Garamond, serif" font-size="12.5">resume 時該跳過而非重做——durable 不重跑已完成步驟的依據</text>
+
+      <rect class="layer layer-5" x="60" y="266" width="760" height="46" rx="4" role="button" tabindex="0" aria-label="rollback registered"/>
+      <text x="80" y="288" fill="var(--accent-text)" font-family="JetBrains Mono, monospace" font-size="13">rollback registered · new</text>
+      <text x="80" y="305" fill="var(--muted)" font-family="EB Garamond, serif" font-size="12.5">是否登記補償——rollback 新加欄位，只替 eligible 步驟重建 handler</text>
+    </svg>
+
+    <div>
+      <p class="hint">點上方任一欄看細節</p>
+      <div class="detail detail-1"><h3>started · 啟動順序</h3><p>記錄 step 是否啟動、以及啟動的先後。並行的 step 完成順序不定，但啟動順序是穩定且持久的——這就是 unwind 反向遍歷的依據。</p></div>
+      <div class="detail detail-2"><h3>completed · 是否完成</h3><p>標記這一步有沒有跑完。replay 看到 completed 就直接讀結果跳過；unwind 用它判斷哪些步驟進入 rollback-eligible 集合。</p></div>
+      <div class="detail detail-3"><h3>returned · 回傳值</h3><p>step body 的回傳被持久化。replay 觸及一個 completed 的 step.do() 時讀這份結果、不重跑；補償 handler 也以它為 output（可能是 undefined）。</p></div>
+      <div class="detail detail-4"><h3>skip-on-resume · 跳過旗標</h3><p>workflow 之後 resume 時，這一步該被跳過而不是重複執行。這是 durable execution「已完成步驟不重跑」這個保證的落點。</p></div>
+      <div class="detail detail-5"><h3>rollback registered · 補償旗標</h3><p>rollback 機制新增的記錄：這一步有沒有掛補償邏輯。Workflows 只需要替「有 rollback 且 eligible」的 step 重建 handler，不必重建全部。</p></div>
+    </div>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-stack-saga-step-record');
+        if (!root) return;
+        const rects = root.querySelectorAll('svg.diagram .layer');
+        rects.forEach((rect, idx) => {
+          const radio = root.querySelector('#vg-w-stack-saga-step-record-r' + (idx + 1));
+          rect.addEventListener('click', () => { if (radio) radio.checked = true; });
+          rect.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); rect.dispatchEvent(new MouseEvent('click', { bubbles: true })); }
+          });
+        });
+      })();
+    </script>
+  </figure>
+
+  <h2>接回 durable execution——replay、idempotency、與補償的重建</h2>
+
+  <p>rollback 要能在崩潰之後仍然正確執行，靠的是它和 durable execution 共用同一套底層機制。Workflows 對每一步記錄的，原文列得很清楚：「Workflows records that the step started, whether it completed, what it returned, and whether it should be skipped instead of repeated if the Workflow resumes later.」啟動了沒、完成了沒、回傳了什麼、resume 時該不該跳過——rollback 在這份記錄上多加了一欄：這一步有沒有登記補償。這一欄就是 unwind 的索引。</p>
+
+  <p>replay 的語意決定了補償不會被重複觸發。當 replay 走到一個已完成的 <code>step.do()</code>，Workflows 直接讀持久化的結果、不重跑 step body——「When replay reaches a completed <code>step.do()</code>, Workflows reads the persisted result instead of running the step body again.」這對 rollback 的意義是：崩潰後重新啟動、workflow replay 到失敗點，那些已完成的正向 step 不會再執行一次（避免又扣一次錢），而 Workflows 知道哪些 step 完成過、哪些登記了補償，於是只需要替「有 rollback 且 eligible」的那些 step 重建 handler，而不是把整條 workflow 的 handler 全部重建。replay 把狀態還原到失敗的那一刻，unwind 從那裡接手。</p>
+
+  <p>但 replay 的「不重跑」只保證正向 step 不被重複執行，它管不到補償本身。補償在執行中也可能崩潰、可能 retry——而 retry 意味著同一個補償動作可能跑超過一次。所以 Cloudflare 把一個責任明白地推回給開發者：補償函式必須 idempotent。原文是「Rollback functions should be idempotent, just like regular Workflow steps. If you refund a charge, use the payment provider's idempotency key.」退款這種補償，要用支付方提供的 idempotency key，讓「退兩次」在對方系統裡折疊成「退一次」。這不是 Workflows 幫你保證的，是你寫補償時要自己守的不變式。</p>
+
+  <p>把這幾件事串起來：補償和正向 step 共用同一套機器——同樣的 retry、timeout、lifecycle event、log、以及最後一筆被記錄下來的結果。補償不是一個跑在框架外的特殊路徑，它就是一個方向相反的 durable step。也正因如此，它繼承了 durable step 的所有保證與所有責任，包括那條「請自己保證 idempotent」。下面這張圖把崩潰後的恢復路徑畫出來：replay 還原、定位失敗、只重建有補償的 step、反向執行。</p>
+
+  <figure class="vg-w-flow-saga-recovery" data-mobile="keep" data-svg-scroll="720">
+    <svg viewBox="0 0 720 360" role="img"
+         aria-label="崩潰後 rollback 的恢復路徑——replay 還原、定位失敗、重建補償 handler、反向執行"
+         style="width: 100%; height: auto; max-width: 720px;">
+      <style>
+        .vg-w-flow-saga-recovery text { font-family: EB Garamond, serif; font-size: 12.5px; }
+        .vg-w-flow-saga-recovery .lbl { font-family: JetBrains Mono, monospace; font-size: 12px; }
+        .vg-w-flow-saga-recovery .sub { fill: var(--muted); font-size: 11.5px; }
+        .vg-w-flow-saga-recovery .note { font-family: IM Fell English, serif; font-style: italic; fill: var(--muted); font-size: 12px; }
+      </style>
+      <defs>
+        <marker id="vg-w-flow-saga-recovery-arr" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+          <path d="M0,0 L7,3.5 L0,7 Z" fill="var(--muted)"/>
+        </marker>
+      </defs>
+
+      <text x="360" y="28" text-anchor="middle" fill="var(--ink)" font-family="EB Garamond, serif" font-size="15">崩潰之後：從持久化記錄重建 unwind</text>
+
+      <rect x="60" y="50" width="240" height="58" rx="6" fill="var(--ink-deep)" fill-opacity="0.08" stroke="var(--ink-deep)" stroke-width="1.4"/>
+      <text x="180" y="74" text-anchor="middle" fill="var(--ink-deep)" class="lbl">1 · replay</text>
+      <text x="180" y="93" text-anchor="middle" class="sub">讀持久化結果還原狀態，completed step 不重跑</text>
+
+      <line x1="300" y1="79" x2="346" y2="79" stroke="var(--muted)" stroke-width="1.4" marker-end="url(#vg-w-flow-saga-recovery-arr)"/>
+
+      <rect x="350" y="50" width="240" height="58" rx="6" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.4"/>
+      <text x="470" y="74" text-anchor="middle" fill="var(--ink)" class="lbl">2 · 定位失敗點</text>
+      <text x="470" y="93" text-anchor="middle" class="sub">workflow 即將 terminal fail，啟動 rollback</text>
+
+      <line x1="470" y1="108" x2="470" y2="146" stroke="var(--muted)" stroke-width="1.4" marker-end="url(#vg-w-flow-saga-recovery-arr)"/>
+
+      <rect x="350" y="150" width="240" height="58" rx="6" fill="var(--accent)" fill-opacity="0.1" stroke="var(--accent)" stroke-width="1.5"/>
+      <text x="470" y="174" text-anchor="middle" fill="var(--accent-text)" class="lbl">3 · 只重建有補償的 step</text>
+      <text x="470" y="193" text-anchor="middle" class="sub">讀 rollback-registered 欄位，挑出 eligible 子集</text>
+
+      <line x1="350" y1="179" x2="304" y2="179" stroke="var(--muted)" stroke-width="1.4" marker-end="url(#vg-w-flow-saga-recovery-arr)"/>
+
+      <rect x="60" y="150" width="240" height="58" rx="6" fill="var(--accent)" fill-opacity="0.1" stroke="var(--accent)" stroke-width="1.5"/>
+      <text x="180" y="174" text-anchor="middle" fill="var(--accent-text)" class="lbl">4 · 反向執行補償</text>
+      <text x="180" y="193" text-anchor="middle" class="sub">按 reverse step-start order 逐一抵銷副作用</text>
+
+      <line x1="180" y1="208" x2="180" y2="246" stroke="var(--muted)" stroke-width="1.4" marker-end="url(#vg-w-flow-saga-recovery-arr)"/>
+
+      <rect x="60" y="250" width="530" height="58" rx="6" fill="var(--sage-deep)" fill-opacity="0.08" stroke="var(--sage-deep)" stroke-width="1.4"/>
+      <text x="325" y="274" text-anchor="middle" fill="var(--sage-deep)" class="lbl">5 · 補償本身也是 durable step</text>
+      <text x="325" y="293" text-anchor="middle" class="sub">共用 retry / timeout / log；可能跑超過一次 → 必須 idempotent</text>
+
+      <text x="360" y="340" text-anchor="middle" class="note">replay 把狀態還原到失敗的那一刻，unwind 從那裡接手——同一份持久化記錄，兩個方向。</text>
+    </svg>
+    <figcaption>
+      崩潰後的恢復不是把整條 workflow 重來，而是 replay 還原狀態、只替「登記了補償且 eligible」的 step 重建 handler、按 reverse step-start order 反向執行。補償與正向 step 共用同一套 durable 機器，所以也共用「請自己保證 idempotent」這條責任。
+    </figcaption>
+  </figure>
+
+  <h2>給開發者的後果——多了什麼保證，又多了什麼責任</h2>
+
+  <p>對寫 workflow 的人來說，這套機制改變的不只是「多一個選項」。它把一個原本散落在各處、靠人記得手寫的善後邏輯，收斂成一個跟著 step 走的 metadata。把補償綁在 <code>step.do()</code> 上、而不是放在一個全域 error handler 裡，意味著當你新增、刪除、調整一個 step 時，它的補償就在旁邊——不容易發生「改了正向邏輯卻忘了同步改某個遠處的 undo 分支」這種漂移。Cloudflare 也談到他們刻意避開了 fluent 風格（<code>step.do(...).rollback(...)</code>）和 builder 風格（<code>step.saga().do().rollback().run()</code>）的 API，理由各不相同——下面這張表把三種設計的取捨並排，點 header 可排序。</p>
+
+  <figure class="vg-w-table-saga-api-design" data-mobile="keep">
+    <style>
+      .vg-w-table-saga-api-design { overflow-x: auto; margin: var(--s-4) 0; }
+      .vg-w-table-saga-api-design table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-saga-api-design thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; }
+      .vg-w-table-saga-api-design thead th[data-sort] { color: var(--accent-text); }
+      .vg-w-table-saga-api-design tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+      .vg-w-table-saga-api-design tbody tr.chosen td { background: color-mix(in srgb, var(--accent) 7%, transparent); }
+      .vg-w-table-saga-api-design code { font-size: 0.92em; }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor"
+           stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/><path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+      </svg>
+      <span>點欄位標頭排序 · 3 種 API 形態 × 4 個面向</span>
+    </p>
+    <table>
+      <thead>
+        <tr>
+          <th data-key="form">API 形態</th>
+          <th data-key="shape">寫法骨架</th>
+          <th data-key="why">Cloudflare 的取捨</th>
+          <th data-key="verdict">結論</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr class="chosen">
+          <td>metadata on step</td>
+          <td><code>step.do(name, fn, { rollback })</code></td>
+          <td>補償是掛在「durable 工作單元」上的 metadata，不是另一個全域 error handler；補償就在正向邏輯旁邊。</td>
+          <td>採用</td>
+        </tr>
+        <tr>
+          <td>fluent</td>
+          <td><code>step.do(...).rollback(...)</code></td>
+          <td>會牽動 promise pipelining——在 future 值尚未完全回到呼叫端前就對它呼叫方法，讓 step 時序變得難以預測。</td>
+          <td>否決</td>
+        </tr>
+        <tr>
+          <td>builder</td>
+          <td><code>step.saga().do().rollback().run()</code></td>
+          <td>每個 step 都要收一個 <code>.run()</code>，忘了收很容易、又難用工具察覺；連單步的簡單情況都長得像一串設定鏈。</td>
+          <td>否決</td>
+        </tr>
+      </tbody>
+    </table>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-table-saga-api-design');
+        if (!root) return;
+        const headers = root.querySelectorAll('thead th');
+        const tbody = root.querySelector('tbody');
+        let activeKey = null, asc = true;
+        headers.forEach(h => h.addEventListener('click', () => {
+          const key = h.dataset.key;
+          if (activeKey === key) asc = !asc; else { activeKey = key; asc = true; }
+          headers.forEach(x => x.removeAttribute('data-sort'));
+          h.setAttribute('data-sort', asc ? 'asc' : 'desc');
+          const rows = [...tbody.querySelectorAll('tr')];
+          const idx = [...headers].indexOf(h);
+          rows.sort((a, b) => {
+            const av = a.children[idx].textContent.trim();
+            const bv = b.children[idx].textContent.trim();
+            return asc ? av.localeCompare(bv, 'zh-Hant') : bv.localeCompare(av, 'zh-Hant');
+          });
+          rows.forEach(r => tbody.appendChild(r));
+        }));
+      })();
+    </script>
+  </figure>
+
+  <p>但保證的另一面是責任。這套機制把幾件事明白地放回開發者肩上。第一是 idempotency：補償可能 retry、可能跑超過一次，框架不替你去重，要 idempotent key 你得自己帶。第二是 <code>output === undefined</code> 的處理：補償拿到的 output 可能是空的，因為登記補償的那一步也許根本沒成功——你的補償邏輯得能優雅地對「沒有東西可補」這件事收手，而不是對著 undefined 拋例外。第三是補償本身的失敗：補償是個會 retry、會 timeout 的 durable step，所以它也會失敗，你得替它配 <code>rollbackConfig</code> 的 retry 與 timeout 策略，並接受「補償也可能補不成功」這個現實。</p>
+
+  <p>還有一個語意上的提醒值得記住：rollback 只在 workflow 要 terminal 失敗時才啟動，被你 catch 並繼續的錯誤不會觸發它。這把「workflow 認輸」和「某一步出錯但被處理掉」清楚地分開了——好處是補償不會被中途的小錯誤誤觸發，代價是你得清楚自己哪些錯誤是 catch 後繼續、哪些是讓它往上冒到 terminal。哪些副作用該配補償、哪些業務上其實可以容忍半成品（例如一封沒寄出的確認信通常不需要 unwind 前面的轉帳），這個判斷框架不替你做。saga 給的是執行反向動作的可靠機制，不是替你想清楚「什麼該被反向」。</p>
+
+  <p>把有沒有 rollback 的兩條結局並排看，最能說明這套機制到底買到了什麼。沒有補償時，step 3 失敗留下的是一個「扣了款、沒到帳」的不一致殘局，需要有人事後手動對帳、手動退款，而且這個善後本身不 durable——對帳腳本跑到一半掛了，沒人知道退到哪裡。有補償時，同樣的失敗會走進一段 durable 的 unwind：每個補償都帶 retry 與 timeout、每一步都被記錄、最終帳對得回來。代價是你要為每個有副作用的 step 多寫一個 idempotent 的補償、並接受最終狀態是「兩筆相反交易」而非「無痕」。</p>
+
+  <figure class="vg-w-arch-saga-two-endings" data-mobile="keep" data-svg-scroll="720">
+    <svg viewBox="0 0 720 300" role="img"
+         aria-label="同一個失敗的兩種結局——沒有補償的不一致殘局，與 saga unwind 的一致失敗"
+         style="width: 100%; height: auto; max-width: 720px;">
+      <style>
+        .vg-w-arch-saga-two-endings text { font-family: EB Garamond, serif; font-size: 12.5px; }
+        .vg-w-arch-saga-two-endings .hd { font-family: var(--sans); font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; }
+        .vg-w-arch-saga-two-endings .sub { fill: var(--muted); font-size: 11.5px; }
+      </style>
+      <text x="360" y="26" text-anchor="middle" fill="var(--ink)" font-family="EB Garamond, serif" font-size="15">step 3 失敗——兩種結局</text>
+
+      <text x="180" y="56" text-anchor="middle" fill="var(--muted)" class="hd">沒有補償</text>
+      <rect x="50" y="70" width="260" height="44" rx="5" fill="var(--accent)" fill-opacity="0.1" stroke="var(--accent)" stroke-width="1.4"/>
+      <text x="180" y="90" text-anchor="middle" fill="var(--accent-text)">A 已扣 · B 未確認入帳</text>
+      <text x="180" y="106" text-anchor="middle" class="sub">不一致殘局</text>
+      <rect x="50" y="126" width="260" height="38" rx="5" fill="none" stroke="var(--muted-2)" stroke-width="1.2"/>
+      <text x="180" y="150" text-anchor="middle" fill="var(--ink)">人工對帳 + 手動退款</text>
+      <rect x="50" y="176" width="260" height="38" rx="5" fill="none" stroke="var(--muted-2)" stroke-width="1.2" stroke-dasharray="4,3"/>
+      <text x="180" y="200" text-anchor="middle" fill="var(--muted)">善後腳本不 durable，崩了沒人知進度</text>
+      <text x="180" y="240" text-anchor="middle" fill="var(--accent-text)" font-family="IM Fell English, serif" font-style="italic">結局：狀態不一致，靠人收尾</text>
+
+      <line x1="360" y1="60" x2="360" y2="252" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="3,3"/>
+
+      <text x="540" y="56" text-anchor="middle" fill="var(--muted)" class="hd">有補償 · saga unwind</text>
+      <rect x="410" y="70" width="260" height="44" rx="5" fill="var(--sage-deep)" fill-opacity="0.1" stroke="var(--sage-deep)" stroke-width="1.4"/>
+      <text x="540" y="90" text-anchor="middle" fill="var(--sage-deep)">reverse start order 反向補償</text>
+      <text x="540" y="106" text-anchor="middle" class="sub">rollback 2 → rollback 1</text>
+      <rect x="410" y="126" width="260" height="38" rx="5" fill="none" stroke="var(--sage)" stroke-width="1.2"/>
+      <text x="540" y="150" text-anchor="middle" fill="var(--ink)">每個補償帶 retry / timeout / log</text>
+      <rect x="410" y="176" width="260" height="38" rx="5" fill="none" stroke="var(--sage)" stroke-width="1.2"/>
+      <text x="540" y="200" text-anchor="middle" fill="var(--ink)">補償 idempotent · 崩潰後可續</text>
+      <text x="540" y="240" text-anchor="middle" fill="var(--sage-deep)" font-family="IM Fell English, serif" font-style="italic">結局：失敗但狀態一致，帳對得回來</text>
+
+      <text x="360" y="282" text-anchor="middle" fill="var(--muted)" font-family="IM Fell English, serif" font-style="italic" font-size="12">買到的是「一致地失敗」，代價是每個副作用多一個 idempotent 補償，且最終狀態非無痕。</text>
+    </svg>
+    <figcaption>
+      saga rollback 不讓失敗消失，它讓失敗變得一致且可自動善後。沒有補償的那條路不是「不會失敗」，而是把不一致與善後責任推給事後的人工流程。
+    </figcaption>
+  </figure>
+
+  <p class="vg-deep-closer"><strong>What changes</strong>：durable execution 保證每一步最終會跑完，saga rollback 補上「跑了一半時把已生效的副作用反向收回」——但它把 idempotency、undefined output、補償自身的失敗，明白地留給你守。</p>
+</div>
