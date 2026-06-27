@@ -1,0 +1,566 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">你的 AI coding assistant 替使用者跑了一段它剛生出來的程式碼，這段程式碼可以任意呼叫 shell。你需要一個沙箱，它要像 VM 一樣關得住惡意碼，要像 container 一樣秒開，還要在使用者來回對話的十分鐘空檔裡記得上一步裝了什麼套件——這三件事，過去你只能挑兩件。</p>
+  <h1 class="vg-post-title">Lambda microVMs，從零講起——Firecracker snapshot 怎麼讓「VM 級隔離」也能秒啟又保狀態</h1>
+</header>
+
+<div class="vg-post-prose">
+
+<p><span class="vg-dropcap">讀</span>完這篇之後，你會知道一件事：AWS 在 6 月 22 日上線的 Lambda microVMs，並不是「Lambda function 變大隻」，而是把 Firecracker 的 snapshot 與 suspend/resume 兩個底層能力，包成了兩個可以直接呼叫的 API。文章會先把你手上那個沙箱需求攤開，再講為什麼 VM 與 container 都各差一截，然後逐層拆 snapshot、suspend/resume、stateful execution 三個機制——你會看到「VM 級隔離又能秒啟又保狀態」這組看似互斥的條件，是怎麼靠一份預先初始化的記憶體快照同時成立的。</p>
+
+<h2>那段你不敢直接 exec 的程式碼——沙箱的三個不可能三角</h2>
+
+<p>先把場景講具體。你在做一個會幫使用者跑程式碼的服務：可能是 AI coding assistant，使用者要它「寫個爬蟲然後跑跑看」；可能是線上的互動式程式碼環境，使用者在瀏覽器裡敲 Python 按執行；可能是資料分析平台，讓人上傳 notebook 自己跑。AWS 自己列的場景就是這幾類——原文寫的是「AI coding assistants, interactive code environments, data analytics platforms, vulnerability scanners, and game servers that run user-supplied scripts」。漏洞掃描器與跑使用者腳本的遊戲伺服器也在同一張清單上。</p>
+
+<p>這些工作有一個共同的形狀：你要執行的程式碼，不是你寫的。它可能是使用者貼的，可能是 LLM 生出來的。你不能假設它善良。它可能想讀別的租戶的資料、想打你的內網、想把整台機器的 CPU 吃乾。所以第一個要求是隔離——而且是強到敢拿來裝不可信程式碼的隔離。</p>
+
+<p>第二個要求是快。這是互動式工作：使用者按下執行，等三分鐘才看到環境起來，這個產品就死了。啟動延遲必須低到使用者感覺不到。</p>
+
+<p>第三個要求最容易被忽略，但最關鍵：保狀態。使用者跟 AI 來回對話，第一輪裝了 numpy，第二輪要它畫圖。如果每一輪都是全新環境，前一輪 pip install 的東西全沒了，每次都要重裝。一個互動 session 裡，環境必須記得上一步——記憶體裡的變數、磁碟上裝好的套件、還在跑的 process，都要在。</p>
+
+<p>強隔離、低延遲、保狀態。麻煩在於，市面上現成的兩個工具，各自只給你其中兩個。</p>
+
+<h2>VM 給你隔離但慢，container 給你快但要自己 hardening</h2>
+
+<p>傳統虛擬機是隔離的標準答案。每個 VM 有自己的 guest kernel，靠硬體虛擬化把租戶之間隔開——這道邊界夠硬，硬到雲廠商敢拿來做 multi-tenant。問題出在啟動。AWS 在公告裡的講法很直白：「Virtual machines deliver strong isolation but take minutes to start.」隔離強，但啟動以分鐘計。對一個使用者按下執行就要看到結果的互動產品來說，分鐘級的冷啟動是不能接受的。</p>
+
+<p>那 container 呢？container 的賣點正好是 VM 的痛點：秒級啟動。同一份公告接著說「Containers launch in seconds, yet their shared-kernel architecture requires significant custom hardening to safely contain untrusted code.」秒啟沒問題，但 container 共用主機的 kernel——所有 container 跟宿主機跑的是同一個 Linux kernel，隔離靠的是 namespace 與 cgroup 這類 kernel 功能，而不是一道硬體邊界。要拿這種東西去裝不可信程式碼，你得自己堆上大量的自訂 hardening：seccomp profile、user namespace 重映射、gVisor 之類的 syscall 攔截層。這些都做得到，但都是你自己的責任，做錯一個地方就是一個逃逸。</p>
+
+<p>把這兩端放進一張圖會更清楚。一個軸是隔離強度，一個軸是啟動延遲。VM 落在「隔離強、啟動慢」那一角；container 落在「啟動快、隔離靠自己補」那一角；傳統的 Lambda function 啟動極快，但它的模型是短命、無狀態、一次呼叫做完就回收，不是給你開一個能保狀態的長 session。三個既有選項，沒有一個剛好落在你要的位置。</p>
+
+<figure class="vg-w-chart-isolation-startup" data-mobile="static" data-svg-scroll="720">
+  <style>
+    .vg-w-chart-isolation-startup { display: grid; grid-template-rows: auto 1fr auto; gap: var(--s-2); }
+    .vg-w-chart-isolation-startup .controls { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+    .vg-w-chart-isolation-startup .controls button { font-family: var(--sans); font-size: var(--fs-sm); padding: 6px 12px; min-height: 36px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); cursor: pointer; border-radius: 2px; }
+    .vg-w-chart-isolation-startup .controls button:hover { border-color: var(--accent); color: var(--accent-text); }
+    .vg-w-chart-isolation-startup .controls button[aria-pressed="true"] { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); color: var(--accent-text); }
+    .vg-w-chart-isolation-startup .vg-w-affordance { display: flex; align-items: center; gap: 6px; font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); margin: 0; }
+    .vg-w-chart-isolation-startup .vg-w-affordance svg { width: 14px !important; height: 14px !important; min-width: 14px; }
+    .vg-w-chart-isolation-startup svg.vg-w-chart-isolation-startup-main { width: 100%; height: auto; }
+    .vg-w-chart-isolation-startup figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    .vg-w-chart-isolation-startup .pt { cursor: pointer; }
+    @media (hover: none) and (pointer: coarse) { .vg-w-chart-isolation-startup [data-vg-controls] { display: none; } }
+  </style>
+
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M9 11a3 3 0 1 0 6 0a3 3 0 0 0-6 0"/><path d="M12 2v3"/><path d="M12 19v3"/><path d="M2 12h3"/><path d="M19 12h3"/>
+    </svg>
+    <span>點任一點或下方按鈕，看它落在哪個象限 · 4 個運算選項</span>
+  </p>
+
+  <div class="controls" data-vg-controls>
+    <button id="vg-w-chart-isolation-startup-b-vm" aria-pressed="false">VM</button>
+    <button id="vg-w-chart-isolation-startup-b-ctr" aria-pressed="false">container</button>
+    <button id="vg-w-chart-isolation-startup-b-fn" aria-pressed="false">Lambda function</button>
+    <button id="vg-w-chart-isolation-startup-b-mvm" aria-pressed="true">microVM</button>
+  </div>
+
+  <svg class="vg-w-chart-isolation-startup-main" viewBox="0 0 720 420" role="img" aria-label="isolation strength versus startup latency positioning chart">
+    <line x1="80" y1="370" x2="690" y2="370" stroke="var(--muted-2)" stroke-width="1"/>
+    <line x1="80" y1="40"  x2="80"  y2="370" stroke="var(--muted-2)" stroke-width="1"/>
+    <text x="385" y="404" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--muted)">啟動延遲（左快 → 右慢）</text>
+    <text x="34" y="205" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--muted)" transform="rotate(-90 34 205)">隔離強度（下弱 → 上強）</text>
+
+    <g font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">
+      <text x="150" y="388" text-anchor="middle">~ms</text>
+      <text x="350" y="388" text-anchor="middle">~秒</text>
+      <text x="600" y="388" text-anchor="middle">~分鐘</text>
+      <text x="74" y="330" text-anchor="end">shared-kernel</text>
+      <text x="74" y="120" text-anchor="end">硬體邊界</text>
+    </g>
+
+    <line x1="80" y1="205" x2="690" y2="205" stroke="var(--line)" stroke-width="1" stroke-dasharray="4 5"/>
+
+    <g id="vg-w-chart-isolation-startup-pt-mvm" class="pt" role="button" tabindex="0" aria-label="microVM">
+      <circle cx="170" cy="100" r="11" fill="var(--accent)"/>
+      <text x="188" y="96" font-family="Manrope, sans-serif" font-size="14" fill="var(--ink)">microVM</text>
+      <text x="188" y="114" font-family="JetBrains Mono, monospace" font-size="10" fill="var(--muted)">snapshot resume · VM 邊界</text>
+    </g>
+    <g id="vg-w-chart-isolation-startup-pt-vm" class="pt" role="button" tabindex="0" aria-label="VM">
+      <circle cx="600" cy="90" r="11" fill="var(--ink-deep)"/>
+      <text x="582" y="76" text-anchor="end" font-family="Manrope, sans-serif" font-size="14" fill="var(--ink)">VM</text>
+      <text x="582" y="94" text-anchor="end" font-family="JetBrains Mono, monospace" font-size="10" fill="var(--muted)">guest kernel · 冷開機分鐘級</text>
+    </g>
+    <g id="vg-w-chart-isolation-startup-pt-ctr" class="pt" role="button" tabindex="0" aria-label="container">
+      <circle cx="300" cy="295" r="11" fill="var(--sage-deep)"/>
+      <text x="318" y="291" font-family="Manrope, sans-serif" font-size="14" fill="var(--ink)">container</text>
+      <text x="318" y="309" font-family="JetBrains Mono, monospace" font-size="10" fill="var(--muted)">shared kernel · 要自補 hardening</text>
+    </g>
+    <g id="vg-w-chart-isolation-startup-pt-fn" class="pt" role="button" tabindex="0" aria-label="Lambda function">
+      <circle cx="150" cy="320" r="11" fill="var(--muted)"/>
+      <text x="168" y="316" font-family="Manrope, sans-serif" font-size="14" fill="var(--ink)">Lambda function</text>
+      <text x="168" y="334" font-family="JetBrains Mono, monospace" font-size="10" fill="var(--muted)">極快但短命無狀態</text>
+    </g>
+
+    <rect id="vg-w-chart-isolation-startup-halo" x="153" y="83" width="34" height="34" rx="17" fill="none" stroke="var(--accent)" stroke-width="1.5" stroke-dasharray="3 4"/>
+  </svg>
+
+  <figcaption>同一張隔離 × 啟動延遲的平面上，VM 在右上（強隔離但慢）、container 與傳統 function 在下方（快但隔離弱或無狀態）。microVM 的目標位置是左上角——靠硬體邊界拿隔離，靠 snapshot resume 拿速度。象限位置是依公告對各方案的定性描述放置，非實測座標。</figcaption>
+
+  <script>
+  (function () {
+    if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+    var root = document.querySelector('.vg-w-chart-isolation-startup');
+    if (!root) return;
+    var halo = root.querySelector('#vg-w-chart-isolation-startup-halo');
+    var map = {
+      vm:  { pt: 'pt-vm',  btn: 'b-vm',  cx: 600, cy: 90 },
+      ctr: { pt: 'pt-ctr', btn: 'b-ctr', cx: 300, cy: 295 },
+      fn:  { pt: 'pt-fn',  btn: 'b-fn',  cx: 150, cy: 320 },
+      mvm: { pt: 'pt-mvm', btn: 'b-mvm', cx: 170, cy: 100 }
+    };
+    function select(key) {
+      var m = map[key];
+      if (!m) return;
+      halo.setAttribute('x', m.cx - 17);
+      halo.setAttribute('y', m.cy - 17);
+      Object.keys(map).forEach(function (k) {
+        var b = root.querySelector('#vg-w-chart-isolation-startup-' + map[k].btn);
+        if (b) b.setAttribute('aria-pressed', String(k === key));
+      });
+    }
+    Object.keys(map).forEach(function (key) {
+      var m = map[key];
+      var g = root.querySelector('#vg-w-chart-isolation-startup-' + m.pt);
+      var b = root.querySelector('#vg-w-chart-isolation-startup-' + m.btn);
+      if (g) {
+        g.addEventListener('click', function () { select(key); });
+        g.addEventListener('keydown', function (e) {
+          if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); select(key); }
+        });
+      }
+      if (b) b.addEventListener('click', function () { select(key); });
+    });
+    select('mvm');
+  })();
+  </script>
+</figure>
+
+<h2>新原語：把 Firecracker 包成兩個 API</h2>
+
+<p>AWS 給這個缺口的答案，自己定義得很精準：「AWS Lambda MicroVMs, a new serverless compute primitive within AWS Lambda that lets you run code generated by users or AI in isolated, stateful execution environments.」一個新的 serverless compute primitive，專門拿來跑使用者或 AI 生成的程式碼，環境同時是 isolated 與 stateful。注意這兩個形容詞——隔離與保狀態——正是上面那張圖左上角缺的那一塊。</p>
+
+<p>底層是什麼？公告寫得直接：「Lambda MicroVMs are powered by Firecracker, the same lightweight virtualization technology that has powered over 15 trillions of monthly Lambda function invocations.」Firecracker 不是新東西，它就是撐起 Lambda 每月逾 15 兆次呼叫的那套輕量虛擬化（原文寫 15 trillions，照引）。要理解 microVM 為什麼能同時做到隔離與快，得先看一眼 Firecracker 本身。</p>
+
+<p>Firecracker 對自己的定位是「an open source virtualization technology that is purpose-built for creating and managing secure, multi-tenant container and function-based services」。它跑出來的東西叫 microVM——「lightweight virtual machines, called microVMs, which provide enhanced security and workload isolation over traditional VMs, while enabling the speed and resource efficiency of containers」。這句話就是整個「兼得」的根：比傳統 VM 更強的安全與隔離，同時有 container 的速度與資源效率。</p>
+
+<p>它怎麼做到的？兩個關鍵。一是隔離邊界用的是真的虛擬化——Firecracker 用 Linux 的 KVM 來建立與管理 microVM，每個 microVM 是一個有自己 guest kernel 的虛擬機，這道邊界跟傳統 VM 同級，不是 container 那種 shared-kernel。二是它把開機慢的原因砍掉了——Firecracker 配的是「a minimal device model that excludes all non-essential functionality」，一個最小化的裝置模型，只留 virtio-net、virtio-block、virtio-vsock、serial console 與 keyboard controller 五個模擬裝置，其餘非必要功能全砍。沒有那一堆要初始化的虛擬硬體，開機自然快。具體有多快？Firecracker 的數字是「initiates user space or application code in as little as 125 ms and supports microVM creation rates of up to 150 microVMs per second per host」——最快 125 ms 起 user space，每台 host 每秒最多建 150 個 microVM。每個 microVM 的記憶體 overhead「less than 5 MiB」，所以單機可以塞得很密。</p>
+
+<p>但 125 ms 是 Firecracker「冷啟動一個全新 microVM」的數字。Lambda microVMs 真正的招數，不是冷啟動更快，而是根本不冷啟動。下面這張圖把兩個新 API 的流向攤開——你會看到 snapshot 是在哪一步產生的。</p>
+
+<figure class="vg-w-arch-microvm-api" data-mobile="static" data-svg-scroll="720">
+  <style>
+    .vg-w-arch-microvm-api { display: grid; grid-template-rows: auto 1fr auto; gap: var(--s-2); }
+    .vg-w-arch-microvm-api .vg-w-affordance { display: flex; align-items: center; gap: 6px; font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); margin: 0; }
+    .vg-w-arch-microvm-api .vg-w-affordance svg { width: 14px !important; height: 14px !important; min-width: 14px; }
+    .vg-w-arch-microvm-api svg.vg-w-arch-microvm-api-main { width: 100%; height: auto; }
+    .vg-w-arch-microvm-api figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    .vg-w-arch-microvm-api .node { cursor: pointer; }
+    .vg-w-arch-microvm-api .node rect { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; transition: stroke 150ms, fill 150ms; }
+    .vg-w-arch-microvm-api .node.is-on rect { stroke: var(--accent); fill: color-mix(in srgb, var(--accent) 10%, transparent); }
+    .vg-w-arch-microvm-api .detail { padding: var(--s-2); border-left: 2px solid var(--accent); font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink-soft); display: none; }
+    .vg-w-arch-microvm-api .detail.is-on { display: block; }
+    .vg-w-arch-microvm-api .detail code { font-family: var(--mono); }
+    @media (hover: none) and (pointer: coarse) { .vg-w-arch-microvm-api [data-vg-controls] { display: none; } }
+  </style>
+
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M9 9a3 3 0 1 1 4 2.83V13"/><path d="M12 17h.01"/><rect x="3" y="3" width="18" height="18" rx="2"/>
+    </svg>
+    <span>點任一階段，讀它在這條流程裡負責什麼 · 4 個階段</span>
+  </p>
+
+  <svg class="vg-w-arch-microvm-api-main" viewBox="0 0 720 260" role="img" aria-label="create-microvm-image and run-microvm API flow">
+    <defs>
+      <marker id="vg-w-arch-microvm-api-arrow" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+        <path d="M0 0 L9 4.5 L0 9 z" fill="var(--muted)"/>
+      </marker>
+    </defs>
+
+    <text x="20" y="30" font-family="Manrope, sans-serif" font-size="13" letter-spacing="0.06em" fill="var(--accent-text)">CREATE-MICROVM-IMAGE</text>
+    <text x="430" y="30" font-family="Manrope, sans-serif" font-size="13" letter-spacing="0.06em" fill="var(--accent-text)">RUN-MICROVM</text>
+    <line x1="408" y1="42" x2="408" y2="230" stroke="var(--line)" stroke-width="1" stroke-dasharray="3 5"/>
+
+    <g class="node" id="vg-w-arch-microvm-api-n1" data-key="img" role="button" tabindex="0" aria-label="build image">
+      <rect x="20" y="90" width="170" height="74" rx="3"/>
+      <text x="105" y="122" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">Dockerfile + code</text>
+      <text x="105" y="144" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" fill="var(--muted)">打包 → build image</text>
+    </g>
+    <line x1="190" y1="127" x2="228" y2="127" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#vg-w-arch-microvm-api-arrow)"/>
+
+    <g class="node" id="vg-w-arch-microvm-api-n2" data-key="snap" role="button" tabindex="0" aria-label="snapshot">
+      <rect x="232" y="90" width="160" height="74" rx="3"/>
+      <text x="312" y="122" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">Firecracker snapshot</text>
+      <text x="312" y="144" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" fill="var(--muted)">memory + disk 凍存</text>
+    </g>
+    <line x1="392" y1="127" x2="446" y2="127" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#vg-w-arch-microvm-api-arrow)"/>
+
+    <g class="node" id="vg-w-arch-microvm-api-n3" data-key="run" role="button" tabindex="0" aria-label="run microVM">
+      <rect x="450" y="90" width="150" height="74" rx="3"/>
+      <text x="525" y="122" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">resume from snapshot</text>
+      <text x="525" y="144" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" fill="var(--muted)">非冷開機</text>
+    </g>
+    <line x1="600" y1="127" x2="638" y2="127" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#vg-w-arch-microvm-api-arrow)"/>
+
+    <g class="node" id="vg-w-arch-microvm-api-n4" data-key="ep" role="button" tabindex="0" aria-label="endpoint">
+      <rect x="618" y="90" width="84" height="74" rx="3"/>
+      <text x="660" y="122" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">endpoint</text>
+      <text x="660" y="144" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" fill="var(--muted)">ID + URL</text>
+    </g>
+
+    <text x="312" y="206" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">建構期（一次）</text>
+    <text x="558" y="206" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">每個 session（多次）</text>
+  </svg>
+
+  <div data-vg-controls>
+    <div class="detail" id="vg-w-arch-microvm-api-d-img"><strong>create-microvm-image</strong>：用我的話講，這個 API 收下一份 Dockerfile 與程式碼，由 Lambda 打包、build 成 image，並對初始化後的應用狀態取 snapshot。這一步等於把「環境長什麼樣」定義清楚——它是建構期那一次性的入口。</div>
+    <div class="detail" id="vg-w-arch-microvm-api-d-snap"><strong>snapshot</strong>：公告的關鍵句是「Lambda runs your Dockerfile, initializes your application, and takes a Firecracker snapshot of the running environment's memory and disk state.」Lambda 實際把你的應用<em>初始化跑起來</em>，然後對這個 running 環境的 memory 與 disk 狀態取一份 Firecracker snapshot。一次性、在建構期完成。</div>
+    <div class="detail" id="vg-w-arch-microvm-api-d-run"><strong>run-microvm（resume）</strong>：「Every subsequent MicroVM launched from that image resumes from the pre-initialized snapshot rather than booting cold, which means launches and idle resumes both achieve near-instant startup latency.」之後每個 microVM 都從這份 pre-initialized snapshot resume，不冷開機——所以 launch 與 idle resume 都近乎即啟。</div>
+    <div class="detail" id="vg-w-arch-microvm-api-d-ep"><strong>endpoint</strong>：用我的話講，run-microvm 從 image 啟一個 microVM，帶上你指定的 execution role 與 idle policy，啟好之後回傳一個唯一 ID 與一個專屬的 endpoint URL，你之後就把這個 session 的流量打到這個 URL。</div>
+  </div>
+
+  <figcaption>左半邊（create-microvm-image）在建構期跑一次：打包、build、把初始化後的應用狀態凍成 snapshot。右半邊（run-microvm）每個 session 跑：從同一份 snapshot resume，回傳專屬 endpoint。snapshot 產生於建構期，不是每次啟動——這是「不冷啟動」的支點。</figcaption>
+
+  <script>
+  (function () {
+    if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+    var root = document.querySelector('.vg-w-arch-microvm-api');
+    if (!root) return;
+    var nodes = Array.prototype.slice.call(root.querySelectorAll('.node'));
+    var details = {
+      img:  root.querySelector('#vg-w-arch-microvm-api-d-img'),
+      snap: root.querySelector('#vg-w-arch-microvm-api-d-snap'),
+      run:  root.querySelector('#vg-w-arch-microvm-api-d-run'),
+      ep:   root.querySelector('#vg-w-arch-microvm-api-d-ep')
+    };
+    function select(key) {
+      nodes.forEach(function (n) { n.classList.toggle('is-on', n.getAttribute('data-key') === key); });
+      Object.keys(details).forEach(function (k) {
+        if (details[k]) details[k].classList.toggle('is-on', k === key);
+      });
+    }
+    nodes.forEach(function (n) {
+      var key = n.getAttribute('data-key');
+      n.addEventListener('click', function () { select(key); });
+      n.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); select(key); }
+      });
+    });
+    select('snap');
+  })();
+  </script>
+</figure>
+
+<h2>不冷啟動：snapshot 怎麼把開機這件事提前做完</h2>
+
+<p>把上面那條流程的兩半分開看，整個機制就清楚了。傳統做法裡，「啟動一個環境」是這樣的：開機 kernel、起 init、跑你的 entrypoint、import 一堆套件、把應用初始化到可以接請求的狀態。這一連串步驟，每次啟動都得重來一遍——這就是 cold boot，慢的就是這一段。</p>
+
+<p>Lambda microVMs 的做法是：把這一整段「開機到初始化完成」只做一次，做在建構期。create-microvm-image 跑你的 Dockerfile、把應用實際初始化起來，然後對這個「已經跑起來、隨時可以接請求」的環境取一份 Firecracker snapshot——把當下的 memory 與 disk 狀態整個凍存下來。之後 run-microvm 要起一個新 microVM，它不從開機開始，而是直接把這份 snapshot 載回 memory，從凍存的那一刻繼續跑。原文的句子值得再看一次：「resumes from the pre-initialized snapshot rather than booting cold」。從預先初始化的快照 resume，而不是冷開機。</p>
+
+<p>這就是為什麼公告敢說 launch 與 idle resume 都是 near-instant startup latency。要注意的是，原文用的是「near-instant」這個詞，沒給確切毫秒數——Firecracker 文件裡那個 125 ms 是它冷啟一個全新 microVM 的數字，不能直接當成 Lambda microVMs 從 snapshot resume 的延遲。合理的推測是，從 snapshot resume 比冷啟還要快，因為連那 125 ms 的開機都省了——但這是推斷，公告沒給數字。</p>
+
+<p>值得停下來想一下，為什麼「VM 級隔離、又能秒啟」這組合過去很難同時成立。VM 慢，慢在它每次都得從一張空白的虛擬硬體開始：BIOS、bootloader、guest kernel、device probe、init 系統，這一整套是為了「從零點亮一台機器」設計的，而你的應用要等這套全跑完才輪得到。container 之所以快，正是因為它跳過了這一整段——它共用宿主機已經開好的 kernel，省下的就是開機。snapshot 的巧妙在於，它讓你保留 VM 的硬體邊界（隔離），卻又不必每次付那段開機代價（速度）：把「開機到應用就緒」的結果凍成一份 memory image，啟動時不是重做這段，而是把結果直接貼回去。換句話說，它不是讓開機變快，是讓開機只發生一次、發生在沒有使用者在等的建構期。隔離與速度之所以以前像是二選一，是因為大家都把「啟動」當成一件每次都得重來的事；snapshot 把它變成可以預先算好、重複套用的東西。</p>
+
+<p>下面這張圖把 cold boot 與 snapshot resume 兩條啟動路徑並排，你可以拖中間那條分隔線比對：左邊是每次都要走完的那串開機步驟，右邊是直接把凍存狀態載回來。</p>
+
+<figure class="vg-w-slider-coldboot-snapshot" data-mobile="swap" data-svg-scroll="720" data-mobile-summary="冷啟動每次重走整段開機；microVM 在建構期取一次 snapshot，之後只載回凍存的 memory 與 disk，從初始化完成處續跑。">
+  <style>
+    .vg-w-slider-coldboot-snapshot { display: grid; grid-template-rows: auto 1fr auto; gap: var(--s-2); }
+    .vg-w-slider-coldboot-snapshot .vg-w-affordance { display: flex; align-items: center; gap: 6px; font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); margin: 0; }
+    .vg-w-slider-coldboot-snapshot .vg-w-affordance svg { width: 14px !important; height: 14px !important; min-width: 14px; }
+    .vg-w-slider-coldboot-snapshot .stage { position: relative; width: 100%; aspect-ratio: 720 / 300; overflow: hidden; border: 1px solid var(--line); border-radius: 2px; }
+    .vg-w-slider-coldboot-snapshot .pane { position: absolute; inset: 0; }
+    .vg-w-slider-coldboot-snapshot .pane svg { width: 100%; height: 100%; display: block; }
+    .vg-w-slider-coldboot-snapshot .pane-after { clip-path: inset(0 0 0 var(--vg-split, 50%)); }
+    .vg-w-slider-coldboot-snapshot .divider { position: absolute; top: 0; bottom: 0; width: 32px; transform: translateX(-50%); left: var(--vg-split, 50%); cursor: ew-resize; touch-action: none; z-index: 3; }
+    .vg-w-slider-coldboot-snapshot .divider::before { content: ''; position: absolute; left: 50%; top: 0; bottom: 0; width: 2px; transform: translateX(-50%); background: var(--accent); }
+    .vg-w-slider-coldboot-snapshot .divider::after { content: ''; position: absolute; left: 50%; top: 50%; width: 18px; height: 18px; transform: translate(-50%, -50%); border-radius: 50%; background: var(--accent); }
+    .vg-w-slider-coldboot-snapshot figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    @media (max-width: 720px) { .vg-w-slider-coldboot-snapshot .stage { aspect-ratio: 480 / 360; } }
+    @media (hover: none) and (pointer: coarse) {
+      .vg-w-slider-coldboot-snapshot .vg-w-affordance,
+      .vg-w-slider-coldboot-snapshot .stage,
+      .vg-w-slider-coldboot-snapshot figcaption { display: none !important; }
+    }
+  </style>
+
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M8 7 4 12l4 5"/><path d="m16 7 4 5-4 5"/>
+    </svg>
+    <span>拖中間的分隔線，比對 cold boot 與 snapshot resume 兩條路</span>
+  </p>
+
+  <div class="stage" id="vg-w-slider-coldboot-snapshot-stage">
+    <div class="pane pane-before">
+      <svg viewBox="0 0 720 300" role="img" aria-label="cold boot path">
+        <text x="24" y="34" font-family="Manrope, sans-serif" font-size="14" letter-spacing="0.05em" fill="var(--ink-deep)">COLD BOOT（每次啟動都重來）</text>
+        <g font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">
+          <rect x="24" y="56" width="300" height="34" rx="3" fill="var(--bg-soft)" stroke="var(--muted-2)"/><text x="40" y="78">① kernel boot</text>
+          <rect x="24" y="100" width="300" height="34" rx="3" fill="var(--bg-soft)" stroke="var(--muted-2)"/><text x="40" y="122">② init / systemd</text>
+          <rect x="24" y="144" width="300" height="34" rx="3" fill="var(--bg-soft)" stroke="var(--muted-2)"/><text x="40" y="166">③ entrypoint</text>
+          <rect x="24" y="188" width="300" height="34" rx="3" fill="var(--bg-soft)" stroke="var(--muted-2)"/><text x="40" y="210">④ import 套件</text>
+          <rect x="24" y="232" width="300" height="34" rx="3" fill="var(--bg-soft)" stroke="var(--muted-2)"/><text x="40" y="254">⑤ 應用初始化</text>
+        </g>
+        <text x="174" y="290" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">五步全走 · 慢</text>
+      </svg>
+    </div>
+    <div class="pane pane-after">
+      <svg viewBox="0 0 720 300" role="img" aria-label="snapshot resume path">
+        <rect x="0" y="0" width="720" height="300" fill="var(--bg)"/>
+        <text x="696" y="34" text-anchor="end" font-family="Manrope, sans-serif" font-size="14" letter-spacing="0.05em" fill="var(--accent-text)">SNAPSHOT RESUME（建構期已做完）</text>
+        <g font-family="EB Garamond, serif" font-size="14" fill="var(--muted)">
+          <rect x="396" y="56" width="300" height="34" rx="3" fill="none" stroke="var(--line)" stroke-dasharray="4 4"/><text x="412" y="78">① ~ ⑤ 凍存在 snapshot 裡</text>
+        </g>
+        <g font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">
+          <rect x="396" y="120" width="300" height="44" rx="3" fill="color-mix(in srgb, var(--accent) 12%, transparent)" stroke="var(--accent)"/><text x="412" y="147">載回 memory + disk snapshot</text>
+          <rect x="396" y="178" width="300" height="44" rx="3" fill="color-mix(in srgb, var(--sage-deep) 14%, transparent)" stroke="var(--sage-deep)"/><text x="412" y="205">從初始化完成那刻續跑</text>
+        </g>
+        <text x="546" y="282" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">兩步 · near-instant</text>
+      </svg>
+    </div>
+    <div class="divider" id="vg-w-slider-coldboot-snapshot-divider" role="slider" tabindex="0" aria-label="比對分隔線" aria-valuemin="0" aria-valuemax="100" aria-valuenow="50"></div>
+  </div>
+
+  <figcaption>左邊冷啟動的①～⑤每次都要重跑；右邊 snapshot resume 把這五步在建構期一次做完凍存，啟動時只剩「載回狀態、續跑」兩步。省掉的不是某一步，是整段開機。</figcaption>
+
+  <script>
+  (function () {
+    if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+    var root = document.querySelector('.vg-w-slider-coldboot-snapshot');
+    if (!root) return;
+    var stage = root.querySelector('#vg-w-slider-coldboot-snapshot-stage');
+    var divider = root.querySelector('#vg-w-slider-coldboot-snapshot-divider');
+    function setSplit(pct) {
+      pct = Math.max(4, Math.min(96, pct));
+      stage.style.setProperty('--vg-split', pct + '%');
+      divider.setAttribute('aria-valuenow', String(Math.round(pct)));
+    }
+    function fromEvent(clientX) {
+      var r = stage.getBoundingClientRect();
+      setSplit(((clientX - r.left) / r.width) * 100);
+    }
+    var dragging = false;
+    divider.addEventListener('pointerdown', function (e) { dragging = true; divider.setPointerCapture(e.pointerId); });
+    divider.addEventListener('pointermove', function (e) { if (dragging) fromEvent(e.clientX); });
+    divider.addEventListener('pointerup', function (e) { dragging = false; divider.releasePointerCapture(e.pointerId); });
+    stage.addEventListener('pointerdown', function (e) { if (e.target !== divider) fromEvent(e.clientX); });
+    divider.addEventListener('keydown', function (e) {
+      var now = parseFloat(divider.getAttribute('aria-valuenow')) || 50;
+      if (e.key === 'ArrowLeft') { e.preventDefault(); setSplit(now - 4); }
+      else if (e.key === 'ArrowRight') { e.preventDefault(); setSplit(now + 4); }
+    });
+    setSplit(50);
+  })();
+  </script>
+</figure>
+
+<h2>保狀態與 suspend：同一個 session 裡記得上一步，閒置時不白燒</h2>
+
+<p>snapshot 解決了「啟動慢」。但前面講的三個要求還有第三個：保狀態。這一塊是 microVM 跟傳統 Lambda function 模型分家的地方。</p>
+
+<p>傳統 function 是無狀態的：一次呼叫進來、跑完、回收，下一次呼叫可能落在完全不同的執行環境，前一次留下的任何東西都不保證在。microVM 反過來。公告講得很清楚：「Each MicroVM gives a single end user or session its own isolated environment that launches rapidly, retains memory and disk state for the length of the session.」一個 microVM 綁一個 end user 或 session，在整個 session 期間保留 memory 與 disk 狀態。再具體一點：「A running MicroVM retains memory, disk, and running processes across the user's session.」連 running processes 都保留——你 session 裡背景跑的那個 process，下一個請求進來時它還在跑。</p>
+
+<p>這直接對上了 coding assistant 的需求。使用者第一輪叫它 pip install，套件裝進磁碟；第二輪叫它 import 來用，磁碟還在、import 得到。中間那個 Python interpreter 的 process 也還活著，記憶體裡的變數都在。對使用者來說，這就是一個連續的 session，而不是每輪都重來的孤立呼叫。</p>
+
+<p>要看出這跟傳統 function 模型差多遠，把同一個情境放回 function 上想一遍：第二輪請求很可能落在另一個全新的執行環境，上一輪裝的套件、開的檔案、跑到一半的 process 全部不在，你只能靠外部儲存（S3、EFS、資料庫）把狀態存出去再讀回來——也就是把「保狀態」這件事自己用一層持久化邏輯補出來。microVM 把這層手工補出來的持久化收進了平台本身：狀態就活在這個 microVM 的 memory 與 disk 裡，不必序列化出去、不必每輪重建，因為它根本沒換環境。隔離單位從「一次呼叫」上移到了「一個 session」，這是模型層面的轉變，不只是規格放大。</p>
+
+<p>但保狀態有代價：一個 microVM 綁定一個 session，session 沒結束，這個 microVM 就一直佔著。使用者去開會了，環境空轉半小時，你卻還在為它付錢——這正是 container 長 session 方案的老問題。microVM 的解法是 suspend。公告寫：「During idle periods, a MicroVM can be suspended – with memory and disk state intact – and resumed when traffic arrives.」閒置期間，microVM 可以被 suspend，而且 memory 與 disk 狀態原封不動地保留；有流量再 resume。配合前面講的 snapshot resume 機制，這個 resume 也是 near-instant 的——使用者開完會回來敲下一行，環境瞬間回來，狀態都還在，他不會察覺中間被 suspend 過。公告對閒置狀態的成本描述是「pauses to a low idle cost when the user steps away」，用的是 low idle cost，沒給具體價格。</p>
+
+<p>什麼時候 suspend、suspend 多久、要不要自動 resume，由一個 idle policy 控制。公告給的範例長這樣：</p>
+
+<pre data-kind="config"><code>--idle-policy '{"maxIdleDurationSeconds":900,"suspendedDurationSeconds":300,"autoResumeEnabled":true}'</code></pre>
+
+<p>三個欄位：<code>maxIdleDurationSeconds</code>（閒置多久後動作，範例 900 秒）、<code>suspendedDurationSeconds</code>（suspend 狀態維持多久，範例 300 秒）、<code>autoResumeEnabled</code>（要不要在流量來時自動 resume，範例 true）。這是 run-microvm 的參數，等於讓你自己定義「活躍 → 閒置 → suspend → resume」這個 session 生命週期的節奏。</p>
+
+<p>這幾個旋鈕背後是一個你得自己拿捏的取捨。idle 門檻設得短，閒置一下就 suspend，省成本，但代價是使用者稍微停頓、回來時就得吃一次 resume；設得長，使用者體感更順，但閒置期間你付的就不是 low idle cost 而是接近活躍的成本。suspendedDurationSeconds 則決定狀態能凍存多久——超過這個窗口，這個 session 大概就被當成結束、資源釋放。autoResumeEnabled 決定喚醒是平台幫你做、還是要靠你的應用層自己觸發。換句話說，idle policy 不是一個開關，而是讓你在「成本」與「使用者體感的連續性」之間畫一條線，按你的工作負載特性去調。</p>
+
+<p>下面這個模擬把一段 session 跑給你看：play 之後 play head 沿時間軸前進，使用者活躍、閒置、被 suspend、再被喚醒，下方那條成本帶會在 suspend 時掉下去，而那一格代表「memory 狀態保留」的指示燈全程亮著——這就是 stateful execution 與 suspend/resume 合在一起的樣子。</p>
+
+<figure class="vg-w-sim-microvm-session" data-mobile="swap" data-mobile-summary="一個 microVM 綁一個 session：閒置就 suspend、成本降但狀態原封保留，流量回來再 near-instant resume。">
+  <style>
+    .vg-w-sim-microvm-session { display: grid; grid-template-rows: auto auto auto; gap: var(--s-2); }
+    .vg-w-sim-microvm-session .toolbar { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); flex-wrap: wrap; }
+    .vg-w-sim-microvm-session button { font-family: var(--sans); font-size: var(--fs-sm); padding: 6px 14px; min-height: 44px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); cursor: pointer; border-radius: 2px; }
+    .vg-w-sim-microvm-session button:hover { border-color: var(--accent); color: var(--accent-text); }
+    .vg-w-sim-microvm-session .state-pill { margin-left: auto; font-family: var(--mono); font-size: var(--fs-sm); color: var(--ink); font-variant-numeric: tabular-nums; }
+    .vg-w-sim-microvm-session canvas { width: 100%; height: auto; aspect-ratio: 720 / 340; display: block; }
+    .vg-w-sim-microvm-session figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    @media (max-width: 720px) { .vg-w-sim-microvm-session canvas { aspect-ratio: 4 / 3; } }
+  </style>
+
+  <div class="toolbar">
+    <button id="vg-w-sim-microvm-session-toggle">▷ play</button>
+    <button id="vg-w-sim-microvm-session-reset">↺ reset</button>
+    <span class="state-pill" id="vg-w-sim-microvm-session-pill">t = 0s · ACTIVE</span>
+  </div>
+
+  <canvas id="vg-w-sim-microvm-session-canvas"></canvas>
+
+  <figcaption>一段約 24 秒的 session：使用者在 ACTIVE 與 IDLE 間來回，閒置撐過門檻就轉 SUSPENDED，計算成本（橙色帶）隨之掉到 low idle；綠色「memory + disk 狀態保留」指示燈全程亮著。模型節奏為示意，非實測時間。</figcaption>
+
+  <script>
+  (function () {
+    if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+    var root = document.querySelector('.vg-w-sim-microvm-session');
+    if (!root) return;
+    var canvas = root.querySelector('canvas');
+    var toggle = root.querySelector('#vg-w-sim-microvm-session-toggle');
+    var resetBtn = root.querySelector('#vg-w-sim-microvm-session-reset');
+    var pill = root.querySelector('#vg-w-sim-microvm-session-pill');
+    var ctx = canvas.getContext('2d');
+
+    function cssVar(name) { return getComputedStyle(root).getPropertyValue(name).trim() || '#888'; }
+    function resize() {
+      var dpr = window.devicePixelRatio || 1;
+      var rect = canvas.getBoundingClientRect();
+      canvas.width = rect.width * dpr;
+      canvas.height = rect.height * dpr;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+    new ResizeObserver(resize).observe(canvas);
+    resize();
+
+    // session script: [tStart, state] ; state in {active, idle, suspended}
+    var SCRIPT = [
+      { t: 0,  s: 'active' },
+      { t: 4,  s: 'idle' },
+      { t: 7,  s: 'suspended' },
+      { t: 12, s: 'active' },
+      { t: 15, s: 'idle' },
+      { t: 18, s: 'suspended' },
+      { t: 22, s: 'active' }
+    ];
+    var DURATION = 24;
+    var running = false, t = 0, last = performance.now();
+
+    function stateAt(time) {
+      var cur = SCRIPT[0].s;
+      for (var i = 0; i < SCRIPT.length; i++) { if (time >= SCRIPT[i].t) cur = SCRIPT[i].s; }
+      return cur;
+    }
+    function costAt(s) { return s === 'suspended' ? 0.12 : (s === 'idle' ? 0.78 : 1.0); }
+
+    function draw() {
+      var W = canvas.getBoundingClientRect().width;
+      var H = canvas.getBoundingClientRect().height;
+      ctx.clearRect(0, 0, W, H);
+      var padL = 16, padR = 16, axW = W - padL - padR;
+      var s = stateAt(t);
+
+      // timeline track
+      var trackY = H * 0.30, trackH = H * 0.16;
+      for (var i = 0; i < SCRIPT.length; i++) {
+        var seg = SCRIPT[i];
+        var x0 = padL + (seg.t / DURATION) * axW;
+        var x1 = padL + ((i + 1 < SCRIPT.length ? SCRIPT[i + 1].t : DURATION) / DURATION) * axW;
+        var col = seg.s === 'suspended' ? cssVar('--muted-2') : (seg.s === 'idle' ? cssVar('--line') : cssVar('--accent'));
+        ctx.fillStyle = col;
+        ctx.globalAlpha = seg.s === 'active' ? 0.55 : 0.9;
+        ctx.fillRect(x0, trackY, Math.max(1, x1 - x0), trackH);
+        ctx.globalAlpha = 1;
+      }
+      ctx.font = '13px "Manrope", sans-serif';
+      ctx.fillStyle = cssVar('--muted');
+      ctx.fillText('session 時間軸', padL, trackY - 8);
+
+      // cost band
+      var costY = H * 0.62, costMaxH = H * 0.22;
+      ctx.fillStyle = cssVar('--muted');
+      ctx.fillText('計算成本', padL, costY - 8);
+      ctx.strokeStyle = cssVar('--line');
+      ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(padL, costY + costMaxH); ctx.lineTo(padL + axW, costY + costMaxH); ctx.stroke();
+      ctx.beginPath();
+      for (var px = 0; px <= axW; px += 3) {
+        var tt = (px / axW) * DURATION;
+        var c = costAt(stateAt(tt));
+        var y = costY + costMaxH - c * costMaxH;
+        if (px === 0) ctx.moveTo(padL + px, y); else ctx.lineTo(padL + px, y);
+      }
+      ctx.strokeStyle = cssVar('--accent'); ctx.lineWidth = 2; ctx.stroke();
+
+      // play head
+      var hx = padL + (t / DURATION) * axW;
+      ctx.strokeStyle = cssVar('--ink'); ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(hx, trackY - 4); ctx.lineTo(hx, costY + costMaxH + 6); ctx.stroke();
+      ctx.fillStyle = cssVar('--ink');
+      ctx.beginPath(); ctx.arc(hx, trackY - 4, 4, 0, Math.PI * 2); ctx.fill();
+
+      // state-retained lamp (always on)
+      var lampY = H * 0.90;
+      ctx.fillStyle = cssVar('--sage-deep');
+      ctx.beginPath(); ctx.arc(padL + 6, lampY, 5, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = cssVar('--ink');
+      ctx.font = '13px "Manrope", sans-serif';
+      ctx.fillText('memory + disk 狀態保留', padL + 18, lampY + 4);
+    }
+
+    function frame(now) {
+      var dt = Math.min(0.05, (now - last) / 1000);
+      last = now;
+      if (running) {
+        t += dt * 1.0;
+        if (t >= DURATION) { t = DURATION; running = false; toggle.textContent = '▷ play'; }
+      }
+      draw();
+      var s = stateAt(t);
+      var label = s === 'suspended' ? 'SUSPENDED' : (s === 'idle' ? 'IDLE' : 'ACTIVE');
+      pill.textContent = 't = ' + t.toFixed(0) + 's · ' + label;
+      requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+
+    toggle.addEventListener('click', function () {
+      if (t >= DURATION) { t = 0; }
+      running = !running; toggle.textContent = running ? '⏸ pause' : '▷ play'; last = performance.now();
+    });
+    resetBtn.addEventListener('click', function () {
+      running = false; toggle.textContent = '▷ play'; t = 0;
+    });
+  })();
+  </script>
+</figure>
+
+<h2>邊界在哪：ARM64、16 vCPU、8 小時，與四個區域</h2>
+
+<p>機制講完，落到工程決策前你得先看清楚硬邊界——一個 microVM 不是無限大的機器，它有很明確的上限。公告把規格列得很清楚，逐項照引：架構是 ARM64；最高 up to 16 vCPUs；32 GB of memory；每個 microVM 32 GB of disk；單次最長 MicroVMs support up to 8 hours of total runtime。下面這幾張卡把這些上限攤開。</p>
+
+<figure class="vg-w-stack-microvm-specs" data-mobile="keep">
+  <style>
+    .vg-w-stack-microvm-specs { display: flex; flex-direction: column; gap: var(--s-3); align-items: stretch; }
+    .vg-w-stack-microvm-specs input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+    .vg-w-stack-microvm-specs .stack-title { font-family: IM Fell English, serif; font-style: italic; font-size: var(--fs-md); margin: 0; color: var(--ink); line-height: 1.4; }
+    .vg-w-stack-microvm-specs .stack-cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--s-2); list-style: none; padding: 0; margin: 0; }
+    .vg-w-stack-microvm-specs .stack-cards li { display: block; padding: var(--s-2); border: 1px solid var(--muted-2); border-radius: 2px; min-height: 44px; }
+    .vg-w-stack-microvm-specs .card-head { font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); letter-spacing: 0.04em; color: var(--accent-text); margin: 0 0 6px 0; }
+    .vg-w-stack-microvm-specs .card-val { font-family: EB Garamond, serif; font-size: 1.5rem; color: var(--ink); margin: 0 0 4px 0; line-height: 1.1; }
+    .vg-w-stack-microvm-specs .card-sub { font-family: IM Fell English, serif; font-style: italic; font-size: var(--fs-sm); color: var(--muted); margin: 0; line-height: 1.4; }
+    .vg-w-stack-microvm-specs svg.diagram { display: none; }
+    @media (max-width: 720px) { .vg-w-stack-microvm-specs .stack-cards { grid-template-columns: 1fr; } }
+  </style>
+
+  <p class="stack-title">一個 microVM 的資源邊界（值逐項照公告）</p>
+  <ul class="stack-cards">
+    <li><p class="card-head">ARCH</p><p class="card-val">ARM64</p><p class="card-sub">架構固定為 ARM64</p></li>
+    <li><p class="card-head">vCPU</p><p class="card-val">≤ 16</p><p class="card-sub">up to 16 vCPUs</p></li>
+    <li><p class="card-head">MEMORY</p><p class="card-val">32 GB</p><p class="card-sub">32 GB of memory</p></li>
+    <li><p class="card-head">DISK</p><p class="card-val">32 GB</p><p class="card-sub">32 GB of disk per MicroVM</p></li>
+    <li><p class="card-head">MAX RUNTIME</p><p class="card-val">8 hr</p><p class="card-sub">up to 8 hours of total runtime</p></li>
+    <li><p class="card-head">REGIONS</p><p class="card-val">4 區</p><p class="card-sub">US East、US West、Ireland、Tokyo</p></li>
+  </ul>
+
+  <svg class="diagram" viewBox="0 0 880 200" role="img" aria-label="microVM spec limits"><text x="20" y="30" font-family="Manrope, sans-serif" font-size="14" fill="var(--ink)">microVM spec limits</text></svg>
+</figure>
+
+<p>這幾個數字框出了它的甜蜜區。ARM64 唯一架構，意味著你的 image 與相依套件得在 ARM64 上跑得起來——x86-only 的二進位檔要先解決。16 vCPU / 32 GB 記憶體 / 32 GB 磁碟，對一個互動式 coding 或資料分析 session 綽綽有餘，但不是給你跑大型訓練或巨量資料批次的規格。單次最長 8 小時，這條最值得留意：它擺明了 microVM 是給「有人在用的 session」，不是給你當常駐服務跑——一個 session 撐到 8 小時就到頂，這跟「per end user / per session」的定位是一致的。</p>
+
+<p>區域目前只有四個：US East（N. Virginia、Ohio）、US West（Oregon）、Europe（Ireland）、Asia Pacific（Tokyo）。台灣團隊離得最近的是 Tokyo，延遲上可以接受；但如果你的使用者在歐洲與美東以外、又對延遲敏感，現階段就得自己權衡。發布狀態是 2026 年 6 月 22 日的「Now available」，不是 preview——可以直接拿來上。價格公告沒列在文內，只說在 Lambda pricing page 上。</p>
+
+<p>那什麼工作真正適合搬上來？回到 AWS 自己列的那張場景清單，把它們的共同點抽出來就清楚了：AI coding assistant、互動式程式碼環境、資料分析平台、漏洞掃描器、跑使用者腳本的遊戲伺服器——這幾類全都同時要求「per-session 的強隔離」「保得住 session 內狀態」「啟動與喚醒要快」這三件事。過去你得在 container 上自己堆 hardening 才能勉強湊齊，現在這三件由一個原語一次給。反過來說，如果你的工作不需要隔離不可信程式碼、或根本不需要保狀態、或不在乎冷啟動延遲，那 microVM 對你就是殺雞用牛刀，傳統 function 或 container 仍然更省。它補的是一個很具體的縫，不是要取代誰。</p>
+
+<p class="vg-deep-closer"><strong>The model</strong>：microVM 不是更大的 function，而是一份「預先開機到一半、隨時可以喚醒」的 Firecracker 快照——隔離來自 VM 的硬體邊界，速度來自不冷啟動，保狀態來自整個 session 綁同一個 microVM，省錢來自閒置時 suspend 而狀態不丟。</p>
+
+</div>
