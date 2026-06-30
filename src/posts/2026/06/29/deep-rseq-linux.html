@@ -1,0 +1,519 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">如果你以為 user space 要做 per-CPU 的 lock-free 操作，唯一的路是 atomic 指令加 cache line 上的 lock prefix，那 rseq 想告訴你另一條：不要去阻止搶佔，而是讓 kernel 在你被搶佔時把你的程式整段重做。</p>
+  <h1 class="vg-post-title">rseq，從零講起——讓 user space 偵測被搶佔，而不是用鎖去防它</h1>
+</header>
+
+<div class="vg-post-body">
+
+<p><span class="vg-dropcap">k</span>ernel 裡到處是 per-CPU 資料結構，因為它有一個 user space 沒有的特權：它能關掉搶佔（preemption），在一段臨界區裡確定自己不會被排到別的 CPU。這篇要講的 restartable sequences（rseq）就是把這個能力的一個替代品交到 user space 手上——不是讓你關搶佔，而是讓你在被搶佔之後知道、然後重做。讀完你會知道 rseq 解決什麼問題、它的臨界區與 abort 機制長什麼樣、為什麼 malloc 跟計數器這種東西能靠它做出不用 atomic 的 fast path，以及它在什麼情況下不划算。</p>
+
+<h2>同一顆 CPU 上的計數器，為什麼還要付 atomic 的錢</h2>
+
+<p>先把場景縮到最小。你要做一個 per-CPU 計數器：每顆 CPU 自己一格，執行緒讀出「我現在在哪顆 CPU」，然後對那一格加一。聽起來不需要鎖——每顆 CPU 各加各的，不會互相踩。問題藏在「我現在在哪顆 CPU」與「對那一格加一」這兩件事之間。</p>
+
+<p>在這兩步之間，排程器可以隨時把你的執行緒從 CPU 3 搬到 CPU 7。於是你讀到的是 CPU 3、加一加到的卻是另一顆正在跑你的 CPU——或者更糟，另一條執行緒此刻也在那一格上動手。你以為的「per-CPU、不會衝突」其實有一個你看不見的窗口：讀 CPU 編號到實際寫入之間，那段時間你不擁有任何東西。</p>
+
+<p>傳統解法是把那一格的加一變成 atomic 操作，靠 CPU 的 read-modify-write 指令保證不被打斷。代價直接寫在指令上。EfficiOS 那篇談 rseq 的文章把問題講得很白：</p>
+
+<blockquote>
+  <p>「Concurrency control algorithms, paired with per-CPU data, are integral to ensuring low-level libraries and high-performance applications scale properly on today's hardware.」</p>
+</blockquote>
+
+<p>它接著點出 atomic 的成本來源：</p>
+
+<blockquote>
+  <p>「The x86 `lock` prefix can easily add many cycles to the cost of the same instruction without the prefix.」</p>
+</blockquote>
+
+<p>翻成工程語言：同一條加法指令，掛上 <code>lock</code> prefix 之後要多花可觀的 cycle，因為它得鎖住快取行、跟其他核心協調 cache coherence。在沒有 contention、其實只有你一個人在動這一格的情況下，這些 cycle 全是白付的——你付的是「以防萬一被別人搶」的保險，但大多數時候根本沒人來搶。per-CPU 資料結構的整個賣點就是「大多數時候只有本地這顆 CPU 在動」，偏偏 atomic 把這個 common case 也課了重稅。</p>
+
+<p>kernel 自己不付這筆稅，因為它在臨界區裡可以 <code>preempt_disable()</code>。一旦關掉搶佔，「讀 CPU 編號」到「寫那一格」之間沒有人能把它搬走，也沒有別的 thread 能插進來，於是它可以用普通的 load / store，不需要 atomic。user space 沒有這個按鈕——你不能要求 kernel 在你跑這三行的時候別排程別人。rseq 要補的，正是這個落差。</p>
+
+<h2>關不掉搶佔，那就偵測它——rseq 的核心翻轉</h2>
+
+<p>rseq 的設計把問題反過來想。既然 user space 不能阻止搶佔與遷移，那就接受它會發生，但保證一件事：只要在臨界區中途被搶佔或被搬到別的 CPU，這段臨界區就<strong>不算數</strong>，kernel 會把控制權跳到一段 abort handler，讓你從頭再來一次。</p>
+
+<p>關鍵在於臨界區的結構。它被切成兩段：一段是準備工作，可以無限次重來；最後一個動作是 commit——一條把結果寫進記憶體的單一指令。Linux 的 kernel 文件這樣描述 rseq 的目的：</p>
+
+<blockquote>
+  <p>「userspace to perform update operations on per-cpu data without requiring heavyweight atomic operations.」</p>
+</blockquote>
+
+<p>TCMalloc 的文件把臨界區的契約講得最精準，因為它是真的拿 rseq 來做 allocator 的人：</p>
+
+<blockquote>
+  <p>「The entire sequence, except for its final store to memory which _commits_ the change, must be capable of starting over.」</p>
+</blockquote>
+
+<p>把這句拆開看。準備階段做的事——讀 CPU 編號、算出要寫的位址、把舊值載進暫存器——全都是冪等的，重做幾次都沒有副作用。真正改變世界的只有最後那條 store。設計的精髓是：如果搶佔發生在 commit 之前，那麼世界還沒被改，丟掉重來完全安全；如果搶佔發生在 commit 之後，臨界區其實已經結束了，沒什麼好丟的。中間那條「commit 是單一指令」的要求，就是為了讓「之前」與「之後」之間不存在一個半完成的灰色地帶。</p>
+
+<p>那「重來」具體怎麼發生？kernel 在每次 context switch 之後、訊號送達之前，會檢查當前執行緒有沒有註冊 rseq、指令指標是不是正落在某個已宣告的臨界區範圍內。如果是，它就不讓你從被打斷的地方繼續，而是把指令指標改到你預先登記的 abort handler。TCMalloc 文件描述這個動作：</p>
+
+<blockquote>
+  <p>「it restarts the thread at an abort sequence, the abort sequence determines the interrupted restartable sequence, and then returns to control to the entry point of this sequence.」</p>
+</blockquote>
+
+<p>下面這個 widget 把整件事跑成動畫。一條執行緒沿著臨界區往 commit 走，搶佔事件隨機落下；落在 commit 之前，kernel 把它彈回 abort handler 重來，落在 commit 之後則算數。你會看到大多數時候它一次就過，偶爾被打斷就重跑——重跑的成本只在被打斷的那一次。</p>
+
+<figure class="vg-w-canvas-preempt" data-mobile="swap" data-mobile-summary="臨界區分準備段與單一 commit；搶佔落在 commit 前就被彈回 abort handler 重做，落在 commit 後才算數。">
+  <style>
+    .vg-w-canvas-preempt { display: grid; grid-template-rows: auto 1fr auto; gap: var(--s-2); }
+    .vg-w-canvas-preempt .toolbar { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); flex-wrap: wrap; }
+    .vg-w-canvas-preempt button { font-family: var(--sans); font-size: var(--fs-sm); padding: 6px 14px; min-height: 44px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); cursor: pointer; }
+    .vg-w-canvas-preempt button:hover { border-color: var(--accent); color: var(--accent-text); }
+    .vg-w-canvas-preempt label.rate { display: flex; align-items: center; gap: var(--s-1); }
+    .vg-w-canvas-preempt input[type="range"] { height: 36px; accent-color: var(--accent); touch-action: none; }
+    .vg-w-canvas-preempt canvas { width: 100%; height: auto; aspect-ratio: 16 / 9; display: block; }
+    .vg-w-canvas-preempt figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    @media (max-width: 720px) { .vg-w-canvas-preempt canvas { aspect-ratio: 4 / 3; } }
+  </style>
+  <div class="toolbar">
+    <button data-act="toggle">▷ play</button>
+    <button data-act="reset">↺ reset</button>
+    <label class="rate">搶佔頻率 <input data-rate type="range" min="0" max="100" value="25" /></label>
+    <span style="margin-left: auto; font-variant-numeric: tabular-nums" data-stat>commit 0 · abort 0</span>
+  </div>
+  <canvas></canvas>
+  <figcaption>橙色方塊是執行緒在臨界區裡的位置，從左走到最右的 commit 線。搶佔事件（豎線）落在 commit 線之前就把方塊彈回起點（abort 一次重做）；落在之後就計一次成功 commit。拖右邊滑桿提高搶佔頻率，看 abort 比例怎麼上升。</figcaption>
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-canvas-preempt');
+      if (!root) return;
+      const canvas = root.querySelector('canvas');
+      const toggleBtn = root.querySelector('[data-act=toggle]');
+      const resetBtn = root.querySelector('[data-act=reset]');
+      const rateInput = root.querySelector('[data-rate]');
+      const stat = root.querySelector('[data-stat]');
+      const ctx = canvas.getContext('2d');
+
+      let cssW = 0, cssH = 0;
+      function resize() {
+        const dpr = window.devicePixelRatio || 1;
+        const rect = canvas.getBoundingClientRect();
+        cssW = rect.width; cssH = rect.height;
+        canvas.width = cssW * dpr;
+        canvas.height = cssH * dpr;
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      }
+      const ro = new ResizeObserver(resize); ro.observe(canvas);
+      resize();
+
+      function cssVar(n) { return getComputedStyle(root).getPropertyValue(n).trim() || '#888'; }
+
+      let running = false;
+      let t = 0;
+      let pos = 0;          // 0..1 progress through the critical section
+      const SPEED = 0.55;   // progress per second
+      let commits = 0, aborts = 0;
+      let flash = 0;        // abort flash timer
+      let nextPreempt = 0;
+
+      function rate() { return Number(rateInput.value) / 100; }
+      function scheduleNext() {
+        // higher rate -> shorter mean gap between preemption events
+        const lambda = 0.4 + rate() * 4.5; // events/sec
+        nextPreempt = t + (-Math.log(Math.random()) / lambda);
+      }
+      scheduleNext();
+
+      function step(dt) {
+        t += dt;
+        pos += SPEED * dt;
+        // preemption check
+        if (t >= nextPreempt) {
+          if (pos < 0.92) {        // before commit line -> abort
+            aborts++;
+            pos = 0;
+            flash = 0.5;
+          }
+          // if already past commit, the section already committed; preempt is harmless
+          scheduleNext();
+        }
+        if (pos >= 1) {            // reached commit
+          commits++;
+          pos = 0;
+        }
+        if (flash > 0) flash = Math.max(0, flash - dt);
+      }
+
+      function draw() {
+        ctx.clearRect(0, 0, cssW, cssH);
+        const padL = 24, padR = 24;
+        const trackY = cssH * 0.46;
+        const trackW = cssW - padL - padR;
+        const commitX = padL + trackW * 0.92;
+
+        // track
+        ctx.strokeStyle = cssVar('--muted-2');
+        ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(padL, trackY); ctx.lineTo(padL + trackW, trackY); ctx.stroke();
+
+        // prep region label
+        ctx.font = '13px "EB Garamond", serif';
+        ctx.fillStyle = cssVar('--muted');
+        ctx.fillText('準備段（可重做）', padL, trackY - 18);
+
+        // commit line
+        ctx.strokeStyle = cssVar('--sage-deep');
+        ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.moveTo(commitX, trackY - 30); ctx.lineTo(commitX, trackY + 30); ctx.stroke();
+        ctx.fillStyle = cssVar('--sage-deep');
+        ctx.fillText('commit', commitX - 18, trackY - 38);
+
+        // start marker / abort handler
+        ctx.fillStyle = cssVar('--muted');
+        ctx.fillText('abort → 回起點', padL, trackY + 40);
+
+        // moving thread block
+        const x = padL + trackW * Math.min(pos, 1);
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = flash > 0 ? cssVar('--accent-text') : cssVar('--accent');
+        ctx.fillRect(x - 8, trackY - 9, 16, 18);
+
+        // flash ring on abort
+        if (flash > 0) {
+          ctx.globalAlpha = flash;
+          ctx.strokeStyle = cssVar('--accent-text');
+          ctx.lineWidth = 2;
+          ctx.beginPath(); ctx.arc(padL, trackY, 14 + (0.5 - flash) * 30, 0, Math.PI * 2); ctx.stroke();
+          ctx.globalAlpha = 1;
+        }
+
+        // counters bar
+        const total = commits + aborts;
+        const okFrac = total > 0 ? commits / total : 1;
+        const barY = cssH * 0.82, barW = trackW, barH = 14;
+        ctx.fillStyle = cssVar('--bg-soft');
+        ctx.fillRect(padL, barY, barW, barH);
+        ctx.fillStyle = cssVar('--sage');
+        ctx.fillRect(padL, barY, barW * okFrac, barH);
+        ctx.font = '12px "Manrope", sans-serif';
+        ctx.fillStyle = cssVar('--ink');
+        ctx.fillText('一次過比例 ' + Math.round(okFrac * 100) + '%', padL, barY - 8);
+      }
+
+      let last = performance.now();
+      function frame(now) {
+        const dt = Math.min(0.1, (now - last) / 1000); last = now;
+        if (running) step(dt);
+        draw();
+        stat.textContent = 'commit ' + commits + ' · abort ' + aborts;
+        requestAnimationFrame(frame);
+      }
+      requestAnimationFrame(frame);
+
+      toggleBtn.addEventListener('click', () => {
+        running = !running;
+        toggleBtn.textContent = running ? '⏸ pause' : '▷ play';
+        last = performance.now();
+      });
+      resetBtn.addEventListener('click', () => {
+        running = false; toggleBtn.textContent = '▷ play';
+        t = 0; pos = 0; commits = 0; aborts = 0; flash = 0; scheduleNext();
+      });
+    })();
+  </script>
+</figure>
+
+<p>有一個容易誤會的點要先釘住：rseq 不保證臨界區只跑一次，它保證的是「commit 要嘛在你不被打斷的狀態下發生、要嘛不發生」。一段臨界區可能被 abort 重做好幾次才終於跑完一輪——但每一次失敗都沒有寫進任何東西，所以對外界來說，最終只有成功那一輪的 commit 看得見。這跟 atomic 的差別在這裡：atomic 是「保證這一條指令不被打斷」，rseq 是「允許被打斷，但被打斷的就丟掉」。</p>
+
+<h2>kernel 與 user space 之間的那塊共用記憶體</h2>
+
+<p>要讓 kernel 知道「現在這條執行緒正落在某個臨界區裡」，user space 得先把資訊放在一塊 kernel 看得到的地方。這塊地方就是 <code>struct rseq</code>，透過 <code>rseq(2)</code> system call 註冊成一個 thread-local 的記憶體區。kernel 文件描述它的角色：</p>
+
+<blockquote>
+  <p>「Restartable Sequences allow to register a per thread userspace memory area to be used as an ABI between kernel and userspace.」</p>
+</blockquote>
+
+<p>注意「ABI between kernel and userspace」這個說法。這塊記憶體不是普通的 user 資料，它是雙方約好欄位意義的介面：有些欄位是 kernel 寫、user space 讀；有一個欄位是 user space 寫、kernel 讀。前者讓 user space 不用 system call 就能拿到「我現在在哪顆 CPU」「哪個 NUMA node」這類資訊；後者讓 user space 告訴 kernel「我現在在跑哪一段臨界區」。kernel 文件列出由 kernel 維護的唯讀欄位，包括 <code>cpu_id_start</code>、<code>cpu_id</code>、<code>node_id</code>、<code>mm_cid</code>，以及一個指向臨界區描述子的 <code>rseq_cs</code> 欄位與一個 <code>flags</code> 欄位。</p>
+
+<p>下面這張圖把這塊共用記憶體攤開，標出每個欄位是誰寫誰讀，以及 <code>rseq_cs</code> 指到的那個臨界區描述子裡放了什麼。</p>
+
+<figure class="vg-w-layout-rseq-struct" data-mobile="keep" data-svg-scroll="720">
+  <style>
+    .vg-w-layout-rseq-struct svg { width: 100%; height: auto; }
+    .vg-w-layout-rseq-struct figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-2); }
+  </style>
+  <svg viewBox="0 0 720 380" preserveAspectRatio="xMidYMid meet" role="img" aria-label="struct rseq 與 rseq_cs 描述子的記憶體佈局">
+    <text x="20" y="28" font-family="Manrope, sans-serif" font-size="13" letter-spacing="0.06em" fill="var(--muted)">STRUCT RSEQ（thread-local · 32-byte 對齊）</text>
+
+    <!-- struct rseq box -->
+    <rect x="20" y="44" width="300" height="296" fill="none" stroke="var(--muted-2)" stroke-width="1.5" />
+
+    <!-- fields -->
+    <g font-family="JetBrains Mono, monospace" font-size="13" fill="var(--ink)">
+      <rect x="20" y="44"  width="300" height="44" fill="color-mix(in srgb, var(--sage) 14%, transparent)" stroke="var(--line)" />
+      <text x="34" y="64">cpu_id_start</text>
+      <text x="34" y="82" font-size="11" fill="var(--muted)" font-family="EB Garamond, serif">啟動快取的 CPU 編號</text>
+
+      <rect x="20" y="88"  width="300" height="44" fill="color-mix(in srgb, var(--sage) 14%, transparent)" stroke="var(--line)" />
+      <text x="34" y="108">cpu_id</text>
+      <text x="34" y="126" font-size="11" fill="var(--muted)" font-family="EB Garamond, serif">目前所在 CPU 編號</text>
+
+      <rect x="20" y="132" width="300" height="44" fill="color-mix(in srgb, var(--sage) 14%, transparent)" stroke="var(--line)" />
+      <text x="34" y="152">node_id</text>
+      <text x="34" y="170" font-size="11" fill="var(--muted)" font-family="EB Garamond, serif">所在 NUMA node</text>
+
+      <rect x="20" y="176" width="300" height="44" fill="color-mix(in srgb, var(--sage) 14%, transparent)" stroke="var(--line)" />
+      <text x="34" y="196">mm_cid</text>
+      <text x="34" y="214" font-size="11" fill="var(--muted)" font-family="EB Garamond, serif">行程內的精簡 CPU id</text>
+
+      <rect x="20" y="220" width="300" height="44" fill="color-mix(in srgb, var(--accent) 12%, transparent)" stroke="var(--line)" />
+      <text x="34" y="240">rseq_cs</text>
+      <text x="34" y="258" font-size="11" fill="var(--muted)" font-family="EB Garamond, serif">指向目前臨界區描述子</text>
+
+      <rect x="20" y="264" width="300" height="44" fill="color-mix(in srgb, var(--sage) 14%, transparent)" stroke="var(--line)" />
+      <text x="34" y="284">flags</text>
+      <text x="34" y="302" font-size="11" fill="var(--muted)" font-family="EB Garamond, serif">行為旗標</text>
+    </g>
+
+    <!-- legend -->
+    <g font-family="Manrope, sans-serif" font-size="11">
+      <rect x="20" y="352" width="12" height="12" fill="color-mix(in srgb, var(--sage) 30%, transparent)" stroke="var(--line)" />
+      <text x="38" y="362" fill="var(--ink)">kernel 寫 · user 讀</text>
+      <rect x="200" y="352" width="12" height="12" fill="color-mix(in srgb, var(--accent) 26%, transparent)" stroke="var(--line)" />
+      <text x="218" y="362" fill="var(--ink)">user 寫 · kernel 讀</text>
+    </g>
+
+    <!-- pointer arrow -->
+    <path d="M320 242 C 360 242, 360 130, 400 130" fill="none" stroke="var(--accent)" stroke-width="1.5" marker-end="url(#vg-w-layout-rseq-struct-arrow)" />
+    <defs>
+      <marker id="vg-w-layout-rseq-struct-arrow" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+        <path d="M0 0 L9 4.5 L0 9 Z" fill="var(--accent)" />
+      </marker>
+    </defs>
+
+    <!-- rseq_cs descriptor -->
+    <text x="400" y="28" font-family="Manrope, sans-serif" font-size="13" letter-spacing="0.06em" fill="var(--muted)">STRUCT RSEQ_CS（臨界區描述子）</text>
+    <rect x="400" y="44" width="300" height="232" fill="none" stroke="var(--muted-2)" stroke-width="1.5" />
+    <g font-family="JetBrains Mono, monospace" font-size="13" fill="var(--ink)">
+      <rect x="400" y="44"  width="300" height="44" fill="color-mix(in srgb, var(--accent) 12%, transparent)" stroke="var(--line)" />
+      <text x="414" y="64">start_ip</text>
+      <text x="414" y="82" font-size="11" fill="var(--muted)" font-family="EB Garamond, serif">臨界區第一條指令位址</text>
+
+      <rect x="400" y="88"  width="300" height="44" fill="color-mix(in srgb, var(--accent) 12%, transparent)" stroke="var(--line)" />
+      <text x="414" y="108">post_commit_offset</text>
+      <text x="414" y="126" font-size="11" fill="var(--muted)" font-family="EB Garamond, serif">臨界區長度（含 commit）</text>
+
+      <rect x="400" y="132" width="300" height="44" fill="color-mix(in srgb, var(--accent) 12%, transparent)" stroke="var(--line)" />
+      <text x="414" y="152">abort_ip</text>
+      <text x="414" y="170" font-size="11" fill="var(--muted)" font-family="EB Garamond, serif">被搶佔時跳去的位址</text>
+
+      <rect x="400" y="176" width="300" height="44" fill="color-mix(in srgb, var(--bg-soft) 100%, transparent)" stroke="var(--line)" />
+      <text x="414" y="196">version / flags</text>
+      <text x="414" y="214" font-size="11" fill="var(--muted)" font-family="EB Garamond, serif">ABI 版本與描述子旗標</text>
+
+      <rect x="400" y="220" width="300" height="44" fill="color-mix(in srgb, var(--bg-soft) 100%, transparent)" stroke="var(--line)" />
+      <text x="414" y="240">[簽章 abort_ip 前 4 byte]</text>
+      <text x="414" y="258" font-size="11" fill="var(--muted)" font-family="EB Garamond, serif">abort handler 前的魔術數字</text>
+    </g>
+
+    <text x="400" y="300" font-family="EB Garamond, serif" font-size="12" font-style="italic" fill="var(--muted)">kernel 用三個位址判定：指令指標落在</text>
+    <text x="400" y="318" font-family="EB Garamond, serif" font-size="12" font-style="italic" fill="var(--muted)">[start_ip, start_ip + post_commit_offset) 內</text>
+    <text x="400" y="336" font-family="EB Garamond, serif" font-size="12" font-style="italic" fill="var(--muted)">且被搶佔 → 跳到 abort_ip。</text>
+  </svg>
+  <figcaption>左邊是 <code>struct rseq</code> 本體：四個唯讀的位置欄位（kernel 維護）、一個 user space 寫的 <code>rseq_cs</code> 指標、一個 <code>flags</code>。右邊是它指到的臨界區描述子：用 <code>start_ip</code> 加 <code>post_commit_offset</code> 框出臨界區範圍，<code>abort_ip</code> 指向重做入口。整塊 <code>struct rseq</code> 要求 32-byte 對齊。</figcaption>
+</figure>
+
+<p>這裡有一個容易被略過、但實作上很關鍵的安全設計：rseq 的 ABI 在 <code>abort_ip</code> 指向的位址<strong>前面</strong>放了一個約定好的 4-byte 簽章（signature）。合理的推測是，kernel 在把控制權跳過去之前會先核對這個簽章——因為 <code>abort_ip</code> 是 user space 自己填的，少了這層檢查，偽造一個 <code>rseq_cs</code>、把 <code>abort_ip</code> 指到任意位址，就可能變成一個由 kernel 幫忙觸發的控制流劫持。要求 abort handler 前面帶一個雙方約好的魔術數字，等於要求「你跳過去的地方確實是一段被當成 abort handler 編譯出來的程式碼」，而不是任意 gadget。</p>
+
+<p>另一個欄位設計值得停一下：<code>cpu_id_start</code> 與 <code>cpu_id</code> 為什麼分兩個？<code>cpu_id_start</code> 是給臨界區一開始拿來算位址用的快取值，<code>cpu_id</code> 是 kernel 持續更新的當下值。fast path 用 <code>cpu_id_start</code> 算出要動哪一格，commit 之前如果被搬走，kernel 會 abort 整段——所以即使 <code>cpu_id_start</code> 已經過時，也不會造成寫錯格子，因為那一輪根本不會 commit。這就是「偵測而非防止」在欄位層級的體現。</p>
+
+<p>值得補一句 kernel 是<strong>什麼時候</strong>做這個檢查的。它不是每條指令都盯著看——那樣太貴。kernel 文件寫得很明確：核心在每次 context switch 之後、訊號送達之前處理 rseq。換句話說，搶佔與遷移的發生點，本來就是核心要做排程切換的那一刻；rseq 只是讓核心在那個它原本就要停下來的點，順手多看一眼當前執行緒的指令指標有沒有落在已宣告的臨界區裡，有的話就改寫指令指標。這個設計讓 abort 的偵測幾乎不增加額外成本，因為它搭的是 context switch 這班本來就要開的車。</p>
+
+<h2>一段 rseq critical section 拆開看</h2>
+
+<p>把前面講的東西具象成程式碼。一段 rseq 的 fast path 在組語層面有三個區段，分別對應描述子裡的三個位址。下面三個 tab 把同一個「per-CPU 計數器加一」的 fast path 拆成準備段、commit、abort handler 並排看——重點不是組語細節，是看清楚哪一行是那條神聖的單一 commit 指令、以及失敗時控制流往哪走。</p>
+
+<div class="vg-w-tabs-rseq-anatomy">
+  <style>
+    .vg-w-tabs-rseq-anatomy { display: grid; gap: var(--s-2); margin: var(--s-3) 0; }
+    .vg-w-tabs-rseq-anatomy input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+    .vg-w-tabs-rseq-anatomy .tabs { display: flex; gap: var(--s-2); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+    .vg-w-tabs-rseq-anatomy .tab { font-family: var(--sans); font-size: var(--fs-sm); padding: var(--s-1) var(--s-2); cursor: pointer; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; min-height: 44px; display: flex; align-items: center; }
+    .vg-w-tabs-rseq-anatomy .panel { display: none; padding: var(--s-2) 0; }
+    .vg-w-tabs-rseq-anatomy:has(#vg-w-tabs-rseq-anatomy-t1:checked) .panel-1 { display: block; }
+    .vg-w-tabs-rseq-anatomy:has(#vg-w-tabs-rseq-anatomy-t1:checked) [for="vg-w-tabs-rseq-anatomy-t1"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    .vg-w-tabs-rseq-anatomy:has(#vg-w-tabs-rseq-anatomy-t2:checked) .panel-2 { display: block; }
+    .vg-w-tabs-rseq-anatomy:has(#vg-w-tabs-rseq-anatomy-t2:checked) [for="vg-w-tabs-rseq-anatomy-t2"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    .vg-w-tabs-rseq-anatomy:has(#vg-w-tabs-rseq-anatomy-t3:checked) .panel-3 { display: block; }
+    .vg-w-tabs-rseq-anatomy:has(#vg-w-tabs-rseq-anatomy-t3:checked) [for="vg-w-tabs-rseq-anatomy-t3"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+  </style>
+  <input type="radio" id="vg-w-tabs-rseq-anatomy-t1" name="vg-w-tabs-rseq-anatomy-sel" checked />
+  <input type="radio" id="vg-w-tabs-rseq-anatomy-t2" name="vg-w-tabs-rseq-anatomy-sel" />
+  <input type="radio" id="vg-w-tabs-rseq-anatomy-t3" name="vg-w-tabs-rseq-anatomy-sel" />
+  <div class="tabs">
+    <label class="tab" for="vg-w-tabs-rseq-anatomy-t1">準備段</label>
+    <label class="tab" for="vg-w-tabs-rseq-anatomy-t2">commit</label>
+    <label class="tab" for="vg-w-tabs-rseq-anatomy-t3">abort handler</label>
+  </div>
+  <div class="panel panel-1">
+<pre data-kind="pseudocode"><code><em>// 在臨界區開始前，把這段 rseq_cs 描述子的位址寫進 struct rseq 的 rseq_cs 欄位</em>
+<em>// 從這裡起 kernel 知道：指令指標若落在本區間且被搶佔，就跳 abort</em>
+start_ip:
+    cpu = load   rseq.cpu_id_start      <em>// 讀快取的 CPU 編號（普通 load，不用 atomic）</em>
+    slot = base + cpu * SLOT_SIZE        <em>// 算出本 CPU 那一格的位址</em>
+    old  = load   [slot]                 <em>// 載入目前計數值</em>
+    new  = old + 1                       <em>// 純計算，沒有副作用，重做幾次都一樣</em>
+<em>// 以上每一行都可以從頭再來；世界還沒被改變</em></code></pre>
+  </div>
+  <div class="panel panel-2">
+<pre data-kind="pseudocode"><code><em>// commit：唯一一條把結果寫回記憶體的指令</em>
+<em>// 設計鐵律——commit 必須是單一 store，沒有半完成狀態</em>
+    store [slot] = new                    <em>// ← 這一條就是 commit</em>
+post_commit_ip:                           <em>// start_ip + post_commit_offset 落在這</em>
+<em>// 若搶佔發生在 store 之前：本輪沒寫進任何東西，abort 重來完全安全</em>
+<em>// 若搶佔發生在 store 之後：臨界區已結束，preempt 無害</em>
+<em>// 普通 store，不需要 lock prefix，因為「被打斷就丟掉」取代了「不准被打斷」</em></code></pre>
+  </div>
+  <div class="panel panel-3">
+<pre data-kind="pseudocode"><code><em>// abort handler：kernel 偵測到中途被搶佔／遷移時，把指令指標改到這裡</em>
+<em>// 注意 abort_ip 的前 4 byte 必須是雙方約好的簽章，kernel 跳過來前會核對</em>
+.long  RSEQ_SIGNATURE                     <em>// abort_ip 之前的魔術數字（防控制流劫持）</em>
+abort_ip:
+    jmp  start_ip                         <em>// 最單純的 abort：整段從頭再來一次</em>
+<em>// 也可以在這裡做別的補救，但最常見就是直接 retry</em>
+<em>// 重做的成本只在「真的被打斷」那一次發生</em></code></pre>
+  </div>
+</div>
+
+<p>這個結構解釋了為什麼 rseq 的 fast path 能完全避開 atomic：準備段全是普通 load 與算術，commit 是普通 store，沒有任何一條指令需要 <code>lock</code> prefix。同一顆 CPU 上不會有兩條執行緒同時跑——因為要嘛你沒被搶佔（那就是你獨占這顆 CPU 的這段時間），要嘛你被搶佔了（那這一輪整個作廢）。正確性不是靠指令的原子性撐起來，是靠「被打斷就不算數」這條規則撐起來。</p>
+
+<p>TCMalloc 文件把這個保證的範圍寫得很精確：一段臨界區的承諾是「execute a region to completion (atomically with respect to other threads on the same CPU) or to be aborted if interrupted by the kernel.」注意那個括號裡的限定——原子性是<strong>相對於同一顆 CPU 上的其他執行緒</strong>而言。rseq 不保證跨 CPU 的原子性，它根本不需要：每顆 CPU 動自己那一格，跨 CPU 本來就不會踩到同一塊記憶體。它要排除的只有「同一顆 CPU 上、在我這段準備到 commit 之間，有別人插進來改了我正要動的格子」這一種情況，而搶佔正是這種插隊唯一的入口。把搶佔這個入口堵住（偵測到就作廢），同 CPU 上的序列化就自動成立，連鎖都不必擺。</p>
+
+<p>再回頭看那個分兩個欄位的 <code>cpu_id_start</code>／<code>cpu_id</code> 設計，會更有感覺。假設你在 CPU 3 上讀了 <code>cpu_id_start</code> = 3、算好了要動 slot[3]，這時候被搬到 CPU 7。kernel 在 context switch 時發現你的指令指標還落在臨界區範圍內、而且 CPU 變了，於是把你彈回 abort handler。你重來一次，這次讀到的 <code>cpu_id_start</code> 是 7，動的是 slot[7]——永遠不會發生「在 CPU 7 上卻寫了 slot[3]」這種錯位。整個正確性論證不需要任何鎖，只需要 kernel 在搶佔點上誠實地把過時的那一輪丟掉。</p>
+
+<h2>它到底快多少——以及什麼時候不划算</h2>
+
+<p>rseq 不是免費午餐，它把成本從「每次操作都付 atomic 稅」搬到「只有被搶佔那次付重做的錢」。這個 trade-off 划不划算，取決於你被搶佔的頻率。EfficiOS 把這條取捨講得很直接（這裡引的是 TCMalloc 文件的說法，因為它最白）：</p>
+
+<blockquote>
+  <p>「Choosing to restart on migration across cores or preemption allows us to optimize the common case - we stay on the same core - by avoiding atomics, over the more rare case - we are actually preempted.」</p>
+</blockquote>
+
+<p>common case 是「我們留在同一顆核心上」，rare case 才是「真的被搶佔」。只要前者遠多於後者，整體就賺。下面這張表是 EfficiOS 量到的實際數字，對比 rseq fast path 與傳統 atomic 做法在不同操作上的加速比。</p>
+
+<figure class="vg-w-table-rseq-bench" data-mobile="keep">
+  <style>
+    .vg-w-table-rseq-bench { overflow-x: auto; }
+    .vg-w-table-rseq-bench table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+    .vg-w-table-rseq-bench thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); }
+    .vg-w-table-rseq-bench tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+    .vg-w-table-rseq-bench td.num { font-variant-numeric: tabular-nums; text-align: right; color: var(--accent-text); }
+    .vg-w-table-rseq-bench figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-2); }
+  </style>
+  <table>
+    <thead>
+      <tr>
+        <th>操作</th>
+        <th class="num">x86 加速比</th>
+        <th class="num">ARM 加速比</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td>取得 CPU 編號</td><td class="num">20×</td><td class="num">35×</td></tr>
+      <tr><td>per-CPU 計數器加一</td><td class="num">7.7×</td><td class="num">11×</td></tr>
+      <tr><td>Userspace RCU 操作</td><td class="num">1.9×</td><td class="num">5.8×</td></tr>
+      <tr><td>LTTng-UST 事件緩衝</td><td class="num">1.2×</td><td class="num">1.1×</td></tr>
+    </tbody>
+  </table>
+  <figcaption>EfficiOS 公布的 rseq 對比傳統 atomic 做法加速比。差距最大的是「取得 CPU 編號」——傳統做法要走 system call 或序列化指令，rseq 直接讀共用記憶體裡的 <code>cpu_id</code>。計數器加一這種短臨界區也有 7.7× 到 11× 的提升；越是高階、本來 atomic 占比就低的操作（如事件緩衝），rseq 帶來的相對提升越小。</figcaption>
+</figure>
+
+<p>從這張表能讀出 rseq 的適用邊界。加速比最誇張的是「取得 CPU 編號」與「短計數器」——這些操作本身極短，atomic 或 system call 的固定成本佔比極高，把它拿掉自然倍數驚人。反過來看 LTTng-UST 事件緩衝只有 1.1× 到 1.2×，因為那個操作本來就重，rseq 省下的那點固定成本佔比小。一句話：操作越短、本來 atomic 稅佔比越高，rseq 越值得；操作越重，邊際效益越薄。</p>
+
+<p>這套機制併進主線其實不算太久——restartable sequences 在 Linux 4.18 才被併入核心。在那之前，user space 要對 per-CPU 資料做無鎖更新，幾乎只能回到 atomic 那條路；rseq 之後，kernel 文件描述的那個目標——讓 user space 對 per-CPU 資料做更新而不需重量級 atomic——才真正成為一條可用的 fast path。這也是為什麼底層函式庫會搶著接：對 malloc、allocator、計數器這種被頻繁呼叫的熱路徑，常見情況遠多於被搶佔的情況，省下 atomic 稅的效益就被這個比例放大。</p>
+
+<p>那「被搶佔頻率」這個變數到底怎麼吃掉好處？下面這個 widget 讓你直接拖。橫軸是平均每段臨界區被搶佔的機率，縱軸是相對於 atomic 基準的有效吞吐量——被搶佔越頻繁，重做的次數越多，rseq 的優勢就被磨平，超過某個點甚至會輸給老老實實用 atomic。</p>
+
+<figure class="vg-w-param-rseq-abort" data-mobile="swap" data-svg-scroll="800" data-mobile-summary="搶佔機率低時 rseq 避開 atomic 而領先；機率升高後重做成本累積，越過交叉點反而輸給穩定付 atomic 稅的做法。">
+  <style>
+    .vg-w-param-rseq-abort { display: grid; grid-template-rows: auto 1fr auto; gap: var(--s-2); }
+    .vg-w-param-rseq-abort .controls { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+    .vg-w-param-rseq-abort .controls input { flex: 1; accent-color: var(--accent); height: 36px; touch-action: none; }
+    .vg-w-param-rseq-abort .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 16ch; text-align: right; }
+    .vg-w-param-rseq-abort svg { width: 100%; height: auto; }
+    .vg-w-param-rseq-abort figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+  </style>
+  <div class="controls">
+    <label for="vg-w-param-rseq-abort-x">每段臨界區被搶佔機率 p =</label>
+    <input id="vg-w-param-rseq-abort-x" type="range" min="0" max="100" value="3" />
+    <span class="readout" id="vg-w-param-rseq-abort-readout">p = 3% · 相對 1.00×</span>
+  </div>
+  <svg viewBox="0 0 720 320" preserveAspectRatio="xMidYMid meet" role="img" aria-label="rseq 有效吞吐量隨搶佔機率變化">
+    <line x1="60" y1="280" x2="700" y2="280" stroke="var(--muted-2)" stroke-width="1" />
+    <line x1="60" y1="20"  x2="60"  y2="280" stroke="var(--muted-2)" stroke-width="1" />
+    <text x="380" y="310" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--muted)">每段臨界區被搶佔機率 p (%)</text>
+
+    <g font-family="JetBrains Mono, monospace" font-size="10" fill="var(--muted)">
+      <text x="56" y="284" text-anchor="end">0×</text>
+      <text x="56" y="216" text-anchor="end">2×</text>
+      <text x="56" y="152" text-anchor="end">4×</text>
+      <text x="56" y="88"  text-anchor="end">6×</text>
+      <text x="56" y="24"  text-anchor="end">8×</text>
+    </g>
+
+    <!-- baseline atomic line at 1x -->
+    <line x1="60" y1="246" x2="700" y2="246" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="4 4" />
+    <text x="700" y="240" text-anchor="end" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">atomic 基準 1×</text>
+
+    <path id="vg-w-param-rseq-abort-curve" fill="none" stroke="var(--accent)" stroke-width="2" />
+    <circle id="vg-w-param-rseq-abort-dot" r="5" fill="var(--accent)" />
+    <line id="vg-w-param-rseq-abort-vline" stroke="var(--accent)" stroke-width="1" stroke-dasharray="2 3" y1="20" y2="280" />
+  </svg>
+  <figcaption>橙線是 rseq 的有效吞吐量（相對 atomic 基準 1×），模型為：fast path 比 atomic 快約 8 倍，但每次被搶佔要付一段重做成本，相對吞吐量隨 p 上升而下滑。虛線是穩定付 atomic 稅的基準。橙線跌破虛線的那一點，就是 rseq 從划算翻成不划算的交叉點。</figcaption>
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-param-rseq-abort');
+      if (!root) return;
+      const input = root.querySelector('input');
+      const readout = root.querySelector('.readout');
+      const curve = root.querySelector('#vg-w-param-rseq-abort-curve');
+      const dot = root.querySelector('#vg-w-param-rseq-abort-dot');
+      const vline = root.querySelector('#vg-w-param-rseq-abort-vline');
+
+      const X0 = 60, X1 = 700, Y0 = 280, Y1 = 20;
+      const P_MAX = 100;      // percent
+      const SPEEDUP = 8;      // rseq fast path speedup over atomic when never preempted
+      const RETRY_COST = 9;   // each abort costs ~ this many fast-path-units of redo
+      const Y_MAX = 8;        // axis top = 8x
+
+      function xOf(p) { return X0 + (p / P_MAX) * (X1 - X0); }
+      function yOf(v) { return Y0 - (Math.max(0, Math.min(Y_MAX, v)) / Y_MAX) * (Y0 - Y1); }
+
+      // effective relative throughput vs atomic:
+      // expected work per successful commit = 1 + (p/(1-p)) * RETRY_COST_in_fastpath_units
+      // throughput_rseq = SPEEDUP / (1 + expectedRetries * RETRY_COST / 1)
+      function relThroughput(pPct) {
+        const p = Math.min(0.95, pPct / 100);
+        const expectedRetries = p / (1 - p);          // geometric mean retries
+        const work = 1 + expectedRetries * RETRY_COST; // in fast-path time units
+        return SPEEDUP / work;
+      }
+
+      const pts = [];
+      for (let p = 0; p <= P_MAX; p += 1) {
+        pts.push(`${p === 0 ? 'M' : 'L'} ${xOf(p).toFixed(1)} ${yOf(relThroughput(p)).toFixed(1)}`);
+      }
+      curve.setAttribute('d', pts.join(' '));
+
+      function update() {
+        const p = Number(input.value);
+        const v = relThroughput(p);
+        readout.textContent = `p = ${p}% · 相對 ${v.toFixed(2)}×`;
+        dot.setAttribute('cx', xOf(p)); dot.setAttribute('cy', yOf(v));
+        vline.setAttribute('x1', xOf(p)); vline.setAttribute('x2', xOf(p));
+      }
+      input.addEventListener('input', update);
+      update();
+    })();
+  </script>
+</figure>
+
+<p>這也劃出了 rseq 的限制。它的甜蜜區是「短臨界區 ＋ 低搶佔率」。如果你的臨界區很長、或系統處在高度 oversubscribe（執行緒數遠多於 CPU、被搶佔頻繁）的狀態，重做成本會累積到吃光、甚至倒貼。另外，臨界區裡不能做任何「無法安全重來」的事——不能呼叫會產生外部副作用的 system call、不能在中途 commit 一半的狀態，所有寫入必須收斂到最後那條單一 store。這也是為什麼 rseq 的典型使用者是 malloc（TCMalloc 已公開實作）、memory allocator、per-CPU 計數器這類「臨界區極短、純記憶體操作」的場景，而不是任意一段業務邏輯。</p>
+
+<p>從 user space 工程師的角度，你幾乎不會手寫 rseq 組語——它太底層、abort handler 與簽章的細節太容易出錯。你更可能是「用到它」而不自知：你連結的 malloc、你用的 tracing library（LTTng-UST、Userspace RCU 都已採用），底下可能就跑著 rseq 的 fast path。知道它存在、知道它的甜蜜區與限制，足以讓你在效能分析時多一個解釋變數——當你發現某個 per-CPU 結構在高 contention 下意外地不退化，rseq 很可能就是答案；當你發現它在 oversubscribe 的 container 裡退化得莫名其妙，過高的搶佔率導致 rseq 一直 abort 也是一個要查的方向。</p>
+
+<p class="vg-deep-closer"><strong>Take-away</strong>：rseq 不是更快的鎖，是把「不准被打斷」換成「被打斷就丟掉」——臨界區拆成可重做的準備段加一條單一 commit，kernel 在搶佔時把你彈回 abort handler，於是沒被搶的常見情況一次就過、零 atomic 成本，代價是搶佔頻繁時要不斷重做。</p>
+
+</div>
