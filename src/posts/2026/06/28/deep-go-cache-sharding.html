@@ -1,0 +1,702 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">
+    同一張 in-memory map，包上一把 sync.Mutex 在單核跑得好好的，換到 8 核機器上吞吐量不升反降——
+    一個 256-shard 的版本在同一台機器上比它快了將近 8 倍。差距不在演算法，在那把鎖怎麼擺。
+  </p>
+  <h1 class="vg-post-title">{{ title }}</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p>
+    <span class="vg-dropcap">幾</span>乎每個 Go service 都有一張 in-process cache：session、metadata、
+    feature flag、解析過的 config。寫法看似只有一種——一個 <code>map[string]V</code> 加一把鎖——
+    但 strebkov.dev 的這篇 shootout 把它拆成六種設計擺在一起量：naive（無保護 map，當基準）、
+    單一 <code>sync.Mutex</code>、單一 <code>sync.RWMutex</code>、標準庫 <code>sync.Map</code>、
+    256-shard 的 lock striping（FNV-1a 路由），以及用 <code>atomic.Pointer</code> 做的 copy-on-write。
+    六種寫法在單核上的差距可以忽略；一旦核心數上去，最快與最慢之間拉開到一個數量級。
+  </p>
+
+  <p>
+    這種 shootout 容易淪為「我跑了一下，sharded 比較快」的逸事。這篇沒有：它把方法學寫死。
+    測試用標準庫 <code>testing.B</code> 的 <code>b.RunParallel</code>、100 萬個 string key、
+    一顆 20 核的 i7-14700K 並把 goroutine 釘到實體核、<code>GOMAXPROCS</code> 從 1 掃到 8、
+    四種讀寫負載（read-only、read-heavy、balanced、write-heavy）、key 存取用 uniform 與
+    Zipfian（s=1.1）兩種分布，每個點跑 10 次取中位數，變異多落在 ±0–3%。
+    先講清楚怎麼量，後面的數字才站得住。
+  </p>
+
+  <p>
+    結論可以一句話講完，但這句話會誤導：「sharded 當預設」。誤導在於它讓人以為其他五種都沒用——
+    其實 CoW 在讀路徑上把 sharded 都比下去，sync.Map 在讀為主時貼著理想擴展線跑。
+    真正要學的不是「誰贏」，而是「在你的 GOMAXPROCS 與讀寫比例下，誰贏」。所以先讓你親手把這兩個
+    旋鈕轉一轉，看排名怎麼洗牌。
+  </p>
+
+  <p>
+    為什麼要先在意 <code>b.RunParallel</code> 而不是隨手寫個迴圈計時？因為並行 cache 的瓶頸
+    只在多 goroutine 真的同時打進來時才會現形。一個單執行緒的 benchmark 永遠看不到鎖爭用——
+    它會告訴你單鎖跟 sharded 一樣快，然後你上線就被打臉。<code>b.RunParallel</code> 會起
+    <code>GOMAXPROCS</code> 個 worker 同時跑同一段程式，逼出鎖在高並行下的真實行為。
+    再配上把 goroutine 釘到 i7-14700K 的實體核（避開 hyperthread 與 E-core 的干擾），
+    量到的才是設計本身的擴展性，而不是排程器的雜訊。這套設定不是過度講究，
+    是「要比較鎖策略」這件事的最低門檻——沒有它，六種設計的差距會被測量誤差淹沒。
+  </p>
+
+  <figure class="vg-w-param-demo-cache-winner" data-mobile="static" data-svg-scroll="720">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M5 9v6"/><path d="M9 5v14"/><path d="M15 9v6"/><path d="M19 5v14"/>
+      </svg>
+      <span>拖兩個滑桿：核心數 1→8、寫入比例 0→100% · 6 種設計即時重排</span>
+    </p>
+    <style>
+      .vg-w-param-demo-cache-winner { display: grid; grid-template-rows: auto auto 1fr auto; gap: var(--s-2); }
+      .vg-w-param-demo-cache-winner .controls { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s-2) var(--s-3); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+      .vg-w-param-demo-cache-winner .ctl { display: flex; align-items: center; gap: var(--s-2); }
+      .vg-w-param-demo-cache-winner .ctl input { flex: 1; height: 36px; accent-color: var(--accent); touch-action: none; min-width: 8ch; }
+      .vg-w-param-demo-cache-winner .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 6ch; text-align: right; }
+      .vg-w-param-demo-cache-winner svg { width: 100%; height: auto; }
+      .vg-w-param-demo-cache-winner figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+      @media (max-width: 720px) {
+        .vg-w-param-demo-cache-winner .controls { grid-template-columns: 1fr; }
+      }
+    </style>
+
+    <div class="controls" data-vg-controls>
+      <div class="ctl">
+        <label for="vg-w-param-demo-cache-winner-cores">cores =</label>
+        <input id="vg-w-param-demo-cache-winner-cores" type="range" min="1" max="8" value="8" step="1" />
+        <span class="readout" id="vg-w-param-demo-cache-winner-cores-readout">8</span>
+      </div>
+      <div class="ctl">
+        <label for="vg-w-param-demo-cache-winner-write">write % =</label>
+        <input id="vg-w-param-demo-cache-winner-write" type="range" min="0" max="100" value="10" step="5" />
+        <span class="readout" id="vg-w-param-demo-cache-winner-write-readout">10%</span>
+      </div>
+    </div>
+
+    <svg viewBox="0 0 720 360" preserveAspectRatio="xMidYMid meet" role="img"
+         aria-label="六種 Go 快取設計在不同核心數與寫入比例下的相對吞吐量長條圖">
+      <g id="vg-w-param-demo-cache-winner-axes"></g>
+      <g id="vg-w-param-demo-cache-winner-bars"></g>
+    </svg>
+
+    <figcaption>
+      長條為相對吞吐量（越高越快），依當下核心數與寫入比例即時重排，當前最快者以 accent 色標示。
+      錨點取自 strebkov.dev shootout（8 核 uniform：read-heavy sharded 22 ns/op、mutex 168 ns/op；
+      read-only cow 11.5 ns/op）；中間值為依這些錨點與「單鎖負成長、sharded 隨核心正成長」的趨勢做的插值，非逐點實測。
+    </figcaption>
+
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        const root = document.querySelector('.vg-w-param-demo-cache-winner');
+        if (!root) return;
+        const coresInput = root.querySelector('#vg-w-param-demo-cache-winner-cores');
+        const writeInput = root.querySelector('#vg-w-param-demo-cache-winner-write');
+        const coresRead = root.querySelector('#vg-w-param-demo-cache-winner-cores-readout');
+        const writeRead = root.querySelector('#vg-w-param-demo-cache-winner-write-readout');
+        const axes = root.querySelector('#vg-w-param-demo-cache-winner-axes');
+        const barsG = root.querySelector('#vg-w-param-demo-cache-winner-bars');
+        const NS = 'http://www.w3.org/2000/svg';
+        function el(tag, attrs, text) {
+          const e = document.createElementNS(NS, tag);
+          for (const [k, v] of Object.entries(attrs || {})) e.setAttribute(k, v);
+          if (text != null) e.textContent = text;
+          return e;
+        }
+
+        // Six designs. base8ro / base8wh anchor the read-only and write-heavy
+        // throughput (relative units, higher = faster) AT 8 cores, derived from
+        // the post's ns/op anchors (throughput ∝ 1/ns). scale(cores) captures
+        // each design's scaling behaviour from 1→8 cores.
+        const X0 = 150, X1 = 690, Y0 = 36, ROW = 50;
+        const designs = [
+          // id, label, ro8, wh8, scaling shape
+          { id: 'cow',     label: 'copy-on-write', ro8: 87, wh8: 1,   shape: 'super' },
+          { id: 'sharded', label: 'sharded ×256',  ro8: 48, wh8: 40,  shape: 'linear' },
+          { id: 'syncmap', label: 'sync.Map',      ro8: 70, wh8: 14,  shape: 'super' },
+          { id: 'naive',   label: 'naive (unsafe)',ro8: 95, wh8: 70,  shape: 'flat' },
+          { id: 'rwmutex', label: 'sync.RWMutex',  ro8: 30, wh8: 4,   shape: 'neg' },
+          { id: 'mutex',   label: 'sync.Mutex',    ro8: 6,  wh8: 6,   shape: 'neg' },
+        ];
+
+        // scaling factor relative to 8-core value; 1 core baseline differs by shape.
+        function scaleFactor(shape, cores) {
+          const f = cores / 8;
+          switch (shape) {
+            case 'super':  return Math.pow(f, 1.05);          // tracks/exceeds ideal
+            case 'linear': return Math.pow(f, 0.96);          // ~6.9x at 8 cores
+            case 'flat':   return 0.55 + 0.45 * f;            // unsynchronised, mild
+            case 'neg':    return f < 0.2 ? 1 : (1.6 - 0.6 * Math.min(1, f)); // contention: more cores hurts
+            default:       return f;
+          }
+        }
+
+        function valueOf(d, cores, writeFrac) {
+          // interpolate read-only vs write-heavy by write fraction
+          const at8 = d.ro8 * (1 - writeFrac) + d.wh8 * writeFrac;
+          return Math.max(0.5, at8 * scaleFactor(d.shape, cores));
+        }
+
+        const MAXVAL = 100;
+        function xOf(v) { return X0 + (v / MAXVAL) * (X1 - X0); }
+
+        // static axis ticks
+        for (let v = 0; v <= MAXVAL; v += 25) {
+          axes.appendChild(el('line', { x1: xOf(v), y1: Y0 - 6, x2: xOf(v), y2: Y0 + ROW * 6 - 18, stroke: 'var(--muted-2)', 'stroke-width': v === 0 ? 1.2 : 0.6, 'stroke-opacity': v === 0 ? 1 : 0.5 }));
+          axes.appendChild(el('text', { x: xOf(v), y: Y0 + ROW * 6 - 2, 'text-anchor': 'middle', 'font-family': 'Manrope, sans-serif', 'font-size': 12, fill: 'var(--muted)' }, String(v)));
+        }
+        axes.appendChild(el('text', { x: (X0 + X1) / 2, y: Y0 + ROW * 6 + 18, 'text-anchor': 'middle', 'font-family': 'EB Garamond, serif', 'font-size': 14, fill: 'var(--muted)' }, '相對吞吐量（越高越快）'));
+
+        // build bar elements once, mutate on update
+        const bars = designs.map((d, i) => {
+          const y = Y0 + i * ROW;
+          barsG.appendChild(el('text', { x: X0 - 12, y: y + 18, 'text-anchor': 'end', 'font-family': 'JetBrains Mono, monospace', 'font-size': 13, fill: 'var(--ink)', id: 'vg-w-param-demo-cache-winner-name-' + d.id }, d.label));
+          const rect = el('rect', { x: X0, y: y, width: 0, height: 26, rx: 2, fill: 'var(--sage)', id: 'vg-w-param-demo-cache-winner-bar-' + d.id });
+          barsG.appendChild(rect);
+          const val = el('text', { x: X0, y: y + 18, 'font-family': 'Manrope, sans-serif', 'font-size': 12, fill: 'var(--ink)', id: 'vg-w-param-demo-cache-winner-val-' + d.id });
+          barsG.appendChild(val);
+          return { d, rect, val, name: barsG.querySelector('#vg-w-param-demo-cache-winner-name-' + d.id) };
+        });
+
+        function update() {
+          const cores = Number(coresInput.value);
+          const writeFrac = Number(writeInput.value) / 100;
+          coresRead.textContent = String(cores);
+          writeRead.textContent = Number(writeInput.value) + '%';
+          let best = -1, bestId = null;
+          bars.forEach(b => { const v = valueOf(b.d, cores, writeFrac); if (v > best) { best = v; bestId = b.d.id; } });
+          bars.forEach(b => {
+            const v = valueOf(b.d, cores, writeFrac);
+            const w = xOf(v) - X0;
+            b.rect.setAttribute('width', Math.max(1, w).toFixed(1));
+            b.rect.setAttribute('fill', b.d.id === bestId ? 'var(--accent)' : 'var(--sage)');
+            b.name.setAttribute('fill', b.d.id === bestId ? 'var(--accent-text)' : 'var(--ink)');
+            b.val.setAttribute('x', (xOf(v) + 6).toFixed(1));
+            b.val.textContent = v.toFixed(0);
+            b.val.setAttribute('fill', b.d.id === bestId ? 'var(--accent-text)' : 'var(--muted)');
+          });
+        }
+        coresInput.addEventListener('input', update);
+        writeInput.addEventListener('input', update);
+        update();
+      })();
+    </script>
+  </figure>
+
+  <p>
+    把寫入比例壓到 0、核心數拉到 8，你會看到 naive 與 cow 衝到最前面——這是讀為主的世界，
+    無鎖的東西就是快。把寫入比例往右推，cow 直接塌到底，naive 因為根本沒同步而「看起來」還行
+    （但它不是執行緒安全的，這條只是物理上限的參考線）。不管你怎麼轉，sharded 那根長條都不會掉到很後面。
+    這就是「當預設」三個字的意思：它不一定每格都第一，但它從不墊底。
+  </p>
+
+  <h2>大表：六種設計的鎖策略一次攤開</h2>
+
+  <p>
+    在進到逐軸的數字之前，先把六種設計的機制差異對齊。點 column header 可以重排，
+    方便你照自己最在意的維度（讀路徑？寫路徑？擴展性？）排序。這張表是地圖，後面每個 H2 是地形。
+  </p>
+
+  <figure class="vg-w-table-cache-designs" data-mobile="keep">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/><path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+      </svg>
+      <span>點欄位標題排序 · 6 列 × 5 欄</span>
+    </p>
+    <style>
+      .vg-w-table-cache-designs { display: grid; gap: var(--s-2); overflow-x: auto; }
+      .vg-w-table-cache-designs table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-cache-designs caption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); text-align: left; padding-bottom: var(--s-2); caption-side: top; }
+      .vg-w-table-cache-designs thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; }
+      .vg-w-table-cache-designs thead th[data-sort] { color: var(--accent-text); }
+      .vg-w-table-cache-designs thead th[data-sort="asc"]::after { content: " ↑"; }
+      .vg-w-table-cache-designs thead th[data-sort="desc"]::after { content: " ↓"; }
+      .vg-w-table-cache-designs tbody th { font-family: var(--mono); font-weight: 600; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); color: var(--ink); white-space: nowrap; }
+      .vg-w-table-cache-designs tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); color: var(--ink-soft); }
+      .vg-w-table-cache-designs td.weak { color: var(--accent-text); }
+      .vg-w-table-cache-designs td.strong { color: var(--sage-deep); }
+      .vg-w-table-cache-designs figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+    <table>
+      <caption>六種 in-memory cache 設計的機制對照（資料來源：strebkov.dev shootout；點 header 可重排）</caption>
+      <thead>
+        <tr>
+          <th data-key="design">設計</th>
+          <th data-key="lock">鎖機制</th>
+          <th data-key="read">讀路徑</th>
+          <th data-key="write">寫路徑</th>
+          <th data-key="scale">隨核心擴展</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <th scope="row">naive</th>
+          <td class="weak">無（非執行緒安全）</td>
+          <td class="strong">直接讀 map</td>
+          <td class="strong">直接寫 map</td>
+          <td>僅作基準</td>
+        </tr>
+        <tr>
+          <th scope="row">sync.Mutex</th>
+          <td>單一全域 mutex</td>
+          <td class="weak">全部序列化</td>
+          <td class="weak">全部序列化</td>
+          <td class="weak">負成長</td>
+        </tr>
+        <tr>
+          <th scope="row">sync.RWMutex</th>
+          <td>單一讀寫鎖</td>
+          <td>讀可並行</td>
+          <td class="weak">比 mutex 寫更慢</td>
+          <td class="weak">多數情況該避免</td>
+        </tr>
+        <tr>
+          <th scope="row">sync.Map</th>
+          <td>標準庫內建</td>
+          <td class="strong">讀近 lock-free</td>
+          <td>amortised</td>
+          <td class="strong">讀為主貼近理想線</td>
+        </tr>
+        <tr>
+          <th scope="row">sharded</th>
+          <td class="strong">256 把 mutex（FNV-1a 路由）</td>
+          <td class="strong">鎖一個 shard</td>
+          <td class="strong">鎖一個 shard</td>
+          <td class="strong">隨核心正成長</td>
+        </tr>
+        <tr>
+          <th scope="row">copy-on-write</th>
+          <td>atomic.Pointer</td>
+          <td class="strong">lock-free（最快）</td>
+          <td class="weak">複製整張 map</td>
+          <td class="strong">讀路徑超線性</td>
+        </tr>
+      </tbody>
+    </table>
+    <figcaption>
+      綠色＝該維度的強項，赭色＝弱項。讀完整張表會發現沒有一行全綠：naive 全綠但不安全、
+      cow 讀全綠卻寫得最慢、sharded 沒有任何一格是弱項——這正是它能當預設的理由。
+    </figcaption>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-table-cache-designs');
+        if (!root) return;
+        const headers = root.querySelectorAll('thead th');
+        const tbody = root.querySelector('tbody');
+        let activeKey = null, asc = true;
+        headers.forEach(h => h.addEventListener('click', () => {
+          const key = h.dataset.key;
+          if (activeKey === key) asc = !asc; else { activeKey = key; asc = true; }
+          headers.forEach(x => x.removeAttribute('data-sort'));
+          h.setAttribute('data-sort', asc ? 'asc' : 'desc');
+          const rows = [...tbody.querySelectorAll('tr')];
+          const idx = [...headers].indexOf(h);
+          rows.sort((a, b) => {
+            const av = (idx === 0 ? a.querySelector('th') : a.children[idx]).textContent.trim();
+            const bv = (idx === 0 ? b.querySelector('th') : b.children[idx]).textContent.trim();
+            return asc ? av.localeCompare(bv, 'zh-Hant') : bv.localeCompare(av, 'zh-Hant');
+          });
+          rows.forEach(r => tbody.appendChild(r));
+        }));
+      })();
+    </script>
+  </figure>
+
+  <h2>讀寫吞吐量：8 核下，sharded 對單鎖近 8 倍</h2>
+
+  <p>
+    先看最直觀的一軸：固定在 8 核、uniform 分布，各設計在四種負載下的每操作耗時。
+    read-heavy 負載下，sharded 約 <code>22 ns/op</code>，單一 mutex 約 <code>168 ns/op</code>——
+    後者是前者的七倍多。作者給的總結是 sharded「up to 8× faster than a single sync.Mutex at 8 cores」。
+    這個 8× 不是空話：當八個 goroutine 全都搶同一把鎖，它們本質上是排隊一個一個進臨界區，
+    多核的算力被序列化吃掉，於是 168 ns 裡大部分是等鎖，不是查 map。
+  </p>
+
+  <p>
+    sharded 的數字在四種負載下都很穩：read-only 約 <code>21 ns/op</code>、read-heavy <code>22 ns/op</code>、
+    balanced <code>24 ns/op</code>、write-heavy <code>25 ns/op</code>。從讀為主走到寫為主，它只慢了不到兩成。
+    原因是 256 把鎖把碰撞機率攤平了——FNV-1a 把 key 雜湊到 256 個 shard，
+    兩個 goroutine 同時要寫、又剛好撞進同一個 shard 的機率是 1/256，
+    其餘時候它們各鎖各的、互不等待。鎖還在，只是不再是同一把。
+  </p>
+
+  <p>
+    讀路徑上有個反轉值得記住：read-only、8 核下，cow 約 <code>11.5 ns/op</code>，
+    比 sharded 的 21 ns/op 還快近一倍。CoW 的讀完全不上鎖，一個 atomic load 取得 map 指標就直接查，
+    沒有任何 atomic CAS、沒有 mutex 的 cache-line ping-pong。
+    純讀的世界裡，「沒有鎖」永遠贏「比較少的鎖」。問題是純讀的世界很少存在，下一軸會看到代價。
+  </p>
+
+  <p>
+    為什麼一把 mutex 的 168 ns 跟查 map 本身的成本幾乎無關？因為 mutex 的代價不在「鎖」這個動作，
+    而在跨核心的協調。當 8 個 goroutine 分散在 8 個實體核上、都想拿同一把鎖，
+    那把鎖的狀態（一個 word）必須在各核的 L1/L2 之間反覆失效再同步——這就是 cache-line ping-pong。
+    每次易手都是一次跨核訊息往返，動輒上百個 cycle。查一次 map 才花幾十個 cycle，
+    協調成本卻是它的數倍。所以單鎖版本量到的不是「map 慢」，是「八個核在搶一條 cache line」。
+    sharded 把這條熱 cache line 拆成 256 條，碰撞機率掉到 1/256，協調成本也跟著被攤掉，
+    這才是 22 ns 與 168 ns 之間真正的差距來源。
+  </p>
+
+  <p>
+    這也解釋了為什麼 read-heavy 與 balanced 的差距不大。很多人直覺以為「寫比讀貴很多」，
+    在 sharded 上其實不然：寫一個 entry 跟讀一個 entry 都只鎖一個 shard、都是 O(1) 的 map 操作，
+    差別只在寫會 dirty 一條 cache line、讀不會。所以 sharded 從 read-only 的 21 ns 到
+    write-heavy 的 25 ns 只差 4 ns。真正讓寫變貴的不是「寫」這個動作本身，
+    是「寫的同時還有別人在搶同一把鎖」——而 sharded 用 256 把鎖把這個同時發生的機率壓到很低。
+  </p>
+
+  <h2>擴展性：1→8 核，誰是正斜率誰是負斜率</h2>
+
+  <p>
+    單點數字只是快照，真正分勝負的是斜率：核心數從 1 加到 8，吞吐量是往上還是往下。
+    作者掃 <code>GOMAXPROCS</code> 1→8 量擴展效率，read-only 下 sharded 達到 <code>6.9×</code>，
+    而 cow 與 syncmap 兩條曲線「track ... even slightly exceed ... the ideal 8× line」，貼著甚至略超理想線。
+    這三條是正斜率：加核心，吞吐量跟著漲。
+  </p>
+
+  <p>
+    反過來，單一 mutex 是負成長。這點違反很多人的直覺：加機器算力，怎麼會變慢？
+    因為臨界區是序列化的，加進來的 goroutine 不是來幫忙的，是來排隊的——而排隊本身有成本
+    （鎖的 cache line 在各核之間來回搬、futex 進核態），核心越多，這個協調成本越高，
+    淨效果就是負斜率。RWMutex 也好不到哪去：作者明說它「worse than a plain mutex for writes」，
+    寫入比普通 mutex 還慢，讀寫鎖的內部狀態維護（讀者計數、寫者旗標）在高並行寫入下反而成了負擔。
+  </p>
+
+  <p>
+    sharded 的擴展性來自一個可調的旋鈕——shard 數。作者量了 1 到 256 的掃描：
+    shard 從 1 拉到 256，吞吐量約 <code>9×</code> 成長，從 <code>4.6 Mops/s</code> 到
+    <code>43 Mops/s</code>，256 shard 為最佳。下面這張圖把這條曲線畫出來，
+    你會看到它不是直線——前段陡、後段平，這是 lock striping 的典型報酬遞減。
+  </p>
+
+  <figure class="vg-w-bench-shard-scaling" data-mobile="keep" data-svg-scroll="720">
+    <style>
+      .vg-w-bench-shard-scaling { display: grid; gap: var(--s-2); }
+      .vg-w-bench-shard-scaling svg { width: 100%; height: auto; }
+      .vg-w-bench-shard-scaling figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+    <svg viewBox="0 0 720 340" preserveAspectRatio="xMidYMid meet" role="img"
+         aria-label="吞吐量隨 shard 數從 1 到 256 變化的長條圖">
+      <g id="vg-w-bench-shard-scaling-axes"></g>
+      <g id="vg-w-bench-shard-scaling-bars"></g>
+    </svg>
+    <figcaption>
+      X 軸為 shard 數（log 尺度刻度），Y 軸為吞吐量（Mops/s）。兩端為實測錨點：1 shard
+      ≈ 4.6 Mops/s、256 shard ≈ 43 Mops/s（約 9×）；中間 shard 數為依「前段陡、後段平」的
+      報酬遞減趨勢插值，非逐點實測。256 之後再加 shard，記憶體與 false sharing 成本開始吃掉收益。
+    </figcaption>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-bench-shard-scaling');
+        if (!root) return;
+        const axes = root.querySelector('#vg-w-bench-shard-scaling-axes');
+        const barsG = root.querySelector('#vg-w-bench-shard-scaling-bars');
+        const NS = 'http://www.w3.org/2000/svg';
+        function el(tag, attrs, text) {
+          const e = document.createElementNS(NS, tag);
+          for (const [k, v] of Object.entries(attrs || {})) e.setAttribute(k, v);
+          if (text != null) e.textContent = text;
+          return e;
+        }
+        const X0 = 60, X1 = 690, Y0 = 280, Y1 = 30;
+        const YMAX = 48;
+        // anchors: 1 -> 4.6, 256 -> 43 (~9x). interpolate diminishing returns.
+        const data = [
+          { shard: 1,   mops: 4.6 },
+          { shard: 2,   mops: 8.4 },
+          { shard: 4,   mops: 14.5 },
+          { shard: 8,   mops: 22.0 },
+          { shard: 16,  mops: 29.5 },
+          { shard: 32,  mops: 35.0 },
+          { shard: 64,  mops: 39.0 },
+          { shard: 128, mops: 41.5 },
+          { shard: 256, mops: 43.0 },
+        ];
+        function yOf(m) { return Y0 - (m / YMAX) * (Y0 - Y1); }
+        // y axis ticks
+        for (let m = 0; m <= YMAX; m += 12) {
+          axes.appendChild(el('line', { x1: X0 - 4, y1: yOf(m), x2: X1, y2: yOf(m), stroke: 'var(--muted-2)', 'stroke-width': m === 0 ? 1.2 : 0.5, 'stroke-opacity': m === 0 ? 1 : 0.4 }));
+          axes.appendChild(el('text', { x: X0 - 8, y: yOf(m) + 4, 'text-anchor': 'end', 'font-family': 'Manrope, sans-serif', 'font-size': 12, fill: 'var(--muted)' }, String(m)));
+        }
+        axes.appendChild(el('text', { x: 18, y: (Y0 + Y1) / 2, 'text-anchor': 'middle', 'font-family': 'EB Garamond, serif', 'font-size': 14, fill: 'var(--muted)', transform: 'rotate(-90 18 ' + ((Y0 + Y1) / 2) + ')' }, 'Mops/s'));
+        axes.appendChild(el('text', { x: (X0 + X1) / 2, y: 322, 'text-anchor': 'middle', 'font-family': 'EB Garamond, serif', 'font-size': 14, fill: 'var(--muted)' }, 'shard 數量'));
+        const slot = (X1 - X0) / data.length;
+        const bw = slot * 0.62;
+        data.forEach((d, i) => {
+          const x = X0 + i * slot + (slot - bw) / 2;
+          const isBest = d.shard === 256;
+          barsG.appendChild(el('rect', { x: x, y: yOf(d.mops), width: bw, height: Y0 - yOf(d.mops), rx: 2, fill: isBest ? 'var(--accent)' : 'var(--sage)' }));
+          barsG.appendChild(el('text', { x: x + bw / 2, y: yOf(d.mops) - 6, 'text-anchor': 'middle', 'font-family': 'Manrope, sans-serif', 'font-size': 11, fill: isBest ? 'var(--accent-text)' : 'var(--muted)' }, d.mops.toFixed(1)));
+          barsG.appendChild(el('text', { x: x + bw / 2, y: Y0 + 16, 'text-anchor': 'middle', 'font-family': 'JetBrains Mono, monospace', 'font-size': 12, fill: 'var(--ink)' }, String(d.shard)));
+        });
+      })();
+    </script>
+  </figure>
+
+  <p>
+    曲線的形狀本身就是個工程結論：從 1 到 16 shard，每翻倍幾乎都把吞吐量再推一大截；
+    過了 64 之後，增幅明顯收斂。256 是這篇選的甜蜜點——再往上加 shard，
+    每個 shard 自己的 mutex 與 map header 開始吃記憶體，相鄰 shard 的鎖落在同一條 cache line 上
+    還會引入 false sharing，收益被成本抵銷。要是你的並行度沒那麼高，128 甚至 64 都夠用；
+    256 是給「我不想為這件事再想第二次」的人準備的安全預設。
+  </p>
+
+  <p>
+    false sharing 這個詞在這裡值得多說一句，因為它是 shard 數報酬遞減的隱藏推手。
+    CPU 以 cache line（通常 64 bytes）為單位搬資料，如果兩個 shard 的 mutex 剛好落在同一條 cache line 上，
+    即使兩個 goroutine 鎖的是不同 shard、邏輯上互不相干，硬體仍會把那條 line 在兩個核之間搬來搬去——
+    爭用從邏輯層消失了，卻在硬體層偷偷回來。shard 數越多、每個 shard 結構越小，
+    擠進同一條 line 的機率就越高。這是為什麼 256 之後加 shard 收益趨平：你買到的鎖均衡，
+    被新引入的 false sharing 吃掉一部分。講究的實作會用 padding 把每個 shard 對齊到 cache line 邊界，
+    但那是另一層 tuning，預設的 256 已經在均衡與成本之間站在一個合理的點上。
+  </p>
+
+  <h2>寫路徑：CoW 的 lock-free 讀，換來 82ms/op 的寫</h2>
+
+  <p>
+    現在回收前面欠的帳。CoW 讀路徑無敵快，是因為它把所有成本搬到了寫路徑：
+    每一次寫，它都複製整張 map，在新副本上改，再用 <code>atomic.Pointer</code> 原子地把指標換過去。
+    100 萬個 key 的 map，複製一次是百萬量級的記憶體搬移加 hash rebuild。
+    作者量到的 cow 寫入是 <code>82 ms/op</code>——不是 ns，不是 µs，是毫秒。
+    對照 sharded 的 write-heavy 是 25 ns/op，這中間差了大約六個數量級。
+  </p>
+
+  <p>
+    把兩種寫路徑的程式碼並排看最清楚。拖動下方的分隔線：左邊是 sharded 的寫，
+    只鎖一個 shard、改一個 entry；右邊是 CoW 的寫，整張表複製一遍。
+    語法長度差不多，執行成本差六個數量級——這就是「lock-free 讀」的隱藏帳單。
+  </p>
+
+  <figure class="vg-w-ba-cache-cow" data-mobile="swap"
+          data-mobile-summary="CoW 讀免鎖、最快；但每次寫都複製整張百萬 key 的 map，約 82ms/op，比 sharded 慢六個數量級，只適合幾乎不寫的資料。">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M8 3 4 7l4 4"/><path d="M4 7h16"/><path d="m16 21 4-4-4-4"/><path d="M20 17H4"/>
+      </svg>
+      <span>拖分隔線比較兩種寫路徑：sharded 鎖一個 shard vs CoW 複製整張 map</span>
+    </p>
+    <style>
+      .vg-w-ba-cache-cow { position: relative; aspect-ratio: 16 / 9; overflow: hidden; border: 1px solid var(--line); background: var(--bg-soft); }
+      .vg-w-ba-cache-cow .layer { position: absolute; inset: 0; padding: var(--s-3) var(--s-3) var(--s-2); box-sizing: border-box; font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 12px; line-height: 1.55; color: var(--ink); white-space: pre; overflow: hidden; }
+      .vg-w-ba-cache-cow .before { background: var(--bg); }
+      .vg-w-ba-cache-cow .after { background: var(--bg); clip-path: polygon(0 0, 50% 0, 50% 100%, 0 100%); }
+      .vg-w-ba-cache-cow .badge { position: absolute; top: var(--s-2); font-family: var(--sans); font-size: var(--fs-xs); padding: 2px 6px; color: var(--bg); z-index: 2; }
+      .vg-w-ba-cache-cow .badge-l { left: var(--s-2); background: var(--accent); }
+      .vg-w-ba-cache-cow .badge-r { right: var(--s-2); background: var(--sage-deep); }
+      .vg-w-ba-cache-cow .divider { position: absolute; top: 0; bottom: 0; left: 50%; width: 32px; transform: translateX(-50%); cursor: ew-resize; touch-action: none; z-index: 3; }
+      .vg-w-ba-cache-cow .divider::before { content: ''; position: absolute; left: 50%; top: 0; bottom: 0; width: 2px; transform: translateX(-50%); background: var(--ink); }
+      .vg-w-ba-cache-cow .divider::after { content: '↔'; position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); background: var(--ink); color: var(--bg); width: 28px; height: 28px; border-radius: 50%; display: grid; place-items: center; font-family: var(--sans); font-size: 16px; }
+      .vg-w-ba-cache-cow .kw { color: var(--accent-text); }
+      .vg-w-ba-cache-cow .ty { color: var(--sage-deep); }
+      .vg-w-ba-cache-cow .cm { color: var(--muted); font-style: italic; }
+    </style>
+    <div class="layer after" id="vg-w-ba-cache-cow-after"><span class="cm">// CoW：讀免鎖，但每次寫複製整張 map（約 82 ms/op）</span>
+<span class="kw">func</span> (c *CoWCache) Set(k <span class="ty">string</span>, v V) {
+  c.mu.Lock()                  <span class="cm">// 寫之間互斥</span>
+  old := c.m.Load()
+  nm := <span class="kw">make</span>(<span class="kw">map</span>[<span class="ty">string</span>]V, <span class="kw">len</span>(*old)+1)
+  <span class="kw">for</span> kk, vv := <span class="kw">range</span> *old {  <span class="cm">// 複製整張表！</span>
+    nm[kk] = vv
+  }
+  nm[k] = v
+  c.m.Store(&nm)               <span class="cm">// atomic 換指標</span>
+  c.mu.Unlock()
+}</div>
+    <div class="layer before" id="vg-w-ba-cache-cow-before"><span class="cm">// sharded：只鎖一個 shard，改一個 entry（約 25 ns/op）</span>
+<span class="kw">func</span> (c *Sharded) Set(k <span class="ty">string</span>, v V) {
+  s := &c.shards[fnv1a(k)&255]  <span class="cm">// FNV-1a 路由到 256 之一</span>
+  s.mu.Lock()                   <span class="cm">// 只鎖這一個 shard</span>
+  s.m[k] = v
+  s.mu.Unlock()
+}
+
+<span class="cm">// 兩個 goroutine 撞同一 shard 的機率 = 1/256，</span>
+<span class="cm">// 其餘時候各鎖各的、完全並行。</span></div>
+    <span class="badge badge-l">sharded</span>
+    <span class="badge badge-r">copy-on-write</span>
+    <div class="divider" id="vg-w-ba-cache-cow-divider"></div>
+    <figcaption>
+      左：sharded 的寫只動一個 shard、一個 entry。右：CoW 的寫要 <code>make</code> 一張新 map、
+      <code>range</code> 複製所有 entry，再 atomic 換指標——讀者因此永遠看到一致快照、且免鎖，代價是寫的 O(n)。
+    </figcaption>
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        const root = document.querySelector('.vg-w-ba-cache-cow');
+        if (!root) return;
+        const after = root.querySelector('#vg-w-ba-cache-cow-after');
+        const divider = root.querySelector('#vg-w-ba-cache-cow-divider');
+        let dragging = false;
+        function setPct(pct) {
+          const c = Math.max(0, Math.min(100, pct));
+          after.style.clipPath = `polygon(0 0, ${c}% 0, ${c}% 100%, 0 100%)`;
+          divider.style.left = `${c}%`;
+        }
+        divider.addEventListener('pointerdown', (e) => { dragging = true; divider.setPointerCapture(e.pointerId); });
+        root.addEventListener('pointermove', (e) => {
+          if (!dragging) return;
+          const rect = root.getBoundingClientRect();
+          setPct(((e.clientX - rect.left) / rect.width) * 100);
+        });
+        root.addEventListener('pointerup', () => { dragging = false; });
+        root.addEventListener('pointercancel', () => { dragging = false; });
+      })();
+    </script>
+  </figure>
+
+  <p>
+    這裡有個容易被忽略的點：CoW 的寫不只是慢，它的成本還跟 map 大小成正比。
+    sharded 寫一個 entry 不管 map 裡有 100 個還是 100 萬個 key 都是 O(1)；
+    CoW 寫一次卻要走遍整張表，map 越大寫越慢。這篇量到的 82 ms/op 是建立在 100 萬 key 上的，
+    換成 1 萬 key 會快很多、換成 1000 萬 key 會更慢。所以 CoW 的適用判斷不是只看寫頻率，
+    還要看資料規模——小而幾乎不變的表（一張幾百筆的路由規則）用 CoW 很理想，
+    大而幾乎不變的表就要算一下那筆 O(n) 的單次寫成本在你的尾延遲預算裡能不能接受。
+    一次 82 ms 的 stall 落在請求路徑上，足以讓 p99 難看。
+  </p>
+
+  <p>
+    這個 O(n) 寫成本決定了 CoW 的全部適用範圍：作者的結論是它「viable only for
+    read-mostly-to-read-only data」，只有資料幾乎不寫時才可行。
+    幾個剛好對得上的場景：啟動時載入一次、之後只讀的 routing table；每分鐘換一次的 feature flag 快照；
+    解析過後就凍結的設定。這些情境裡寫的頻率低到 82 ms 攤下來可以忽略，
+    而讀的 11.5 ns/op 是真金白銀。一旦寫的頻率上去，CoW 立刻變成最差的選項——
+    前面互動圖裡把寫入比例往右一推它就塌底，畫的就是這件事。
+  </p>
+
+  <h2>分布偏態：Zipfian 為何是 sharded 的兩面刃</h2>
+
+  <p>
+    前面的數字多半來自 uniform 分布——每個 key 被存取的機率一樣。真實流量很少這樣，
+    真實流量是 Zipfian：少數熱 key 吃掉大部分請求。作者用 s=1.1 的 Zipfian 也量了一輪，
+    結果對 sharded 是個壞消息：balanced 負載下，Zipfian 相對 uniform 只剩約 <code>0.82×</code>，
+    慢了將近兩成，原因是 shard collision——熱 key 全擠進少數幾個 shard，那幾把鎖變成新的熱點。
+  </p>
+
+  <figure class="vg-w-annotated-zipfian" data-mobile="keep" data-svg-scroll="720">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/>
+      </svg>
+      <span>uniform vs Zipfian 兩種分布如何打在 256 個 shard 上</span>
+    </p>
+    <style>
+      .vg-w-annotated-zipfian { display: grid; gap: var(--s-2); }
+      .vg-w-annotated-zipfian svg { width: 100%; height: auto; }
+      .vg-w-annotated-zipfian figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+    <svg viewBox="0 0 720 320" preserveAspectRatio="xMidYMid meet" role="img"
+         aria-label="均勻分布與 Zipfian 分布在 shard 上的負載對比示意圖">
+      <text x="20" y="34" font-family="Manrope, sans-serif" font-size="13" fill="var(--sage-deep)">uniform：負載平均攤在所有 shard</text>
+      <g id="vg-w-annotated-zipfian-uniform"></g>
+      <text x="20" y="186" font-family="Manrope, sans-serif" font-size="13" fill="var(--accent-text)">Zipfian (s=1.1)：熱 key 擠爆少數 shard</text>
+      <g id="vg-w-annotated-zipfian-zipf"></g>
+      <text x="20" y="304" font-family="EB Garamond, serif" font-size="13" fill="var(--muted)">每根長條＝一個 shard 承受的相對請求量；高出虛線者為爭用熱點</text>
+    </svg>
+    <figcaption>
+      均勻分布下每個 shard 高度接近，256 把鎖各自分攤；Zipfian 下前幾個 shard 被熱 key 灌爆、
+      變成爭用熱點，lock striping 的好處在這幾把鎖上被抵銷——這是 sharded 在偏態流量下掉到 0.82× 的根因。
+      但同一個偏態也讓快取本身更有效（熱 key 命中率高），所以它是兩面刃。
+    </figcaption>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-annotated-zipfian');
+        if (!root) return;
+        const NS = 'http://www.w3.org/2000/svg';
+        function el(tag, attrs) {
+          const e = document.createElementNS(NS, tag);
+          for (const [k, v] of Object.entries(attrs || {})) e.setAttribute(k, v);
+          return e;
+        }
+        const N = 32, X0 = 30, X1 = 700, slot = (X1 - X0) / N, bw = slot * 0.7;
+        // uniform band: baseline y=130, bars short & even
+        const uG = root.querySelector('#vg-w-annotated-zipfian-uniform');
+        const uBase = 140, uH = 70;
+        for (let i = 0; i < N; i++) {
+          const h = uH * (0.85 + 0.3 * Math.random() * 0); // deterministic-ish flat
+          const hh = uH * (0.78 + ((i * 37) % 11) / 50); // slight variation
+          uG.appendChild(el('rect', { x: X0 + i * slot + (slot - bw) / 2, y: uBase - hh, width: bw, height: hh, rx: 1, fill: 'var(--sage)' }));
+        }
+        uG.appendChild(el('line', { x1: X0, y1: uBase - uH * 0.95, x2: X1, y2: uBase - uH * 0.95, stroke: 'var(--muted-2)', 'stroke-width': 1, 'stroke-dasharray': '4,3' }));
+        // zipfian band: baseline y=292, first bars tall (hot), rest tiny
+        const zG = root.querySelector('#vg-w-annotated-zipfian-zipf');
+        const zBase = 292, zMax = 86;
+        const hotLine = zBase - zMax * 0.5;
+        for (let i = 0; i < N; i++) {
+          const rank = i + 1;
+          const val = 1 / Math.pow(rank, 1.1);
+          const norm = val / 1; // rank1 = 1
+          const hh = Math.max(3, zMax * norm);
+          const hot = hh > zMax * 0.5;
+          zG.appendChild(el('rect', { x: X0 + i * slot + (slot - bw) / 2, y: zBase - hh, width: bw, height: hh, rx: 1, fill: hot ? 'var(--accent)' : 'var(--sage)' }));
+        }
+        zG.appendChild(el('line', { x1: X0, y1: hotLine, x2: X1, y2: hotLine, stroke: 'var(--muted-2)', 'stroke-width': 1, 'stroke-dasharray': '4,3' }));
+      })();
+    </script>
+  </figure>
+
+  <p>
+    「兩面刃」是字面意思。偏態流量讓 sharded 的鎖分布失衡、吞吐量掉到 0.82×，這是壞的一面；
+    但同樣的偏態讓快取本身更有價值——熱 key 反覆被命中，cache 的存在意義正是吃下這些重複請求。
+    所以 Zipfian 不是單純的扣分項：它一手扣 sharded 的鎖均衡分數，一手加快取整體的命中收益。
+    實務上的解法是把 shard 數加大、或在 hash 前對 key 做一次擾動（salt），
+    把熱 key 打散到更多 shard——這又繞回前面那條 shard scaling 曲線：加 shard 能買到均衡，直到報酬遞減。
+  </p>
+
+  <p>
+    值得提醒的是 naive 那條基準線。它在所有負載下都「最快」，因為它根本不同步——
+    但它不是執行緒安全的，多 goroutine 併發寫會直接觸發 Go runtime 的 concurrent map write panic。
+    它存在的唯一意義是當物理上限：告訴你「如果鎖完全免費，吞吐量能到哪」。
+    sharded 與這條線的距離，就是 lock striping 仍要付的協調稅；CoW 讀路徑貼著這條線，
+    是因為它在讀的方向上真的把鎖稅降到了零。
+  </p>
+
+  <h2>怎麼選：把 sharded 當預設，其餘看條件</h2>
+
+  <p>
+    把四軸收成一條決策路徑。先問寫的頻率：如果資料是 read-mostly 到 read-only、寫極少
+    （routing table、凍結的 config、低頻 flag 快照），CoW 是最佳解——讀 11.5 ns/op、免鎖，
+    那筆 82 ms 的寫攤到幾乎不發生的寫上等於不存在。一旦寫的頻率上來，CoW 立刻出局。
+  </p>
+
+  <p>
+    其餘所有情況——也就是絕大多數的 in-process cache——選 sharded。
+    它在四種負載下都穩在 21–25 ns/op，隨核心數正成長，8 核對單鎖近 8×，沒有任何一格是弱項。
+    shard 數預設 256，並行度不高時 64–128 也夠。唯一要留意的是偏態流量會把它拉到 0.82×，
+    需要時用更多 shard 或 key 擾動來緩解。至於 <code>sync.Map</code>，它在讀為主時表現很好、
+    貼著理想擴展線，是 sharded 之外一個合理的標準庫選項，但寫多時不如 sharded 穩。
+  </p>
+
+  <p>
+    這裡值得停下來想一個常見的反問：既然標準庫有 <code>sync.Map</code>，為什麼還要自己刻 256-shard？
+    兩個理由。一是 <code>sync.Map</code> 的內部結構是為「key 集合穩定、讀遠多於寫」這個特定形狀調的，
+    它用一個 read-only 的快照 map 加一個 dirty map，讀命中快照時免鎖、miss 才上鎖補；
+    當寫的比例上來、key 不斷新增，dirty map 一直要 promote，攤銷成本就回來了。
+    這也是為什麼它在讀為主時貼著理想線、寫多時卻不如 sharded。
+    二是 sharded 給你一個明確可調的旋鈕（shard 數），你能照自己的核心數與流量偏態去 tune；
+    <code>sync.Map</code> 是個黑盒，調不了。當你的負載剛好落在它的甜蜜點，用它最省事；
+    一旦偏離，sharded 的可控性就值回那幾十行程式碼。
+  </p>
+
+  <p>
+    剩下兩個是該主動避開的。單一 <code>sync.Mutex</code> 只在單核或極低並行時無妨，多核下是負成長；
+    <code>sync.RWMutex</code> 更要小心——它寫入比普通 mutex 還慢，作者直接說「reach for it rarely」，
+    很多人以為「讀多就用讀寫鎖」是免費的最佳化，這篇的數字說那是個迷思。
+    真要讀多，sharded 或 sync.Map 都比 RWMutex 好。
+  </p>
+
+  <p>
+    最後一句方法學的提醒：上面所有數字都來自一台 20 核 i7-14700K。
+    你的 CPU、key 分布、value 大小都不一樣，別把 256 這個數字當成宇宙常數。
+    這篇真正可帶走的不是某個 shard 數，是那套量法——<code>b.RunParallel</code> 配 <code>GOMAXPROCS</code> 掃描、
+    讀寫比例與 key 分布都當變數、跑 10 次取中位數。選型先有預設（sharded），再用這套量法在你自己的負載上驗證。
+  </p>
+
+  <p class="vg-deep-closer"><strong>The call</strong>：八成的 in-process cache 直接用 sharded（256 shard）當預設；只有讀到幾乎不寫的資料才換 CoW，sync.RWMutex 多數時候是該避開的陷阱。</p>
+</div>
