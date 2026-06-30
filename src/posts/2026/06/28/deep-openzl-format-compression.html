@@ -1,0 +1,439 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">同一份星表資料，zstd -3 壓到 1.31 倍、xz -9 壓到 1.64 倍，OpenZL 壓到 2.06 倍——而且壓縮吞吐量比 zstd 還快。讓它同時拿下這兩件事的，不是更兇的 entropy coder，而是有人先把資料的格式講給壓縮器聽了。</p>
+  <h1 class="vg-post-title">OpenZL——把格式講給壓縮器聽</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p><span class="vg-dropcap">通</span>用壓縮器看到的永遠是一串 byte。zstd、xz、gzip 不知道你餵進去的是一張星表、一份 Parquet、還是一段 protobuf——它們在 byte stream 上找重複、做 entropy coding，能榨出多少全看資料碰巧長得多有規律。OpenZL 是 Meta 在 2025 年 10 月開源、並已在內部 production 大量使用的壓縮框架，它換了一個前提：使用者用一份格式描述告訴它「這份資料的結構長這樣」，OpenZL 就照這份結構建一個專門針對該格式的壓縮器。Meta 的說法是「OpenZL takes a description of your data and builds from it a specialized compressor optimized for your specific format」。關鍵在於，所有這些長相各異的專用壓縮器，產出的檔案都能被同一個通用解壓器讀回來。</p>
+
+  <p>底下幾節依序拆開這個框架的幾個構件：先是把結構交給壓縮器的那份描述（SDDL），再是壓縮的真正引擎（codec 的有向無環圖），接著是讓「一個壓縮器、無數種格式」得以成立的那個通用解壓器，最後用 SAO 星表資料集上的實測數字說明「高壓縮比 + 高吞吐」為什麼同時成立、為什麼對資料中心與 AI workload 重要。先從一個問題開始：把結構講得越清楚，壓縮比到底能往上走多少？下面這個滑桿掃過四個真實的設定點。</p>
+
+  <figure class="vg-w-param-demo-openzl-awareness" data-mobile="static" data-svg-scroll="720">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M5 9l-3 3 3 3"/><path d="M9 5l3-3 3 3"/><path d="M15 19l-3 3-3-3"/><path d="M19 9l3 3-3 3"/><path d="M2 12h20"/><path d="M12 2v20"/>
+      </svg>
+      <span>drag the slider across four real benchmark setups · 4 設定點</span>
+    </p>
+    <style>
+      .vg-w-param-demo-openzl-awareness { display: grid; grid-template-rows: auto auto 1fr; gap: var(--s-2); }
+      .vg-w-param-demo-openzl-awareness .controls { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+      .vg-w-param-demo-openzl-awareness .controls input[type="range"] { flex: 1; height: 36px; accent-color: var(--accent); touch-action: none; }
+      .vg-w-param-demo-openzl-awareness .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 14ch; text-align: right; font-family: var(--serif); }
+      .vg-w-param-demo-openzl-awareness svg { width: 100%; height: auto; }
+      .vg-w-param-demo-openzl-awareness figcaption { font-family: var(--scribed); font-style: italic; font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+
+    <div class="controls" data-vg-controls>
+      <label for="vg-w-param-demo-openzl-awareness-x">結構描述精細度</label>
+      <input id="vg-w-param-demo-openzl-awareness-x" type="range" min="0" max="3" step="1" value="2" aria-label="結構描述精細度，0 到 3" />
+      <span class="readout" id="vg-w-param-demo-openzl-awareness-readout">OpenZL profile</span>
+    </div>
+
+    <svg viewBox="0 0 720 320" preserveAspectRatio="xMidYMid meet" role="img" aria-label="壓縮比隨結構描述精細度上升的折線——zstd -3、xz -9、OpenZL profile、OpenZL trained 四個設定點">
+      <line x1="70" y1="270" x2="690" y2="270" stroke="var(--muted-2)" stroke-width="1" />
+      <line x1="70" y1="30"  x2="70"  y2="270" stroke="var(--muted-2)" stroke-width="1" />
+      <text x="380" y="304" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--muted)">壓縮器對資料結構知道得越多 ——&gt;</text>
+      <text x="26"  y="150" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--muted)" transform="rotate(-90 26 150)">壓縮比 (×)</text>
+
+      <!-- y gridlines at ratio 1, 2, 3 -->
+      <line x1="70" y1="270" x2="690" y2="270" stroke="var(--line)" stroke-width="0.5" />
+      <text x="60" y="274" text-anchor="end" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">1×</text>
+      <line x1="70" y1="190" x2="690" y2="190" stroke="var(--line)" stroke-width="0.5" stroke-dasharray="3,3" />
+      <text x="60" y="194" text-anchor="end" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">2×</text>
+      <line x1="70" y1="110" x2="690" y2="110" stroke="var(--line)" stroke-width="0.5" stroke-dasharray="3,3" />
+      <text x="60" y="114" text-anchor="end" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">3×</text>
+
+      <path id="vg-w-param-demo-openzl-awareness-curve" fill="none" stroke="var(--accent)" stroke-width="2" />
+
+      <!-- static dots for all four points -->
+      <g font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">
+        <circle cx="70"  cy="265" r="3" fill="var(--muted-2)" /><text x="70"  y="288" text-anchor="middle">zstd -3</text>
+        <circle cx="276" cy="219" r="3" fill="var(--muted-2)" /><text x="276" y="288" text-anchor="middle">xz -9</text>
+        <circle cx="483" cy="185" r="3" fill="var(--muted-2)" /><text x="483" y="288" text-anchor="middle">profile</text>
+        <circle cx="690" cy="71"  r="3" fill="var(--muted-2)" /><text x="690" y="288" text-anchor="middle">trained</text>
+      </g>
+
+      <circle id="vg-w-param-demo-openzl-awareness-dot" r="6" fill="var(--accent)" />
+      <text id="vg-w-param-demo-openzl-awareness-tag" font-family="EB Garamond, serif" font-size="16" fill="var(--accent-text)" text-anchor="middle">2.06×</text>
+    </svg>
+
+    <figcaption>四個點是兩組真實 benchmark：zstd -3 (1.31×)、xz -9 (1.64×) 是 SAO 星表資料集上的通用壓縮器；OpenZL profile (1.50×) 與 trained (3.47×) 是 quick-start 文件 sra0 樣本上「描述 + 訓練」的兩段。兩組資料集不同、不可直接相減，這裡只把它們放在「壓縮器對結構知道多少」這條軸上看趨勢。SAO 上 OpenZL 本身達 2.06×（折線在中段標出）。</figcaption>
+
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        const root = document.querySelector('.vg-w-param-demo-openzl-awareness');
+        const input = root.querySelector('input[type="range"]');
+        const readout = root.querySelector('.readout');
+        const curve = root.querySelector('#vg-w-param-demo-openzl-awareness-curve');
+        const dot = root.querySelector('#vg-w-param-demo-openzl-awareness-dot');
+        const tag = root.querySelector('#vg-w-param-demo-openzl-awareness-tag');
+        // four setups: x position, ratio, label
+        const pts = [
+          { x: 70,  ratio: 1.31, label: 'zstd -3 · 1.31×' },
+          { x: 276, ratio: 1.64, label: 'xz -9 · 1.64×' },
+          { x: 483, ratio: 2.06, label: 'OpenZL profile · 此處標 SAO 2.06×' },
+          { x: 690, ratio: 3.47, label: 'OpenZL trained · 3.47×' },
+        ];
+        // y mapping: ratio 1 -> 270, ratio 3 -> 110  => y = 270 - (ratio-1)*80
+        function yOf(r) { return 270 - (r - 1) * 80; }
+        // draw the connecting curve through the displayed ratios
+        const d = pts.map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x} ${yOf(p.ratio).toFixed(1)}`).join(' ');
+        curve.setAttribute('d', d);
+        function update() {
+          const i = Number(input.value);
+          const p = pts[i];
+          readout.textContent = ['zstd -3', 'xz -9', 'OpenZL profile', 'OpenZL trained'][i];
+          dot.setAttribute('cx', p.x);
+          dot.setAttribute('cy', yOf(p.ratio));
+          tag.setAttribute('x', Math.max(96, Math.min(664, p.x)));
+          tag.setAttribute('y', yOf(p.ratio) - 14);
+          tag.textContent = p.ratio.toFixed(2) + '×';
+        }
+        input.addEventListener('input', update);
+        update();
+      })();
+    </script>
+  </figure>
+
+  <h2>SDDL：把二進位格式寫成一份描述</h2>
+
+  <p>第一個構件是描述本身。OpenZL 提供 SDDL（Simple Data Description Language），文件給的定義很直白：「SDDL is a domain-specific language for describing binary file formats.」它的目的是讓你「formally specify the structure of binary data so it can be efficiently processed by compression algorithms, transformation tools, and other downstream systems」。換句話說，SDDL 不是壓縮演算法，是一份說明書——告訴系統「這份檔案前 N byte 是 header、後面是一連串固定欄位的 record、第三欄是排序過的整數」。</p>
+
+  <p>SDDL 的構件是工程師熟悉的那一套：type、record、array、variable、expression，再加上條件邏輯的 <code>when</code> 區塊與驗證約束的 <code>expect</code> 述句。重點不在語法新不新，而在於它把「資料的形狀」變成壓縮器的一個明確輸入。Meta 在發表文裡點出通用方法的代價：「Using generic methods on structured data leaves compression gains on the table.」一串混了 header、整數欄、字串欄的 byte，在 zstd 眼裡是均質的；但只要你說清楚哪段是什麼，壓縮就能「focus on a sequence of reversible steps that surface patterns before coding」——先用一連串可逆變換把規律攤開，再交給 coder。</p>
+
+  <p><code>when</code> 與 <code>expect</code> 這兩個構件值得多看一眼，因為它們把 SDDL 從「靜態 schema」推向「能描述真實格式」的工具。真實的二進位格式很少是一張固定表格：某個欄位的存在與否，往往取決於前面某個 flag 的值；某段資料的長度，寫在前面的 length 欄裡。<code>when</code> 區塊讓描述能表達「滿足某條件時這段才存在」的條件欄位，<code>expect</code> 述句則是驗證約束——宣告「這裡的 magic number 應該是某值」「這個長度欄不能超過某上界」。對壓縮器而言，這些不只是防呆：每多一條被 <code>expect</code> 確認過的不變式，壓縮器就多一分可以倚賴的結構假設，少一分得保守處理的不確定性。把資料的形狀講得越完整，可逆變換能站穩的地基就越大。</p>
+
+  <p>描述不一定要全手寫。除了 SDDL，OpenZL 也接受自訂 parser；更進一步，它有一個離線的 training 環節，會去探索不同的變換選擇，「builds an effective compression config that can be re-employed for similar data」——也就是替一類資料找出一份夠好的壓縮計畫，之後同類資料重複套用。quick-start 文件裡的 sra0 樣本就示範了這個落差：只給一個現成 profile，OpenZL 壓到 1.50×（同檔 zstd-19 是 1.22×、gzip-9 是 1.19×）；經過 training，同一份資料壓到 3.47×，文件原話是「Training improved compression ratio by 130.48%」。描述講得越精確、訓練探索得越深，壓縮器對這份資料的理解就越貼。</p>
+
+  <h2>graph model：codec 串成的有向無環圖</h2>
+
+  <p>有了描述，真正幹活的是壓縮引擎。OpenZL 的白皮書把它的核心抽象稱為「the 'graph model' of compression, a new theoretical framework for representing compression as a directed acyclic graph of modular codecs」——把一次壓縮表示成一張由模組化 codec 構成的有向無環圖。每個 codec 是一個可逆的小變換：bitpack、delta、tokenize、entropy coding，各做一件事。描述告訴系統資料怎麼拆，graph 決定每一段資料流過哪些 codec、以什麼順序。</p>
+
+  <p>SAO 星表是 Meta 自己舉的例子，也最能說明 graph 怎麼運作。流程是：先把 header 跟 record 分開；把每筆 record 拆解成一條條 field stream（同一欄的值聚成一條流）；再對每條流套上適合它的變換——排序過的座標欄用 delta coding（只存相鄰差值）、低基數的欄位用 tokenization（把重複值換成短 token）；最後每條流各自再做最適合自己的 entropy 壓縮。重點在「各自」：通用壓縮器只有一條 pipeline 套在整串 byte 上，OpenZL 的 graph 讓每條 field stream 走自己最佳的那條路徑。文件把這張圖的地位講得很重：「The compression graph is the ultimate driver of both compression and decompression.」它同時決定怎麼壓、也決定怎麼解。下面這個 widget 把 SAO 這條 graph 攤開成幾個 codec 階段，點任一階段看它負責什麼。</p>
+
+  <figure class="vg-w-stack-openzl-graph" data-mobile="keep">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M9 18l6-6-6-6"/>
+      </svg>
+      <span>click any codec stage to read its job · 5 stages</span>
+    </p>
+    <style>
+      .vg-w-stack-openzl-graph { display: flex; flex-direction: column; gap: var(--s-3); align-items: stretch; }
+      .vg-w-stack-openzl-graph input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-stack-openzl-graph .stack-title { font-family: IM Fell English, serif; font-style: italic; font-size: var(--fs-md); margin: 0; color: var(--ink); line-height: 1.4; }
+      .vg-w-stack-openzl-graph .stack-cards { display: flex; flex-direction: column; gap: var(--s-1); list-style: none; padding: 0; margin: 0; }
+      .vg-w-stack-openzl-graph .stack-cards label { display: block; padding: var(--s-2); border: 1px solid var(--muted-2); border-radius: 2px; cursor: pointer; transition: border-color 200ms, background 200ms; min-height: 44px; }
+      .vg-w-stack-openzl-graph .stack-cards label:hover { border-color: var(--accent); }
+      .vg-w-stack-openzl-graph .stack-cards .card-head { font-family: EB Garamond, serif; font-size: var(--fs-md); margin: 0 0 4px 0; color: var(--ink); display: flex; align-items: baseline; justify-content: space-between; gap: var(--s-2); flex-wrap: wrap; }
+      .vg-w-stack-openzl-graph .stack-cards .card-sub { font-family: IM Fell English, serif; font-style: italic; font-size: var(--fs-sm); color: var(--muted); margin: 0; line-height: 1.5; }
+      .vg-w-stack-openzl-graph .stack-cards .card-tag { font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); color: var(--accent-text); font-style: normal; }
+      .vg-w-stack-openzl-graph:has(#vg-w-stack-openzl-graph-r1:checked) .card-1,
+      .vg-w-stack-openzl-graph:has(#vg-w-stack-openzl-graph-r2:checked) .card-2,
+      .vg-w-stack-openzl-graph:has(#vg-w-stack-openzl-graph-r3:checked) .card-3,
+      .vg-w-stack-openzl-graph:has(#vg-w-stack-openzl-graph-r4:checked) .card-4,
+      .vg-w-stack-openzl-graph:has(#vg-w-stack-openzl-graph-r5:checked) .card-5 { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+      .vg-w-stack-openzl-graph svg.diagram { display: none; }
+      @media (min-width: 720px) {
+        .vg-w-stack-openzl-graph svg.diagram { display: block; width: 100%; height: auto; max-width: 880px; }
+        .vg-w-stack-openzl-graph .stack-title { display: none; }
+        .vg-w-stack-openzl-graph .stack-cards { display: none; }
+      }
+      .vg-w-stack-openzl-graph .node { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; transition: fill 180ms, stroke 180ms; }
+      .vg-w-stack-openzl-graph .node:hover { stroke: var(--accent); }
+      .vg-w-stack-openzl-graph .node-text { pointer-events: none; font-family: EB Garamond, serif; font-size: 14px; }
+      .vg-w-stack-openzl-graph .node-sub { pointer-events: none; font-family: JetBrains Mono, monospace; font-size: 11px; fill: var(--muted); }
+      .vg-w-stack-openzl-graph .head { font-family: IM Fell English, serif; font-style: italic; font-size: 13px; }
+      .vg-w-stack-openzl-graph:has(#vg-w-stack-openzl-graph-r1:checked) .node-1,
+      .vg-w-stack-openzl-graph:has(#vg-w-stack-openzl-graph-r2:checked) .node-2,
+      .vg-w-stack-openzl-graph:has(#vg-w-stack-openzl-graph-r3:checked) .node-3,
+      .vg-w-stack-openzl-graph:has(#vg-w-stack-openzl-graph-r4:checked) .node-4,
+      .vg-w-stack-openzl-graph:has(#vg-w-stack-openzl-graph-r5:checked) .node-5 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+      .vg-w-stack-openzl-graph .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+      .vg-w-stack-openzl-graph .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-stack-openzl-graph .detail p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-stack-openzl-graph .hint { font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin: 0 0 var(--s-1) 0; }
+    </style>
+
+    <input type="radio" id="vg-w-stack-openzl-graph-r1" name="vg-w-stack-openzl-graph-sel" checked aria-label="stage 1 split" />
+    <input type="radio" id="vg-w-stack-openzl-graph-r2" name="vg-w-stack-openzl-graph-sel" aria-label="stage 2 decompose" />
+    <input type="radio" id="vg-w-stack-openzl-graph-r3" name="vg-w-stack-openzl-graph-sel" aria-label="stage 3 delta" />
+    <input type="radio" id="vg-w-stack-openzl-graph-r4" name="vg-w-stack-openzl-graph-sel" aria-label="stage 4 tokenize" />
+    <input type="radio" id="vg-w-stack-openzl-graph-r5" name="vg-w-stack-openzl-graph-sel" aria-label="stage 5 entropy" />
+
+    <p class="stack-title" id="vg-w-stack-openzl-graph-title">SAO 星表的 codec graph——資料先拆解，每條 stream 走自己的路徑</p>
+    <ul class="stack-cards" aria-labelledby="vg-w-stack-openzl-graph-title">
+      <li class="card-1"><label for="vg-w-stack-openzl-graph-r1">
+        <p class="card-head"><span>1 · split header</span><code class="card-tag">separate</code></p>
+        <p class="card-sub">把 header 與 record body 分開——兩者的統計性質完全不同，混在一起壓兩邊都吃虧。</p>
+      </label></li>
+      <li class="card-2"><label for="vg-w-stack-openzl-graph-r2">
+        <p class="card-head"><span>2 · decompose records</span><code class="card-tag">field streams</code></p>
+        <p class="card-sub">把每筆 record 拆成一條條 field stream，同一欄的值聚成一條流，規律才浮得出來。</p>
+      </label></li>
+      <li class="card-3"><label for="vg-w-stack-openzl-graph-r3">
+        <p class="card-head"><span>3 · delta</span><code class="card-tag">delta coding</code></p>
+        <p class="card-sub">排序過的座標欄只存相鄰差值，把大整數變成一串接近零的小數，後段 coder 更好壓。</p>
+      </label></li>
+      <li class="card-4"><label for="vg-w-stack-openzl-graph-r4">
+        <p class="card-head"><span>4 · tokenize</span><code class="card-tag">low cardinality</code></p>
+        <p class="card-sub">低基數欄位（重複值多）換成短 token，把寬欄位塌縮成一張小字典加索引。</p>
+      </label></li>
+      <li class="card-5"><label for="vg-w-stack-openzl-graph-r5">
+        <p class="card-head"><span>5 · entropy</span><code class="card-tag">per-stream</code></p>
+        <p class="card-sub">每條 stream 各自做最適合自己的 entropy 壓縮——graph 的葉節點，不是統一一條 pipeline。</p>
+      </label></li>
+    </ul>
+
+    <svg class="diagram" viewBox="0 0 880 360" role="img" aria-label="SAO codec graph：split header、decompose records、delta、tokenize、per-stream entropy 五個 codec 節點">
+      <text x="440" y="24" text-anchor="middle" fill="var(--ink)" class="head">SAO codec graph——一張 DAG，每個節點是一個可逆 codec</text>
+
+      <rect class="node node-1" data-target="vg-w-stack-openzl-graph-r1" x="40" y="150" width="150" height="64" rx="2" role="button" tabindex="0" aria-label="split header" />
+      <text x="115" y="180" text-anchor="middle" fill="var(--ink)" class="node-text">split header</text>
+      <text x="115" y="200" text-anchor="middle" class="node-sub">separate</text>
+
+      <line x1="190" y1="182" x2="240" y2="182" stroke="var(--muted-2)" stroke-width="1.5" marker-end="url(#vg-w-stack-openzl-graph-arrow)" />
+
+      <rect class="node node-2" data-target="vg-w-stack-openzl-graph-r2" x="240" y="150" width="170" height="64" rx="2" role="button" tabindex="0" aria-label="decompose records" />
+      <text x="325" y="180" text-anchor="middle" fill="var(--ink)" class="node-text">decompose records</text>
+      <text x="325" y="200" text-anchor="middle" class="node-sub">field streams</text>
+
+      <!-- branch into three streams -->
+      <line x1="410" y1="182" x2="460" y2="90"  stroke="var(--muted-2)" stroke-width="1.5" marker-end="url(#vg-w-stack-openzl-graph-arrow)" />
+      <line x1="410" y1="182" x2="460" y2="182" stroke="var(--muted-2)" stroke-width="1.5" marker-end="url(#vg-w-stack-openzl-graph-arrow)" />
+      <line x1="410" y1="182" x2="460" y2="274" stroke="var(--muted-2)" stroke-width="1.5" marker-end="url(#vg-w-stack-openzl-graph-arrow)" />
+
+      <rect class="node node-3" data-target="vg-w-stack-openzl-graph-r3" x="460" y="58" width="150" height="56" rx="2" role="button" tabindex="0" aria-label="delta coding" />
+      <text x="535" y="82" text-anchor="middle" fill="var(--ink)" class="node-text">delta</text>
+      <text x="535" y="100" text-anchor="middle" class="node-sub">sorted coords</text>
+
+      <rect class="node node-4" data-target="vg-w-stack-openzl-graph-r4" x="460" y="154" width="150" height="56" rx="2" role="button" tabindex="0" aria-label="tokenize" />
+      <text x="535" y="178" text-anchor="middle" fill="var(--ink)" class="node-text">tokenize</text>
+      <text x="535" y="196" text-anchor="middle" class="node-sub">low cardinality</text>
+
+      <rect class="node node-4b" x="460" y="250" width="150" height="56" rx="2" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.5" />
+      <text x="535" y="274" text-anchor="middle" fill="var(--muted)" class="node-text">raw stream</text>
+      <text x="535" y="292" text-anchor="middle" class="node-sub">pass-through</text>
+
+      <line x1="610" y1="86"  x2="690" y2="170" stroke="var(--muted-2)" stroke-width="1.5" marker-end="url(#vg-w-stack-openzl-graph-arrow)" />
+      <line x1="610" y1="182" x2="690" y2="182" stroke="var(--muted-2)" stroke-width="1.5" marker-end="url(#vg-w-stack-openzl-graph-arrow)" />
+      <line x1="610" y1="278" x2="690" y2="194" stroke="var(--muted-2)" stroke-width="1.5" marker-end="url(#vg-w-stack-openzl-graph-arrow)" />
+
+      <rect class="node node-5" data-target="vg-w-stack-openzl-graph-r5" x="690" y="150" width="150" height="64" rx="2" role="button" tabindex="0" aria-label="per-stream entropy" />
+      <text x="765" y="180" text-anchor="middle" fill="var(--ink)" class="node-text">entropy</text>
+      <text x="765" y="200" text-anchor="middle" class="node-sub">per-stream</text>
+
+      <text x="440" y="344" text-anchor="middle" fill="var(--muted)" class="node-sub">點任一節點看它的職責——三條 field stream 各走各的變換，不是一條共用 pipeline</text>
+
+      <defs>
+        <marker id="vg-w-stack-openzl-graph-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+          <path d="M0,0 L8,4 L0,8 Z" fill="var(--muted-2)" />
+        </marker>
+      </defs>
+    </svg>
+
+    <div>
+      <p class="hint">click any codec node above</p>
+      <div class="detail detail-1">
+        <h3>split header · 職責</h3>
+        <p>把 header 與 record body 分成兩條獨立的流。header 通常是少量、結構固定的 metadata，record body 是大量同構的資料——兩者的統計分布不一樣，混著壓會互相拖累。</p>
+        <p><strong>不負責的事</strong>：怎麼壓。它只做切分，把後面的決策留給下游節點。</p>
+      </div>
+      <div class="detail detail-2">
+        <h3>decompose records · 職責</h3>
+        <p>把列式的 record 轉成欄式的 field stream——第一欄全部聚在一起、第二欄全部聚在一起。同一欄的值統計性質相近，規律（單調、低基數、固定步長）這時才看得見。</p>
+        <p><strong>不負責的事</strong>：判斷每條流該用哪個 codec，那是下游 delta / tokenize 節點的事。</p>
+      </div>
+      <div class="detail detail-3">
+        <h3>delta · 職責</h3>
+        <p>對排序過或近單調的欄位（星表裡的座標就是這種），只存相鄰元素的差值。一串遞增的大整數變成一串接近零的小差值，entropy coder 面對「多半是小數字」的分布能壓得更兇。</p>
+        <p><strong>適用前提</strong>：欄位本身要有順序性。對亂序欄位 delta 反而會放大數值範圍。</p>
+      </div>
+      <div class="detail detail-4">
+        <h3>tokenize · 職責</h3>
+        <p>對低基數欄位（distinct 值少、重複多）建一張字典，把原值換成短 token。寬欄位塌縮成「一張小字典 + 一串索引」，索引本身又是低基數、好壓。</p>
+        <p><strong>適用前提</strong>：distinct 值要遠少於總筆數，否則字典本身就跟原資料一樣大。</p>
+      </div>
+      <div class="detail detail-5">
+        <h3>entropy · 職責</h3>
+        <p>graph 的葉節點。每條被前面變換攤平過的 stream，各自做最適合自己分布的 entropy 壓縮。關鍵是「各自」——delta 過的座標流與 tokenize 過的索引流分布不同，套不同參數，而不是一條共用 pipeline 一視同仁。</p>
+        <p><strong>不負責的事</strong>：產生規律。它吃的是上游已經攤平好的資料，只負責把剩下的 redundancy 編掉。</p>
+      </div>
+    </div>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-stack-openzl-graph');
+        root.querySelectorAll('.node').forEach((rect) => {
+          const targetId = rect.getAttribute('data-target');
+          if (!targetId) return;
+          rect.addEventListener('click', () => {
+            const radio = root.querySelector('#' + targetId);
+            if (radio) radio.checked = true;
+          });
+          rect.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); rect.dispatchEvent(new MouseEvent('click', { bubbles: true })); }
+          });
+        });
+      })();
+    </script>
+    <figcaption>SAO 的 codec graph：split → decompose → 三條 field stream 各走 delta / tokenize / pass-through → 每條再各自 entropy。圖只示意分支結構，實際 codec 種類與接法由描述與 training 決定。</figcaption>
+  </figure>
+
+  <p>這裡有個容易混淆的點：graph 不是「先全套變換、再壓縮」的兩段式流程，變換本身就是壓縮的一部分。delta、tokenize 這些 codec 不直接縮小資料，它們做的是把 redundancy 從「coder 看不見的形式」搬成「coder 看得見的形式」。一串遞增整數的資訊量其實很低，但 zstd 在原始 byte 上看不出這點，只能在表面找重複的位元組序列；delta 之後同一串資料變成一連串接近零的小差值，redundancy 攤在明面上，coder 就壓得動了。這正是 Meta 說的「Compression can then focus on a sequence of reversible steps that surface patterns before coding」——壓縮的主力工作從「直接編碼」前移到「先攤開規律」。OpenZL 的價值不在發明新的 entropy coder，而在於它讓你能為每一段資料、用一張組合圖，把規律提前攤開到通用 coder 吃得下的地方；同一套標準 codec 庫，靠不同的接法服務天差地別的格式。</p>
+
+  <h2>通用解壓器：自描述 wire format</h2>
+
+  <p>到這裡會冒出一個明顯的問題：如果每種格式、甚至每次 training 都產出一個不同的壓縮器，那解壓端怎麼辦？要為每個壓縮器配一個對應的解壓器嗎？OpenZL 的答案是不用——所有檔案共用同一個解壓器。Meta 的原話：「all OpenZL files can be decompressed using the same universal OpenZL decompressor」，而且不管它當初是用哪個壓縮設定壓的。CLI 文件講得更具體：「decompression doesn't require any <code>--profile</code>: data compressed with <code>openzl</code> is always decodable, regardless of which <code>--profile</code> was used for compression.」</p>
+
+  <p>能做到這件事，靠的是把壓縮計畫本身寫進檔案。白皮書的講法是：「OpenZL compresses data into a self-describing wire format, any configuration of which can be decompressed by a universal decoder.」壓縮時所用的那張 codec graph——哪些節點、什麼順序、各自的參數——被序列化進壓縮後的 frame；解壓器讀出這張圖，反向把每個 codec 逐一逆轉回去。因為前面提過「The compression graph is the ultimate driver of both compression and decompression」，同一張圖正向走是壓縮、反向走是解壓。解壓器不需要事先認得你的格式，它只需要認得 codec 庫裡那組標準構件，剩下的接法從 frame 裡讀。下面的 widget 把同一份 SAO 資料兩種看法疊在一起，拖動分隔線比較。</p>
+
+  <figure class="vg-w-ba-openzl-view" data-interactive="drag" data-mobile="swap" data-mobile-summary="同份 SAO 資料，zstd 看成一串 byte 壓 1.31×，OpenZL 拆成多條 field stream 各走 codec，壓到 2.06×。">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M18 8L22 12L18 16"/><path d="M6 8L2 12L6 16"/><path d="M2 12H22"/>
+      </svg>
+      <span>drag the divider · generic byte stream vs. OpenZL field streams</span>
+    </p>
+    <style>
+      .vg-w-ba-openzl-view { position: relative; aspect-ratio: 16 / 9; overflow: hidden; }
+      .vg-w-ba-openzl-view .layer { position: absolute; inset: 0; }
+      .vg-w-ba-openzl-view .after { clip-path: polygon(50% 0, 100% 0, 100% 100%, 50% 100%); }
+      .vg-w-ba-openzl-view .divider { position: absolute; top: 0; bottom: 0; left: 50%; width: 32px; transform: translateX(-50%); cursor: ew-resize; touch-action: none; }
+      .vg-w-ba-openzl-view .divider::before { content: ''; position: absolute; left: 50%; top: 0; bottom: 0; width: 2px; transform: translateX(-50%); background: var(--accent); }
+      .vg-w-ba-openzl-view .divider::after { content: '↔'; position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); background: var(--accent); color: var(--bg); width: 32px; height: 32px; border-radius: 50%; display: grid; place-items: center; font-family: var(--sans); font-size: 16px; }
+    </style>
+
+    <svg class="layer before" viewBox="0 0 480 270" role="img" aria-label="通用壓縮器視角：一條不透明的 byte stream">
+      <rect width="480" height="270" fill="var(--bg-soft)" />
+      <text x="20" y="34" font-family="IM Fell English, serif" font-style="italic" font-size="15" fill="var(--muted)">generic：一條 byte stream</text>
+      <g font-family="JetBrains Mono, monospace" font-size="15" fill="var(--ink)">
+        <text x="20" y="86">a3 1f 00 7c 91 02 ff 6e 44 1a 08 c0</text>
+        <text x="20" y="112">3d 71 00 9b 12 e5 47 02 a1 ff 00 33</text>
+        <text x="20" y="138">5c 88 1e 04 b2 00 7a 41 9d 02 ff 60</text>
+        <text x="20" y="164">2c 0f 91 00 44 d3 1a 02 ff 7e 88 05</text>
+      </g>
+      <text x="20" y="216" font-family="EB Garamond, serif" font-size="15" fill="var(--muted)">壓縮器只能在這串 byte 表面找重複</text>
+      <text x="20" y="244" font-family="JetBrains Mono, monospace" font-size="15" fill="var(--accent-text)">zstd -3 → 1.31×</text>
+    </svg>
+
+    <svg class="layer after" viewBox="0 0 480 270" id="vg-w-ba-openzl-view-after" role="img" aria-label="OpenZL 視角：拆解成 header 與多條 field stream">
+      <rect width="480" height="270" fill="var(--accent)" fill-opacity="0.08" />
+      <text x="20" y="34" font-family="IM Fell English, serif" font-style="italic" font-size="15" fill="var(--accent-text)">OpenZL：拆成 header + field streams</text>
+      <g font-family="JetBrains Mono, monospace" font-size="15">
+        <rect x="20" y="56" width="180" height="22" fill="var(--accent)" fill-opacity="0.18" stroke="var(--accent)" stroke-width="0.8" />
+        <text x="28" y="71" fill="var(--ink)">header</text>
+        <rect x="20" y="88" width="280" height="22" fill="var(--sage)" fill-opacity="0.28" />
+        <text x="28" y="103" fill="var(--ink)">coord  · delta → +1 +1 +2 +1</text>
+        <rect x="20" y="120" width="200" height="22" fill="var(--sage)" fill-opacity="0.28" />
+        <text x="28" y="135" fill="var(--ink)">class  · tokenize → A A B A</text>
+        <rect x="20" y="152" width="240" height="22" fill="var(--sage)" fill-opacity="0.28" />
+        <text x="28" y="167" fill="var(--ink)">mag    · entropy stream</text>
+      </g>
+      <text x="20" y="216" font-family="EB Garamond, serif" font-size="15" fill="var(--accent-text)">每條 stream 走自己最佳的 codec</text>
+      <text x="20" y="244" font-family="JetBrains Mono, monospace" font-size="15" fill="var(--accent-text)">OpenZL → 2.06×</text>
+    </svg>
+
+    <div class="divider" id="vg-w-ba-openzl-view-divider"></div>
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        const root = document.querySelector('.vg-w-ba-openzl-view');
+        const after = root.querySelector('#vg-w-ba-openzl-view-after');
+        const divider = root.querySelector('#vg-w-ba-openzl-view-divider');
+        let dragging = false;
+        function setPct(pct) {
+          const clamped = Math.max(0, Math.min(100, pct));
+          after.style.clipPath = `polygon(${clamped}% 0, 100% 0, 100% 100%, ${clamped}% 100%)`;
+          divider.style.left = `${clamped}%`;
+        }
+        divider.addEventListener('pointerdown', (e) => { dragging = true; divider.setPointerCapture(e.pointerId); });
+        root.addEventListener('pointermove', (e) => { if (!dragging) return; const rect = root.getBoundingClientRect(); setPct(((e.clientX - rect.left) / rect.width) * 100); });
+        root.addEventListener('pointerup', () => { dragging = false; });
+        root.addEventListener('pointercancel', () => { dragging = false; });
+      })();
+    </script>
+    <figcaption>左半是通用壓縮器看到的——一串均質 byte；右半是 OpenZL 看到的——header 與三條各有結構的 field stream。同一份 SAO 資料，看法不同，壓縮比就是 1.31× 對 2.06×。</figcaption>
+  </figure>
+
+  <p>通用解壓器的好處不只是省一個 binary。Meta 列了三個它在 production 重視的後果：因為全公司只有一個解壓器，安全稽核只要審這一份；壓縮端的改進可以 fleet-wide 推開，不必擔心解壓端跟不上；向後相容因此有了硬保證。GitHub 上 README 給的承諾很具體：「payloads compressed with any release-tagged version of the library will remain decompressible by new releases of the library for at least the next several years.」壓縮端可以年年換更聰明的 graph、更好的 training，舊資料照樣解得開——因為解壓邏輯不在壓縮器裡，而在資料自己攜帶的那張圖加上那組固定的標準 codec 庫。白皮書把這層效益總結成「its universal decoder eliminates deployment lag」：新壓縮器一寫好就能用，不必等解壓端先佈署到每一台機器。</p>
+
+  <p>值得停下來想清楚這個分工為什麼成立。傳統上「壓縮器」與「解壓器」是一對綁死的程式：你換了壓縮邏輯，就得同步換解壓邏輯，否則舊解壓器讀不懂新格式。OpenZL 把這層耦合切斷的辦法，是讓壓縮後的 frame 自己攜帶「該怎麼被解開」的全部資訊——也就是那張 codec graph 的序列化形式。解壓器不認得你的格式、不認得你這次用了什麼 training，它只認得標準 codec 庫裡那組固定的可逆構件，再按 frame 裡讀到的圖把它們逐一逆轉。這也解釋了 CLI 那句「decompression doesn't require any <code>--profile</code>」：解壓端不需要被告知任何配置，因為配置就寫在資料裡。白皮書還點出這個設計的另一個副作用——把所有壓縮策略的多樣性收斂到「不同的圖」這一層，真正要長期維護、要嚴格稽核的程式碼就只剩那組標準 codec 庫，安全風險集中在一塊小而被反覆驗證的表面上，而不是散在每個團隊各自寫的解壓器裡。對一個要在整個機隊上跑十幾年的壓縮系統，這種「壓縮可以一直演進、解壓器保持單一且穩定」的形狀，才是它敢給出數年向後相容承諾的底氣。</p>
+
+  <h2>SAO 數字：為什麼「高壓縮比 + 高吞吐」一起拿下</h2>
+
+  <p>把機制講完，回到那組讓人多看一眼的數字。傳統的直覺是壓縮比與速度互斥——xz -9 用 1.64× 的壓縮比換來了慘烈的 3.1 MB/s 壓縮速度，就是這條 trade-off 曲線的典型。OpenZL 在 SAO 星表資料集上的官網數字打破了這個直覺：壓縮比 2.06×，壓縮速度 203 MB/s（比 zstd -3 的 115 MB/s 還快），解壓 822 MB/s。Meta 對 OpenZL 的一句話定位是「lossless compression for structured data, with performance comparable to specialized compressors」——拿通用框架的可維護性，換到專用壓縮器等級的表現。下面這張表把三者擺在一起，點欄位標題排序。</p>
+
+  <p>速度能跟上的原因，回頭看就是前面那張 graph。通用壓縮器把整串 byte 餵進一條較重的 pipeline，要榨出更高壓縮比往往得開更大的 search window、更慢的 match finder——xz 的 3.1 MB/s 就是這樣換來的。OpenZL 的 graph 反過來：因為描述已經把資料拆成幾條結構單純的 field stream，每條流上跑的是輕量、針對性的 codec（delta 就是逐元素相減、tokenize 就是查字典），重活在「拆解」這一步用結構知識省掉了，留給 entropy coder 的是已經攤平、好啃的資料。換句話說，高壓縮比不是靠在 coder 那端加碼算力拿到的，而是靠前段的結構變換把問題變簡單——這就是為什麼壓縮比往上走的同時，吞吐量還能守在 zstd 的量級。對一條每秒要吞下幾百 MB 的 ingestion pipeline，這個性質決定了 OpenZL 能不能站在熱路徑上，而不是只能當離線壓縮工具。</p>
+
+  <figure class="vg-w-table-openzl-sao" data-mobile="keep">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/><path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+      </svg>
+      <span>click column header to sort · 4 columns × 3 rows</span>
+    </p>
+    <style>
+      .vg-w-table-openzl-sao { overflow-x: auto; }
+      .vg-w-table-openzl-sao table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-openzl-sao thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; }
+      .vg-w-table-openzl-sao thead th[data-sort] { color: var(--accent-text); }
+      .vg-w-table-openzl-sao thead th[data-sort]::after { content: ' ▾'; font-size: 0.7em; }
+      .vg-w-table-openzl-sao thead th[data-sort="asc"]::after { content: ' ▴'; font-size: 0.7em; }
+      .vg-w-table-openzl-sao tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); }
+      .vg-w-table-openzl-sao td.num { font-variant-numeric: tabular-nums; text-align: right; }
+      .vg-w-table-openzl-sao td.win { color: var(--sage-deep); font-family: JetBrains Mono, monospace; font-variant-numeric: tabular-nums; text-align: right; }
+      .vg-w-table-openzl-sao tbody tr:hover td { background: var(--bg-soft); }
+      .vg-w-table-openzl-sao caption { text-align: left; caption-side: top; font-family: var(--scribed); font-style: italic; color: var(--muted); font-size: var(--fs-sm); padding: var(--s-1) 0; }
+    </style>
+    <table>
+      <caption>SAO 星表資料集，數字直接取自 openzl.org 首頁。壓縮比越高越好；速度越高越好。點欄位標題排序。</caption>
+      <thead>
+        <tr>
+          <th data-key="tool">壓縮器</th>
+          <th data-key="ratio" class="num">壓縮比 (×)</th>
+          <th data-key="comp" class="num">壓縮 (MB/s)</th>
+          <th data-key="decomp" class="num">解壓 (MB/s)</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>zstd -3</td><td class="num">1.31</td><td class="num">115</td><td class="num">890</td></tr>
+        <tr><td>xz -9</td><td class="num">1.64</td><td class="num">3.1</td><td class="num">30</td></tr>
+        <tr><td>OpenZL</td><td class="win">2.06</td><td class="win">203</td><td class="win">822</td></tr>
+      </tbody>
+    </table>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-table-openzl-sao');
+        const headers = root.querySelectorAll('thead th');
+        const tbody = root.querySelector('tbody');
+        let activeKey = null, asc = true;
+        headers.forEach((h, idx) => h.addEventListener('click', () => {
+          const key = h.dataset.key;
+          if (activeKey === key) asc = !asc; else { activeKey = key; asc = true; }
+          headers.forEach((x) => x.removeAttribute('data-sort'));
+          h.setAttribute('data-sort', asc ? 'asc' : 'desc');
+          const rows = Array.from(tbody.querySelectorAll('tr'));
+          rows.sort((a, b) => {
+            const av = a.children[idx].textContent.trim().replace(/,/g, '');
+            const bv = b.children[idx].textContent.trim().replace(/,/g, '');
+            const an = Number(av), bn = Number(bv);
+            const cmp = (!Number.isNaN(an) && !Number.isNaN(bn)) ? an - bn : av.localeCompare(bv);
+            return asc ? cmp : -cmp;
+          });
+          rows.forEach((r) => tbody.appendChild(r));
+        }));
+      })();
+    </script>
+  </figure>
+
+  <p>一個必要的誠實標註：Meta 的發表文裡，同一個 SAO 例子給的速度是另一組數字——壓縮比一樣 2.06×，但壓縮速度 340 MB/s、解壓 1200 MB/s，量測平台註明是 M1 CPU、clang-17。官網與發表文的壓縮比一致、速度量級不同，合理的推測是兩者跑在不同硬體或不同建置設定上（發表文明寫 M1/clang-17，官網未註明平台），所以這裡把兩組數字分開引、不混算。要點不在哪一組絕對值，而在兩組都呈現同一件事：壓縮比明顯高過 zstd，吞吐量卻維持在同個量級甚至更快。兩組數字在壓縮比這一項完全一致、都是 2.06×——壓縮比只取決於資料與壓縮策略，不隨硬體變動，會跟著平台跑的只有速度。所以拿來支撐「結構感知贏過通用壓縮」這個論點的，其實是那個跨兩份來源都站得住的壓縮比，而速度數字我只用來說明它沒有為了高壓縮比犧牲吞吐，量級對得上即可，不去比較哪一台機器跑得快。</p>
+
+  <p>這件事為什麼重要，得看資料中心的成本結構。在一條高吞吐的儲存或傳輸 pipeline 上，壓縮器若慢到變成瓶頸，省下的空間就被吐不出去的吞吐量吃掉了——xz 的 3.1 MB/s 就是這種情況，壓縮比好看，但只能拿去壓冷資料。OpenZL 想站的位置是「壓縮比往 xz 靠、速度往 zstd 靠」的那個角落：既值得放進熱路徑，又真的省下可觀的儲存與頻寬。Meta 點名的目標使用者是「engineers that deal with large quantities of specialized datasets (like AI workloads for example) and require high speed for their processing pipelines」——AI workload 的訓練資料、特徵檔、模型 checkpoint 多半是高度結構化又體積龐大的資料，正好落在「通用壓縮器留了一截 gain 在桌上、又吃不起慢速壓縮」的夾縫裡。</p>
+
+  <p>另一個對採用者實際的數字是工程成本。白皮書說 Meta 內部佈署「consistent improvements in size and/or speed, with development timelines reduced from months to days」——做一個專用壓縮器從幾個月縮到幾天。傳統上要為某個格式寫專用壓縮器，等於要連配套的專用解壓器一起寫、測試、佈署、長期維護；OpenZL 把「設計壓縮策略」與「維護解壓器」這兩件事拆開——前者用描述加 training 快速迭代，後者由那個共用的通用解壓器一次解決。GitHub README 也把成熟度講清楚：「we consider the core to have reached production-readiness, and OpenZL is used extensively in production at Meta.」這不是一個論文 demo，是已經在正式環境跑的東西。</p>
+
+  <p class="vg-deep-closer"><strong>What this enables</strong>：把「資料的結構」變成壓縮器的一個顯式輸入後，你能用一張 codec 的有向無環圖、針對每一種格式快速組出專用壓縮器——而它們全部共用一個自描述、向後相容的通用解壓器，於是專用壓縮器的高壓縮比與高吞吐，第一次能在不犧牲可維護性的前提下同時拿下。</p>
+</div>
