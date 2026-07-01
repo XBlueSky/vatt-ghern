@@ -1,0 +1,493 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">你把隨身碟拔出來的時候，燈還在閃。過幾天打開那顆碟上的 SQLite 檔，它壞了——不是你的 SQL 寫錯，是那一秒鐘裡，碟對作業系統說了謊，作業系統把謊話原封不動轉給了 SQLite。</p>
+  <h1 class="vg-post-title">如何弄壞一個 SQLite 資料庫檔</h1>
+</header>
+
+<div class="vg-post-body">
+
+<p><span class="vg-dropcap">S</span>QLite 官方有一份很少人從頭讀完的文件，標題直白得近乎挑釁——<em>How To Corrupt An SQLite Database File</em>。它不是教你怎麼修，而是把所有「應用程式能弄壞資料庫的方法」一條一條列出來。讀完這篇你會理解一件事：SQLite 的資料完整性，是建立在一串承諾之上的。作業系統向它承諾鎖會照約定運作，硬碟向它承諾 sync 完成代表資料真的落地了。corruption 不是 SQLite 崩壞，而是這串承諾裡某一環悄悄毀約，而 SQLite 沒有任何辦法察覺。</p>
+
+<h2>一次乾淨的斷電，資料庫卻壞了</h2>
+
+<p>先看最不需要背景知識的那個場景。你把資料庫放在一支 USB 隨身碟上，寫入結束，你拔掉它。SQLite 官方文件對這個動作的評語相當不客氣：</p>
+
+<blockquote>
+  <p>「USB flash memory sticks seem to be especially pernicious liars regarding sync requests... Pulling out the memory stick while the LED is still flashing will frequently result in database corruption.」</p>
+</blockquote>
+
+<p>注意這裡的用詞。文件不說「可能」，它說 frequently——經常。而且它把隨身碟形容成 especially pernicious liars，特別惡毒的說謊者。這是一份技術文件裡罕見的情緒，背後是無數個壞掉的資料庫檔換來的。</p>
+
+<p>問題的核心不在「拔太快」，而在「說謊」這個動作。要看懂它在說什麼謊，得先知道 SQLite 向底下的世界要了什麼保證。這篇剩下的篇幅都在拆這件事：SQLite 假設了什麼、每一層各自替上層背了什麼書、以及當某一層毀約時，corruption 具體長成什麼樣子。</p>
+
+<h2>SQLite 到底假設了什麼</h2>
+
+<p>SQLite 保證每一次 commit 要嘛整筆生效、要嘛完全沒發生，斷電也不例外。要做到這件事，它必須在關鍵時刻叫作業系統把所有還在記憶體裡的寫入刷進持久儲存，然後<em>等它刷完</em>。文件對這個動作的定義是這樣的：</p>
+
+<blockquote>
+  <p>「In order to guarantee that database files are always consistent, SQLite will occasionally ask the operating system to flush all pending writes to persistent storage then wait for that flush to complete. This is accomplished using the fsync() system call under unix and FlushFileBuffers() under Windows. We call this flush of pending writes a 'sync'.」</p>
+</blockquote>
+
+<p>先把 atomic commit 怎麼靠 journal 撐起來說清楚，因為後面很多條 corruption 都繞著它。SQLite 改資料靠一份 rollback journal（或 WAL 模式下的 WAL 檔）保護：commit 過程會呼叫 sync 把待寫入刷到持久儲存並等它完成，crash 之後再靠那份 journal 把沒寫完的交易回捲。這份文件把這件事的技術核心收斂成一句話——sync 是一道 I/O barrier，只要 barrier 前的寫入都先於 barrier 後的寫入落地，就不會 corrupt。整套機制的兩個死穴，就是那道 barrier 要真的建立順序，以及那份 journal 在 recovery 前要還在——後面會看到這兩個死穴各自對應一整類 corruption。（rollback journal 逐頁備份、標記失效的完整流程細節，屬於 SQLite 另一份 atomic commit 文件的範圍，這裡不展開。）</p>
+
+<p>關鍵字是 <code>fsync()</code>。SQLite 在 commit 的過程中會呼叫它，然後假設它回傳的那一刻，資料真的在碟上了。但這個假設其實比你想的還要寬鬆一點。文件接著澄清，如果你只要 atomic 與 consistent、願意放棄 durable，sync 甚至不需要真的等資料落地——它只要當一道 I/O barrier 就夠了：</p>
+
+<blockquote>
+  <p>「the sync operation can be thought of as an I/O barrier. As long as all writes that occur before the sync are completed before any write that happens after the sync, no database corruption will occur.」</p>
+</blockquote>
+
+<p>把這句話咀嚼一下，因為整篇的技術核心就在這裡。SQLite 不強求「sync 回傳時資料已落地」，它只要求一件更弱的事：sync 之前的寫入，全部要在 sync 之後的寫入之前落地。順序，不是時間。這就是 barrier 的意思——它是一道柵欄，柵欄前的東西可以晚點過，但絕不准柵欄後的東西先過。只要這道柵欄成立，斷電最多丟掉最後一筆還沒過柵欄的資料，資料庫本身不會壞（no database corruption will occur，文件在這裡難得地用了斷定語氣）。</p>
+
+<p>於是問題收斂成一句話：誰負責維持這道 barrier？答案是作業系統與硬碟。而 SQLite 對它們的回報只能照單全收——它沒有辦法驗證：</p>
+
+<blockquote>
+  <p>「Note that SQLite must believe whatever the operating system and hardware tell it about the status of sync requests. There is no way for SQLite to detect that either is lying and that writes might be occurring out-of-order.」</p>
+</blockquote>
+
+<p>must believe。SQLite 沒有第二套感官去查核，它只能相信。這就是它整個完整性模型的信任邊界，也是所有 corruption 的溫床。</p>
+
+<p>值得先把「corruption 不等於 crash」這件事講清楚。斷電時，如果只是最後一筆還沒過 barrier 的寫入丟了，那不是 corruption——那只是那筆交易沒成功，資料庫本身完好，重跑就是。真正的 corruption 是資料庫檔內部自相矛盾：某一頁指向一頁不存在的資料、某個 index 對不上它該指的 row、某段內容一半是舊交易一半是新交易。這種檔最麻煩的地方在於，它未必當場報錯——一份自相矛盾的檔可能拖到某次特定查詢才引爆。文件列的每一條，最終都收斂到同一種結果：把一份原本自洽的檔，變成一份自相矛盾的檔。</p>
+
+<h2>每一層都在替上層背書</h2>
+
+<p>把這個信任關係畫成一疊。從你的應用程式往下，一直到磁碟的碟片，每一層都對上一層許了一個承諾，也都靠下一層的承諾才撐得住自己那句。點任何一層，看它對上層說了什麼、又是什麼樣的毀約會讓這句話變成空頭支票。</p>
+
+<figure class="vg-w-annotated-durability-stack" data-mobile="static" data-svg-scroll="720">
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+         stroke="currentColor" stroke-width="1.8"
+         stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M9 11.24V7.5a2.5 2.5 0 0 1 5 0v3.74"/><path d="M6 11h12a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-6a2 2 0 0 1 2-2z"/>
+    </svg>
+    <span>點任一層讀它許的承諾與毀約方式 · 共 4 層</span>
+  </p>
+  <style>
+    .vg-w-annotated-durability-stack { display: flex; flex-direction: column; gap: var(--s-3); align-items: stretch; }
+    .vg-w-annotated-durability-stack svg { width: 100%; height: auto; }
+    .vg-w-annotated-durability-stack input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+    .vg-w-annotated-durability-stack .layer { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; transition: fill 200ms, stroke 200ms; }
+    .vg-w-annotated-durability-stack .layer:hover { stroke: var(--accent); }
+    .vg-w-annotated-durability-stack .layer:focus { outline: none; }
+    .vg-w-annotated-durability-stack .layer:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .vg-w-annotated-durability-stack .layer-text, .vg-w-annotated-durability-stack .arrow-text { pointer-events: none; }
+    .vg-w-annotated-durability-stack .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+    .vg-w-annotated-durability-stack .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+    .vg-w-annotated-durability-stack .detail p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+    .vg-w-annotated-durability-stack:has(#vg-w-annotated-durability-stack-r1:checked) .layer-1 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+    .vg-w-annotated-durability-stack:has(#vg-w-annotated-durability-stack-r2:checked) .layer-2 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+    .vg-w-annotated-durability-stack:has(#vg-w-annotated-durability-stack-r3:checked) .layer-3 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+    .vg-w-annotated-durability-stack:has(#vg-w-annotated-durability-stack-r4:checked) .layer-4 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+    .vg-w-annotated-durability-stack:has(#vg-w-annotated-durability-stack-r1:checked) .detail-1 { display: block; }
+    .vg-w-annotated-durability-stack:has(#vg-w-annotated-durability-stack-r2:checked) .detail-2 { display: block; }
+    .vg-w-annotated-durability-stack:has(#vg-w-annotated-durability-stack-r3:checked) .detail-3 { display: block; }
+    .vg-w-annotated-durability-stack:has(#vg-w-annotated-durability-stack-r4:checked) .detail-4 { display: block; }
+    @media (max-width: 720px) {
+      .vg-w-annotated-durability-stack { grid-template-columns: 1fr; }
+    }
+  </style>
+
+  <div class="vg-w-annotated-durability-stack-controls" data-vg-controls>
+    <input type="radio" id="vg-w-annotated-durability-stack-r1" name="vg-w-annotated-durability-stack-sel" tabindex="-1" checked />
+    <input type="radio" id="vg-w-annotated-durability-stack-r2" name="vg-w-annotated-durability-stack-sel" tabindex="-1" />
+    <input type="radio" id="vg-w-annotated-durability-stack-r3" name="vg-w-annotated-durability-stack-sel" tabindex="-1" />
+    <input type="radio" id="vg-w-annotated-durability-stack-r4" name="vg-w-annotated-durability-stack-sel" tabindex="-1" />
+  </div>
+
+  <svg viewBox="0 0 720 360" preserveAspectRatio="xMidYMid meet" role="img" aria-label="SQLite durability stack of promises">
+    <rect class="layer layer-1" data-target="vg-w-annotated-durability-stack-r1" role="button" tabindex="0" aria-label="select application layer" x="120" y="20" width="480" height="60" rx="6" />
+    <text class="layer-text" x="360" y="46" text-anchor="middle" font-family="EB Garamond, serif" font-size="18" fill="var(--ink)">你的應用程式</text>
+    <text class="layer-text" x="360" y="66" text-anchor="middle" font-family="Manrope, sans-serif" font-size="12" fill="var(--muted)">COMMIT / INSERT / UPDATE</text>
+
+    <rect class="layer layer-2" data-target="vg-w-annotated-durability-stack-r2" role="button" tabindex="0" aria-label="select SQLite layer" x="120" y="105" width="480" height="60" rx="6" />
+    <text class="layer-text" x="360" y="131" text-anchor="middle" font-family="EB Garamond, serif" font-size="18" fill="var(--ink)">SQLite</text>
+    <text class="layer-text" x="360" y="151" text-anchor="middle" font-family="Manrope, sans-serif" font-size="12" fill="var(--muted)">journal + fsync() = atomic commit</text>
+
+    <rect class="layer layer-3" data-target="vg-w-annotated-durability-stack-r3" role="button" tabindex="0" aria-label="select OS and filesystem layer" x="120" y="190" width="480" height="60" rx="6" />
+    <text class="layer-text" x="360" y="216" text-anchor="middle" font-family="EB Garamond, serif" font-size="18" fill="var(--ink)">作業系統 + 檔案系統</text>
+    <text class="layer-text" x="360" y="236" text-anchor="middle" font-family="Manrope, sans-serif" font-size="12" fill="var(--muted)">advisory locks · fsync 轉發給硬體</text>
+
+    <rect class="layer layer-4" data-target="vg-w-annotated-durability-stack-r4" role="button" tabindex="0" aria-label="select disk hardware layer" x="120" y="275" width="480" height="60" rx="6" />
+    <text class="layer-text" x="360" y="301" text-anchor="middle" font-family="EB Garamond, serif" font-size="18" fill="var(--ink)">硬碟 / 快閃記憶體</text>
+    <text class="layer-text" x="360" y="321" text-anchor="middle" font-family="Manrope, sans-serif" font-size="12" fill="var(--muted)">track buffer → oxide（碟片）</text>
+
+    <line x1="80" y1="80" x2="80" y2="275" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-annotated-durability-stack-arrow)" />
+    <text class="arrow-text" x="70" y="180" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)" transform="rotate(-90 70 180)">承諾往下傳</text>
+    <line x1="640" y1="275" x2="640" y2="85" stroke="var(--sage-deep)" stroke-width="1.5" marker-end="url(#vg-w-annotated-durability-stack-arrow-up)" />
+    <text class="arrow-text" x="652" y="180" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--sage-deep)" transform="rotate(90 652 180)">回報往上傳</text>
+
+    <defs>
+      <marker id="vg-w-annotated-durability-stack-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+      </marker>
+      <marker id="vg-w-annotated-durability-stack-arrow-up" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--sage-deep)" />
+      </marker>
+    </defs>
+  </svg>
+
+  <div>
+    <div class="detail detail-1">
+      <h3>你的應用程式 · 它相信的承諾</h3>
+      <p>你寫 <code>COMMIT</code>，就相信這筆交易之後要嘛完整存在、要嘛完全沒發生。你不會去想 fsync、track buffer、advisory lock——這正是資料庫存在的意義：把這些髒東西藏起來。</p>
+      <p><strong>它不知道</strong>：底下三層裡任何一層毀約，這個信任就是空的。而應用程式層自己也能製造麻煩——文件把「交易進行到一半就去備份檔案」列為一條獨立的 corruption 來源。</p>
+    </div>
+    <div class="detail detail-2">
+      <h3>SQLite · 它許的承諾</h3>
+      <p>SQLite 用 rollback journal（或 WAL）加上關鍵時刻的 <code>fsync()</code> 兌現 atomic commit。crash 後它靠 journal 把沒寫完的交易回捲。前提是 journal 還在，而且 fsync 真的建立了那道 I/O barrier。</p>
+      <p><strong>它不知道</strong>：fsync 是不是被誰騙了。文件明講 SQLite must believe 作業系統與硬體的回報，沒有第二套感官去查核 sync 到底有沒有完成。</p>
+    </div>
+    <div class="detail detail-3">
+      <h3>作業系統 + 檔案系統 · 它許的承諾</h3>
+      <p>它答應兩件事：一是把 <code>fsync()</code> 忠實轉發給硬體並回報結果；二是讓檔案鎖（POSIX advisory lock）照文件說的方式運作，讓多個連線能協調存取。</p>
+      <p><strong>它會毀約的地方</strong>：網路檔案系統（尤其 NFS）的鎖實作常有 bug；而 POSIX 有個惡名昭彰的坑——同一個 process 裡任何一條 thread 對這個檔呼叫 <code>close()</code>，會取消<em>整個 process</em>對它的所有 advisory lock。</p>
+    </div>
+    <div class="detail detail-4">
+      <h3>硬碟 / 快閃記憶體 · 它該許的承諾</h3>
+      <p>它該保證 sync 回報完成時，barrier 前的資料都已離開揮發性的 track buffer、寫進碟片（oxide）。</p>
+      <p><strong>它會毀約的地方</strong>：消費級碟與隨身碟常常「資料一進 track buffer 就回報寫好了」。斷電時，barrier 後的寫入可能已落地、barrier 前的還在快取裡——順序顛倒，barrier 破功，corruption 從這裡長出來。</p>
+    </div>
+  </div>
+
+  <script>
+    (function () {
+      if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+      const root = document.querySelector('.vg-w-annotated-durability-stack');
+      root.querySelectorAll('.layer').forEach((rect) => {
+        rect.addEventListener('click', () => {
+          const targetId = rect.getAttribute('data-target');
+          const radio = root.querySelector('#' + targetId);
+          if (radio) radio.checked = true;
+        });
+        rect.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            rect.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+          }
+        });
+      });
+    })();
+  </script>
+</figure>
+
+<p>這疊圖的形狀就是整篇的骨架。上面兩層是你和 SQLite——這裡的毀約多半是誤用（拿去 fork、在交易中間備份）。下面兩層是 OS 與硬體——這裡的毀約是別人幫你埋的地雷（NFS 的鎖、說謊的碟）。接下來把承諾破掉的幾種樣子逐一攤開。</p>
+
+<p>在往下走之前，先補一個容易被漏掉的角度：SQLite 這條信任鏈裡，最上面那層——你的程式碼——毀約的方式往往最荒謬，因為它跟資料庫邏輯毫無關係。文件開頭就記了一種：一個 file descriptor 本來開在某個檔上，被關掉之後，同一個 fd 號碼被 SQLite 拿去重開成資料庫；但程式裡另一段還抓著舊的 fd 號碼繼續寫——它不知道那個檔早就關了。於是本來要寫進原檔的東西，直接覆蓋到 SQLite 資料庫的中間，corruption。這種 bug 真的發生過：文件記下 2013 年 Fossil 版本控制系統的官方 repository 就中過招——stderr（fd 2）被誤關（文件說 by stunnel, we suspect），SQLite 把這個低號 fd 重開成資料庫，之後一個 assert() 的錯誤訊息就印進了 Fossil 那份資料庫檔裡。關掉 fd 的不是 Fossil 自己，Fossil 是受害的那一方。SQLite 從 3.8.1 版（2013-10-17）起乾脆拒絕用低號 fd 開資料庫，就是為了躲這顆。</p>
+
+<h2>承諾破掉的五種樣子</h2>
+
+<p>先給一張總表。SQLite 文件列的失敗模式不只五種，這裡挑出跨層、機制最清楚的幾條，標上它住在哪一層、什麼條件觸發、以及文件原文用了多強的語氣。原文的語氣很重要——它用 will 的地方是斷定，用 can／might 的地方是「條件湊齊才會」。點欄位標題可以重排。</p>
+
+<figure class="vg-w-table-modes" data-mobile="keep">
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+         stroke="currentColor" stroke-width="1.8"
+         stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/>
+      <path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+    </svg>
+    <span>點欄位標題重排 · 4 欄 × 5 列</span>
+  </p>
+  <style>
+    .vg-w-table-modes { overflow-x: auto; }
+    .vg-w-table-modes table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+    .vg-w-table-modes thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; }
+    .vg-w-table-modes thead th[data-sort] { color: var(--accent-text); }
+    .vg-w-table-modes tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+    .vg-w-table-modes td.mono { font-family: var(--mono); font-size: var(--fs-xs); }
+  </style>
+  <table>
+    <thead>
+      <tr>
+        <th data-key="mode">失敗模式</th>
+        <th data-key="layer">所在層</th>
+        <th data-key="trigger">觸發條件</th>
+        <th data-key="hedge">原文語氣</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td>刪掉 crash 後的 hot journal</td><td>SQLite / 檔案系統</td><td>crash 後把 journal 移走、刪掉或改名</td><td class="mono">may</td></tr>
+      <tr><td>檔案系統鎖實作有 bug（NFS）</td><td>OS / 檔案系統</td><td>網路檔案系統上兩個以上連線同時存取</td><td class="mono">might</td></tr>
+      <tr><td>close() 取消整個 process 的鎖</td><td>OS（POSIX）</td><td>多 thread 共用同檔，某 thread close()</td><td class="mono">can</td></tr>
+      <tr><td>碟謊報 sync 完成</td><td>硬碟 / 快閃記憶體</td><td>斷電時 barrier 後的寫入先落地</td><td class="mono">can</td></tr>
+      <tr><td>交易進行中做備份</td><td>應用程式</td><td>交易中途複製整個檔</td><td class="mono">might</td></tr>
+    </tbody>
+  </table>
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-table-modes');
+      const headers = root.querySelectorAll('thead th');
+      const tbody = root.querySelector('tbody');
+      let activeKey = null, asc = true;
+      headers.forEach(h => h.addEventListener('click', () => {
+        const key = h.dataset.key;
+        if (activeKey === key) asc = !asc; else { activeKey = key; asc = true; }
+        headers.forEach(x => x.removeAttribute('data-sort'));
+        h.setAttribute('data-sort', asc ? 'asc' : 'desc');
+        const rows = [...tbody.querySelectorAll('tr')];
+        const idx = [...headers].indexOf(h);
+        rows.sort((a, b) => {
+          const av = a.children[idx].textContent.trim();
+          const bv = b.children[idx].textContent.trim();
+          return asc ? av.localeCompare(bv) : bv.localeCompare(av);
+        });
+        rows.forEach(r => tbody.appendChild(r));
+      }));
+    })();
+  </script>
+</figure>
+
+<p>讀這張表最該盯的是最後一欄。SQLite 文件的語氣不是隨手寫的：它對「實作 bug 與系統設計問題」用最重的 will、must、do not——這些是機制決定的必然；對「要湊齊特定條件才會出事」的場景用 can；對更受條件限制的用 might、could。這欄語氣就是風險溫度計。看到 might，代表你多半得同時滿足好幾個條件才會中；看到 will，代表機制一旦觸發就是那個結果，沒有僥倖。下面把其中幾條展開，從最容易懂的碟開始。</p>
+
+<p>先回到開頭那支隨身碟。文件對「碟謊報」的原文是這樣的：碟會在資料<em>剛進 track buffer</em> 時就回報「已安全寫入持久媒體」，其實根本還沒寫到碟片。</p>
+
+<blockquote>
+  <p>「Disk drives will report that content is safely on persistent media as soon as it reaches the track buffer and before actually being written to oxide.」</p>
+</blockquote>
+
+<p>track buffer 是碟上一塊揮發性快取。一旦碟對 <code>fsync()</code> 說「好了」但資料其實還在這塊快取裡，那道 barrier 就名存實亡了。文件把後果講得很精確：</p>
+
+<blockquote>
+  <p>「if a power loss or hard reset does occur, and if that results in content that was written after a sync reaching oxide while content written before the sync is still in a track buffer, then database corruption can occur.」</p>
+</blockquote>
+
+<p>把這句話拖著看一遍。下面這個 widget 讓你把「斷電發生的時間點」沿著一串寫入序列拖動，對照誠實的碟與說謊的碟在那一刻各自留下什麼。誠實的碟嚴守 barrier，斷電最多丟掉最後一筆；說謊的碟把 sync 後的寫入先落地、sync 前的留在快取，斷電後兩邊順序顛倒——SQLite 醒來讀到半新半舊，就是 corruption。</p>
+
+<figure class="vg-w-scrubber-powerloss" data-mobile="swap" data-svg-scroll="720" data-mobile-summary="誠實的碟斷電只丟最後一筆，資料仍一致；說謊的碟讓寫入順序顛倒，SQLite 讀到半新半舊就是 corruption。">
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+         stroke="currentColor" stroke-width="1.8"
+         stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M18 8L22 12L18 16"/><path d="M6 8L2 12L6 16"/><path d="M2 12H22"/>
+    </svg>
+    <span>拖動斷電時間點 · 沿 6 筆寫入序列</span>
+  </p>
+  <style>
+    .vg-w-scrubber-powerloss { display: grid; gap: var(--s-2); }
+    .vg-w-scrubber-powerloss .scrub { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+    .vg-w-scrubber-powerloss .scrub input { flex: 1; accent-color: var(--accent); height: 36px; touch-action: none; }
+    .vg-w-scrubber-powerloss .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 9ch; text-align: right; }
+    .vg-w-scrubber-powerloss svg { width: 100%; height: auto; }
+    .vg-w-scrubber-powerloss figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+  </style>
+  <div class="scrub">
+    <label for="vg-w-scrubber-powerloss-x">斷電於第</label>
+    <input id="vg-w-scrubber-powerloss-x" type="range" min="1" max="6" value="6" step="1" />
+    <span class="readout" id="vg-w-scrubber-powerloss-readout">6 筆後</span>
+  </div>
+  <svg viewBox="0 0 720 300" preserveAspectRatio="xMidYMid meet" role="img" aria-label="honest disk vs lying disk under power loss">
+    <text x="20" y="30" font-family="Manrope, sans-serif" font-size="12" fill="var(--muted)" letter-spacing="0.06em">寫入順序（左到右）· sync barrier 在第 3、第 4 筆之間</text>
+
+    <line x1="360" y1="45" x2="360" y2="270" stroke="var(--accent)" stroke-width="1.5" stroke-dasharray="4 4" />
+    <text x="360" y="60" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--accent-text)">sync barrier</text>
+
+    <text x="20" y="120" font-family="EB Garamond, serif" font-size="15" fill="var(--sage-deep)">誠實的碟</text>
+    <g id="vg-w-scrubber-powerloss-honest"></g>
+
+    <text x="20" y="220" font-family="EB Garamond, serif" font-size="15" fill="var(--accent-text)">說謊的碟</text>
+    <g id="vg-w-scrubber-powerloss-lying"></g>
+
+    <rect x="20" y="255" width="680" height="34" rx="6" fill="var(--bg-soft)" stroke="var(--line)" stroke-width="1" id="vg-w-scrubber-powerloss-verdict-box" />
+    <text x="34" y="277" font-family="Manrope, sans-serif" font-size="12" fill="var(--muted)" id="vg-w-scrubber-powerloss-verdict">全部落地，資料一致。</text>
+  </svg>
+  <figcaption>● 已落地、○ 斷電時仍在 track buffer 而遺失。誠實的碟遵守 barrier——斷電只切掉序列尾端；說謊的碟允許 barrier 後的第 4、5、6 筆搶先落地，一旦斷電時 barrier 前的還在快取，就出現「後面在、前面不在」的破洞。</figcaption>
+  <script>
+    (function () {
+      if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+      const root = document.querySelector('.vg-w-scrubber-powerloss');
+      const input = root.querySelector('input');
+      const readout = root.querySelector('#vg-w-scrubber-powerloss-readout');
+      const honestG = root.querySelector('#vg-w-scrubber-powerloss-honest');
+      const lyingG = root.querySelector('#vg-w-scrubber-powerloss-lying');
+      const vBox = root.querySelector('#vg-w-scrubber-powerloss-verdict-box');
+      const vText = root.querySelector('#vg-w-scrubber-powerloss-verdict');
+      const N = 6, BARRIER = 3;
+      const x0 = 150, dx = 88, yHonest = 110, yLying = 210;
+
+      function circle(cx, cy, filled) {
+        const c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+        c.setAttribute('cx', cx); c.setAttribute('cy', cy); c.setAttribute('r', 13);
+        c.setAttribute('fill', filled ? 'var(--sage-deep)' : 'transparent');
+        c.setAttribute('stroke', filled ? 'var(--sage-deep)' : 'var(--muted-2)');
+        c.setAttribute('stroke-width', '1.5');
+        if (!filled) c.setAttribute('stroke-dasharray', '3 3');
+        return c;
+      }
+      function label(cx, cy, txt, filled) {
+        const t = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+        t.setAttribute('x', cx); t.setAttribute('y', cy + 4); t.setAttribute('text-anchor', 'middle');
+        t.setAttribute('font-family', 'JetBrains Mono, monospace'); t.setAttribute('font-size', '11');
+        t.setAttribute('fill', filled ? 'var(--bg)' : 'var(--muted)');
+        t.textContent = txt;
+        return t;
+      }
+
+      function render(cut) {
+        while (honestG.firstChild) honestG.removeChild(honestG.firstChild);
+        while (lyingG.firstChild) lyingG.removeChild(lyingG.firstChild);
+        for (let i = 1; i <= N; i++) {
+          const cx = x0 + (i - 1) * dx;
+          // honest disk: strict order, survives iff i <= cut
+          const hFilled = i <= cut;
+          honestG.appendChild(circle(cx, yHonest, hFilled));
+          honestG.appendChild(label(cx, yHonest, 'w' + i, hFilled));
+          // lying disk: post-barrier writes (i > BARRIER) may land early;
+          // pre-barrier writes still in buffer if cut < BARRIER
+          let lFilled;
+          if (i <= BARRIER) lFilled = i <= cut && cut >= BARRIER;
+          else lFilled = true;
+          lyingG.appendChild(circle(cx, yLying, lFilled));
+          lyingG.appendChild(label(cx, yLying, 'w' + i, lFilled));
+        }
+        readout.textContent = cut + ' 筆後';
+        // verdict: lying disk corrupt if any pre-barrier missing while any post-barrier present
+        const preMissing = cut < BARRIER;
+        const postPresent = true; // post-barrier always shown present on lying disk
+        const corrupt = preMissing && postPresent;
+        vBox.setAttribute('stroke', corrupt ? 'var(--accent)' : 'var(--line)');
+        vBox.setAttribute('stroke-width', corrupt ? '2' : '1');
+        vBox.setAttribute('fill', corrupt ? 'color-mix(in srgb, var(--accent) 12%, var(--bg-soft))' : 'var(--bg-soft)');
+        vText.setAttribute('fill', corrupt ? 'var(--accent-text)' : 'var(--muted)');
+        vText.textContent = corrupt
+          ? '說謊的碟：w' + (BARRIER + 1) + '~w6 已落地，但 barrier 前的 w' + (cut + 1) + '~w3 還在快取裡遺失了 —— 後面在、前面不在，corruption。'
+          : (cut >= N ? '全部落地，資料一致。' : '兩碟都只切掉序列尾端，barrier 前的仍完整，資料一致。');
+      }
+      input.addEventListener('input', () => render(Number(input.value)));
+      render(6);
+    })();
+  </script>
+</figure>
+
+<p>把滑桿拖到第 2 筆斷電：說謊的碟上，barrier 後的 w4、w5、w6 都在，barrier 前的 w3 卻不見了。這正是文件說的 out-of-order——後面的先落地，前面的還在快取。SQLite 醒來以為交易完成，讀到的卻是一份前後不接的檔。順帶一提，你也可以自己關掉那道 barrier：<code>PRAGMA synchronous=OFF</code> 會省掉所有 sync 操作，文件說這讓 SQLite 看起來跑更快，但也讓作業系統可以自由重排寫入，斷電時 could result in database corruption。這是你親手把說謊的碟模擬出來。</p>
+
+<p>再看一條完全不同層的毀約——POSIX 的鎖。文件裡有一條它自己形容 particularly pernicious 的問題：</p>
+
+<blockquote>
+  <p>「the close() system call will cancel all POSIX advisory locks on the same file for all threads and all file descriptors in the process.」</p>
+</blockquote>
+
+<p>這句話翻成後果很嚇人：只要 process 裡任何一條 thread 對某個檔呼叫了 <code>close()</code>，這個檔上所有 thread、所有 file descriptor 持有的 advisory lock 全部被取消。而且被取消的那幾條 thread 完全不知情。下面用四個階段把這場事故演一遍。</p>
+
+<div class="vg-w-tabs-close-lock">
+  <style>
+    .vg-w-tabs-close-lock { display: grid; gap: var(--s-2); }
+    .vg-w-tabs-close-lock input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+    .vg-w-tabs-close-lock .tabs { display: flex; flex-wrap: wrap; gap: var(--s-2); border-bottom: 1px solid var(--line); }
+    .vg-w-tabs-close-lock .tab { font-family: var(--sans); font-size: var(--fs-sm); padding: var(--s-1) var(--s-2); cursor: pointer; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+    .vg-w-tabs-close-lock .panel { display: none; padding: var(--s-2) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+    .vg-w-tabs-close-lock .panel p { margin: 0 0 var(--s-1) 0; }
+    .vg-w-tabs-close-lock:has(#vg-w-tabs-close-lock-t1:checked) .panel-1 { display: block; }
+    .vg-w-tabs-close-lock:has(#vg-w-tabs-close-lock-t1:checked) [for="vg-w-tabs-close-lock-t1"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    .vg-w-tabs-close-lock:has(#vg-w-tabs-close-lock-t2:checked) .panel-2 { display: block; }
+    .vg-w-tabs-close-lock:has(#vg-w-tabs-close-lock-t2:checked) [for="vg-w-tabs-close-lock-t2"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    .vg-w-tabs-close-lock:has(#vg-w-tabs-close-lock-t3:checked) .panel-3 { display: block; }
+    .vg-w-tabs-close-lock:has(#vg-w-tabs-close-lock-t3:checked) [for="vg-w-tabs-close-lock-t3"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    .vg-w-tabs-close-lock:has(#vg-w-tabs-close-lock-t4:checked) .panel-4 { display: block; }
+    .vg-w-tabs-close-lock:has(#vg-w-tabs-close-lock-t4:checked) [for="vg-w-tabs-close-lock-t4"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+  </style>
+  <input type="radio" id="vg-w-tabs-close-lock-t1" name="vg-w-tabs-close-lock-sel" checked />
+  <input type="radio" id="vg-w-tabs-close-lock-t2" name="vg-w-tabs-close-lock-sel" />
+  <input type="radio" id="vg-w-tabs-close-lock-t3" name="vg-w-tabs-close-lock-sel" />
+  <input type="radio" id="vg-w-tabs-close-lock-t4" name="vg-w-tabs-close-lock-sel" />
+  <div class="tabs">
+    <label class="tab" for="vg-w-tabs-close-lock-t1">1 · 各持鎖</label>
+    <label class="tab" for="vg-w-tabs-close-lock-t2">2 · 第三者插入</label>
+    <label class="tab" for="vg-w-tabs-close-lock-t3">3 · close 掃掉全部</label>
+    <label class="tab" for="vg-w-tabs-close-lock-t4">4 · 同時寫入</label>
+  </div>
+  <div class="panel panel-1">
+    <p>一個多 thread 的 process 裡，兩條以上的 thread 各自開了自己的 SQLite 連線，連到同一個資料庫檔。它們透過 POSIX advisory lock 協調——誰在讀、誰要寫，鎖說了算。到這裡一切正常，這正是 SQLite 設計上支援的用法。</p>
+  </div>
+  <div class="panel panel-2">
+    <p>這時第三條 thread 出現了。它想自己直接讀那個檔裡的一點東西，沒有經過 SQLite library——比方說某段 debug 程式碼、某個順手 <code>open()</code> 又 <code>close()</code> 的工具函式。文件原話：a third thread comes along and wants to read something out of that same database file on its own, without using the SQLite library。</p>
+  </div>
+  <div class="panel panel-3">
+    <p>第三條 thread 讀完，呼叫 <code>close()</code>。就這一下，POSIX 的規則生效——這個檔上<em>整個 process</em> 的所有 advisory lock 被清空。前兩條 thread 的鎖也一起沒了。文件的說法是 the close() system call caused the locks held on the database by all the other threads to be dropped，而 those other threads have no way of knowing that their locks have just been trashed，它們沒有任何辦法知道鎖被扔了。</p>
+  </div>
+  <div class="panel panel-4">
+    <p>前兩條 thread 以為自己還握著鎖，於是繼續動作。文件的結論句是 this can lead to two or more threads or processes trying to write to the database at the same time, resulting in database corruption——兩條以上的 thread 同時對資料庫寫入，corruption。整場事故的起點只是一個無辜的、發生在別處的 <code>close()</code>。</p>
+    <p>合理的推測是，這也解釋了為什麼一個看似無關的第三方函式庫，能在你完全沒改動資料庫程式碼的情況下把 db 弄壞。</p>
+  </div>
+</div>
+
+<p>這條坑不是理論。文件提到有一款商業產品就是栽在這裡——後來追查發現，是因為應用程式連結了<em>兩份獨立的 SQLite</em>，兩份各自維護一份「開啟中檔案」的清單，互相看不見對方的鎖，於是一份的 <code>close()</code> 掃掉了另一份的鎖。文件也記下 SQLite 從 3.51.0 版（2025-11-04）起加了額外防禦，試著繞開 close() 破壞鎖造成的問題——但這是後來補的網，機制本身的鋒利度沒有變。</p>
+
+<p>最後一條，是 crash 後的 recovery。SQLite crash 後靠 hot journal 把沒寫完的交易回捲。文件講得很直接：</p>
+
+<blockquote>
+  <p>「If the hot journal files are moved, deleted, or renamed after a crash or power failure, then automatic recovery will not work and the database may go corrupt.」</p>
+</blockquote>
+
+<p>很多備份腳本、清理工具會「順手」刪掉那些看起來像暫存檔的 <code>-journal</code>、<code>-wal</code> 檔。平時它們確實是暫存的；但在 crash 之後、下一次開啟之前，那個 journal 是資料庫唯一的救命索。刪掉它，recovery 就瞎了。</p>
+
+<figure class="vg-w-diagram-hot-journal" data-mobile="keep" data-svg-scroll="720">
+  <style>
+    .vg-w-diagram-hot-journal svg { width: 100%; height: auto; }
+    .vg-w-diagram-hot-journal figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-2); }
+  </style>
+  <svg viewBox="0 0 720 300" preserveAspectRatio="xMidYMid meet" role="img" aria-label="hot journal present versus deleted after a crash">
+    <defs>
+      <marker id="vg-w-diagram-hot-journal-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+      </marker>
+    </defs>
+
+    <text x="20" y="28" font-family="Manrope, sans-serif" font-size="12" fill="var(--muted)" letter-spacing="0.06em">CRASH 之後，下一次開啟時……</text>
+
+    <g>
+      <rect x="20" y="55" width="140" height="56" rx="6" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.5" />
+      <text x="90" y="80" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">db 檔</text>
+      <text x="90" y="98" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">交易寫到一半</text>
+
+      <rect x="20" y="125" width="140" height="40" rx="6" fill="none" stroke="var(--sage-deep)" stroke-width="1.5" />
+      <text x="90" y="150" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--sage-deep)">-journal 還在</text>
+
+      <line x1="170" y1="110" x2="230" y2="110" stroke="var(--sage-deep)" stroke-width="1.5" marker-end="url(#vg-w-diagram-hot-journal-arrow)" />
+      <rect x="235" y="82" width="150" height="56" rx="6" fill="none" stroke="var(--sage-deep)" stroke-width="1.5" />
+      <text x="310" y="107" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--sage-deep)">rollback 回捲</text>
+      <text x="310" y="125" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">recovery 成功</text>
+    </g>
+
+    <line x1="410" y1="45" x2="410" y2="265" stroke="var(--line)" stroke-width="1" stroke-dasharray="3 3" />
+
+    <g>
+      <rect x="435" y="55" width="140" height="56" rx="6" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.5" />
+      <text x="505" y="80" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">db 檔</text>
+      <text x="505" y="98" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">交易寫到一半</text>
+
+      <rect x="435" y="125" width="140" height="40" rx="6" fill="none" stroke="var(--accent)" stroke-width="1.5" stroke-dasharray="4 4" />
+      <text x="505" y="150" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--accent-text)">-journal 被刪</text>
+
+      <line x1="585" y1="110" x2="645" y2="110" stroke="var(--accent)" stroke-width="1.5" marker-end="url(#vg-w-diagram-hot-journal-arrow)" />
+      <rect x="585" y="185" width="115" height="56" rx="6" fill="color-mix(in srgb, var(--accent) 12%, var(--bg-soft))" stroke="var(--accent)" stroke-width="1.5" />
+      <text x="642" y="210" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--accent-text)">recovery 瞎了</text>
+      <text x="642" y="228" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">may go corrupt</text>
+      <line x1="505" y1="165" x2="600" y2="185" stroke="var(--accent)" stroke-width="1.5" stroke-dasharray="4 4" marker-end="url(#vg-w-diagram-hot-journal-arrow)" />
+    </g>
+  </svg>
+  <figcaption>同一個 crash、同一份寫到一半的 db 檔，差別只在那個 <code>-journal</code> 還在不在。左邊 recovery 靠它回捲成功；右邊它被清理工具刪了，SQLite 找不到回捲的依據——文件用的字是 automatic recovery will not work。</figcaption>
+</figure>
+
+<h2>你踩得到哪幾顆</h2>
+
+<p>把這幾條收成一張「我的部署會不會中」的清單。它們的觸發條件都很具體，不是玄學。</p>
+
+<p>把 SQLite 檔放在 NFS 或其他網路檔案系統上，然後讓多個連線同時存取——這是最經典的一顆。文件的原話是 This is especially true of network filesystems and NFS in particular，鎖不照約定運作，兩個以上的 thread 或 process 同時存取，database corruption might result。單機、單一存取者時 NFS 未必出事，但只要併發加上網路鎖的 bug，機率就上來了。實務上的結論很簡單：資料庫檔不要放網路檔案系統。</p>
+
+<p>開了連線之後 <code>fork()</code>，然後在 child 裡用那個從 parent 繼承來的連線——文件對這條的語氣是全篇最硬的祈使句之一：Do not open an SQLite database connection, then fork(), then try to use that database connection in the child process，接著補一句 you can easily end up with a corrupt database。它甚至警告連在 child 裡呼叫 <code>sqlite3_close()</code> 都不行，因為 close 可能觸發清理動作，把 parent 正在用的內容刪掉。要在 fork 後用資料庫，就在 child 裡重新開一個連線。</p>
+
+<p>備份策略也藏著一顆。跑背景自動備份的系統，可能在交易進行到一半時去複製 db 檔，複製出來的檔 might contain some old and some new content, and thus be corrupt——一半舊一半新。文件給的安全做法不是「複製檔案時小心一點」，而是換工具：用 <code>sqlite3_rsync</code>、<code>VACUUM INTO</code>、或 backup API，讓 SQLite 自己在一致的時間點產生副本。這裡的教訓比備份本身更廣：任何「把 db 檔當成一坨 bytes 直接搬」的操作，都預設了搬的當下沒有交易在寫——這個假設在有背景寫入的系統裡很容易破。</p>
+
+<p>還有兩顆比較隱蔽、跟「檔名」有關的地雷，POSIX 系統上才踩得到。第一顆：一個 process 開著連線的時候，另一個 process 把這個檔 unlink 掉、再用同名建一個新檔並開啟它——這時兩個 process 名義上開著同一個檔名，實際上是兩個不同的檔。麻煩在於 rollback journal 與 WAL 檔是<em>照 db 檔名</em>命名的，於是這兩個不同的 db 會共用同一個 journal，一邊的 recovery might use content from the other database，拿錯檔的內容去回捲，就壞了。第二顆是同一個問題的變形：一個 db 檔如果有多個 hard link 或 soft link，等於它有多個名字；不同 process 用不同名字開它，就會各自算出不同的 journal 路徑，一個 crash 了，另一個要 recovery 時會去錯的地方找 journal，找不到。</p>
+
+<p>這兩顆的共同教訓是：SQLite 用檔名當索引去找它的輔助檔，所以任何讓「同一份資料有多個名字」或「同一個名字指向多份資料」的檔案系統操作，都在拆這套命名假設。少用 link、別在 db 開著時對它做 rename／unlink 的把戲，就繞得開。</p>
+
+<p>還有一顆跟「大家講同一種語言」有關。SQLite 支援不只一種鎖協定——預設的 POSIX advisory lock，也有 dot-file locking 等替代。文件強調，連到同一個 db 檔的所有連線必須用同一種鎖協定；如果一個程式用 POSIX advisory lock、另一個用 dot-file locking，兩邊根本看不見對方的鎖，也就無法協調存取，possibly leading to database corruption。這通常發生在你為了某種檔案系統的相容性，手動換了 <code>sqlite3_vfs</code>，卻只換了一半的存取方——另一半還在用預設協定。結論一樣簡單：同一個檔，全體連線用同一套鎖。</p>
+
+<p>至於消費級硬碟與隨身碟謊報 sync 這條，你多半改不了硬體的行為，但你能改環境。真的在意持久性的資料，別放在會說謊的媒體上；別為了跑分關掉 <code>PRAGMA synchronous</code>。文件點名的對象是「consumer-grade mass storage devices」，並沒有替其他等級的碟背書——所以與其賭手上這顆碟老不老實，不如假設它可能說謊，別把「已回報寫入完成」直接當成「已落地」。剩下的，交給 SQLite 的 journal 與那道——只要底層肯守約就成立的——I/O barrier。</p>
+
+<p>把這些條件擺在一起看，會發現它們幾乎沒有一條是「SQLite 用起來很危險」。恰恰相反——單機、本地磁碟、單一 process、老實的儲存，這套組合被驗證得極其扎實，這也是 SQLite 能跑在幾乎每一支手機、每一個瀏覽器裡的原因。會出事的，都是你把它推出這個舒適區的時候：搬上網路檔案系統、跨 fork 共用連線、拿一坨 bytes 當備份、或信任一顆會說謊的碟。文件的價值不在嚇你，而在幫你畫出那條界線——界線之內，那疊承諾成立；踩出去，你就得自己知道剛剛依賴了哪一層、而那層有沒有毀約的前科。</p>
+
+<p>還有一個很現實的操作面：corruption 常常拖很久才被發現，因為一份自相矛盾的檔未必當場報錯。想早一點抓到，可以定期跑 <code>PRAGMA integrity_check</code>——這份文件在講 free page list 漏頁時提到，它會回報「pages missing from the free list」這類問題（更完整的檢查項目要查 pragma 專頁）。它不能防止 corruption，但能把「悄悄壞著卻沒人知道」變成「明確地報告出事了」，早一步把問題撈上檯面。</p>
+
+<p class="vg-deep-closer"><strong>心智模型</strong>：SQLite 的完整性不是它一個人的事，是一整疊承諾的連鎖擔保；corruption 幾乎從不是 SQLite 出錯，而是某一層——你、作業系統、或那顆碟——安靜地毀了約，而 SQLite must believe，沒有第二套感官能拆穿。</p>
+
+</div>
