@@ -1,0 +1,585 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">Uber 一個核心服務的 profile 上，有一行寫著 <code>runtime copystack 39.98 seconds (0.048%) out of a total 8106.43 seconds (9.77%)</code>——將近一成的 CPU 花在「把 goroutine 的堆疊搬到更大的地方」這件跟業務邏輯毫無關係的事上。他們沒有改任何一行商業程式碼，只把 goroutine 的初始堆疊從 2KB 調到 32KB，這條開銷就從約 10% 掉到不到 1%，換來的是每個容器約 200MB 的記憶體、以及整體 CPU 約 16% 的降幅。</p>
+  <h1 class="vg-post-title">{{ title }}</h1>
+</header>
+
+<div class="vg-post-body">
+  <p>
+    <span class="vg-dropcap">這</span>是一個關於 Go runtime 預設值的故事。Go 給每個 goroutine 的初始堆疊只有 2KB，不夠用時會動態長大——這個設計讓「開百萬個 goroutine」變得便宜，卻在熱路徑上藏了一筆持續付出的 CPU 稅。Uber 的 Sr Staff Engineer Cristian Velazquez 在 2026 年 5 月 7 日的一篇工程 blog 裡，把這筆稅從發現、拆解、到三種解法的取捨、最後選定哪一種上線，完整地攤了出來。值得記的不是「調大堆疊」這個結論本身，而是他們怎麼從一行 profile 反推到一個可以自動化的調參流程。
+  </p>
+
+  <p>
+    整條線是時間序的：先在 profile 上看到 <code>copystack</code> 這個異常的百分比，往下挖發現是 <code>morestack</code> 在熱路徑上反覆被觸發；接著試了三條路——goroutine pooling、改 runtime、以及用 profiler 反推靜態堆疊大小——最後選了最後一條。下面先把「堆疊為什麼會長大」這件事用一個可以拖的動畫講清楚，因為整個問題的根都在這裡。
+  </p>
+
+  <h2>一行 profile：copystack 佔掉將近一成 CPU</h2>
+
+  <p>
+    Go 的 goroutine 堆疊不是固定大小。runtime 給每個新 goroutine 分配 <code>2KB</code> 的初始堆疊——這是刻意壓到很小的數字，因為 Go 的賣點之一就是「開幾十萬個 goroutine 不心疼」，初始堆疊越小，同樣的記憶體能塞越多 goroutine。原文的描述是：「Go uses 2KB as the default initial size for a goroutine.」
+  </p>
+
+  <p>
+    問題是 2KB 常常不夠。當一個函式的呼叫可能讓堆疊溢位時，Go 有一套機制會先檢查、然後動手擴張。按原文：「If 2KB isn't enough, Go has a special procedure to check if a function is going to overflow. When this happens, it creates a new stack of double the size and copies the contents of the previous one.」——建一塊兩倍大的新堆疊、把舊的內容整個複製過去。這個複製動作就是 profile 裡的 <code>runtime.copystack</code>，觸發它的檢查點則是編譯器插在函式序言（prologue）裡的 <code>runtime.morestack</code>。
+  </p>
+
+  <p>
+    這個「翻倍加複製」的設計本身是合理的權衡：初始給得小，讓開幾十萬個 goroutine 的記憶體成本壓得很低；真的不夠再長大，讓少數需要深堆疊的路徑也不會爆。麻煩之處在於複製不是免費的——每一次翻倍都得把當前整塊堆疊的內容搬到新配置的記憶體，堆疊越大、搬得越多。對只跑一次的 goroutine 這筆帳可以忽略，但對「每個請求都重新開一個、每個都走同一條深路徑」的服務型工作量，同樣的翻倍複製會在每個請求上重演一次，於是這筆一次性的分攤成本變成了穩定的經常性開銷。這正是為什麼它會在一個長時間跑的服務 profile 上，累積成一條顯眼的百分比。
+  </p>
+
+  <p>
+    翻到 Uber 某個 top service 的 CPU profile，這條開銷大得離譜。原文寫的是「around 10% CPU coming from stack growth」，對應的 profile 行是 <code>runtime copystack 39.98 seconds (0.048%) out of a total 8106.43 seconds (9.77%)</code>。近一成的 CPU 拿去搬堆疊——這些週期沒有算任何一次乘法、沒有服務任何一個請求，純粹是 runtime 在為「初始堆疊猜得太小」補課。下面這個動畫把單一 goroutine 的堆疊成長攤開：預設從 2KB 起跳，每次不夠就翻倍、複製，直到穩定；你可以拖動「峰值需求」滑桿，看它要 morestack 幾次、以及累積複製了多少 bytes。
+  </p>
+
+  <figure class="vg-w-canvas-stack-growth" data-mobile="swap" data-mobile-summary="goroutine 堆疊從 2KB 起跳，不夠就翻倍複製；峰值需求越高、翻倍次數越多，累積複製即 copystack 開銷。">
+    <style>
+      .vg-w-canvas-stack-growth { display: grid; grid-template-rows: auto 1fr auto; gap: var(--s-2); margin: var(--s-4) 0; }
+      .vg-w-canvas-stack-growth .toolbar { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); flex-wrap: wrap; }
+      .vg-w-canvas-stack-growth button { font-family: var(--sans); font-size: var(--fs-sm); padding: 6px 14px; min-height: 44px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); cursor: pointer; }
+      .vg-w-canvas-stack-growth button:hover { border-color: var(--accent); color: var(--accent-text); }
+      .vg-w-canvas-stack-growth .peak-ctl { display: flex; align-items: center; gap: var(--s-2); flex: 1; min-width: 12rem; }
+      .vg-w-canvas-stack-growth input[type="range"] { flex: 1; height: 36px; accent-color: var(--accent); touch-action: none; }
+      .vg-w-canvas-stack-growth .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 6ch; text-align: right; }
+      .vg-w-canvas-stack-growth canvas { width: 100%; height: auto; aspect-ratio: 16 / 9; display: block; }
+      .vg-w-canvas-stack-growth figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+      @media (max-width: 720px) {
+        .vg-w-canvas-stack-growth canvas { aspect-ratio: 4 / 3; }
+      }
+    </style>
+
+    <div class="toolbar">
+      <button id="vg-w-canvas-stack-growth-toggle" type="button">▷ 播放</button>
+      <button id="vg-w-canvas-stack-growth-reset" type="button">↺ 重置</button>
+      <span class="peak-ctl">
+        <label for="vg-w-canvas-stack-growth-peak">峰值需求</label>
+        <input id="vg-w-canvas-stack-growth-peak" type="range" min="3" max="40" value="20" />
+        <span class="readout" id="vg-w-canvas-stack-growth-peak-readout">20 KB</span>
+      </span>
+    </div>
+
+    <canvas id="vg-w-canvas-stack-growth-canvas"></canvas>
+
+    <figcaption>單一 goroutine：初始 2KB，需求超過現有容量就翻倍、把舊堆疊整塊複製到新堆疊。翻倍次數與累積複製量隨峰值需求上升——這些複製正是 profile 裡的 copystack。</figcaption>
+
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        const root = document.querySelector('.vg-w-canvas-stack-growth');
+        if (!root) return;
+        const canvas = root.querySelector('canvas');
+        const toggle = root.querySelector('#vg-w-canvas-stack-growth-toggle');
+        const reset = root.querySelector('#vg-w-canvas-stack-growth-reset');
+        const peakInput = root.querySelector('#vg-w-canvas-stack-growth-peak');
+        const peakReadout = root.querySelector('#vg-w-canvas-stack-growth-peak-readout');
+        const ctx = canvas.getContext('2d');
+
+        function cssVar(name) {
+          return getComputedStyle(root).getPropertyValue(name).trim() || '#000';
+        }
+        function resize() {
+          const dpr = window.devicePixelRatio || 1;
+          const rect = canvas.getBoundingClientRect();
+          canvas.width = Math.max(1, rect.width * dpr);
+          canvas.height = Math.max(1, rect.height * dpr);
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        }
+        new ResizeObserver(resize).observe(canvas);
+        resize();
+
+        // Model: stack starts at 2KB, demand ramps toward peak; each time
+        // demand exceeds capacity, capacity doubles and old bytes are copied.
+        let running = false;
+        let t = 0;             // seconds of virtual time
+        let demand = 0;        // current KB "wanted" by the call chain
+        let capacity = 2;      // current stack capacity in KB
+        let copyCount = 0;     // number of morestack/copystack events
+        let copiedBytes = 0;   // cumulative KB copied
+        let flash = 0;         // decays after each copy for a visual pulse
+
+        function peakKB() { return Number(peakInput.value); }
+
+        function reseed() {
+          t = 0; demand = 0; capacity = 2; copyCount = 0; copiedBytes = 0; flash = 0;
+        }
+
+        function step(dt) {
+          t += dt;
+          // demand climbs to the peak over ~4s, then holds
+          const target = peakKB();
+          demand = Math.min(target, (t / 4) * target);
+          while (demand > capacity && capacity < 1024) {
+            copiedBytes += capacity;   // the old stack contents get copied
+            capacity *= 2;
+            copyCount += 1;
+            flash = 1;
+          }
+          if (flash > 0) flash = Math.max(0, flash - dt * 2.5);
+        }
+
+        function draw() {
+          const W = canvas.getBoundingClientRect().width;
+          const H = canvas.getBoundingClientRect().height;
+          ctx.clearRect(0, 0, W, H);
+
+          const padL = 54, padR = 18, padT = 30, padB = 34;
+          const plotW = W - padL - padR;
+          const plotH = H - padT - padB;
+          const maxKB = 40;
+
+          // baseline
+          ctx.strokeStyle = cssVar('--muted-2');
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.moveTo(padL, padT); ctx.lineTo(padL, padT + plotH); ctx.lineTo(padL + plotW, padT + plotH);
+          ctx.stroke();
+
+          // power-of-two gridlines: 2,4,8,16,32
+          ctx.font = '12px "Manrope", sans-serif';
+          ctx.fillStyle = cssVar('--muted');
+          ctx.textAlign = 'right';
+          [2, 4, 8, 16, 32].forEach(kb => {
+            const y = padT + plotH - (kb / maxKB) * plotH;
+            ctx.strokeStyle = cssVar('--muted-2');
+            ctx.globalAlpha = 0.4;
+            ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(padL + plotW, y); ctx.stroke();
+            ctx.globalAlpha = 1;
+            ctx.fillText(kb + 'KB', padL - 6, y + 4);
+          });
+
+          // capacity bar (the allocated stack); pulses on a copy event
+          const barX = padL + plotW * 0.30;
+          const barW = plotW * 0.16;
+          const capY = padT + plotH - (Math.min(capacity, maxKB) / maxKB) * plotH;
+          ctx.fillStyle = cssVar('--accent');
+          ctx.globalAlpha = 0.18 + 0.5 * flash;
+          ctx.fillRect(barX, capY, barW, padT + plotH - capY);
+          ctx.globalAlpha = 1;
+          ctx.strokeStyle = cssVar('--accent');
+          ctx.lineWidth = 1.5;
+          ctx.strokeRect(barX, capY, barW, padT + plotH - capY);
+          ctx.fillStyle = cssVar('--accent-text');
+          ctx.textAlign = 'center';
+          ctx.font = '13px "EB Garamond", serif';
+          ctx.fillText('capacity ' + capacity + 'KB', barX + barW / 2, capY - 8);
+
+          // demand bar (what the call chain wants)
+          const dX = padL + plotW * 0.58;
+          const dW = plotW * 0.16;
+          const dY = padT + plotH - (Math.min(demand, maxKB) / maxKB) * plotH;
+          ctx.fillStyle = cssVar('--sage-deep');
+          ctx.globalAlpha = 0.5;
+          ctx.fillRect(dX, dY, dW, padT + plotH - dY);
+          ctx.globalAlpha = 1;
+          ctx.fillStyle = cssVar('--sage-deep');
+          ctx.font = '13px "EB Garamond", serif';
+          ctx.fillText('demand ' + demand.toFixed(1) + 'KB', dX + dW / 2, dY - 8);
+
+          // counters
+          ctx.textAlign = 'left';
+          ctx.font = '13px "EB Garamond", serif';
+          ctx.fillStyle = cssVar('--ink');
+          ctx.fillText('morestack 次數: ' + copyCount, padL + 4, padT - 12);
+          ctx.textAlign = 'right';
+          ctx.fillStyle = cssVar('--muted');
+          ctx.fillText('累積複製 ' + copiedBytes + 'KB', padL + plotW, padT - 12);
+        }
+
+        let last = performance.now();
+        function frame(now) {
+          const dt = Math.min(0.05, (now - last) / 1000);
+          last = now;
+          if (running) step(dt);
+          draw();
+          requestAnimationFrame(frame);
+        }
+        requestAnimationFrame(frame);
+
+        peakInput.addEventListener('input', () => {
+          peakReadout.textContent = peakKB() + ' KB';
+          reseed();
+        });
+        toggle.addEventListener('click', () => {
+          running = !running;
+          toggle.textContent = running ? '⏸ 暫停' : '▷ 播放';
+          last = performance.now();
+        });
+        reset.addEventListener('click', () => {
+          running = false;
+          toggle.textContent = '▷ 播放';
+          reseed();
+        });
+        peakReadout.textContent = peakKB() + ' KB';
+      })();
+    </script>
+  </figure>
+
+  <p>
+    這裡藏著問題的本質：每一次翻倍都是一次完整的複製，複製的 bytes 量等於當前堆疊大小。從 2KB 到 32KB 要經過 2→4→8→16→32 五次翻倍，累積複製 2+4+8+16 = 30KB。單看一次不算什麼，但如果這條路徑每個請求都走一遍，而且服務跑著每秒幾萬個請求，這些複製週期就會在 profile 上疊成那近一成的 <code>copystack</code>。
+  </p>
+
+  <h2>往下挖：一個 middleware 就吃掉 2.6KB</h2>
+
+  <p>
+    知道是 stack growth 只是第一步，真正要問的是「誰讓堆疊長這麼大」。Uber 團隊沿著 <code>copystack</code> 的呼叫堆疊往上找，抓到一個具體的元兇。原文寫得很直白：「we found that go.uber.org/yarpc/internal/observability.(*Middleware).Call was consuming 2.6KB of stack memory. This is a middleware, so it would be called by every single request.」
+  </p>
+
+  <p>
+    這句話的殺傷力在「every single request」。<code>yarpc</code> 是 Uber 自家的 RPC 框架，observability 這層 middleware 掛在請求路徑的最外圈——每一個進來的 request 都會穿過它。單一函式吃 <code>2.6KB</code> 堆疊，本身已經逼近 2KB 初始值；再加上它下游呼叫的所有東西，這條熱路徑幾乎保證會觸發至少一次 morestack。乘上請求量，就是 profile 上那行寫著「runtime copystack 39.98 seconds (0.048%) out of a total 8106.43 seconds (9.77%)」的數字——一個看起來只佔全域 0.048% 的函式，靠著被幾乎每個請求都呼叫一次，最終疊成了近一成的總體 CPU。
+  </p>
+
+  <p>
+    對這個特定的 middleware，他們直接動手把它的堆疊用量降下來——透過一個 GitHub pull request，把這個函式的堆疊需求從 <code>2.6KB</code> 減到 <code>600 bytes</code>。這是最乾淨的一種修法：如果某個函式的堆疊佔用是因為寫法（大的 stack-allocated struct、深的內聯呼叫），改寫它就能從源頭消掉需求，不必付出任何記憶體代價。從 2.6KB 到 600 bytes，等於直接把這條路徑撞破 2KB 初始值那一下省了下來——問題是這種修法能命中的只有你剛好找得到、又剛好改得動的那幾個函式。
+  </p>
+
+  <figure class="vg-w-callout-middleware" data-mobile="keep">
+    <style>
+      .vg-w-callout-middleware { margin: var(--s-3) 0; }
+      .vg-w-callout-middleware svg { width: 100%; max-width: 480px; height: auto; display: block; margin: 0 auto; }
+    </style>
+    <svg viewBox="0 0 480 100" preserveAspectRatio="xMidYMid meet" role="img"
+         aria-label="yarpc Middleware.Call 堆疊用量從 2.6KB 降到 600 bytes">
+      <rect x="10" y="20" width="200" height="60" rx="6" fill="var(--accent)" opacity="0.18" stroke="var(--accent)" stroke-width="1"/>
+      <text x="110" y="46" text-anchor="middle" font-family="Manrope, sans-serif" font-size="12" fill="var(--muted)">Middleware.Call</text>
+      <text x="110" y="68" text-anchor="middle" font-family="'EB Garamond', serif" font-size="22" fill="var(--accent-text)" font-weight="700">2.6 KB</text>
+      <line x1="220" y1="50" x2="260" y2="50" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#vg-w-callout-arrow)"/>
+      <defs><marker id="vg-w-callout-arrow" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0 0 L8 3 L0 6" fill="var(--muted)"/></marker></defs>
+      <rect x="270" y="28" width="140" height="44" rx="6" fill="var(--sage-deep)" opacity="0.18" stroke="var(--sage-deep)" stroke-width="1"/>
+      <text x="340" y="46" text-anchor="middle" font-family="Manrope, sans-serif" font-size="12" fill="var(--muted)">PR 後</text>
+      <text x="340" y="66" text-anchor="middle" font-family="'EB Garamond', serif" font-size="22" fill="var(--sage-deep)" font-weight="700">600 B</text>
+      <text x="425" y="54" text-anchor="start" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">−77%</text>
+    </svg>
+  </figure>
+
+  <p>
+    這條路不 scale。一個大型 Go 服務有成千上萬個函式，堆疊用量的分佈是長尾的：沒有單一元兇，而是一堆各自吃一點的函式疊起來把熱路徑推過了 2KB。你不可能為每一個都提一個 PR，也不可能要求每個服務團隊都懂 Go 的 stack growth 內部機制、去人工盯自己的 profile。真正想要的是一個「不用改任何業務程式碼、也不用每個團隊都變成 runtime 專家」的系統性解法——這正是後面三選一要解決的問題。
+  </p>
+
+  <h2>三條路：pooling、改 runtime、還是反推堆疊大小</h2>
+
+  <p>
+    面對「怎麼避免熱路徑反覆 morestack」，Uber 評估了三種方向。它們在「改動範圍」與「維護成本」上落在很不同的位置，值得並排看。下面這張表把三者的機制、代價與最終命運排在一起，點欄位標題可以排序。
+  </p>
+
+  <figure class="vg-w-table-stack-approaches" data-mobile="keep">
+    <style>
+      .vg-w-table-stack-approaches { margin: var(--s-4) 0; overflow-x: auto; }
+      .vg-w-table-stack-approaches table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-stack-approaches thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; }
+      .vg-w-table-stack-approaches thead th[data-sort] { color: var(--accent-text); }
+      .vg-w-table-stack-approaches tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+      .vg-w-table-stack-approaches tbody tr:last-child td { font-weight: 600; }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+           stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/>
+        <path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+      </svg>
+      <span>點欄位標題可排序 · 3 種方案 × 4 欄</span>
+    </p>
+    <table>
+      <thead>
+        <tr>
+          <th data-key="name">方案</th>
+          <th data-key="how">機制</th>
+          <th data-key="cost">主要代價</th>
+          <th data-key="fate">命運</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>goroutine pooling</td>
+          <td>重用已經「長大」的 goroutine，讓熱路徑跑在早就擴張過的堆疊上</td>
+          <td>要改業務程式碼、增加複雜度；channel 溝通有成本、pool 大小是靜態的</td>
+          <td>其他團隊用過，但需要單一職責的 worker pool 才適用</td>
+        </tr>
+        <tr>
+          <td>改 runtime（linkname）</td>
+          <td>用 private linking 接進 runtime，暴露 startingStackSize 與 debug 變數來調初始堆疊</td>
+          <td>依賴 Go 內部符號、非公開 API，升級 Go 版本要重新驗證</td>
+          <td>被選為改 runtime 的手段，因為「touches the runtime the least」</td>
+        </tr>
+        <tr>
+          <td>profiler 反推 + 靜態預設</td>
+          <td>從 fleet 收 CPU profile、篩 copystack frame、反組譯算每個函式堆疊用量，推薦一個 2 的次方大小</td>
+          <td>約 200MB／容器的記憶體 overhead；要建 profile 分析與配置注入的自動化</td>
+          <td>最終上線的方案</td>
+        </tr>
+      </tbody>
+    </table>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-table-stack-approaches');
+        if (!root) return;
+        const headers = root.querySelectorAll('thead th');
+        const tbody = root.querySelector('tbody');
+        let activeKey = null, asc = true;
+        headers.forEach(h => h.addEventListener('click', () => {
+          const key = h.dataset.key;
+          if (activeKey === key) asc = !asc; else { activeKey = key; asc = true; }
+          headers.forEach(x => x.removeAttribute('data-sort'));
+          h.setAttribute('data-sort', asc ? 'asc' : 'desc');
+          const rows = [...tbody.querySelectorAll('tr')];
+          const idx = [...headers].indexOf(h);
+          rows.sort((a, b) => {
+            const av = a.children[idx].textContent.trim();
+            const bv = b.children[idx].textContent.trim();
+            const an = Number(av), bn = Number(bv);
+            const cmp = !Number.isNaN(an) && !Number.isNaN(bn) ? an - bn : av.localeCompare(bv);
+            return asc ? cmp : -cmp;
+          });
+          rows.forEach(r => tbody.appendChild(r));
+        }));
+      })();
+    </script>
+  </figure>
+
+  <p>
+    第一條是 goroutine pooling。想法是：與其讓每個請求開一個新 goroutine（初始 2KB、然後一路 morestack），不如維護一個 worker pool，重用已經存在的 goroutine——照這個邏輯推想，已經長大過的堆疊就不需要再觸發複製，但原文並沒有解釋 pooling 為何能減少 stack growth 的具體機制，這是作者的理解。原文對這條路的評價是它對特定場景「works really well for them because the worker pool has only one responsibility」，但代價是：「you need to perform code changes that make the code slightly more complex, take time」，而且「Channel communication also has a cost, and its size is static.」要改業務程式碼、要吃 channel 溝通成本、pool 大小還是靜態的——對一個通用服務不划算。
+  </p>
+
+  <p>
+    第二條是直接改 Go runtime。goroutine 的初始堆疊大小是 runtime 內部的一個值，如果能把它調大，morestack 自然就少觸發。問題是這個值不是公開 API，你沒辦法在自己的程式裡「正常地」讀寫它。要動它有幾種姿勢：fork 一份 Go runtime 自己維護、向上游提案加一個公開的配置旋鈕、或是用 <code>linkname</code> 這種私有連結手段偷偷接進去。三種的長期維護成本差很多——fork runtime 意味著每次 Go 升級都要重新 rebase 自己那份改動，向上游提案則要等 Go 團隊審查、接受，時程完全不在自己手上；就算提案被接受，也還要等這個版本實際發佈、服務升級上去才用得到，緩不濟急。
+  </p>
+
+  <p>
+    Uber 選的是 <code>linkname</code>（private linking）——用 Go 的 <code>//go:linkname</code> 機制接進 runtime 的私有符號，暴露出 <code>startingStackSize</code> 這個全域變數與 <code>debug</code> 變數、再包一層 wrapper 方法去調它。為什麼選這條？原文的判斷是：「we decided to use the private linking approach because it touches the runtime the least.」動 runtime 動得越少，之後跟上游 Go 版本升級的摩擦就越小。這是一個典型的「盡量少碰別人家地基」的工程判斷：linkname 沒有 fork 整個 runtime、也沒有等一個公開 API 落地，只是借了一個現成的私有符號。代價是它綁在 Go 內部的實作細節上——這些符號名稱或語意在未來版本可能變，所以每次升 Go 都得重新驗證這條路還通。這是一筆自願承擔、而且明確知道自己在承擔的技術債。
+  </p>
+
+  <p>
+    第三條——也是最後上線的——是不去猜堆疊大小，而是讓 profiler 告訴你答案。這條路的洞見是：profile 本來就記錄了每個函式的堆疊用量，那筆資料一直都在，問題只是怎麼把它自動變成一個「該把初始堆疊設多大」的建議。下一節單獨講這條。
+  </p>
+
+  <h2>讓 profiler 反推：把 morestack 開銷變成一個可算的堆疊大小</h2>
+
+  <p>
+    最後選定的方案把整件事翻了過來。與其人工去找哪個函式吃堆疊、或去猜一個安全的初始值，不如建一套自動流程，直接從生產環境的 profile 反推出「這個服務的 goroutine 初始堆疊該設多大」。原文提出的問題是：「how could we automate this process? How could we do it without adding runtime instrumentation?」關鍵限制是不加 runtime instrumentation——不想為了測量而在熱路徑上再插一層開銷。
+  </p>
+
+  <p>
+    做法分幾步：從整個 fleet 拉 CPU profile；篩出跟 <code>copystack</code> 有關的 frame；用 pprof library 把這些 frame 的 stack trace 抽出來；再反組譯（disassemble）binary、算出每個函式實際用了多少堆疊；把這些累加起來，得到這個服務熱路徑真正的堆疊需求，最後 round 到最接近的 2 的次方，就是要設的初始堆疊大小。原文給的例子是：「If we analyze the top usage, we see that we're using around 19KB, but since we need to set the stack as a power of 2, the correct value is 32KB.」實測熱路徑用約 <code>19KB</code>，但因為堆疊大小必須是 2 的次方，往上取到 <code>32KB</code>。
+  </p>
+
+  <p>
+    這幾步裡最巧的是「反組譯 binary 算堆疊用量」這一段。函式用了多少堆疊，答案其實已經被編譯器寫死在機器碼裡了——每個函式的序言都有一段固定的 frame 配置，反組譯就能讀出來，不需要在執行期插任何 instrumentation 去測。這回應了原文那個「how could we do it without adding runtime instrumentation」的限制：測量的資料早就存在，profile 給出「哪些函式在熱路徑上」，靜態分析給出「每個函式吃多少堆疊」，兩者相乘就是答案。整條 pipeline 不碰生產環境的熱路徑一根寒毛，卻能為每個服務算出一個量身訂做的數字。
+  </p>
+
+  <p>
+    為什麼一定要 round 到 2 的次方？因為 Go 的堆疊成長本來就是以翻倍為單位——2、4、8、16、32——堆疊大小的合法值就是這串 2 的次方。反推出 19KB 只是說「熱路徑大約需要這麼多」，但你不能把初始堆疊設成 19KB，最接近又不會讓熱路徑再觸發一次翻倍的合法值是 32KB。取 16KB 會讓熱路徑仍差一步、還得 morestack 一次；取 32KB 則一步到位。這個「往上取到下一個 2 的次方」是把「幾乎不再成長」變成「零成長」的關鍵一格。
+  </p>
+
+  <p>
+    這一步跟前面第二條路接了起來：算出 32KB 之後，還是靠 <code>linkname</code> 那套把 <code>startingStackSize</code> 設進去，只是這個值不再是拍腦袋的常數，而是每個服務各自從自己的 profile 反推出來、透過既有配置系統注入的。「改 runtime」是手段，「profiler 反推」是決定該把手段調到哪個刻度的方法——兩者合起來才是完整的解。
+  </p>
+
+  <p>
+    把初始堆疊直接設成 32KB，代表大多數 goroutine 一出生就有足夠空間跑完熱路徑，morestack 幾乎不再被觸發、copystack 也就不再複製。代價是記憶體：每個 goroutine 起手就吃 32KB 而不是 2KB。這是一個典型的空間換時間，問題只在於——這筆記憶體帳單有多重？下面這個滑桿讓你自己掃過不同初始堆疊大小，同時看 CPU 開銷與記憶體 overhead 兩條曲線怎麼反向移動。
+  </p>
+
+  <figure class="vg-w-param-tradeoff" data-mobile="static" data-svg-scroll="720">
+    <style>
+      .vg-w-param-tradeoff { display: grid; grid-template-rows: auto 1fr auto; gap: var(--s-2); margin: var(--s-4) 0; }
+      .vg-w-param-tradeoff .controls { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+      .vg-w-param-tradeoff .controls input { flex: 1; height: 36px; accent-color: var(--accent); touch-action: none; }
+      .vg-w-param-tradeoff .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 5ch; text-align: right; }
+      .vg-w-param-tradeoff svg { width: 100%; height: auto; }
+      .vg-w-param-tradeoff figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+
+    <div class="controls" data-vg-controls>
+      <label for="vg-w-param-tradeoff-x">初始堆疊 =</label>
+      <input id="vg-w-param-tradeoff-x" type="range" min="0" max="7" step="1" value="4" />
+      <span class="readout" id="vg-w-param-tradeoff-x-readout">32KB</span>
+    </div>
+
+    <svg viewBox="0 0 720 320" preserveAspectRatio="xMidYMid meet" role="img"
+         aria-label="初始堆疊大小掃描：morestack CPU 開銷隨堆疊變大而下降，記憶體 overhead 隨之上升，32KB 附近是拐點">
+      <g id="vg-w-param-tradeoff-axes"></g>
+      <g id="vg-w-param-tradeoff-series"></g>
+      <circle id="vg-w-param-tradeoff-dot-cpu" r="5" fill="var(--bg)" stroke="var(--accent)" stroke-width="2" />
+      <circle id="vg-w-param-tradeoff-dot-mem" r="5" fill="var(--bg)" stroke="var(--sage-deep)" stroke-width="2" />
+      <line id="vg-w-param-tradeoff-cursor" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="3,3" />
+    </svg>
+
+    <figcaption>示意曲線：CPU 開銷用 Uber 報告的兩端錨定（2KB 對應約 10%、32KB 對應不到 1%），記憶體 overhead 隨堆疊線性放大。曲線形狀為說明用途，兩個端點與 32KB 拐點取自原文數字。</figcaption>
+
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        const root = document.querySelector('.vg-w-param-tradeoff');
+        if (!root) return;
+        const input = root.querySelector('input');
+        const readout = root.querySelector('.readout');
+        const axesG = root.querySelector('#vg-w-param-tradeoff-axes');
+        const seriesG = root.querySelector('#vg-w-param-tradeoff-series');
+        const dotCpu = root.querySelector('#vg-w-param-tradeoff-dot-cpu');
+        const dotMem = root.querySelector('#vg-w-param-tradeoff-dot-mem');
+        const cursor = root.querySelector('#vg-w-param-tradeoff-cursor');
+
+        const NS = 'http://www.w3.org/2000/svg';
+        function el(tag, attrs) {
+          const e = document.createElementNS(NS, tag);
+          for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+          return e;
+        }
+
+        // stack sizes as powers of two: index 0..7 → 2KB..256KB
+        const sizes = [2, 4, 8, 16, 32, 64, 128, 256];
+        const X0 = 66, X1 = 660, Y0 = 250, Y1 = 34;
+
+        // CPU stack-growth cost model: high at small stacks, near-zero once
+        // the stack covers the hot path. Anchored to Uber's reported points:
+        // 2KB ≈ 10%, 32KB ≈ <1%. Uses an exponential decay toward the knee.
+        function cpuPct(kb) {
+          // decays from ~10 at 2KB to ~0.8 at 32KB, floor ~0.6
+          return 0.6 + 9.4 * Math.pow(0.5, Math.log2(kb / 2) * 0.85);
+        }
+        // Memory overhead per goroutine, relative to 2KB baseline, expressed
+        // as % of a 16GB container assuming a fixed live-goroutine count.
+        // Anchored so 32KB ≈ ~1.2% (200MB / 16GB ≈ 1.25%).
+        function memPct(kb) {
+          return (kb - 2) / (32 - 2) * 1.25;
+        }
+
+        const maxCpu = 10;
+        const maxMem = 10;
+        const xOf = i => X0 + i * (X1 - X0) / (sizes.length - 1);
+        const yCpu = v => Y0 - (v / maxCpu) * (Y0 - Y1);
+        const yMem = v => Y0 - (v / maxMem) * (Y0 - Y1);
+
+        // axes
+        axesG.appendChild(el('line', { x1: X0, y1: Y0, x2: X1, y2: Y0, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+        axesG.appendChild(el('line', { x1: X0, y1: Y0, x2: X0, y2: Y1, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+
+        // y ticks (left, % scale shared)
+        for (let v = 0; v <= 10; v += 2) {
+          const y = yCpu(v);
+          axesG.appendChild(el('line', { x1: X0 - 4, y1: y, x2: X0, y2: y, stroke: 'var(--muted-2)' }));
+          const t = el('text', { x: X0 - 8, y: y + 4, 'text-anchor': 'end', 'font-family': 'Manrope, sans-serif', 'font-size': 12, fill: 'var(--muted)' });
+          t.textContent = v + '%';
+          axesG.appendChild(t);
+        }
+
+        // x tick labels
+        sizes.forEach((kb, i) => {
+          const t = el('text', { x: xOf(i), y: Y0 + 20, 'text-anchor': 'middle', 'font-family': 'Manrope, sans-serif', 'font-size': 12, fill: 'var(--muted)' });
+          t.textContent = kb + 'K';
+          axesG.appendChild(t);
+        });
+
+        // axis labels
+        const xl = el('text', { x: (X0 + X1) / 2, y: Y0 + 44, 'text-anchor': 'middle', 'font-family': 'EB Garamond, serif', 'font-size': 14, fill: 'var(--muted)' });
+        xl.textContent = 'goroutine 初始堆疊大小（KB，2 的次方）';
+        axesG.appendChild(xl);
+        const yl = el('text', { x: 22, y: (Y0 + Y1) / 2, 'text-anchor': 'middle', 'font-family': 'EB Garamond, serif', 'font-size': 13, fill: 'var(--muted)', transform: `rotate(-90 22 ${(Y0 + Y1) / 2})` });
+        yl.textContent = '佔比（%）';
+        axesG.appendChild(yl);
+
+        // 32KB knee marker
+        const kneeX = xOf(4);
+        axesG.appendChild(el('line', { x1: kneeX, y1: Y0, x2: kneeX, y2: Y1, stroke: 'var(--muted-2)', 'stroke-width': 0.5, 'stroke-dasharray': '2,4' }));
+        const kt = el('text', { x: kneeX, y: Y1 - 6, 'text-anchor': 'middle', 'font-family': 'IM Fell English, serif', 'font-style': 'italic', 'font-size': 12, fill: 'var(--accent-text)' });
+        kt.textContent = 'Uber 選定 32KB';
+        axesG.appendChild(kt);
+
+        // build the two curves (smooth over the 8 anchor points)
+        function pathFor(fn, yFn) {
+          let d = '';
+          for (let i = 0; i < sizes.length; i++) {
+            d += (i === 0 ? 'M' : 'L') + ' ' + xOf(i).toFixed(1) + ' ' + yFn(fn(sizes[i])).toFixed(1) + ' ';
+          }
+          return d.trim();
+        }
+        seriesG.appendChild(el('path', { d: pathFor(cpuPct, yCpu), fill: 'none', stroke: 'var(--accent)', 'stroke-width': 2 }));
+        seriesG.appendChild(el('path', { d: pathFor(memPct, yMem), fill: 'none', stroke: 'var(--sage-deep)', 'stroke-width': 2 }));
+
+        // legend
+        const lg = el('g', { 'font-family': 'Manrope, sans-serif', 'font-size': 12 });
+        lg.appendChild(el('rect', { x: 470, y: 44, width: 14, height: 2, fill: 'var(--accent)' }));
+        const l1 = el('text', { x: 490, y: 48, fill: 'var(--ink)' }); l1.textContent = 'stack-growth CPU'; lg.appendChild(l1);
+        lg.appendChild(el('rect', { x: 470, y: 64, width: 14, height: 2, fill: 'var(--sage-deep)' }));
+        const l2 = el('text', { x: 490, y: 68, fill: 'var(--ink)' }); l2.textContent = '記憶體 overhead'; lg.appendChild(l2);
+        seriesG.appendChild(lg);
+
+        function update() {
+          const i = Number(input.value);
+          const kb = sizes[i];
+          readout.textContent = kb + 'KB';
+          const x = xOf(i);
+          const cy = yCpu(cpuPct(kb));
+          const my = yMem(memPct(kb));
+          dotCpu.setAttribute('cx', x); dotCpu.setAttribute('cy', cy);
+          dotMem.setAttribute('cx', x); dotMem.setAttribute('cy', my);
+          cursor.setAttribute('x1', x); cursor.setAttribute('y1', Y1);
+          cursor.setAttribute('x2', x); cursor.setAttribute('y2', Y0);
+        }
+        input.addEventListener('input', update);
+        update();
+      })();
+    </script>
+  </figure>
+
+  <p>
+    這條 trade-off 曲線是整篇的核心判斷：左邊小堆疊，CPU 開銷高；往右加大堆疊，CPU 開銷快速掉到接近底線，但記憶體 overhead 線性往上爬。甜蜜點不在最左也不在最右，而是在「CPU 曲線已經壓平、但記憶體還沒漲太多」的那個拐點——對 Uber 那個服務，profiler 反推出來剛好落在 32KB 附近。這個拐點不是通用常數：另一個服務的熱路徑如果更淺，反推出來可能是 8KB；更深則可能是 64KB。這正是「用 profile 反推」比「全 fleet 統一設一個大值」高明的地方。
+  </p>
+
+  <h2>上線之後：CPU 稅從近一成掉到不到 1%</h2>
+
+  <p>
+    改動生效後，最直接的驗證還是回到那條 profile 行。改之前是 <code>runtime copystack 39.98 seconds (0.048%) out of a total 8106.43 seconds (9.77%)</code>；改之後變成 <code>runtime copystack 0.42s (0.0047%) of 70.61s (0.79%)</code>。<code>copystack</code> 在 stack-growth 這個維度的佔比從約 10% 掉到不到 1%——morestack 幾乎不再被觸發，因為大多數 goroutine 一出生就有足夠堆疊跑完熱路徑。
+  </p>
+
+  <figure class="vg-w-before-after-profile" data-mobile="static" data-svg-scroll="680">
+    <style>
+      .vg-w-before-after-profile { margin: var(--s-4) 0; }
+      .vg-w-before-after-profile svg { width: 100%; height: auto; }
+      .vg-w-before-after-profile figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-1); }
+    </style>
+    <svg viewBox="0 0 680 200" preserveAspectRatio="xMidYMid meet" role="img"
+         aria-label="before/after 對比：stack-growth CPU 從 9.77% 降到 0.79%，整體 CPU 降約 16%">
+      <rect x="0" y="0" width="680" height="200" fill="none"/>
+      <text x="170" y="24" text-anchor="middle" font-family="Manrope, sans-serif" font-size="13" fill="var(--muted)" font-weight="600">BEFORE</text>
+      <text x="510" y="24" text-anchor="middle" font-family="Manrope, sans-serif" font-size="13" fill="var(--muted)" font-weight="600">AFTER</text>
+      <line x1="340" y1="10" x2="340" y2="190" stroke="var(--line)" stroke-width="1" stroke-dasharray="4,4"/>
+      <rect x="30" y="40" width="280" height="32" rx="4" fill="var(--accent)" opacity="0.15"/>
+      <rect x="30" y="40" width="274" height="32" rx="4" fill="var(--accent)" opacity="0.5"/>
+      <text x="40" y="61" font-family="'EB Garamond', serif" font-size="14" fill="var(--ink)">stack growth CPU</text>
+      <text x="300" y="61" text-anchor="end" font-family="Manrope, sans-serif" font-size="15" fill="var(--accent-text)" font-weight="700">9.77%</text>
+      <rect x="370" y="40" width="280" height="32" rx="4" fill="var(--accent)" opacity="0.15"/>
+      <rect x="370" y="40" width="22" height="32" rx="4" fill="var(--accent)" opacity="0.5"/>
+      <text x="380" y="61" font-family="'EB Garamond', serif" font-size="14" fill="var(--ink)">stack growth CPU</text>
+      <text x="640" y="61" text-anchor="end" font-family="Manrope, sans-serif" font-size="15" fill="var(--accent-text)" font-weight="700">0.79%</text>
+      <rect x="30" y="90" width="280" height="32" rx="4" fill="var(--sage-deep)" opacity="0.15"/>
+      <text x="40" y="111" font-family="'EB Garamond', serif" font-size="14" fill="var(--ink)">copystack</text>
+      <text x="300" y="111" text-anchor="end" font-family="Manrope, sans-serif" font-size="14" fill="var(--muted)">39.98s / 8106s</text>
+      <rect x="370" y="90" width="280" height="32" rx="4" fill="var(--sage-deep)" opacity="0.15"/>
+      <text x="380" y="111" font-family="'EB Garamond', serif" font-size="14" fill="var(--ink)">copystack</text>
+      <text x="640" y="111" text-anchor="end" font-family="Manrope, sans-serif" font-size="14" fill="var(--muted)">0.42s / 70.6s</text>
+      <rect x="30" y="140" width="280" height="32" rx="4" fill="var(--ink-deep)" opacity="0.1"/>
+      <text x="40" y="161" font-family="'EB Garamond', serif" font-size="14" fill="var(--ink)">overall CPU</text>
+      <text x="300" y="161" text-anchor="end" font-family="Manrope, sans-serif" font-size="15" fill="var(--ink)" font-weight="700">~180</text>
+      <rect x="370" y="140" width="280" height="32" rx="4" fill="var(--ink-deep)" opacity="0.1"/>
+      <text x="380" y="161" font-family="'EB Garamond', serif" font-size="14" fill="var(--ink)">overall CPU</text>
+      <text x="640" y="161" text-anchor="end" font-family="Manrope, sans-serif" font-size="15" fill="var(--ink)" font-weight="700">~150 (−16%)</text>
+    </svg>
+    <figcaption>改動前後的三個指標並排：stack-growth 佔比從近一成掉到不到 1%，整體 CPU 降約 16%。數字取自原文。</figcaption>
+  </figure>
+
+  <p>
+    記憶體那邊的帳單，原文也給了具體分佈：「Most instances use around 50MB of stack, with a few reaching 200MB. The container has 16GB of memory, so 200MB overhead is less than 2%.」多數實例的堆疊總量約 <code>50MB</code>，少數尖峰到 <code>200MB</code>；而容器有 <code>16GB</code> 記憶體，就算按最壞的 200MB 算，overhead 也不到 2%。用不到 2% 的記憶體換掉近一成的 CPU 開銷——這個兌換比在絕大多數服務上都成立，因為 CPU 通常比記憶體貴、也更常是瓶頸。
+  </p>
+
+  <p>
+    整體 CPU 的降幅，原文寫的是：「The impact on CPU was significant (1-(150/180) == ~16%).」用他們給的算式，CPU 從約 180 降到約 150、約 <code>16%</code> 的整體降幅。注意這 16% 大於前面那條 stack-growth 的 10%——合理的推測是：morestack 少觸發之後，連帶減少了記憶體配置、GC 壓力、以及 cache 行為的二階效應，最終在整體 CPU 上放大成比單看 copystack 更大的收益。原文只把整體降幅歸為「significant」並給出 16% 這個數字，並沒有逐項拆解這多出來的 6% 來自哪裡，所以這裡是推斷、不是原文的結論。
+  </p>
+
+  <p>
+    這套方法的一般性值得記下——這是作者的推斷，原文只講了 Uber 自己的案例。方法本身不依賴 Uber 的業務、也不依賴 <code>yarpc</code>；照同樣的邏輯，任何跑在 Go、且在 profile 上看得到 <code>copystack</code> 佔比偏高的服務，理論上都可以套同一條路：先確認 stack growth 是真的開銷（不是所有服務都有這個問題），再用 profile 反推熱路徑的堆疊需求、round 到 2 的次方，透過 <code>linkname</code> 把初始堆疊設進去。前提是你的服務 goroutine 數量沒有大到讓「每個多吃 30KB」變成記憶體災難——這也是為什麼要用 profile 判斷、而不是全 fleet 一律調大。
+  </p>
+
+  <p>
+    往回看整條線，最該學的其實不是那三個具體選項，而是他們怎麼決定該做哪一個。第一反應（改函式）修掉了最大的單一元兇，卻在「成千上萬個函式」面前碰壁；第二個念頭（改 runtime）給了操作旋鈕，但單獨看只是把「拍腦袋 2KB」換成「拍腦袋某個大值」，換湯不換藥；真正讓方案成立的是第三步把「該設多大」這個判斷交還給資料——profile 本來就知道答案，缺的只是把它自動化的那段程式。改 runtime 是手，profiler 是眼，兩者缺一都不成。對任何想在生產環境省 CPU 的人，這個順序值得記：先用 profile 確認開銷是真的、再讓 profile 告訴你該調到哪，最後才動手調——而不是反過來先猜一個值、再祈禱它剛好對。
+  </p>
+
+  <p class="vg-deep-closer"><strong>What changes</strong>：如果你的 Go 服務 profile 裡 <code>runtime.copystack</code> 佔比異常，先別急著到處改函式——那筆開銷的解法可能只是把初始堆疊從預設的 2KB 調到一個從你自己 profile 反推出來的 2 的次方值，用不到 2% 的記憶體換回接近一成的 CPU。</p>
+</div>
