@@ -5,7 +5,7 @@
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import yaml from "js-yaml";
+import { load as yamlLoad } from "js-yaml";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(here, "..", "..", "..");
@@ -21,7 +21,7 @@ let cache = null;
 function readAll() {
   if (cache) return cache;
   const text = readFileSync(YML_PATH, "utf8");
-  const doc = yaml.load(text);
+  const doc = yamlLoad(text);
   if (!doc || !Array.isArray(doc.sources)) {
     throw new Error(`sources.yml malformed — missing top-level "sources:" list`);
   }
