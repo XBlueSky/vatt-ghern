@@ -32,7 +32,7 @@ if (urls.length === 0) {
   process.exit(2);
 }
 
-const browser = await chromium.launch();
+const browser = await chromium.launch({ executablePath: process.env.PLAYWRIGHT_CHROMIUM_PATH || undefined });
 const ctx = await browser.newContext({
   viewport: { width: MOBILE_WIDTH, height: MOBILE_HEIGHT },
 });
