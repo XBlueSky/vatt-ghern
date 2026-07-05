@@ -1,0 +1,444 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">一段解引用 raw pointer 的 unsafe Rust 可以順利 compile，rustc 對它的 soundness 一個字都沒說。Kani 做的事，是把這段程式碼對「所有可能的輸入」證明一遍，而不是測那麼幾組。</p>
+  <h1 class="vg-post-title">Kani，從零講起——rustc 不檢查的那三件事，怎麼用 model checking 補上</h1>
+</header>
+
+<div class="vg-post-prose">
+
+<p><span class="vg-dropcap">讀</span>完這篇你會知道三件事：bounded model checking 是什麼、它跟寫測試差在哪、以及 Kani 怎麼把一段 Rust 編成一個 SAT solver 能判定的數學問題。這篇論文（<em>Kani: A Model Checker for Rust</em>，收在 ASE 的 industry track）本身很短，但它站在一個值得停下來看的位置：Rust 的型別系統向來被當成記憶體安全的最後一道防線，而這篇正好在講那道防線「沒在守」的地帶。</p>
+
+<h2>一段 compile 得過、卻沒人保證的 unsafe Rust</h2>
+
+<p>先把場景擺出來。Rust 的賣點是 ownership——borrow checker 在編譯期擋掉 use-after-free、double-free、data race 這類記憶體錯誤。這件事在 safe code 裡是成立的，論文開頭就是這麼說的：「Rust's ownership type system prevents memory errors in safe code」。問題是「in safe code」這五個字。</p>
+
+<p>一旦你寫下 <code>unsafe</code>，borrow checker 對區塊裡的 raw pointer 解引用就不再幫你背書。下面這段會 compile，rustc 不會有任何抱怨：</p>
+
+<pre data-kind="pseudocode"><code>fn read_at(buf: &amp;[u8], i: usize) -&gt; u8 {
+    unsafe { *buf.as_ptr().add(i) }   <em>// i 越界？rustc 不管</em>
+}</code></pre>
+
+<p>當 <code>i</code> 超過 <code>buf.len()</code>，這是一個 out-of-bounds read，是 undefined behaviour。編譯器讓它過，因為 <code>unsafe</code> 的合約是「我，程式員，保證這裡安全」——編譯器把責任交還給你，然後閉嘴。這不是 Rust 的瑕疵，是設計：unsafe 是逃生門，讓你在型別系統表達不了的地方手動接管。代價是那扇門後面的正確性，型別系統一律不查。</p>
+
+<p>論文把這件事講得更完整。它列出三類「與 compilation 正交」的性質，也就是能不能編譯跟這些性質對不對，是兩回事：unsafe 操作的 soundness（例如 raw pointer 解引用）、functional correctness（功能正確性），以及 absence of runtime panics（不會在執行期 panic）。原文的句子是：「the soundness of unsafe operations (e.g., raw pointer dereferences), functional correctness, and absence of runtime panics」。這三件事，rustc 編譯成功那一刻，一件都沒替你確認。</p>
+
+<h2>型別系統沒在看的三件事</h2>
+
+<p>把上面那句話攤成一張表，界線會更清楚。左邊是 rustc 在編譯期給你的保證，右邊是 Kani 這種 model checker 補上的部分。重點不是「Rust 不安全」——safe code 的記憶體安全確實由 ownership 保證了；重點是這份保證的邊界，恰好停在 unsafe soundness、panic-freedom、functional correctness 之前。</p>
+
+<figure class="vg-w-table-kani-guarantee" data-mobile="keep">
+  <style>
+    .vg-w-table-kani-guarantee { overflow-x: auto; }
+    .vg-w-table-kani-guarantee table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+    .vg-w-table-kani-guarantee thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); }
+    .vg-w-table-kani-guarantee tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+    .vg-w-table-kani-guarantee .yes { color: var(--sage-deep); font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.04em; }
+    .vg-w-table-kani-guarantee .no { color: var(--accent-text); font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.04em; }
+    .vg-w-table-kani-guarantee .na { color: var(--muted); font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.04em; }
+    .vg-w-table-kani-guarantee figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-2); }
+  </style>
+  <table>
+    <thead>
+      <tr>
+        <th scope="col">性質</th>
+        <th scope="col">rustc 編譯期</th>
+        <th scope="col">Kani（model checking）</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>safe code 的記憶體安全（ownership、borrow）</td>
+        <td><span class="yes">保證</span></td>
+        <td><span class="na">不需要</span></td>
+      </tr>
+      <tr>
+        <td>unsafe 操作的 soundness（raw pointer 解引用、越界）</td>
+        <td><span class="no">不檢查</span></td>
+        <td><span class="yes">自動檢查</span></td>
+      </tr>
+      <tr>
+        <td>不會 runtime panic（overflow、unwrap、index out of bounds）</td>
+        <td><span class="no">不檢查</span></td>
+        <td><span class="yes">自動檢查</span></td>
+      </tr>
+      <tr>
+        <td>functional correctness（函式真的算對）</td>
+        <td><span class="no">不檢查</span></td>
+        <td><span class="yes">檢查，需 contracts</span></td>
+      </tr>
+    </tbody>
+  </table>
+  <figcaption>右欄前三列 Kani 都標「自動」，對應論文那句「automatically checking a comprehensive set of safety properties with no user annotation」——不需要你先寫規格。最後一列的 functional correctness 才需要你動手寫 contract，因為「算對」得先由你定義什麼叫對。</figcaption>
+</figure>
+
+<p>這張表裡有一個容易被跳過的字：右欄前三列的「自動」。論文的說法是 Kani「automatically checking a comprehensive set of safety properties with no user annotation」——你不必先寫任何規格，Kani 就會去檢查一整套 safety property：算術溢位、陣列越界、指標有效性這類「壞掉會很明顯」的東西。你要做的只是給它一個入口。真正需要你先動筆的，是最後一列的 functional correctness——因為「這個函式算對了嗎」這個問題，得先有人定義「對」是什麼。</p>
+
+<p>這裡值得為中間那一列多停一秒——「不會 runtime panic」聽起來像小事，其實不是。Rust 的 panic 預設會 unwind 然後在許多情境下讓整個 process 收攤；在一個 library 裡，一個你沒想到的 <code>unwrap</code> 或整數溢位，可能就是把呼叫方的服務打掛的那顆地雷。到了 <code>no_std</code>、embedded 或 kernel 這種沒有 unwind 機制的地方，panic 的後果更難收拾。所以「證明這段程式在任何輸入下都不會 panic」不是潔癖，是把一整類 runtime 崩潰從「靠測試碰運氣」變成「靜態排除」。這正是 Kani 那一套自動檢查最直接的用處。</p>
+
+<p>那麼，「檢查一整套 safety property」到底是怎麼檢查的？它跟你平常寫 <code>#[test]</code> 差在哪？這是整篇的核心，下一節開始講。</p>
+
+<h2>model checking：不是抽樣，是對所有輸入證明</h2>
+
+<p>先講測試在做什麼。一個 unit test 是這樣的形狀：你手挑幾組輸入，跑函式，assert 輸出。<code>assert_eq!(read_at(&amp;[1,2,3], 1), 2)</code>。它驗證的是「這一組輸入下，行為對」。你挑十組，就驗證十個點。輸入空間有多大？對一個吃 <code>u8</code> 的函式來說是 256 個；吃兩個 <code>u8</code> 是 65536 個；吃一個 <code>u64</code> 是 2 的 64 次方。你的十組 test，在這片空間裡是十個孤立的點。bug 只要藏在你沒挑到的點上，測試就是綠的，程式照樣壞。</p>
+
+<p>model checking 換一個問法。它不問「這組輸入對不對」，它問「有沒有『任何一組』輸入會讓性質不成立」。做法是把輸入變成 symbolic value——一個代表「所有可能值」的符號，不是一個具體數字。然後讓工具用邏輯推理，一次涵蓋整片輸入空間。找不到反例，就等於在這個範圍內證明了性質成立；找得到，它會把那組害你出事的具體輸入（counterexample）直接印給你。</p>
+
+<p>「用邏輯推理一次涵蓋整片」聽起來像魔法，拆開其實不玄。solver 收到的是一條巨大的布林條件——把程式的每一步、每個變數、你要證的性質，全部編碼成一組互相牽制的邏輯約束，然後問一個問題：有沒有一組變數賦值同時滿足「程式照這樣跑」而且「性質不成立」？這叫 satisfiability（可滿足性），SAT 這個名字就是這麼來的；SMT 則是它的加強版，直接懂整數、位元、陣列這些理論，不必你把一切拆到單一 bit。solver 找到一組解，那組解就是活生生的 counterexample；窮盡搜索後回報無解，就等於證明了「在這條件下，反例不存在」。驗證的本質，是把「找 bug」翻譯成一道 solver 能機械回答的可滿足性問題。</p>
+
+<p>下面這張圖把這件事的差別畫成同一片輸入空間。左邊是 unit test 點亮的幾個點，右邊是 <code>kani::any()</code> 涵蓋的整片。同一個要害輸入（我這裡放在 0xFF）在左邊是暗的——沒被測到；在右邊被圈出來，成了 counterexample。拖動中間的分隔線來回比。</p>
+
+<figure class="vg-w-ba-test-vs-symbolic" data-mobile="swap" data-mobile-summary="同一個吃 u8 的函式，5 個手挑的 unit test 全過，卻漏掉 0xFF 這個觸發 overflow 的輸入；kani::any() 一次符號式涵蓋全部 256 個輸入，counterexample 直接浮出來。">
+  <style>
+    .vg-w-ba-test-vs-symbolic { display: grid; gap: var(--s-2); }
+    .vg-w-ba-test-vs-symbolic .vg-w-affordance { display: flex; align-items: center; gap: var(--s-1); font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; margin: 0; }
+    .vg-w-ba-test-vs-symbolic .stage { position: relative; width: 100%; aspect-ratio: 720 / 240; touch-action: none; user-select: none; }
+    .vg-w-ba-test-vs-symbolic .layer { position: absolute; inset: 0; }
+    .vg-w-ba-test-vs-symbolic .layer svg { width: 100%; height: 100%; display: block; }
+    .vg-w-ba-test-vs-symbolic .before { clip-path: inset(0 calc(100% - var(--vg-split, 50%)) 0 0); }
+    .vg-w-ba-test-vs-symbolic .divider { position: absolute; top: 0; bottom: 0; left: var(--vg-split, 50%); width: 32px; transform: translateX(-50%); cursor: ew-resize; touch-action: none; z-index: 3; }
+    .vg-w-ba-test-vs-symbolic .divider::before { content: ''; position: absolute; left: 50%; top: 0; bottom: 0; width: 2px; transform: translateX(-50%); background: var(--accent); }
+    .vg-w-ba-test-vs-symbolic .divider::after { content: ''; position: absolute; left: 50%; top: 50%; width: 14px; height: 14px; transform: translate(-50%, -50%); border-radius: 50%; background: var(--accent); }
+    .vg-w-ba-test-vs-symbolic figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+  </style>
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="m18 8 4 4-4 4"/><path d="M2 12h20"/><path d="m6 8-4 4 4 4"/>
+    </svg>
+    <span>拖動分隔線比較 · 左 unit test 5 個輸入，右 kani::any() 全部 256 個</span>
+  </p>
+  <div class="stage">
+    <div class="layer after">
+      <svg class="vg-w-ba-test-vs-symbolic-after" viewBox="0 0 720 240" preserveAspectRatio="xMidYMid meet" role="img" aria-label="kani::any 符號式涵蓋全部輸入">
+        <text x="16" y="26" font-family="EB Garamond, serif" font-size="17" fill="var(--sage-deep)">kani::any()：256 個輸入全覆蓋</text>
+        <g id="vg-w-ba-test-vs-symbolic-after-grid"></g>
+        <text x="16" y="232" font-family="Manrope, sans-serif" font-size="12" fill="var(--sage-deep)">counterexample：input = 0xFF 觸發 overflow</text>
+      </svg>
+    </div>
+    <div class="layer before">
+      <svg class="vg-w-ba-test-vs-symbolic-before" viewBox="0 0 720 240" preserveAspectRatio="xMidYMid meet" role="img" aria-label="unit test 只點亮少數輸入">
+        <text x="16" y="26" font-family="EB Garamond, serif" font-size="17" fill="var(--accent-text)">unit test：5 個手挑輸入</text>
+        <g id="vg-w-ba-test-vs-symbolic-before-grid"></g>
+        <text x="16" y="232" font-family="Manrope, sans-serif" font-size="12" fill="var(--muted)">0xFF 沒被挑到——測試全綠，bug 溜過去</text>
+      </svg>
+    </div>
+    <div class="divider" role="slider" tabindex="0" aria-label="拖動比較 unit test 與符號驗證的覆蓋" aria-valuemin="0" aria-valuemax="100" aria-valuenow="50"></div>
+  </div>
+  <figcaption>256 格對應一個 u8 的所有取值。unit test 點亮 5 格（綠），其餘全暗；kani::any() 把整片染上並在 0xFF 標出 counterexample。這正是「抽樣」與「對所有輸入證明」的差別。</figcaption>
+  <script>
+    (function () {
+      if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+      const root = document.querySelector('.vg-w-ba-test-vs-symbolic');
+      if (!root) return;
+      const NS = 'http://www.w3.org/2000/svg';
+      const COLS = 32, ROWS = 8, CW = 21, CH = 21, X0 = 16, Y0 = 40;
+      const BAD = 255;
+      const TESTED = [3, 47, 120, 198, 240];
+
+      function cellRect(idx) {
+        const col = idx % COLS, row = Math.floor(idx / COLS);
+        return { x: X0 + col * CW, y: Y0 + row * CH };
+      }
+      function mkRect(idx, fill, stroke, sw) {
+        const p = cellRect(idx);
+        const r = document.createElementNS(NS, 'rect');
+        r.setAttribute('x', p.x); r.setAttribute('y', p.y);
+        r.setAttribute('width', CW - 3); r.setAttribute('height', CH - 3);
+        r.setAttribute('rx', '2');
+        r.setAttribute('fill', fill);
+        if (stroke) { r.setAttribute('stroke', stroke); r.setAttribute('stroke-width', sw || 1); }
+        return r;
+      }
+
+      const afterG = root.querySelector('#vg-w-ba-test-vs-symbolic-after-grid');
+      const beforeG = root.querySelector('#vg-w-ba-test-vs-symbolic-before-grid');
+
+      for (let i = 0; i < COLS * ROWS; i++) {
+        afterG.appendChild(mkRect(i, 'color-mix(in srgb, var(--sage-deep) 30%, transparent)', 'var(--sage-deep)', 0.5));
+      }
+      const ring = mkRect(BAD, 'var(--accent)', 'var(--accent-text)', 2);
+      afterG.appendChild(ring);
+
+      for (let i = 0; i < COLS * ROWS; i++) {
+        const lit = TESTED.includes(i);
+        beforeG.appendChild(mkRect(
+          i,
+          lit ? 'color-mix(in srgb, var(--sage-deep) 55%, transparent)' : 'transparent',
+          lit ? 'var(--sage-deep)' : 'var(--muted-2)',
+          lit ? 1 : 0.5
+        ));
+      }
+
+      const stage = root.querySelector('.stage');
+      const divider = root.querySelector('.divider');
+      function setSplit(pct) {
+        const p = Math.max(4, Math.min(96, pct));
+        root.style.setProperty('--vg-split', p + '%');
+        divider.setAttribute('aria-valuenow', Math.round(p));
+      }
+      function fromEvent(e) {
+        const rect = stage.getBoundingClientRect();
+        setSplit(((e.clientX - rect.left) / rect.width) * 100);
+      }
+      let dragging = false;
+      divider.addEventListener('pointerdown', (e) => { dragging = true; divider.setPointerCapture(e.pointerId); e.preventDefault(); });
+      divider.addEventListener('pointermove', (e) => { if (dragging) fromEvent(e); });
+      divider.addEventListener('pointerup', (e) => { dragging = false; divider.releasePointerCapture(e.pointerId); });
+      stage.addEventListener('pointerdown', (e) => { if (e.target === divider) return; fromEvent(e); });
+      divider.addEventListener('keydown', (e) => {
+        const cur = parseFloat(root.style.getPropertyValue('--vg-split')) || 50;
+        if (e.key === 'ArrowLeft') { setSplit(cur - 4); e.preventDefault(); }
+        if (e.key === 'ArrowRight') { setSplit(cur + 4); e.preventDefault(); }
+      });
+      setSplit(50);
+    })();
+  </script>
+</figure>
+
+<p>這裡要立刻補一個誠實的括號：右邊那片「全覆蓋」不是真的把 256 個輸入一個一個跑過。對 <code>u8</code> 剛好可以，但對 <code>u64</code>、對帶迴圈的函式，逐一枚舉是天文數字。model checking 靠的是符號推理——把整片輸入交給一個 SAT/SMT solver，用邏輯一次論證「不存在反例」，而不是一格一格點亮。所以真正的問題從來不是「怎麼枚舉」，而是「怎麼把一段 Rust 變成 solver 看得懂的邏輯式子」。</p>
+
+<p>你可能會想：我已經在 fuzz 了，這不就是在餵大量隨機輸入嗎？值得把兩者分清楚。fuzzing 再聰明——coverage-guided、feedback-driven——本質仍是抽樣，它是用啟發式在龐大的輸入空間裡「更會挑」的取樣，跑得再久也是在點亮更多的點，永遠不會宣稱「剩下的點都安全」。model checking 反過來，它不點點，它對整片空間做一次邏輯論證；跑完回報無反例，是一個關於「全部」的陳述，不是「目前為止還沒踩到」。fuzzing 找 bug 很強、成本低、不用寫規格；verification 給的是保證，代價是要寫規格、要跟 state-space explosion 搏鬥。兩者是互補，不是替代——這也是為什麼標準庫既 fuzz 也上 Kani。</p>
+
+<h2>一個 proof harness 怎麼變成 SAT 問題</h2>
+
+<p>Kani 的入口叫 proof harness。它長得像一個 test，但語意完全不同。一個典型的 harness 是這樣：</p>
+
+<pre><code class="language-rust">// 被驗證的函式
+fn add_headroom(len: u8, pad: u8) -&gt; u8 {
+    len + pad          // 可能 overflow panic
+}
+
+#[kani::proof]
+fn check_add_headroom() {
+    let len: u8 = kani::any();   // 對「所有」u8 取一個 symbolic 值
+    let pad: u8 = kani::any();
+    kani::assume(pad &lt;= 16);      // 縮小輸入空間：pad 最多 16
+    let r = add_headroom(len, pad);
+    kani::assert(r &gt;= len, "headroom never shrinks length");
+}</code></pre>
+
+<p>拆開看：<code>kani::any()</code> 給你一個 symbolic 的 <code>u8</code>，代表全部 256 個取值一起；<code>kani::assume</code> 對輸入加約束，把驗證範圍縮到你在意的那塊（這裡假設 <code>pad &lt;= 16</code>）；<code>kani::assert</code> 是你要證的性質。跑 <code>kani</code>，它不會挑幾組跑，它會問 solver：「存在任何一組滿足 assume 的 (len, pad)，使 assert 不成立嗎？」以這個例子，<code>len = 250, pad = 10</code> 會讓 <code>len + pad</code> 溢位 panic，Kani 會把這組具體數字當 counterexample 印出來——連同 Kani 免費附送的 arithmetic-overflow 檢查（那是它自動查的 safety property 之一，你沒寫都會查）。</p>
+
+<p><code>kani::assume</code> 這一行還藏著一個要小心的雙面刃。它縮小輸入空間讓驗證跑得動，但假設下得太緊，等於把可能出事的輸入親手排除在檢查之外——solver 只在你允許的範圍裡找反例，範圍外的 bug 它連看都不看。這叫 over-constraining，是形式驗證裡最隱蔽的假安心：畫面一片綠，只因為你沒讓它去看會出事的那塊。所以讀一份 Kani 的驗證結果，跟讀結論同樣重要的是讀它的 <code>assume</code>——那才是這份「證明」真正的邊界。</p>
+
+<p>那從這段 Rust 到 solver 的判定，中間發生了什麼？論文只用一句話帶過管線：「Kani compiles proof harnesses from Rust's Mid-level Intermediate Representation (MIR) into CBMC's bit-precise verification engine」。這句話裡有兩個關鍵詞——MIR 與 CBMC——值得展開。MIR 是 Rust 編譯器內部的中階表示，比原始碼低階、比機器碼高階，泛型已經單型化、控制流已經攤平，是做程式分析很順手的一層。CBMC 則是 C 語言世界裡用了很多年的 bounded model checker，它的看家本領就是把一段命令式程式變成一條邏輯式子丟給 SAT/SMT solver。Kani 把 MIR 翻成 CBMC 吃得下的形式，等於借用了 CBMC 那套成熟的求解引擎。整條管線大致是這幾站：</p>
+
+<figure class="vg-w-stack-kani-pipeline" data-mobile="keep">
+  <style>
+    .vg-w-stack-kani-pipeline .pipe-svg { display: none; }
+    .vg-w-stack-kani-pipeline .pipe-cards { display: grid; gap: var(--s-2); }
+    .vg-w-stack-kani-pipeline .pcard { border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 4px; padding: var(--s-2); }
+    .vg-w-stack-kani-pipeline .pcard h4 { font-family: var(--mono); font-size: var(--fs-sm); color: var(--accent-text); margin: 0 0 4px; }
+    .vg-w-stack-kani-pipeline .pcard p { font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink-soft); margin: 0; }
+    .vg-w-stack-kani-pipeline figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-2); }
+    @media (min-width: 721px) {
+      .vg-w-stack-kani-pipeline .pipe-svg { display: block; }
+      .vg-w-stack-kani-pipeline .pipe-cards { display: none; }
+      .vg-w-stack-kani-pipeline .pipe-svg svg { width: 100%; height: auto; }
+    }
+  </style>
+  <div class="pipe-cards">
+    <div class="pcard"><h4>Rust + #[kani::proof]</h4><p>你寫的 proof harness 原始碼，用 kani::any / assume / assert 描述輸入與性質。</p></div>
+    <div class="pcard"><h4>MIR</h4><p>Rust 編譯器的中階 IR，泛型已單型化、控制流已攤平，適合做程式分析。</p></div>
+    <div class="pcard"><h4>goto-program</h4><p>CBMC 的內部表示——把命令式控制流轉成統一的 goto 形式，準備符號化。</p></div>
+    <div class="pcard"><h4>symbolic execution + 迴圈展開</h4><p>把輸入符號化、把迴圈展開到有限深度，累積成一條巨大的邏輯條件。</p></div>
+    <div class="pcard"><h4>SAT / SMT solver</h4><p>求解「是否存在反例」。無解即證明成立；有解就回一組 counterexample。</p></div>
+  </div>
+  <div class="pipe-svg">
+    <svg viewBox="0 0 720 200" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Kani 從 Rust 到 SAT 的編譯管線">
+      <defs>
+        <marker id="vg-w-stack-kani-pipeline-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0 0 L10 5 L0 10 z" fill="var(--muted)"/>
+        </marker>
+      </defs>
+      <g font-family="JetBrains Mono, monospace">
+        <rect x="8" y="56" width="128" height="88" rx="6" fill="none" stroke="var(--accent)" stroke-width="1.5"/>
+        <text x="72" y="86" text-anchor="middle" font-size="13" fill="var(--accent-text)">Rust +</text>
+        <text x="72" y="104" text-anchor="middle" font-size="13" fill="var(--accent-text)">#[kani::proof]</text>
+        <text x="72" y="126" text-anchor="middle" font-size="11" fill="var(--muted)" font-family="EB Garamond, serif">harness 原始碼</text>
+
+        <rect x="156" y="56" width="120" height="88" rx="6" fill="none" stroke="currentColor" stroke-width="1.5"/>
+        <text x="216" y="98" text-anchor="middle" font-size="14" fill="var(--ink)">MIR</text>
+        <text x="216" y="120" text-anchor="middle" font-size="11" fill="var(--muted)" font-family="EB Garamond, serif">Rust 中階 IR</text>
+
+        <rect x="296" y="56" width="124" height="88" rx="6" fill="none" stroke="currentColor" stroke-width="1.5"/>
+        <text x="358" y="98" text-anchor="middle" font-size="13" fill="var(--ink)">goto-program</text>
+        <text x="358" y="120" text-anchor="middle" font-size="11" fill="var(--muted)" font-family="EB Garamond, serif">CBMC 內部表示</text>
+
+        <rect x="440" y="56" width="124" height="88" rx="6" fill="none" stroke="currentColor" stroke-width="1.5"/>
+        <text x="502" y="92" text-anchor="middle" font-size="12" fill="var(--ink)">symbolic +</text>
+        <text x="502" y="108" text-anchor="middle" font-size="12" fill="var(--ink)">unwind</text>
+        <text x="502" y="128" text-anchor="middle" font-size="11" fill="var(--muted)" font-family="EB Garamond, serif">符號執行、展開</text>
+
+        <rect x="584" y="56" width="128" height="88" rx="6" fill="none" stroke="var(--sage-deep)" stroke-width="1.5"/>
+        <text x="648" y="92" text-anchor="middle" font-size="13" fill="var(--sage-deep)">SAT / SMT</text>
+        <text x="648" y="110" text-anchor="middle" font-size="13" fill="var(--sage-deep)">solver</text>
+        <text x="648" y="128" text-anchor="middle" font-size="11" fill="var(--muted)" font-family="EB Garamond, serif">求解，回判定</text>
+      </g>
+      <g stroke="var(--muted)" stroke-width="1.4">
+        <line x1="138" y1="100" x2="152" y2="100" marker-end="url(#vg-w-stack-kani-pipeline-arrow)"/>
+        <line x1="278" y1="100" x2="292" y2="100" marker-end="url(#vg-w-stack-kani-pipeline-arrow)"/>
+        <line x1="422" y1="100" x2="436" y2="100" marker-end="url(#vg-w-stack-kani-pipeline-arrow)"/>
+        <line x1="566" y1="100" x2="580" y2="100" marker-end="url(#vg-w-stack-kani-pipeline-arrow)"/>
+      </g>
+    </svg>
+  </div>
+  <figcaption>論文只寫了「MIR 到 CBMC 的 bit-precise 引擎」這兩端；中間的 goto-program、符號執行、迴圈展開是 CBMC 這類 bounded model checker 的通用做法，放進來是為了讓「怎麼變成 SAT 問題」這條路看得見。</figcaption>
+</figure>
+
+<p>「bit-precise」這個形容詞不是裝飾。它的意思是 solver 把每個整數當成一串 bit 來推理，所以 two's-complement 的溢位、位元運算、型別寬度都被如實建模——這正是為什麼它抓得到 <code>u8</code> 加法在 250 + 10 溢位這種事，而不是用一個理想化的無限精度整數含糊帶過。</p>
+
+<p>但這條管線裡藏著整套方法最重要的一個字：unwind，迴圈展開。SAT solver 處理的是「有限大小」的邏輯式子，而一個 <code>while</code> 迴圈的迭代次數可能沒有上界。CBMC 的做法是把迴圈展開到一個固定深度 k——展開三次就檢查前三圈、展開十次就檢查前十圈。這就是「bounded」的來源，也是這套方法的天花板。下面這個 widget 讓你把這個 bound 直接拖給我看。</p>
+
+<figure class="vg-w-param-demo-kani-bound" data-mobile="static" data-svg-scroll="720">
+  <style>
+    .vg-w-param-demo-kani-bound { display: grid; gap: var(--s-2); }
+    .vg-w-param-demo-kani-bound .controls { display: flex; align-items: center; gap: var(--s-2); flex-wrap: wrap; font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+    .vg-w-param-demo-kani-bound .controls input[type="range"] { flex: 1; min-width: 140px; height: 36px; accent-color: var(--accent); }
+    .vg-w-param-demo-kani-bound .controls label.chk { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+    .vg-w-param-demo-kani-bound .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 5ch; text-align: right; }
+    .vg-w-param-demo-kani-bound svg { width: 100%; height: auto; }
+    .vg-w-param-demo-kani-bound figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    @media (max-width: 720px) { .vg-w-param-demo-kani-bound .controls { display: none; } }
+  </style>
+  <div class="controls" data-vg-controls>
+    <label for="vg-w-param-demo-kani-bound-k">unwind depth k =</label>
+    <span class="readout" id="vg-w-param-demo-kani-bound-readout">4</span>
+    <input id="vg-w-param-demo-kani-bound-k" type="range" min="0" max="12" value="4" step="1" />
+    <label class="chk"><input id="vg-w-param-demo-kani-bound-contract" type="checkbox" /> 加上 loop contract</label>
+  </div>
+  <svg class="vg-w-param-demo-kani-bound-main" viewBox="0 0 720 300" preserveAspectRatio="xMidYMid meet" role="img" aria-label="unwinding bound 探索器">
+    <text x="16" y="26" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)" letter-spacing="0.06em">LOOP ITERATIONS 0..12 · BUG 在第 7 圈</text>
+    <g id="vg-w-param-demo-kani-bound-slots" font-family="JetBrains Mono, monospace">
+      <rect x="16" y="100" width="48" height="56" rx="3" fill="color-mix(in srgb, var(--accent) 42%, transparent)" stroke="var(--accent)" stroke-width="1.5"/>
+      <rect x="68" y="100" width="48" height="56" rx="3" fill="color-mix(in srgb, var(--accent) 42%, transparent)" stroke="var(--accent)" stroke-width="1.5"/>
+      <rect x="120" y="100" width="48" height="56" rx="3" fill="color-mix(in srgb, var(--accent) 42%, transparent)" stroke="var(--accent)" stroke-width="1.5"/>
+      <rect x="172" y="100" width="48" height="56" rx="3" fill="color-mix(in srgb, var(--accent) 42%, transparent)" stroke="var(--accent)" stroke-width="1.5"/>
+      <rect x="224" y="100" width="48" height="56" rx="3" fill="color-mix(in srgb, var(--accent) 42%, transparent)" stroke="var(--accent)" stroke-width="1.5"/>
+      <rect x="276" y="100" width="48" height="56" rx="3" fill="transparent" stroke="var(--muted-2)" stroke-width="1"/>
+      <rect x="328" y="100" width="48" height="56" rx="3" fill="transparent" stroke="var(--muted-2)" stroke-width="1"/>
+      <rect x="380" y="100" width="48" height="56" rx="3" fill="transparent" stroke="var(--muted-2)" stroke-width="1"/>
+      <rect x="432" y="100" width="48" height="56" rx="3" fill="transparent" stroke="var(--muted-2)" stroke-width="1"/>
+      <rect x="484" y="100" width="48" height="56" rx="3" fill="transparent" stroke="var(--muted-2)" stroke-width="1"/>
+      <rect x="536" y="100" width="48" height="56" rx="3" fill="transparent" stroke="var(--muted-2)" stroke-width="1"/>
+      <rect x="588" y="100" width="48" height="56" rx="3" fill="transparent" stroke="var(--muted-2)" stroke-width="1"/>
+      <rect x="640" y="100" width="48" height="56" rx="3" fill="transparent" stroke="var(--muted-2)" stroke-width="1"/>
+      <g font-size="11" fill="var(--muted)" text-anchor="middle">
+        <text x="40" y="174">0</text><text x="92" y="174">1</text><text x="144" y="174">2</text>
+        <text x="196" y="174">3</text><text x="248" y="174">4</text><text x="300" y="174">5</text>
+        <text x="352" y="174">6</text><text x="404" y="174">7</text><text x="456" y="174">8</text>
+        <text x="508" y="174">9</text><text x="560" y="174">10</text><text x="612" y="174">11</text>
+        <text x="664" y="174">12</text>
+      </g>
+    </g>
+    <g id="vg-w-param-demo-kani-bound-bug">
+      <path d="M404 60 L420 90 L388 90 Z" fill="var(--muted-2)" id="vg-w-param-demo-kani-bound-bugmark"/>
+      <text x="404" y="52" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--accent-text)">panic @ 7</text>
+    </g>
+    <text x="16" y="190" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)" id="vg-w-param-demo-kani-bound-cover">已窮舉 unwind depth ≤ 4</text>
+    <rect x="16" y="210" width="688" height="72" rx="6" fill="var(--bg-soft)" stroke="var(--line)" stroke-width="1" id="vg-w-param-demo-kani-bound-vbox"/>
+    <text x="34" y="238" font-family="Manrope, sans-serif" font-size="13" fill="var(--ink)" id="vg-w-param-demo-kani-bound-vtitle">unwind ≤ 4：範圍內沒有 counterexample</text>
+    <text x="34" y="262" font-family="EB Garamond, serif" font-size="13" fill="var(--muted)" id="vg-w-param-demo-kani-bound-vtext">但第 7 圈的 panic 在 bound 之外——沒被證明，也沒被否證。</text>
+  </svg>
+  <figcaption>橙色代表 BMC 實際窮舉到的迴圈迭代；灰框是 bound 之外、沒看到的部分。把 k 拖過 7，counterexample 才浮出來；勾上 loop contract，覆蓋一次跳到全部（unbounded），bound 不再是天花板。</figcaption>
+  <script>
+    (function () {
+      if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+      const root = document.querySelector('.vg-w-param-demo-kani-bound');
+      if (!root) return;
+      const NS = 'http://www.w3.org/2000/svg';
+      const slotsG = root.querySelector('#vg-w-param-demo-kani-bound-slots');
+      while (slotsG.firstChild) slotsG.removeChild(slotsG.firstChild);
+      const slider = root.querySelector('#vg-w-param-demo-kani-bound-k');
+      const contract = root.querySelector('#vg-w-param-demo-kani-bound-contract');
+      const readout = root.querySelector('#vg-w-param-demo-kani-bound-readout');
+      const cover = root.querySelector('#vg-w-param-demo-kani-bound-cover');
+      const vtitle = root.querySelector('#vg-w-param-demo-kani-bound-vtitle');
+      const vtext = root.querySelector('#vg-w-param-demo-kani-bound-vtext');
+      const vbox = root.querySelector('#vg-w-param-demo-kani-bound-vbox');
+      const bugmark = root.querySelector('#vg-w-param-demo-kani-bound-bugmark');
+      const BUG = 7, N = 13, X0 = 16, W = 48, GAP = 4, Y = 100, H = 56;
+
+      const rects = [];
+      for (let i = 0; i < N; i++) {
+        const x = X0 + i * (W + GAP);
+        const r = document.createElementNS(NS, 'rect');
+        r.setAttribute('x', x); r.setAttribute('y', Y);
+        r.setAttribute('width', W); r.setAttribute('height', H);
+        r.setAttribute('rx', '3');
+        slotsG.appendChild(r);
+        rects.push(r);
+        const t = document.createElementNS(NS, 'text');
+        t.setAttribute('x', x + W / 2); t.setAttribute('y', Y + H + 18);
+        t.setAttribute('text-anchor', 'middle');
+        t.setAttribute('font-family', 'JetBrains Mono, monospace');
+        t.setAttribute('font-size', '11'); t.setAttribute('fill', 'var(--muted)');
+        t.textContent = i;
+        slotsG.appendChild(t);
+      }
+
+      function render() {
+        const k = Number(slider.value);
+        const on = contract.checked;
+        readout.textContent = k;
+        for (let i = 0; i < N; i++) {
+          const covered = on || i <= k;
+          rects[i].setAttribute('fill', covered
+            ? (on ? 'color-mix(in srgb, var(--sage-deep) 40%, transparent)' : 'color-mix(in srgb, var(--accent) 42%, transparent)')
+            : 'transparent');
+          rects[i].setAttribute('stroke', covered
+            ? (on ? 'var(--sage-deep)' : 'var(--accent)')
+            : 'var(--muted-2)');
+          rects[i].setAttribute('stroke-width', covered ? '1.5' : '1');
+        }
+        const caught = on || k >= BUG;
+        bugmark.setAttribute('fill', caught ? 'var(--accent)' : 'var(--muted-2)');
+        cover.textContent = on ? '已證明所有迭代（unbounded）' : ('已窮舉 unwind depth ≤ ' + k);
+        if (on) {
+          vbox.setAttribute('stroke', 'var(--sage-deep)');
+          vbox.setAttribute('fill', 'color-mix(in srgb, var(--sage-deep) 12%, var(--bg-soft))');
+          vtitle.setAttribute('fill', 'var(--sage-deep)');
+          vtitle.textContent = 'loop contract：對所有迭代成立（unbounded）';
+          vtext.textContent = '第 7 圈的 panic 要嘛被證明不會發生，要嘛被抓成 counterexample——bound 不再是天花板。';
+        } else if (k >= BUG) {
+          vbox.setAttribute('stroke', 'var(--accent)');
+          vbox.setAttribute('fill', 'color-mix(in srgb, var(--accent) 12%, var(--bg-soft))');
+          vtitle.setAttribute('fill', 'var(--accent-text)');
+          vtitle.textContent = 'counterexample：第 7 圈 panic（bound 夠深，抓到了）';
+          vtext.textContent = 'k 展開到 ' + k + '，涵蓋了第 7 圈，Kani 印出害它 panic 的那組具體輸入。';
+        } else {
+          vbox.setAttribute('stroke', 'var(--line)');
+          vbox.setAttribute('fill', 'var(--bg-soft)');
+          vtitle.setAttribute('fill', 'var(--ink)');
+          vtitle.textContent = 'unwind ≤ ' + k + '：範圍內沒有 counterexample';
+          vtext.textContent = '但第 7 圈的 panic 在 bound 之外——沒被證明，也沒被否證。';
+        }
+      }
+      slider.addEventListener('input', render);
+      contract.addEventListener('change', render);
+      render();
+    })();
+  </script>
+</figure>
+
+<p>拖這個 widget 你會撞到 bounded model checking 最誠實、也最容易被誤讀的一句話：k 之內找不到反例，只證明了「前 k 圈沒問題」，沒證明「永遠沒問題」。把 k 停在 6，畫面一片安靜，但那個藏在第 7 圈的 bug 明明還在。所以 bound 是一個 cost 與 coverage 的取捨——展開越深越接近完整，但式子越大、solver 越慢，沒有一個天生「正確」的 k。這也是為什麼論文說 Kani 是把 BMC「beyond bug-finding」推向「correctness guarantees」——因為單靠加大 bound，你永遠只能宣稱「找不到 bug」，不能宣稱「證明沒有 bug」。要跨過這條線，得換一套工具。</p>
+
+<h2>從 bounded 到 unbounded：contracts 買到什麼、代價是什麼</h2>
+
+<p>論文給的答案是一套 specification language。原文：「To extend verification from bounded to unbounded, Kani provides a specification language comprising function contracts, loop contracts, quantifiers, and function stubbing.」這四樣東西各自解掉 bounded 的一個死角，值得一件件看。</p>
+
+<p><strong>loop contracts</strong>直接對付上面那個 widget 的天花板。你不再把迴圈展開 k 次，而是給迴圈寫一條 invariant——一個「每一圈進出都成立」的性質。工具改成證這條 invariant 對「任意圈數」都保持，於是覆蓋一次跳到 unbounded，不再受 k 限制。這就是 widget 裡「加上 loop contract」那個勾勾在做的事。</p>
+
+<p><strong>function contracts</strong>與<strong>function stubbing</strong>是一對，解的是規模問題。當函式 <code>f</code> 呼叫 <code>g</code>，驗證 <code>f</code> 時預設得把 <code>g</code> 的整個函式體也展開進來——<code>g</code> 若又呼叫別人，狀態空間就這樣炸開。contract 讓你替 <code>g</code> 寫一份「前置條件 / 後置條件」的合約，驗證 <code>f</code> 時用這份合約取代 <code>g</code> 的實作（這就是 stubbing）；<code>g</code> 的合約本身再單獨驗一次。原本一次要嚼完整棵呼叫樹，被拆成一個個可以獨立驗證的小塊。這是模組化驗證，也是能撐到函式庫規模的關鍵。</p>
+
+<p><strong>quantifiers</strong>則讓你把性質寫成「對所有 / 存在」的形式——例如「陣列裡每個元素都小於某界」——而不必手動枚舉每個 index。這是把「對所有輸入證明」這件事，直接寫進規格語言的語法。</p>
+
+<p>這套工具用下去，論文報的成果是兩個數字，值得原封不動記住。其一，在工業 Rust 專案的 case study 中，contracts 把驗證「from panic-freedom to functional correctness」——也就是從「不會爆」升級到「算得對」——過程「uncovering six previously unknown bugs」，挖出六個先前沒人知道的 bug。要留意的是，論文沒有指名是哪些專案、也沒有列出這六個 bug 的細節，這裡只能照它的說法轉述。其二，也是最能說明它不是玩具的一個數字：「over 16,000 harnesses verified per code change in the Rust standard library verification campaign」——在 Rust 標準函式庫的驗證行動裡，每一次程式碼變更會跑超過一萬六千個 harness，而且是掛在 production CI 上跑。這代表 model checking 對 Rust 來說，已經從論文附錄裡的技術，變成標準庫日常擋 regression 的一道關卡。</p>
+
+<p>那代價呢？誠實講三條。第一，state-space explosion 沒有消失——contract 與 stubbing 是在對抗它，不是消滅它；遇到結構複雜的狀態，solver 還是會卡到跑不完。第二，bound 的取捨依然在，凡是沒被 loop contract 蓋住的迴圈，你仍要挑一個 k，仍要承擔挑錯的風險。第三，也是最根本的一條：要驗 functional correctness，你得先把「對」寫成 contract。這不是免費的——它把「這段程式到底該做什麼」這個平常藏在工程師腦子裡的東西，逼你落成白紙黑字的規格。很多時候，光是寫這份規格的過程，就已經把設計上的模糊處照出來了。</p>
+
+<p>還有一條要先講在前面的期望管理：不是每段 Rust 都驗得動。BMC 的成本跟式子大小走，遇到大量 heap aliasing、深層遞迴、或展不完的大迴圈，solver 會直接跑到 timeout——這時你拿到的不是「證明成立」，也不是「找到 bug」，而是「不知道」。這是這類方法的第三種結局，也是最需要心理準備的一種：它不代表工具壞了，代表這個問題落在可判定性與成本的鋼索之外。實務上的解法往往是回頭改 harness——縮小 assume 的範圍、用 stubbing 把貴的 callee 換成 contract、把大迴圈換成 loop contract——把問題壓回 solver 撐得住的尺寸。換句話說，寫得動的 harness 本身就是一種工程技藝，跟寫得對的測試一樣需要練。</p>
+
+<p>那什麼時候該把這套東西搬進自己的專案？照這篇的定位合理的判斷是：越靠近 unsafe、越靠近「輸入來自外部而且必須全對」的地方，投報率越高。寫 parser、寫 allocator、寫 <code>no_std</code> 的資料結構、包一層 FFI 邊界——這些地方一個越界或溢位就是 CVE，而它們的輸入空間又大到測試永遠抽不乾淨，正是 model checking 的主場。採用路徑也不必一步到位：先為關鍵函式寫一個只求 panic-freedom 的 harness，讓 Kani 用自動檢查免費幫你掃一輪算術與越界；等這關穩了，再逐步為它補 contract，把驗證往 functional correctness 推。標準函式庫那個每次變更跑一萬六千個 harness 的數字，說白了就是這條路徑走到規模化之後的樣子。</p>
+
+<p class="vg-deep-closer"><strong>Take-away</strong>：測試問「這組輸入對不對」，model checking 問「有沒有任何一組輸入會出錯」；Kani 把後者接到 rustc 守不到的三個地帶——unsafe soundness、panic-freedom、functional correctness——而 bounded 的意思，永遠是「在你選的深度之內」，跨過那條線要靠 contract，不是靠把 k 調大。</p>
+
+</div>
