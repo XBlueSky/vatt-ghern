@@ -1,0 +1,407 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">把每一條執行緒的寫入都交給同一個 combiner 依序套用，聽起來像退回單執行緒的年代——FlintKV 的賭注是：在 byte-addressable 的 NVM 上，這種集中反而讓吞吐更好擴展。</p>
+  <h1 class="vg-post-title">{{ title }}</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p><span class="vg-dropcap">F</span>lintKV 是一個把儲存引擎放到 NVM 上重新設計的 skiplist 引擎，它想解決的問題很具體：現有的 NVM key-value 儲存在寫入與點查上很快，卻沒把生產資料庫真正需要的那組介面保證做齊——時間點快照、一致性迭代器、原子批次。少了這幾樣，交易與並行控制就沒有地基可站。這篇論文是一份 arXiv preprint，來自 Royal Holloway 與 University of Surrey 的研究團隊；下文所有具體宣稱都以它的摘要為準，摘要沒攤開的演算法細節，我會明確標成一般背景或推測。</p>
+
+  <h2>先前的 NVM KV 儲存少了什麼</h2>
+
+  <p>NVM 的賣點是 byte 定址加上非揮發——理論上你可以把整個資料結構直接擺在持久記憶體裡，不必再走「揮發性記憶體結構加一份 write-ahead log 落盤」的兩層老設計。近幾年的 NVM key-value 儲存確實把 ingestion 與 point lookup 的吞吐推得很高。論文的說法是這些系統「achieve high throughput for ingestion and point lookups」，但緊接著點名它們「omit or under-specify」了更豐富的介面保證。快歸快，能給的介面卻是殘缺的。</p>
+
+  <p>傳統引擎為什麼要那兩層？因為 DRAM 一斷電就沒了，真正的資料得先寫進一份 append-only 的 log 落到磁碟，記憶體裡的結構只是加速用的鏡像，崩潰後靠 replay log 重建。NVM 把這個前提打掉——結構本身就在非揮發媒介上，指標跨重開機仍然有效，理論上可以省掉 log 那一層。但省掉 log 不等於免費：你得自己保證結構在任何一個崩潰點都是可恢復的，這正是後面 durable linearizability 那一節要處理的問題。</p>
+
+  <p>生產級引擎——論文舉的例子是 RocksDB——提供三樣東西：point-in-time snapshots、consistent iterators、atomic batches。這三樣不是錦上添花，摘要的原話是它們「features essential for implementing transactions and concurrency control」。你要做 MVCC 讀、要在一個 batch 裡原子地改多把 key、要在不被並行寫入干擾的情況下掃過一段 range，全靠它們撐著。先前的 NVM 儲存把這幾樣省略或含糊帶過，於是它們適合當快取或當純粹的 ingestion 引擎，卻難以直接拿來當交易資料庫的底層。下面這張表把三個保證在三類系統上的狀態並排，看清楚缺口在哪。</p>
+
+  <p>把這三樣拆開看，就知道為什麼少了它們就當不了交易底層。時間點快照是 snapshot isolation 的地基——交易要在一個固定的檢視上讀，才不會讀到別人做到一半的狀態。一致性迭代器讓 range scan 在整段掃描期間看到同一個快照，否則一邊掃一邊被寫入插隊，掃出來的結果自相矛盾。原子批次則保證一組跨多把 key 的修改要嘛全成、要嘛全不成，這是實作交易 commit 的最小單位。三樣缺一，上層就得自己在應用碼裡補回來，而在儲存引擎外面補這些保證，通常又慢又容易錯。</p>
+
+  <figure class="vg-w-table-flintkv-api" data-mobile="keep">
+    <style>
+      .vg-w-table-flintkv-api { overflow-x: auto; }
+      .vg-w-table-flintkv-api table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-flintkv-api caption { text-align: left; caption-side: top; font-family: var(--scribed); font-style: italic; color: var(--muted); font-size: var(--fs-sm); padding: var(--s-1) 0; }
+      .vg-w-table-flintkv-api thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); }
+      .vg-w-table-flintkv-api thead th.flint { color: var(--accent-text); }
+      .vg-w-table-flintkv-api tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+      .vg-w-table-flintkv-api td.feat { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.04em; color: var(--ink); }
+      .vg-w-table-flintkv-api td.gap { color: var(--muted); }
+      .vg-w-table-flintkv-api td.have { color: var(--ink-soft); }
+      .vg-w-table-flintkv-api td.flint { color: var(--accent-text); }
+      .vg-w-table-flintkv-api tbody tr:hover td { background: var(--bg-soft); }
+    </style>
+    <table>
+      <caption>摘要點名的三個保證，在三類系統上的狀態。生產級引擎有，先前 NVM 儲存「省略或含糊」，FlintKV 宣稱原生支援。</caption>
+      <thead>
+        <tr>
+          <th>保證</th>
+          <th>生產級引擎（如 RocksDB）</th>
+          <th>先前 NVM KV 儲存</th>
+          <th class="flint">FlintKV</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="feat">時間點快照</td>
+          <td class="have">提供</td>
+          <td class="gap">省略／含糊帶過</td>
+          <td class="flint">原生支援</td>
+        </tr>
+        <tr>
+          <td class="feat">一致性迭代器</td>
+          <td class="have">提供</td>
+          <td class="gap">省略／含糊帶過</td>
+          <td class="flint">原生支援（snapshot-consistent）</td>
+        </tr>
+        <tr>
+          <td class="feat">原子批次</td>
+          <td class="have">提供</td>
+          <td class="gap">省略／含糊帶過</td>
+          <td class="flint">原生支援，且宣稱高效</td>
+        </tr>
+      </tbody>
+    </table>
+  </figure>
+
+  <p>FlintKV 的定位就是把這一整欄補齊：摘要說它「natively supports the full API of production key-value stores」，並且可以獨立部署，也可以只把它那條 durable skiplist 拆下來，整合進既有的 NVM 儲存，替它們補上同一組能力。接下來三個小節依序拆它的三個核心元件：並行控制、多版本、持久化與崩潰語意。</p>
+
+  <p>順帶解釋一個選型：摘要說 FlintKV 是 skiplist-based。skiplist 用多層機率性的索引取代平衡樹的旋轉，插入與刪除不需要整棵樹重新平衡，這在並行場景特別友善——改動局部化，容易做到細粒度的並行或無鎖插入。放到 NVM 上還多一個好處：沒有旋轉就沒有大範圍的節點搬移，需要 flush 與 fence 的持久化寫入比較集中、比較好推理。合理的推測是，FlintKV 選 skiplist 而非 B-tree，一部分正是衝著這個持久化上的單純。</p>
+
+  <p>還有一個部署上的細節值得記住：摘要說這條 durable skiplist 可以被整合進既有的 NVM 儲存。也就是說，就算你手上已經有一套跑在 NVM 上、只做 ingestion 與點查的儲存，理論上也能把 FlintKV 這條 skiplist 接進去，替它補上快照與原子批次，而不必整個換掉。對已經投資在某個 NVM 儲存上的團隊，這是個實際的選項——是加一個元件，而不是砍掉重練。</p>
+
+  <h2>flat-combining 並行控制</h2>
+
+  <p>FlintKV 的核心，論文稱為「a novel flat-combining based concurrency control algorithm」。flat-combining 本身是一個已有的並行技術，先講它的一般樣貌：與其讓每條執行緒各自去搶同一把鎖、在共享結構上做自己那一小步，不如讓執行緒把「我想做的操作」publish 到一個公開的 slot，然後由其中一條被選為 combiner 的執行緒，一趟把大家 pending 的操作全部掃過去、套用到共享結構上。摘要只說 FlintKV 以 flat-combining 為基礎，並結合 multi-versioning 與共同設計的持久化，沒有把演算法細節攤開，所以底下對 combiner 運作的描述是這個技術的一般形態，FlintKV 具體怎麼接，還要看全文。</p>
+
+  <p>為什麼集中反而快？關鍵在 cache coherence。一把被高度爭用的鎖，會在各個 core 的 cache line 之間來回彈跳，每次 acquire 與 release 都是一次跨 core 的 coherence traffic；執行緒越多，這種 ping-pong 越兇，實際吞吐不升反降。flat-combining 把這件事翻過來：共享結構只有 combiner 一條執行緒碰，結構的 cache line 幾乎待在同一個 core 上；其他執行緒只寫自己的 publication slot，彼此不爭。批次套用還有第二個好處——多個操作可以攤在一起做一次持久化，把 fence 與 flush 的固定成本分攤掉。合理的推測是，FlintKV 之所以把 flat-combining 跟 NVM 綁在一起談，正是看上「一趟 combiner pass 對應一次批次持久化」這個對齊。</p>
+
+  <p>flat-combining 的實作細節通常長這樣：每條執行緒有一筆 publication record，欄位裡放它要做的操作與一個結果槽。想做操作時，執行緒把 record 掛上一個公開的 publication list，然後 spin 等待——要嘛自己搶到 combiner 角色、要嘛等別人幫它做完。搶到 combiner 的那條執行緒掃一遍 list，把每筆 pending 操作套用到共享結構、把結果寫回各自的結果槽，再放掉 combiner 角色。這個角色是動態輪替的，不是固定某條執行緒專職。表面看像退回單執行緒，但省掉的鎖爭用與 cache 彈跳，往往比「一條執行緒依序做」的損失更划算，尤其在寫多、爭用重的場景。</p>
+
+  <p>值得跟另一條路對照：很多高效能結構走 lock-free，用 CAS 讓多條執行緒無鎖地並行改結構。lock-free 在讀多的場景很漂亮，但寫爭用一重，CAS 一直失敗重試，同樣會把 cache line 打得到處跑；而且要正確地在 lock-free 結構上疊加快照、原子批次、崩潰一致這幾層保證，難度很高。flat-combining 選了相反的取捨：放棄結構上的並行，換來一個乾淨的單點——所有變更都經過 combiner，快照要凍結哪個版本、批次的邊界在哪、fence 該發在哪，全都好講。合理的推測是，FlintKV 押 flat-combining 而不是 lock-free，正是因為它要的是那一整組保證，而不只是裸吞吐。</p>
+
+  <p>當然 flat-combining 不是萬靈丹。它把並行度壓到一條 combiner，讀多寫少、爭用很輕的工作負載反而吃虧——那種場景每條執行緒各走各的最快，硬要繞去 publication list 排隊只是多繞一圈。它的甜蜜區是寫入密集、爭用重、而且每個操作本身不算太大的場景，這時省下的爭用成本遠大於失去的結構並行。摘要把 flat-combining 跟 NVM 的批次持久化綁在一起賣，暗示 FlintKV 針對的正是這一類寫入吃重的工作負載。</p>
+
+  <p>下面的互動圖把 combiner 這一趟掃描具象化：五條 worker 執行緒各自 publish 一個操作，你拖動中間那條 combiner 游標掃過它們，被掃過的操作就被套用、蓋上一個單調遞增的版本號。注意整條 skiplist 只有 combiner 在改，worker 從頭到尾沒有碰結構本身。</p>
+
+  <figure class="vg-w-combine-flintkv" data-mobile="static" data-svg-scroll="880">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <polyline points="18 8 22 12 18 16"/><polyline points="6 8 2 12 6 16"/><line x1="2" y1="12" x2="22" y2="12"/>
+      </svg>
+      <span>拖動 combiner 游標掃過 5 條執行緒 · 看批次套用與版本遞增</span>
+    </p>
+    <style>
+      .vg-w-combine-flintkv svg { width: 100%; height: auto; }
+      .vg-w-combine-flintkv .thr rect { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; }
+      .vg-w-combine-flintkv .thr.applied rect { fill: var(--accent); fill-opacity: 0.20; stroke: var(--accent); }
+      .vg-w-combine-flintkv .thr .op { font-family: JetBrains Mono, monospace; font-size: 15px; fill: var(--ink); }
+      .vg-w-combine-flintkv .thr .state { font-family: Manrope, sans-serif; font-size: 12px; fill: var(--muted); }
+      .vg-w-combine-flintkv .thr.applied .state { fill: var(--accent-text); }
+      .vg-w-combine-flintkv .stamp { font-family: JetBrains Mono, monospace; font-size: 13px; fill: var(--accent-text); }
+      .vg-w-combine-flintkv #vg-w-combine-flintkv-handle { cursor: grab; touch-action: none; }
+      .vg-w-combine-flintkv #vg-w-combine-flintkv-handle rect { fill: var(--ink-deep); }
+      .vg-w-combine-flintkv #vg-w-combine-flintkv-handle text { font-family: Manrope, sans-serif; font-size: 12px; fill: var(--bg); }
+      .vg-w-combine-flintkv .cline { stroke: var(--ink-deep); stroke-width: 2; stroke-dasharray: 4 3; }
+      .vg-w-combine-flintkv .lbl { font-family: IM Fell English, serif; font-style: italic; font-size: 13px; fill: var(--muted); }
+      .vg-w-combine-flintkv .big { font-family: EB Garamond, serif; font-size: 30px; fill: var(--ink); font-variant-numeric: tabular-nums; }
+    </style>
+    <svg class="vg-w-combine-flintkv-main" viewBox="0 0 880 320" role="img" aria-label="flat-combining：五條執行緒各 publish 一個操作，單一 combiner 游標掃過後批次套用並遞增版本號">
+      <text x="20" y="28" class="lbl">worker 執行緒各自 publish 一個操作到自己的 slot（不碰共享結構）</text>
+
+      <g class="thr applied" data-cx="140" data-i="1">
+        <rect x="85" y="60" width="110" height="64" rx="4"/>
+        <text x="140" y="92" text-anchor="middle" class="op">PUT a</text>
+        <text x="140" y="112" text-anchor="middle" class="state">applied</text>
+        <text x="140" y="146" text-anchor="middle" class="stamp">@v101</text>
+      </g>
+      <g class="thr applied" data-cx="280" data-i="2">
+        <rect x="225" y="60" width="110" height="64" rx="4"/>
+        <text x="280" y="92" text-anchor="middle" class="op">PUT b</text>
+        <text x="280" y="112" text-anchor="middle" class="state">applied</text>
+        <text x="280" y="146" text-anchor="middle" class="stamp">@v102</text>
+      </g>
+      <g class="thr" data-cx="420" data-i="3">
+        <rect x="365" y="60" width="110" height="64" rx="4"/>
+        <text x="420" y="92" text-anchor="middle" class="op">DEL c</text>
+        <text x="420" y="112" text-anchor="middle" class="state">pending</text>
+        <text x="420" y="146" text-anchor="middle" class="stamp" style="display:none">@v103</text>
+      </g>
+      <g class="thr" data-cx="560" data-i="4">
+        <rect x="505" y="60" width="110" height="64" rx="4"/>
+        <text x="560" y="92" text-anchor="middle" class="op">PUT d</text>
+        <text x="560" y="112" text-anchor="middle" class="state">pending</text>
+        <text x="560" y="146" text-anchor="middle" class="stamp" style="display:none">@v104</text>
+      </g>
+      <g class="thr" data-cx="700" data-i="5">
+        <rect x="645" y="60" width="110" height="64" rx="4"/>
+        <text x="700" y="92" text-anchor="middle" class="op">PUT a</text>
+        <text x="700" y="112" text-anchor="middle" class="state">pending</text>
+        <text x="700" y="146" text-anchor="middle" class="stamp" style="display:none">@v105</text>
+      </g>
+
+      <g id="vg-w-combine-flintkv-handle" transform="translate(350,0)" role="slider" tabindex="0" aria-label="combiner 游標位置" aria-valuemin="0" aria-valuemax="5" aria-valuenow="2">
+        <line class="cline" x1="0" y1="52" x2="0" y2="250"/>
+        <rect x="-30" y="30" width="60" height="22" rx="3"/>
+        <text x="0" y="45" text-anchor="middle">combiner</text>
+      </g>
+
+      <line x1="60" y1="200" x2="820" y2="200" stroke="var(--muted-2)" stroke-width="1"/>
+      <text x="20" y="238" class="lbl">shared durable skiplist — 只有 combiner 這條執行緒會改它</text>
+
+      <text x="560" y="258" class="lbl">global version</text>
+      <text x="560" y="300" class="big" data-ver="">102</text>
+      <text x="642" y="300" class="lbl">·  本趟批次套用 <tspan data-batch="">2</tspan> 個操作</text>
+    </svg>
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        const root = document.querySelector('.vg-w-combine-flintkv');
+        const svg = root.querySelector('svg.vg-w-combine-flintkv-main');
+        const handle = root.querySelector('#vg-w-combine-flintkv-handle');
+        const verOut = root.querySelector('[data-ver]');
+        const batchOut = root.querySelector('[data-batch]');
+        const threads = Array.from(svg.querySelectorAll('.thr'));
+        const X_MIN = 90, X_MAX = 770;
+        let curX = 350;
+        function toVBx(clientX) {
+          const pt = svg.createSVGPoint();
+          pt.x = clientX; pt.y = 0;
+          const p = pt.matrixTransform(svg.getScreenCTM().inverse());
+          return Math.max(X_MIN, Math.min(X_MAX, p.x));
+        }
+        function apply(x) {
+          let n = 0;
+          threads.forEach((t) => {
+            const cx = Number(t.dataset.cx);
+            const on = cx < x;
+            t.classList.toggle('applied', on);
+            const stamp = t.querySelector('.stamp');
+            const state = t.querySelector('.state');
+            if (on) { n++; stamp.style.display = ''; state.textContent = 'applied'; }
+            else { stamp.style.display = 'none'; state.textContent = 'pending'; }
+          });
+          verOut.textContent = String(100 + n);
+          batchOut.textContent = String(n);
+          handle.setAttribute('aria-valuenow', String(n));
+        }
+        function setX(x) {
+          x = Math.max(X_MIN, Math.min(X_MAX, x));
+          curX = x;
+          handle.setAttribute('transform', 'translate(' + x + ',0)');
+          apply(x);
+        }
+        let dragging = false;
+        handle.addEventListener('pointerdown', (e) => { dragging = true; handle.setPointerCapture(e.pointerId); handle.style.cursor = 'grabbing'; e.preventDefault(); });
+        handle.addEventListener('pointermove', (e) => { if (dragging) setX(toVBx(e.clientX)); });
+        handle.addEventListener('pointerup', () => { dragging = false; handle.style.cursor = 'grab'; });
+        handle.addEventListener('keydown', (e) => {
+          if (e.key === 'ArrowRight') { setX(curX + 40); e.preventDefault(); }
+          if (e.key === 'ArrowLeft') { setX(curX - 40); e.preventDefault(); }
+        });
+        svg.addEventListener('click', (e) => { if (!dragging) setX(toVBx(e.clientX)); });
+        setX(350);
+      })();
+    </script>
+    <figcaption>拖動 combiner 游標：它左邊的操作已被批次套用、蓋上單調遞增的版本號，右邊仍是 pending。worker 全程只寫自己的 slot，沒有一條 worker 碰共享結構——這就是 flat-combining 用「集中」換掉「爭用」的方式。版本號與操作為示意，非量測資料。</figcaption>
+  </figure>
+
+  <h2>multi-versioning 與快照讀取</h2>
+
+  <p>光有 combiner 還不夠。摘要要 FlintKV 同時做到「snapshot-consistent iteration」——你在某個時間點開一個迭代器，掃過一段 range，看到的必須是那個時間點的一致檢視，不能一半舊一半新，也不能被之後才發生的寫入改掉。做法是 multi-versioning：每次寫入不就地覆蓋，而是替那把 key 追加一個新版本，蓋上當時的全域版本號，舊版本留著。點查跟迭代因此都變成「在版本鏈上挑一個版本」的問題。</p>
+
+  <p>有了版本鏈，快照讀取就變簡單：一個快照等於「凍結在某個版本號 S」。讀某把 key，就沿它的版本鏈找出版本號不超過 S 的最新那個。並行的寫入會產生版本號大於 S 的新版本，但快照看不到它們，於是迭代器全程看到一致的檢視，而且完全不擋寫入——讀跟寫走的是不同版本，不需要互相等待。代價是舊版本要一直留到沒有任何存活的快照還會用到它，之後才能回收，這是所有 MVCC 系統共通的 garbage collection 難題，摘要沒有交代 FlintKV 在 NVM 上怎麼處理這一段。下面這個滑桿讓你把快照的版本號沿時間軸拖動，看三把 key 各自解析到哪一個版本。</p>
+
+  <p>版本要放在哪、怎麼找，是 multi-versioning 的實作重點。常見做法是每把 key 掛一條依版本號排序的版本鏈，讀取沿鏈找第一個不超過快照的版本，寫入則在鏈頭接上新版本。這帶來兩個成本：一是讀取可能要跳過幾個太新的版本，二是舊版本會累積，得靠一套回收機制在「沒有任何存活快照會用到某版本」時把它清掉，常見的是 epoch-based reclamation 這類技巧。放到 NVM 上，回收還多一層麻煩——被回收的空間本身是持久的，崩潰後不能留下懸空引用，摘要沒有說 FlintKV 這一段怎麼設計。</p>
+
+  <p>點查跟迭代器在這裡是兩種不同的讀。點查給一把 key，沿它的版本鏈挑一個版本就結束。迭代器要掃一整段 range，難的地方在於整趟掃描必須固定在同一個快照上——即使掃到一半有並行寫入進來，也要當作沒看見。有了全域版本號，這件事就退化成「整趟迭代都用同一個 S 去解析每把 key」，實作上乾淨得多。</p>
+
+  <p>原子批次在這個框架裡也順勢變簡單。一個 batch 是一組要一起生效的寫入；交給 combiner，它在同一趟 pass 裡把整批套用、蓋上同一個版本號，然後才讓這個版本號對讀者可見。於是外界要嘛看到整批（版本號已推進），要嘛完全看不到（版本號還沒推進），沒有中間態——這正是原子性要的。快照、一致性迭代、原子批次三樣，最後其實都收斂到同一個機制：一個由 combiner 單點推進的全域版本號。這也是為什麼把並行控制設計成單點，反而讓這些保證變得好做。</p>
+
+  <figure class="vg-w-mvcc-flintkv" data-mobile="static" data-svg-scroll="720">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <polyline points="18 8 22 12 18 16"/><polyline points="6 8 2 12 6 16"/><line x1="2" y1="12" x2="22" y2="12"/>
+      </svg>
+      <span>拖動滑桿移動快照版本 · 三把 key 各自解析到不超過該版本的最新版本</span>
+    </p>
+    <style>
+      .vg-w-mvcc-flintkv { display: grid; gap: var(--s-2); }
+      .vg-w-mvcc-flintkv .controls { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+      .vg-w-mvcc-flintkv .controls input { flex: 1; height: 36px; accent-color: var(--accent); touch-action: none; }
+      .vg-w-mvcc-flintkv .controls .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 4ch; text-align: right; }
+      .vg-w-mvcc-flintkv svg { width: 100%; height: auto; }
+      .vg-w-mvcc-flintkv .ver { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; }
+      .vg-w-mvcc-flintkv .ver.resolved { fill: var(--accent); fill-opacity: 0.25; stroke: var(--accent); stroke-width: 2.5; }
+      .vg-w-mvcc-flintkv .vlabel { font-family: JetBrains Mono, monospace; font-size: 12px; fill: var(--muted); }
+      .vg-w-mvcc-flintkv .klabel { font-family: JetBrains Mono, monospace; font-size: 14px; fill: var(--ink); }
+      .vg-w-mvcc-flintkv .snap { stroke: var(--ink-deep); stroke-width: 2; }
+      .vg-w-mvcc-flintkv .axis { font-family: IM Fell English, serif; font-style: italic; font-size: 12px; fill: var(--muted); }
+      .vg-w-mvcc-flintkv .resolve-out { font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink-soft); font-variant-numeric: tabular-nums; }
+      .vg-w-mvcc-flintkv .resolve-out em { color: var(--accent-text); font-style: normal; }
+    </style>
+    <div class="controls" data-vg-controls>
+      <label for="vg-w-mvcc-flintkv-s">snapshot 版本 S =</label>
+      <input id="vg-w-mvcc-flintkv-s" type="range" min="1" max="18" step="1" value="12"/>
+      <span class="readout">12</span>
+    </div>
+    <svg class="vg-w-mvcc-flintkv-main" viewBox="0 0 720 300" role="img" aria-label="三把 key 的版本鏈與快照讀取：快照凍結在版本 S，每把 key 解析到不超過 S 的最新版本">
+      <text x="30" y="34" class="axis">key</text>
+      <text x="360" y="34" text-anchor="middle" class="axis">全域版本號軸（寫入依全域版本累加）→</text>
+
+      <line class="snap" id="vg-w-mvcc-flintkv-snapline" x1="452" y1="52" x2="452" y2="270"/>
+      <text id="vg-w-mvcc-flintkv-snaptext" x="452" y="48" text-anchor="middle" class="axis" fill="var(--ink-deep)">S=12</text>
+
+      <text x="30" y="118" class="klabel">user:42</text>
+      <g data-row="A">
+        <circle class="ver" data-v="3" cx="156" cy="112" r="13"/>
+        <text class="vlabel" x="156" y="140" text-anchor="middle">v3</text>
+        <circle class="ver resolved" data-v="8" cx="321" cy="112" r="13"/>
+        <text class="vlabel" x="321" y="140" text-anchor="middle">v8</text>
+        <circle class="ver" data-v="14" cx="518" cy="112" r="13"/>
+        <text class="vlabel" x="518" y="140" text-anchor="middle">v14</text>
+      </g>
+
+      <text x="30" y="180" class="klabel">cart:7</text>
+      <g data-row="B">
+        <circle class="ver" data-v="5" cx="222" cy="174" r="13"/>
+        <text class="vlabel" x="222" y="202" text-anchor="middle">v5</text>
+        <circle class="ver resolved" data-v="11" cx="419" cy="174" r="13"/>
+        <text class="vlabel" x="419" y="202" text-anchor="middle">v11</text>
+      </g>
+
+      <text x="30" y="242" class="klabel">flag:on</text>
+      <g data-row="C">
+        <circle class="ver" data-v="2" cx="123" cy="236" r="13"/>
+        <text class="vlabel" x="123" y="264" text-anchor="middle">v2</text>
+        <circle class="ver resolved" data-v="9" cx="354" cy="236" r="13"/>
+        <text class="vlabel" x="354" y="264" text-anchor="middle">v9</text>
+        <circle class="ver" data-v="16" cx="584" cy="236" r="13"/>
+        <text class="vlabel" x="584" y="264" text-anchor="middle">v16</text>
+      </g>
+    </svg>
+    <div class="resolve-out" data-resolve>快照 S=12：user:42 → <em>v8</em>　cart:7 → <em>v11</em>　flag:on → <em>v9</em></div>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-mvcc-flintkv');
+        const input = root.querySelector('#vg-w-mvcc-flintkv-s');
+        const readout = root.querySelector('.controls .readout');
+        const svg = root.querySelector('svg.vg-w-mvcc-flintkv-main');
+        const line = root.querySelector('#vg-w-mvcc-flintkv-snapline');
+        const snaptext = root.querySelector('#vg-w-mvcc-flintkv-snaptext');
+        const out = root.querySelector('[data-resolve]');
+        const rows = Array.from(svg.querySelectorAll('g[data-row]'));
+        const names = { A: 'user:42', B: 'cart:7', C: 'flag:on' };
+        function xOf(v) { return 90 + (v - 1) / 17 * 560; }
+        function update() {
+          const S = Number(input.value);
+          readout.textContent = String(S);
+          const x = xOf(S);
+          line.setAttribute('x1', x); line.setAttribute('x2', x);
+          snaptext.setAttribute('x', x); snaptext.textContent = 'S=' + S;
+          const parts = [];
+          rows.forEach((g) => {
+            const circles = Array.from(g.querySelectorAll('.ver'));
+            let best = null;
+            circles.forEach((c) => {
+              c.classList.remove('resolved');
+              const v = Number(c.dataset.v);
+              if (v <= S && (best === null || v > Number(best.dataset.v))) best = c;
+            });
+            const key = names[g.dataset.row];
+            if (best) { best.classList.add('resolved'); parts.push(key + ' → <em>v' + best.dataset.v + '</em>'); }
+            else { parts.push(key + ' → <em>尚未可見</em>'); }
+          });
+          out.innerHTML = '快照 S=' + S + '：' + parts.join('　');
+        }
+        input.addEventListener('input', update);
+        update();
+      })();
+    </script>
+    <figcaption>把快照 S 往右拖，看得到的版本就越新；往左拖到某把 key 的第一個版本之前，它就「尚未可見」。並行寫入只會在軸的右邊追加新版本，永遠不改動快照已經凍結的檢視。版本號為示意結構，非量測資料。</figcaption>
+  </figure>
+
+  <h2>durable linearizability 與共同設計的持久化</h2>
+
+  <p>FlintKV 對外的正確性保證是 durable linearizability。先把兩個詞拆開。linearizability 是說每個操作看起來都在它的呼叫與回傳之間某一個瞬間原子地生效，整個系統的行為等價於某個合法的循序執行。durable（或 persistent）linearizability 多加一條：這個「生效瞬間」的效果必須在崩潰後還在。換句話說，一個操作在回報成功之前，它的效果必須已經持久化；否則你 ack 了使用者、機器一斷電、那筆寫入卻不見了，就違反了保證。</p>
+
+  <p>這條保證在 NVM 上不是免費的。CPU 對 NVM 的寫入會先停在 cache 裡，要靠 cache line flush 加上 store fence 才能確定真的落到持久媒介；順序也要自己顧，不然崩潰後可能看到「後面的寫入到了、前面的還沒到」這種撕裂狀態。摘要用的詞是「carefully co-designed persistence mechanisms」——並行控制跟持久化是一起設計的，不是先做好一個無鎖結構、再事後補一層 flush。合理的推測是，combiner 的批次語意在這裡又幫上忙：一趟 pass 套用完一批操作後做一次 fence，就把這批操作的 durability 邊界對齊在同一個點上，而不是每個操作各 fence 一次。下面用一張對照圖說明「有沒有把持久化擺進 ack 之前」對崩潰後的結果差在哪。</p>
+
+  <p>具體到 x86，把一筆寫入推到 NVM 大致是這樣：先寫進 cache line，再用 clwb 或 clflushopt 把那條 line 寫回持久域，最後一個 sfence 確保前面的 flush 都完成、且不會跟後面的寫入亂序。少了 fence，CPU 與記憶體控制器完全可以把寫入重排，於是崩潰後看到的持久狀態可能是任意一個中間態。這也是為什麼並行控制跟持久化得一起設計：什麼時候發 fence、哪些寫入要在同一個 fence 之前落地、combiner 一趟 pass 的邊界怎麼跟 durability 的邊界對齊，這些決定同時牽動正確性與效能，拆開來各做各的往往兩頭不討好。</p>
+
+  <p>durable linearizability 還有常被略過的另一半：崩潰之後。保證不只是「已 ack 的寫入還在」，也包含「重開機後結構能回到一個一致、可用的狀態」，不能留下改到一半的節點、指向已回收空間的指標、或斷掉的版本鏈。所以持久化設計通常要搭配一套 recovery 程序，在重新啟動時掃描並修補這些半成品。摘要只給了 durable linearizability 這個結論性的保證，沒有描述 FlintKV 的 recovery 具體怎麼走；但凡是宣稱這個等級保證的系統，這一塊都躲不掉。</p>
+
+  <figure class="vg-w-durlin-flintkv" data-mobile="keep" data-svg-scroll="880">
+    <style>
+      .vg-w-durlin-flintkv svg { width: 100%; height: auto; }
+      .vg-w-durlin-flintkv .lane { font-family: IM Fell English, serif; font-style: italic; font-size: 14px; }
+      .vg-w-durlin-flintkv .step { font-family: Manrope, sans-serif; font-size: 12px; fill: var(--ink); }
+      .vg-w-durlin-flintkv .note { font-family: EB Garamond, serif; font-size: 13px; fill: var(--muted); }
+      .vg-w-durlin-flintkv .crash { font-family: Manrope, sans-serif; font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; fill: var(--accent-text); }
+      .vg-w-durlin-flintkv .lost { fill: var(--muted); }
+      .vg-w-durlin-flintkv .survive { fill: var(--sage-deep); }
+    </style>
+    <svg viewBox="0 0 880 300" role="img" aria-label="對照圖：只保證 linearizability 時 ack 在持久化之前，崩潰後寫入遺失；durable linearizability 把持久化擺進 ack 之前，崩潰後寫入存活">
+      <line x1="470" y1="30" x2="470" y2="272" stroke="var(--accent)" stroke-width="2" stroke-dasharray="5 4"/>
+      <text x="470" y="24" text-anchor="middle" class="crash">crash 斷電</text>
+
+      <text x="20" y="70" class="lane" fill="var(--muted)">只保證 linearizability</text>
+      <rect x="60" y="86" width="130" height="34" rx="4" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.5"/>
+      <text x="125" y="107" text-anchor="middle" class="step">write 生效（僅在 cache）</text>
+      <rect x="210" y="86" width="90" height="34" rx="4" fill="var(--ink-deep)" fill-opacity="0.18" stroke="var(--ink-deep)" stroke-width="1.5"/>
+      <text x="255" y="107" text-anchor="middle" class="step">ack 使用者</text>
+      <line x1="300" y1="103" x2="455" y2="103" stroke="var(--muted-2)" stroke-width="1.5" stroke-dasharray="3 3"/>
+      <text x="330" y="96" class="note lost">尚未 flush / fence</text>
+      <text x="520" y="107" class="note lost">→ 寫入遺失，違反保證</text>
+
+      <text x="20" y="180" class="lane" fill="var(--accent-text)">durable linearizability</text>
+      <rect x="60" y="196" width="120" height="34" rx="4" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.5"/>
+      <text x="120" y="217" text-anchor="middle" class="step">write 進 cache</text>
+      <rect x="196" y="196" width="130" height="34" rx="4" fill="var(--accent)" fill-opacity="0.20" stroke="var(--accent)" stroke-width="1.5"/>
+      <text x="261" y="217" text-anchor="middle" class="step">flush + store fence</text>
+      <rect x="342" y="196" width="90" height="34" rx="4" fill="var(--ink-deep)" fill-opacity="0.18" stroke="var(--ink-deep)" stroke-width="1.5"/>
+      <text x="387" y="217" text-anchor="middle" class="step">ack 使用者</text>
+      <text x="330" y="190" class="note survive">持久化在 ack 之前</text>
+      <text x="520" y="217" class="note survive">→ 寫入存活，保證成立</text>
+
+      <text x="20" y="292" class="note">差別只有一步：把 flush + fence 擺在 ack 之前，還是之後。批次 combiner 讓這一步能攤在一整批操作上做一次。</text>
+    </svg>
+    <figcaption>durable linearizability 的一般定義：操作的效果必須在回報成功前落到持久媒介。摘要只斷言 FlintKV「guaranteeing durable linearizability」，此圖說明的是這個保證的語意，不是 FlintKV 的具體實作路徑。</figcaption>
+  </figure>
+
+  <h2>75% 從哪來，又不能過度解讀</h2>
+
+  <p>摘要給的唯一一個數字是：「up to a 75% improvement in end-to-end throughput over prior work」。逐字拆這句話有三個限定要記住。第一，是 up to——75% 是觀察到的上限，不是每個工作負載都有這麼多。第二，量的是 end-to-end throughput，是端到端吞吐，不是單一操作的延遲。第三，基準是 over prior work，而摘要沒有點名對照的是哪一個或哪幾個先前系統、在什麼硬體、什麼工作負載下量出來的。</p>
+
+  <p>所以正確的讀法是：在某些條件下，FlintKV 的端到端吞吐比它對照的先前工作高出最多 75%，而且是在「多做了快照、一致性迭代、原子批次、durable linearizability 這一整組保證」的前提下拿到的——這才是這個數字真正有意思的地方。通常加上這些保證會拖慢吞吐，FlintKV 宣稱不但補齊了保證還跑得更快。全文出來之前，把 75% 當成一個帶著大量前提的上限，而不是一個可以到處引用的通用倍數。下面那張圖只畫得出這唯一一個數字，以及它周圍那一圈不確定。</p>
+
+  <p>還有一個容易忽略的點：end-to-end 這個詞本身有訊息量。它量的不是某個微基準下的單點操作速率，而是把並行控制、多版本、持久化全部算進去之後、整條路徑跑完的吞吐。也就是說，這 75% 是在「已經付了那組保證的成本」之後還剩下的優勢，而不是把保證關掉測出來的漂亮數字。這讓它比一個孤立的 op/s 更有參考價值，但也更依賴對照組與工作負載的選擇——換一組 baseline，這個百分比可以完全不一樣。</p>
+
+  <figure class="vg-w-bench-flintkv" data-mobile="keep" data-svg-scroll="720">
+    <style>
+      .vg-w-bench-flintkv svg { width: 100%; height: auto; }
+      .vg-w-bench-flintkv .blabel { font-family: var(--serif); font-size: 14px; fill: var(--ink); }
+      .vg-w-bench-flintkv .num { font-family: JetBrains Mono, monospace; font-size: 14px; fill: var(--accent-text); font-variant-numeric: tabular-nums; }
+      .vg-w-bench-flintkv .axis { font-family: IM Fell English, serif; font-style: italic; font-size: 12px; fill: var(--muted); }
+      .vg-w-bench-flintkv .hedge { font-family: Manrope, sans-serif; font-size: 12px; fill: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+    </style>
+    <svg viewBox="0 0 720 220" role="img" aria-label="端到端吞吐相對比：先前工作為基準 100，FlintKV 最高 175，超出部分為 up-to 的不確定區間">
+      <line x1="150" y1="40" x2="150" y2="180" stroke="var(--muted-2)" stroke-width="1"/>
+      <text x="150" y="200" text-anchor="middle" class="axis">相對吞吐（先前工作 = 100）</text>
+
+      <text x="20" y="76" class="blabel">先前工作</text>
+      <rect x="150" y="58" width="330" height="30" fill="var(--muted)" opacity="0.4"/>
+      <text x="492" y="79" class="num">100</text>
+
+      <text x="20" y="136" class="blabel">FlintKV</text>
+      <rect x="150" y="118" width="330" height="30" fill="var(--accent)" opacity="0.55"/>
+      <rect x="480" y="118" width="248" height="30" fill="var(--accent)" opacity="0.22" stroke="var(--accent)" stroke-width="1" stroke-dasharray="4 3"/>
+      <text x="600" y="112" text-anchor="middle" class="hedge">up to</text>
+      <text x="690" y="137" text-anchor="end" class="num">175</text>
+
+      <text x="150" y="30" class="hedge">實線＝基準；虛線區＝「up to」的上限，不代表每個工作負載都達到</text>
+    </svg>
+    <figcaption>摘要只給了這一個數字：端到端吞吐相對先前工作最高提升 75%（基準記為 100，FlintKV 上限記為 175）。虛線區間刻意畫成不確定——摘要沒交代對照系統、硬體與工作負載，所以這是上限而非通用倍數。</figcaption>
+  </figure>
+
+  <p class="vg-deep-closer"><strong>What this enables</strong>：把一個原本只快在 ingestion 與 point lookup 的 NVM 儲存，補上快照、一致性迭代與原子批次這組保證，交易與並行控制才有地基可站；而那條 durable skiplist 還能被拆下來、整合進既有的 NVM 儲存，替它們補齊同一組能力。</p>
+</div>
