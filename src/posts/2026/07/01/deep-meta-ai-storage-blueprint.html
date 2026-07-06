@@ -1,0 +1,508 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">拖垮 AI training 的 storage 瓶頸，多半不在「搬 byte 的頻寬不夠」，而在「還沒開始搬 byte 之前」——一個讀取請求到達 API server 後，要在三層 metadata 之間反覆查詢才能把路徑解成 block 位址，這些查詢可能跨區，累積延遲到數百毫秒，任何一次慢查詢就足以讓上萬顆 GPU 空轉。</p>
+  <h1 class="vg-post-title">{{ title }}</h1>
+</header>
+
+<div class="vg-post-body">
+  <p><span class="vg-dropcap">M</span>eta 把餵給 AI training 的 storage stack 整條重畫了一遍。動機很直白：按他們的說法，storage 瓶頸一直是造成 GPU stall 的主要成因之一，而 Meta 營運著 hundreds of exabyte-scale 的 storage cluster，單次 training 會有 hundreds of thousands of GPUs 對這些資料反覆迭代多次。把這個規模乘上「每次讀取都要先解析路徑」的成本，control-plane 就成了決定 GPU 要不要空等的那道閘。新 stack 的核心不是把搬資料做快，而是把「解析要搬哪些資料」這件事從 hot path 上移除——重寫 metadata 層讓查詢變成 O(1)、拿掉一整層 dataplane proxy、再疊三層 cache 把常讀的資料留在離 GPU 最近的地方。底下四個小節各自拆一塊：先看被打掉的舊瓶頸，再看重畫後的 Tectonic 地基、攤平的 metadata schema、直連的 fat client，最後是撐起 80% 命中率的三層 cache。</p>
+
+  <p>先把新舊兩條讀取路徑並排看。舊路徑的每一步都要經手 control-plane 與 proxy；新路徑把 metadata 收成單一查詢、讓 client 直連 storage。下面這組分頁對照三個階段——舊的多層 proxied lookup、攤平後的 ZippyDB 查詢、以及 fat client 直 stream。</p>
+
+  <div class="vg-w-tabs-meta-request-path">
+    <style>
+      .vg-w-tabs-meta-request-path { display: grid; gap: var(--s-2); margin: var(--s-4) 0; }
+      .vg-w-tabs-meta-request-path input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-tabs-meta-request-path .tabs { display: flex; gap: var(--s-2); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+      .vg-w-tabs-meta-request-path .tab { font-family: var(--sans); font-size: var(--fs-sm); padding: var(--s-1) var(--s-2); cursor: pointer; color: var(--muted); min-height: 44px; display: flex; align-items: center; }
+      .vg-w-tabs-meta-request-path .panel { display: none; padding: var(--s-2) 0; }
+      .vg-w-tabs-meta-request-path .panel h3 { font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); margin: 0 0 var(--s-1) 0; }
+      .vg-w-tabs-meta-request-path .panel p { font-family: var(--serif); font-size: var(--fs-sm); margin: 0 0 var(--s-1) 0; }
+      .vg-w-tabs-meta-request-path .flow { font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); color: var(--ink-soft); background: var(--bg-soft); border-left: 2px solid var(--muted-2); padding: var(--s-1) var(--s-2); margin: 0 0 var(--s-1) 0; overflow-x: auto; }
+      .vg-w-tabs-meta-request-path .cost { font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); color: var(--accent-text); }
+      .vg-w-tabs-meta-request-path:has(#vg-w-tabs-meta-request-path-t1:checked) .panel-1 { display: block; }
+      .vg-w-tabs-meta-request-path:has(#vg-w-tabs-meta-request-path-t1:checked) [for="vg-w-tabs-meta-request-path-t1"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-meta-request-path:has(#vg-w-tabs-meta-request-path-t2:checked) .panel-2 { display: block; }
+      .vg-w-tabs-meta-request-path:has(#vg-w-tabs-meta-request-path-t2:checked) [for="vg-w-tabs-meta-request-path-t2"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-meta-request-path:has(#vg-w-tabs-meta-request-path-t3:checked) .panel-3 { display: block; }
+      .vg-w-tabs-meta-request-path:has(#vg-w-tabs-meta-request-path-t3:checked) [for="vg-w-tabs-meta-request-path-t3"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    </style>
+    <input type="radio" id="vg-w-tabs-meta-request-path-t1" name="vg-w-tabs-meta-request-path-sel" checked aria-label="舊路徑" />
+    <input type="radio" id="vg-w-tabs-meta-request-path-t2" name="vg-w-tabs-meta-request-path-sel" aria-label="攤平 metadata" />
+    <input type="radio" id="vg-w-tabs-meta-request-path-t3" name="vg-w-tabs-meta-request-path-sel" aria-label="fat client 直連" />
+    <div class="tabs">
+      <label class="tab" for="vg-w-tabs-meta-request-path-t1">① 舊：多層 proxied lookup</label>
+      <label class="tab" for="vg-w-tabs-meta-request-path-t2">② 新：ZippyDB O(1)</label>
+      <label class="tab" for="vg-w-tabs-meta-request-path-t3">③ 新：fat client 直 stream</label>
+    </div>
+    <div class="panel panel-1">
+      <h3>legacy control-plane</h3>
+      <p class="flow">client → API server → namelayer → volumeslayer → containerlayer → (blockId, offset, size) → dataplane proxy → storage</p>
+      <p>request 到 API server 後，要在 namelayer、volumeslayer、containerlayer 之間做多次 metadata lookup，才把路徑解成一組 <code>(blockId, offset, size)</code> 三元組。這些查詢有些會跨區，延遲累積到數百毫秒並不罕見；而且是 fan-out 依賴，任一次慢查詢就足以拖垮整條路徑。</p>
+      <p class="cost">metadata 解析：數次跨層查詢，可跨區，累積可達 hundreds of ms</p>
+    </div>
+    <div class="panel panel-2">
+      <h3>unified flat schema</h3>
+      <p class="flow">client → API server → ZippyDB（單一 flat schema）→ O(1) → storage address</p>
+      <p>Meta 重寫了整個 metadata subsystem，把原本分散在不同層的 metadata 攤平收成一個 unified、flat 的 schema，後端是 ZippyDB。原本要橫跨三層的路徑解析，變成對單一 schema 的 O(1) 查詢；再疊上 read-plan cache，metadata 存取縮到 1-2 ms。Meta 稱這是一次 step-function 的改進。</p>
+      <p class="cost">metadata 解析：O(1) 單次查詢，read-plan cache 命中時 1-2 ms</p>
+    </div>
+    <div class="panel panel-3">
+      <h3>fat client dataplane</h3>
+      <p class="flow">client SDK（內嵌 BlockClient）── 直接 stream bytes ──→ storage server</p>
+      <p>解出 storage address 之後，byte 怎麼搬也重畫了。Meta 拿掉 dataplane proxy，改成一個 fat client SDK，直接把 byte 從 storage server stream 到 client。這個 SDK 內嵌了 Tectonic 的 BlockClient，因此能直接從 Tectonic 的 block 讀資料——中間那層代為存取的 proxy 就此消失。</p>
+      <p class="cost">data-plane：少一次 proxy hop，client 直連 storage server</p>
+    </div>
+  </div>
+
+  <h2>被打掉的瓶頸：API-server 代理的 metadata lookup</h2>
+
+  <p>要理解新設計為什麼這樣長，得先看清舊路徑慢在哪。按 Meta 的描述，一個讀取請求到達 API server 之後，server 要在 namelayer、volumeslayer、containerlayer 這三層 metadata 之間做多次查詢，才能把使用者要的路徑解析成一組 <code>(blockId, offset, size)</code> 三元組——也就是「這份資料實際落在哪個 block、從哪個 offset 起、多長」。這一整段都還沒碰到任何實際資料，純粹是 control-plane 在回答「要去哪裡搬」。</p>
+
+  <p>問題有兩重。第一重是延遲的絕對量級：這些 lookup 有些會跨區，Meta 說延遲累積到 hundreds of milliseconds 並不罕見。對一個要餵飽上萬顆 GPU 的 data loader，資料還沒開始傳、光是問路就先花掉幾百毫秒，這個成本會直接反映成 GPU 空等。第二重更難纏——這是一條 fan-out 的依賴鏈，三層查詢環環相扣，Meta 的原話是「one slow response from any of the lookups was sufficient」，任何一次慢查詢就足以拖垮整條路徑。這是 tail latency 的典型陷阱：你不是被平均延遲害的，是被最慢那一次查詢害的，而查詢越多、跨區越多，撞到慢尾的機率就越高。</p>
+
+  <p>把這兩重放在一起，結論就浮出來了：真正該攻擊的不是搬資料的頻寬，而是搬資料之前的路徑解析。舊架構把 metadata 拆成三層，每層各自演進、各自查詢，好處是模組邊界清楚，代價是每次讀取都要付一次跨層、可能跨區的協調成本。新 stack 的第一刀，就砍在這裡——把三層攤平成一層。下面這張表把舊的三層 metadata 與新的單一 schema 並排，看得出攤平前後在「查幾次、去哪查」上的差別。</p>
+
+  <figure class="vg-w-table-meta-metadata-layers" data-mobile="keep">
+    <style>
+      .vg-w-table-meta-metadata-layers { overflow-x: auto; margin: var(--s-4) 0; }
+      .vg-w-table-meta-metadata-layers table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-meta-metadata-layers thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); }
+      .vg-w-table-meta-metadata-layers tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+      .vg-w-table-meta-metadata-layers td.layer { font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); color: var(--accent-text); white-space: nowrap; }
+      .vg-w-table-meta-metadata-layers tbody tr.after td { background: color-mix(in srgb, var(--sage) 12%, transparent); }
+      .vg-w-table-meta-metadata-layers tbody tr:hover td { background: var(--bg-soft); }
+      .vg-w-table-meta-metadata-layers caption { text-align: left; caption-side: top; font-family: var(--scribed); font-style: italic; color: var(--muted); font-size: var(--fs-sm); padding: var(--s-1) 0; }
+    </style>
+    <table>
+      <caption>舊 metadata 分三層各自查詢，新設計攤平成單一 ZippyDB schema。層級與後端取自 Meta blog；查詢次數是對「攤平前後」的結構描述，非 Meta 給的獨立數字。</caption>
+      <thead>
+        <tr>
+          <th>結構</th>
+          <th>層 / schema</th>
+          <th>負責回答</th>
+          <th>查詢代價</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>舊</td><td class="layer">namelayer</td><td>名稱空間 → 邏輯物件</td><td>跨層查詢之一，可能跨區</td></tr>
+        <tr><td>舊</td><td class="layer">volumeslayer</td><td>邏輯物件 → volume 對應</td><td>跨層查詢之一，可能跨區</td></tr>
+        <tr><td>舊</td><td class="layer">containerlayer</td><td>volume → 實際 block 位址</td><td>跨層查詢之一，可能跨區</td></tr>
+        <tr class="after"><td>新</td><td class="layer">unified flat schema (ZippyDB)</td><td>路徑 → storage address（一步到位）</td><td>O(1) 單次查詢，命中 read-plan cache 時 1-2 ms</td></tr>
+      </tbody>
+    </table>
+    <figcaption>三層各自演進換來清楚的模組邊界，代價是每次讀取都付一次跨層協調；攤平後路徑解析退化成對單一 schema 的一次 O(1) 查詢。</figcaption>
+  </figure>
+
+  <p>這裡值得把 control-plane 與 data-plane 兩條路徑分開想。data-plane 是實際搬 byte 的路——它的成本跟資料量成正比，要快就得加頻寬、加並行、把資料放近。control-plane 是「決定要搬哪些 byte」的路——它的成本跟資料量幾乎無關，只跟「要問幾次、每次問多遠」有關。舊架構的病灶落在 control-plane：三層跨區 lookup 讓每次讀取都先付一筆固定的協調稅，而這筆稅不會因為你把資料放得更近就變小。這也是為什麼單純堆頻寬解不了問題——頻寬治的是 data-plane，而按 Meta 的說法，拖垮 GPU 的瓶頸恰恰是 storage 這條路上「還沒開始搬 byte」的那一段。看清這條分界，後面每一刀砍在哪就有了座標：攤平 schema 與 ZippyDB 砍 control-plane 的查詢次數，fat client 砍 data-plane 的一次繞路，三層 cache 則同時讓兩條路都少走遠門。</p>
+
+  <h2>Tectonic block layer：重畫過的地基</h2>
+
+  <p>攤平 metadata 之前，得先有一塊夠平、夠通用的地基去承接它。這塊地基就是 Tectonic block layer。用 Meta 的定義，它是「a regional, multi-tenant storage fabric」——區域範圍、多租戶共用的儲存 fabric，靠 erasure-coding 提供高耐久與可用性，支援跨媒體型別（例如 HDD 與 flash）的 tiering，並且智慧擺放 hot、cold、warm 三種冷熱程度的資料，讓 I/O 在多租戶之間有效利用。</p>
+
+  <p>拆開這句定義，每個限定詞都對應一個設計決策。regional 意味著這塊 fabric 的邊界是區域，而不是單機或單機架——這跟後面 L3 cache 也是區域範圍互相呼應。multi-tenant 表示多個服務、多個 training job 共用同一塊底層儲存，好處是資源利用率高，代價是要有機制隔離彼此的 I/O 干擾——「smart placement of hot, cold, and warm data」正是為此而生：把常讀的熱資料放到快媒體、冷資料沉到 HDD，才不會讓某個租戶的冷資料掃描吃掉別人的熱路徑頻寬。erasure-coding 則是用編碼冗餘換耐久，比起單純三副本，同樣的可用性下省下大量儲存空間——這對 exabyte 級的規模是必要的，不然光副本就吃掉數倍容量。</p>
+
+  <p>這裡有個乾淨的分工：Tectonic block layer 只負責「block 這一層」的儲存語意——把資料切成 block、編碼、擺放、保證取回。它不負責「路徑怎麼對應到哪些 block」——那是 metadata 層的事。這道分界正是攤平 metadata 能成立的前提：block layer 提供穩定的 block 定址介面，metadata 層才能專心把「路徑 → block 位址」這件事收成單一 schema，不必再管 block 底下的擺放與編碼細節。反過來說，metadata 層攤平之後也沒有把 block layer 的複雜度往上洩漏——上層看到的永遠是「一次查詢換一個 storage address」，至於那個 address 底下是 HDD 還是 flash、是熱資料還是被降級到冷媒體，都由 Tectonic 自己的 smart placement 決定。這種「介面窄、責任清」的分層，是後面 fat client 能安全內嵌 BlockClient 的另一個前提：client 只需要理解 block 定址這個窄介面，不必把整套 placement 與 erasure-coding 邏輯搬進來。</p>
+
+  <h2>統一而扁平的 metadata schema：ZippyDB 撐起的 O(1)</h2>
+
+  <p>這是整套改造的樞紐。Meta 的原話是「We rewrote the metadata subsystem and collapsed the metadata spread across different layers into one unified and flat schema backed by ZippyDB」——重寫了 metadata subsystem，把分散在不同層的 metadata 攤平、收成一個 unified、flat 的 schema，後端換成 ZippyDB。這句話裡兩個詞是關鍵：collapsed（攤平合併）與 flat（扁平）。舊的三層是巢狀的——要先問 namelayer 才知道去 volumeslayer 問什麼，再拿 volumeslayer 的結果去 containerlayer 問。攤平的意思是把這個巢狀的問答鏈拆掉，直接建一張「路徑 → storage address」的扁平映射。</p>
+
+  <p>扁平帶來的直接後果就是查詢複雜度。Meta 說這「paves the way for O(1) lookup to resolve paths to storage addresses」——為 O(1) 的路徑解析鋪好了路。原本要走三層、每層一次可能跨區的查詢，理論上退化成對單一 schema 的一次查詢。ZippyDB 是 Meta 自家的分散式 key-value store，本來就是為「大量小 key、低延遲點查」設計的——把攤平後的 metadata 放進一個 KV store，路徑當 key、storage address 當 value，O(1) 查詢就是 KV store 最擅長的那種存取。Meta 用 step-function improvement 形容這次改動，直譯是「階躍式的改進」——這是他們自己的評價，不是我替他們下的客觀結論，但從「數次跨區查詢」變成「一次點查」，這個描述的方向是站得住的。</p>
+
+  <p>光是 O(1) 還不夠，因為就算是一次查詢，若每次都打到 ZippyDB 本體仍有網路 round-trip。所以 metadata 這條路上還疊了一層 read-plan cache。Meta 給的數字是 read-plan cache 提供 1-2 ms 的 metadata 存取——把這個 1-2 ms 跟舊路徑的 hundreds of ms 並排，control-plane 延遲砍掉的量級就很清楚了。read-plan 顧名思義是「這次讀取要碰哪些 block 的計畫」，把它快取起來，重複讀同一批資料時連 O(1) 那次查詢都省了，直接吃 1-2 ms 的 cache 命中。對 training 這種「同一批資料多 epoch 反覆掃」的 workload，read-plan cache 的命中率天然就高。</p>
+
+  <h2>fat client SDK：把 BlockClient 搬進 client、消掉 proxy hop</h2>
+
+  <p>metadata 解析快了，接下來是實際搬 byte 的 data-plane。舊架構在 client 與 storage 之間夾了一層 dataplane proxy——client 不直接碰 storage，而是把讀取請求交給 proxy，由 proxy 代為存取後再把資料轉回來。這層 proxy 是一次額外的網路 hop，也是一個要維運、要擴容、會成為瓶頸的中間層。</p>
+
+  <p>Meta 的做法是直接拿掉它。原話是「We eliminated the dataplane proxy and built a fat client SDK that is capable of streaming bytes directly from storage servers to the clients」——消掉 dataplane proxy，改建一個 fat client SDK，能把 byte 直接從 storage server stream 到 client。fat 這個字點出了關鍵：原本住在 proxy 裡的存取邏輯，現在被搬進了 client 端的 SDK，所以 client 變「厚」了。具體來說，Meta 說「The SDK has Tectonic BlockClient embedded within it」——SDK 內嵌了 Tectonic 的 BlockClient，因此能直接從 Tectonic 的 block stream 資料。BlockClient 本來是跟 Tectonic block layer 對話的那塊邏輯，以前藏在 proxy 後面，現在直接跑在 client 裡。</p>
+
+  <p>這是一個典型的 proxy-elimination trade。好處明確：少一次 hop、少一層要維運的服務、少一個潛在瓶頸，byte 從 storage server 直接 stream 到用資料的 GPU host。代價是 client 變厚——BlockClient 的邏輯、版本、相容性現在散佈在每一個 client SDK 裡，升級一個 protocol 細節要推到所有 client，不像單一 proxy 那樣改一處就好。對 Meta 這種 client 數量以 GPU host 計、且大多是自家 data loader 的環境，fat client 的維運代價可控，換來的直連收益卻是實打實地反映在每一次讀取上。合理的推測是，這也是為什麼這種設計在 Meta 內部行得通、卻不見得適合 client 型別高度異質的通用儲存服務——不過這一層 Meta 沒明說，是我的推斷。</p>
+
+  <figure class="vg-w-arch-meta-fatclient" data-mobile="keep" data-svg-scroll="720">
+    <style>
+      .vg-w-arch-meta-fatclient { margin: var(--s-4) 0; }
+      .vg-w-arch-meta-fatclient text { font-family: EB Garamond, serif; font-size: 13px; }
+      .vg-w-arch-meta-fatclient .lbl { font-family: IM Fell English, serif; font-style: italic; font-size: 12px; }
+      .vg-w-arch-meta-fatclient .num { font-family: JetBrains Mono, monospace; font-size: 11px; }
+      .vg-w-arch-meta-fatclient .head { font-family: IM Fell English, serif; font-style: italic; font-size: 13px; }
+      .vg-w-arch-meta-fatclient figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+    <svg viewBox="0 0 720 300" role="img" style="width: 100%; height: auto;"
+         aria-label="fat client 消掉 dataplane proxy 的前後對照：舊路徑 client 經 proxy 才到 storage，新路徑 client SDK 內嵌 BlockClient 直連 storage server">
+      <text x="360" y="24" text-anchor="middle" fill="var(--ink)" class="head">dataplane：proxy hop 消失前後</text>
+
+      <!-- OLD ROW -->
+      <text x="20" y="70" fill="var(--muted)" class="lbl">舊</text>
+      <rect x="70" y="52" width="120" height="40" fill="none" stroke="var(--muted-2)" stroke-width="1.5" rx="2"/>
+      <text x="130" y="76" text-anchor="middle" fill="var(--ink)">client</text>
+      <line x1="190" y1="72" x2="290" y2="72" stroke="var(--muted-2)" stroke-width="1.5"/>
+      <polygon points="290,72 282,68 282,76" fill="var(--muted-2)"/>
+      <rect x="290" y="52" width="140" height="40" fill="var(--accent)" fill-opacity="0.18" stroke="var(--accent)" stroke-width="1.5" rx="2"/>
+      <text x="360" y="70" text-anchor="middle" fill="var(--ink)">dataplane</text>
+      <text x="360" y="85" text-anchor="middle" fill="var(--accent-text)" class="num">proxy hop</text>
+      <line x1="430" y1="72" x2="530" y2="72" stroke="var(--muted-2)" stroke-width="1.5"/>
+      <polygon points="530,72 522,68 522,76" fill="var(--muted-2)"/>
+      <rect x="530" y="52" width="140" height="40" fill="none" stroke="var(--muted-2)" stroke-width="1.5" rx="2"/>
+      <text x="600" y="76" text-anchor="middle" fill="var(--ink)">storage server</text>
+      <text x="360" y="112" text-anchor="middle" fill="var(--muted)" class="lbl">client 交給 proxy 代為存取，多一次 hop</text>
+
+      <!-- divider -->
+      <line x1="70" y1="140" x2="670" y2="140" stroke="var(--line)" stroke-width="1" stroke-dasharray="3,3"/>
+
+      <!-- NEW ROW -->
+      <text x="20" y="200" fill="var(--sage-deep)" class="lbl">新</text>
+      <rect x="70" y="176" width="180" height="52" fill="var(--sage)" fill-opacity="0.16" stroke="var(--sage-deep)" stroke-width="1.5" rx="2"/>
+      <text x="160" y="196" text-anchor="middle" fill="var(--ink)">fat client SDK</text>
+      <text x="160" y="214" text-anchor="middle" fill="var(--sage-deep)" class="num">＋ Tectonic BlockClient</text>
+      <line x1="250" y1="202" x2="530" y2="202" stroke="var(--sage-deep)" stroke-width="2"/>
+      <polygon points="530,202 520,197 520,207" fill="var(--sage-deep)"/>
+      <text x="390" y="192" text-anchor="middle" fill="var(--sage-deep)" class="lbl">直接 stream bytes</text>
+      <rect x="530" y="176" width="140" height="52" fill="none" stroke="var(--muted-2)" stroke-width="1.5" rx="2"/>
+      <text x="600" y="206" text-anchor="middle" fill="var(--ink)">storage server</text>
+      <text x="360" y="252" text-anchor="middle" fill="var(--muted)" class="lbl">BlockClient 搬進 SDK，client 直連——proxy 那一格不見了</text>
+      <text x="360" y="284" text-anchor="middle" fill="var(--muted)" class="lbl">代價：BlockClient 邏輯散佈到每個 client，升級要推到所有 client</text>
+    </svg>
+    <figcaption>舊路徑的 proxy 是一次額外 hop 與一個要維運的中間層；fat client 把 BlockClient 內嵌進 SDK 後直連 storage，換來的維運代價是升級得推到所有 client。</figcaption>
+  </figure>
+
+  <h2>三層 cache：80% 命中率怎麼撐起 exabyte 級吞吐</h2>
+
+  <p>前面三刀——攤平 metadata、Tectonic 地基、fat client——把 control-plane 與一次 proxy hop 都清掉了。但就算路徑解析變 O(1)、byte 直連，exabyte 級資料本身仍住在區域儲存裡，每次讀取還是要走一趟網路。最後一塊拼圖是把常讀的資料留在離 GPU 最近的地方，這就是三層 distributed data cache。</p>
+
+  <p>Meta 的配置是：「we leverage the memory and flash on the GPU host as L1 and L2 caches. And we leverage the regional BLOB-storage fabric backed by flash as the L3 cache」——L1 是 GPU host 上的 memory、L2 是 GPU host 上的 flash，這兩層都是 host-local，資料就在跑 training 的那台機器上；L3 是區域範圍、以 flash 為後端的 BLOB-storage fabric，是跨 host 共享的一層。三層由近到遠、由快到大：L1 最快最小，命中就完全不出機器；L2 稍慢但容量大得多，仍在本機；L3 最遠但整個區域共享，一台機器拉過的資料別台也能命中。而 data loader 完全不必管這三層——Meta 說它「continues to access storage through the familiar BLOB-storage SDK」，分層對上層是透明的。</p>
+
+  <p>撐起這套設計的數字是命中率。Meta 說「In practice we observe an average cache hit rate of 80% on the distributed data cache」——實測 distributed data cache 的平均命中率是 80%。這個 80% 為什麼能成立？回到前面那個規模描述：單次 training 期間，hundreds of thousands of GPUs 會對 storage 裡的資料反覆迭代多次（iterate over vast amounts of data multiple times）。「multiple times」是關鍵——training 會多 epoch 掃同一批資料，第一個 epoch 把資料拉進 cache，後面的 epoch 就大量命中。正是「反覆讀同一批資料」這個 workload 特性，讓 cache 命中率能穩定在 80% 這種高檔，而不是像隨機讀取那樣命中率低到讓 cache 形同虛設。下面這個互動工具讓你開關三層 cache，看有效讀取延遲怎麼隨命中的層變化——預設三層全開，對應 Meta 的 80% 命中場景。</p>
+
+  <figure class="vg-w-chart-meta-cache-effective" data-mobile="swap" data-mobile-summary="三層 cache（host memory → host flash → 區域 flash）實測 80% 命中率；關掉任一層，讀取落到更遠層或回源。">
+    <style>
+      .vg-w-chart-meta-cache-effective { display: grid; gap: var(--s-3); margin: var(--s-4) 0; }
+      .vg-w-chart-meta-cache-effective .controls { display: grid; grid-template-columns: 1fr; gap: var(--s-2); }
+      @media (min-width: 720px) { .vg-w-chart-meta-cache-effective .controls { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+      .vg-w-chart-meta-cache-effective .toggle { display: flex; flex-direction: column; gap: var(--s-1); padding: var(--s-2); border: 1px solid var(--line); cursor: pointer; user-select: none; min-height: 44px; transition: border-color 200ms; }
+      .vg-w-chart-meta-cache-effective .toggle:hover { border-color: var(--accent); }
+      .vg-w-chart-meta-cache-effective .toggle input { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-chart-meta-cache-effective .toggle-head { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); display: flex; align-items: center; gap: var(--s-1); }
+      .vg-w-chart-meta-cache-effective .toggle-dot { width: 10px; height: 10px; border-radius: 50%; border: 1.5px solid var(--muted-2); background: var(--bg-soft); transition: background 150ms, border-color 150ms; }
+      .vg-w-chart-meta-cache-effective .toggle:has(input:checked) .toggle-dot { background: var(--sage-deep); border-color: var(--sage-deep); }
+      .vg-w-chart-meta-cache-effective .toggle:has(input:checked) .toggle-head { color: var(--accent-text); }
+      .vg-w-chart-meta-cache-effective .toggle-name { font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink); }
+      .vg-w-chart-meta-cache-effective .toggle-meta { font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); color: var(--muted); font-variant-numeric: tabular-nums; }
+      .vg-w-chart-meta-cache-effective svg { width: 100%; height: auto; }
+      .vg-w-chart-meta-cache-effective .readout { display: grid; grid-template-columns: 1fr; gap: var(--s-1); padding: var(--s-3); background: var(--bg-soft); border-left: 2px solid var(--accent); }
+      @media (min-width: 720px) { .vg-w-chart-meta-cache-effective .readout { grid-template-columns: auto 1fr; align-items: center; gap: var(--s-3); } }
+      .vg-w-chart-meta-cache-effective .hit { font-family: EB Garamond, serif; font-size: 2rem; color: var(--ink); font-variant-numeric: tabular-nums; white-space: nowrap; }
+      .vg-w-chart-meta-cache-effective .hit .unit { font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-left: 0.4ch; }
+      .vg-w-chart-meta-cache-effective .breakdown { font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink-soft); }
+      .vg-w-chart-meta-cache-effective .breakdown em { color: var(--accent-text); font-style: italic; }
+      .vg-w-chart-meta-cache-effective figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+      .vg-w-chart-meta-cache-effective .bar { transition: width 250ms ease-out; }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M9 11a3 3 0 1 0 6 0a3 3 0 0 0-6 0"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="M4 12H2"/><path d="M22 12h-2"/>
+      </svg>
+      <span>toggle 三層 cache，看有效讀取延遲與命中組成如何變化 · 3 層 + 區域來源</span>
+    </p>
+
+    <div class="controls" data-vg-controls role="group" aria-label="三層 cache 開關">
+      <label class="toggle">
+        <input type="checkbox" data-tier="l1" checked />
+        <span class="toggle-head"><span class="toggle-dot"></span>L1 · host memory</span>
+        <span class="toggle-name">host-local memory</span>
+        <span class="toggle-meta">最快、最小</span>
+      </label>
+      <label class="toggle">
+        <input type="checkbox" data-tier="l2" checked />
+        <span class="toggle-head"><span class="toggle-dot"></span>L2 · host flash</span>
+        <span class="toggle-name">host-local flash</span>
+        <span class="toggle-meta">本機、容量大</span>
+      </label>
+      <label class="toggle">
+        <input type="checkbox" data-tier="l3" checked />
+        <span class="toggle-head"><span class="toggle-dot"></span>L3 · regional flash</span>
+        <span class="toggle-name">regional disaggregated</span>
+        <span class="toggle-meta">跨 host 共享</span>
+      </label>
+    </div>
+
+    <svg class="vg-w-chart-meta-cache-effective-main" viewBox="0 0 720 260" preserveAspectRatio="xMidYMid meet" role="img"
+         aria-label="三層 cache 各層的相對讀取延遲長條圖，關掉某層後讀取落到下一層或回源，有效延遲上升">
+      <g id="vg-w-chart-meta-cache-effective-axes"></g>
+      <g id="vg-w-chart-meta-cache-effective-series"></g>
+    </svg>
+
+    <div class="readout">
+      <div class="hit"><span data-hit>80</span><span class="unit">% hit（三層全開）</span></div>
+      <div class="breakdown" data-breakdown>三層全開——對應 Meta 實測的 <em>80% 平均命中率</em>：多數讀取命中 host-local 的 L1/L2，剩下由區域 L3 承接，只有少數回源到 Tectonic。</div>
+    </div>
+
+    <figcaption>長條是各層的<em>相對</em>讀取延遲（越靠近 GPU 越短，非 Meta 給的絕對毫秒）。命中率 80% 與三層配置取自 Meta blog；關掉某層時，本該命中它的讀取落到更遠的層或回源，有效延遲隨之上升——用來說明「為什麼命中要盡量發生在近端」。</figcaption>
+
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        const root = document.querySelector('.vg-w-chart-meta-cache-effective');
+        const svg = root.querySelector('svg.vg-w-chart-meta-cache-effective-main');
+        const axesG = root.querySelector('#vg-w-chart-meta-cache-effective-axes');
+        const seriesG = root.querySelector('#vg-w-chart-meta-cache-effective-series');
+        const inputs = root.querySelectorAll('input[data-tier]');
+        const hitEl = root.querySelector('[data-hit]');
+        const breakdown = root.querySelector('[data-breakdown]');
+
+        const NS = 'http://www.w3.org/2000/svg';
+        function el(tag, attrs) {
+          const e = document.createElementNS(NS, tag);
+          for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+          return e;
+        }
+
+        // 相對延遲刻度（單位任意，越遠越大）：L1 最近，回源最遠。
+        // 非 Meta 給的絕對毫秒——僅表達「越靠近 GPU 越短」的層級關係。
+        const tiers = [
+          { key: 'l1', label: 'L1 · host memory', rel: 1,  base: 0.50 },
+          { key: 'l2', label: 'L2 · host flash',  rel: 4,  base: 0.20 },
+          { key: 'l3', label: 'L3 · regional',    rel: 20, base: 0.10 },
+          { key: 'src', label: 'miss → Tectonic', rel: 100, base: 0.20, always: true },
+        ];
+
+        const X0 = 150, X1 = 700, Y0 = 40, rowH = 46, barMax = X1 - X0;
+        const maxRel = 100;
+        function widthFor(rel) { return Math.max(6, (rel / maxRel) * barMax); }
+
+        function render() {
+          const on = {};
+          inputs.forEach((inp) => { on[inp.dataset.tier] = inp.checked; });
+
+          // 把被關掉層的命中份額往下一個可用層推。
+          let hitNear = 0; // host-local (L1+L2) 命中份額
+          const share = {};
+          let carried = 0;
+          tiers.forEach((t) => {
+            if (t.always) { share[t.key] = 0; return; }
+            if (on[t.key]) {
+              share[t.key] = t.base + carried;
+              carried = 0;
+              if (t.key === 'l1' || t.key === 'l2') hitNear += share[t.key];
+            } else {
+              carried += t.base; // 這層本該命中的份額，落到更遠的層
+              share[t.key] = 0;
+            }
+          });
+          share.src = carried; // 沒有任何 cache 接住的，回源
+          const totalCacheHit = 1 - share.src;
+
+          axesG.replaceChildren();
+          seriesG.replaceChildren();
+
+          const yl = el('text', { x: 16, y: Y0 + rowH * 1.5, 'text-anchor': 'middle', 'font-family': 'EB Garamond, serif', 'font-size': 13, fill: 'var(--muted)', transform: `rotate(-90 16 ${Y0 + rowH * 1.5})` });
+          yl.textContent = 'read path'; axesG.appendChild(yl);
+
+          tiers.forEach((t, i) => {
+            const y = Y0 + i * rowH;
+            const active = t.always ? true : on[t.key];
+            const sh = share[t.key];
+            const barColor = t.always ? 'var(--muted)' : (i <= 1 ? 'var(--accent)' : 'var(--sage-deep)');
+            const opacity = active ? (i === 0 ? 0.72 : i === 1 ? 0.58 : i === 2 ? 0.5 : 0.4) : 0.12;
+
+            const lt = el('text', { x: X0 - 10, y: y + 20, 'text-anchor': 'end', 'font-family': 'JetBrains Mono, monospace', 'font-size': 12, fill: active ? 'var(--ink)' : 'var(--muted)' });
+            lt.textContent = t.label; axesG.appendChild(lt);
+
+            const bar = el('rect', { class: 'bar', x: X0, y: y + 4, width: widthFor(t.rel), height: 26, rx: 2, fill: barColor, 'fill-opacity': opacity });
+            seriesG.appendChild(bar);
+
+            const shTxt = el('text', { x: X0 + widthFor(t.rel) + 8, y: y + 22, 'font-family': 'JetBrains Mono, monospace', 'font-size': 11, fill: active || t.always ? 'var(--ink-soft)' : 'var(--muted)' });
+            shTxt.textContent = active && sh > 0 ? Math.round(sh * 100) + '% 命中' : (t.always && sh > 0 ? Math.round(sh * 100) + '% 回源' : (active ? '—' : '關閉'));
+            axesG.appendChild(shTxt);
+
+            const rl = el('text', { x: X1 - 4, y: y - 2, 'text-anchor': 'end', 'font-family': 'IM Fell English, serif', 'font-style': 'italic', 'font-size': 10, fill: 'var(--muted)' });
+            rl.textContent = '相對延遲 ' + t.rel + '×'; axesG.appendChild(rl);
+          });
+
+          hitEl.textContent = Math.round(totalCacheHit * 100);
+          const nOff = Array.from(inputs).filter((i) => !i.checked).length;
+          if (nOff === 0) {
+            breakdown.innerHTML = '三層全開——對應 Meta 實測的 <em>80% 平均命中率</em>：多數讀取命中 host-local 的 L1/L2，剩下由區域 L3 承接，只有少數回源到 Tectonic。';
+          } else {
+            const back = Math.round(share.src * 100);
+            breakdown.innerHTML = '關掉 <em>' + nOff + ' 層</em>後，本該命中它的讀取落到更遠的層或回源；回源到 Tectonic 的份額升到 <em>' + back + '%</em>，有效讀取延遲跟著抬高——這就是為什麼命中要盡量發生在近端。';
+          }
+        }
+
+        inputs.forEach((inp) => inp.addEventListener('change', render));
+        render();
+      })();
+    </script>
+  </figure>
+
+  <p>三層的切法本身也有講究。L1 與 L2 都在 GPU host 上，卻分成 memory 與 flash 兩層，是因為兩者是不同的取捨點：memory 快但小、貴，只夠裝最熱的那一小撮；flash 慢一截但容量大得多、單位成本低，接住放不進 memory 的次熱資料。把兩者當成一層會被迫在「小而快」與「大而略慢」之間二選一，分成兩層才能兩頭都要。L3 跳出單機、做成區域範圍的 disaggregated flash，則是另一個層次的取捨：把 flash 從各台 GPU host 裡拆出來、集中成一塊區域共享的 fabric，好處是一台機器拉過的資料整個區域都受惠——同一份 training dataset 被幾百台機器同時掃時，L3 的共享命中就是省下大量回源的關鍵。代價是它比 host-local 兩層遠、要走一趟區域網路，disaggregation 換來的是容量與共享，不是延遲。這三層由近到遠、由快到大、由私有到共享的排列，正好對上 training 讀取「熱的極熱、冷的極冷」的分佈形狀。</p>
+
+  <p>把三層 cache 跟前面的 fat client 合起來看，才看得出這套設計的整體幾何。fat client 讓命中近端 cache 的讀取能直接、無 proxy 地拿到 byte；三層 cache 讓 80% 的讀取根本不必走到區域儲存本體。兩者是互補的：cache 決定「多常需要走遠路」，fat client 決定「走遠路時少繞一個彎」。而支撐 cache 命中率的，是 training workload 本身「多 epoch 反覆掃同一批資料」的節奏——這也解釋了為什麼同一套 cache 設計搬到「每筆資料只讀一次」的 workload 上，命中率會塌掉、整套優化的價值也跟著縮水。下面這張 stack 圖把三層的物理位置與範圍畫出來，點任一層看它住在哪、共享範圍多大。</p>
+
+  <figure class="vg-w-stack-meta-cache-tiers" data-mobile="keep">
+    <style>
+      .vg-w-stack-meta-cache-tiers { display: flex; flex-direction: column; gap: var(--s-3); align-items: stretch; margin: var(--s-4) 0; }
+      .vg-w-stack-meta-cache-tiers input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+
+      .vg-w-stack-meta-cache-tiers .stack-title { font-family: IM Fell English, serif; font-style: italic; font-size: var(--fs-md); margin: 0 0 var(--s-1) 0; color: var(--ink); line-height: 1.4; }
+      .vg-w-stack-meta-cache-tiers .stack-cards { display: flex; flex-direction: column; gap: var(--s-1); list-style: none; padding: 0; margin: 0; }
+      .vg-w-stack-meta-cache-tiers .stack-cards label { display: block; padding: var(--s-2); border: 1px solid var(--muted-2); border-radius: 2px; cursor: pointer; transition: border-color 200ms, background 200ms; min-height: 44px; }
+      .vg-w-stack-meta-cache-tiers .stack-cards label:hover { border-color: var(--accent); }
+      .vg-w-stack-meta-cache-tiers .stack-cards .card-head { font-family: EB Garamond, serif; font-size: var(--fs-md); margin: 0 0 4px 0; color: var(--ink); display: flex; align-items: baseline; justify-content: space-between; gap: var(--s-2); flex-wrap: wrap; }
+      .vg-w-stack-meta-cache-tiers .stack-cards .card-sub { font-family: IM Fell English, serif; font-style: italic; font-size: var(--fs-sm); color: var(--muted); margin: 0; line-height: 1.5; }
+      .vg-w-stack-meta-cache-tiers .stack-cards .card-tag { font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); color: var(--accent-text); font-style: normal; }
+      .vg-w-stack-meta-cache-tiers:has(#vg-w-stack-meta-cache-tiers-r1:checked) .card-1,
+      .vg-w-stack-meta-cache-tiers:has(#vg-w-stack-meta-cache-tiers-r2:checked) .card-2,
+      .vg-w-stack-meta-cache-tiers:has(#vg-w-stack-meta-cache-tiers-r3:checked) .card-3,
+      .vg-w-stack-meta-cache-tiers:has(#vg-w-stack-meta-cache-tiers-r4:checked) .card-4 { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+
+      .vg-w-stack-meta-cache-tiers svg.diagram { display: none; }
+      @media (min-width: 720px) {
+        .vg-w-stack-meta-cache-tiers svg.diagram { display: block; width: 100%; height: auto; max-width: 880px; }
+        .vg-w-stack-meta-cache-tiers .stack-title { display: none; }
+        .vg-w-stack-meta-cache-tiers .stack-cards { display: none; }
+      }
+      .vg-w-stack-meta-cache-tiers .diagram text { font-family: EB Garamond, serif; font-size: 13px; }
+      .vg-w-stack-meta-cache-tiers .diagram .sub { font-family: IM Fell English, serif; font-style: italic; font-size: 11px; fill: var(--muted); }
+      .vg-w-stack-meta-cache-tiers .diagram .tag { font-family: JetBrains Mono, monospace; font-size: 11px; }
+      .vg-w-stack-meta-cache-tiers .diagram .head { font-family: IM Fell English, serif; font-style: italic; font-size: 13px; }
+      .vg-w-stack-meta-cache-tiers .layer { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; }
+      .vg-w-stack-meta-cache-tiers:has(#vg-w-stack-meta-cache-tiers-r1:checked) .layer-1 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+      .vg-w-stack-meta-cache-tiers:has(#vg-w-stack-meta-cache-tiers-r2:checked) .layer-2 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+      .vg-w-stack-meta-cache-tiers:has(#vg-w-stack-meta-cache-tiers-r3:checked) .layer-3 { fill: var(--sage-deep); fill-opacity: 0.28; stroke: var(--sage-deep); }
+      .vg-w-stack-meta-cache-tiers:has(#vg-w-stack-meta-cache-tiers-r4:checked) .layer-4 { fill: var(--muted); fill-opacity: 0.28; stroke: var(--muted); }
+
+      .vg-w-stack-meta-cache-tiers .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+      .vg-w-stack-meta-cache-tiers .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-stack-meta-cache-tiers .detail p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-stack-meta-cache-tiers:has(#vg-w-stack-meta-cache-tiers-r1:checked) .detail-1,
+      .vg-w-stack-meta-cache-tiers:has(#vg-w-stack-meta-cache-tiers-r2:checked) .detail-2,
+      .vg-w-stack-meta-cache-tiers:has(#vg-w-stack-meta-cache-tiers-r3:checked) .detail-3,
+      .vg-w-stack-meta-cache-tiers:has(#vg-w-stack-meta-cache-tiers-r4:checked) .detail-4 { display: block; }
+      .vg-w-stack-meta-cache-tiers .hint { font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin: 0 0 var(--s-1) 0; }
+      .vg-w-stack-meta-cache-tiers figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M9 18h6"/><path d="M10 22h4"/><path d="M15.09 14c.18-.98.65-1.74 1.41-2.5A4.65 4.65 0 0 0 18 8 6 6 0 0 0 6 8c0 1 .23 2.23 1.5 3.5A4.61 4.61 0 0 1 8.91 14"/>
+      </svg>
+      <span>click any tier to read its scope · 3 層 cache + 區域來源</span>
+    </p>
+
+    <input type="radio" id="vg-w-stack-meta-cache-tiers-r1" name="vg-w-stack-meta-cache-tiers-sel" checked aria-label="L1 host memory" />
+    <input type="radio" id="vg-w-stack-meta-cache-tiers-r2" name="vg-w-stack-meta-cache-tiers-sel" aria-label="L2 host flash" />
+    <input type="radio" id="vg-w-stack-meta-cache-tiers-r3" name="vg-w-stack-meta-cache-tiers-sel" aria-label="L3 regional flash" />
+    <input type="radio" id="vg-w-stack-meta-cache-tiers-r4" name="vg-w-stack-meta-cache-tiers-sel" aria-label="Tectonic source of truth" />
+
+    <p class="stack-title" id="vg-w-stack-meta-cache-tiers-title">三層 distributed data cache——越靠近 GPU 越快、越遠共享範圍越大</p>
+    <ul class="stack-cards" aria-labelledby="vg-w-stack-meta-cache-tiers-title">
+      <li class="card-1"><label for="vg-w-stack-meta-cache-tiers-r1">
+        <p class="card-head"><span>L1 · host memory</span><code class="card-tag">per-host</code></p>
+        <p class="card-sub">GPU host 上的 memory，命中就完全不出這台機器——最快、最小。</p>
+      </label></li>
+      <li class="card-2"><label for="vg-w-stack-meta-cache-tiers-r2">
+        <p class="card-head"><span>L2 · host flash</span><code class="card-tag">per-host</code></p>
+        <p class="card-sub">同一台 GPU host 上的 flash，比 memory 慢但容量大得多，仍在本機、不出網路。</p>
+      </label></li>
+      <li class="card-3"><label for="vg-w-stack-meta-cache-tiers-r3">
+        <p class="card-head"><span>L3 · regional flash</span><code class="card-tag">per-region</code></p>
+        <p class="card-sub">區域範圍、flash 為後端的 BLOB-storage fabric，跨 host 共享——一台拉過的資料別台也命中。</p>
+      </label></li>
+      <li class="card-4"><label for="vg-w-stack-meta-cache-tiers-r4">
+        <p class="card-head"><span>miss → Tectonic</span><code class="card-tag">source of truth</code></p>
+        <p class="card-sub">三層都沒接住才回源到 Tectonic block layer——這是資料的真正來源。</p>
+      </label></li>
+    </ul>
+
+    <svg class="diagram" viewBox="0 0 880 340" role="img"
+         aria-label="三層 distributed data cache 的物理位置：L1 host memory、L2 host flash 都在 GPU host 上，L3 是區域 flash fabric，miss 回源到 Tectonic">
+      <text x="40" y="26" fill="var(--ink)" class="head">三層 distributed data cache——host-local 兩層 + 區域一層，miss 回源 Tectonic</text>
+
+      <!-- GPU host box wrapping L1 + L2 -->
+      <rect x="40" y="44" width="440" height="150" fill="none" stroke="var(--muted-2)" stroke-width="1.2" stroke-dasharray="4,3" rx="4"/>
+      <text x="52" y="62" fill="var(--muted)" class="sub">GPU host（host-local）</text>
+
+      <rect class="layer layer-1" data-target="vg-w-stack-meta-cache-tiers-r1" x="60" y="74" width="400" height="46" rx="2" role="button" tabindex="0" aria-label="L1 host memory" />
+      <text x="76" y="96" fill="var(--ink)">L1 · host memory</text>
+      <text x="76" y="112" class="sub">命中不出機器，最快最小</text>
+      <text x="446" y="101" text-anchor="end" class="tag" fill="var(--accent-text)">per-host</text>
+
+      <rect class="layer layer-2" data-target="vg-w-stack-meta-cache-tiers-r2" x="60" y="130" width="400" height="46" rx="2" role="button" tabindex="0" aria-label="L2 host flash" />
+      <text x="76" y="152" fill="var(--ink)">L2 · host flash</text>
+      <text x="76" y="168" class="sub">本機 flash，容量大、仍不出網路</text>
+      <text x="446" y="157" text-anchor="end" class="tag" fill="var(--accent-text)">per-host</text>
+
+      <!-- arrow to L3 -->
+      <line x1="480" y1="140" x2="540" y2="140" stroke="var(--muted-2)" stroke-width="1.5"/>
+      <polygon points="540,140 532,136 532,144" fill="var(--muted-2)"/>
+      <text x="510" y="130" text-anchor="middle" class="sub">miss ↓</text>
+
+      <!-- L3 regional -->
+      <rect class="layer layer-3" data-target="vg-w-stack-meta-cache-tiers-r3" x="540" y="74" width="300" height="102" rx="2" role="button" tabindex="0" aria-label="L3 regional flash" />
+      <text x="556" y="104" fill="var(--ink)">L3 · regional flash</text>
+      <text x="556" y="122" class="sub">區域 BLOB-storage fabric</text>
+      <text x="556" y="138" class="sub">跨 host 共享：一台拉過別台也命中</text>
+      <text x="826" y="160" text-anchor="end" class="tag" fill="var(--sage-deep)">per-region</text>
+
+      <!-- arrow down to source -->
+      <line x1="690" y1="176" x2="690" y2="228" stroke="var(--muted-2)" stroke-width="1.5"/>
+      <polygon points="690,228 686,220 694,220" fill="var(--muted-2)"/>
+      <text x="704" y="206" class="sub">三層皆 miss ↓</text>
+
+      <!-- Tectonic source -->
+      <rect class="layer layer-4" data-target="vg-w-stack-meta-cache-tiers-r4" x="540" y="232" width="300" height="60" rx="2" role="button" tabindex="0" aria-label="Tectonic source of truth" />
+      <text x="556" y="258" fill="var(--ink)">Tectonic block layer</text>
+      <text x="556" y="276" class="sub">source of truth，erasure-coded</text>
+      <text x="826" y="266" text-anchor="end" class="tag" fill="var(--muted)">回源</text>
+
+      <text x="40" y="322" fill="var(--muted)" class="sub">Meta 實測 distributed data cache 平均命中率 80%——多數讀取止於 host-local 的 L1/L2，不必走到區域或回源</text>
+    </svg>
+
+    <div>
+      <p class="hint">click any tier above</p>
+      <div class="detail detail-1">
+        <h3>L1 · host memory</h3>
+        <p>GPU host 上的 memory。三層裡最快、最小的一層，命中就完全不出這台機器。training 反覆掃同一批資料時，最熱的那部分會留在這裡。</p>
+        <p><strong>範圍</strong>：per-host。只有這台 GPU host 自己能用。</p>
+      </div>
+      <div class="detail detail-2">
+        <h3>L2 · host flash</h3>
+        <p>同一台 GPU host 上的 flash。比 memory 慢，但容量大得多，接住放不進 memory 的次熱資料——仍是 host-local，命中不出網路。</p>
+        <p><strong>範圍</strong>：per-host。L1 裝不下的溢出到這裡。</p>
+      </div>
+      <div class="detail detail-3">
+        <h3>L3 · regional flash</h3>
+        <p>區域範圍、以 flash 為後端的 BLOB-storage fabric，是三層裡唯一跨 host 共享的一層。一台機器拉進 L3 的資料，同區域別台機器的讀取也能命中——這是 host-local 兩層之外的第二重命中機會。</p>
+        <p><strong>範圍</strong>：per-region。整個區域的 GPU host 共用。</p>
+      </div>
+      <div class="detail detail-4">
+        <h3>miss → Tectonic</h3>
+        <p>三層 cache 都沒接住的讀取，才回源到 Tectonic block layer——資料真正的 source of truth。Meta 實測平均只有兩成的讀取會走到 cache 之外（80% 命中率的另一面）。</p>
+        <p><strong>範圍</strong>：regional、multi-tenant，erasure-coded 的儲存 fabric。</p>
+      </div>
+    </div>
+
+    <figcaption>L1/L2 都在 GPU host 上（host-local），L3 是區域共享的 flash fabric，三層皆 miss 才回源 Tectonic。分層與範圍取自 Meta blog；命中率 80% 是實測平均值。</figcaption>
+
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        const root = document.querySelector('.vg-w-stack-meta-cache-tiers');
+        root.querySelectorAll('.layer').forEach((rect) => {
+          rect.addEventListener('click', () => {
+            const targetId = rect.getAttribute('data-target');
+            const radio = root.querySelector('#' + targetId);
+            if (radio) radio.checked = true;
+          });
+          rect.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); rect.dispatchEvent(new MouseEvent('click', { bubbles: true })); }
+          });
+        });
+      })();
+    </script>
+  </figure>
+
+  <p class="vg-deep-closer"><strong>What this enables</strong>：把 metadata 攤平成 O(1) 查詢、消掉 proxy hop、再用三層 cache 吃掉 80% 讀取，Meta 說這套新 BLOB-storage stack 現在能服務 AI workload 而不造成 GPU stall——但他們也自己標了邊界：這種優化只對跨越數週或數月的大規模 training job 才划算，絕大多數 job 其實小得多，硬套反而不值得。真正能帶走的判斷是：排查 GPU stall 時，先量 metadata control-plane 的路徑（幾次查詢、是否跨區、是否經 proxy），別急著加頻寬——瓶頸常常在你還沒開始搬 byte 的地方。</p>
+</div>
