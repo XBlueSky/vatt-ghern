@@ -1,0 +1,303 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">把 wire-to-wire latency 的 p95 壓到 50 微秒以下，靠的不是少寫幾條 AVX 指令，而是從 NIC 收封包那一刻到同一張 NIC 送出訂單的整條路徑，每一層都不留任何非預期的延遲來源——kernel bypass 省 20 到 45 微秒，BIOS 鎖死 C-state 與 PCIe ASPM，isolcpus 把核心從排程器裡挖出來，最後才輪到程式碼層的 cache line 對齊。</p>
+  <h1 class="vg-post-title">從網卡到 P99：低延遲交易系統</h1>
+</header>
+
+<div class="vg-post-body">
+  <p><span class="vg-dropcap">低</span>延遲交易系統要解的問題只有一個定義：wire-to-wire latency，從市場資料封包抵達 NIC 的那一刻，量到同一張 NIC 把訂單送出去為止。這條路徑上，硬體、作業系統、應用層資料結構缺一不可——任何一層沒調對，前面幾層做得再乾淨都沒用。目標是把 p95 wire-to-wire latency 壓到 50 微秒以下，這個數字乍看抽象，但放進交易系統實際處理的量級裡就有了重量：CME 平均一天要處理兩千萬到三千萬筆成交、一億到一億五千萬筆未平倉事件，這個規模決定了「調校」不是錦上添花，而是能不能撐住吞吐量的前提。光譜的另一端更極端——用 FPGA、ASIC 這類專用硬體把整條決策路徑刻進電路，執行時間可以壓到 tens of nanoseconds 等級，比軟體加調校能碰到的天花板還低一個數量級。但多數系統仍然跑在通用 CPU 上，靠的是接下來四層各自消除自己的固定成本：網卡到使用者空間的那段路、BIOS 與 kernel 層的省電與排程機制、應用層的記憶體佈局，以及貫穿前三者、決定調校是否真的有效的量測紀律。</p>
+
+  <figure class="vg-w-param-demo-latency-budget" data-mobile="static" data-svg-scroll="720">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/>
+        <path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+      </svg>
+      <span>拖曳滑桿關掉各層優化 · 4 個開關</span>
+    </p>
+    <style>
+      .vg-w-param-demo-latency-budget { display: grid; grid-template-rows: auto auto auto; gap: var(--s-3); }
+      .vg-w-param-demo-latency-budget .switches { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--s-2); }
+      @media (min-width: 720px) { .vg-w-param-demo-latency-budget .switches { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+      .vg-w-param-demo-latency-budget .sw { display: flex; flex-direction: column; gap: var(--s-1); padding: var(--s-2); border: 1px solid var(--line); cursor: pointer; user-select: none; }
+      .vg-w-param-demo-latency-budget .sw:hover { border-color: var(--accent); }
+      .vg-w-param-demo-latency-budget .sw input { display: none; }
+      .vg-w-param-demo-latency-budget .sw-head { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); display: flex; align-items: center; gap: var(--s-1); }
+      .vg-w-param-demo-latency-budget .sw-dot { width: 10px; height: 10px; border-radius: 50%; border: 1.5px solid var(--muted-2); background: var(--bg-soft); }
+      .vg-w-param-demo-latency-budget .sw:has(input:checked) .sw-dot { background: var(--sage-deep); border-color: var(--sage-deep); }
+      .vg-w-param-demo-latency-budget .sw:has(input:checked) .sw-head { color: var(--accent-text); }
+      .vg-w-param-demo-latency-budget .sw-name { font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink); }
+      .vg-w-param-demo-latency-budget .sw-cost { font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); color: var(--muted); font-variant-numeric: tabular-nums; }
+      .vg-w-param-demo-latency-budget svg.vg-w-param-demo-latency-budget-main { width: 100%; height: auto; min-width: 720px; }
+      .vg-w-param-demo-latency-budget .readout { display: grid; grid-template-columns: 1fr; gap: var(--s-2); padding: var(--s-3); background: var(--bg-soft); border-left: 2px solid var(--accent); }
+      @media (min-width: 720px) { .vg-w-param-demo-latency-budget .readout { grid-template-columns: auto 1fr; align-items: center; } }
+      .vg-w-param-demo-latency-budget .total { font-family: EB Garamond, serif; font-size: 2rem; color: var(--ink); font-variant-numeric: tabular-nums; }
+      .vg-w-param-demo-latency-budget .total .unit { font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-left: 0.4ch; }
+      .vg-w-param-demo-latency-budget .breakdown { font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink-soft); }
+      .vg-w-param-demo-latency-budget .breakdown em { color: var(--accent-text); font-style: italic; }
+    </style>
+
+    <div class="switches" role="group" aria-label="四層延遲優化開關" data-vg-controls>
+      <label class="sw">
+        <input type="checkbox" data-layer="bypass" checked />
+        <span class="sw-head"><span class="sw-dot"></span>kernel bypass</span>
+        <span class="sw-name">DPDK polling</span>
+        <span class="sw-cost">關掉 +20~45 µs</span>
+      </label>
+      <label class="sw">
+        <input type="checkbox" data-layer="cstate" checked />
+        <span class="sw-head"><span class="sw-dot"></span>C-state/governor</span>
+        <span class="sw-name">鎖 performance</span>
+        <span class="sw-cost">關掉 +8 µs</span>
+      </label>
+      <label class="sw">
+        <input type="checkbox" data-layer="isol" checked />
+        <span class="sw-head"><span class="sw-dot"></span>isolcpus 家族</span>
+        <span class="sw-name">核心隔離</span>
+        <span class="sw-cost">關掉 +6 µs</span>
+      </label>
+      <label class="sw">
+        <input type="checkbox" data-layer="cache" checked />
+        <span class="sw-head"><span class="sw-dot"></span>cache 對齊</span>
+        <span class="sw-name">無 false sharing</span>
+        <span class="sw-cost">關掉 +4 µs</span>
+      </label>
+    </div>
+
+    <svg class="vg-w-param-demo-latency-budget-main" viewBox="0 0 720 160" role="img" aria-label="四層優化開關累計的 p95 wire-to-wire 延遲預算">
+      <line x1="60" y1="110" x2="680" y2="110" stroke="var(--muted-2)" stroke-width="1"/>
+      <text x="60" y="128" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="11">0</text>
+      <text x="230" y="128" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="11">30</text>
+      <text x="400" y="128" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="11">50</text>
+      <text x="570" y="128" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="11">70</text>
+      <text x="680" y="128" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="11">90</text>
+      <line x1="400" y1="20" x2="400" y2="110" stroke="var(--sage-deep)" stroke-width="1" stroke-dasharray="3,3"/>
+      <text x="400" y="16" text-anchor="middle" fill="var(--sage-deep)" font-family="IM Fell English, serif" font-style="italic" font-size="12">目標 p95 &lt; 50 µs</text>
+      <text x="370" y="148" text-anchor="middle" fill="var(--muted)" font-family="IM Fell English, serif" font-style="italic" font-size="11">p95 wire-to-wire latency（µs）</text>
+      <rect data-bar x="60" y="70" width="93" height="28" fill="var(--accent)" opacity="0.75"/>
+      <text data-label x="163" y="90" fill="var(--ink)" font-family="JetBrains Mono, monospace" font-size="13">18 µs</text>
+    </svg>
+
+    <div class="readout">
+      <div class="total"><span data-total>18</span><span class="unit">µs · p95</span></div>
+      <div class="breakdown" data-breakdown>四層全開——維持在目標線左側。每關掉一層，那一層原本被壓掉的延遲整段回填，不是「稍微變慢」。</div>
+    </div>
+
+    <figcaption>基準 18 µs 取自文章列出的各層優化幅度加總後的保守估計；每個開關對應原文給出的節省區間（DPDK 20–45 µs 取中位數，其餘三項為同一份調校清單中會累加的固定成本）。拖曳/點擊開關看 p95 如何越過 50 µs 的目標線。</figcaption>
+
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        const root = document.querySelector('.vg-w-param-demo-latency-budget');
+        const inputs = root.querySelectorAll('input[data-layer]');
+        const total = root.querySelector('[data-total]');
+        const breakdown = root.querySelector('[data-breakdown]');
+        const bar = root.querySelector('[data-bar]');
+        const label = root.querySelector('[data-label]');
+        const X0 = 60, X1 = 680, MIN = 0, MAX = 90;
+        function xFor(v) { return X0 + (Math.max(MIN, Math.min(MAX, v)) / MAX) * (X1 - X0); }
+        const baseline = 18;
+        const costs = { bypass: 32, cstate: 8, isol: 6, cache: 4 };
+        const names = { bypass: 'kernel bypass（DPDK polling）', cstate: 'C-state/Turbo Boost/governor', isol: 'isolcpus/nohz_full/rcu_nocbs', cache: 'cache line 對齊' };
+        function recompute() {
+          let v = baseline;
+          const off = [];
+          inputs.forEach((inp) => {
+            if (!inp.checked) { v += costs[inp.dataset.layer]; off.push(names[inp.dataset.layer]); }
+          });
+          const display = Math.min(v, MAX);
+          total.textContent = String(Math.round(display));
+          const x = xFor(display);
+          bar.setAttribute('width', String(Math.max(8, x - X0)));
+          label.setAttribute('x', String(x + 8));
+          label.textContent = Math.round(display) + ' µs';
+          bar.setAttribute('fill', display > 50 ? 'var(--accent-text)' : 'var(--accent)');
+          if (off.length === 0) {
+            breakdown.innerHTML = '四層全開——維持在目標線左側。每關掉一層，那一層原本被壓掉的延遲整段回填，不是「稍微變慢」。';
+          } else {
+            breakdown.innerHTML = '關掉：<em>' + off.join('、') + '</em>。' + (display > 50 ? '已經超過 50 µs 目標線。' : '尚未超過目標線，但安全邊際變薄。');
+          }
+        }
+        inputs.forEach((inp) => inp.addEventListener('change', recompute));
+        recompute();
+      })();
+    </script>
+  </figure>
+
+  <h2>NIC 到使用者空間：kernel bypass 拆掉的那一段路</h2>
+
+  <p>封包進來的第一段路徑，決定了後面所有優化還有沒有意義。標準 Linux network stack 的路徑是：網卡觸發硬體中斷、kernel 把封包從 driver buffer 複製進 socket buffer、應用程式再透過系統呼叫把資料從 kernel space 複製到 user space——每一段複製、每一次中斷、每一次 context switch 都是延遲的來源，而且是不可預測的延遲，因為中斷什麼時候來、排程器什麼時候把你排上 CPU，都不是應用程式能控制的。這條路徑上還藏著另一種成本：系統呼叫本身要切換 CPU 的特權層級，從 user mode 進 kernel mode 再回來，這個切換即使不涉及任何實際工作，也要付出固定的週期數。DPDK 的 polling mode 把這條路徑整個繞開：關掉網卡中斷，讓使用者空間的執行緒用忙輪詢（busy-poll）直接檢查網卡的接收環，封包一到就地處理，不必等中斷、不必經過 kernel network stack 的層層封裝與拆解，也不必再付系統呼叫那筆固定成本。文章給出的具體數字是，DPDK polling mode 調校正確時「can save roughly 20 to 45 microseconds」——這個區間本身帶著明確的但書：必須針對 market data processing 的場景調對，不是插上就有效，區間的寬度也說明了實際節省幅度跟工作負載形狀、封包大小、到達節奏都有關係。</p>
+
+  <p>Exanic 與 Solarflare 這類專用網卡，把 kernel bypass 再往前推一步：它們原生提供 zero-copy 資料存取、硬體層過濾、硬體時間戳，以及可彈性配置的流量導向（flow steering）。這意味著封包分類與過濾這件事，從「CPU 收到封包後用軟體判斷該不該處理」，變成「網卡自己在硬體邏輯裡先篩過一輪，只把交易系統真正在意的那部分流量送進使用者空間」——過濾這個動作本身從熱路徑上被搬走了。硬體時間戳記同樣重要——如果延遲量測要精確到微秒等級，靠軟體在收到封包後才蓋時間戳，量到的其實是「軟體處理延遲加上真實網路延遲」的混合值，而不是真實的到達時間，這個混合值會讓後面所有基於這個時間戳做的延遲分析都帶著一層系統性偏差，而且偏差量還會隨著 CPU 負載變動，不是固定的常數可以事後扣除。硬體時間戳讓每個進出封包在網卡層就被打上時間，把量測誤差從路徑裡拿掉，這也是為什麼後面談量測紀律的章節，會把時間來源本身列為第一個要檢查的環節。</p>
+
+  <p>但 kernel bypass 換來的低延遲、高吞吐是有代價的：一旦繞過作業系統的排程與資源管理，CPU 核心與記憶體就必須被靜態、專屬地分配給這個輪詢執行緒——它不能被排程器搶走，也不能被打斷去處理別的事，忙輪詢的性質決定了它會把整顆核心的使用率釘在接近 100%，即使當下沒有封包進來也一樣，這是用電力與核心數換取延遲可預測性的直接交易。這把問題直接遞交給下一層：作業系統與 BIOS 層要怎麼保證，這顆核心真的不會被任何背景機制打斷——計時器中斷、其他行程搶佔、電源管理狀態切換，任何一個不受控制，前面靠 kernel bypass 省下來的時間都可能被同一顆核心上的另一種延遲吃掉。</p>
+
+  <h2>BIOS 與 kernel：把不確定性一項項鎖死</h2>
+
+  <p>如果 kernel bypass 拆掉的是「軟體路徑」上的延遲，BIOS 與作業系統層要拆的是「硬體省電機制」與「排程器背景活動」帶來的延遲尖峰。這兩類延遲的共同點是：平常幾乎量不到，但一旦發生就是動輒數微秒到數十微秒的離群值——恰好就是把 p99、p99.9 拖垮的那種尖峰。以下這張表把文章列出的調校項目按「作用層」與「解決的問題」整理：</p>
+
+  <figure class="vg-w-table-tuning-checklist" data-mobile="keep">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/>
+        <path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+      </svg>
+      <span>click column header to sort · 3 columns × 8 rows</span>
+    </p>
+    <style>
+      .vg-w-table-tuning-checklist { overflow-x: auto; }
+      .vg-w-table-tuning-checklist table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-tuning-checklist thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; }
+      .vg-w-table-tuning-checklist thead th[data-sort] { color: var(--accent-text); }
+      .vg-w-table-tuning-checklist thead th[data-sort]::after { content: ' ▾'; font-size: 0.7em; }
+      .vg-w-table-tuning-checklist thead th[data-sort="asc"]::after { content: ' ▴'; font-size: 0.7em; }
+      .vg-w-table-tuning-checklist tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+      .vg-w-table-tuning-checklist td.layer { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); white-space: nowrap; }
+      .vg-w-table-tuning-checklist tbody tr:hover td { background: var(--bg-soft); }
+    </style>
+    <table>
+      <thead>
+        <tr>
+          <th data-key="layer">作用層</th>
+          <th data-key="item">調校項目</th>
+          <th data-key="reason">解決的問題</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td class="layer">BIOS</td><td>Disable C-states and Turbo Boost</td><td>省電狀態切換與動態超頻本身就是延遲不可預期的來源</td></tr>
+        <tr><td class="layer">BIOS</td><td>Lock PCIe ASPM off</td><td>PCIe 鏈路在省電狀態間切換造成延遲尖峰</td></tr>
+        <tr><td class="layer">BIOS</td><td>Set CPU governor to performance mode</td><td>避免動態調頻造成的延遲不穩定</td></tr>
+        <tr><td class="layer">BIOS</td><td>Enable hugepages</td><td>減少 TLB miss，降低記憶體存取延遲變異</td></tr>
+        <tr><td class="layer">kernel</td><td>isolcpus</td><td>把核心從一般排程器隔離，不接受其他行程排上來</td></tr>
+        <tr><td class="layer">kernel</td><td>nohz_full</td><td>減少該核心上的計時器中斷（tick）</td></tr>
+        <tr><td class="layer">kernel</td><td>rcu_nocbs</td><td>把 RCU callback 挪到別的核心處理，不佔用關鍵路徑核心</td></tr>
+        <tr><td class="layer">應用層</td><td>mlockall</td><td>把行程記憶體鎖在實體記憶體，防止 page fault 造成延遲尖峰</td></tr>
+      </tbody>
+    </table>
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-table-tuning-checklist');
+        const headers = root.querySelectorAll('thead th');
+        const tbody = root.querySelector('tbody');
+        let activeKey = null, asc = true;
+        headers.forEach((h, idx) => h.addEventListener('click', () => {
+          const key = h.dataset.key;
+          if (activeKey === key) asc = !asc; else { activeKey = key; asc = true; }
+          headers.forEach((x) => x.removeAttribute('data-sort'));
+          h.setAttribute('data-sort', asc ? 'asc' : 'desc');
+          const rows = Array.from(tbody.querySelectorAll('tr'));
+          rows.sort((a, b) => {
+            const av = a.children[idx].textContent.trim();
+            const bv = b.children[idx].textContent.trim();
+            const cmp = av.localeCompare(bv);
+            return asc ? cmp : -cmp;
+          });
+          rows.forEach((r) => tbody.appendChild(r));
+        }));
+      })();
+    </script>
+  </figure>
+
+  <p>這張表最容易被誤解的一點，是把每一項都當成獨立的效能開關。實際上它們的作用方式是「消除某一種非預期事件」，而不是「加速某一種計算」——isolcpus 不會讓 CPU 算得更快，它只是不讓排程器把別的行程排到這顆核心上；nohz_full 不會讓時脈變準，它只是讓計時器中斷不要在錯的時間點打斷你；rcu_nocbs 也不會讓 RCU 機制本身變快，它只是把處理 callback 的工作挪到別的核心，讓關鍵路徑的核心不必分心。這也是為什麼調校清單裡幾乎看不到「加速」類型的項目：低延遲交易系統的敵人主要不是「平均延遲太高」，而是「延遲的變異太大」——同一段程式碼跑一千次，九百九十九次都在幾微秒內完成，剩下那一次因為被中斷或換頁卡住幾十微秒，這一次就足以拖垮整個 p99 分佈。這正是 NUMA 親和性也被明確點名的原因：「For critical processes, you want to pin threads to cores within the same NUMA node and ensure that the data those threads access is also allocated on the same node.」把執行緒與它存取的資料釘在同一個 NUMA node，避免的正是跨 node 記憶體存取那段不固定、且比同 node 存取慢上一截的延遲——現代多路伺服器的記憶體控制器是分散在每顆實體 CPU 上的，跨 node 存取代表資料要多繞一段互連匯流排，這段路徑的延遲跟排隊狀況都不像同 node 存取那樣穩定。跨主機的時間同步則交給另一種硬體機制——PTP 硬體時鐘，文章直接把它定位成「the standard approach」，用來確保分散在不同機器上的時間戳彼此可比較，這對任何要把多台主機的延遲數字放在同一張圖上比較的系統都是前提，沒有這一步，「機器 A 比機器 B 快 3 微秒」這種說法可能只是兩台機器的時鐘本身沒對齊。</p>
+
+  <h2>應用層資料結構：cache line 與 lock-free queue</h2>
+
+  <p>把 NIC、BIOS、kernel 都調對之後，延遲的戰場移到應用程式自己的記憶體存取模式上。第一條原則是靜態化：啟動時把需要的記憶體區段一次配置好，關鍵路徑上完全不呼叫 <code>malloc</code>、不使用會動態成長的容器，目標是把所有系統呼叫從熱路徑上徹底清除——動態配置的問題不只是配置本身要花時間，還在於它的耗時不固定，取決於當下記憶體碎片化程度與配置器內部狀態，這正是「延遲變異」而非「延遲平均值」的另一個來源。第二條原則是計時：用 TSC（Time Stamp Counter）取代任何需要系統呼叫的計時手段，因為 TSC 本身不需要系統呼叫，讀取成本極低——但這個工具本身有一個容易被忽略的限制：「TSC can drift across cores on the same CPU.」也就是說，如果一個量測橫跨了兩顆不同的核心，兩次讀到的 TSC 值之間可能存在漂移，這個漂移看起來會像是真實的延遲尖峰，但其實只是計時工具本身的誤差——如果沒意識到這一點，工程師很可能把時間花在追查一個根本不存在的效能問題上。</p>
+
+  <p>真正決定多執行緒系統延遲下限的，往往不是演算法複雜度，而是 cache line 層級的資料佈局。文章把 false sharing 明確定性為「one of the most common mistakes in multithreaded systems」——常見到值得單獨點名。它的機制是：「When two threads write to variables that share a cache line, even if those variables are logically unrelated, the cache coherency protocol treats the entire line as contested and forces unnecessary cross-core coordination.」也就是說，即使兩個變數在程式邏輯上毫無關聯，只要它們被編譯器安排在同一條 cache line 上，一個核心寫入其中一個變數，就會讓另一個核心手上那份 cache line 的副本失效——即使那個核心根本沒有碰觸到被寫入的那個變數，它下一次讀取同一條 line 時仍然要重新從別的核心或主記憶體抓一份。多核心系統的 cache coherency protocol（例如 MESI 家族）是以整條 cache line 為粒度追蹤狀態，不是以變數為粒度，這是問題的根源：協定本身看不見「這條 line 裡有兩個邏輯無關的欄位」，它只看得見「這條 line 被寫入了」。修法通常是把會被不同執行緒頻繁寫入的變數用 padding 隔到不同的 cache line 上，讓每個執行緒各自持有一整條專屬的 line，用一點記憶體浪費換取跨核心同步完全消失。</p>
+
+  <figure class="vg-w-diagram-false-sharing" data-mobile="keep" data-svg-scroll="720">
+    <style>
+      .vg-w-diagram-false-sharing svg { width: 100%; height: auto; max-width: 720px; }
+      .vg-w-diagram-false-sharing text { font-family: EB Garamond, serif; }
+      .vg-w-diagram-false-sharing .label { font-family: IM Fell English, serif; font-style: italic; }
+      .vg-w-diagram-false-sharing .mono { font-family: JetBrains Mono, monospace; }
+    </style>
+    <svg viewBox="0 0 720 260" role="img" aria-label="false sharing 機制：兩個執行緒各自寫入邏輯無關的變數，但變數落在同一條 cache line，coherency protocol 把整條 line 當作爭用對象">
+      <text x="360" y="24" text-anchor="middle" fill="var(--ink)" class="label" font-size="14">同一條 cache line 上的兩個「無關」變數</text>
+
+      <rect x="80" y="50" width="560" height="60" fill="none" stroke="var(--muted-2)" stroke-width="1.5"/>
+      <line x1="360" y1="50" x2="360" y2="110" stroke="var(--muted-2)" stroke-dasharray="3,3"/>
+      <text x="220" y="45" text-anchor="middle" fill="var(--muted)" class="mono" font-size="11">counter_a（thread 1 寫入）</text>
+      <text x="500" y="45" text-anchor="middle" fill="var(--muted)" class="mono" font-size="11">counter_b（thread 2 寫入）</text>
+      <text x="220" y="85" text-anchor="middle" fill="var(--ink)" class="mono" font-size="13">0x00</text>
+      <text x="500" y="85" text-anchor="middle" fill="var(--ink)" class="mono" font-size="13">0x04</text>
+      <text x="360" y="130" text-anchor="middle" fill="var(--muted)" class="label" font-size="11">64-byte cache line（0x00–0x3F）</text>
+
+      <text x="120" y="175" fill="var(--ink)" font-size="13">thread 1 寫 counter_a</text>
+      <path d="M 220 185 L 220 210" stroke="var(--accent)" stroke-width="1.5" marker-end="url(#vg-w-diagram-false-sharing-arrow)"/>
+      <text x="220" y="228" text-anchor="middle" fill="var(--accent-text)" class="mono" font-size="11">整條 line 標記 modified</text>
+
+      <text x="500" y="175" fill="var(--ink)" font-size="13">thread 2 的副本失效</text>
+      <path d="M 500 185 L 500 210" stroke="var(--sage-deep)" stroke-width="1.5" marker-end="url(#vg-w-diagram-false-sharing-arrow-2)"/>
+      <text x="500" y="228" text-anchor="middle" fill="var(--sage-deep)" class="mono" font-size="11">即使沒碰 counter_a</text>
+
+      <defs>
+        <marker id="vg-w-diagram-false-sharing-arrow" viewBox="0 0 10 10" refX="5" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--accent)"/>
+        </marker>
+        <marker id="vg-w-diagram-false-sharing-arrow-2" viewBox="0 0 10 10" refX="5" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--sage-deep)"/>
+        </marker>
+      </defs>
+
+      <text x="360" y="252" text-anchor="middle" fill="var(--muted)" class="label" font-size="11">修法：把 counter_a／counter_b 各自 padding 到獨立 cache line</text>
+    </svg>
+    <figcaption>counter_a 與 counter_b 邏輯上互不相關，但落在同一條 64-byte cache line 內——coherency protocol 以整條 line 為粒度追蹤狀態，thread 1 寫入 counter_a 會讓 thread 2 手上的整條 line 失效，即使 thread 2 從未碰過 counter_a。</figcaption>
+  </figure>
+
+  <p>在資料結構的選擇上，文章明確建議「Use lock-free SPSC queues」——single-producer single-consumer 佇列。SPSC 之所以能做到 lock-free 且效率極高，是因為它把問題限制到最窄的並行場景：只有一個執行緒寫、一個執行緒讀，讀寫兩端的 index 各自只被一邊修改，用一對原子變數（讀 index、寫 index）就能保證正確性，完全不需要互斥鎖，也不需要更複雜的多生產者/多消費者佇列要處理的 ABA 問題與競爭仲裁開銷。互斥鎖的成本不只是鎖住的那段臨界區——作業系統層面的鎖競爭可能觸發 futex 系統呼叫、甚至讓執行緒被排程器換出，一旦換出，重新排回這顆核心的時間完全不可控，對一個要求微秒等級穩定性的系統來說，這種不可控本身就是不能接受的風險。SPSC queue 把這整條風險路徑砍掉，代價是拓撲必須真的是一對一——如果系統裡有多個生產者要塞進同一個佇列，SPSC 的保證就不成立，必須換成別的資料結構或者拆成多個 SPSC 通道，讓每一對生產者與消費者各自持有自己專屬的佇列。推論下去，這個限制與前面 cache line 對齊的原理其實是同一件事：SPSC queue 的讀寫 index 分別被兩個不同執行緒各自修改，如果沒有刻意隔到不同 cache line，這兩個 index 本身就會落入同一種 false sharing 情境——原文沒有直接點名這個組合，但機制上是同一條規則的延伸。</p>
+
+  <h2>量測比調校更難：SIMD 誤用與 baseline histogram</h2>
+
+  <p>前面三層調校清單看起來像是「照抄就對」，但文章特別點出了一個常見的反直覺陷阱：SIMD 向量化不是無條件正確的優化方向。「Premature SIMD can actually increase latency when your workload is memory-bound rather than compute-bound.」——如果瓶頸根本不在計算量，而在記憶體頻寬或快取命中率，硬把資料排列去配合 SIMD 寬度，反而可能引入額外的資料重排、對齊開銷，讓延遲不降反升。這條陷阱之所以危險，是因為它違反了工程師的直覺：向量化通常被當成「顯然更快」的優化，很少有人會先去驗證瓶頸到底在哪一段，等到把 SIMD 指令換上去、發現延遲反而變差，才回頭意識到問題從一開始就不在計算量上。文章給的處理方式很直接：「Always benchmark before and after adding vectorization because the performance impact can go in either direction depending on your memory access pattern.」——量測永遠排在優化前面，而不是把優化當成理所當然的第一步。</p>
+
+  <p>這三個常見錯誤（false sharing、premature SIMD、TSC drift）有一個共同的解法，而且是唯一的解法：先量測，再優化。三者的共通點是都會在系統層面偽裝成別的東西——false sharing 偽裝成「多核心擴展性不好」，premature SIMD 偽裝成「這段程式碼已經優化過了」，TSC drift 偽裝成「真實的延遲尖峰」。不先做量測，這三種偽裝都不會被拆穿。下面用分頁對照這三種問題各自的樣貌與量測方式：</p>
+
+  <div class="vg-w-tabs-pitfalls">
+    <style>
+      .vg-w-tabs-pitfalls { display: grid; gap: var(--s-2); }
+      .vg-w-tabs-pitfalls input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-tabs-pitfalls .tabs { display: flex; gap: var(--s-2); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+      .vg-w-tabs-pitfalls .tab { font-family: var(--sans); font-size: var(--fs-sm); padding: var(--s-1) var(--s-2); cursor: pointer; color: var(--muted); min-height: 44px; display: flex; align-items: center; }
+      .vg-w-tabs-pitfalls .panel { display: none; padding: var(--s-2) 0; }
+      .vg-w-tabs-pitfalls .panel h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-tabs-pitfalls .panel p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-tabs-pitfalls:has(#vg-w-tabs-pitfalls-t1:checked) .panel-1 { display: block; }
+      .vg-w-tabs-pitfalls:has(#vg-w-tabs-pitfalls-t1:checked) [for="vg-w-tabs-pitfalls-t1"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-pitfalls:has(#vg-w-tabs-pitfalls-t2:checked) .panel-2 { display: block; }
+      .vg-w-tabs-pitfalls:has(#vg-w-tabs-pitfalls-t2:checked) [for="vg-w-tabs-pitfalls-t2"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-pitfalls:has(#vg-w-tabs-pitfalls-t3:checked) .panel-3 { display: block; }
+      .vg-w-tabs-pitfalls:has(#vg-w-tabs-pitfalls-t3:checked) [for="vg-w-tabs-pitfalls-t3"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    </style>
+    <input type="radio" id="vg-w-tabs-pitfalls-t1" name="vg-w-tabs-pitfalls-sel" checked />
+    <input type="radio" id="vg-w-tabs-pitfalls-t2" name="vg-w-tabs-pitfalls-sel" />
+    <input type="radio" id="vg-w-tabs-pitfalls-t3" name="vg-w-tabs-pitfalls-sel" />
+    <div class="tabs" role="tablist" aria-label="三種常見延遲陷阱">
+      <label class="tab" for="vg-w-tabs-pitfalls-t1">false sharing</label>
+      <label class="tab" for="vg-w-tabs-pitfalls-t2">premature SIMD</label>
+      <label class="tab" for="vg-w-tabs-pitfalls-t3">TSC drift</label>
+    </div>
+    <div class="panel panel-1">
+      <h3>症狀</h3>
+      <p>多核心吞吐量隨核心數增加不升反降，perf 顯示大量 cache miss，但程式邏輯上各執行緒操作的變數彼此無關。</p>
+      <h3>根因</h3>
+      <p>不同執行緒寫入的變數落在同一條 cache line，coherency protocol 以整條 line 為粒度判斷爭用，逼出跨核心同步。</p>
+    </div>
+    <div class="panel panel-2">
+      <h3>症狀</h3>
+      <p>導入向量化指令後，微觀 benchmark 顯示計算更快，但端到端 wire-to-wire 延遲反而上升。</p>
+      <h3>根因</h3>
+      <p>瓶頸其實是記憶體頻寬或快取命中率（memory-bound），不是計算量（compute-bound），向量化帶來的資料重排/對齊開銷蓋過了計算上的節省。</p>
+    </div>
+    <div class="panel panel-3">
+      <h3>症狀</h3>
+      <p>延遲量測出現看似真實的尖峰，但這些尖峰無法用任何已知的系統事件解釋，且集中在跨核心的量測區間。</p>
+      <h3>根因</h3>
+      <p>TSC 在同一顆 CPU 的不同核心之間可能存在漂移，跨核心量測讀到的時間差裡混入了漂移量，而不是真實延遲。</p>
+    </div>
+  </div>
+
+  <p>三個陷阱的共同解法是「Running without baseline histograms makes all of the above invisible」——沒有基準的 p50/p99 histogram，false sharing 造成的 cache miss、SIMD 引入的額外延遲、TSC 漂移造成的偽尖峰，全部混在一起，無從分辨哪個才是真正該修的瓶頸。反過來說，在每個處理階段都量測 p50 與 p99 分佈，是文章唯一稱得上「可靠」的做法——不是因為它本身能降低延遲，而是因為它是唯一能告訴你，前面三層做的每一項調校，究竟有沒有真的把尾延遲往下壓的方法。少了這一步，isolcpus 開了沒開、cache 有沒有對齊，都只是信仰，不是工程。這也是為什麼把 NUMA 綁定、hugepages、kernel 隔離參數這一整份清單照抄過去，跟真正解決一個延遲問題，中間還隔著一步：你必須先在每個階段量出 p50 與 p99 的分佈，才知道抄來的哪一項真的對你的工作負載有用，哪一項只是把問題挪到了看不到的地方。</p>
+
+  <p class="vg-deep-closer"><strong>What this enables</strong>：把 wire-to-wire 延遲拆成 NIC、BIOS/kernel、應用層資料結構、量測紀律四段各自處理，讓 p95 有機會落在 50 微秒以下——但四段裡任何一段沒被 baseline histogram 驗證過，前面做的調校都只是猜測，不是已核實的延遲下降。</p>
+</div>

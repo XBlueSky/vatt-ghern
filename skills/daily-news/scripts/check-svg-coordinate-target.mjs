@@ -42,7 +42,7 @@ export function hasBareSvgQuery(scriptText) {
 
 async function run(urls) {
   const { chromium } = await import("@playwright/test");
-  const browser = await chromium.launch();
+  const browser = await chromium.launch({ executablePath: process.env.PLAYWRIGHT_CHROMIUM_PATH || undefined });
   let anyFail = false;
   let figuresInspected = 0;
   let loadErrors = 0;
