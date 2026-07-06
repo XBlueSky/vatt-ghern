@@ -32,7 +32,7 @@ export function pairOverlaps(a, b) {
 
 async function run(urls) {
   const { chromium } = await import("@playwright/test");
-  const browser = await chromium.launch();
+  const browser = await chromium.launch({ executablePath: process.env.PLAYWRIGHT_CHROMIUM_PATH || undefined });
   const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
 
   let anyFail = false;
