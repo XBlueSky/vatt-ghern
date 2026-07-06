@@ -484,11 +484,11 @@ The sidecar contract is unchanged:
 
 Issue all ≤3 dispatches in ONE response (single message containing
 multiple `Agent` tool blocks). Each dispatch uses
-`subagent_type: general-purpose` with **`model: "opus"` required** —
+`subagent_type: general-purpose` with **`model: "sonnet"` required** —
 author writing is a design-grade judgment task (archetype selection,
 H2 structuring, opener/closer crafting, material density), not
 mechanical pattern-matching. Default sub-agent model selection
-(cheap) is wrong here. If Opus is not available at dispatch time,
+(cheap) is wrong here. If Sonnet is not available at dispatch time,
 report BLOCKED rather than fall back to a cheaper model — the routine
 should produce no PR rather than a PR of unknown calibration. The
 brief from Step 7a is passed as the prompt — see
@@ -657,10 +657,9 @@ max 3), dispatch **2 independent reviewer sub-agents** with
 Reviewer quality judgment (Axis 2 structural coherence, Axis 4 depth
 vs. paraphrase, Axis 6 anti-template) is a design-grade task. Running
 reviewer on the same model family as author also produces LLM-judging-LLM
-bias — using Opus widens the judgment-power gap when author defaults
-to Sonnet, and preserves judgment depth when author is also Opus. If
-Opus is unavailable at dispatch time, report BLOCKED rather than fall
-back. Each reviewer's brief follows the template in
+bias — using Opus widens the judgment-power gap now that author defaults
+to Sonnet. If Opus is unavailable at dispatch time, report BLOCKED rather
+than fall back. Each reviewer's brief follows the template in
 `${CLAUDE_PLUGIN_ROOT}/skills/daily-news/references/content-reviewer-brief.md`
 with the per-post values substituted.
 
@@ -711,7 +710,7 @@ original brief (from Step 7a — held by parent) PLUS:
   forbidden; every concrete detail must come from the source material.
 
 Parent dispatches retry author sub-agents in parallel (one per post
-needing retry) — **same `model: "opus"` requirement as Step 7b**.
+needing retry) — **same `model: "sonnet"` requirement as Step 7b**.
 After all retries return, re-dispatch the dual reviewers (Step 7.5a,
 also Opus) for each retried post; consolidate again (Step 7.5b).
 
