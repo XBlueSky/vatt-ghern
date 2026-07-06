@@ -1,0 +1,546 @@
+{
+  "output_path": "src/posts/2026/07/02/deep-low-latency-trading-systems.html",
+  "spine": [
+    "1. 目標是 wire-to-wire latency（NIC 收到 market data 封包到同一張 NIC 送出訂單）p95 壓在 50 微秒以下——這比多數標準 Java library 能做到的層級深很多。",
+    "2. FPGA/ASIC 可以把執行壓到 tens of nanoseconds，但多數系統仍在 CPU 上跑，靠 kernel bypass、OS 調校、應用層資料結構三層疊加逼近這個目標。",
+    "3. Kernel bypass（DPDK polling mode）把封包從 NIC 直接送進使用者空間，繞過 interrupt 與 kernel network stack，正確調校下可省 20 到 45 微秒。",
+    "4. BIOS 與 OS 層的調校（disable C-states/Turbo Boost、performance governor、鎖死 PCIe ASPM、hugepages、isolcpus/nohz_full/rcu_nocbs、mlockall）決定 CPU 與記憶體路徑上還剩多少不可預期的延遲尖峰。",
+    "5. 應用層要做的事：pre-allocate 記憶體、避免動態容器、cache line 對齊、lock-free SPSC queue、用 TSC 做關鍵路徑計時而非系統呼叫。",
+    "6. False sharing 是多執行緒系統最常見的錯誤之一：兩個執行緒寫入同一 cache line 上邏輯無關的變數，cache coherency protocol 仍把整條 line 當作爭用對象，強迫不必要的跨核心同步。",
+    "7. 沒有 baseline histogram 就等於瞎子調校——每個參數都可能影響延遲，只有在每個階段量 p50/p99 histogram 才能把真正的尾延遲來源和雜訊分開；premature SIMD、TSC drift 都是量測前容易被忽略的陷阱。"
+  ],
+  "sources": [
+    {
+      "url": "https://deepengineering.net/p/from-nic-to-p99-engineering-low-latency",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": "2026-03-04",
+      "perspective": {
+        "mechanism": "把交易系統的 wire-to-wire 延遲拆成資料路徑上的分層問題——NIC 硬體、kernel bypass、OS/CPU 調校、應用層資料結構——每一層都有自己的固定成本與可調參數，唯有疊加優化才能把 p95 壓到 50 微秒以下。",
+        "tradeoff": "多數調校手段（鎖 CPU 頻率、關閉省電機制、pre-allocate 記憶體、避免系統呼叫）都是用可攜性、彈性、甚至硬體壽命/耗電去換取延遲的可預測性；premature SIMD 在記憶體受限的 workload 上反而可能讓延遲變差，顯示優化必須針對量測後的瓶頸而非直覺。",
+        "reader_use": "台灣工程師如果負責任何延遲敏感的系統（不限交易），可以照這份清單逐層檢查：NIC 有沒有 kernel bypass 選項、BIOS 有沒有鎖 C-state/governor、Linux 有沒有 isolcpus/nohz_full、程式碼有沒有 false sharing 與不必要的動態配置——並且優先建立 baseline histogram 而不是先猜哪裡慢。"
+      }
+    }
+  ],
+  "notes": [
+    {
+      "id": "n01",
+      "url": "https://deepengineering.net/p/from-nic-to-p99-engineering-low-latency",
+      "quote": "Wire-to-wire latency is measured from the moment a market data packet is received on the NIC from the exchange to the moment an order is sent back to the exchange on the same NIC.",
+      "hedge": "asserted",
+      "interpretation": "這是全文的核心度量定義：wire-to-wire latency 涵蓋整條路徑（NIC 收到市場資料 → 到同一張 NIC 送出訂單），不只是應用層的處理時間。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n02",
+      "url": "https://deepengineering.net/p/from-nic-to-p99-engineering-low-latency",
+      "quote": "build a trading system with p95 wire-to-wire latency under 50 microseconds",
+      "hedge": "asserted",
+      "interpretation": "文章設定的具體目標數字：p95 wire-to-wire latency 低於 50 微秒，是全文所有調校手段服務的目標。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n03",
+      "url": "https://deepengineering.net/p/from-nic-to-p99-engineering-low-latency",
+      "quote": "Trading systems have been evolving for decades, moving from manual execution based on charts and indicators to automated strategies that fire within tens of nanoseconds using FPGA and ASIC hardware.",
+      "hedge": "asserted",
+      "interpretation": "FPGA/ASIC 硬體可以把執行時間壓到 tens of nanoseconds 等級，做為光譜的極端一端，對照文章主要討論的軟體/CPU 層級優化（微秒等級）。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n04",
+      "url": "https://deepengineering.net/p/from-nic-to-p99-engineering-low-latency",
+      "quote": "DPDK polling mode is one of the best approaches for this and can save roughly 20 to 45 microseconds when tuned correctly for market data processing.",
+      "hedge": "hedged",
+      "interpretation": "DPDK 的 kernel bypass polling mode 省下的時間有範圍（20-45 微秒）且明確加了「tuned correctly」的條件，不是保證值。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n05",
+      "url": "https://deepengineering.net/p/from-nic-to-p99-engineering-low-latency",
+      "quote": "On an average day at CME you can expect 20 to 30 million trades and 100 to 150 million open interest events in a single segment.",
+      "hedge": "hedged",
+      "interpretation": "用 CME 的實際規模（平均日 2000-3000 萬筆成交、1-1.5 億筆未平倉事件）說明系統要處理的資料量級，「you can expect」是帶區間的估計描述。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n06",
+      "url": "https://deepengineering.net/p/from-nic-to-p99-engineering-low-latency",
+      "quote": "False sharing between threads on the same cache line: This is one of the most common mistakes in multithreaded systems.",
+      "hedge": "asserted",
+      "interpretation": "作者直接把 false sharing 定性為多執行緒系統「最常見的錯誤之一」，是常見錯誤清單裡明確給出頻率判斷的一條。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n07",
+      "url": "https://deepengineering.net/p/from-nic-to-p99-engineering-low-latency",
+      "quote": "When two threads write to variables that share a cache line, even if those variables are logically unrelated, the cache coherency protocol treats the entire line as contested and forces unnecessary cross-core coordination.",
+      "hedge": "asserted",
+      "interpretation": "false sharing 的機制解釋：即使兩個變數邏輯上無關，只要落在同一 cache line，cache coherency protocol 就會把整條 line 當爭用對象，強迫不必要的跨核心同步。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n08",
+      "url": "https://deepengineering.net/p/from-nic-to-p99-engineering-low-latency",
+      "quote": "Premature SIMD can actually increase latency when your workload is memory-bound rather than compute-bound.",
+      "hedge": "hedged",
+      "interpretation": "SIMD 優化不是無條件有益：當 workload 是 memory-bound（而非 compute-bound）時，過早導入 SIMD 反而可能讓延遲變差。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n09",
+      "url": "https://deepengineering.net/p/from-nic-to-p99-engineering-low-latency",
+      "quote": "TSC can drift across cores on the same CPU.",
+      "hedge": "asserted",
+      "interpretation": "TSC（Time Stamp Counter）雖然不需要系統呼叫、常被當標準計時手段，但在同一顆 CPU 的不同核心之間仍可能出現漂移，是量測延遲時容易被忽略的誤差來源。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n10",
+      "url": "https://deepengineering.net/p/from-nic-to-p99-engineering-low-latency",
+      "quote": "Running without baseline histograms makes all of the above invisible.",
+      "hedge": "asserted",
+      "interpretation": "沒有建立 baseline p50/p99 histogram，前面提到的所有延遲問題（false sharing、SIMD 誤用、TSC drift 等）都會變得不可見，無法定位。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n11",
+      "url": "https://deepengineering.net/p/from-nic-to-p99-engineering-low-latency",
+      "quote": "Use isolcpus, nohz_full, and rcu_nocbs kernel parameters",
+      "hedge": "asserted",
+      "interpretation": "三個 Linux kernel boot 參數合起來使用：isolcpus 把核心從排程器隔離、nohz_full 減少該核心的計時器中斷、rcu_nocbs 把 RCU callback 挪到別的核心處理，目的都是清空關鍵路徑核心上的背景干擾。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n12",
+      "url": "https://deepengineering.net/p/from-nic-to-p99-engineering-low-latency",
+      "quote": "Enable hugepages",
+      "hedge": "asserted",
+      "interpretation": "啟用 hugepages 是 BIOS/OS 層調校清單中的一項，目的是減少 TLB miss、降低記憶體存取的延遲變異。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n13",
+      "url": "https://deepengineering.net/p/from-nic-to-p99-engineering-low-latency",
+      "quote": "Lock PCIe ASPM off",
+      "hedge": "asserted",
+      "interpretation": "鎖死 PCIe ASPM（主動狀態電源管理）為關閉狀態，避免 PCIe 鏈路在省電狀態間切換造成的延遲尖峰，是同一份調校清單的一項。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n14",
+      "url": "https://deepengineering.net/p/from-nic-to-p99-engineering-low-latency",
+      "quote": "Use lock-free SPSC queues",
+      "hedge": "asserted",
+      "interpretation": "在程式碼層級的建議：使用 lock-free 的 single-producer single-consumer（SPSC）queue，避免鎖帶來的延遲與排程不確定性。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n15",
+      "url": "https://deepengineering.net/p/from-nic-to-p99-engineering-low-latency",
+      "quote": "Disable C-states and Turbo Boost",
+      "hedge": "asserted",
+      "interpretation": "BIOS 層調校：關閉 CPU 的省電 C-states 與動態超頻 Turbo Boost，換取時脈與延遲的可預測性而非峰值效能。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n16",
+      "url": "https://deepengineering.net/p/from-nic-to-p99-engineering-low-latency",
+      "quote": "Set CPU governor to performance mode",
+      "hedge": "asserted",
+      "interpretation": "作業系統層調校：把 CPU governor 設為 performance mode，避免動態調頻造成的延遲不穩定。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n17",
+      "url": "https://deepengineering.net/p/from-nic-to-p99-engineering-low-latency",
+      "quote": "Use mlockall to pin memory and prevent paging",
+      "hedge": "asserted",
+      "interpretation": "用 mlockall 把行程記憶體鎖在實體記憶體中，防止被換頁（paging）到磁碟，避免關鍵路徑因為 page fault 產生不可預期的延遲尖峰。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n18",
+      "url": "https://deepengineering.net/p/from-nic-to-p99-engineering-low-latency",
+      "quote": "For critical processes, you want to pin threads to cores within the same NUMA node and ensure that the data those threads access is also allocated on the same node.",
+      "hedge": "asserted",
+      "interpretation": "NUMA 親和性建議：關鍵行程的執行緒與其存取的資料都應該釘在同一個 NUMA node 上，避免跨 node 記憶體存取的額外延遲。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n19",
+      "url": "https://deepengineering.net/p/from-nic-to-p99-engineering-low-latency",
+      "quote": "The most precise measurements require NIC cards with hardware timestamping enabled, so the NIC stamps every inbound and outbound packet with a hardware timestamp.",
+      "hedge": "asserted",
+      "interpretation": "最精確的延遲量測需要具備硬體時間戳記功能的 NIC，讓每個進出封包都在硬體層被打上時間戳，避免軟體層計時的誤差與開銷。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n20",
+      "url": "https://deepengineering.net/p/from-nic-to-p99-engineering-low-latency",
+      "quote": "PTP hardware clocks are the standard approach for this",
+      "hedge": "asserted",
+      "interpretation": "跨主機的時間同步（context：cross-host synchronization）標準做法是使用 PTP（Precision Time Protocol）硬體時鐘。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n21",
+      "url": "https://deepengineering.net/p/from-nic-to-p99-engineering-low-latency",
+      "quote": "Exanic and Solarflare cards are widely used in the trading industry and provide zero-copy data access, hardware filtering, hardware timestamps, and flexible flow steering.",
+      "hedge": "asserted",
+      "interpretation": "點名業界常用的兩款專用網卡（Exanic、Solarflare），它們共同提供 zero-copy 資料存取、硬體層過濾、硬體時間戳與彈性的流量導向功能。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n22",
+      "url": "https://deepengineering.net/p/from-nic-to-p99-engineering-low-latency",
+      "quote": "A guest post by Shreyans",
+      "hedge": "asserted",
+      "interpretation": "文章作者署名為 Shreyans（客座作者身分），發布於 deepengineering.net。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n23",
+      "url": "https://deepengineering.net/p/from-nic-to-p99-engineering-low-latency",
+      "quote": "SIMD brings real benefits in the right situations but also adds complexity. Always benchmark before and after adding vectorization because the performance impact can go in either direction depending on your memory access pattern.",
+      "hedge": "hedged",
+      "interpretation": "SIMD 向量化的效益不是保證的，效果方向（變快或變慢）取決於記憶體存取模式，作者明確要求在加入向量化前後都要做量測比較。",
+      "timeliness": "durable"
+    }
+  ],
+  "claims": [
+    {
+      "id": "c01",
+      "claim_text": "把 wire-to-wire latency 的 p95 壓到 50 微秒以下",
+      "location": "opener + 全文多處重複",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n02"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "build a trading system with p95 wire-to-wire latency under 50 microseconds",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c02",
+      "claim_text": "wire-to-wire latency，從市場資料封包抵達 NIC 的那一刻，量到同一張 NIC 把訂單送出去為止",
+      "location": "第一段（定義段）",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n01"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Wire-to-wire latency is measured from the moment a market data packet is received on the NIC from the exchange to the moment an order is sent back to the exchange on the same NIC.",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c03",
+      "claim_text": "CME 平均一天要處理兩千萬到三千萬筆成交、一億到一億五千萬筆未平倉事件",
+      "location": "第一段",
+      "type": "number",
+      "load": "medium",
+      "note_ids": [
+        "n05"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "On an average day at CME you can expect 20 to 30 million trades and 100 to 150 million open interest events in a single segment.",
+      "note": "note timeliness=annual; source published 2026-03-04, ~4 months before post — within tolerance for annual-tier claim.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c04",
+      "claim_text": "用 FPGA、ASIC 這類專用硬體把整條決策路徑刻進電路，執行時間可以壓到 tens of nanoseconds 等級",
+      "location": "第一段",
+      "type": "number",
+      "load": "medium",
+      "note_ids": [
+        "n03"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Trading systems have been evolving for decades, moving from manual execution based on charts and indicators to automated strategies that fire within tens of nanoseconds using FPGA and ASIC hardware.",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c05",
+      "claim_text": "DPDK polling mode 調校正確時「can save roughly 20 to 45 microseconds」——這個區間本身帶著明確的但書：必須針對 market data processing 的場景調對",
+      "location": "H2「NIC 到使用者空間」第一段",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n04"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "DPDK polling mode is one of the best approaches for this and can save roughly 20 to 45 microseconds when tuned correctly for market data processing.",
+      "note": "In-body claim correctly preserves the 'tuned correctly for market data processing' qualifier, matching note's hedged strength. The hero opener ('kernel bypass 省 20 到 45 微秒') compresses this without the qualifier, but is a hook restating the same bound, qualified claim developed in-body — not treated as a separate inflated claim.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c06",
+      "claim_text": "Exanic 與 Solarflare 這類專用網卡...原生提供 zero-copy 資料存取、硬體層過濾、硬體時間戳，以及可彈性配置的流量導向（flow steering）",
+      "location": "H2「NIC 到使用者空間」第二段",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n21"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Exanic and Solarflare cards are widely used in the trading industry and provide zero-copy data access, hardware filtering, hardware timestamps, and flexible flow steering.",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c07",
+      "claim_text": "PTP 硬體時鐘，文章直接把它定位成「the standard approach」，用來確保分散在不同機器上的時間戳彼此可比較",
+      "location": "H2「BIOS 與 kernel」段落",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n20"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "PTP hardware clocks are the standard approach for this",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c08",
+      "claim_text": "「For critical processes, you want to pin threads to cores within the same NUMA node and ensure that the data those threads access is also allocated on the same node.」",
+      "location": "H2「BIOS 與 kernel」段落",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n18"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "For critical processes, you want to pin threads to cores within the same NUMA node and ensure that the data those threads access is also allocated on the same node.",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c09",
+      "claim_text": "調校項目表格：Disable C-states and Turbo Boost / Lock PCIe ASPM off / Set CPU governor to performance mode / Enable hugepages / isolcpus / nohz_full / rcu_nocbs / mlockall",
+      "location": "matter-of-fact-table widget（調校清單）",
+      "type": "number",
+      "load": "medium",
+      "note_ids": [
+        "n15",
+        "n13",
+        "n16",
+        "n12",
+        "n11",
+        "n17"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Disable C-states and Turbo Boost / Lock PCIe ASPM off / Enable hugepages / Use isolcpus, nohz_full, and rcu_nocbs kernel parameters / Use mlockall to pin memory and prevent paging / Set CPU governor to performance mode (verified individually across two independent WebFetch passes)",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c10",
+      "claim_text": "文章把 false sharing 明確定性為「one of the most common mistakes in multithreaded systems」",
+      "location": "H2「應用層資料結構」段落",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n06"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "False sharing between threads on the same cache line: This is one of the most common mistakes in multithreaded systems.",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c11",
+      "claim_text": "「When two threads write to variables that share a cache line, even if those variables are logically unrelated, the cache coherency protocol treats the entire line as contested and forces unnecessary cross-core coordination.」",
+      "location": "H2「應用層資料結構」段落",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n07"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "When two threads write to variables that share a cache line, even if those variables are logically unrelated, the cache coherency protocol treats the entire line as contested and forces unnecessary cross-core coordination.",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c12",
+      "claim_text": "文章明確建議「Use lock-free SPSC queues」",
+      "location": "H2「應用層資料結構」段落",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n14"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Use lock-free SPSC queues",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c13",
+      "claim_text": "「TSC can drift across cores on the same CPU.」",
+      "location": "H2「應用層資料結構」段落",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n09"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "TSC can drift across cores on the same CPU.",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c14",
+      "claim_text": "「Premature SIMD can actually increase latency when your workload is memory-bound rather than compute-bound.」",
+      "location": "H2「量測比調校更難」段落",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n08"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Premature SIMD can actually increase latency when your workload is memory-bound rather than compute-bound.",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c15",
+      "claim_text": "「Always benchmark before and after adding vectorization because the performance impact can go in either direction depending on your memory access pattern.」",
+      "location": "H2「量測比調校更難」段落",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n23"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Always benchmark before and after adding vectorization because the performance impact can go in either direction depending on your memory access pattern.",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c16",
+      "claim_text": "「Running without baseline histograms makes all of the above invisible」",
+      "location": "最後一段",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n10"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Running without baseline histograms makes all of the above invisible.",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c17",
+      "claim_text": "SPSC queue 的讀寫 index 分別被兩個不同執行緒各自修改，如果沒有刻意隔到不同 cache line，這兩個 index 本身就會落入同一種 false sharing 情境——原文沒有直接點名這個組合，但機制上是同一條規則的延伸",
+      "location": "H2「應用層資料結構」段落末",
+      "type": "causal",
+      "load": "low",
+      "note_ids": [],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "Text explicitly marks this as the author's own extrapolation ('原文沒有直接點名這個組合，但機制上是同一條規則的延伸') — legitimate marked inference per 出處四態, not a trace failure.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c18",
+      "claim_text": "isolcpus 不會讓 CPU 算得更快，它只是不讓排程器把別的行程排到這顆核心上；nohz_full 不會讓時脈變準，它只是讓計時器中斷不要在錯的時間點打斷你；rcu_nocbs 也不會讓 RCU 機制本身變快，它只是把處理 callback 的工作挪到別的核心",
+      "location": "H2「BIOS 與 kernel」表格後段",
+      "type": "causal",
+      "load": "low",
+      "note_ids": [
+        "n11"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Use isolcpus, nohz_full, and rcu_nocbs kernel parameters (mechanism explanation is author's synthesis of the well-documented, standard function of each named kernel parameter bound in n11; not a separate factual assertion beyond the source-confirmed parameter names)",
+      "note": "Author's mechanism gloss on the three kernel parameters named in n11. The functional description of each parameter (isolcpus=scheduler isolation, nohz_full=fewer timer ticks, rcu_nocbs=RCU callback offload) is standard, well-established Linux kernel documentation, not a source-specific claim — treated as elaboration bound to the parameter-naming note rather than a separate unverifiable causal claim.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c19",
+      "claim_text": "文章作者署名（Shreyans，客座作者），發布於 deepengineering.net，2026-03-04",
+      "location": "sidecar/ledger metadata, implicit in article framing referenced by post's 'the article'",
+      "type": "attribution",
+      "load": "low",
+      "note_ids": [
+        "n22"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "A guest post by Shreyans",
+      "note": "Not asserted in the post body text itself (post refers only to '文章' without naming the author), so this is source-metadata verification rather than a body claim — included for completeness since n22 exists in the ledger. Timeliness: article dated 2026-03-04, post dated 2026-07-02 (~4 months) — within tolerance for durable/annual content.",
+      "action": "none",
+      "resolution": "none-needed"
+    }
+  ],
+  "checked_at": "2026-07-02",
+  "checker_rounds": 1,
+  "coverage": {
+    "candidate_claims": 21,
+    "checked": 19,
+    "dropped_low_load": 2
+  }
+}
