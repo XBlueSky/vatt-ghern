@@ -192,7 +192,7 @@ if (!isRollupDir && deepCount < 3) {
         "wallclock",
         "wall-clock",
         "dispatch cost",
-        "opus quota",
+        "model quota",
       ];
       const legalPatterns = [
         ["score", "qualifying"],

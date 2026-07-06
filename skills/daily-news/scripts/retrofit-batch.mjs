@@ -60,7 +60,7 @@ const briefs = paths.map((p) => {
     archetype: f.archetype,
     domain: f.domain,
     dispatch_note:
-      "Dispatch this brief with model: \"opus\" required. Author writing " +
+      "Dispatch this brief with model: \"sonnet\" required. Author writing " +
       "is a design-grade judgment task per SKILL.md Step 7b. Do NOT fall " +
       "back to a cheaper model — report BLOCKED instead.",
     brief: [
