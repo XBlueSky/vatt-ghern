@@ -1,0 +1,383 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">把候選生成、列排序、entity 排序、版面組裝拆成四套獨立模型分階段跑，是 Netflix 首頁團隊維護多年的架構——GenPage 把它們全部收進一顆 decoder-only transformer，一個 token 接一個 token 把整頁生出來，serving 延遲卻反而比舊 pipeline 低了兩成。</p>
+  <h1 class="vg-post-title">GenPage：Netflix 用一顆生成模型直接生首頁</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p><span class="vg-dropcap">N</span>etflix 工程團隊在 6 月 29 日的 Netflix Tech Blog 文章裡，把整個首頁推薦問題重新定義成一次生成任務：GenPage 把使用者的觀看歷史、個人資料屬性與這次請求的情境 tokenize 成 prompt，直接把整個首頁——每一列、列裡每個項目——當成 response 自迴歸生成出來。作者是 Lequn Wang、Jiangwei Pan 與 Linas Baltrunas。</p>
+
+  <p>這篇文章值得工程師仔細讀的地方，不是「Netflix 又推出新功能」，而是一個具體的架構賭注：把候選生成、排序、版面這三件事收進同一顆模型，理論上該犧牲效率——更大的模型、更多運算——但拆開來看，GenPage 動的每一個工程細節，tokenization schema、hybrid row decoding、business rule 的 token mask 化，目標都是把這個賭注在 serving 端兌現，而不是只在 offline 指標上贏。</p>
+
+  <h2>舊架構：候選、排序、版面各自為政</h2>
+
+  <p>文章對舊系統的描述很直接：「a complex, multi-stage pipeline, with separate components for candidate generation and ranking at both the row and entity levels」。候選生成負責先從全庫篩出一批可能相關的作品；列（row）層級的排序決定「續看清單」「本週熱門」這類分類要不要出現、排在第幾列；entity 層級的排序再決定每一列裡放哪些具體作品、順序如何。三段各自訓練、各自有自己的離線指標，彼此之間沒有共同的最佳化目標——列排序模型覺得好的順序，entity 排序模型未必買單。</p>
+
+  <p>這種切法帶來三個具體代價，文章點名了。拆開的階段容易「misaligned objectives across stages」；每一段都是一個要單獨維護、單獨部署、單獨除錯的 ML 模型，模型數量本身就是維運成本；而多階段管線通常還配一整組手工設計的特徵工程，把使用者行為轉成排序模型吃得下的特徵向量，這批特徵工程隨著業務規則演進只會愈滾愈大。GenPage 想拿掉的正是這三塊——用一顆模型「avoids misaligned objectives across stages」、「reduces the number of ML models to maintain」、「eliminates much of the traditional feature engineering」。</p>
+
+  <p>這三個代價換算成日常維運，大概是這樣：候選生成、列排序、entity 排序、版面組裝各自養一套上線審核流程與一套離線指標，而這四段流程的目標函式彼此不對齊，意味著任何一段的改動都可能在其他階段的評測裡測不出來的地方產生副作用，得等到上線才會被發現。</p>
+
+  <p>傳統推薦系統裡，列層級排序通常在優化版面多樣性與曝光配置，entity 層級排序優化的則是點擊、觀看這類預測分數——這兩種目標函式本來就不是同一件事，「misaligned objectives across stages」在多階段架構裡幾乎是結構性必然，不是哪個團隊沒把模型調好的問題。</p>
+
+  <figure class="vg-w-ba-genpage-architecture" data-mobile="static" data-svg-scroll="720">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m18 8 4 4-4 4"/><path d="M2 12h20"/><path d="m6 8-4 4 4 4"/>
+      </svg>
+      <span>拖曳分隔線比較舊管線與 GenPage 的架構 · 4 段模型 vs 1 顆模型</span>
+    </p>
+    <style>
+      .vg-w-ba-genpage-architecture { position: relative; aspect-ratio: 16 / 9; overflow: hidden; }
+      .vg-w-ba-genpage-architecture .layer { position: absolute; inset: 0; width: 100%; height: 100%; }
+      .vg-w-ba-genpage-architecture .after { clip-path: polygon(50% 0, 100% 0, 100% 100%, 50% 100%); }
+      .vg-w-ba-genpage-architecture .stage-label { font-family: EB Garamond, serif; font-size: 15px; }
+      .vg-w-ba-genpage-architecture .stage-sub { font-family: IM Fell English, serif; font-style: italic; font-size: 11px; fill: var(--muted); }
+      .vg-w-ba-genpage-architecture .divider { position: absolute; top: 0; bottom: 0; left: 50%; width: 32px; transform: translateX(-50%); cursor: ew-resize; touch-action: none; }
+      .vg-w-ba-genpage-architecture .divider::before { content: ''; position: absolute; left: 50%; top: 0; bottom: 0; width: 2px; transform: translateX(-50%); background: var(--accent); }
+      .vg-w-ba-genpage-architecture .divider::after { content: '↔'; position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); background: var(--accent); color: var(--bg); width: 32px; height: 32px; border-radius: 50%; display: grid; place-items: center; font-family: var(--sans); font-size: 16px; }
+      @media (hover: none) and (pointer: coarse) {
+        .vg-w-ba-genpage-architecture .divider { display: none; }
+      }
+    </style>
+
+    <svg class="layer before" viewBox="0 0 720 360" role="img" aria-label="舊架構：候選生成、列排序、entity 排序、版面組裝，四個獨立模型">
+      <rect width="720" height="360" fill="var(--bg-soft)" />
+      <text x="360" y="30" text-anchor="middle" class="stage-label" fill="var(--muted)">舊架構——四個獨立模型</text>
+      <rect x="60" y="50" width="600" height="60" fill="none" stroke="var(--muted-2)" stroke-width="1.5" />
+      <text x="360" y="78" text-anchor="middle" class="stage-label" fill="var(--ink)">候選生成</text>
+      <text x="360" y="98" text-anchor="middle" class="stage-sub">從全庫篩出可能相關的作品</text>
+      <line x1="360" y1="110" x2="360" y2="126" stroke="var(--muted-2)" stroke-width="1.5" marker-end="url(#vg-w-ba-genpage-architecture-arrow)"/>
+      <rect x="60" y="128" width="600" height="60" fill="none" stroke="var(--muted-2)" stroke-width="1.5" />
+      <text x="360" y="156" text-anchor="middle" class="stage-label" fill="var(--ink)">列（row）排序</text>
+      <text x="360" y="176" text-anchor="middle" class="stage-sub">決定哪些分類上頁、排第幾列</text>
+      <line x1="360" y1="188" x2="360" y2="204" stroke="var(--muted-2)" stroke-width="1.5" marker-end="url(#vg-w-ba-genpage-architecture-arrow)"/>
+      <rect x="60" y="206" width="600" height="60" fill="none" stroke="var(--muted-2)" stroke-width="1.5" />
+      <text x="360" y="234" text-anchor="middle" class="stage-label" fill="var(--ink)">entity 排序</text>
+      <text x="360" y="254" text-anchor="middle" class="stage-sub">決定每列放哪些作品、順序</text>
+      <line x1="360" y1="266" x2="360" y2="282" stroke="var(--muted-2)" stroke-width="1.5" marker-end="url(#vg-w-ba-genpage-architecture-arrow)"/>
+      <rect x="60" y="284" width="600" height="60" fill="none" stroke="var(--muted-2)" stroke-width="1.5" />
+      <text x="360" y="312" text-anchor="middle" class="stage-label" fill="var(--ink)">版面組裝</text>
+      <text x="360" y="332" text-anchor="middle" class="stage-sub">各自訓練、各自最佳化目標</text>
+      <defs>
+        <marker id="vg-w-ba-genpage-architecture-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M0,0 L10,5 L0,10 z" fill="var(--muted-2)" />
+        </marker>
+      </defs>
+    </svg>
+
+    <svg class="layer after" id="vg-w-ba-genpage-architecture-after" viewBox="0 0 720 360" role="img" aria-label="GenPage：單一 decoder-only transformer，輸入 prompt 直接自迴歸生成整頁">
+      <rect width="720" height="360" fill="var(--bg)" />
+      <text x="360" y="30" text-anchor="middle" class="stage-label" fill="var(--accent-text)">GenPage——一顆 decoder-only transformer</text>
+      <text x="360" y="70" text-anchor="middle" class="stage-sub">prompt：使用者歷史、屬性、情境 tokenize 後的序列</text>
+      <line x1="360" y1="82" x2="360" y2="106" stroke="var(--accent)" stroke-width="1.5" marker-end="url(#vg-w-ba-genpage-architecture-arrow2)"/>
+      <rect x="140" y="108" width="440" height="180" rx="6" fill="var(--accent)" fill-opacity="0.16" stroke="var(--accent)" stroke-width="2"/>
+      <text x="360" y="190" text-anchor="middle" font-family="EB Garamond, serif" font-size="20" fill="var(--ink)">decoder-only</text>
+      <text x="360" y="216" text-anchor="middle" font-family="EB Garamond, serif" font-size="20" fill="var(--ink)">transformer</text>
+      <line x1="360" y1="288" x2="360" y2="312" stroke="var(--accent)" stroke-width="1.5" marker-end="url(#vg-w-ba-genpage-architecture-arrow2)"/>
+      <text x="360" y="336" text-anchor="middle" class="stage-sub">response：自迴歸生成整頁——列 token + entity token</text>
+      <defs>
+        <marker id="vg-w-ba-genpage-architecture-arrow2" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M0,0 L10,5 L0,10 z" fill="var(--accent)" />
+        </marker>
+      </defs>
+    </svg>
+
+    <div class="divider" id="vg-w-ba-genpage-architecture-divider" role="slider" tabindex="0" aria-label="拖曳比較舊架構與 GenPage" aria-valuemin="0" aria-valuemax="100" aria-valuenow="50"></div>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-ba-genpage-architecture');
+        const after = root.querySelector('#vg-w-ba-genpage-architecture-after');
+        const divider = root.querySelector('#vg-w-ba-genpage-architecture-divider');
+        const isTouch = window.matchMedia('(hover: none) and (pointer: coarse)').matches;
+        function setPct(pct) {
+          const clamped = Math.max(0, Math.min(100, pct));
+          after.style.clipPath = 'polygon(' + clamped + '% 0, 100% 0, 100% 100%, ' + clamped + '% 100%)';
+          divider.style.left = clamped + '%';
+          divider.setAttribute('aria-valuenow', String(Math.round(clamped)));
+        }
+        if (isTouch) return;
+        let dragging = false;
+        divider.addEventListener('pointerdown', function (e) { dragging = true; divider.setPointerCapture(e.pointerId); });
+        root.addEventListener('pointermove', function (e) {
+          if (!dragging) return;
+          const rect = root.getBoundingClientRect();
+          setPct(((e.clientX - rect.left) / rect.width) * 100);
+        });
+        root.addEventListener('pointerup', function () { dragging = false; });
+        root.addEventListener('pointercancel', function () { dragging = false; });
+        divider.addEventListener('keydown', function (e) {
+          const current = parseFloat(divider.style.left) || 50;
+          if (e.key === 'ArrowLeft') { e.preventDefault(); setPct(current - 5); }
+          if (e.key === 'ArrowRight') { e.preventDefault(); setPct(current + 5); }
+        });
+      })();
+    </script>
+    <figcaption>拖曳分隔線：左邊是舊架構的四段管線（候選生成 → 列排序 → entity 排序 → 版面組裝），右邊是 GenPage 收斂成的單一 decoder-only transformer。</figcaption>
+  </figure>
+
+  <p>把兩張圖疊在一起看，差異不是「模型變大」，而是「決策收斂到一個地方」。舊架構裡，候選生成模型看不到列排序的決策、列排序模型看不到 entity 排序的決策，每一段都在自己的資訊視野裡做局部最佳化。GenPage 的 decoder-only transformer 在生成第 20 個 token 時，前面 19 個 token（不管屬於哪一列、哪個 entity）全部已經在 context 裡——它是在整頁的視野下做決定，而不是在某一段管線的視野下做決定。</p>
+
+  <p>特徵工程消失的原因，也不是憑空發生。傳統排序模型吃的是人工彙整過的統計特徵——例如「使用者過去 30 天看了幾部韓劇」這類事先算好的聚合數字；GenPage 吃的是 tokenize 過的原始行為序列本身，聚合這件事理論上讓 transformer 自己在訓練裡學，不必由工程師事先決定要彙整成哪些統計量。這也是為什麼原文特別強調「operating on raw tokenized inputs」而不是先做一輪特徵萃取——省下的不只是運算，還有每次業務規則變動都要重新設計特徵的那部分工程成本。</p>
+
+  <h2>GenPage 怎麼「生」出一整頁：token 字彙與生成順序</h2>
+
+  <p>這套框架的邊界，原文寫得直白：「GenPage treats the user history and request context as the prompt, and autoregressively generates the entire homepage as the response」——prompt 端沒有另外一層人工特徵，就是使用者歷史加上這次請求的情境；response 端也不是一組排序分數，而是完整的一頁畫面。字彙表怎麼定義同樣具體：「Each entity (movie, show, game) and row (e.g., "Korean TV Shows") becomes a single token」，也就是說列名本身——不只列裡放的作品——也各自佔字彙表裡一個位置。「Korean TV Shows」這種分類名稱不是外部傳進模型的 metadata 條件，而是模型自己要生成出來的 token，跟電影、劇集、遊戲的 entity token 地位相同。這個設計決定了生成順序為什麼行得通：如果列名不是字彙表裡的一個 token，模型就沒有辦法把「這一列該不該出現」跟「這一列裡放什麼」處理成同一條生成鏈裡先後相依的兩個決定。</p>
+
+  <p>一整頁的 row token 加上每一列的 entity token，數量會隨頁面上的列數與每列作品數往上疊——這個序列長度對 transformer 的 context window 不算誇張，但自迴歸生成的每一步都要多跑一次前向傳播，這正是後面 serving 端要動 hybrid row decoding 手術的原因。</p>
+
+  <p>GenPage 的骨幹是一個「decoder-only transformer architecture」。prompt 是使用者歷史、屬性與情境 tokenize 後的序列，response 是整個首頁——每一列的列名（像「Korean TV Shows」）跟列裡的每個作品，各自變成字彙表裡的一個 token。生成順序不是隨機排列，文章講得很明確：模型「in layout order: left to right, then top to bottom」逐一預測下一個 page token，也就是先決定第一列的列 token，再依序生成這一列裡的 entity token，生成完才輪到下一列的列 token——跟版面在螢幕上被讀到的順序完全對齊。</p>
+
+  <figure class="vg-w-canvas-genpage-decode" data-mobile="static" data-svg-scroll="720">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M9 9a3 3 0 1 1 5.83 1c-.5 1-1.83 1.5-1.83 2.5"/><circle cx="12" cy="12" r="10"/><path d="M12 17h.01"/>
+      </svg>
+      <span>按播放看生成順序逐步展開 · 14 個 token</span>
+    </p>
+    <style>
+      .vg-w-canvas-genpage-decode { display: grid; grid-template-rows: auto 1fr auto; gap: var(--s-2); }
+      .vg-w-canvas-genpage-decode .toolbar { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); flex-wrap: wrap; }
+      .vg-w-canvas-genpage-decode button { font-family: var(--sans); font-size: var(--fs-sm); padding: 6px 14px; min-height: 44px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); cursor: pointer; }
+      .vg-w-canvas-genpage-decode button:hover { border-color: var(--accent); color: var(--accent-text); }
+      .vg-w-canvas-genpage-decode canvas { width: 100%; height: auto; aspect-ratio: 16 / 9; display: block; }
+      .vg-w-canvas-genpage-decode figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+      @media (max-width: 720px) {
+        .vg-w-canvas-genpage-decode canvas { aspect-ratio: 4 / 3; }
+        .vg-w-canvas-genpage-decode .toolbar { display: none; }
+      }
+    </style>
+
+    <div class="toolbar" data-vg-controls>
+      <button id="vg-w-canvas-genpage-decode-toggle" type="button">▷ 播放</button>
+      <button id="vg-w-canvas-genpage-decode-step" type="button">→ 單步</button>
+      <button id="vg-w-canvas-genpage-decode-reset" type="button">↺ 重置</button>
+      <span style="margin-left: auto" id="vg-w-canvas-genpage-decode-clock">已生成 14 / 14</span>
+    </div>
+
+    <canvas id="vg-w-canvas-genpage-decode-canvas"></canvas>
+
+    <figcaption>模型依版面順序（左到右、上到下）逐一生成列 token 與 entity token；預設畫面顯示全部生成完畢後的順序編號，按「播放」可看生成過程重播一次。</figcaption>
+
+    <script>
+      (function () {
+        const root = document.querySelector('.vg-w-canvas-genpage-decode');
+        const canvas = root.querySelector('#vg-w-canvas-genpage-decode-canvas');
+        const toggle = root.querySelector('#vg-w-canvas-genpage-decode-toggle');
+        const stepBtn = root.querySelector('#vg-w-canvas-genpage-decode-step');
+        const resetBtn = root.querySelector('#vg-w-canvas-genpage-decode-reset');
+        const clock = root.querySelector('#vg-w-canvas-genpage-decode-clock');
+        const ctx = canvas.getContext('2d');
+
+        const ROWS = [
+          { name: '熱門新片', n: 4 },
+          { name: '續看清單', n: 3 },
+          { name: '韓劇推薦', n: 4 },
+        ];
+        const tokens = [];
+        ROWS.forEach(function (r) {
+          tokens.push({ kind: 'row', label: r.name });
+          for (let i = 0; i < r.n; i++) tokens.push({ kind: 'entity', label: 'E' + (i + 1), row: r.name });
+        });
+        const TOTAL = tokens.length;
+
+        let step = TOTAL;
+        let running = false;
+        let timer = null;
+
+        function getCssVar(name) {
+          return getComputedStyle(root).getPropertyValue(name).trim() || '#888';
+        }
+
+        function draw() {
+          const rect = canvas.getBoundingClientRect();
+          const W = rect.width, H = rect.height;
+          if (!W || !H) return;
+          ctx.clearRect(0, 0, W, H);
+          const marginX = 16, marginTop = 28, rowGap = 8;
+          const rowH = (H - marginTop - 16) / ROWS.length - rowGap;
+          let idx = 0;
+          let y = marginTop;
+          ctx.textBaseline = 'middle';
+          ROWS.forEach(function (r) {
+            const rowGenerated = idx < step;
+            const rowBoxW = Math.min(110, W * 0.28);
+            ctx.font = '12px "EB Garamond", serif';
+            ctx.fillStyle = rowGenerated ? getCssVar('--accent') : getCssVar('--bg-soft');
+            ctx.fillRect(marginX, y, rowBoxW, rowH);
+            ctx.strokeStyle = getCssVar('--muted-2');
+            ctx.strokeRect(marginX, y, rowBoxW, rowH);
+            ctx.fillStyle = rowGenerated ? getCssVar('--bg') : getCssVar('--muted');
+            ctx.fillText(r.name, marginX + 6, y + rowH / 2);
+            if (rowGenerated) {
+              ctx.font = '10px "JetBrains Mono", monospace';
+              ctx.fillStyle = getCssVar('--bg');
+              ctx.fillText(String(idx + 1), marginX + 4, y + 12);
+            }
+            idx++;
+            let x = marginX + rowBoxW + 10;
+            const cellW = Math.min(52, (W - x - marginX) / r.n - 6);
+            for (let i = 0; i < r.n; i++) {
+              const generated = idx < step;
+              ctx.fillStyle = generated ? getCssVar('--sage') : getCssVar('--bg-soft');
+              ctx.fillRect(x, y, cellW, rowH);
+              ctx.strokeStyle = getCssVar('--muted-2');
+              ctx.strokeRect(x, y, cellW, rowH);
+              if (generated) {
+                ctx.font = '10px "JetBrains Mono", monospace';
+                ctx.fillStyle = getCssVar('--ink');
+                ctx.fillText(String(idx + 1), x + 4, y + 12);
+              }
+              x += cellW + 6;
+              idx++;
+            }
+            y += rowH + rowGap;
+          });
+        }
+
+        function updateClock() {
+          if (step >= TOTAL) {
+            clock.textContent = '已生成 ' + TOTAL + ' / ' + TOTAL;
+          } else if (step <= 0) {
+            clock.textContent = '已生成 0 / ' + TOTAL;
+          } else {
+            const current = tokens[step - 1];
+            const kindLabel = current.kind === 'row' ? 'row token' : 'entity token';
+            clock.textContent = '已生成 ' + step + ' / ' + TOTAL + ' —— 目前：' + kindLabel + '「' + current.label + '」';
+          }
+        }
+
+        function tick() {
+          step += 1;
+          if (step >= TOTAL) { step = TOTAL; stopPlay(); }
+          draw();
+          updateClock();
+        }
+
+        function startPlay() {
+          if (step >= TOTAL) step = 0;
+          running = true;
+          toggle.textContent = '⏸ 暫停';
+          timer = setInterval(tick, 480);
+        }
+        function stopPlay() {
+          running = false;
+          toggle.textContent = '▷ 播放';
+          if (timer) clearInterval(timer);
+          timer = null;
+        }
+
+        function resize() {
+          const dpr = window.devicePixelRatio || 1;
+          const rect = canvas.getBoundingClientRect();
+          canvas.width = rect.width * dpr;
+          canvas.height = rect.height * dpr;
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+          draw();
+        }
+        window.addEventListener('resize', resize);
+
+        toggle.addEventListener('click', function () { running ? stopPlay() : startPlay(); });
+        stepBtn.addEventListener('click', function () {
+          stopPlay();
+          step = step >= TOTAL ? 1 : step + 1;
+          draw(); updateClock();
+        });
+        resetBtn.addEventListener('click', function () {
+          stopPlay();
+          step = 0;
+          draw(); updateClock();
+        });
+
+        resize();
+        updateClock();
+      })();
+    </script>
+  </figure>
+
+  <p>這個順序選擇本身就是一種歸納偏誤：它假設「這一列放什麼」跟「這一列裡的作品要怎麼挑」是有因果順序的兩個決定，後者依賴前者。模型每生成一個 token，都是在前面所有已生成的 page token（不管屬於哪一列）跟 context token 的條件下做預測——列與列之間、entity 與 entity 之間，因此不是各自獨立生成，而是共享同一條因果鏈。文章也老實承認這套做法還沒完全脫離手工痕跡：「handcrafted summaries still introduce a form of prompt engineering into the pipeline」——GenPage 想盡量吃原始輸入，但目前餵給它的一部分 context 仍是人工設計過的摘要，不是純粹的原始資料。</p>
+
+  <h2>訓練三階段：預訓練、分類後訓練、RL 後訓練</h2>
+
+  <p>訓練分三段疊加。第一段是預訓練，用 next-token prediction 直接對 tokenize 後的序列做語言模型式的訓練——沒有標註、沒有互動訊號，純粹學「這串 token 接下來合理的下一個 token 是什麼」。第二段後訓練用 weighted binary classification，把預訓練學到的下一 token 預測能力對齊到真正要優化的互動訊號上——監督式學習處理這種使用者互動資料時常見的問題是類別不平衡，大部分曝光沒有點擊或觀看，正例遠少於負例，加權是避免模型學到「一律預測負例」這種偷懶解的常見做法；原文沒有明講加權細節，這裡只是點出這一步為什麼需要「weighted」，不是這篇文章的獨有揭露。第三段後訓練疊加 RL：文章的說法是「RL treats page generation as a sequential decision-making problem, allowing the model to optimize a page-level reward while preserving the flexibility of autoregressive generation」——用的演算法是 Dr. GRPO，並搭配 KL penalty 壓住 reward hacking，避免模型為了衝高 reward model 給的分數而生成不合理的頁面。</p>
+
+  <div class="vg-w-tabs-genpage-training">
+    <style>
+      .vg-w-tabs-genpage-training { display: grid; gap: var(--s-2); }
+      .vg-w-tabs-genpage-training input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-tabs-genpage-training .tabs { display: flex; gap: var(--s-2); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+      .vg-w-tabs-genpage-training .tab { font-family: var(--sans); font-size: var(--fs-sm); padding: var(--s-1) var(--s-2); cursor: pointer; color: var(--muted); min-height: 44px; display: flex; align-items: center; }
+      .vg-w-tabs-genpage-training .panel { display: none; padding: var(--s-2); font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink); }
+      .vg-w-tabs-genpage-training:has(#vg-w-tabs-genpage-training-t1:checked) .panel-1 { display: block; }
+      .vg-w-tabs-genpage-training:has(#vg-w-tabs-genpage-training-t1:checked) [for="vg-w-tabs-genpage-training-t1"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-genpage-training:has(#vg-w-tabs-genpage-training-t2:checked) .panel-2 { display: block; }
+      .vg-w-tabs-genpage-training:has(#vg-w-tabs-genpage-training-t2:checked) [for="vg-w-tabs-genpage-training-t2"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-genpage-training:has(#vg-w-tabs-genpage-training-t3:checked) .panel-3 { display: block; }
+      .vg-w-tabs-genpage-training:has(#vg-w-tabs-genpage-training-t3:checked) [for="vg-w-tabs-genpage-training-t3"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    </style>
+    <input type="radio" id="vg-w-tabs-genpage-training-t1" name="vg-w-tabs-genpage-training-sel" checked />
+    <input type="radio" id="vg-w-tabs-genpage-training-t2" name="vg-w-tabs-genpage-training-sel" />
+    <input type="radio" id="vg-w-tabs-genpage-training-t3" name="vg-w-tabs-genpage-training-sel" />
+    <div class="tabs" role="tablist">
+      <label class="tab" for="vg-w-tabs-genpage-training-t1">預訓練</label>
+      <label class="tab" for="vg-w-tabs-genpage-training-t2">後訓練：分類</label>
+      <label class="tab" for="vg-w-tabs-genpage-training-t3">後訓練：RL</label>
+    </div>
+    <div class="panel panel-1">用 next-token prediction 對 tokenize 後的整段序列做預訓練，讓模型先學會「怎麼生成一個合法、通順的頁面」。offline 實驗顯示只做這一步，Entity AUC 就從 0.91 升到 0.92。</div>
+    <div class="panel panel-2">用 weighted binary classification 做第二段後訓練，把預訓練學到的下一 token 預測能力對齊到真正要優化的互動訊號上——這一步是從「生成合理的頁面」過渡到「生成對使用者有用的頁面」。</div>
+    <div class="panel panel-3">疊加 RL，把整頁生成當一個序列決策問題，優化 page-level reward，同時保留自迴歸生成的彈性；用的演算法是 Dr. GRPO，並疊加 KL penalty，壓住模型為了衝高 reward model 分數而生成不合理頁面的傾向。</div>
+  </div>
+
+  <p>三段疊加而不是一步到位，理由跟拆開多階段管線的邏輯相似：預訓練先把「怎麼生成合法頁面」學會，後訓練分類再對齊互動訊號，RL 最後才處理「整頁作為一個決策單位」的最佳化——三段各自的訓練訊號跟資料規模差異很大，硬併成一步反而更難收斂。</p>
+
+  <p>RL 這一段疊加 KL penalty 不是可有可無的細節。單純優化 page-level reward 容易讓模型學會討好 reward model 本身的評分方式，而不是真的把使用者體驗變好，這就是 reward hacking。KL penalty 的作用是把生成的機率分佈拉回預訓練與分類後訓練學到的基準附近，限制 RL 這一步能偏離多遠——等於是拿前兩段訓練的結果當錨點，不讓最後疊加的強化學習把整個模型帶去一個訓練資料沒驗證過的角落。</p>
+
+  <p>Dr. GRPO 屬於 GRPO 這系列做法，這幾年常見於 LLM 的 RLHF 後訓練——核心想法是拿同一個情境下生成的一組樣本互相比較、算相對優劣，不需要另外訓練一個獨立的 value network 去估計 baseline。如果 GenPage 沿用這個常見設計，比較的對象很可能是同一個使用者情境下生成出來的不同版面，但文章沒有把這一步的實作細節寫出來。</p>
+
+  <h2>serving 端的手術：把大模型塞進舊 pipeline 的延遲預算</h2>
+
+  <p>單一大模型取代整條管線，直覺上應該更慢——但文章給的因果是反過來的：「By replacing multiple ranking stages and heavy feature computation with a single transformer operating on raw tokenized inputs, we eliminated substantial serving complexity and computational overhead.」拿掉的是好幾段排序模型各自的推論成本，跟支撐它們的整套特徵計算管線；換上的是一次 transformer 的前向傳播，但這次傳播要先在幾個地方動手術，才追得上舊管線的延遲預算。</p>
+
+  <figure class="vg-w-table-genpage-serving" data-mobile="keep">
+    <style>
+      .vg-w-table-genpage-serving { overflow-x: auto; }
+      .vg-w-table-genpage-serving table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-genpage-serving caption { text-align: left; caption-side: top; font-family: var(--scribed); font-style: italic; color: var(--muted); font-size: var(--fs-sm); padding: var(--s-1) 0; }
+      .vg-w-table-genpage-serving thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); }
+      .vg-w-table-genpage-serving tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+      .vg-w-table-genpage-serving tbody tr:hover td { background: var(--bg-soft); }
+    </style>
+    <table>
+      <caption>serving 端三個手術——把單一大模型的推論成本壓回舊 pipeline 的延遲預算內。</caption>
+      <thead>
+        <tr><th>機制</th><th>沒有它會怎樣</th><th>GenPage 的做法</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>使用者行為 tokenization</td><td>用 GPT-5 tokenizer 編碼一則行為要 16 個 token，例如「User watched Orange Is the New Black for 50 minutes 30 days ago.」</td><td>自訂 4-token schema：Entity_ID、Action_Type、Action_Time_Bucket、Action_Duration_Bucket，序列變短，拉低 inference cost 與延遲</td></tr>
+        <tr><td>row 內排序（hybrid row decoding）</td><td>整列 entity 逐一自迴歸生成，forward pass 次數隨 entity 數線性增加</td><td>只自迴歸生成前幾個 entity 當 prefix，其餘在同一次 forward pass 裡對所有合格 entity 取 logits、挑分數最高的填滿</td></tr>
+        <tr><td>business rule 套用</td><td>額外一套多階段 post-processing 服務，得單獨維護</td><td>做成 token-level mask，decoding 時直接擋掉不合格 token，併入同一次生成</td></tr>
+      </tbody>
+    </table>
+  </figure>
+
+  <p>business rule 的做法，原文寫得很乾脆：「Business rules become token-level masks rather than complex post-processing」——不合格的 token 在生成當下的機率分佈就被壓到接近零，不需要事後再跑一套獨立服務去過濾，也不需要過濾完再回頭調整版面順序，這個判斷跟版面本身的生成擠進同一次前向傳播裡完成。hybrid row decoding 那句 quote 裡有個字眼不能跳過：原文寫的是「all eligible entities」，不是「all entities」——候選篩選這個概念並沒有真的消失，只是從一個獨立訓練、獨立部署的模型，收進了同一次 decoding 的資格判斷裡，變成生成前先圈定合格集合，而不是另一段管線。</p>
+
+  <p>這三個手術裡，hybrid row decoding 影響最大：如果 GenPage 老實地把每一列裡的每個 entity 都自迴歸生成一輪，forward pass 次數會隨頁面上的 entity 數線性增加，延遲直接爆掉。用「先自迴歸生成前幾個，其餘用一次 forward pass 拿 logits 選出」的折衷，是拿掉一部分自迴歸生成的精確度，換一個數量級的推論成本下降——這也是為什麼文章要單獨用一節「Addressing production challenges」講清楚。</p>
+
+  <p>原文對這個折衷寫得比想像中精確：「The model autoregressively generates only the first few entities in each row. Conditioned on this generated prefix, we obtain logits for all eligible entities in a single forward pass and select the top-scoring remaining entities」。關鍵在「conditioned on this generated prefix」這幾個字——後面那批用一次 forward pass 選出來的作品，不是獨立於前面已生成的內容，而是拿前幾個自迴歸生成出來的 entity 當條件；一列裡真正逐步自迴歸的深度只到前幾個位置，後面的因果依賴被壓縮進同一次前向傳播的條件輸入裡，而不是完全消失。</p>
+
+  <h2>數字對帳：延遲、互動指標與規模 vs 情境</h2>
+
+  <p>offline 實驗那節問了四個問題：預訓練有沒有用？效能怎麼隨模型規模變化？效能怎麼隨使用者情境裡的資訊量變化？RL 後訓練有沒有真的在頁面層級做最佳化？前面提過的 Entity AUC 從 0.91 升到 0.92，屬於第一題的答案。第二、三題的對照更有意思：把模型參數量從約 1.2 億撐到約 9 億、放大 7.5 倍，loss 只降了「roughly 1.3%」；相對地，只是把使用者情境資訊做得更豐富，loss 降了「around 6.9%」——文章的結論寫得很白：「In several cases, a single well-designed context addition delivers a larger improvement than the entire ~7.5× model-capacity scaling.」對一個要決定把預算花在「模型撐大」還是「情境資料做豐富」的團隊，這是一個具體、可驗證的參照點，只是文章自己也只講「in several cases」，不是放諸四海皆準的規律。</p>
+
+  <p>這幾組 offline 數字用的實驗規模也得對照著看：主要的 ablation 是在「~200M-parameter models」上跑的，規模那組對照則另外拉了一組從約 1.2 億到約 9 億參數的 sweep。換句話說，「7.5 倍模型規模只換來 1.3% loss 下降」跟「一次 context 擴充換來 6.9% loss 下降」這兩個數字，不是同一顆模型在同一次實驗裡量出來的兩種操作。拿這個對照去說服團隊「先做 context 別急著加大模型」的時候，得留意這一點，不然容易把兩組不同設定的實驗結果當成同一套控制變因下的結論來引用。</p>
+
+  <p>線上 A/B 測試跑了 14 天，對照的是「a mature, highly optimized multi-stage production baseline」，不是隨便一個弱基準——這件事不是隨口一提的細節：如果對照組是一個沒調校過的弱基準，20% 的延遲降幅跟統計顯著的互動提升都很容易灌水；對照組換成已經在生產環境裡反覆優化過的系統，門檻高很多，這個結果的可信度也跟著提高。結果：「GenPage reduced end-to-end serving latency by 20% relative to the baseline」，而且文章特別加註這個數字是「without exhausting the available optimizations; further reductions are possible」——20% 不是天花板，只是還沒把能做的優化都做完時量到的數字。互動指標那邊，文章的說法是「All variants delivered statistically significant improvements on the core user engagement metric we use for launch decisions (p < 0.001)」，注意它給的是統計顯著性，沒有給互動指標具體提升了多少百分比，這點不能替它腦補一個數字。</p>
+
+  <p>p &lt; 0.001 這個數字本身只回答「這個提升是不是雜訊」，不回答「提升有多大」——統計顯著性看的是量測到的差異有多不像隨機波動，跟差異本身的大小是兩件事。文章願意公開 p 值卻不公開絕對百分比，讀者能做的判斷也就只到「這個效果是真的」，到不了「這個效果值不值得為了它承擔一整套 serving 手術的複雜度」。</p>
+
+  <p>換來的代價也寫在文章裡：「We observed unintended shifts in the distribution of impressed entity categories... these shifts are not necessarily negative, but they are not something we explicitly optimized for, and they warrant deeper investigation.」拿掉多階段管線裡每一段各自的可解釋決策點之後，這種曝光分布的位移變得更難單獨拆解成「哪一段造成的」，團隊自己也承認這還沒查清楚。</p>
+
+  <p>文章沒有把 hybrid row decoding 跟這個曝光分布位移擺在一起討論，但兩者會不會有關——排在列尾的作品只靠一次 forward pass 的 logits 挑出來，跳過真正逐步的自迴歸調整，會不會系統性地偏向某些類別——是一個文章沒有回答、也沒有證據能回答的問題。</p>
+
+  <p class="vg-deep-closer"><strong>What this enables</strong>：把候選生成、排序、版面決策收斂成一顆 decoder-only transformer，換來的不是「更大的模型」，而是一個共享因果鏈的決策空間——GenPage 在生成第 N 個 token 時看得到前面所有已生成的頁面內容，這是分階段管線結構上做不到的事；serving 端配合客製 tokenization 與 hybrid row decoding 之後，這個好處目前量到的成本是端到端延遲降 20%，不是加 20%。</p>
+</div>

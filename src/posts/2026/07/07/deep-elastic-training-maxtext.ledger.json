@@ -1,0 +1,379 @@
+{
+  "output_path": "src/posts/2026/07/07/deep-elastic-training-maxtext.html",
+  "spine": [
+    "1. 傳統 SPMD 分散式訓練裡，一台 TPU 死掉通常等於整個 job 崩潰重跑；MaxText 的 elastic training 示範把同一種故障壓縮成一分五十秒的自我修復。",
+    "2. 關鍵前提是 Pathways 的 single-controller 架構——整個叢集只有一個 Python process，跑在 CPU 機器上，把每顆 TPU 都當作本地資源操作；TPU 死亡時，這個 process 本身沒有跟著死。",
+    "3. Pathways 用兩條路徑偵測故障：in-flight 的 RPC 直接收到 DATA_LOSS，沒有 in-flight 操作時靠 heartbeat timeout（約 10 秒後 DEADLINE_EXCEEDED）；MaxText 的 elastic_retry decorator 接住這個例外，在同一個 process、同一個 PID 裡執行復原路徑。",
+    "4. 復原靠 Orbax 的 checkpoint 驗證機制——只有 shard 全部 flush 且寫入 commit_success marker 的 checkpoint 才算「有效」，中途寫壞的目錄會被整個刪除，退回上一份有效 checkpoint，訓練因此會倒退幾十步。",
+    "5. 兩種復原模式：pause-and-resume 等新 slice 排上來才用完整 mesh 繼續，replica-resize 直接在剩下的 slice 上以較低吞吐量繼續、之後再擴回原規模；這次示範走的是前者。",
+    "6. 實測案例把一分五十秒拆解：heartbeat 偵測約 13 秒、pod 重新排程與歸隊約 50 秒（佔比最大）、checkpoint 從 Cloud Storage 拉回只要 5.39 秒、復原後第一步要 12.7 秒（是穩態的六十倍上下），整個 job 只有失敗的那個 slice 被重建，其餘 slice 與 controller 全程存活、同一個 PID。",
+    "7. 這把故障網域從「整個 job」縮小到「單一 device slice」，但也有邊界——checkpoint 大到 135 GiB 級時，controller-routed 的復原路徑本身會把 proxy OOM 灌爆，得靠讓 TPU host 直接讀寫 Cloud Storage（繞過 controller）才撐得住；未來版本打算用常駐記憶體 snapshot 取代這趟 GCS 來回，但原文未給出具體時程或數字。"
+  ],
+  "sources": [
+    {
+      "url": "https://developers.googleblog.com/en/we-terminated-a-tpu-mid-training-and-it-recovered-in-seconds-introduction-to-elastic-training-with-maxtext/",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": null,
+      "perspective": {
+        "mechanism": "Pathways 的 single-controller 架構把 TPU 硬體故障從 process-level 崩潰轉換成 controller process 裡一個可以 catch 的 Python 例外；MaxText 的 elastic_retry decorator 接住它，靠 Orbax 的 commit_success marker 驗證 checkpoint 有效性，只重建失敗的那個 device slice，而不是整個 job。",
+        "tradeoff": "把復原粒度做到 per-slice 需要額外的架構複雜度（single controller、marker 驗證、checkpoint 的 proxy 路由），而且大 checkpoint（135 GiB 級）下 controller-routed 復原本身會變成新瓶頸，必須再繞過 controller（ENABLE_PATHWAYS_PERSISTENCE）才撐得住；復原時間裡 Kubernetes 排程（~50 秒）佔比遠大於 MaxText 自己的邏輯（checkpoint 還原 5.39 秒）。",
+        "reader_use": "管理大規模分散式訓練 job 的讀者可以用這篇建立一個可遷移的心智模型：失敗網域能不能做到「單一 device」而不是「整個 job」，關鍵在於管理故障的那個 process 是否活在故障域之外——評估任何分散式訓練框架的容錯設計時都能問同一個問題。"
+      }
+    }
+  ],
+  "notes": [
+    {
+      "id": "n01",
+      "url": "https://developers.googleblog.com/en/we-terminated-a-tpu-mid-training-and-it-recovered-in-seconds-introduction-to-elastic-training-with-maxtext/",
+      "quote": "Most commonly, an in-flight operation to the dead worker fails and Pathways returns a DATA_LOSS error. If nothing happens to be in flight, the resource manager (a container running alongside our script on the CPU node) notices the worker has stopped heartbeating and returns DEADLINE_EXCEEDED after about 10 seconds.",
+      "hedge": "asserted",
+      "interpretation": "Pathways 有兩條故障偵測路徑：同步（in-flight RPC 直接失敗回 DATA_LOSS）與非同步（resource manager 心跳逾時，約 10 秒回 DEADLINE_EXCEEDED），確保不管故障發生時 controller 有沒有正在跟該 worker 通訊，最終都會收到訊號。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n02",
+      "url": "https://developers.googleblog.com/en/we-terminated-a-tpu-mid-training-and-it-recovered-in-seconds-introduction-to-elastic-training-with-maxtext/",
+      "quote": "With Pathways, there is exactly one Python process, running on a plain CPU machine, and it sees every TPU chip in the cluster as if they were local.",
+      "hedge": "asserted",
+      "interpretation": "single-controller 架構：整個叢集只曝露一個 Python process，跑在跟 TPU 分開的 CPU 機器上，把每顆 TPU 晶片當本地資源操作。這是與傳統 SPMD（一個 process 對一台機器）相反的模型，是後續一切可復原性的結構前提。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n03",
+      "url": "https://developers.googleblog.com/en/we-terminated-a-tpu-mid-training-and-it-recovered-in-seconds-introduction-to-elastic-training-with-maxtext/",
+      "quote": "Because when a TPU machine dies, there is still a healthy Python process alive on the CPU node that can do something about it.",
+      "hedge": "asserted",
+      "interpretation": "single controller 為何重要的直接理由：管理訓練迴圈的 process 活在跟 TPU 分開的機器上，TPU 死亡不會連帶讓這個 process 死亡，因此有機會在原地做點什麼而不是整組崩潰。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n04",
+      "url": "https://developers.googleblog.com/en/we-terminated-a-tpu-mid-training-and-it-recovered-in-seconds-introduction-to-elastic-training-with-maxtext/",
+      "quote": "It catches that specific exception, logs Slice down event detected. Retrying. message, and runs the recovery path instead of letting the error crash the process.",
+      "hedge": "asserted",
+      "interpretation": "elastic_retry decorator 的具體行為：捕捉例外、記錄特定 log 訊息、執行復原路徑而不是讓 process 崩潰，全部發生在同一個 process 裡。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n05",
+      "url": "https://developers.googleblog.com/en/we-terminated-a-tpu-mid-training-and-it-recovered-in-seconds-introduction-to-elastic-training-with-maxtext/",
+      "quote": "Checkpoints are written to Cloud Storage in the background while training runs, and a checkpoint is only considered viable when every shard has been flushed and a tiny commit_success marker file is written next to it. During recovery, the cleanup code checks the latest checkpoint directory: if there's no marker (it was mid-write when things broke), the directory is deleted, and we fall back to the newest checkpoint that does have one.",
+      "hedge": "asserted",
+      "interpretation": "checkpoint 有效性是二元且由 marker 檔守門的：沒有 commit_success 檔的目錄一律視為無效並整個刪除，退回上一份有標記的 checkpoint，保證復原永遠從完整、已知良好的狀態開始。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n06",
+      "url": "https://developers.googleblog.com/en/we-terminated-a-tpu-mid-training-and-it-recovered-in-seconds-introduction-to-elastic-training-with-maxtext/",
+      "quote": "For about 13 seconds the training loop has no idea anything is wrong",
+      "hedge": "asserted",
+      "interpretation": "這次示範的 heartbeat 逾時偵測耗時約 13 秒，是「故障發生」到「controller 第一次知道出事」之間的時間。（但明確是「in our run」這一次示範的觀察值，非普遍常數）",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n07",
+      "url": "https://developers.googleblog.com/en/we-terminated-a-tpu-mid-training-and-it-recovered-in-seconds-introduction-to-elastic-training-with-maxtext/",
+      "quote": "In our run that took about 50 seconds",
+      "hedge": "asserted",
+      "interpretation": "pod 重新排程與歸隊耗時約 50 秒，是整段復原時間裡最久的一段，且是 Kubernetes 排程層的開銷，不是 MaxText 自己的邏輯。（限定於「our run」這一次示範）",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n08",
+      "url": "https://developers.googleblog.com/en/we-terminated-a-tpu-mid-training-and-it-recovered-in-seconds-introduction-to-elastic-training-with-maxtext/",
+      "quote": "Orbax pulls the ~7 GiB of model and optimizer state back from Cloud Storage and pushes it out to the TPUs in 5.39 seconds",
+      "hedge": "asserted",
+      "interpretation": "checkpoint 從 Cloud Storage 還原到 TPU 的實際資料搬運只要 5.39 秒，相對於 pod 排程的 50 秒是很小的一段。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n09",
+      "url": "https://developers.googleblog.com/en/we-terminated-a-tpu-mid-training-and-it-recovered-in-seconds-introduction-to-elastic-training-with-maxtext/",
+      "quote": "That first step took 12.7 seconds, versus ~0.2 once it's back at steady state",
+      "hedge": "asserted",
+      "interpretation": "復原後第一個訓練步驟明顯變慢（12.7 秒 vs 穩態 ~0.2 秒，約 60 倍），推測是重新編譯／重新進入 mesh 的一次性代價，之後回到正常速度。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n10",
+      "url": "https://developers.googleblog.com/en/we-terminated-a-tpu-mid-training-and-it-recovered-in-seconds-introduction-to-elastic-training-with-maxtext/",
+      "quote": "Total time from kill to that line: about 1 minute 50 seconds",
+      "hedge": "asserted",
+      "interpretation": "整段復原的端到端總時間，是這次示範最核心的數字。四段量測值（13+50+5.39+12.7≈81秒）相加少於這個總數，差距原文未逐項說明。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n11",
+      "url": "https://developers.googleblog.com/en/we-terminated-a-tpu-mid-training-and-it-recovered-in-seconds-introduction-to-elastic-training-with-maxtext/",
+      "quote": "The step counter goes 3388 to 3301 in the same log stream: we lost 88 steps of progress, rewound to the last committed checkpoint at step 3300, and kept going.",
+      "hedge": "asserted",
+      "interpretation": "CORRECTED (was incomplete quote in original capture): the log shows step 3388 (crash) then the next logged step is 3301, but the article explicitly states the last COMMITTED checkpoint was at step 3300, and the lost progress is 88 steps (3301 through 3388 redone), not 87. The original note's truncated quote led to a wrong derived number (87 via naive 3388-3301 subtraction); the fuller quote gives the correct figures: checkpoint=3300, steps lost=88. Draft HTML has been corrected accordingly (figcaption, drag-widget ANCHOR constant, and state text all now use 3300/88).",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n12",
+      "url": "https://developers.googleblog.com/en/we-terminated-a-tpu-mid-training-and-it-recovered-in-seconds-introduction-to-elastic-training-with-maxtext/",
+      "quote": "Zero restarts. Same process, same PID, under two minutes of downtime",
+      "hedge": "asserted",
+      "interpretation": "整個復原過程中 controller process 沒有重啟過，PID 不變，這是「復原發生在同一個 process 裡」而非「排程器重新排了一個新 pod」的具體、可檢查的證據。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n13",
+      "url": "https://developers.googleblog.com/en/we-terminated-a-tpu-mid-training-and-it-recovered-in-seconds-introduction-to-elastic-training-with-maxtext/",
+      "quote": "Hardware: 3 x TPU v5e-16 slices = 48 chips, plus one n2-standard-64 CPU node for the controller.",
+      "hedge": "asserted",
+      "interpretation": "示範叢集拓樸：3 個獨立 TPU v5e-16 slice、共 48 顆晶片，由 1 個 CPU controller 節點統一管理，建立「1 controller : N slice」的比例。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n14",
+      "url": "https://developers.googleblog.com/en/we-terminated-a-tpu-mid-training-and-it-recovered-in-seconds-introduction-to-elastic-training-with-maxtext/",
+      "quote": "qwen3-0.6b's checkpoint is only ~6.7 GiB",
+      "hedge": "asserted",
+      "interpretation": "示範選用的模型 checkpoint 只有 6.7 GiB，刻意小，使 checkpoint 復原成本低；這個選擇的必要性在後文的 135 GiB 對照案例中被解釋。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n15",
+      "url": "https://developers.googleblog.com/en/we-terminated-a-tpu-mid-training-and-it-recovered-in-seconds-introduction-to-elastic-training-with-maxtext/",
+      "quote": "that's roughly $30 with 48 chips at ~$1.20/chip-hour for half an hour",
+      "hedge": "asserted",
+      "interpretation": "跑完整個示範（半小時、48 顆晶片）的粗估成本約 30 美元，說明這是一個低成本可重現的實驗，不是對生產成本的宣稱。（用「roughly」明確標示為粗估）",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n16",
+      "url": "https://developers.googleblog.com/en/we-terminated-a-tpu-mid-training-and-it-recovered-in-seconds-introduction-to-elastic-training-with-maxtext/",
+      "quote": "But with a larger model, like Qwen3-4B where params plus Adam optimizer moments add up to about 135 GiB, the proxy has to buffer all of that in flight, and the proxy OOM-kills and recovery fails.",
+      "hedge": "asserted",
+      "interpretation": "核心限制：復原路徑預設經過 controller 的 proxy，checkpoint 大到 135 GiB 級時 proxy 得把資料整批緩衝在記憶體裡，反而把 controller 自己灌爆、造成復原失敗——single controller 的一個具體邊界。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n17",
+      "url": "https://developers.googleblog.com/en/we-terminated-a-tpu-mid-training-and-it-recovered-in-seconds-introduction-to-elastic-training-with-maxtext/",
+      "quote": "The right answer is to take the controller out of the data path: set ENABLE_PATHWAYS_PERSISTENCE=1 in the controller's environment.",
+      "hedge": "asserted",
+      "interpretation": "對 n16 限制的修法：讓 TPU host 直接讀寫自己的 checkpoint shard 到 Cloud Storage，繞過 controller 的 proxy，恢復「控制面與資料面分離」的設計。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n18",
+      "url": "https://developers.googleblog.com/en/we-terminated-a-tpu-mid-training-and-it-recovered-in-seconds-introduction-to-elastic-training-with-maxtext/",
+      "quote": "The single most important line for elasticity is backoffLimit: 20 on the worker Job.",
+      "hedge": "asserted",
+      "interpretation": "Kubernetes JobSet 層的關鍵設定：失敗 slice 底下的 pod 可以在 Job 這一層原地重啟最多 20 次，才會讓整個 worker Job 被判定失敗，把故障限制在單一 Job 範圍，不升級成整個 JobSet 重排。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n19",
+      "url": "https://developers.googleblog.com/en/we-terminated-a-tpu-mid-training-and-it-recovered-in-seconds-introduction-to-elastic-training-with-maxtext/",
+      "quote": "enable_single_controller=True, elastic_enabled=true, elastic_timeout_seconds=300, elastic_max_retries=10",
+      "hedge": "asserted",
+      "interpretation": "啟用機制的四個設定旗標：single_controller 讓 JAX 走 Pathways proxy，elastic_enabled 包進 elastic_retry decorator，timeout_seconds 限制等待替換 slice 的時間，max_retries 限制放棄前容忍的故障次數。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n20",
+      "url": "https://developers.googleblog.com/en/we-terminated-a-tpu-mid-training-and-it-recovered-in-seconds-introduction-to-elastic-training-with-maxtext/",
+      "quote": "A full restart tears down and reschedules the whole workload, from the controller (head) pod, every healthy worker pod, to the fresh controller Python process that comes with them, while elastic recovery leaves all of it running and only swaps the slice that died.",
+      "hedge": "asserted",
+      "interpretation": "全篇的核心機制對比：full restart 的故障網域是「整個 job」（連健康 pod 都被拆掉重排），elastic recovery 的故障網域是「單一 device slice」。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n21",
+      "url": "https://developers.googleblog.com/en/we-terminated-a-tpu-mid-training-and-it-recovered-in-seconds-introduction-to-elastic-training-with-maxtext/",
+      "quote": "The next iteration of elasticity removes that round-trip. Instead of rebuilding from the latest GCS checkpoint, the elastic manager periodically saves a snapshot of the training state into host memory, kept alongside the live process.",
+      "hedge": "hedged",
+      "interpretation": "未來規劃：用常駐主機記憶體的 snapshot 取代目前的 GCS checkpoint 復原路徑，理論上能存得更頻繁，但原文沒有給出具體頻率或時程數字。（明確是「next iteration」，尚未上線的方向）",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n22",
+      "url": "https://developers.googleblog.com/en/we-terminated-a-tpu-mid-training-and-it-recovered-in-seconds-introduction-to-elastic-training-with-maxtext/",
+      "quote": "One more flag worth calling out: checkpoint_period=100. MaxText's default is 10,000 steps.",
+      "hedge": "asserted",
+      "interpretation": "示範刻意把 checkpoint 週期從 MaxText 預設的一萬步調成一百步，讓一次故障最多損失的進度有一個窄上限，代價是更頻繁的 checkpoint 寫入。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n23",
+      "url": "https://developers.googleblog.com/en/we-terminated-a-tpu-mid-training-and-it-recovered-in-seconds-introduction-to-elastic-training-with-maxtext/",
+      "quote": "At our ~0.16s per step, 100 steps means a new checkpoint starts roughly every 16 seconds, so there's always something recent to fall back to.",
+      "hedge": "asserted",
+      "interpretation": "換算成時間，這次示範的訓練速度下，checkpoint 大約每 16 秒開始寫一次。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n24",
+      "url": "https://developers.googleblog.com/en/we-terminated-a-tpu-mid-training-and-it-recovered-in-seconds-introduction-to-elastic-training-with-maxtext/",
+      "quote": "We'll use MaxText, an open-source LLM training library written in pure Python and JAX.",
+      "hedge": "asserted",
+      "interpretation": "MaxText 的基本定位：一個現有的開源 LLM 訓練函式庫，elastic training 是建在它與 Pathways、Orbax 之上的能力，不是全新的訓練框架。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n25",
+      "url": "https://developers.googleblog.com/en/we-terminated-a-tpu-mid-training-and-it-recovered-in-seconds-introduction-to-elastic-training-with-maxtext/",
+      "quote": "In pause and resume, the exception gets caught, you wait for the failed slice to be replaced, then reload the last viable checkpoint and continue on the full mesh.",
+      "hedge": "asserted",
+      "interpretation": "第一種復原模式：等替換硬體真的到位，才在完整規模的 mesh 上繼續訓練。這次示範採用的就是這個模式。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n26",
+      "url": "https://developers.googleblog.com/en/we-terminated-a-tpu-mid-training-and-it-recovered-in-seconds-introduction-to-elastic-training-with-maxtext/",
+      "quote": "In replica resize, you reload the last viable checkpoint immediately onto the surviving slices and training keeps running at reduced throughput while the replacement comes up, then scales back to full size once it's ready.",
+      "hedge": "asserted",
+      "interpretation": "第二種復原模式：不等替換硬體，立刻在剩下的 slice 上以較低吞吐量繼續訓練，等替補上線再擴回原規模——用吞吐量換可用性。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n27",
+      "url": "https://developers.googleblog.com/en/we-terminated-a-tpu-mid-training-and-it-recovered-in-seconds-introduction-to-elastic-training-with-maxtext/",
+      "quote": "A JobSet is a single Kubernetes resource that groups several Jobs together and gives them a shared restart policy and a shared headless Service so the pods can find each other by name. That's exactly what a Pathways cluster needs: one head Job on the CPU node, and one worker Job per TPU slice.",
+      "hedge": "asserted",
+      "interpretation": "JobSet 是把整個 Pathways 叢集拓樸釘在一起的 Kubernetes 資源：一個 head Job 對應 controller 所在的 CPU 節點，每個 TPU slice 各自對應一個 worker Job，靠共享的 headless Service 用名稱（而非 IP）互相找到彼此——這解釋了替換 pod 為何不需要額外重新設定就能被其他 pod 找到。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n28",
+      "url": "https://developers.googleblog.com/en/we-terminated-a-tpu-mid-training-and-it-recovered-in-seconds-introduction-to-elastic-training-with-maxtext/",
+      "quote": "Those pods don't run our code at all. They run the Pathways worker binary, which connects back to the resource manager and waits to be handed compiled XLA programs.",
+      "hedge": "asserted",
+      "interpretation": "TPU pod 本身不執行使用者的訓練程式碼，只跑一份通用的 Pathways worker binary，被動等待 controller 送來編譯好的 XLA 程式——這是 single controller 能在 TPU 死亡時全身而退的結構性理由之一：會壞掉的機器上根本沒有放使用者邏輯。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n29",
+      "url": "https://developers.googleblog.com/en/we-terminated-a-tpu-mid-training-and-it-recovered-in-seconds-introduction-to-elastic-training-with-maxtext/",
+      "quote": "Small on purpose so the failure-and-recovery loop is quick to watch and cheap to run.",
+      "hedge": "asserted",
+      "interpretation": "模型選擇 qwen3-0.6b 的直接理由：刻意選小，讓故障與復原的循環看得快、跑得便宜——這是台面上的理由，135 GiB 限制（n16）則是台面下更硬的技術理由。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n30",
+      "url": "https://developers.googleblog.com/en/we-terminated-a-tpu-mid-training-and-it-recovered-in-seconds-introduction-to-elastic-training-with-maxtext/",
+      "quote": "Once training has been going for a while and there are a few checkpoints on disk, we pick a worker pod on slice 2 and force-kill it: kubectl delete pod pw-elastic-worker-2-0-vhhvx --grace-period=0 --force",
+      "hedge": "asserted",
+      "interpretation": "示範故障的具體觸發方式：對 slice 2 上的一個 worker pod 下 kubectl delete --grace-period=0 --force，直接、無預警地砍掉，貼近真實硬體斷線的情境，不是軟體層模擬的假故障。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n31",
+      "url": "https://developers.googleblog.com/en/we-terminated-a-tpu-mid-training-and-it-recovered-in-seconds-introduction-to-elastic-training-with-maxtext/",
+      "quote": "What happens when one machine dies in the middle of a multi-node training run? If you've trained large models across many machines, you already know the answer: the communication times out, every worker exits, and you re-launch the whole job from the last checkpoint. It's painful, and it's just how distributed training works. Or is it?",
+      "hedge": "asserted",
+      "interpretation": "文章開場白，用傳統分散式訓練的痛點（逾時、全部退出、從頭重跑）建立對照基準，最後用反問句帶出這篇文章要挑戰的假設。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n32",
+      "url": "https://developers.googleblog.com/en/we-terminated-a-tpu-mid-training-and-it-recovered-in-seconds-introduction-to-elastic-training-with-maxtext/",
+      "quote": "After a short warm-up — the training function re-entering and running its first step on the rebuilt mesh — the log prints completed step: 3301. That first step took 12.7 seconds, versus ~0.2 once it's back at steady state.",
+      "hedge": "asserted",
+      "interpretation": "解釋復原後第一步變慢的機制：training function 重新進入剛重建好的 mesh 並執行第一步，這個「re-entering」動作本身是一次性代價，之後就回到穩態速度。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n33",
+      "url": "https://developers.googleblog.com/en/we-terminated-a-tpu-mid-training-and-it-recovered-in-seconds-introduction-to-elastic-training-with-maxtext/",
+      "quote": "Our hardware unit is the TPU chip, an accelerator built around matrix-multiply units. Chips are grouped into a TPU slice, a set of chips wired together with a fast dedicated interconnect called ICI (Inter-Chip Interconnect). Within a slice, chips are attached to ordinary CPU host VMs (four hosts per slice in our setup).",
+      "hedge": "asserted",
+      "interpretation": "硬體拓樸的最小定義：TPU chip 是最小單位，一組 chip 用 ICI 高速互連組成一個 slice，slice 裡的 chip 掛在普通 CPU host VM 上，這次示範每個 slice 掛四台 host——這是 single controller 要管理的實體對象。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n34",
+      "url": "https://developers.googleblog.com/en/we-terminated-a-tpu-mid-training-and-it-recovered-in-seconds-introduction-to-elastic-training-with-maxtext/",
+      "quote": "Google Kubernetes Engine. Everything runs as pods.",
+      "hedge": "asserted",
+      "interpretation": "整套拓樸（controller 與所有 TPU worker）都跑在 GKE 上、都是 pod，沒有例外——這是為什麼 JobSet／backoffLimit／resource manager 這套邏輯可以直接借用 Kubernetes 既有機制的平台前提。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n35",
+      "url": "https://developers.googleblog.com/en/we-terminated-a-tpu-mid-training-and-it-recovered-in-seconds-introduction-to-elastic-training-with-maxtext/",
+      "quote": "The difference between the two paths is the teardown, not the compile — and in our run, skipping that full-workload teardown was the difference between about hundreds of seconds and several minutes.",
+      "hedge": "asserted",
+      "interpretation": "full restart 與 elastic recovery 的量化對照：兩條路徑真正的差異是「要不要拆除重排」，不是編譯耗時；跳過整個 workload 的拆除重排，讓復原時間從「幾分鐘」等級降到「幾百秒」等級。（用 about 明確標示為概略量級，非精確數字）",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n36",
+      "url": "https://developers.googleblog.com/en/we-terminated-a-tpu-mid-training-and-it-recovered-in-seconds-introduction-to-elastic-training-with-maxtext/",
+      "quote": "Replica resize then adds something a restart can't offer at all: training keeps going even if some of the TPUs never come back.",
+      "hedge": "asserted",
+      "interpretation": "replica resize 相對 full restart 的獨特價值：即使壞掉的硬體永遠沒有補回來，訓練仍然可以繼續——這是 full restart 完全沒有的選項。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n37",
+      "url": "https://developers.googleblog.com/en/we-terminated-a-tpu-mid-training-and-it-recovered-in-seconds-introduction-to-elastic-training-with-maxtext/",
+      "quote": "For elastic recovery, three independent components have to cooperate.",
+      "hedge": "asserted",
+      "interpretation": "全文的結構宣告：elastic recovery 需要三個獨立元件合作，隨後分別點名 Pathways（發現故障）、decorator（接住例外）、Orbax（決定可復原狀態）——這是本文技術深潛的組件拆解依據。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n38",
+      "url": "https://developers.googleblog.com/en/we-terminated-a-tpu-mid-training-and-it-recovered-in-seconds-introduction-to-elastic-training-with-maxtext/",
+      "quote": "At on-demand v5e list prices that's roughly $30 with 48 chips at ~$1.20/chip-hour for half an hour, plus the CPU controller node.",
+      "hedge": "asserted",
+      "interpretation": "n15 的更精確版本：$30 估算明確基於 on-demand（非 spot/preemptible）v5e 牌價，且註明 CPU controller 節點是另外算的，不包含在 48 顆晶片的算式裡。（roughly 明確標示為粗估）",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n39",
+      "url": "https://developers.googleblog.com/en/we-terminated-a-tpu-mid-training-and-it-recovered-in-seconds-introduction-to-elastic-training-with-maxtext/",
+      "quote": "MaxText can be configured entirely through command-line flags layered on top of a base YAML.",
+      "hedge": "asserted",
+      "interpretation": "MaxText 的設定機制：所有行為（single controller、elastic_retry、checkpoint 週期等）最終都是疊在同一份 base YAML 上的命令列參數，不是散落各處的環境變數。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n40",
+      "url": "https://developers.googleblog.com/en/we-terminated-a-tpu-mid-training-and-it-recovered-in-seconds-introduction-to-elastic-training-with-maxtext/",
+      "quote": "The elastic_retry decorator comes from pathwaysutils; MaxText simply applies it around its training function.",
+      "hedge": "asserted",
+      "interpretation": "elastic_retry decorator 的來源澄清：容錯邏輯活在 pathwaysutils 函式庫裡，不是 MaxText 自己發明的，MaxText 只是把它包在自己的 training function 外面——暗示任何用 Pathways 的訓練程式理論上都能套用同一機制。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n41",
+      "url": "https://developers.googleblog.com/en/we-terminated-a-tpu-mid-training-and-it-recovered-in-seconds-introduction-to-elastic-training-with-maxtext/",
+      "quote": "By the end, you'll understand exactly which three components make that possible, where the approach still has rough edges, and how to reproduce everything yourself.",
+      "hedge": "asserted",
+      "interpretation": "文章自己的路線圖宣告：三個元件、粗糙邊界（rough edges）、如何自己重現——本文第五段（135 GiB 限制）對應的正是「rough edges」這個承諾。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n42",
+      "url": "https://developers.googleblog.com/en/we-terminated-a-tpu-mid-training-and-it-recovered-in-seconds-introduction-to-elastic-training-with-maxtext/",
+      "quote": "Orbax handles checkpointing: it coordinates the save from the controller, while each TPU host writes its own shard of the model state directly to Cloud Storage in parallel.",
+      "hedge": "asserted",
+      "interpretation": "Orbax 的角色定義：checkpoint 的「寫入」路徑上，controller 只協調，實際把 shard 資料送進 Cloud Storage 的是各個 TPU host 自己平行動手——這跟「讀回來復原」時預設要繞道 controller proxy 的路徑不對稱，是 135 GiB 限制的根源。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n43",
+      "url": "https://developers.googleblog.com/en/we-terminated-a-tpu-mid-training-and-it-recovered-in-seconds-introduction-to-elastic-training-with-maxtext/",
+      "quote": "python3 -m maxtext.trainers.pre_train.train src/maxtext/configs/base.yml base_output_directory=gs://${BUCKET_NAME}/output run_name=${RUN_NAME} model_name=qwen3-0.6b per_device_batch_size=1 steps=5000 enable_checkpointing=true checkpoint_period=100 enable_single_controller=true elastic_enabled=true elastic_timeout_seconds=300 elastic_max_retries=10 dataset_type=grain grain_file_type=arrayrecord grain_train_files=gs://${BUCKET_NAME}/data/glaive-fc-v2/train.array_record*",
+      "hedge": "asserted",
+      "interpretation": "示範實際下的完整指令：總共排定跑 5000 步、per_device_batch_size=1、資料集是 glaive-fc-v2（一份真正的 function-calling 資料集，經 grain 讀取），故障發生在第 3388 步時已跑過約三分之二的行程。",
+      "timeliness": "annual"
+    }
+  ],
+  "claims": [],
+  "checked_at": "2026-07-07",
+  "checker_rounds": 0,
+  "coverage": {
+    "candidate_claims": 26,
+    "checked": 0,
+    "dropped_low_load": 0
+  }
+}
