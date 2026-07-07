@@ -1,0 +1,151 @@
+{
+  "output_path": "src/posts/2026/07/07/deep-preempt-none-postgres.html",
+  "spine": [
+    "1. AWS 工程師 Salvatore Dipietro 在 m8g.24xlarge（96 vCPU Graviton4）上跑 PostgreSQL 17 的 pgbench，發現同一套硬體、同一個 workload，tps 從 98,565.86 掉到 50,751.96——換算下來新 kernel 只交出 0.51x 的吞吐量。",
+    "2. 唯一變因是 Linux 7.0 拿掉了 PREEMPT_NONE、預設改成 PREEMPT_LAZY，直覺上排程器的搶佔策略不該影響資料庫吞吐量這麼多。",
+    "3. perf 抓到熱點：56.03% 的 CPU 時間卡在 StartReadBuffer，一路收斂到 55.60% 卡在 s_lock，幾乎是同一條路徑，而不是分散的開銷——排除了「只是搶佔次數變多、context switch 變貴」的一般性理論。",
+    "4. Andres Freund 在 -hackers 與 Hacker News 上進一步查出：問題不在排程器本身,而在 StrategyControl->buffer_strategy_lock 這顆 spinlock 保護的程式碼會在特定設定下觸發 minor page fault。",
+    "5. 120GB 的 shared_buffers 用 4KB 分頁時有約 31,457,280 個 PTE、約 3100 萬次潛在的 first-touch page fault；持有 spinlock 的行程若在缺頁當下被 PREEMPT_LAZY 搶佔,其餘上百個等待者就在 userspace 空轉燒 CPU。",
+    "6. 開 huge_pages（2MB 或 1GB）能把 PTE 數量壓到 61,440 或甚至 120,退化完全消失——Freund 後續測試證實這一點。",
+    "7. 教訓不是去反對或反轉 kernel 的預設值,而是先檢查大型 shared memory 區段用的分頁大小;方法論上,先用 perf 定位熱點路徑,再回頭查那條路徑實際做了什麼,比先入為主假設「搶佔次數」更快找到答案。"
+  ],
+  "sources": [
+    {
+      "url": "https://thebuild.com/blog/preempt_none-is-dead-your-postgres-probably-doesnt-care/",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": "2026-04-23",
+      "perspective": {
+        "mechanism": "教的是 spinlock 與記憶體分頁大小之間一個容易被忽略的耦合:持有 spinlock 的程式碼路徑如果會觸發 page fault,搶佔策略的改變(PREEMPT_LAZY 允許在 fault 服務期間搶佔持鎖行程)會把「缺頁的微秒級延遲」放大成「缺頁延遲 + 排程延遲」,在高並行下這個放大效應會透過鎖佇列複合成整體吞吐量腰斬。",
+        "tradeoff": "huge_pages 把 PTE 數量從千萬級壓到百級,幾乎消除這個問題,但要求維運者事先設定 vm.nr_hugepages 並確保 shared_memory_size_in_huge_pages 對得上,這是一個需要提前規劃、不能臨時開的系統設定;另一條路(核心提供 rseq 之類的機制讓 spinlock 持有者不被搶佔)需要使用者空間軟體自己去採用一個 7.0 之後才有的新設施,只為了補一個 7.0 之後才出現的退化,作者認為不划算。",
+        "reader_use": "任何在自管 Linux 上跑大型 shared_buffers/shared-memory 資料庫或快取(不只 Postgres)的工程師,升級 kernel 前應該先確認 huge_pages 是否已經開啟,而不是等吞吐量腰斬才回頭查;這也是一個「先看 perf 熱點路徑,再問那條路徑實際做了什麼」的診斷順序範例。"
+      }
+    }
+  ],
+  "notes": [
+    {
+      "id": "n01",
+      "url": "https://thebuild.com/blog/preempt_none-is-dead-your-postgres-probably-doesnt-care/",
+      "quote": "kernel almost never interrupts a running userspace thread",
+      "hedge": "asserted",
+      "interpretation": "作者對 PREEMPT_NONE(現已被拿掉的模式)的行為定義:核心幾乎不主動打斷正在跑的 userspace 執行緒。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n02",
+      "url": "https://thebuild.com/blog/preempt_none-is-dead-your-postgres-probably-doesnt-care/",
+      "quote": "A benchmark came out of AWS earlier this month showing PostgreSQL throughput on Linux 7.0 dropping to 0.51x what the same workload produced on Linux 6.x.",
+      "hedge": "asserted",
+      "interpretation": "全文開場的鉤子句,直接點出「0.51x」這個腰斬比例,是整篇追兇的起點。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n03",
+      "url": "https://thebuild.com/blog/preempt_none-is-dead-your-postgres-probably-doesnt-care/",
+      "quote": "Baseline (linux-next, PREEMPT_LAZY) 50,751.96 1.00x / With 7dadeaa6e851 reverted 98,565.86 1.94x",
+      "hedge": "asserted",
+      "interpretation": "benchmark 結果表的兩列原始數字,唯一變因是搶佔模式(是否回退該 commit),其餘硬體與 workload 相同。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n04",
+      "url": "https://thebuild.com/blog/preempt_none-is-dead-your-postgres-probably-doesnt-care/",
+      "quote": "56.03% - StartReadBuffer / 55.93% - GetVictimBuffer / 55.93% - StrategyGetBuffer / 55.60% - s_lock",
+      "hedge": "asserted",
+      "interpretation": "perf 呼叫路徑的百分比幾乎逐層原封不動地往下傳,顯示 CPU 時間收斂在單一條路徑、單一顆鎖上,而不是分散在多處開銷——這排除了「搶佔次數變多、context switch 變貴」這種一般性解釋。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n05",
+      "url": "https://thebuild.com/blog/preempt_none-is-dead-your-postgres-probably-doesnt-care/",
+      "quote": "StrategyControl->buffer_strategy_lock",
+      "hedge": "asserted",
+      "interpretation": "被鎖住的是 Postgres buffer manager 挑選 victim buffer 用的這顆 spinlock,是整條追兇路徑最後停下來的地方。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n06",
+      "url": "https://thebuild.com/blog/preempt_none-is-dead-your-postgres-probably-doesnt-care/",
+      "quote": "can, under the wrong configuration, take a minor page fault",
+      "hedge": "asserted",
+      "interpretation": "buffer_strategy_lock 保護的程式碼,在特定分頁設定下會觸發 minor page fault,這是 Freund 找到的關鍵耦合點。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n07",
+      "url": "https://thebuild.com/blog/preempt_none-is-dead-your-postgres-probably-doesnt-care/",
+      "quote": "roughly 31 million pages",
+      "hedge": "hedged",
+      "interpretation": "120GB shared_buffers 在 4KB 分頁下的粗估頁數,作者用「roughly」保留了估算的性質。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n08",
+      "url": "https://thebuild.com/blog/preempt_none-is-dead-your-postgres-probably-doesnt-care/",
+      "quote": "4 KB pages ~31,457,280 PTEs ~31M first-touch faults / 2 MB huge pages ~61,440 PTEs ~61K first-touch events / 1 GB huge pages 120 PTEs ~120 first-touch events",
+      "hedge": "asserted",
+      "interpretation": "同一個 120GB shared_buffers,換算成三種分頁大小下的 PTE 數量與潛在 first-touch page fault 數量,是全文解法的量化核心。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n09",
+      "url": "https://thebuild.com/blog/preempt_none-is-dead-your-postgres-probably-doesnt-care/",
+      "quote": "with huge_pages=on (or even THP doing the right thing), the regression does not appear. With huge_pages=off, on the same hardware, the regression appears.",
+      "hedge": "asserted",
+      "interpretation": "這是全文的解答句:同一套硬體,huge_pages 開關直接決定退化出不出現。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n10",
+      "url": "https://thebuild.com/blog/preempt_none-is-dead-your-postgres-probably-doesnt-care/",
+      "quote": "The answer — as Andres Freund worked out on -hackers and on Hacker News — is not the scheduler, or not directly.",
+      "hedge": "asserted",
+      "interpretation": "作者把 Freund 的貢獻定位成整個追兇轉折點:問題表面上跟著 kernel 排程器變化出現,但根源不是排程器本身。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n11",
+      "url": "https://thebuild.com/blog/preempt_none-is-dead-your-postgres-probably-doesnt-care/",
+      "quote": "Freund's response was measured and exactly right: requiring userspace software to adopt a new kernel facility introduced in 7.0, in order to paper over a regression that only exists in 7.0+, is not a good deal.",
+      "hedge": "asserted",
+      "interpretation": "這段是作者 Pettus 對 Freund 立場的轉述與背書,不是逐字加引號的 Freund 原話——文中用「Freund's response was...」帶出,行文上讀作作者的摘要而非直接引語,寫作時應以「Pettus 轉述」處理,不放進「」直接引用。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n12",
+      "url": "https://thebuild.com/blog/preempt_none-is-dead-your-postgres-probably-doesnt-care/",
+      "quote": "Lætitia Avrot wrote her own clear-eyed walkthrough of the same regression on My DBA Notebook on April 15, and if you read only one piece on this, read hers.",
+      "hedge": "asserted",
+      "interpretation": "作者列出另一篇獨立分析文章作為佐證讀物,屬同一事件的第二手描述,不是獨立重跑出新數字的來源。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n13",
+      "url": "https://thebuild.com/blog/preempt_none-is-dead-your-postgres-probably-doesnt-care/",
+      "quote": "Set huge pages. Upgrade your kernel. Move on.",
+      "hedge": "asserted",
+      "interpretation": "全文收尾的操作建議,兩個動作,沒有延伸的展望修辭。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n14",
+      "url": "https://thebuild.com/blog/preempt_none-is-dead-your-postgres-probably-doesnt-care/",
+      "quote": "Will Postgres eventually do something like it? Probably.",
+      "hedge": "hedged",
+      "interpretation": "作者對「Postgres 未來是否會採用 rseq 之類機制」的預測,明確用「Probably」標記為推測。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n15",
+      "url": "https://thebuild.com/blog/preempt_none-is-dead-your-postgres-probably-doesnt-care/",
+      "quote": "Instance: m8g.24xlarge / PostgreSQL: Version 17 / Workload: pgbench simple-update / Clients: 1,024 / Threads: 96 / Protocol: Prepared / Scale factor: 8,470 / Fillfactor: 90 / Duration: 1,200 seconds / Runs averaged: 3 each",
+      "hedge": "asserted",
+      "interpretation": "重現這次退化用的完整 benchmark 設定,決定了 shared_buffers 實際有多大、缺頁規模有多大。",
+      "timeliness": "annual"
+    }
+  ],
+  "claims": [],
+  "checked_at": "2026-07-07",
+  "checker_rounds": 0,
+  "coverage": { "candidate_claims": 0, "checked": 0, "dropped_low_load": 0 }
+}

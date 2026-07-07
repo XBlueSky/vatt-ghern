@@ -1,0 +1,484 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">48 顆 TPU 晶片裡死了一顆，Google 這次示範記錄下來的復原時間是一分五十秒——靠的是同一個 process、同一個 PID，把訓練從上一個有效的 checkpoint 接回去。</p>
+  <h1 class="vg-post-title">TPU 訓練中途掛掉，MaxText 讓它自己活過來</h1>
+</header>
+
+<div class="vg-post-body">
+
+<p><span class="vg-dropcap">大</span>規模分散式訓練的多數框架，程式碼是以一個 Python process 對應一台機器的方式跑的——SPMD。這代表平常管著整個訓練迴圈生死的那個 process，通常就活在會壞掉的那批機器上：硬體一斷線，process 也跟著斷線，剩下的選項只有把整個 job 拆掉、讓排程器重排一輪。Google 這篇部落格談的 MaxText elastic training，把這個假設整個換掉——訓練迴圈收到的不是「process 被殺掉」的訊號，而是一個能在原地被接住的 Python 例外。MaxText 本身沒什麼神秘：原文說得很直白，「We'll use MaxText, an open-source LLM training library written in pure Python and JAX」，一個開源的 LLM 訓練函式庫，這次談的機制是建在它跟 Pathways、Orbax 之上的一層能力，不是重寫一套新的訓練框架。對動輒跑上好幾天的大型 pretraining job 來說，這種差別直接決定了每次硬體閃斷之後，要不要把整個 job 拆掉重排、所有 worker 重新暖機一輪。下面從叢集拓樸開始，一路拆到復原當下實際花掉的每一秒。</p>
+
+<h2>single controller：故障網域為何能縮小到一顆 TPU</h2>
+
+<p>這一切成立的前提是 Pathways 的架構選擇。原文寫得很直接：「With Pathways, there is exactly one Python process, running on a plain CPU machine, and it sees every TPU chip in the cluster as if they were local.」整個叢集不管掛了幾顆 TPU、幾個 slice，對外只曝露一個 Python process，跑在跟 TPU 分開的 CPU 機器上，用代理的方式把每顆晶片當成本地資源操作。這跟前面說的 SPMD 模型正好相反：SPMD 是「process 跟著裝置走」，Pathways 是「一個 process 遙控所有裝置」。</p>
+
+<p>這個選擇的直接後果，作者自己點出來了：「Because when a TPU machine dies, there is still a healthy Python process alive on the CPU node that can do something about it.」TPU 機器死掉，跟著死的只有那台機器上的東西——控制邏輯所在的 process，因為根本沒有跑在 TPU 主機上，完全不受影響。故障網域第一次被拆成兩塊：裝置這塊會死，控制這塊不會。</p>
+
+<p>這個模型本身也有代價。原文集中談的是「TPU 死掉」這個情境，但沒有花篇幅討論 controller 自己所在的那台 CPU 機器掛掉會怎樣——single controller 拿掉了「TPU 是唯一故障點」這個假設，同時也把這台 CPU controller 節點本身的可用性，變成一個新的、文章裡沒有進一步展開的前提。這不是原文的疏漏，只是這篇文章的範圍剛好停在「TPU 故障」這一類事件上。</p>
+
+<figure class="vg-w-canvas-maxtext-elastic" data-mobile="static">
+  <style>
+    .vg-w-canvas-maxtext-elastic { display: grid; grid-template-rows: auto auto 1fr auto; gap: var(--s-2); }
+    .vg-w-canvas-maxtext-elastic .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+    .vg-w-canvas-maxtext-elastic button { font-family: var(--sans); font-size: var(--fs-sm); padding: 6px 14px; min-height: 44px; min-width: 44px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); cursor: pointer; }
+    .vg-w-canvas-maxtext-elastic button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent-text); }
+    .vg-w-canvas-maxtext-elastic button:hover { border-color: var(--accent); color: var(--accent-text); }
+    .vg-w-canvas-maxtext-elastic canvas { width: 100%; height: auto; aspect-ratio: 16 / 9; display: block; }
+    .vg-w-canvas-maxtext-elastic .phase { font-family: var(--scribed); font-style: italic; font-size: var(--fs-sm); color: var(--ink-soft); }
+    .vg-w-canvas-maxtext-elastic figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    @media (max-width: 720px) {
+      .vg-w-canvas-maxtext-elastic canvas { aspect-ratio: 4 / 3; }
+      .vg-w-canvas-maxtext-elastic .toolbar { display: none; }
+    }
+  </style>
+
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <circle cx="12" cy="12" r="9"/><path d="M9 9l6 6M15 9l-6 6"/>
+    </svg>
+    <span>切換 elastic recovery／full restart、按播放看重建範圍・4 個方塊</span>
+  </p>
+
+  <div class="toolbar" data-vg-controls>
+    <button type="button" id="vg-w-canvas-maxtext-elastic-mode-elastic" aria-pressed="true">elastic recovery</button>
+    <button type="button" id="vg-w-canvas-maxtext-elastic-mode-full" aria-pressed="false">full restart</button>
+    <button type="button" id="vg-w-canvas-maxtext-elastic-play">▷ 播放</button>
+    <button type="button" id="vg-w-canvas-maxtext-elastic-reset">↺ reset</button>
+    <span class="phase" id="vg-w-canvas-maxtext-elastic-phase"></span>
+  </div>
+
+  <canvas id="vg-w-canvas-maxtext-elastic-canvas" aria-label="controller 與三個 TPU slice 的故障復原示意圖"></canvas>
+
+  <figcaption>controller（CPU 上的單一 Python process）＋ 3 個 TPU v5e-16 slice。elastic recovery 模式下只有壞掉的 slice 2 被重建；full restart 模式下連 controller 跟另外兩個健康的 slice 都會被一起拆掉重排——對應原文那句「elastic recovery leaves all of it running and only swaps the slice that died」。</figcaption>
+
+  <script>
+  (function () {
+    const root = document.querySelector('.vg-w-canvas-maxtext-elastic');
+    const canvas = root.querySelector('#vg-w-canvas-maxtext-elastic-canvas');
+    const ctx = canvas.getContext('2d');
+    const btnElastic = root.querySelector('#vg-w-canvas-maxtext-elastic-mode-elastic');
+    const btnFull = root.querySelector('#vg-w-canvas-maxtext-elastic-mode-full');
+    const btnPlay = root.querySelector('#vg-w-canvas-maxtext-elastic-play');
+    const btnReset = root.querySelector('#vg-w-canvas-maxtext-elastic-reset');
+    const phaseLabel = root.querySelector('#vg-w-canvas-maxtext-elastic-phase');
+
+    function cssVar(name) {
+      return getComputedStyle(root).getPropertyValue(name).trim() || '#888';
+    }
+
+    function resize() {
+      const dpr = window.devicePixelRatio || 1;
+      const rect = canvas.getBoundingClientRect();
+      canvas.width = rect.width * dpr;
+      canvas.height = rect.height * dpr;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+    window.addEventListener('resize', () => { resize(); draw(); });
+
+    const PHASES = ['健康', '偵測到故障', '拆除中', '重建中', '已恢復'];
+    let mode = 'elastic';
+    let phase = 4;
+    let running = false;
+    let timer = null;
+
+    function boxState(boxId) {
+      const isSlice2 = boxId === 'slice2';
+      if (phase === 0) return 'ok';
+      if (phase === 1) return isSlice2 ? 'failed' : 'ok';
+      const affected = isSlice2 || mode === 'full';
+      if (phase === 2) return affected ? 'teardown' : 'ok';
+      if (phase === 3) return affected ? 'rebuilding' : 'ok';
+      return affected ? 'restored-rebuilt' : 'ok';
+    }
+
+    function roundRect(x, y, w, h, r) {
+      ctx.beginPath();
+      ctx.moveTo(x + r, y);
+      ctx.arcTo(x + w, y, x + w, y + h, r);
+      ctx.arcTo(x + w, y + h, x, y + h, r);
+      ctx.arcTo(x, y + h, x, y, r);
+      ctx.arcTo(x, y, x + w, y, r);
+      ctx.closePath();
+    }
+
+    function draw() {
+      const rect = canvas.getBoundingClientRect();
+      const W = rect.width, H = rect.height;
+      ctx.clearRect(0, 0, W, H);
+
+      const boxes = [
+        { id: 'controller', x: W * 0.5 - 62, y: H * 0.06, w: 124, h: 38, label: 'controller (CPU)' },
+        { id: 'slice1', x: W * 0.14, y: H * 0.55, w: 100, h: 58, label: 'slice 1' },
+        { id: 'slice2', x: W * 0.5 - 50, y: H * 0.55, w: 100, h: 58, label: 'slice 2' },
+        { id: 'slice3', x: W * 0.86 - 100, y: H * 0.55, w: 100, h: 58, label: 'slice 3' },
+      ];
+
+      ctx.strokeStyle = cssVar('--muted-2');
+      ctx.lineWidth = 1.2;
+      ctx.setLineDash([]);
+      boxes.slice(1).forEach((b) => {
+        ctx.beginPath();
+        ctx.moveTo(W * 0.5, H * 0.06 + 38);
+        ctx.lineTo(b.x + b.w / 2, b.y);
+        ctx.stroke();
+      });
+
+      boxes.forEach((b) => {
+        const state = boxState(b.id);
+        let fill = cssVar('--sage');
+        let stroke = cssVar('--sage-deep');
+        let dashed = false;
+        let alpha = 0.75;
+        if (state === 'failed') { fill = cssVar('--accent'); stroke = cssVar('--accent'); }
+        else if (state === 'teardown') { fill = cssVar('--bg-soft'); stroke = cssVar('--muted-2'); dashed = true; alpha = 0.4; }
+        else if (state === 'rebuilding') { fill = cssVar('--bg-soft'); stroke = cssVar('--accent'); dashed = true; alpha = 0.55; }
+        else if (state === 'restored-rebuilt') { stroke = cssVar('--accent'); dashed = true; }
+
+        ctx.save();
+        ctx.globalAlpha = alpha;
+        ctx.fillStyle = fill;
+        ctx.setLineDash(dashed ? [4, 3] : []);
+        ctx.strokeStyle = stroke;
+        ctx.lineWidth = 1.6;
+        roundRect(b.x, b.y, b.w, b.h, 6);
+        ctx.fill();
+        ctx.stroke();
+        ctx.restore();
+
+        ctx.fillStyle = cssVar('--ink');
+        ctx.font = '13px "EB Garamond", serif';
+        ctx.textAlign = 'center';
+        ctx.fillText(b.label, b.x + b.w / 2, b.y + b.h / 2 + 4);
+        if (state === 'restored-rebuilt') {
+          ctx.font = '10px "IM Fell English", serif';
+          ctx.fillStyle = cssVar('--accent-text');
+          ctx.fillText('重建過', b.x + b.w / 2, b.y + b.h + 14);
+        }
+      });
+
+      ctx.fillStyle = cssVar('--muted');
+      ctx.font = '11px "IM Fell English", serif';
+      ctx.textAlign = 'center';
+      if (mode === 'elastic') {
+        ctx.fillText('controller 全程同一個 PID・只有 slice 2 被換掉', W / 2, H - 8);
+      } else {
+        ctx.fillText('controller 與全部 slice 一起拆掉、一起重排', W / 2, H - 8);
+      }
+    }
+
+    function updatePhaseLabel() {
+      phaseLabel.textContent = '階段：' + PHASES[phase];
+    }
+
+    function setMode(m) {
+      mode = m;
+      btnElastic.setAttribute('aria-pressed', String(m === 'elastic'));
+      btnFull.setAttribute('aria-pressed', String(m === 'full'));
+      draw();
+    }
+
+    resize();
+    draw();
+    updatePhaseLabel();
+
+    if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+
+    btnElastic.addEventListener('click', () => setMode('elastic'));
+    btnFull.addEventListener('click', () => setMode('full'));
+
+    btnPlay.addEventListener('click', () => {
+      if (running) return;
+      running = true;
+      phase = 0;
+      updatePhaseLabel();
+      draw();
+      let step = 0;
+      const seq = [1, 2, 3, 4];
+      timer = setInterval(() => {
+        phase = seq[step];
+        updatePhaseLabel();
+        draw();
+        step += 1;
+        if (step >= seq.length) {
+          clearInterval(timer);
+          running = false;
+        }
+      }, 900);
+    });
+
+    btnReset.addEventListener('click', () => {
+      if (timer) clearInterval(timer);
+      running = false;
+      phase = 4;
+      updatePhaseLabel();
+      draw();
+    });
+  })();
+  </script>
+</figure>
+
+<p>官方原文把兩條路徑的差異寫得很白：「A full restart tears down and reschedules the whole workload, from the controller (head) pod, every healthy worker pod, to the fresh controller Python process that comes with them, while elastic recovery leaves all of it running and only swaps the slice that died.」全部重排，或者只換一格——上面互動示意圖的兩個模式，畫的就是這句話：切到 full restart，連沒壞的 slice 1 與 slice 3 都會被標成「重建過」；切回 elastic recovery，只有 slice 2 會換，controller 全程掛著同一個 PID。這個對照也解釋了為什麼「Zero restarts. Same process, same PID, under two minutes of downtime」會被原文特別記下來——復原有沒有真的做到 per-slice，看 controller 的 PID 有沒有換過就知道，不必用猜的。</p>
+
+<h2>DATA_LOSS 與 DEADLINE_EXCEEDED：例外怎麼被抓住</h2>
+
+<p>硬體真的死掉之後，Pathways 怎麼發現？原文描述了兩條路徑：「Most commonly, an in-flight operation to the dead worker fails and Pathways returns a DATA_LOSS error. If nothing happens to be in flight, the resource manager (a container running alongside our script on the CPU node) notices the worker has stopped heartbeating and returns DEADLINE_EXCEEDED after about 10 seconds.」也就是說，如果 controller 這時候正好在等某個 TPU 回應，死亡幾乎立刻曝光成一個 DATA_LOSS；如果沒有任何操作在飛行中，就得靠 resource manager 的心跳偵測，大約 10 秒後判定逾時。兩條路徑合起來保證了一件事：不管故障發生在哪個瞬間，controller 遲早都會收到一個訊號，不會永遠卡住等一個回不來的回應。</p>
+
+<p>訊號進來之後，接手的是 pathwaysutils 函式庫裡的 elastic_retry decorator。原文：「It catches that specific exception, logs Slice down event detected. Retrying. message, and runs the recovery path instead of letting the error crash the process.」這個 decorator 包住整個 training function；一旦抓到例外，它不會讓 Python 預設的「未接例外往上拋、process 結束」路徑發生，而是原地切進一段復原邏輯，繼續用同一個 process。</p>
+
+<figure class="vg-w-table-maxtext-elastic" data-mobile="keep">
+  <style>
+    .vg-w-table-maxtext-elastic { overflow-x: auto; }
+    .vg-w-table-maxtext-elastic table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+    .vg-w-table-maxtext-elastic thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); }
+    .vg-w-table-maxtext-elastic tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; line-height: 1.55; }
+    .vg-w-table-maxtext-elastic td code { font-family: var(--mono); font-size: 0.92em; }
+    .vg-w-table-maxtext-elastic td.num { font-variant-numeric: tabular-nums; }
+  </style>
+  <table>
+    <thead>
+      <tr><th>設定 / 數值</th><th>作用</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>enable_single_controller=True</code></td><td>讓 JAX 走 Pathways 的 proxy，叢集只曝露一個 controller process</td></tr>
+      <tr><td><code>elastic_enabled=true</code></td><td>把整個 training function 包進 elastic_retry decorator</td></tr>
+      <tr><td><code>elastic_timeout_seconds=300</code></td><td>願意等一個壞掉的 slice 被換掉的時限</td></tr>
+      <tr><td><code>elastic_max_retries=10</code></td><td>放棄、讓 job 真正失敗之前，最多容忍幾次故障</td></tr>
+      <tr><td><code>backoffLimit: 20</code>（JobSet worker Job）</td><td>失敗 slice 底下的 pod 原地重啟上限，超過才升級成整個 worker Job 失敗</td></tr>
+      <tr><td>叢集硬體</td><td>3 x TPU v5e-16 slice（共 48 顆晶片）＋ 1 x n2-standard-64 controller 節點</td></tr>
+      <tr><td>模型與 checkpoint（qwen3-0.6b）</td><td class="num">checkpoint 約 6.7 GiB</td></tr>
+      <tr><td>demo 成本估計</td><td class="num">約 $30（48 顆晶片，約 $1.20/chip-hour，跑半小時）</td></tr>
+    </tbody>
+  </table>
+  <figcaption>啟用整套機制要調的旗標，加上這次示範實際用的叢集規模與成本量級。數字全部取自原文的設定與 setup 段落。</figcaption>
+</figure>
+
+<p>這幾個旗標合起來要回答同一個問題：故障要拖多久，才會被判定成「真的失敗」而不是暫時的抖動。elastic_timeout_seconds=300 給 Pathways 五分鐘去等替補的 slice 排上來；elastic_max_retries=10 則從次數上設一道防線，避免同一顆一直壞的硬體讓 job 無限重試下去。往下一層，Kubernetes JobSet 把同一個原則又做了一次——「The single most important line for elasticity is backoffLimit: 20 on the worker Job」，失敗 slice 底下的 pod 可以在 Job 這一層原地重啟最多 20 次，才會讓整個 worker Job 被判定失敗，不會一路往上捅到整個 JobSet 重新排程。控制邏輯、排程層各自用自己的方式，把同一件事又確認了一遍：故障留在原地，不要往外擴散。</p>
+
+<h2>commit_success marker：checkpoint 何時算「有效」</h2>
+
+<p>process 活下來、例外被接住之後，下一個問題是拿什麼狀態復原。答案是 checkpoint，但不是任何一份 checkpoint 都算數。原文：「Checkpoints are written to Cloud Storage in the background while training runs, and a checkpoint is only considered viable when every shard has been flushed and a tiny commit_success marker file is written next to it. During recovery, the cleanup code checks the latest checkpoint directory: if there's no marker (it was mid-write when things broke), the directory is deleted, and we fall back to the newest checkpoint that does have one.」每個 shard 都寫完，旁邊多寫一個小小的 commit_success 標記檔，這份 checkpoint 才算「有效」；復原時系統只認標記，沒標記的目錄——不管裡面實際寫了多少——整個刪掉，退回上一份有標記的。這個設計把「checkpoint 壞了要不要用」這個判斷，從「事後檢查內容」換成「事前檢查一個標記檔存不存在」——不用打開 checkpoint 內容做驗證，只要看旁邊那個檔案在不在，判斷成本幾乎是常數，不會隨 checkpoint 變大而變貴。</p>
+
+<p>從 checkpoint 復原之後怎麼接下去，官方點出兩種模式。第一種：「In pause and resume, the exception gets caught, you wait for the failed slice to be replaced, then reload the last viable checkpoint and continue on the full mesh.」等新的 slice 真的排上來，再用完整的 mesh 繼續。另一種：「In replica resize, you reload the last viable checkpoint immediately onto the surviving slices and training keeps running at reduced throughput while the replacement comes up, then scales back to full size once it's ready.」不等，直接在剩下的 slice 上用縮小過的吞吐量繼續跑，等替補上線再擴回原本的規模。這次示範走的是第一種——等 slice 真的被換掉，再用完整的 48 顆晶片繼續。</p>
+
+<p>checkpoint 多久存一次也是刻意調過的：「One more flag worth calling out: checkpoint_period=100. MaxText's default is 10,000 steps.」這次示範把週期從預設的一萬步調成一百步，換算下來「At our ~0.16s per step, 100 steps means a new checkpoint starts roughly every 16 seconds, so there's always something recent to fall back to.」調密的代價是更頻繁的 checkpoint 寫入，換來的是「最多損失多少進度」有一個很窄的上限。</p>
+
+<figure class="vg-w-drag-maxtext-elastic" data-mobile="static" data-svg-scroll="720">
+  <style>
+    .vg-w-drag-maxtext-elastic svg { width: 100%; height: auto; }
+    .vg-w-drag-maxtext-elastic .state { font-family: var(--serif); font-size: var(--fs-sm); padding: var(--s-2); background: var(--bg-soft); border-left: 2px solid var(--accent); }
+    .vg-w-drag-maxtext-elastic figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-1); }
+  </style>
+
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <line x1="2" y1="12" x2="22" y2="12"/><polyline points="6 8 2 12 6 16"/><polyline points="18 8 22 12 18 16"/>
+    </svg>
+    <span>拖動故障點，看退回哪個 checkpoint、損失幾步・step 軸 3200-3420</span>
+  </p>
+
+  <svg viewBox="0 0 720 170" role="img" aria-label="訓練 step 軸：checkpoint 位置與故障點之間的距離決定損失的步數">
+    <line x1="40" y1="90" x2="680" y2="90" stroke="var(--muted-2)" stroke-width="1.5" />
+    <g id="vg-w-drag-maxtext-elastic-ticks"></g>
+    <g id="vg-w-drag-maxtext-elastic-real"></g>
+    <line id="vg-w-drag-maxtext-elastic-handle-line" x1="0" y1="60" x2="0" y2="120" stroke="var(--accent)" stroke-width="2" />
+    <circle id="vg-w-drag-maxtext-elastic-h" cx="0" cy="90" r="9" fill="var(--accent)" cursor="grab" />
+    <text id="vg-w-drag-maxtext-elastic-label" x="0" y="50" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--ink)">3388</text>
+  </svg>
+
+  <div class="state" id="vg-w-drag-maxtext-elastic-state">拖動紅點：模擬故障點</div>
+
+  <figcaption>綠色刻度是以這次示範的真實 checkpoint（step 3301，checkpoint_period=100）往兩側推算出的假設格點；★ 是這次示範真正的故障步數。原文：「The step counter goes 3388 to 3301」——退回第 3301 步，等於白做了 87 步。</figcaption>
+
+  <script>
+  (function () {
+    const root = document.querySelector('.vg-w-drag-maxtext-elastic');
+    const svg = root.querySelector('svg');
+    const handle = root.querySelector('#vg-w-drag-maxtext-elastic-h');
+    const handleLine = root.querySelector('#vg-w-drag-maxtext-elastic-handle-line');
+    const label = root.querySelector('#vg-w-drag-maxtext-elastic-label');
+    const stateDiv = root.querySelector('#vg-w-drag-maxtext-elastic-state');
+    const ticksG = root.querySelector('#vg-w-drag-maxtext-elastic-ticks');
+    const realG = root.querySelector('#vg-w-drag-maxtext-elastic-real');
+
+    const STEP_MIN = 3200, STEP_MAX = 3420;
+    const X0 = 40, X1 = 680;
+    const ANCHOR = 3301, PERIOD = 100;
+    const CRASH_REAL = 3388;
+    const xOf = (s) => X0 + ((s - STEP_MIN) / (STEP_MAX - STEP_MIN)) * (X1 - X0);
+    const sOf = (x) => STEP_MIN + ((x - X0) / (X1 - X0)) * (STEP_MAX - STEP_MIN);
+    const NS = 'http://www.w3.org/2000/svg';
+    function el(tag, attrs) {
+      const e = document.createElementNS(NS, tag);
+      for (const k in attrs) e.setAttribute(k, attrs[k]);
+      return e;
+    }
+
+    // Hypothetical checkpoint grid extrapolated from the one real anchor + real period.
+    const checkpoints = [];
+    for (let c = ANCHOR - PERIOD * 2; c <= STEP_MAX + PERIOD; c += PERIOD) {
+      if (c >= STEP_MIN - 10 && c <= STEP_MAX + 10) checkpoints.push(c);
+    }
+    checkpoints.forEach((c) => {
+      const x = xOf(c);
+      ticksG.appendChild(el('line', { x1: x, y1: 82, x2: x, y2: 98, stroke: 'var(--sage-deep)', 'stroke-width': 2 }));
+      const t = el('text', { x, y: 138, 'text-anchor': 'middle', 'font-family': 'JetBrains Mono, monospace', 'font-size': 11, fill: 'var(--sage-deep)' });
+      t.textContent = String(c);
+      ticksG.appendChild(t);
+      const tag = el('text', { x, y: 152, 'text-anchor': 'middle', 'font-family': 'Manrope, sans-serif', 'font-size': 9, fill: 'var(--muted)' });
+      tag.textContent = c === ANCHOR ? 'commit_success ✓（真實）' : 'commit_success ✓（推算）';
+      ticksG.appendChild(tag);
+    });
+
+    // Real crash marker (fixed).
+    const rx = xOf(CRASH_REAL);
+    realG.appendChild(el('circle', { cx: rx, cy: 90, r: 4, fill: 'var(--muted)' }));
+    const rt = el('text', { x: rx, y: 30, 'text-anchor': 'middle', 'font-family': 'Manrope, sans-serif', 'font-size': 10, fill: 'var(--muted)' });
+    rt.textContent = '★ 真實故障點 3388';
+    realG.appendChild(rt);
+
+    function nearestCheckpoint(step) {
+      let best = checkpoints[0];
+      for (const c of checkpoints) if (c <= step && c > best) best = c;
+      if (best > step) best = checkpoints[0];
+      return best;
+    }
+
+    function update(step) {
+      step = Math.max(STEP_MIN + 5, Math.min(STEP_MAX - 5, Math.round(step)));
+      const x = xOf(step);
+      handle.setAttribute('cx', x);
+      handleLine.setAttribute('x1', x); handleLine.setAttribute('x2', x);
+      label.setAttribute('x', x);
+      label.textContent = String(step);
+      const ckpt = nearestCheckpoint(step);
+      const lost = step - ckpt;
+      const isReal = step === CRASH_REAL;
+      stateDiv.textContent = '在第 ' + step + ' 步故障 → 退回第 ' + ckpt + ' 步 → 損失 ' + lost + ' 步的訓練。' + (isReal ? '（這正是示範中的真實數字：3388 → 3301，損失 87 步。）' : '（假設情境，checkpoint 格點依 100 步週期推算。）');
+    }
+
+    update(CRASH_REAL);
+
+    if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+
+    let dragging = false;
+    function clientToStep(clientX) {
+      const pt = svg.createSVGPoint();
+      pt.x = clientX; pt.y = 0;
+      const svgPt = pt.matrixTransform(svg.getScreenCTM().inverse());
+      return sOf(Math.max(X0, Math.min(X1, svgPt.x)));
+    }
+    handle.addEventListener('pointerdown', (e) => { dragging = true; handle.setPointerCapture(e.pointerId); });
+    handle.addEventListener('pointermove', (e) => { if (dragging) update(clientToStep(e.clientX)); });
+    handle.addEventListener('pointerup', () => { dragging = false; });
+  })();
+  </script>
+</figure>
+
+<p>checkpoint 週期本質上是一個旋鈕。調密一點，故障發生時最壞情況損失的步數變小，但寫入 Cloud Storage 的次數跟著變多；調鬆一點，寫入次數少了，一旦故障落在週期中段，賠掉的訓練也跟著變多。這次示範把週期從 MaxText 預設的一萬步壓到一百步，換算下來大約每十六秒就起手寫一次——即使如此，checkpoint 存得再密，也省不掉 pod 重新排程那將近 50 秒，這是下一段要拆的部分。</p>
+
+<h2>50 秒都去哪了：復原時間的實測拆解</h2>
+
+<p>這整套機制實際跑起來要多久？Google 直接殺掉一個 worker，錄下整段過程。故障之後，原文說「For about 13 seconds the training loop has no idea anything is wrong」——這段時間裡 heartbeat 還沒逾時，controller 完全不知道出事。逾時觸發之後是排程重新歸隊，「In our run that took about 50 seconds」，這是四段裡耗最久的一段，花的是 Kubernetes 排程，不是 MaxText 自己的邏輯。歸隊之後才輪到真正的狀態復原：「Orbax pulls the ~7 GiB of model and optimizer state back from Cloud Storage and pushes it out to the TPUs in 5.39 seconds」。模型灌回 TPU 之後，第一步訓練「took 12.7 seconds, versus ~0.2 once it's back at steady state」——比穩態慢了六十倍上下，這是重新編譯、重新進入 mesh 的代價，只發生一次。整段加起來，官方給的總數是「Total time from kill to that line: about 1 minute 50 seconds」。而且全程只有這一個 process：「Zero restarts. Same process, same PID, under two minutes of downtime.」</p>
+
+<figure class="vg-w-scrub-maxtext-elastic" data-mobile="static" data-svg-scroll="720">
+  <style>
+    .vg-w-scrub-maxtext-elastic svg { width: 100%; height: auto; }
+    .vg-w-scrub-maxtext-elastic .state { font-family: var(--serif); font-size: var(--fs-sm); padding: var(--s-2); background: var(--bg-soft); border-left: 2px solid var(--accent); }
+    .vg-w-scrub-maxtext-elastic figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-1); }
+  </style>
+
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <line x1="2" y1="12" x2="22" y2="12"/><polyline points="6 8 2 12 6 16"/><polyline points="18 8 22 12 18 16"/>
+    </svg>
+    <span>拖動時間軸看每一段耗時・4 段量測、加總約 81 秒</span>
+  </p>
+
+  <svg viewBox="0 0 720 150" role="img" aria-label="復原四階段的實測耗時：偵測、排程歸隊、checkpoint 還原、第一步">
+    <line x1="40" y1="72" x2="680" y2="72" stroke="var(--muted-2)" stroke-width="1.5" />
+    <g id="vg-w-scrub-maxtext-elastic-events"></g>
+    <line id="vg-w-scrub-maxtext-elastic-handle-line" x1="40" y1="46" x2="40" y2="98" stroke="var(--accent)" stroke-width="2" />
+    <circle id="vg-w-scrub-maxtext-elastic-handle" cx="40" cy="72" r="8" fill="var(--accent)" cursor="grab" />
+  </svg>
+
+  <div class="state" id="vg-w-scrub-maxtext-elastic-state">拖動滑鈕：查看每個時間點的狀態</div>
+
+  <figcaption>四段量測加總約 81 秒，比原文報的總時間「about 1 minute 50 seconds」少了將近 30 秒——文章沒有逐項點名這段差距，合理的推測是還有一些沒被單獨列出的排程與初始化開銷。</figcaption>
+
+  <script>
+  (function () {
+    const root = document.querySelector('.vg-w-scrub-maxtext-elastic');
+    const svg = root.querySelector('svg');
+    const handle = root.querySelector('#vg-w-scrub-maxtext-elastic-handle');
+    const handleLine = root.querySelector('#vg-w-scrub-maxtext-elastic-handle-line');
+    const stateDiv = root.querySelector('#vg-w-scrub-maxtext-elastic-state');
+    const eventsG = root.querySelector('#vg-w-scrub-maxtext-elastic-events');
+
+    const events = [
+      [0, '故障', '+0s', 'worker 被強制關掉的瞬間。'],
+      [13, '逾時', '+13s', '原文：「For about 13 seconds the training loop has no idea anything is wrong」——heartbeat 逾時判定 DEADLINE_EXCEEDED。'],
+      [63, '歸隊', '+50s', '原文：「In our run that took about 50 seconds」——pod 重新排上、新 worker 歸隊，四段裡最久的一段。'],
+      [68.4, '還原', '+5.4s', '原文：「Orbax pulls the ~7 GiB of model and optimizer state back from Cloud Storage and pushes it out to the TPUs in 5.39 seconds」。'],
+      [81.1, '第一步', '+12.7s', '原文：「That first step took 12.7 seconds, versus ~0.2 once it\\'s back at steady state」。'],
+    ];
+    const T_MAX = 82;
+    const X0 = 40, X1 = 680;
+    const xOf = (t) => X0 + (t / T_MAX) * (X1 - X0);
+    const NS = 'http://www.w3.org/2000/svg';
+    function el(tag, attrs) {
+      const e = document.createElementNS(NS, tag);
+      for (const k in attrs) e.setAttribute(k, attrs[k]);
+      return e;
+    }
+
+    events.forEach(([t, name, delta]) => {
+      const x = xOf(t);
+      eventsG.appendChild(el('circle', { cx: x, cy: 72, r: 4, fill: 'var(--muted)' }));
+      const dt = el('text', { x, y: 32, 'text-anchor': 'middle', 'font-family': 'JetBrains Mono, monospace', 'font-size': 11, fill: 'var(--accent-text)' });
+      dt.textContent = delta;
+      eventsG.appendChild(dt);
+      const nt = el('text', { x, y: 100, 'text-anchor': 'middle', 'font-family': 'Manrope, sans-serif', 'font-size': 11, fill: 'var(--ink)' });
+      nt.textContent = name;
+      eventsG.appendChild(nt);
+    });
+
+    function clamp(x) { return Math.max(X0, Math.min(X1, x)); }
+    function clientToSvgX(clientX) {
+      const pt = svg.createSVGPoint();
+      pt.x = clientX; pt.y = 0;
+      const svgPt = pt.matrixTransform(svg.getScreenCTM().inverse());
+      return clamp(svgPt.x);
+    }
+    function update(x) {
+      handle.setAttribute('cx', x);
+      handleLine.setAttribute('x1', x); handleLine.setAttribute('x2', x);
+      const t = ((x - X0) / (X1 - X0)) * T_MAX;
+      let active = events[0];
+      for (const e of events) if (e[0] <= t) active = e;
+      stateDiv.textContent = active[3];
+    }
+
+    update(xOf(0));
+
+    if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+
+    let dragging = false;
+    handle.addEventListener('pointerdown', (e) => { dragging = true; handle.setPointerCapture(e.pointerId); });
+    handle.addEventListener('pointermove', (e) => { if (dragging) update(clientToSvgX(e.clientX)); });
+    handle.addEventListener('pointerup', () => { dragging = false; });
+  })();
+  </script>
+</figure>
+
+<p>這四段裡真正屬於 MaxText、Orbax 自己邏輯的只有兩段——checkpoint 還原與第一步訓練，加起來不到 18 秒；其餘時間都花在 Kubernetes 排程與心跳偵測上。真要把整段復原時間往下壓，排程層大概才是該先下手的地方，而不是 elastic_retry 或 Orbax 的還原邏輯本身。</p>
+
+<h2>135 GiB 之後：controller-routed 復原的邊界</h2>
+
+<p>這次示範選了一個刻意小的模型——qwen3-0.6b，checkpoint 只有 6.7 GiB。這個選擇背後有個具體理由。原文承認：「But with a larger model, like Qwen3-4B where params plus Adam optimizer moments add up to about 135 GiB, the proxy has to buffer all of that in flight, and the proxy OOM-kills and recovery fails.」復原路徑預設會經過 controller 的 proxy，checkpoint 一大，proxy 得把整批資料先扛在自己記憶體裡轉手，135 GiB 級直接把 proxy 灌爆，復原本身反而失敗。single controller 架構解決了「誰能接住例外」，卻在資料量夠大時，讓同一個 controller 變成新的瓶頸。選 qwen3-0.6b 不是隨便挑的——把成本控制在示範等級的同時，也讓整個 checkpoint 復原流程避開了 135 GiB 這個門檻：48 顆晶片、約 1.20 美元一顆一小時，跑半小時整套示範，總共約 30 美元，換來的是一個乾淨、不撞到 proxy 瓶頸的示範環境；一旦真的要用 4B 甚至更大的模型，前面談的 controller-routed 復原路徑就得先換掉。</p>
+
+<p>對應的修法是把 controller 移出資料路徑：「The right answer is to take the controller out of the data path: set ENABLE_PATHWAYS_PERSISTENCE=1 in the controller's environment.」打開這個旗標之後，TPU host 直接跟 Cloud Storage 讀寫自己的 checkpoint shard，位元組不再繞經 controller 的 proxy。這也再次印證前面的結構：single controller 負責的是「誰能對故障做決定」，不代表它必須經手每一個 byte——真正大量的資料，還是該讓最靠近資料的那個節點自己處理。</p>
+
+<p>這條路目前還沒走到頭。原文說下一步：「The next iteration of elasticity removes that round-trip. Instead of rebuilding from the latest GCS checkpoint, the elastic manager periodically saves a snapshot of the training state into host memory, kept alongside the live process.」現在的復原要靠 Orbax 把 checkpoint 從 Cloud Storage 拉回來，下一版打算換成常駐在健康主機記憶體裡的 snapshot，拿掉這一趟雲端儲存的來回——這是還沒上線的方向，原文自己也只說是「next iteration」，snapshot 存得比 checkpoint 更頻繁，理論上是因為它不必真的落地到儲存層，但實際會做到多頻繁、代價多大，原文並未給出數字。</p>
+
+<p class="vg-deep-closer"><strong>解鎖了什麼</strong>：當故障網域可以縮小到一顆 device slice，大規模訓練不必再為了單點硬體故障，賠上整個 job 的排程與暖機成本——真正該問的問題，從「這次示範撐不撐得住」變成「你的 checkpoint 大小，撐不撐得住 controller-routed 這條復原路徑」。</p>
+
+</div>
