@@ -5,7 +5,7 @@
 
 <div class="vg-post-body">
 
-<p><span class="vg-dropcap">大</span>規模分散式訓練的多數框架，程式碼是以一個 Python process 對應一台機器的方式跑的——SPMD。原文開場就把這種痛講在前面：「the communication times out, every worker exits, and you re-launch the whole job from the last checkpoint. It's painful, and it's just how distributed training works. Or is it?」這代表平常管著整個訓練迴圈生死的那個 process，通常就活在會壞掉的那批機器上：硬體一斷線，process 也跟著斷線，剩下的選項只有把整個 job 拆掉、讓排程器重排一輪。Google 這篇部落格談的 MaxText elastic training，把這個假設整個換掉——訓練迴圈收到的不是「process 被殺掉」的訊號，而是一個能在原地被接住的 Python 例外。MaxText 本身沒什麼神秘：原文說得很直白，「We'll use MaxText, an open-source LLM training library written in pure Python and JAX」，一個開源的 LLM 訓練函式庫，這次談的機制是建在它跟 Pathways、Orbax 之上的一層能力，不是重寫一套新的訓練框架。對動輒跑上好幾天的大型 pretraining job 來說，這種差別直接決定了每次硬體閃斷之後，要不要把整個 job 拆掉重排、所有 worker 重新暖機一輪。原文自己把整套機制拆成三塊來講：「For elastic recovery, three independent components have to cooperate.」第一塊負責發現故障——「Pathways detects the failure」；第二塊是接住例外、決定要不要重試的 decorator；第三塊是決定什麼狀態可以拿來復原的 Orbax。下面就照這三塊往下拆，從叢集拓樸開始，一路拆到復原當下實際花掉的每一秒。</p>
+<p><span class="vg-dropcap">大</span>規模分散式訓練的多數框架，程式碼是以一個 Python process 對應一台機器的方式跑的——SPMD。原文開場就把這種痛講在前面：「the communication times out, every worker exits, and you re-launch the whole job from the last checkpoint. It's painful, and it's just how distributed training works. Or is it?」這代表平常管著整個訓練迴圈生死的那個 process，通常就活在會壞掉的那批機器上：硬體一斷線，process 也跟著斷線，剩下的選項只有把整個 job 拆掉、讓排程器重排一輪。Google 這篇部落格談的 MaxText elastic training，把這個假設整個換掉——訓練迴圈收到的不是「process 被殺掉」的訊號，而是一個能在原地被接住的 Python 例外。MaxText 本身沒什麼神秘：原文說得很直白，「We'll use MaxText, an open-source LLM training library written in pure Python and JAX」，一個開源的 LLM 訓練函式庫，這次談的機制是建在它跟 Pathways、Orbax 之上的一層能力，不是重寫一套新的訓練框架。對動輒跑上好幾天的大型 pretraining job 來說，這種差別直接決定了每次硬體閃斷之後，要不要把整個 job 拆掉重排、所有 worker 重新暖機一輪。原文自己把整套機制拆成三塊來講：「For elastic recovery, three independent components have to cooperate.」第一塊負責發現故障——「Pathways detects the failure」，靠的是前面提到的 in-flight 錯誤與 heartbeat 逾時兩條路徑；第二塊是接住例外、決定要不要重試的 decorator，讓 process 原地續命而不是被殺掉；第三塊是決定什麼狀態可以拿來復原的 Orbax，靠 commit_success 標記檔判斷哪份 checkpoint 真的能用。下面就照這三塊往下拆，從叢集拓樸開始，一路拆到復原當下實際花掉的每一秒。</p>
 
 <h2>single controller：故障網域為何能縮小到一顆 TPU</h2>
 
@@ -222,11 +222,11 @@
 
 <h2>DATA_LOSS 與 DEADLINE_EXCEEDED：例外怎麼被抓住</h2>
 
-<p>硬體真的死掉之後，Pathways 怎麼發現？原文描述了兩條路徑：「Most commonly, an in-flight operation to the dead worker fails and Pathways returns a DATA_LOSS error. If nothing happens to be in flight, the resource manager (a container running alongside our script on the CPU node) notices the worker has stopped heartbeating and returns DEADLINE_EXCEEDED after about 10 seconds.」也就是說，如果 controller 這時候正好在等某個 TPU 回應，死亡幾乎立刻曝光成一個 DATA_LOSS；如果沒有任何操作在飛行中，就得靠 resource manager 的心跳偵測，大約 10 秒後判定逾時。兩條路徑合起來保證了一件事：不管故障發生在哪個瞬間，controller 遲早都會收到一個訊號，不會永遠卡住等一個回不來的回應。</p>
+<p>硬體真的死掉之後，Pathways 怎麼發現？原文描述了兩條路徑：「Most commonly, an in-flight operation to the dead worker fails and Pathways returns a DATA_LOSS error. If nothing happens to be in flight, the resource manager (a container running alongside our script on the CPU node) notices the worker has stopped heartbeating and returns DEADLINE_EXCEEDED after about 10 seconds.」也就是說，如果 controller 這時候正好在等某個 TPU 回應，死亡幾乎立刻曝光成一個 DATA_LOSS；如果沒有任何操作在飛行中，就得靠 resource manager 的心跳偵測，大約 10 秒後判定逾時。兩條路徑合起來保證了一件事：不管故障發生在哪個瞬間，controller 遲早都會收到一個訊號，不會永遠卡住等一個回不來的回應。這兩條路徑分別對應兩種故障時機，加起來覆蓋的是整個時間軸，不是挑一種常見情況去賭，而是把「controller 什麼時候會發現」這件事，變成一個不管運氣好壞都成立的保證。</p>
 
 <p>resource manager 本身不只是一個心跳計時器。原文把它的職責攤開來寫：「The pathways-rm container is the resource manager (it assigns slices to clients, compiles XLA functions, and tracks slice health, among other things)」。把哪個 slice 分給哪個 client、把訓練函式編譯成 XLA 程式、持續追蹤每個 slice 的健康狀態，三件事本來就是同一個 container 在做——heartbeat 逾時判斷只是它日常工作裡的其中一項副產品，不是另外加掛的一套監控。</p>
 
-<p>訊號進來之後，接手的是 pathwaysutils 函式庫裡的 elastic_retry decorator。原文：「It catches that specific exception, logs Slice down event detected. Retrying. message, and runs the recovery path instead of letting the error crash the process.」這個 decorator 包住整個 training function；一旦抓到例外，它不會讓 Python 預設的「未接例外往上拋、process 結束」路徑發生，而是原地切進一段復原邏輯，繼續用同一個 process。</p>
+<p>訊號進來之後，接手的是 pathwaysutils 函式庫裡的 elastic_retry decorator——這不是 MaxText 自己發明的邏輯。原文說得很清楚：「The elastic_retry decorator comes from pathwaysutils; MaxText simply applies it around its training function.」MaxText 做的事只是把這個 decorator 包在自己的 training function 外面，容錯邏輯本身活在更底層、跟 MaxText 無關的函式庫裡，換句話說，任何用 Pathways 跑的訓練程式，理論上都能套用同一套機制，不是 MaxText 專屬的特殊待遇。原文：「It catches that specific exception, logs Slice down event detected. Retrying. message, and runs the recovery path instead of letting the error crash the process.」這個 decorator 包住整個 training function；一旦抓到例外，它不會讓 Python 預設的「未接例外往上拋、process 結束」路徑發生，而是原地切進一段復原邏輯，繼續用同一個 process。</p>
 
 <figure class="vg-w-table-maxtext-elastic" data-mobile="keep">
   <style>
@@ -257,17 +257,21 @@
 
 <p>這幾個旗標合起來要回答同一個問題：故障要拖多久，才會被判定成「真的失敗」而不是暫時的抖動。elastic_timeout_seconds=300 給 Pathways 五分鐘去等替補的 slice 排上來；elastic_max_retries=10 則從次數上設一道防線，避免同一顆一直壞的硬體讓 job 無限重試下去。往下一層，Kubernetes JobSet 把同一個原則又做了一次——「The single most important line for elasticity is backoffLimit: 20 on the worker Job」，失敗 slice 底下的 pod 可以在 Job 這一層原地重啟最多 20 次，才會讓整個 worker Job 被判定失敗，不會一路往上捅到整個 JobSet 重新排程。控制邏輯、排程層各自用自己的方式，把同一件事又確認了一遍：故障留在原地，不要往外擴散。</p>
 
-<p>這套故障復原不是憑空長在一個裸 process 上，底下還有一層 JobSet 把整個拓樸釘住。原文：「A JobSet is a single Kubernetes resource that groups several Jobs together and gives them a shared restart policy and a shared headless Service so the pods can find each other by name. That's exactly what a Pathways cluster needs: one head Job on the CPU node, and one worker Job per TPU slice.」一個 head Job 對應 controller 所在的 CPU 節點，每個 TPU slice 各自對應一個 worker Job，靠同一個 headless Service 用名稱互相找到對方。更關鍵的是那幾個 TPU pod 裡到底跑了什麼——原文說得很直接：「Those pods don't run our code at all. They run the Pathways worker binary, which connects back to the resource manager and waits to be handed compiled XLA programs.」TPU pod 本身不執行任何一行使用者寫的訓練程式，只跑一份通用的 Pathways worker binary，被動等 controller 把編譯好的 XLA 程式送過來執行。single controller 能在 TPU 死掉時全身而退，一半的理由就在這裡——真正會壞掉的那台機器上，本來就沒有放使用者的訓練邏輯，壞掉的只是一份可以整份替換的通用執行體。</p>
+<p>這套故障復原不是憑空長在一個裸 process 上，底下還有一層 JobSet 把整個拓樸釘住。原文：「A JobSet is a single Kubernetes resource that groups several Jobs together and gives them a shared restart policy and a shared headless Service so the pods can find each other by name. That's exactly what a Pathways cluster needs: one head Job on the CPU node, and one worker Job per TPU slice.」一個 head Job 對應 controller 所在的 CPU 節點，每個 TPU slice 各自對應一個 worker Job，靠同一個 headless Service 用名稱互相找到對方——這也解釋了故障 slice 被換掉之後，剩下的 worker 為什麼不用重新設定就能找到新來的那個：headless Service 靠的是名稱，不是特定 pod 的 IP，換了一顆新的 pod 進來，只要用同樣的名稱註冊，其他人照樣找得到它。更關鍵的是那幾個 TPU pod 裡到底跑了什麼——原文說得很直接：「Those pods don't run our code at all. They run the Pathways worker binary, which connects back to the resource manager and waits to be handed compiled XLA programs.」TPU pod 本身不執行任何一行使用者寫的訓練程式，只跑一份通用的 Pathways worker binary，被動等 controller 把編譯好的 XLA 程式送過來執行。single controller 能在 TPU 死掉時全身而退，一半的理由就在這裡——真正會壞掉的那台機器上，本來就沒有放使用者的訓練邏輯，壞掉的只是一份可以整份替換的通用執行體。</p>
 
 <p>這整套拓樸最終還是跑在一個具體的平台上。原文寫得很直接：「Google Kubernetes Engine. Everything runs as pods.」不管是 CPU 上的 controller，還是三個 TPU slice 底下的 worker，全部都是 GKE 上的 pod，沒有例外——這也是為什麼前面那套 JobSet、backoffLimit、resource manager 的邏輯，可以整套借用 Kubernetes 既有的排程與重啟機制，不必另外發明一套容錯系統。這些旗標本身也不是散落各處的環境變數：「MaxText can be configured entirely through command-line flags layered on top of a base YAML.」single controller、elastic_retry、checkpoint 週期這些行為，最終都收斂成疊在同一份 base YAML 上的命令列參數，跟前面表格裡列出的那幾行是同一套東西。</p>
 
 <h2>commit_success marker：checkpoint 何時算「有效」</h2>
+
+<p>Orbax 在這裡扮演的角色，原文講得很明確：「Orbax handles checkpointing: it coordinates the save from the controller, while each TPU host writes its own shard of the model state directly to Cloud Storage in parallel.」寫入這一側，controller 只負責協調，真正把 shard 資料送進 Cloud Storage 的，是各個 TPU host 自己平行動手——這跟後面談到的復原路徑不是同一條路：寫入時 host 直接寫，讀回來復原時預設卻要繞道 controller 的 proxy，這個不對稱，正是 135 GiB 那道門檻會出現的原因。</p>
 
 <p>process 活下來、例外被接住之後，下一個問題是拿什麼狀態復原。答案是 checkpoint，但不是任何一份 checkpoint 都算數。原文：「Checkpoints are written to Cloud Storage in the background while training runs, and a checkpoint is only considered viable when every shard has been flushed and a tiny commit_success marker file is written next to it. During recovery, the cleanup code checks the latest checkpoint directory: if there's no marker (it was mid-write when things broke), the directory is deleted, and we fall back to the newest checkpoint that does have one.」每個 shard 都寫完，旁邊多寫一個小小的 commit_success 標記檔，這份 checkpoint 才算「有效」；復原時系統只認標記，沒標記的目錄——不管裡面實際寫了多少——整個刪掉，退回上一份有標記的。這個設計把「checkpoint 壞了要不要用」這個判斷，從「事後檢查內容」換成「事前檢查一個標記檔存不存在」——不用打開 checkpoint 內容做驗證，只要看旁邊那個檔案在不在，判斷成本幾乎是常數，不會隨 checkpoint 變大而變貴。</p>
 
 <p>從 checkpoint 復原之後怎麼接下去，官方點出兩種模式。第一種：「In pause and resume, the exception gets caught, you wait for the failed slice to be replaced, then reload the last viable checkpoint and continue on the full mesh.」等新的 slice 真的排上來，再用完整的 mesh 繼續。另一種：「In replica resize, you reload the last viable checkpoint immediately onto the surviving slices and training keeps running at reduced throughput while the replacement comes up, then scales back to full size once it's ready.」不等，直接在剩下的 slice 上用縮小過的吞吐量繼續跑，等替補上線再擴回原本的規模。原文特別點出這條路的價值：「Replica resize then adds something a restart can't offer at all: training keeps going even if some of the TPUs never come back.」full restart 沒有這個選項可挑——它只有「全部拆掉重排」一種姿勢；replica resize 讓訓練在少一個 slice 的情況下也能不停，即使壞掉的硬體最後根本沒補回來。這次示範走的是第一種——等 slice 真的被換掉，再用完整的 48 顆晶片繼續。</p>
 
 <p>checkpoint 多久存一次也是刻意調過的：「One more flag worth calling out: checkpoint_period=100. MaxText's default is 10,000 steps.」這次示範把週期從預設的一萬步調成一百步，換算下來「At our ~0.16s per step, 100 steps means a new checkpoint starts roughly every 16 seconds, so there's always something recent to fall back to.」調密的代價是更頻繁的 checkpoint 寫入，換來的是「最多損失多少進度」有一個很窄的上限。</p>
+
+<p>這次示範實際下的指令，原文也整段附上：「python3 -m maxtext.trainers.pre_train.train」開頭，後面才接前面表格那些旗標。指令裡還藏著兩個沒被特別強調的數字與資料：「steps=5000」，訓練總共排定要跑五千步；資料集用的是 grain_train_files 指向的一份 glaive-fc-v2 資料——一份真正的 function-calling 資料集，不是隨便湊出來的假資料。指令裡還有一個容易被忽略的旗標：per_device_batch_size=1，每個裝置一次只餵一筆樣本，這也是為什麼三個 slice、48 顆晶片還能把整套示範壓在半小時、30 美元的量級。故障發生在第 3388 步，已經跑過三分之二的行程。</p>
 
 <figure class="vg-w-drag-maxtext-elastic" data-mobile="static" data-svg-scroll="720">
   <style>
@@ -294,7 +298,7 @@
 
   <div class="state" id="vg-w-drag-maxtext-elastic-state">拖動紅點：模擬故障點</div>
 
-  <figcaption>綠色刻度是以這次示範的真實 checkpoint（step 3301，checkpoint_period=100）往兩側推算出的假設格點；★ 是這次示範真正的故障步數。原文：「The step counter goes 3388 to 3301」——退回第 3301 步，等於白做了 87 步。</figcaption>
+  <figcaption>綠色刻度是以這次示範的真實 checkpoint（step 3300，checkpoint_period=100）往兩側推算出的假設格點；★ 是這次示範真正的故障步數。原文：「The step counter goes 3388 to 3301 in the same log stream: we lost 88 steps of progress, rewound to the last committed checkpoint at step 3300, and kept going.」——退回第 3300 步，重做第 3301 到 3388 步，等於白做了 88 步。</figcaption>
 
   <script>
   (function () {
@@ -309,7 +313,7 @@
 
     const STEP_MIN = 3200, STEP_MAX = 3420;
     const X0 = 40, X1 = 680;
-    const ANCHOR = 3301, PERIOD = 100;
+    const ANCHOR = 3300, PERIOD = 100;
     const CRASH_REAL = 3388;
     const xOf = (s) => X0 + ((s - STEP_MIN) / (STEP_MAX - STEP_MIN)) * (X1 - X0);
     const sOf = (x) => STEP_MIN + ((x - X0) / (X1 - X0)) * (STEP_MAX - STEP_MIN);
@@ -360,7 +364,7 @@
       const ckpt = nearestCheckpoint(step);
       const lost = step - ckpt;
       const isReal = step === CRASH_REAL;
-      stateDiv.textContent = '在第 ' + step + ' 步故障 → 退回第 ' + ckpt + ' 步 → 損失 ' + lost + ' 步的訓練。' + (isReal ? '（這正是示範中的真實數字：3388 → 3301，損失 87 步。）' : '（假設情境，checkpoint 格點依 100 步週期推算。）');
+      stateDiv.textContent = '在第 ' + step + ' 步故障 → 退回第 ' + ckpt + ' 步 → 損失 ' + lost + ' 步的訓練。' + (isReal ? '（這正是示範中的真實數字：3388 → 3300，損失 88 步。）' : '（假設情境，checkpoint 格點依 100 步週期推算。）');
     }
 
     update(CRASH_REAL);
@@ -480,6 +484,8 @@
 <p>這四段裡真正屬於 MaxText、Orbax 自己邏輯的只有兩段——checkpoint 還原與第一步訓練，加起來不到 18 秒；其餘時間都花在 Kubernetes 排程與心跳偵測上。真要把整段復原時間往下壓，排程層大概才是該先下手的地方，而不是 elastic_retry 或 Orbax 的還原邏輯本身。</p>
 
 <h2>135 GiB 之後：controller-routed 復原的邊界</h2>
+
+<p>原文一開頭就先把讀者的期待壓低一格：「By the end, you'll understand exactly which three components make that possible, where the approach still has rough edges, and how to reproduce everything yourself.」前面幾段拆的是「哪三個元件讓這件事成立」，這一段輪到「這套做法目前還有哪些不平整的地方」——而最明顯的一塊粗邊，就長在 checkpoint 大小上。</p>
 
 <p>這次示範選了一個刻意小的模型——qwen3-0.6b，checkpoint 只有 6.7 GiB，原文自己講得很白：「Small on purpose so the failure-and-recovery loop is quick to watch and cheap to run.」但省錢、跑得快只是台面上的理由，這個選擇背後還有一個更硬的技術原因。原文承認：「But with a larger model, like Qwen3-4B where params plus Adam optimizer moments add up to about 135 GiB, the proxy has to buffer all of that in flight, and the proxy OOM-kills and recovery fails.」復原路徑預設會經過 controller 的 proxy，checkpoint 一大，proxy 得把整批資料先扛在自己記憶體裡轉手，135 GiB 級直接把 proxy 灌爆，復原本身反而失敗。single controller 架構解決了「誰能接住例外」，卻在資料量夠大時，讓同一個 controller 變成新的瓶頸。選 qwen3-0.6b 不是隨便挑的——把成本控制在示範等級的同時，也讓整個 checkpoint 復原流程避開了 135 GiB 這個門檻。原文把成本算得很精確：「At on-demand v5e list prices that's roughly $30 with 48 chips at ~$1.20/chip-hour for half an hour, plus the CPU controller node.」48 顆晶片、按需求即付的 on-demand 牌價、約 1.20 美元一顆一小時，跑半小時整套示範，連 CPU controller 節點另外算，總共約 30 美元，換來的是一個乾淨、不撞到 proxy 瓶頸的示範環境；一旦真的要用 4B 甚至更大的模型，前面談的 controller-routed 復原路徑就得先換掉。</p>
 
