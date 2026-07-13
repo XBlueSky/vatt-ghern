@@ -1,0 +1,856 @@
+{
+  "output_path": "src/posts/2026/07/14/deep-cloudflare-meerkat-consensus.html",
+  "spine": [
+    "1. 案例：Cloudflare 要在 330+ 個全球資料中心上提供強一致的 key-value 服務，讀寫都不能分歧，且部分節點或連線失效時仍要能繼續寫入。",
+    "2. 缺口：Raft／Multi-Paxos 這類 leader-based 共識在廣域網路上碰兩個問題——leader 掛掉時所有寫入停擺直到新 leader 選出，以及 timeout 參數本身的兩難（太短誤判、太長反應慢），Cloudflare 自己因此吃過多次事故。",
+    "3. 概念：QuePaxa 把「一定要有 leader 才能寫」這個假設拿掉——所有複本隨時可提案，leader 只是能用更少來回（1 vs 3+）驅動決議的選配捷徑，並發提案之間不會互相打架，而是協調收斂。",
+    "4. 機制：QuePaxa 決議一次提案通常要 1 到 3 個以上來回，決議延遲取決於「某個多數派複本之間」的溝通延遲，而非固定 leader 的距離；核心不變量保證任兩個複本對同一決議插槽的看法一致。",
+    "5. 容錯模型：在 2f+1 台機器組成的系統裡容忍 f 台故障，前提是多數機器存活且能互相通訊；不處理拜占庭故障。",
+    "6. 生產落地：開發者申請一組互相連線的 Meerkat 複本 cluster，客戶端可送到任一複本；複本上可同時跑多個應用（consensus log、key-value store、leasing 系統），QuePaxa 的設計目標是應付不可靠、可能被針對性攻擊的網路環境。",
+    "7. 邊界與現況：Meerkat 尚未上生產，先鎖定寫得不頻繁但必須一致的控制層資料；物理距離造成的延遲下限不會因為換演算法而消失，原文自己承認這是根本限制。"
+  ],
+  "sources": [
+    {
+      "url": "https://blog.cloudflare.com/meerkat-introduction/",
+      "fetch_status": "ok",
+      "archive_url": "http://web.archive.org/web/20260709174143/https://blog.cloudflare.com/meerkat-introduction/",
+      "published": "2026-07-08",
+      "perspective": {
+        "mechanism": "QuePaxa 把共識的『必須先過 leader』拿掉，讓所有複本隨時可提案；leader 若存在，只是把決議來回數從 3+ 壓到 1 的效能捷徑，並發提案靠多數決性質協調收斂而非互相推翻。",
+        "tradeoff": "拿掉單點依賴、換到不會因 timeout 卡死的可用性，但決議延遲的下限仍取決於某個多數派複本之間的實際網路來回，物理距離造成的延遲不會消失；目前只鎖定寫得不頻繁的控制層資料，不是通用資料庫替代品。",
+        "reader_use": "工程師評估是否需要類似機制時，該問的不是『QuePaxa 比 Raft 快多少』，而是『系統能不能忍受 leader 消失時整體不可寫』——多數應用能忍受幾秒的選舉空窗，只有像 Cloudflare 這種全球控制層系統才值得為了拿掉單點依賴，換來更高的實作複雜度。"
+      }
+    }
+  ],
+  "notes": [
+    {
+      "id": "n01",
+      "url": "https://blog.cloudflare.com/meerkat-introduction/",
+      "quote": "a strongly consistent, fault-tolerant key-value store",
+      "hedge": "asserted",
+      "interpretation": "Meerkat 的自我定位，用於文章開場說明它要解決的問題類型：跨全球節點的強一致 key-value 服務。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n02",
+      "url": "https://blog.cloudflare.com/meerkat-introduction/",
+      "quote": "never see inconsistent state",
+      "hedge": "asserted",
+      "interpretation": "強一致的具體定義——不同讀者不能看到互相矛盾的答案。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n03",
+      "url": "https://blog.cloudflare.com/meerkat-introduction/",
+      "quote": "system remains available for writes even when some data centers or links fail",
+      "hedge": "asserted",
+      "interpretation": "Meerkat 的可用性目標：即使部分節點或連線故障，寫入仍要繼續可用。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n04",
+      "url": "https://blog.cloudflare.com/meerkat-introduction/",
+      "quote": "If the leader goes down, the system becomes unavailable (all writes block) until a new leader is elected",
+      "hedge": "asserted",
+      "interpretation": "Raft/Multi-Paxos 的核心弱點：leader 是單點，掛掉時全部寫入停擺直到新 leader 選出。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n05",
+      "url": "https://blog.cloudflare.com/meerkat-introduction/",
+      "quote": "when the timeout is shorter than the network delay...replicas will constantly be timing out and thus blocking writes",
+      "hedge": "asserted",
+      "interpretation": "timeout 設太短的後果：廣域網路延遲抖動導致複本不斷誤判 leader 已死，寫入被自己人卡住。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n06",
+      "url": "https://blog.cloudflare.com/meerkat-introduction/",
+      "quote": "when the timeout is too long, the system reacts slowly to a failed leader, during which writes are also blocked",
+      "hedge": "asserted",
+      "interpretation": "timeout 設太長的後果：真正故障時系統反應遲鈍，一樣造成寫入卡住。這是兩難的另一半。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n07",
+      "url": "https://blog.cloudflare.com/meerkat-introduction/",
+      "quote": "experienced multiple incidents caused by unavailable leaders in consensus-driven systems",
+      "hedge": "asserted",
+      "interpretation": "Cloudflare 自陳因 leader 不可用出過不只一次事故，是整篇文章要解決問題的動機來源。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n08",
+      "url": "https://blog.cloudflare.com/meerkat-introduction/",
+      "quote": "all replicas can perform writes at all times, and progress is never halted due to a timeout",
+      "hedge": "asserted",
+      "interpretation": "QuePaxa 的核心設計目標：所有複本隨時可寫，進度不會因 timeout 卡住。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n09",
+      "url": "https://blog.cloudflare.com/meerkat-introduction/",
+      "quote": "There is a leader, but it is not required",
+      "hedge": "asserted",
+      "interpretation": "leader 從共識的必要條件降級為選配角色，這是 QuePaxa 與 Raft 最根本的差異。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n10",
+      "url": "https://blog.cloudflare.com/meerkat-introduction/",
+      "quote": "its only advantage is that it can drive consensus with fewer round trips (one) than other replicas (3+)",
+      "hedge": "asserted",
+      "interpretation": "leader 的唯一價值是少繞路：走 leader 1 個來回，不走 leader 至少 3 個來回。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n11",
+      "url": "https://blog.cloudflare.com/meerkat-introduction/",
+      "quote": "clients are free to contact multiple replicas concurrently for the same proposal",
+      "hedge": "asserted",
+      "interpretation": "客戶端不必只認一個入口，可以同時找多個複本送出同一個提案。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n12",
+      "url": "https://blog.cloudflare.com/meerkat-introduction/",
+      "quote": "Concurrent proposals do not destructively interfere: replicas work together to decide",
+      "hedge": "asserted",
+      "interpretation": "並發提案不會互相推翻，複本之間會協調收斂出誰的提案先定案。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n13",
+      "url": "https://blog.cloudflare.com/meerkat-introduction/",
+      "quote": "maintains much higher (~10x) throughput than Raft and Multi-Paxos",
+      "hedge": "hedged",
+      "interpretation": "在惡劣網路下的吞吐量優勢，~10x 是近似值，不是精確測得的單一數字。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n14",
+      "url": "https://blog.cloudflare.com/meerkat-introduction/",
+      "quote": "one to three round trips (usually, although it can take more)",
+      "hedge": "hedged",
+      "interpretation": "決議一次提案的來回數範圍，帶「usually」與「can take more」的保留語氣，不是硬性上限。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n15",
+      "url": "https://blog.cloudflare.com/meerkat-introduction/",
+      "quote": "proposal decision latency is proportional to the latency between some majority of replicas",
+      "hedge": "asserted",
+      "interpretation": "決議延遲的決定因素是某個多數派複本之間的延遲，不是離固定 leader 的距離。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n16",
+      "url": "https://blog.cloudflare.com/meerkat-introduction/",
+      "quote": "run multiple proofs-of-concept with up to 50 replicas distributed around the world, to great success",
+      "hedge": "asserted",
+      "interpretation": "Cloudflare 做過的概念驗證規模（最多 50 個複本、分布全球）與結果評價。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n17",
+      "url": "https://blog.cloudflare.com/meerkat-introduction/",
+      "quote": "Leaders in our proof-of-concept clusters constantly fail, and the cluster keeps operating with no increase in error-rate",
+      "hedge": "asserted",
+      "interpretation": "PoC 中持續殺掉 leader，叢集照常運作，錯誤率沒有上升。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n18",
+      "url": "https://blog.cloudflare.com/meerkat-introduction/",
+      "quote": "request a cluster of Meerkat replicas",
+      "hedge": "asserted",
+      "interpretation": "生產環境的使用方式：開發者申請一組 Meerkat 複本叢集。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n19",
+      "url": "https://blog.cloudflare.com/meerkat-introduction/",
+      "quote": "Each replica is connected to every other replica",
+      "hedge": "asserted",
+      "interpretation": "複本之間的網路拓樸是全連接（每個複本都跟其他每個複本相連）。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n20",
+      "url": "https://blog.cloudflare.com/meerkat-introduction/",
+      "quote": "send an application-specific request to any replica in the cluster",
+      "hedge": "asserted",
+      "interpretation": "客戶端可以把請求送到叢集中任一複本，不用挑特定入口。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n21",
+      "url": "https://blog.cloudflare.com/meerkat-introduction/",
+      "quote": "compare-and-swap-style writes",
+      "hedge": "asserted",
+      "interpretation": "Meerkat key-value store 支援的寫入語意之一：CAS 風格寫入，另外也支援一般交易語意。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n22",
+      "url": "https://blog.cloudflare.com/meerkat-introduction/",
+      "quote": "tolerate f faults in a system of 2f + 1 machines",
+      "hedge": "asserted",
+      "interpretation": "容錯模型的具體公式：2f+1 台機器組成的系統可容忍 f 台故障。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n23",
+      "url": "https://blog.cloudflare.com/meerkat-introduction/",
+      "quote": "A majority of the machines in our system are alive and can communicate",
+      "hedge": "asserted",
+      "interpretation": "多數決運作的前提條件：多數機器存活且彼此能通訊。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n24",
+      "url": "https://blog.cloudflare.com/meerkat-introduction/",
+      "quote": "if any two replicas decide on the value for a slot, those values are the same",
+      "hedge": "asserted",
+      "interpretation": "Meerkat 的核心不變量：任兩個複本對同一決議插槽的看法必須一致，這是正確性的定義。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n25",
+      "url": "https://blog.cloudflare.com/meerkat-introduction/",
+      "quote": "they will always read v11",
+      "hedge": "asserted",
+      "interpretation": "官方給的 put/put/get 範例結論：三個依序操作的 client，第三個 get 永遠讀到最後寫入的值。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n26",
+      "url": "https://blog.cloudflare.com/meerkat-introduction/",
+      "quote": "designed for a less reliable network environment ('asynchrony')",
+      "hedge": "asserted",
+      "interpretation": "選用 QuePaxa 而非 Raft 的理由之一：設計目標是應付較不可靠的非同步網路環境。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n27",
+      "url": "https://blog.cloudflare.com/meerkat-introduction/",
+      "quote": "for networks in which an imaginary adversary can launch targeted attacks on replica connections",
+      "hedge": "asserted",
+      "interpretation": "QuePaxa 假設的敵對網路模型：一個假想的對手可以針對性攻擊複本之間的連線。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n28",
+      "url": "https://blog.cloudflare.com/meerkat-introduction/",
+      "quote": "Meerkat has limitations. It is not designed to create general-purpose data systems like databases",
+      "hedge": "asserted",
+      "interpretation": "Meerkat 自陳的邊界：不是要取代通用資料庫。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n29",
+      "url": "https://blog.cloudflare.com/meerkat-introduction/",
+      "quote": "Meerkat's fundamental latency limitations remain, especially when it is run at global scale",
+      "hedge": "hedged",
+      "interpretation": "承認延遲限制是根本性的，全球規模運行時尤其明顯，不會因為換共識演算法而消失。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n30",
+      "url": "https://blog.cloudflare.com/meerkat-introduction/",
+      "quote": "perfect, in the short term, for control plane information that is written infrequently but must remain consistent",
+      "hedge": "hedged",
+      "interpretation": "現階段定位：「in the short term」是明確的時間限定語，短期內適合的場景是寫得不頻繁但必須一致的控制層資料。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n31",
+      "url": "https://blog.cloudflare.com/meerkat-introduction/",
+      "quote": "not deployed to production",
+      "hedge": "asserted",
+      "interpretation": "截至發文時的部署狀態：尚未上生產環境。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n32",
+      "url": "https://blog.cloudflare.com/meerkat-introduction/",
+      "quote": "being designed initially to manage small pieces of control plane state",
+      "hedge": "hedged",
+      "interpretation": "初期設計目標範圍：先管理小範圍的控制層狀態。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n33",
+      "url": "https://blog.cloudflare.com/meerkat-introduction/",
+      "quote": "a few ways to squeeze better performance",
+      "hedge": "hedged",
+      "interpretation": "效能優化空間，語氣保留（「a few」、「squeeze」都暗示是部分解法而非根本解）。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n34",
+      "url": "https://blog.cloudflare.com/meerkat-introduction/",
+      "quote": "Not all reads must trigger a consensus round",
+      "hedge": "asserted",
+      "interpretation": "讀取優化做法之一：不是每次讀都要觸發共識，代價是接受一定程度的過期資料。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n35",
+      "url": "https://blog.cloudflare.com/meerkat-introduction/",
+      "quote": "a replica receives 10 writes in a span of 10ms",
+      "hedge": "asserted",
+      "interpretation": "批次寫入划算與否的具體條件範例：10 毫秒內收到 10 次寫入這種密集場景。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n36",
+      "url": "https://blog.cloudflare.com/meerkat-introduction/",
+      "quote": "across 330+ global data centers",
+      "hedge": "asserted",
+      "interpretation": "Cloudflare 基礎設施規模的具體數字，用於文章開場定義問題規模。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n37",
+      "url": "https://blog.cloudflare.com/meerkat-introduction/",
+      "quote": "Byzantine faults",
+      "hedge": "asserted",
+      "interpretation": "Meerkat 容錯模型明確不處理的故障類型：機器說謊（拜占庭故障），只防機器掛掉或斷線。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n38",
+      "url": "https://blog.cloudflare.com/meerkat-introduction/",
+      "quote": "July 8, 2026 / James Larisch, Bob Halley, João Pedro Leite",
+      "hedge": "asserted",
+      "interpretation": "發文日期與作者資訊，用於 ledger 的時間定錨與來源記錄，未直接引用於正文。",
+      "timeliness": "durable"
+    }
+  ],
+  "claims": [
+    {
+      "id": "c01",
+      "claim_text": "Cloudflare 的基礎設施攤在超過 330 個資料中心上",
+      "location": "under H2「330 個資料中心，一把 key，兩個讀者要看到同一個答案」",
+      "type": "number",
+      "load": "medium",
+      "note_ids": [
+        "n36"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "our 330+ global data centers",
+      "note": "原文 across 330+ global data centers，「超過 330」對應 330+，數字一致。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c02",
+      "claim_text": "原文把它定義成一個「a strongly consistent, fault-tolerant key-value store」，橫跨全球節點，讀者「never see inconsistent state」，寫入即使在部分節點或連線失效時仍然可用",
+      "location": "under H2「330 個資料中心…」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n01",
+        "n02",
+        "n03"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "build a strongly consistent, fault-tolerant key-value store / never see inconsistent state / system remains available for writes even when some data centers or links fail",
+      "note": "三段引號全部逐字命中。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c03",
+      "claim_text": "原文說得很直接：「If the leader goes down, the system becomes unavailable (all writes block) until a new leader is elected」",
+      "location": "under H2「Leader 掛了，寫入全部卡住…」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n04"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "if the leader goes down, the system becomes unavailable (all writes block) until a new leader is elected",
+      "note": "逐字命中；原文為句中小寫 if，post 以大寫 If 起句，僅句首大小寫差異，不改變語意。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c04",
+      "claim_text": "原文寫得很白：「when the timeout is shorter than the network delay...replicas will constantly be timing out and thus blocking writes」",
+      "location": "under H2「Leader 掛了…」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n05"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "when the timeout is shorter than the network delay between the original leader and that replica, replicas will constantly be timing out and thus blocking writes",
+      "note": "post 以刪節號省略中段，兩端逐字命中，省略未改變語意。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c05",
+      "claim_text": "「when the timeout is too long, the system reacts slowly to a failed leader, during which writes are also blocked」",
+      "location": "under H2「Leader 掛了…」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n06"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "when the timeout is too long, the system reacts slowly to a failed leader, during which writes are also blocked",
+      "note": "逐字命中。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c06",
+      "claim_text": "Cloudflare 自己在文章裡承認：「experienced multiple incidents caused by unavailable leaders in consensus-driven systems」——他們的共識系統因為 leader 不可用，已經出過不只一次事故",
+      "location": "under H2「Leader 掛了…」",
+      "type": "attribution",
+      "load": "high",
+      "note_ids": [
+        "n07"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "We have experienced multiple incidents caused by unavailable leaders in consensus-driven systems",
+      "note": "自陳事故，逐字命中；「不只一次」對應 multiple。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c07",
+      "claim_text": "原文的說法是：「all replicas can perform writes at all times, and progress is never halted due to a timeout」",
+      "location": "under H2「把 leader 從必要條件拿掉…」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n08"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "all replicas can perform writes at all times, and progress is never halted due to a timeout",
+      "note": "逐字命中。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c08",
+      "claim_text": "原文說「There is a leader, but it is not required」",
+      "location": "under H2「把 leader 從必要條件拿掉…」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n09"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "There is a leader, but it is not required",
+      "note": "逐字命中，全篇論證支點。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c09",
+      "claim_text": "它「only advantage is that it can drive consensus with fewer round trips (one) than other replicas (3+)」",
+      "location": "under H2「把 leader 從必要條件拿掉…」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n10"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "its only advantage is that it can drive consensus with fewer round trips (one) than other replicas (3+)",
+      "note": "逐字命中；1 vs 3+ 的來回數對應正文「一個來回」與「多繞幾個來回」。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c10",
+      "claim_text": "「clients are free to contact multiple replicas concurrently for the same proposal」",
+      "location": "under H2「把 leader 從必要條件拿掉…」與 morph-path 圖說",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n11"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "clients are free to contact multiple replicas concurrently for the same proposal",
+      "note": "逐字命中，正文與 widget 圖說各引一次。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c11",
+      "claim_text": "「Concurrent proposals do not destructively interfere: replicas work together to decide」",
+      "location": "under H2「把 leader 從必要條件拿掉…」",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n12"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Concurrent proposals do not destructively interfere: replicas work together to decide one of the proposed values",
+      "note": "post 引至 decide 止，為原句前段，逐字命中。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c12",
+      "claim_text": "在網路狀況不好的環境下，吞吐量比 Raft 與 Multi-Paxos 高出大約 10 倍，原文原句是「maintains much higher (~10x) throughput than Raft and Multi-Paxos」",
+      "location": "under H2「把 leader 從必要條件拿掉…」與對照表",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n13"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "maintains much higher (~10x) throughput than Raft and Multi-Paxos during such conditions",
+      "note": "note 標為 hedged（~10x 近似值）；post 用「大約 10 倍」並附原句 ~10x，且以「網路狀況不好的環境下」對應原文 during such conditions，近似語氣保留，未上調。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c13",
+      "claim_text": "QuePaxa 決議一個提案，原文給的範圍是「one to three round trips (usually, although it can take more)」",
+      "location": "under H2「一次決議要幾個來回…」與 scrub 圖說",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n14"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "QuePaxa in particular takes one to three round trips (usually, although it can take more)",
+      "note": "note 標 hedged；post 以「範圍」引述並保留 usually/can take more 保留語氣，未上調成硬性上限。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c14",
+      "claim_text": "「proposal decision latency is proportional to the latency between some majority of replicas」——決議延遲不是取決於離 leader 有多遠，而是取決於「某個多數派複本之間」互相溝通要花多久",
+      "location": "under H2「一次決議要幾個來回…」",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [
+        "n15"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "proposal decision latency is proportional to the latency between some majority of replicas",
+      "note": "逐字命中；因果轉述與原文一致。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c15",
+      "claim_text": "多數決類演算法…靠的是「任兩個多數派集合必然有交集」這個性質…原文沒有攤開 QuePaxa 收斂協定的完整細節，這段是照多數決演算法的一般性質推演",
+      "location": "after 對照表",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "quorum-intersection 推理，正文明確標記為作者推演（「這段是照多數決演算法的一般性質推演」），屬合法的已標記推斷，非冒充來源事實。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c16",
+      "claim_text": "原文把這個不變式寫得很精確：「if any two replicas decide on the value for a slot, those values are the same」",
+      "location": "under H2「一次決議要幾個來回…」與 linearize 圖說",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n24"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "if any two replicas decide on the value for a slot, those values are the same",
+      "note": "逐字命中，正文、pseudocode 與 widget 圖說均引用。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c17",
+      "claim_text": "如果一個 client 執行 put k1 v1，接著第二個 client 執行 put k1 v11，再接著第三個 client 執行 get k1，那麼「they will always read v11」",
+      "location": "under H2「一次決議要幾個來回…」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n25"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "they will always read v11. It guarantees this even if each request is submitted to a different replica",
+      "note": "put/put/get 範例與結論逐字命中。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c18",
+      "claim_text": "在 2f+1 台機器組成的系統裡，可以容忍 f 台故障",
+      "location": "under H2「Meerkat 在生產環境長什麼樣子…」與 quorum 圖說",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n22"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "we tolerate f faults in a system of 2f + 1 machines",
+      "note": "公式逐字命中；widget 圖說亦引原句 tolerate f faults in a system of 2f + 1 machines。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c19",
+      "claim_text": "前提是「A majority of the machines in our system are alive and can communicate」——多數機器活著、彼此能通訊",
+      "location": "under H2「Meerkat 在生產環境…」與 quorum 圖說",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n23"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "A majority of the machines in our system are alive and can communicate with one another",
+      "note": "post 引至 communicate 止，為原句前段，逐字命中。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c20",
+      "claim_text": "它不處理拜占庭故障（Byzantine faults），也就是不防機器說謊，只防機器掛掉或斷線",
+      "location": "under H2「Meerkat 在生產環境…」",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n37"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "we, like Raft-based systems, do not handle Byzantine faults",
+      "note": "原文明言不處理 Byzantine faults，逐字命中；「不防機器說謊」為對拜占庭故障的通俗轉述。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c21",
+      "claim_text": "開發者「request a cluster of Meerkat replicas」，每個複本互相連線——「Each replica is connected to every other replica」…客戶端…「send an application-specific request to any replica in the cluster」",
+      "location": "under H2「Meerkat 在生產環境…」",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n18",
+        "n19",
+        "n20"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Developers of services using Meerkat request a cluster of Meerkat replicas / Each replica is connected to every other replica / a developer's client sends an application-specific request to any replica in the cluster",
+      "note": "三段引號皆逐字命中。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c22",
+      "claim_text": "key-value store 支援「compare-and-swap-style writes」跟一般的交易語意",
+      "location": "under H2「Meerkat 在生產環境…」",
+      "type": "quote",
+      "load": "low",
+      "note_ids": [
+        "n21"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "compare-and-swap-style writes in which writes execute only if a value has not changed",
+      "note": "逐字命中。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c23",
+      "claim_text": "它「designed for a less reliable network environment (asynchrony)」……「for networks in which an imaginary adversary can launch targeted attacks on replica connections」",
+      "location": "under H2「Meerkat 在生產環境…」",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n26",
+        "n27"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "QuePaxa was designed for a less reliable network environment (\"asynchrony\") / for networks in which an imaginary adversary can launch targeted attacks on replica connections",
+      "note": "兩段引號逐字命中。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c24",
+      "claim_text": "Cloudflare 自己也做過多輪概念驗證：「run multiple proofs-of-concept with up to 50 replicas distributed around the world, to great success」",
+      "location": "under H2「Meerkat 在生產環境…」",
+      "type": "number",
+      "load": "medium",
+      "note_ids": [
+        "n16"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "we have run multiple proofs-of-concept with up to 50 replicas distributed around the world, to great success",
+      "note": "逐字命中；up to 50 replicas 數字一致。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c25",
+      "claim_text": "「Leaders in our proof-of-concept clusters constantly fail, and the cluster keeps operating with no increase in error-rate」——leader 在他們的概念驗證叢集裡不斷掛掉，系統照樣運作，錯誤率沒有上升",
+      "location": "under H2「Meerkat 在生產環境…」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n17"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Leaders in our proof-of-concept clusters constantly fail, and the cluster keeps operating with no increase in error-rate",
+      "note": "逐字命中，支撐 take-away 的關鍵佐證。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c26",
+      "claim_text": "原文寫得很清楚：「Meerkat has limitations. It is not designed to create general-purpose data systems like databases」",
+      "location": "under H2「Meerkat 在生產環境…」",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n28"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Meerkat has limitations. It is not designed to create general-purpose data systems like databases",
+      "note": "逐字命中。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c27",
+      "claim_text": "「Meerkat's fundamental latency limitations remain, especially when it is run at global scale」，跨洲級的物理距離不會因為換了共識演算法就消失",
+      "location": "under H2「Meerkat 在生產環境…」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n29"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Meerkat's fundamental latency limitations remain, especially when it is run at global scale",
+      "note": "note 標 hedged；post 直接引原句並保留 especially/global scale 語境，未上調。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c28",
+      "claim_text": "原文說 Meerkat「perfect, in the short term, for control plane information that is written infrequently but must remain consistent」",
+      "location": "under H2「Meerkat 在生產環境…」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n30"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "These limitations make it perfect, in the short term, for control plane information that is written infrequently but must remain consistent",
+      "note": "note 標 hedged；post 完整保留「in the short term」時間限定語，未把短期定位講成永久定位。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c29",
+      "claim_text": "截至發文，Meerkat「not deployed to production」，先鎖定小範圍的控制層狀態，短期內只會內部使用",
+      "location": "under H2「Meerkat 在生產環境…」",
+      "type": "date-version",
+      "load": "high",
+      "note_ids": [
+        "n31",
+        "n32"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Meerkat is not deployed to production / It's being designed initially to manage small pieces of control plane state / it will be kept internal-only for the immediate future",
+      "note": "生產狀態框架正確：原文明言尚未上生產、仍在開發、短期內僅內部使用；post 以「截至發文」與「短期內只會內部使用」如實對應，時效層 volatile 但有明確時間定錨。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c30",
+      "claim_text": "還在找「squeeze better performance」的空間……不是所有讀取都要觸發一輪共識……批次寫入…條件是「a replica receives 10 writes in a span of 10ms」",
+      "location": "under H2「Meerkat 在生產環境…」",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n33",
+        "n34",
+        "n35"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "there are a few ways to squeeze better performance out of Meerkat / Not all reads must trigger a consensus round / if a replica receives 10 writes in a span of 10ms",
+      "note": "三段皆逐字命中；post 以「加分項，不是解法」保留原文 a few/squeeze 的保留語氣，未上調成根本解。",
+      "action": "none",
+      "resolution": "none-needed"
+    }
+  ],
+  "checked_at": "2026-07-14",
+  "checker_rounds": 1,
+  "coverage": {
+    "candidate_claims": 34,
+    "checked": 30,
+    "dropped_low_load": 4
+  }
+}

@@ -1,0 +1,486 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">Meta 把廣告服務的執行緒排程邏輯，從寫死在核心裡的 CFS 與 EEVDF，搬進一個開機後才載入、隨時可以整支換掉的 BPF 程式——初次上線，廣告服務 p99 延遲降了 28%；之後完全沒再動核心版本，只重新啟動一個 user-space 行程換一版策略，又再降了 60%。</p>
+  <h1 class="vg-post-title">{{ title }}</h1>
+</header>
+
+<div class="vg-post-body">
+  <p><span class="vg-dropcap">s</span>ched_ext 是一個上游、以 BPF 撰寫的可插拔排程框架——原文的講法是「the upstream, BPF-based extensible scheduling framework」，2026 年隨 Linux v6.12 正式進入主線核心。它的設計不是 Meta 關起門來自己搞的私有 patch，而是「by partnering with the authors of Google's ghOSt to design a scheduler suitable for upstream Linux integration」，換句話說，從一開始的目標就是要讓排程邏輯乾淨到可以被上游核心社群接受，而不是一份注定要跟每一次核心升級打架的內部修補程式。Meta 把這套框架接上廣告服務，寫了一份看得懂「哪個執行緒正跑在延遲關鍵路徑上」的專屬策略，取代掉原本只認 CFS 與 EEVDF 這兩個通用排程器的核心排程邏輯。</p>
+
+  <p>這篇東西值得工程師細看的地方，不在於 Meta 換了哪一顆排程器，而在於排程策略第一次被拆成一塊可以獨立迭代的軟體，不必再綁死在核心版本上。任何自己維運延遲敏感服務、又懷疑通用排程器在某些 workload 上不夠好的團隊，理論上都能在 sched_ext 這個框架裡找到同一條路徑：不必等下一次核心升級排上日程，也不必自己維護一份跟每個核心版本打架的私有 patch。下面先拆開這套框架本身怎麼運作，再看 Meta 廣告服務具體怎麼用它。</p>
+
+  <h2>sched_ext 怎麼掛進核心</h2>
+
+  <p>通用排程器是編譯進核心的一段程式碼——CFS 也好，後來的 EEVDF 也好，邏輯寫死在核心原始碼裡，要換邏輯，就得改核心、重新編譯、重新開機。sched_ext 把這段邏輯整個抽出來，變成一支獨立的 BPF 程式，核心本身只保留呼叫介面：文中的說法是核心「calls into the BPF scheduler through a set of event-driven callbacks to handle common scheduling events」，具名的四個事件是「Thread wake-up, Enqueue, Dispatch, and Idle transitions」。核心不再自己決定「這個執行緒該排到哪」，它只負責在對的時間點，把決定權交給外面那支 BPF 程式。</p>
+
+  <p>這個切法呼應核心開發社群長期以來對「排程器該不該長出策略分支」這個問題的態度——CFS 本身就是為了取代更早期、規則更複雜的排程器而生，過程中核心維護者一直抗拒把太多特定場景的判斷寫進通用排程器，因為那會讓每個人都得為別人的 workload 付出維護成本。sched_ext 提供的答案不是「說服所有人接受你的判斷」，而是「讓你的判斷完全不用進核心」——這也是為什麼原文特別強調這套框架的目標是「suitable for upstream Linux integration」，而不是自己維護一份永遠追不上核心版本的 fork。</p>
+
+  <p>真正決定規則的 BPF 程式，又是被一個 user-space 行程載入進去的——「The policy is packaged as a user-space binary that loads the BPF program」。這帶來的直接後果是部署速度：換一版策略，「we can simply restart the scheduler process to unload the old policy and load the new one, without rebuilding or reinstalling the kernel」。三層責任因此徹底分開：核心負責在對的時間點呼叫、BPF callback 負責回答「這次排程要不要介入、怎麼介入」、user-space 行程負責裝載與替換策略本身。下面這張圖點開任一塊，看各自的責任邊界劃在哪裡、彼此又不知道對方的什麼。</p>
+
+  <p>從訊號的角度看，這四個 callback 其實對應著排程器可以取得的四種資訊：wake-up 告訴它「誰醒了」，enqueue 告訴它「誰在排隊」，dispatch 是它唯一能真正指定「誰跑在哪顆 CPU」的時刻，idle transition 則告訴它「哪裡有空位」。策略邏輯能用的訊號，全部從這四個時間點的呼叫參數裡取得——沒有額外的旁路通道，也不需要修改應用程式碼去主動回報自己的優先權，這也是為什麼同一套框架能套用在完全不同的 workload 上。</p>
+
+  <figure class="vg-w-annotated-sched-ext-arch" data-mobile="static" data-svg-scroll="880">
+    <style>
+      .vg-w-annotated-sched-ext-arch { display: grid; grid-template-columns: 1fr; gap: var(--s-3); align-items: start; }
+      @media (min-width: 720px) { .vg-w-annotated-sched-ext-arch { grid-template-columns: 1fr; } }
+      .vg-w-annotated-sched-ext-arch svg { width: 100%; height: auto; }
+      .vg-w-annotated-sched-ext-arch input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-annotated-sched-ext-arch .component { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; transition: fill 200ms, stroke 200ms; }
+      .vg-w-annotated-sched-ext-arch .component:hover { stroke: var(--accent); }
+      .vg-w-annotated-sched-ext-arch .component:focus { outline: none; }
+      .vg-w-annotated-sched-ext-arch .component:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+      .vg-w-annotated-sched-ext-arch .component-text { pointer-events: none; }
+      .vg-w-annotated-sched-ext-arch .num-chip { pointer-events: none; font-family: JetBrains Mono, monospace; font-size: 11px; }
+      .vg-w-annotated-sched-ext-arch .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+      .vg-w-annotated-sched-ext-arch .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-annotated-sched-ext-arch .detail p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-annotated-sched-ext-arch .hint { font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin: 0 0 var(--s-1) 0; }
+      .vg-w-annotated-sched-ext-arch:has(#vg-w-annotated-sched-ext-arch-r1:checked) .component-1 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-annotated-sched-ext-arch:has(#vg-w-annotated-sched-ext-arch-r2:checked) .component-2 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-annotated-sched-ext-arch:has(#vg-w-annotated-sched-ext-arch-r3:checked) .component-3 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-annotated-sched-ext-arch:has(#vg-w-annotated-sched-ext-arch-r4:checked) .component-4 { fill: var(--sage-deep); fill-opacity: 0.28; stroke: var(--sage-deep); }
+      .vg-w-annotated-sched-ext-arch:has(#vg-w-annotated-sched-ext-arch-r1:checked) .detail-1 { display: block; }
+      .vg-w-annotated-sched-ext-arch:has(#vg-w-annotated-sched-ext-arch-r2:checked) .detail-2 { display: block; }
+      .vg-w-annotated-sched-ext-arch:has(#vg-w-annotated-sched-ext-arch-r3:checked) .detail-3 { display: block; }
+      .vg-w-annotated-sched-ext-arch:has(#vg-w-annotated-sched-ext-arch-r4:checked) .detail-4 { display: block; }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m9 9 5 12 1.8-5.2L21 14Z"/><path d="M7.2 2.2 8 5.1"/><path d="m5.1 8-2.9-.8"/><path d="M14 4.1 12 6"/><path d="m6 12-1.9 2"/>
+      </svg>
+      <span>點任一元件看責任邊界 · 4 個元件</span>
+    </p>
+
+    <div data-vg-controls>
+      <input type="radio" id="vg-w-annotated-sched-ext-arch-r1" aria-label="select 排程核心" name="vg-w-annotated-sched-ext-arch-sel" checked />
+      <input type="radio" id="vg-w-annotated-sched-ext-arch-r2" aria-label="select BPF callback" name="vg-w-annotated-sched-ext-arch-sel" />
+      <input type="radio" id="vg-w-annotated-sched-ext-arch-r3" aria-label="select 策略行程" name="vg-w-annotated-sched-ext-arch-sel" />
+      <input type="radio" id="vg-w-annotated-sched-ext-arch-r4" aria-label="select CPU 軟分區" name="vg-w-annotated-sched-ext-arch-sel" />
+    </div>
+
+    <svg viewBox="0 0 880 300" role="img" aria-label="sched_ext 的四個元件：核心排程核心、BPF callback 集合、user-space 策略行程、CPU 軟分區決策">
+      <text x="440" y="30" text-anchor="middle" fill="var(--ink)" font-family="EB Garamond, serif" font-size="16">sched_ext 的四個元件——點選任一塊看責任邊界</text>
+
+      <rect class="component component-1" data-target="vg-w-annotated-sched-ext-arch-r1" role="button" tabindex="0" aria-label="select 排程核心" x="20" y="90" width="150" height="100" />
+      <text class="component-text" x="95" y="138" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">排程核心</text>
+      <text class="component-text" x="95" y="160" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="11" fill="var(--muted)">kernel dispatch loop</text>
+      <text class="num-chip" x="30" y="105" fill="var(--muted)">1</text>
+
+      <rect class="component component-2" data-target="vg-w-annotated-sched-ext-arch-r2" role="button" tabindex="0" aria-label="select BPF callback" x="250" y="90" width="150" height="100" />
+      <text class="component-text" x="325" y="138" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">BPF callback</text>
+      <text class="component-text" x="325" y="160" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="11" fill="var(--muted)">wake·enqueue·dispatch·idle</text>
+      <text class="num-chip" x="260" y="105" fill="var(--muted)">2</text>
+
+      <rect class="component component-3" data-target="vg-w-annotated-sched-ext-arch-r3" role="button" tabindex="0" aria-label="select 策略行程" x="480" y="90" width="150" height="100" />
+      <text class="component-text" x="555" y="138" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">策略行程</text>
+      <text class="component-text" x="555" y="160" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="11" fill="var(--muted)">user-space binary</text>
+      <text class="num-chip" x="490" y="105" fill="var(--muted)">3</text>
+
+      <rect class="component component-4" data-target="vg-w-annotated-sched-ext-arch-r4" role="button" tabindex="0" aria-label="select CPU 軟分區" x="710" y="90" width="150" height="100" />
+      <text class="component-text" x="785" y="138" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">CPU 軟分區</text>
+      <text class="component-text" x="785" y="160" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="11" fill="var(--muted)">p99 優先·L3 locality</text>
+      <text class="num-chip" x="720" y="105" fill="var(--muted)">4</text>
+
+      <line x1="170" y1="140" x2="250" y2="140" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-annotated-sched-ext-arch-arrow)" />
+      <line x1="400" y1="140" x2="480" y2="140" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-annotated-sched-ext-arch-arrow)" />
+      <line x1="630" y1="140" x2="710" y2="140" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-annotated-sched-ext-arch-arrow)" />
+
+      <text x="440" y="230" text-anchor="middle" fill="var(--muted)" font-family="IM Fell English, serif" font-style="italic" font-size="11">核心呼叫 callback，callback 交出決定，策略行程裝載規則，規則落成 CPU 分區</text>
+
+      <defs>
+        <marker id="vg-w-annotated-sched-ext-arch-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+        </marker>
+      </defs>
+    </svg>
+
+    <div>
+      <p class="hint">click a component above</p>
+      <div class="detail detail-1">
+        <h3>排程核心 · 責任邊界</h3>
+        <p>核心只在四個 callback 時間點呼叫出去，把排程決定交給外面。</p>
+        <p><strong>不清楚</strong>：哪個執行緒屬於哪個 workload——判斷在 BPF callback 與策略行程裡，核心不看。</p>
+      </div>
+      <div class="detail detail-2">
+        <h3>BPF callback 集合 · 責任邊界</h3>
+        <p>在四個時間點被核心呼叫進來，負責回答「這次排程要不要介入」。</p>
+        <p><strong>不清楚</strong>：策略邏輯本身的規則——那是策略行程載入的內容，callback 只是介面。</p>
+      </div>
+      <div class="detail detail-3">
+        <h3>策略行程（user-space binary）· 責任邊界</h3>
+        <p>載入 BPF 程式的 user-space 行程。換策略只需重新啟動它去卸下舊的、載入新的，不需重編或重灌核心。</p>
+        <p><strong>不清楚</strong>：核心版本細節——介面維持穩定，行程可獨立於核心版本被替換。</p>
+      </div>
+      <div class="detail detail-4">
+        <h3>CPU 軟分區決策 · 責任邊界</h3>
+        <p>依照策略把 CPU 軟分成兩池：一池給延遲關鍵請求路徑的執行緒，一池給不那麼敏感的背景工作；能改善 p99 的工作先跑，其餘讓路，且傾向讓相關工作留在同一組 CPU，改善 L3 局部性、減少 DRAM 存取。</p>
+        <p><strong>不清楚的事</strong>：個別執行緒實際在算什麼業務邏輯——分區只看它屬於哪一池，不看內容。</p>
+      </div>
+    </div>
+
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        const root = document.querySelector('.vg-w-annotated-sched-ext-arch');
+        root.querySelectorAll('.component').forEach((rect) => {
+          rect.addEventListener('click', () => {
+            const targetId = rect.getAttribute('data-target');
+            const radio = root.querySelector('#' + targetId);
+            if (radio) radio.checked = true;
+          });
+          rect.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              rect.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            }
+          });
+        });
+      })();
+    </script>
+  </figure>
+
+  <p>把責任拆成三層，也解釋了為什麼這套設計可以喊出「適合上游整合」。核心那一側改動的範圍其實很小，只是在既有的排程時機多開幾個呼叫點，原本的 CFS、EEVDF 邏輯完全可以繼續留著當預設值，兩者不衝突；真正會變動、會出錯、需要反覆調整的部分，全部關在 BPF 程式跟 user-space 行程裡，離核心原始碼很遠，出了問題也不會拖累其他不相關的核心子系統。這種切法對任何想寫自己排程策略的團隊都有意義：不需要說服核心維護者接受一份客製化的排程演算法本身，只需要說服他們接受一組穩定、通用的呼叫介面，演算法留在自己的行程裡反覆迭代、出錯了也只影響掛載這套策略的那一組機器。</p>
+
+  <p>這也是為什麼原文特別點名感謝 Ads Capacity Efficiency and Kernel team——這不是一個單純的核心工程專案，同時牽涉容量規劃（怎麼決定該分多少 CPU 給哪一池）與核心維運（怎麼確保 BPF 程式在機隊規模下穩定運作）。把排程策略跟容量效率綁在同一個團隊底下，某種程度上也反映了這套系統真正發揮效益的地方：不是單一機器上的排程優化，而是整個機隊的資源分配問題。</p>
+
+  <h2>四個事件驅動的 callback，各自何時介入</h2>
+
+  <p>把一次排程動作攤開來看，一個執行緒從醒來到真正跑在某顆 CPU 上，會依序撞上這四個 callback。wake-up 是執行緒從睡眠或阻塞狀態醒來的瞬間，這一刻它還沒被排進任何佇列；enqueue 把它放進等待佇列，這是 BPF 策略第一次有機會表態「這個工作重不重要」；dispatch 才是真正把執行緒指派給某顆實體 CPU 執行的時刻——這一步也是 Meta 廣告策略動手腳最重的地方：「Work that improves the p99 request latency is scheduled first, and everything else takes a back seat」；idle transition 則發生在某顆 CPU 沒事做的時候，排程器要決定要不要把別顆 CPU 排隊中的工作搬過來執行。</p>
+
+  <p>四個 callback 不是四段互相獨立的程式，而是同一次排程決策沿著時間軸展開的四個切片——核心在每個切片上都會暫停、把決定權交給 BPF 程式，再拿著答案繼續往下走。這也是為什麼「換一版策略」可以只靠重新啟動 user-space 行程就生效：四個 callback 的介面本身是穩定的，變的只是每個 callback 裡面的決策邏輯。下面這個時間軸可以拖著看，每個時間點排程器實際在回答哪個問題。</p>
+
+  <p>把這四個 callback 放在同一張時間軸上看，也能看出 sched_ext 跟傳統核心 patch 最大的差異：傳統做法要嘛整個排程器換掉，要嘛完全不動；sched_ext 允許你只在某幾個時間點插手，其他時間點沿用預設行為。對 Meta 廣告服務這種只需要在 dispatch 階段做出「誰的 p99 比較重要」判斷的場景，不需要重寫喚醒或睡眠邏輯，這種粒度的控制本身就是一種成本節省。</p>
+
+  <figure class="vg-w-scrub-sched-ext-callbacks" data-mobile="static" data-svg-scroll="800">
+    <style>
+      .vg-w-scrub-sched-ext-callbacks { display: grid; gap: var(--s-2); }
+      .vg-w-scrub-sched-ext-callbacks svg { width: 100%; height: auto; }
+      .vg-w-scrub-sched-ext-callbacks .state { font-family: var(--serif); font-size: var(--fs-sm); padding: var(--s-2); background: var(--bg-soft); border-left: 2px solid var(--accent); }
+      .vg-w-scrub-sched-ext-callbacks circle#vg-w-scrub-sched-ext-callbacks-handle { touch-action: none; }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M18 8L22 12L18 16"/><path d="M6 8L2 12L6 16"/><path d="M2 12H22"/>
+      </svg>
+      <span>拖曳把手看排程決策沿時間軸的四個切片 · 4 個 callback</span>
+    </p>
+
+    <svg class="vg-w-scrub-sched-ext-callbacks-main" viewBox="0 0 720 110" role="img" aria-label="thread wake-up、enqueue、dispatch、idle transition 四個 callback 的時間軸">
+      <line x1="40" y1="45" x2="680" y2="45" stroke="var(--muted-2)" stroke-width="1.5" />
+      <g id="vg-w-scrub-sched-ext-callbacks-events"></g>
+      <line id="vg-w-scrub-sched-ext-callbacks-handle-line" x1="40" y1="20" x2="40" y2="70" stroke="var(--accent)" stroke-width="2" />
+      <circle id="vg-w-scrub-sched-ext-callbacks-handle" cx="40" cy="45" r="9" fill="var(--accent)" cursor="grab" role="slider" tabindex="0" aria-label="拖曳查看四個排程 callback" />
+      <text id="vg-w-scrub-sched-ext-callbacks-clock" x="40" y="14" text-anchor="middle" font-family="Manrope, sans-serif" font-size="12" fill="var(--ink)">wake-up</text>
+    </svg>
+
+    <div class="state" id="vg-w-scrub-sched-ext-callbacks-state">執行緒從睡眠或阻塞中醒來，還沒被排進任何佇列。</div>
+
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        const root = document.querySelector('.vg-w-scrub-sched-ext-callbacks');
+        const svg = root.querySelector('svg.vg-w-scrub-sched-ext-callbacks-main');
+        const handle = root.querySelector('#vg-w-scrub-sched-ext-callbacks-handle');
+        const handleLine = root.querySelector('#vg-w-scrub-sched-ext-callbacks-handle-line');
+        const clock = root.querySelector('#vg-w-scrub-sched-ext-callbacks-clock');
+        const stateDiv = root.querySelector('#vg-w-scrub-sched-ext-callbacks-state');
+        const eventsG = root.querySelector('#vg-w-scrub-sched-ext-callbacks-events');
+
+        const events = [
+          [0, 'wake-up', '執行緒從睡眠或阻塞中醒來，還沒被排進任何佇列。'],
+          [1, 'enqueue', '排進等待佇列——BPF 策略第一次能表態「這個工作重不重要」。'],
+          [2, 'dispatch', '真正指派到某顆 CPU 執行；能改善 p99 的工作在這一步被排到前面，其餘讓路。'],
+          [3, 'idle transition', '某顆 CPU 沒事做，排程器決定要不要把別顆 CPU 排隊中的工作搬過來。'],
+        ];
+        const T_MAX = 3;
+        const X0 = 40, X1 = 680;
+        const xOf = (t) => X0 + (t / T_MAX) * (X1 - X0);
+
+        for (const [t, label] of events) {
+          const NS = 'http://www.w3.org/2000/svg';
+          const c = document.createElementNS(NS, 'circle');
+          c.setAttribute('cx', xOf(t)); c.setAttribute('cy', 45); c.setAttribute('r', 4);
+          c.setAttribute('fill', 'var(--muted)');
+          eventsG.appendChild(c);
+          const tx = document.createElementNS(NS, 'text');
+          tx.setAttribute('x', xOf(t)); tx.setAttribute('y', 90);
+          tx.setAttribute('text-anchor', 'middle');
+          tx.setAttribute('font-family', 'Manrope, sans-serif');
+          tx.setAttribute('font-size', 11);
+          tx.setAttribute('fill', 'var(--muted)');
+          tx.textContent = label;
+          eventsG.appendChild(tx);
+        }
+
+        function clamp(x) { return Math.max(X0, Math.min(X1, x)); }
+        function clientToSvgX(clientX) {
+          const pt = svg.createSVGPoint();
+          pt.x = clientX; pt.y = 0;
+          const svgPt = pt.matrixTransform(svg.getScreenCTM().inverse());
+          return clamp(svgPt.x);
+        }
+        function update(x) {
+          handle.setAttribute('cx', x);
+          handleLine.setAttribute('x1', x); handleLine.setAttribute('x2', x);
+          clock.setAttribute('x', x);
+          const t = ((x - X0) / (X1 - X0)) * T_MAX;
+          let active = events[0];
+          for (const e of events) if (e[0] <= t + 0.001) active = e;
+          clock.textContent = active[1];
+          stateDiv.textContent = active[2];
+        }
+
+        let dragging = false;
+        handle.addEventListener('pointerdown', (e) => { dragging = true; handle.setPointerCapture(e.pointerId); });
+        handle.addEventListener('pointermove', (e) => { if (!dragging) return; update(clientToSvgX(e.clientX)); });
+        handle.addEventListener('pointerup', () => { dragging = false; });
+        handle.addEventListener('keydown', (e) => {
+          const t = ((parseFloat(handle.getAttribute('cx')) - X0) / (X1 - X0)) * T_MAX;
+          if (e.key === 'ArrowRight') update(xOf(Math.min(T_MAX, Math.round(t) + 1)));
+          if (e.key === 'ArrowLeft') update(xOf(Math.max(0, Math.round(t) - 1)));
+        });
+
+        update(X0);
+      })();
+    </script>
+  </figure>
+
+  <p>值得多看一眼的是，這四個 callback 沒有一個是「效能優化」本身，它們只是決策的介面點——真正產生延遲改善的，是塞進 dispatch 那一步的判斷邏輯（誰的 p99 比較重要）跟塞進 enqueue、idle transition 裡的分區規則。把介面跟邏輯分開，正是 sched_ext 能同時滿足「核心穩定」與「策略常常要改」這兩個互相矛盾的需求的原因：介面很少變，邏輯天天可能變，兩者被拆到不同的程式碼庫、不同的發布節奏裡。</p>
+
+  <figure class="vg-w-diagram-sched-ext-signals" data-mobile="static" data-svg-scroll="800">
+    <style>
+      .vg-w-diagram-sched-ext-signals svg { width: 100%; height: auto; }
+    </style>
+    <svg viewBox="0 0 720 240" role="img" aria-label="四個 callback 各自收到的訊號與能做的決定">
+      <text x="360" y="24" text-anchor="middle" font-family="EB Garamond, serif" font-size="16" fill="var(--ink)">callback 收到什麼訊號、能做什麼決定</text>
+      <text x="40" y="52" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">callback</text>
+      <text x="280" y="52" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">收到的訊號</text>
+      <text x="520" y="52" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">能做的決定</text>
+      <line x1="20" y1="62" x2="700" y2="62" stroke="var(--muted-2)" stroke-width="1" />
+
+      <text x="40" y="90" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--accent-text)">wake-up</text>
+      <text x="280" y="90" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">執行緒剛醒來，還沒排隊</text>
+      <text x="520" y="90" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">尚未介入，交給下一步 enqueue</text>
+      <line x1="20" y1="104" x2="700" y2="104" stroke="var(--line)" stroke-width="1" />
+
+      <text x="40" y="132" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--accent-text)">enqueue</text>
+      <text x="280" y="132" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">執行緒進了等待佇列</text>
+      <text x="520" y="132" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">BPF 策略第一次表態這工作重不重要</text>
+      <line x1="20" y1="146" x2="700" y2="146" stroke="var(--line)" stroke-width="1" />
+
+      <text x="40" y="174" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--sage-deep)">dispatch</text>
+      <text x="280" y="174" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">要指定執行的 CPU 是哪一顆</text>
+      <text x="520" y="174" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">p99 優先權在這一步生效</text>
+      <line x1="20" y1="188" x2="700" y2="188" stroke="var(--line)" stroke-width="1" />
+
+      <text x="40" y="216" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--accent-text)">idle</text>
+      <text x="280" y="216" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">某顆 CPU 出現空位</text>
+      <text x="520" y="216" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">決定要不要把別顆 CPU 排隊中的工作搬過來</text>
+    </svg>
+  </figure>
+
+  <h2>user-space policy 行程：換演算法不必重開機</h2>
+
+  <p>把策略邏輯搬到 user-space，換來的直接好處是部署速度。傳統上要換排程邏輯，得改核心原始碼、重新編譯、在機隊上滾動重開機——這條路徑動輒以天甚至週計，而且重開機本身對線上服務就是一次風險。sched_ext 把這整段時間壓縮成「重新啟動一個行程」：卸下舊的 BPF 程式、載入新的，核心版本完全不用動，機器也不用重開。</p>
+
+  <p>這個決定也有它的代價。通用排程器的好處是背後有整個核心開發社群多年打磨、踩過無數坑的邏輯撐著；換成專屬策略，等於把「這段邏輯正不正確」的責任收回到 Meta 自己頭上——sched_ext 本身只保證呼叫介面穩定，策略寫得好不好、會不會有邊界案例排錯，是 user-space 那支行程要自己扛的事。但對一個會被線上流量直接放大的效能問題，這筆帳顯然划算：後面會看到，Meta 光靠幾次 user-space 端的策略更新，完全沒再碰過一次核心版本，就又拿到一輪很不小的延遲改善。</p>
+
+  <p>這種部署模式也悄悄改變了「測試一版新策略」的成本結構。核心變更走的路徑通常是先在小規模機器上驗證、再逐步擴大範圍，任何一步出錯都要走回頭路重新編譯、重新開機；user-space 行程走的路徑是程式照樣要測、要驗證，但每一輪迭代的物理成本只剩下「重新啟動一個行程」，不必再疊加核心編譯與機隊重開機這兩段最貴的時間。策略邏輯因此可以按照一般應用程式的節奏去改、去上線、去還原，而不必套用核心變更那套更保守、更慢的流程——這也是為什麼下一節會看到，同一套 sched_ext 骨架上光靠策略迭代就能再擠出一輪改善。</p>
+
+  <p>這也解釋了為什麼一份看起來只是「換個排程器」的變更，會被寫成一篇工程部落格文章，而不是一行 changelog。多數效能優化的成本集中在寫程式那一刻；這裡的成本結構不同——寫完策略只是起點，往後每一次核心版本升級、每一次流量型態改變，都要有人持續盯著這支 user-space 行程的行為是否還正確。把排程邏輯留在自己手上，換來的迭代速度是真的，但也把一份原本不需要團隊操心的長期維運責任，換成了團隊自己的。</p>
+
+  <figure class="vg-w-diagram-sched-ext-deploy-paths" data-mobile="static" data-svg-scroll="800">
+    <style>
+      .vg-w-diagram-sched-ext-deploy-paths svg { width: 100%; height: auto; }
+    </style>
+    <svg viewBox="0 0 720 260" role="img" aria-label="核心版本變更與 user-space 策略更新兩條部署路徑的步驟對比">
+      <text x="360" y="24" text-anchor="middle" font-family="EB Garamond, serif" font-size="16" fill="var(--ink)">兩條部署路徑，步驟數不一樣</text>
+
+      <text x="180" y="54" text-anchor="middle" font-family="Manrope, sans-serif" font-size="12" fill="var(--muted)">核心版本變更</text>
+      <rect x="60" y="66" width="240" height="34" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.5" />
+      <text x="180" y="88" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">改核心原始碼</text>
+      <line x1="180" y1="100" x2="180" y2="116" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-diagram-sched-ext-deploy-paths-arrow)" />
+      <rect x="60" y="118" width="240" height="34" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.5" />
+      <text x="180" y="140" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">重新編譯核心</text>
+      <line x1="180" y1="152" x2="180" y2="168" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-diagram-sched-ext-deploy-paths-arrow)" />
+      <rect x="60" y="170" width="240" height="34" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.5" />
+      <text x="180" y="192" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">機隊滾動重開機</text>
+      <text x="180" y="222" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="11" fill="var(--muted)">任何一步出錯都要走回頭路</text>
+
+      <text x="540" y="54" text-anchor="middle" font-family="Manrope, sans-serif" font-size="12" fill="var(--muted)">user-space 策略更新</text>
+      <rect x="420" y="66" width="240" height="34" fill="var(--accent)" fill-opacity="0.12" stroke="var(--accent)" stroke-width="1.5" />
+      <text x="540" y="88" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">改策略邏輯</text>
+      <line x1="540" y1="100" x2="540" y2="116" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-diagram-sched-ext-deploy-paths-arrow)" />
+      <rect x="420" y="118" width="240" height="34" fill="var(--accent)" fill-opacity="0.12" stroke="var(--accent)" stroke-width="1.5" />
+      <text x="540" y="140" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">重新啟動 user-space 行程</text>
+      <text x="540" y="192" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--accent-text)">完成，核心版本沒有動過</text>
+      <text x="540" y="222" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="11" fill="var(--muted)">不必重建或重灌核心</text>
+
+      <defs>
+        <marker id="vg-w-diagram-sched-ext-deploy-paths-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+        </marker>
+      </defs>
+    </svg>
+  </figure>
+
+  <h2>軟分區與 p99 優先</h2>
+
+  <p>廣告服務專屬的排程策略，說穿了是把 CPU 分成兩個池子——「soft-partitions CPUs into two pools, one for threads on the latency-critical request path and one for less latency-sensitive work」。哪一池優先跑，判準很直接：「Work that improves the p99 request latency is scheduled first, and everything else takes a back seat」。通用排程器不做這個區分——CFS、EEVDF「balance threads across CPUs with no understanding of the workload」，意思是同一顆 CPU 上，延遲關鍵的請求處理執行緒，跟背景批次工作，隨時可能被排在一起輪流跑。</p>
+
+  <p>這個分法帶來一個不是排程目標本身、卻是排程結果的附帶好處：「This approach tends to keep related work on the same CPUs over time, improving last-level cache (L3) locality and reducing costly DRAM access」——用「tends to」這個詞，原文自己也沒把它講成保證，是傾向。道理不難想：CPU 每次排程器換手，如果換上的是完全無關的工作，L3 快取裡原本為請求路徑暖好的資料，就有可能被沖掉；下一次請求路徑的執行緒醒來，得重新從 DRAM 把資料抓回來，這段存取本身就比從 L3 抓貴上一個數量級。把相關工作固定留在同一組 CPU，等於讓快取裡的內容盡量跟正在跑的工作對得上。下面這張對照圖，左邊是通用排程器不分類的擺法，右邊是軟分區之後的擺法，拖動分隔線看兩種擺法差在哪裡。</p>
+
+  <figure class="vg-w-ba-sched-ext-locality" data-mobile="static" data-svg-scroll="560">
+    <style>
+      .vg-w-ba-sched-ext-locality { position: relative; aspect-ratio: 16 / 9; overflow: hidden; }
+      .vg-w-ba-sched-ext-locality .layer { position: absolute; inset: 0; }
+      .vg-w-ba-sched-ext-locality .after { clip-path: polygon(50% 0, 100% 0, 100% 100%, 50% 100%); }
+      .vg-w-ba-sched-ext-locality .divider { position: absolute; top: 0; bottom: 0; left: 50%; width: 32px; transform: translateX(-50%); cursor: ew-resize; touch-action: none; }
+      .vg-w-ba-sched-ext-locality .divider::before { content: ''; position: absolute; left: 50%; top: 0; bottom: 0; width: 2px; transform: translateX(-50%); background: var(--accent); }
+      .vg-w-ba-sched-ext-locality .divider::after { content: '↔'; position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); background: var(--accent); color: var(--bg); width: 32px; height: 32px; border-radius: 50%; display: grid; place-items: center; font-family: var(--sans); font-size: 16px; }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M18 8L22 12L18 16"/><path d="M6 8L2 12L6 16"/><path d="M2 12H22"/>
+      </svg>
+      <span>拖曳分隔線比較 CFS／EEVDF 與 sched_ext 的 CPU 配置 · 6 顆 CPU</span>
+    </p>
+
+    <svg class="layer before" viewBox="0 0 400 225" role="img" aria-label="CFS／EEVDF：不理解 workload，延遲關鍵與背景工作交錯排在同一顆 CPU">
+      <rect width="400" height="225" fill="var(--bg-soft)" />
+      <circle cx="30" cy="30" r="5" fill="var(--accent)" /><text x="42" y="34" font-family="Manrope, sans-serif" font-size="11" fill="var(--ink)">延遲關鍵</text>
+      <circle cx="115" cy="30" r="5" fill="var(--sage-deep)" /><text x="127" y="34" font-family="Manrope, sans-serif" font-size="11" fill="var(--ink)">背景工作</text>
+
+      <g font-family="JetBrains Mono, monospace" font-size="10" fill="var(--muted)">
+        <rect x="25" y="80" width="50" height="60" fill="none" stroke="var(--muted-2)" stroke-width="1.5" />
+        <circle cx="40" cy="100" r="6" fill="var(--accent)" /><circle cx="60" cy="120" r="6" fill="var(--sage-deep)" />
+        <text x="50" y="155" text-anchor="middle">CPU0</text>
+
+        <rect x="85" y="80" width="50" height="60" fill="none" stroke="var(--muted-2)" stroke-width="1.5" />
+        <circle cx="100" cy="100" r="6" fill="var(--sage-deep)" /><circle cx="120" cy="120" r="6" fill="var(--accent)" />
+        <text x="110" y="155" text-anchor="middle">CPU1</text>
+
+        <rect x="145" y="80" width="50" height="60" fill="none" stroke="var(--muted-2)" stroke-width="1.5" />
+        <circle cx="160" cy="100" r="6" fill="var(--accent)" /><circle cx="180" cy="120" r="6" fill="var(--sage-deep)" />
+        <text x="170" y="155" text-anchor="middle">CPU2</text>
+      </g>
+
+      <text x="25" y="205" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">CFS／EEVDF：不分類</text>
+    </svg>
+    <svg class="layer after" viewBox="0 0 400 225" id="vg-w-ba-sched-ext-locality-after" role="img" aria-label="sched_ext：延遲關鍵執行緒固定同一組 CPU，背景工作留在另一組">
+      <rect width="400" height="225" fill="var(--accent)" fill-opacity="0.08" />
+      <circle cx="215" cy="30" r="5" fill="var(--accent)" /><text x="227" y="34" font-family="Manrope, sans-serif" font-size="11" fill="var(--ink)">延遲關鍵池</text>
+      <circle cx="300" cy="30" r="5" fill="var(--sage-deep)" /><text x="312" y="34" font-family="Manrope, sans-serif" font-size="11" fill="var(--ink)">背景池</text>
+
+      <g font-family="JetBrains Mono, monospace" font-size="10" fill="var(--muted)">
+        <rect x="205" y="80" width="50" height="60" fill="none" stroke="var(--muted-2)" stroke-width="1.5" />
+        <circle cx="220" cy="100" r="6" fill="var(--sage-deep)" /><circle cx="240" cy="120" r="6" fill="var(--sage-deep)" />
+        <text x="230" y="155" text-anchor="middle">CPU3</text>
+
+        <rect x="265" y="80" width="50" height="60" fill="none" stroke="var(--muted-2)" stroke-width="1.5" />
+        <circle cx="280" cy="100" r="6" fill="var(--sage-deep)" /><circle cx="300" cy="120" r="6" fill="var(--sage-deep)" />
+        <text x="290" y="155" text-anchor="middle">CPU4</text>
+
+        <rect x="325" y="80" width="50" height="60" fill="none" stroke="var(--muted-2)" stroke-width="1.5" />
+        <circle cx="340" cy="100" r="6" fill="var(--sage-deep)" /><circle cx="360" cy="120" r="6" fill="var(--sage-deep)" />
+        <text x="350" y="155" text-anchor="middle">CPU5</text>
+      </g>
+
+      <text x="210" y="205" font-family="EB Garamond, serif" font-size="14" fill="var(--accent-text)">sched_ext：軟分區</text>
+    </svg>
+    <div class="divider" id="vg-w-ba-sched-ext-locality-divider"></div>
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        const root = document.querySelector('.vg-w-ba-sched-ext-locality');
+        const after = root.querySelector('#vg-w-ba-sched-ext-locality-after');
+        const divider = root.querySelector('#vg-w-ba-sched-ext-locality-divider');
+        let dragging = false;
+        function setPct(pct) {
+          const clamped = Math.max(0, Math.min(100, pct));
+          after.style.clipPath = `polygon(${clamped}% 0, 100% 0, 100% 100%, ${clamped}% 100%)`;
+          divider.style.left = `${clamped}%`;
+        }
+        divider.addEventListener('pointerdown', (e) => { dragging = true; divider.setPointerCapture(e.pointerId); });
+        root.addEventListener('pointermove', (e) => {
+          if (!dragging) return;
+          const rect = root.getBoundingClientRect();
+          setPct(((e.clientX - rect.left) / rect.width) * 100);
+        });
+        root.addEventListener('pointerup', () => { dragging = false; });
+        root.addEventListener('pointercancel', () => { dragging = false; });
+      })();
+    </script>
+  </figure>
+
+  <p>這張對照圖刻意只畫出「哪些執行緒被排在同一顆 CPU」，沒有畫排程器怎麼決定要放誰進去——那部分屬於前面兩節講的 dispatch callback 與策略行程。軟分區本身不是一次畫定就不再變動的靜態擺法，而是排程器每次面對新的 wake-up、enqueue、dispatch 決策時都會參考的分類依據，久而久之才會呈現出「相關工作留在同一組 CPU」這種統計上的傾向，而不是每個瞬間都精準分開——這也對應前面提到的用詞：原文說的是「tends to」，不是「always」。</p>
+
+  <p>這也是為什麼軟分區帶來的效益不只反映在延遲數字上，還反映在機隊的用電量上——快取未命中換來的 DRAM 存取，消耗的不只是時間，也是實際的電力與匯流排頻寬。當同一批工作反覆被排到不理解彼此關聯的 CPU 上，浪費的資源會隨機隊規模線性放大；後面會看到，Meta 公佈的機隊省電數字，某種程度上就是這種浪費在機隊尺度上被收回來的量。</p>
+
+  <h2>從 CFS／EEVDF 的落差到量到的數字</h2>
+
+  <p>會走到這一步，起點是一次具體的回歸，不是效能優化的選配題。Meta 原本「have been using the general-purpose schedulers typically integrated in the Linux kernel (CFS and EEVDF) that balance threads across CPUs with no understanding of the workload」——這是基準狀態，排程器不知道、也不在乎誰是誰。問題出在 v6.6 引入的新版排程器：「the new Earliest Eligible Virtual Deadline First (EEVDF) scheduler introduced in Linux kernel v6.6 was causing a latency regression which reduced the number of ads ranked in response」。延遲變差不是一個抽象的百分點，它直接砍掉了一次回應裡能排進結果的廣告數量——這是業務指標，不是內部監控儀表板上的雜訊。</p>
+
+  <p>「Earliest Eligible Virtual Deadline First」這個名字本身透露了 EEVDF 想解決的問題：在多個「已經有資格跑」的執行緒裡，挑一個虛擬期限（virtual deadline）最早到期的先執行，藉此在公平性與延遲之間找折衷。但不管是 CFS 還是 EEVDF，判斷依據都停在執行時間統計這個層次——排程器不知道某個執行緒屬於哪個服務、在不在使用者能感知的關鍵路徑上，這正是「no understanding of the workload」這句話的字面意思。sched_ext 不是要否定這套公平性模型，而是在它之外另開一條路，讓有能力辨識 workload 語意的團隊，把這層資訊也餵進排程決策裡。</p>
+
+  <p>換上 sched_ext 之後，數字分兩波量到。第一波是把核心版本一起換掉——從 kernel 6.4 配 CFS，換成 kernel 6.9 配 sched_ext：廣告檢索路徑的服務 p99 延遲降了 28%，weighted-ads-ranked 這個業務指標長了 1.1%，機隊層級省下 3.28 百萬瓦的電力。第二波完全沒再動核心版本，純粹靠 user-space policy 行程的幾次策略更新：p99 延遲又額外降了 60%，關鍵路徑上的 timeout 錯誤減少 18%。所有數字的量測方法是同一套：「Measured by backtest after the rollout reached global scale and stabilized (~3 weeks), and validated via the Ads Delivery launch-candidate review plus group and company holdout backtests」——不是上線當下的即時讀數，是全球流量都吃到、穩定約三週之後回頭做的 backtest，再拿發布候選審查跟 holdout backtest 交叉驗證過。</p>
+
+  <figure class="vg-w-table-sched-ext-bench" data-mobile="keep">
+    <style>
+      .vg-w-table-sched-ext-bench { overflow-x: auto; }
+      .vg-w-table-sched-ext-bench table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-sched-ext-bench caption { text-align: left; caption-side: top; font-family: var(--scribed); font-style: italic; color: var(--muted); font-size: var(--fs-sm); padding: var(--s-1) 0; }
+      .vg-w-table-sched-ext-bench thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); }
+      .vg-w-table-sched-ext-bench tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); }
+      .vg-w-table-sched-ext-bench td.num { font-variant-numeric: tabular-nums; text-align: right; }
+    </style>
+    <table>
+      <caption>數字取自 Meta 工程部落格，backtest 於上線穩定約 3 週後量測並交叉驗證。</caption>
+      <thead>
+        <tr><th>階段</th><th>指標</th><th class="num">數值</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>初次上線（kernel 6.4＋CFS → kernel 6.9＋sched_ext）</td><td>廣告檢索路徑 p99 延遲</td><td class="num">−28%</td></tr>
+        <tr><td>初次上線</td><td>weighted-ads-ranked</td><td class="num">+1.1%</td></tr>
+        <tr><td>初次上線</td><td>機隊省電</td><td class="num">3.28 MW</td></tr>
+        <tr><td>後續 user-space 策略更新（核心版本未變）</td><td>p99 延遲（額外）</td><td class="num">−60%</td></tr>
+        <tr><td>後續 user-space 策略更新</td><td>關鍵路徑 timeout 錯誤</td><td class="num">−18%</td></tr>
+      </tbody>
+    </table>
+  </figure>
+
+  <figure class="vg-w-bench-sched-ext-two-waves" data-mobile="static" data-svg-scroll="800">
+    <style>
+      .vg-w-bench-sched-ext-two-waves svg { width: 100%; height: auto; }
+    </style>
+    <svg viewBox="0 0 720 200" role="img" aria-label="p99 延遲相對值：基準 100%、換框架後 72%、策略迭代後約 29%，兩波改善是相乘不是相加">
+      <text x="360" y="24" text-anchor="middle" font-family="EB Garamond, serif" font-size="16" fill="var(--ink)">兩波改善是相乘，不是相加</text>
+
+      <text x="30" y="60" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">基準</text>
+      <rect x="140" y="46" width="500" height="24" fill="var(--muted-2)" fill-opacity="0.35" />
+      <text x="650" y="63" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--ink)">100%</text>
+
+      <text x="30" y="104" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">換框架後</text>
+      <rect x="140" y="90" width="360" height="24" fill="var(--accent)" fill-opacity="0.45" />
+      <text x="510" y="107" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--accent-text)">72%（−28%）</text>
+
+      <text x="30" y="148" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">策略迭代後</text>
+      <rect x="140" y="134" width="144" height="24" fill="var(--sage-deep)" fill-opacity="0.55" />
+      <text x="294" y="151" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--sage-deep)">約 29%（再 −60%）</text>
+
+      <text x="140" y="186" font-family="IM Fell English, serif" font-style="italic" font-size="11" fill="var(--muted)">29% 為本站換算（72%×40%），原文只公布兩個百分比本身，未給複合後的總相對值</text>
+    </svg>
+  </figure>
+
+  <p>backtest 加上 holdout 交叉驗證的量測方式，也值得工程師留意。這代表這些數字不是上線瞬間的峰值讀數，而是把一段時間內的真實流量重播、跟沒有套用新排程器的對照組比較出來的差異——這種方法論本身能過濾掉單日流量波動造成的雜訊，但也代表數字反映的是穩定狀態下的平均效益，而不是任何單一請求的改善幅度。</p>
+
+  <p>把兩波數字放在一起看，會發現它們其實在驗證兩件不同的事。第一波的 28%，量的是「從通用排程器換成 workload-aware 排程」這個決定本身值多少；第二波的 60%，完全沒有換核心版本，量的是「同一套 sched_ext 骨架上，policy 邏輯可以被反覆調整」這件事本身值多少——這正好對照前面說的部署速度優勢：如果每次調整策略都要重新編譯核心、滾動重開機，不會有這麼多次迭代的空間去擠出這一輪改善。負責這個專案的是 Meta 內部的 Ads Capacity Efficiency and Kernel team。</p>
+
+  <p>這兩波數字合起來也回答了一個容易被忽略的問題：一次性換框架的紅利跟長期迭代的紅利，哪個比較大。從絕對數字看，第二波的 60% 比第一波的 28% 還高，而且完全沒有再承擔一次換核心版本的風險——這意味著，對 Meta 而言，把資源投在維護一支 user-space 策略行程、持續調整分區規則，長期報酬可能比一次性換完框架就停手更划算。這是從公開數字推出的合理解讀，原文本身沒有直接下這個結論。</p>
+
+  <p>對想嘗試同樣路徑的團隊，這篇文章畫出的檢查清單很具體：先確認自己的核心版本是否已經支援 sched_ext（v6.12 起），有沒有一段可以重播驗證的流量，再決定要不要投入寫一份專屬策略。少了 backtest 與 holdout 這一層驗證能力，貿然換上自訂排程器等於在賭一個沒有安全網的效能優化。</p>
+
+  <p class="vg-deep-closer"><strong>What this enables</strong>：把排程策略從核心裡搬出來，換成一個可以隨時重新啟動、隨時換版本的 user-space 行程，拿掉的不是效能，而是「改一次排程邏輯就要重編核心」這道門檻。Meta 廣告服務的兩波數字合起來說明這件事的份量：一次是換框架時量到的 28% p99 改善，一次是完全沒碰核心版本、純靠策略迭代量到的額外 60%——當排程器可以看懂 workload、又能用重新啟動一個行程的速度去調整，延遲問題就從「等下一次核心升級排上日程」，變成「這週就能試下一版策略」。這對任何自己維護延遲敏感服務的團隊都是一個可以直接抄的判斷依據：先問排程器懂不懂你的 workload，再問改一次策略要付出多少部署成本。</p>
+</div>
