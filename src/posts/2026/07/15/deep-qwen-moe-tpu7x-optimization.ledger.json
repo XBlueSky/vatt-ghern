@@ -5,7 +5,7 @@
     "2. Ironwood TPU v7x 每 chip 2 個 Tensor Core、4 個 MXU，FP8 尖峰 4,614 TFLOPS、192GB HBM——這組硬體規格決定了 roofline 天花板在哪。",
     "3. 8-way tensor parallelism 撞上只有 2 個 KV head：2/8=0.25 個 head/device 物理上切不出來，逼團隊放棄 TP，改用 DP=8（attention 整份複製）+ EP=8（512 個專家平均分到 8 device，每台 64 個），代價是要另外扛 400GB 參數不重複複製的記憶體設計。",
     "4. Kernel 層動手術：Ragged Page Attention 的 KV block size 從 16 拉到 256，decode latency 在 concurrency-512 下從 428µs 砍到 283µs（省 33.8%）；Grouped GEMM v2 把 SwiGLU 與 512-subchannel FP8 量化融合進單一 tile；GDN 的 Causal Conv1D 直接在 VPU 暫存器裡做完，省掉 6 次 HBM 來回。",
-    "5. 集體通信也瘦身：3 次 All-Gather 打包成 2 次（routing metadata 的 collective latency 減半）；Reduce-Scatter 拆成 intra-chip（快 6 倍）與 inter-chip 兩階段、用 2–4 個 micro-batch 做 pipeline。",
+    "5. 集體通訊也瘦身：3 次 All-Gather 打包成 2 次（routing metadata 的 collective latency 減半）；Reduce-Scatter 拆成 intra-chip（快 6 倍）與 inter-chip 兩階段、用 2–4 個 micro-batch 做 pipeline。",
     "6. 結果攤在 concurrency 64：prefill-heavy 實測 3,707 tokens/s/chip，摸到 discounted roofline（4,500）的 82.4%；decode-heavy 677 tokens/s/chip，摸到 discounted roofline（850）的 79.6%。512 concurrency 下整體對比 4 月的舊版拿到 4.7x（prefill）／3.1x（decode）加速。",
     "7. 工程哲學：不是重新調一次模型，而是把系統拆成可重用的獨立 building block（Batched RPA、Grouped GEMMs、SparseCore unpermutation）配 hardware-aware cost model，讓下一個 MoE 模型不必再從零開始 trial-and-error。"
   ],
@@ -230,8 +230,7 @@
       "hedge": "asserted",
       "interpretation": "團隊把這套方法定位成對抗「每個新模型都要重跑幾個月 trial-and-error」的解法，目標是模組化、可跨模型重用。",
       "timeliness": "durable"
-    }
-    ,
+    },
     {
       "id": "n27",
       "url": "https://developers.googleblog.com/en/systems-engineering-playbook-optimizing-qwen-35-397b-moe-on-ironwood-tpu7x/",
@@ -289,8 +288,501 @@
       "timeliness": "durable"
     }
   ],
-  "claims": [],
+  "claims": [
+    {
+      "id": "c01",
+      "claim_text": "397B 參數裡只有 17B 會在某個 token 的前向傳播裡被真正算到，官方比例 4.3%",
+      "type": "number",
+      "load": "high",
+      "independence": "single-source",
+      "note_ids": [
+        "n01"
+      ],
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "397 billion total parameters ... exactly 17 billion parameters per token per forward pass ... 4.3% routing activation ratio"
+    },
+    {
+      "id": "c02",
+      "claim_text": "60 層是 3 層 GDN 線性注意力配 1 層標準 GQA 的固定節奏",
+      "type": "number",
+      "load": "medium",
+      "independence": "single-source",
+      "note_ids": [
+        "n02"
+      ],
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "3 consecutive layers ... of Gated DeltaNet (GDN) with MoE, then 1 layer of standard GQA coupled with routed sparse MoE"
+    },
+    {
+      "id": "c03",
+      "claim_text": "GDN 層用 64 個 Value head 配 16 個 Query/Key head，head dim 128",
+      "type": "number",
+      "load": "medium",
+      "independence": "single-source",
+      "note_ids": [
+        "n03"
+      ],
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "64 linear attention heads for Values (V) and 16 heads for Queries and Keys (QK) with a head dimension of 128"
+    },
+    {
+      "id": "c04",
+      "claim_text": "GQA 層是 32 個 query head 對上只有 2 個 KV head（Nkv=2）",
+      "type": "number",
+      "load": "high",
+      "independence": "single-source",
+      "note_ids": [
+        "n04"
+      ],
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "32 query heads (Nq=32) and exactly 2 key-value (KV) heads (Nkv=2)"
+    },
+    {
+      "id": "c05",
+      "claim_text": "512 個路由專家，intermediate dim 1024，top 10，加一個恆定執行的共享專家",
+      "type": "number",
+      "load": "high",
+      "independence": "single-source",
+      "note_ids": [
+        "n05"
+      ],
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "512 small experts with an intermediate expert dimension of 1024 ... Top 10 routed experts via a soft-max probability distribution ... one shared expert path that is always executed"
+    },
+    {
+      "id": "c06",
+      "claim_text": "Ironwood 每晶片 2 TC、每 TC 2 MXU、2.2 GHz、FP8 4,614 TFLOPS、192GB HBM",
+      "type": "number",
+      "load": "medium",
+      "independence": "single-source",
+      "note_ids": [
+        "n06"
+      ],
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "Tensor Core (TC) Frequency: 2.2 GHz ... 2 Tensor Cores per chip ... 2 MXUs (Matrix Execution Units) per TC ... Peak FP8 performance: 4,614 TFLOPS/chip ... 192GB of HBM capacity per chip"
+    },
+    {
+      "id": "c07",
+      "claim_text": "512 concurrency 下 decode-heavy 約 3.1 倍、prefill-heavy 約 4.7 倍",
+      "type": "number",
+      "load": "high",
+      "independence": "single-source",
+      "note_ids": [
+        "n07"
+      ],
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "The optimizations discussed below allowed us to improve inference performance by approximately 3.1x for Decode-heavy and by approximately 4.7x for Prefill-heavy workloads (512 Concurrency tier) between April and June 2026."
+    },
+    {
+      "id": "c08",
+      "claim_text": "Prefill-heavy 實測 3,707 tokens/s/chip",
+      "type": "number",
+      "load": "high",
+      "independence": "single-source",
+      "note_ids": [
+        "n08"
+      ],
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "3,707 tokens/s/chip"
+    },
+    {
+      "id": "c09",
+      "claim_text": "Decode-heavy 實測 677 tokens/s/chip",
+      "type": "number",
+      "load": "high",
+      "independence": "single-source",
+      "note_ids": [
+        "n09"
+      ],
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "677 tokens/s/chip"
+    },
+    {
+      "id": "c10",
+      "claim_text": "理論上限 5,170（未打折）、4,500（打折）",
+      "type": "number",
+      "load": "high",
+      "independence": "single-source",
+      "note_ids": [
+        "n10"
+      ],
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "estimated maximum theoretical roofline throughput of 5,170 tokens/s/chip (undiscounted), and 4,500 tokens/s/chip under standard scheduling de-rate factors"
+    },
+    {
+      "id": "c11",
+      "claim_text": "理論上限 978（未打折）、850（打折）",
+      "type": "number",
+      "load": "high",
+      "independence": "single-source",
+      "note_ids": [
+        "n11"
+      ],
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "peak theoretical throughput of 978 tokens/s/chip (undiscounted) and a realistic, discounted serving roofline limit of 850 tokens/s/chip"
+    },
+    {
+      "id": "c12",
+      "claim_text": "效率 82.4%（prefill，對 discounted 4,500）官方值",
+      "type": "number",
+      "load": "high",
+      "independence": "single-source",
+      "note_ids": [
+        "n12",
+        "n08",
+        "n10"
+      ],
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "our custom SparseCore and TensorCore co-designed GEMMs successfully extract 82.4% of the absolute compute capacity / 3,707 tokens/s/chip / estimated maximum theoretical roofline throughput of 5,170 tokens/s/chip (undiscounted), and 4,500 tokens/s/chip under standard scheduling de-rate factors"
+    },
+    {
+      "id": "c13",
+      "claim_text": "效率 79.6%（decode，對 discounted 850）官方值",
+      "type": "number",
+      "load": "high",
+      "independence": "single-source",
+      "note_ids": [
+        "n13",
+        "n09",
+        "n11"
+      ],
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "our Ragged Page Attention (RPA) and Gated DeltaNet (GDN) fusions successfully achieve 79.6% of the theoretical HBM bandwidth limit / 677 tokens/s/chip / peak theoretical throughput of 978 tokens/s/chip (undiscounted) and a realistic, discounted serving roofline limit of 850 tokens/s/chip"
+    },
+    {
+      "id": "c14",
+      "claim_text": "hero 圖表換算值：undiscounted 下 prefill 效率 71.7%（3,707/5,170）",
+      "type": "number",
+      "load": "medium",
+      "independence": "single-source",
+      "note_ids": [
+        "n08",
+        "n10"
+      ],
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "note": "figcaption 明確標示「undiscounted 下的數字為依同一組實測值換算」，屬已標記推斷；原始輸入 3,707（n08）與 5,170（n10）皆逐字核實。",
+      "evidence": "作者換算值（figcaption 標示為依實測值換算）；原始輸入逐字核實：3,707 tokens/s/chip / estimated maximum theoretical roofline throughput of 5,170 tokens/s/chip (undiscounted), and 4,500 tokens/s/chip under standard scheduling de-rate factors"
+    },
+    {
+      "id": "c15",
+      "claim_text": "hero 圖表換算值：undiscounted 下 decode 效率 69.2%（677/978）",
+      "type": "number",
+      "load": "medium",
+      "independence": "single-source",
+      "note_ids": [
+        "n09",
+        "n11"
+      ],
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "note": "figcaption 標示為依同一組實測值換算，屬已標記推斷；原始輸入 677（n09）與 978（n11）皆逐字核實。",
+      "evidence": "作者換算值（figcaption 標示為依實測值換算）；原始輸入逐字核實：677 tokens/s/chip / peak theoretical throughput of 978 tokens/s/chip (undiscounted) and a realistic, discounted serving roofline limit of 850 tokens/s/chip"
+    },
+    {
+      "id": "c16",
+      "claim_text": "concurrency-512 下 decode step latency 從 428µs 壓到 283µs，33.8% kernel 級加速",
+      "type": "number",
+      "load": "high",
+      "independence": "single-source",
+      "note_ids": [
+        "n14"
+      ],
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "reduced the decode step latency under Concurrency-512 from 428µs to 283µs, achieving a 33.8% kernel-level speedup"
+    },
+    {
+      "id": "c17",
+      "claim_text": "KV block size 16→256（--block-size=256），massive indexing overhead 讓 VPU 停頓",
+      "type": "quote",
+      "load": "medium",
+      "independence": "single-source",
+      "note_ids": [
+        "n15"
+      ],
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "Legacy block size: 16 tokens ... Optimized block size: 256 tokens (via --block-size=256) ... massive indexing overhead ... Vector Processing Unit (VPU) to stall"
+    },
+    {
+      "id": "c18",
+      "claim_text": "單一 token step 跨 60 層總延遲 16.36 毫秒",
+      "type": "number",
+      "load": "medium",
+      "independence": "single-source",
+      "note_ids": [
+        "n16"
+      ],
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "The total execution latency across all 60 layers is calculated at 16.36 ms per token step"
+    },
+    {
+      "id": "c19",
+      "claim_text": "fractional head sharding（2/8 = 0.25 heads per device）physically impossible",
+      "type": "quote",
+      "load": "high",
+      "independence": "single-source",
+      "note_ids": [
+        "n17"
+      ],
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "fractional head sharding (2/8 = 0.25 heads per device), which is physically impossible on hardware"
+    },
+    {
+      "id": "c20",
+      "claim_text": "attention 複製一份（DP=8），MoE 切成 EP=8",
+      "type": "attribution",
+      "load": "high",
+      "independence": "single-source",
+      "note_ids": [
+        "n18"
+      ],
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "Hybrid sharding scheme...8-way Attention Batch Sharding (Data Parallelism, DP=8) combined with 8-way Expert Parallelism (EP=8)"
+    },
+    {
+      "id": "c21",
+      "claim_text": "512 個路由專家平均分到 8 個裝置，每台 64 個",
+      "type": "number",
+      "load": "medium",
+      "independence": "single-source",
+      "note_ids": [
+        "n19"
+      ],
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "512 routed experts...distributed evenly (64 experts per device)"
+    },
+    {
+      "id": "c22",
+      "claim_text": "400GB 級參數 footprint 會在每個節點重複放一份",
+      "type": "number",
+      "load": "medium",
+      "independence": "single-source",
+      "note_ids": [
+        "n20"
+      ],
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "duplicating the 400 GB parameter footprint across all nodes"
+    },
+    {
+      "id": "c23",
+      "claim_text": "三次 All-Gather 打包成兩次，routing metadata collective latency 砍半",
+      "type": "quote",
+      "load": "medium",
+      "independence": "single-source",
+      "note_ids": [
+        "n21"
+      ],
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "Stack, bitcast, and pack ... single dense 32-bit integer array ... Halving the routing metadata collective latency"
+    },
+    {
+      "id": "c24",
+      "claim_text": "intra-chip 共享記憶體快 6 倍；整批切成 2 到 4 個 micro-batch",
+      "type": "number",
+      "load": "medium",
+      "independence": "single-source",
+      "note_ids": [
+        "n22"
+      ],
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "6x faster shared-memory ... 2 to 4 micro-batches"
+    },
+    {
+      "id": "c25",
+      "claim_text": "Grouped GEMM v2 融合 SwiGLU + 512-subchannel FP8，消 VREG spills、VPU 吞吐翻倍",
+      "type": "causal",
+      "load": "medium",
+      "independence": "single-source",
+      "note_ids": [
+        "n23"
+      ],
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "single tile via dual DMA reads ... 512 subchannel activation quantization for FP8 operations ... eliminated VREG spills ... doubled vector arithmetic throughput on the VPU"
+    },
+    {
+      "id": "c26",
+      "claim_text": "GDN Causal Conv1D 融合，消掉 6 次 HBM 往返",
+      "type": "number",
+      "load": "medium",
+      "independence": "single-source",
+      "note_ids": [
+        "n24"
+      ],
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "Register-level sliding window algorithm that caches historical token states directly within the TPU's VPU registers ... Eliminated 6 redundant HBM round-trips"
+    },
+    {
+      "id": "c27",
+      "claim_text": "引用：decompose into self-contained independent building blocks + hardware-aware cost models",
+      "type": "quote",
+      "load": "high",
+      "independence": "single-source",
+      "note_ids": [
+        "n25"
+      ],
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "Rather than tackling models as monolithic systems, we decompose them into self-contained, independent building blocks (such as Batched RPA, Grouped GEMMs, and SparseCore unpermutation) accompanied by hardware-aware cost models."
+    },
+    {
+      "id": "c28",
+      "claim_text": "原生上下文 262,144 token，YaRN 可拉到超過 1,010,000",
+      "type": "number",
+      "load": "low",
+      "independence": "single-source",
+      "note_ids": [
+        "n27"
+      ],
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "Native context: 262,144 tokens, extensible to over 1,010,000 tokens using YaRN RoPE scaling"
+    },
+    {
+      "id": "c29",
+      "claim_text": "引用：bypasses heavily-padded unaligned intermediate tensors in HBM",
+      "type": "quote",
+      "load": "low",
+      "independence": "single-source",
+      "note_ids": [
+        "n28"
+      ],
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "Offloads routing to SparseCore's indirect addressing capabilities ... Bypasses heavily-padded, unaligned intermediate tensors in HBM, saving massive memory bandwidth"
+    },
+    {
+      "id": "c30",
+      "claim_text": "引用：completely skipped the expensive post-rank-1 matrix multiplication；FP32→BF16",
+      "type": "quote",
+      "load": "medium",
+      "independence": "single-source",
+      "note_ids": [
+        "n30"
+      ],
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "completely skipped the expensive post-rank-1 matrix multiplication ... Float32 to BFloat16 precision...doubled the vector arithmetic throughput on the VPU"
+    },
+    {
+      "id": "c31",
+      "claim_text": "引用：completely bypasses read/write intermediate activation tensors to VMEM or HBM",
+      "type": "quote",
+      "load": "low",
+      "independence": "single-source",
+      "note_ids": [
+        "n31"
+      ],
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "Single unified Pallas kernel combining causal 1D convolution and entire GDN recurrent block ... caches intermediate sequence and recurrent states directly within the local registers ... Completely bypasses the need to read and write intermediate activation tensors to VMEM or HBM"
+    },
+    {
+      "id": "c32",
+      "claim_text": "引用：Numerical Verification Layer；zero deviation from Float32 reference path",
+      "type": "quote",
+      "load": "high",
+      "independence": "single-source",
+      "note_ids": [
+        "n33"
+      ],
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "action": "none",
+      "resolution": "none-needed",
+      "evidence": "incorporated a dedicated Numerical Verification Layer to audit accumulation precision ... verified that our Pallas-lowered gating weights maintain zero deviation from the high-precision Float32 reference path"
+    }
+  ],
   "checked_at": "2026-07-15",
-  "checker_rounds": 0,
-  "coverage": { "candidate_claims": 33, "checked": 0, "dropped_low_load": 0 }
+  "checker_rounds": 1,
+  "coverage": {
+    "candidate_claims": 33,
+    "checked": 32,
+    "dropped_low_load": 1
+  }
 }
