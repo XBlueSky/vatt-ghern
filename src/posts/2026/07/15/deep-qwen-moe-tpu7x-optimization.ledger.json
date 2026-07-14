@@ -1,0 +1,296 @@
+{
+  "output_path": "src/posts/2026/07/15/deep-qwen-moe-tpu7x-optimization.html",
+  "spine": [
+    "1. Qwen3.5-397B 是 397B 參數、每 token 只點亮 17B（4.3% 稀疏度）的 MoE：60 層裡 3 層 Gated DeltaNet 線性注意力配 1 層 GQA，都掛著 512 個路由專家（top-10）加 1 個永遠執行的共享專家。",
+    "2. Ironwood TPU v7x 每 chip 2 個 Tensor Core、4 個 MXU，FP8 尖峰 4,614 TFLOPS、192GB HBM——這組硬體規格決定了 roofline 天花板在哪。",
+    "3. 8-way tensor parallelism 撞上只有 2 個 KV head：2/8=0.25 個 head/device 物理上切不出來，逼團隊放棄 TP，改用 DP=8（attention 整份複製）+ EP=8（512 個專家平均分到 8 device，每台 64 個），代價是要另外扛 400GB 參數不重複複製的記憶體設計。",
+    "4. Kernel 層動手術：Ragged Page Attention 的 KV block size 從 16 拉到 256，decode latency 在 concurrency-512 下從 428µs 砍到 283µs（省 33.8%）；Grouped GEMM v2 把 SwiGLU 與 512-subchannel FP8 量化融合進單一 tile；GDN 的 Causal Conv1D 直接在 VPU 暫存器裡做完，省掉 6 次 HBM 來回。",
+    "5. 集體通信也瘦身：3 次 All-Gather 打包成 2 次（routing metadata 的 collective latency 減半）；Reduce-Scatter 拆成 intra-chip（快 6 倍）與 inter-chip 兩階段、用 2–4 個 micro-batch 做 pipeline。",
+    "6. 結果攤在 concurrency 64：prefill-heavy 實測 3,707 tokens/s/chip，摸到 discounted roofline（4,500）的 82.4%；decode-heavy 677 tokens/s/chip，摸到 discounted roofline（850）的 79.6%。512 concurrency 下整體對比 4 月的舊版拿到 4.7x（prefill）／3.1x（decode）加速。",
+    "7. 工程哲學：不是重新調一次模型，而是把系統拆成可重用的獨立 building block（Batched RPA、Grouped GEMMs、SparseCore unpermutation）配 hardware-aware cost model，讓下一個 MoE 模型不必再從零開始 trial-and-error。"
+  ],
+  "sources": [
+    {
+      "url": "https://developers.googleblog.com/en/systems-engineering-playbook-optimizing-qwen-35-397b-moe-on-ironwood-tpu7x/",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": null,
+      "perspective": {
+        "mechanism": "把 MoE 推論優化拆解成三層各自可驗證的問題：平行拓樸（TP vs DP+EP）、Pallas 客製 kernel（RPA、GMM v2、GDN 融合）、分散式集體通訊（All-Gather、Reduce-Scatter），每層都對著 roofline model 算出理論天花板再量測實測落點。",
+        "tradeoff": "放棄 tensor parallelism 這種心智模型簡單、已有大量現成工具鏈支援的切法，換成因為稀疏路由與極端 KV head 數（Nkv=2）量身訂做的 DP+EP 混合切分——代價是切分邏輯更複雜、需要額外的 Numerical Verification Layer 去確認 Pallas 降階後的數值沒有偏離 FP32 參考路徑。",
+        "reader_use": "台灣工程師若要在自家 TPU/GPU 叢集上部署類似結構（高稀疏度 MoE + 混合線性注意力）的模型，可以照抄這套「先用 roofline 定位是 compute-bound 還是 memory-bound、再依此決定該動 kernel 還是動平行拓樸、最後才處理集體通訊」的診斷順序，而不必等到供應商或原廠釋出現成方案。"
+      }
+    }
+  ],
+  "notes": [
+    {
+      "id": "n01",
+      "url": "https://developers.googleblog.com/en/systems-engineering-playbook-optimizing-qwen-35-397b-moe-on-ironwood-tpu7x/",
+      "quote": "397 billion total parameters ... exactly 17 billion parameters per token per forward pass ... 4.3% routing activation ratio",
+      "hedge": "asserted",
+      "interpretation": "模型總參數與每 token 實際啟動參數的比例定義了稀疏度，這是後續一切平行策略與 kernel 設計要繞著走的核心事實。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n02",
+      "url": "https://developers.googleblog.com/en/systems-engineering-playbook-optimizing-qwen-35-397b-moe-on-ironwood-tpu7x/",
+      "quote": "3 consecutive layers ... of Gated DeltaNet (GDN) with MoE, then 1 layer of standard GQA coupled with routed sparse MoE",
+      "hedge": "asserted",
+      "interpretation": "60 層裡是 3:1 的 GDN 線性注意力對 GQA 混合比例，不是單一注意力機制貫穿全模型。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n03",
+      "url": "https://developers.googleblog.com/en/systems-engineering-playbook-optimizing-qwen-35-397b-moe-on-ironwood-tpu7x/",
+      "quote": "64 linear attention heads for Values (V) and 16 heads for Queries and Keys (QK) with a head dimension of 128",
+      "hedge": "asserted",
+      "interpretation": "GDN 層 V 與 QK 的 head 數不對稱，是線性注意力常見的設計，決定了它在硬體上的記憶體佈局需求。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n04",
+      "url": "https://developers.googleblog.com/en/systems-engineering-playbook-optimizing-qwen-35-397b-moe-on-ironwood-tpu7x/",
+      "quote": "32 query heads (Nq=32) and exactly 2 key-value (KV) heads (Nkv=2)",
+      "hedge": "asserted",
+      "interpretation": "GQA 層只有 2 個 KV head，這個小數字正是後面 8-way tensor parallelism 切不動的物理原因。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n05",
+      "url": "https://developers.googleblog.com/en/systems-engineering-playbook-optimizing-qwen-35-397b-moe-on-ironwood-tpu7x/",
+      "quote": "512 small experts with an intermediate expert dimension of 1024 ... Top 10 routed experts via a soft-max probability distribution ... one shared expert path that is always executed",
+      "hedge": "asserted",
+      "interpretation": "512 選 10 的路由加上恆定執行的共享專家，決定了 EP=8 切分時每台裝置要放 64 個專家。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n06",
+      "url": "https://developers.googleblog.com/en/systems-engineering-playbook-optimizing-qwen-35-397b-moe-on-ironwood-tpu7x/",
+      "quote": "Tensor Core (TC) Frequency: 2.2 GHz ... 2 Tensor Cores per chip ... 2 MXUs (Matrix Execution Units) per TC ... Peak FP8 performance: 4,614 TFLOPS/chip ... 192GB of HBM capacity per chip",
+      "hedge": "asserted",
+      "interpretation": "Ironwood 每 chip 4 個 MXU、FP8 尖峰 4,614 TFLOPS、192GB HBM，這組數字是 roofline 天花板計算的輸入。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n07",
+      "url": "https://developers.googleblog.com/en/systems-engineering-playbook-optimizing-qwen-35-397b-moe-on-ironwood-tpu7x/",
+      "quote": "The optimizations discussed below allowed us to improve inference performance by approximately 3.1x for Decode-heavy and by approximately 4.7x for Prefill-heavy workloads (512 Concurrency tier) between April and June 2026.",
+      "hedge": "hedged",
+      "interpretation": "這是整篇文章的頭號數字：512 concurrency 下，四月到六月之間，decode-heavy 提速約 3.1 倍、prefill-heavy 約 4.7 倍。沒有給出對照組的絕對吞吐數字，只有倍數。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n08",
+      "url": "https://developers.googleblog.com/en/systems-engineering-playbook-optimizing-qwen-35-397b-moe-on-ironwood-tpu7x/",
+      "quote": "3,707 tokens/s/chip",
+      "hedge": "asserted",
+      "interpretation": "Prefill-heavy（8K/1K）在 concurrency 64 下的實測吞吐量。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n09",
+      "url": "https://developers.googleblog.com/en/systems-engineering-playbook-optimizing-qwen-35-397b-moe-on-ironwood-tpu7x/",
+      "quote": "677 tokens/s/chip",
+      "hedge": "asserted",
+      "interpretation": "Decode-heavy（1K/8K）在 concurrency 64 下的實測吞吐量。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n10",
+      "url": "https://developers.googleblog.com/en/systems-engineering-playbook-optimizing-qwen-35-397b-moe-on-ironwood-tpu7x/",
+      "quote": "estimated maximum theoretical roofline throughput of 5,170 tokens/s/chip (undiscounted), and 4,500 tokens/s/chip under standard scheduling de-rate factors",
+      "hedge": "hedged",
+      "interpretation": "Prefill-heavy 在 concurrency 64 下的兩種理論上限：未打折的 5,170，實務排程打折後的 4,500。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n11",
+      "url": "https://developers.googleblog.com/en/systems-engineering-playbook-optimizing-qwen-35-397b-moe-on-ironwood-tpu7x/",
+      "quote": "peak theoretical throughput of 978 tokens/s/chip (undiscounted) and a realistic, discounted serving roofline limit of 850 tokens/s/chip",
+      "hedge": "hedged",
+      "interpretation": "Decode-heavy 在 concurrency 64 下的兩種理論上限：未打折的 978，打折後的 850。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n12",
+      "url": "https://developers.googleblog.com/en/systems-engineering-playbook-optimizing-qwen-35-397b-moe-on-ironwood-tpu7x/",
+      "quote": "our custom SparseCore and TensorCore co-designed GEMMs successfully extract 82.4% of the absolute compute capacity",
+      "hedge": "asserted",
+      "interpretation": "Prefill-heavy 相對 discounted roofline（4,500）的效率，官方自己算的百分比。3,707/4,500=82.4% 吻合。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n13",
+      "url": "https://developers.googleblog.com/en/systems-engineering-playbook-optimizing-qwen-35-397b-moe-on-ironwood-tpu7x/",
+      "quote": "our Ragged Page Attention (RPA) and Gated DeltaNet (GDN) fusions successfully achieve 79.6% of the theoretical HBM bandwidth limit",
+      "hedge": "asserted",
+      "interpretation": "Decode-heavy 相對 discounted roofline（850）的效率。677/850=79.6% 吻合。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n14",
+      "url": "https://developers.googleblog.com/en/systems-engineering-playbook-optimizing-qwen-35-397b-moe-on-ironwood-tpu7x/",
+      "quote": "reduced the decode step latency under Concurrency-512 from 428µs to 283µs, achieving a 33.8% kernel-level speedup",
+      "hedge": "asserted",
+      "interpretation": "RPA block size 從 16 調到 256 之後，concurrency-512 下的 decode step latency 改善量。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n15",
+      "url": "https://developers.googleblog.com/en/systems-engineering-playbook-optimizing-qwen-35-397b-moe-on-ironwood-tpu7x/",
+      "quote": "Legacy block size: 16 tokens ... Optimized block size: 256 tokens (via --block-size=256) ... massive indexing overhead ... Vector Processing Unit (VPU) to stall",
+      "hedge": "asserted",
+      "interpretation": "block size 太小導致大量索引開銷、讓 VPU 停頓，是延遲改善的根本原因，不只是調參數。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n16",
+      "url": "https://developers.googleblog.com/en/systems-engineering-playbook-optimizing-qwen-35-397b-moe-on-ironwood-tpu7x/",
+      "quote": "The total execution latency across all 60 layers is calculated at 16.36 ms per token step",
+      "hedge": "asserted",
+      "interpretation": "Decode-heavy 情境下單一 token step 跨越全部 60 層的總延遲。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n17",
+      "url": "https://developers.googleblog.com/en/systems-engineering-playbook-optimizing-qwen-35-397b-moe-on-ironwood-tpu7x/",
+      "quote": "fractional head sharding (2/8 = 0.25 heads per device), which is physically impossible on hardware",
+      "hedge": "asserted",
+      "interpretation": "8-way tensor parallelism 撞上只有 2 個 KV head 時，切出來的 0.25 個 head/device 無法在硬體上存在，這是放棄傳統 TP 的直接理由。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n18",
+      "url": "https://developers.googleblog.com/en/systems-engineering-playbook-optimizing-qwen-35-397b-moe-on-ironwood-tpu7x/",
+      "quote": "Hybrid sharding scheme...8-way Attention Batch Sharding (Data Parallelism, DP=8) combined with 8-way Expert Parallelism (EP=8)",
+      "hedge": "asserted",
+      "interpretation": "取代方案：attention 部分整份複製到 8 個裝置（DP=8），MoE 部分改用 8-way 專家平行（EP=8）。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n19",
+      "url": "https://developers.googleblog.com/en/systems-engineering-playbook-optimizing-qwen-35-397b-moe-on-ironwood-tpu7x/",
+      "quote": "512 routed experts...distributed evenly (64 experts per device)",
+      "hedge": "asserted",
+      "interpretation": "512 個路由專家平均分配到 8 個裝置，每台裝 64 個。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n20",
+      "url": "https://developers.googleblog.com/en/systems-engineering-playbook-optimizing-qwen-35-397b-moe-on-ironwood-tpu7x/",
+      "quote": "duplicating the 400 GB parameter footprint across all nodes",
+      "hedge": "asserted",
+      "interpretation": "如果硬套 tensor parallelism 式的整份複製，會在每個節點重複放一份 400GB 的參數，這是 DP+EP 混合設計要避免的記憶體代價。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n21",
+      "url": "https://developers.googleblog.com/en/systems-engineering-playbook-optimizing-qwen-35-397b-moe-on-ironwood-tpu7x/",
+      "quote": "Stack, bitcast, and pack ... single dense 32-bit integer array ... Halving the routing metadata collective latency",
+      "hedge": "asserted",
+      "interpretation": "原本三次獨立的 All-Gather（token hidden dims、專家索引、gating 權重）被打包成一次跟原本的 hidden-dim All-Gather，減少到兩次呼叫，讓 routing metadata 的 collective 延遲減半。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n22",
+      "url": "https://developers.googleblog.com/en/systems-engineering-playbook-optimizing-qwen-35-397b-moe-on-ironwood-tpu7x/",
+      "quote": "6x faster shared-memory ... 2 to 4 micro-batches",
+      "hedge": "asserted",
+      "interpretation": "Reduce-Scatter 拆成 intra-chip（共享記憶體，快 6 倍）與 inter-chip（跨 ICI 遞迴倍增）兩階段，並用 2 到 4 個 micro-batch 做 DMA 與計算的 pipeline 重疊。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n23",
+      "url": "https://developers.googleblog.com/en/systems-engineering-playbook-optimizing-qwen-35-397b-moe-on-ironwood-tpu7x/",
+      "quote": "single tile via dual DMA reads ... 512 subchannel activation quantization for FP8 operations ... eliminated VREG spills ... doubled vector arithmetic throughput on the VPU",
+      "hedge": "asserted",
+      "interpretation": "Grouped GEMM v2 把 SwiGLU 的 gating 與 up-projection 融合進單一 tile、搭配 512-subchannel 的 FP8 量化，省掉暫存器溢位、讓 VPU 的向量運算吞吐量翻倍。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n24",
+      "url": "https://developers.googleblog.com/en/systems-engineering-playbook-optimizing-qwen-35-397b-moe-on-ironwood-tpu7x/",
+      "quote": "Register-level sliding window algorithm that caches historical token states directly within the TPU's VPU registers ... Eliminated 6 redundant HBM round-trips",
+      "hedge": "asserted",
+      "interpretation": "GDN 的 Causal Conv1D 原本要把中間結果寫回 HBM 再讀出，融合後歷史 token 狀態直接留在 VPU 暫存器裡，省掉 6 次 HBM 往返。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n25",
+      "url": "https://developers.googleblog.com/en/systems-engineering-playbook-optimizing-qwen-35-397b-moe-on-ironwood-tpu7x/",
+      "quote": "Rather than tackling models as monolithic systems, we decompose them into self-contained, independent building blocks (such as Batched RPA, Grouped GEMMs, and SparseCore unpermutation) accompanied by hardware-aware cost models.",
+      "hedge": "asserted",
+      "interpretation": "團隊自述的方法論核心：把模型拆成可重用的獨立 building block，各自配上硬體感知的 cost model，而非把模型當整體去調。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n26",
+      "url": "https://developers.googleblog.com/en/systems-engineering-playbook-optimizing-qwen-35-397b-moe-on-ironwood-tpu7x/",
+      "quote": "Deploying and serving a Mixture-of-Experts (MoE) model like Qwen3.5-397B...requires a disciplined, first-principles engineering methodology over empirical trial-and-error modifications. ... Engineering teams can no longer afford to spend months optimizing each new model family in isolation...our performance team has pioneered a modular, model-agnostic optimization strategy.",
+      "hedge": "asserted",
+      "interpretation": "團隊把這套方法定位成對抗「每個新模型都要重跑幾個月 trial-and-error」的解法，目標是模組化、可跨模型重用。",
+      "timeliness": "durable"
+    }
+    ,
+    {
+      "id": "n27",
+      "url": "https://developers.googleblog.com/en/systems-engineering-playbook-optimizing-qwen-35-397b-moe-on-ironwood-tpu7x/",
+      "quote": "Native context: 262,144 tokens, extensible to over 1,010,000 tokens using YaRN RoPE scaling",
+      "hedge": "asserted",
+      "interpretation": "模型原生上下文與 YaRN 擴展後的上限，用來說明長上下文情境下記憶體成長的壓力。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n28",
+      "url": "https://developers.googleblog.com/en/systems-engineering-playbook-optimizing-qwen-35-397b-moe-on-ironwood-tpu7x/",
+      "quote": "Offloads routing to SparseCore's indirect addressing capabilities ... Bypasses heavily-padded, unaligned intermediate tensors in HBM, saving massive memory bandwidth",
+      "hedge": "asserted",
+      "interpretation": "MoE 路由運算被搬到 TPU 的 SparseCore 硬體單元上執行，繞開通用矩陣運算單元在稀疏 gather/scatter 上的填充浪費。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n29",
+      "url": "https://developers.googleblog.com/en/systems-engineering-playbook-optimizing-qwen-35-397b-moe-on-ironwood-tpu7x/",
+      "quote": "Groups multiple decode streams into single Pallas kernel ... Amortizing VPU instruction dispatch latency, breaking the data dependency stalls of sequential requests, and improving memory alignment",
+      "hedge": "asserted",
+      "interpretation": "Batched RPA 把多個獨立 decode stream 打包進同一次 kernel 呼叫，用來攤薄單次呼叫的固定開銷。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n30",
+      "url": "https://developers.googleblog.com/en/systems-engineering-playbook-optimizing-qwen-35-397b-moe-on-ironwood-tpu7x/",
+      "quote": "completely skipped the expensive post-rank-1 matrix multiplication ... Float32 to BFloat16 precision...doubled the vector arithmetic throughput on the VPU",
+      "hedge": "asserted",
+      "interpretation": "GDN 遞迴公式重新推導後省掉一次矩陣乘法，同時把遞迴狀態變數的精度從 FP32 降到 BF16，讓 VPU 向量運算吞吐量再翻倍。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n31",
+      "url": "https://developers.googleblog.com/en/systems-engineering-playbook-optimizing-qwen-35-397b-moe-on-ironwood-tpu7x/",
+      "quote": "Single unified Pallas kernel combining causal 1D convolution and entire GDN recurrent block ... caches intermediate sequence and recurrent states directly within the local registers ... Completely bypasses the need to read and write intermediate activation tensors to VMEM or HBM",
+      "hedge": "asserted",
+      "interpretation": "比前面提到的 Conv1D 融合更進一步的完全融合版本，連 VMEM 層級的讀寫都被跳過，不只是 HBM。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n32",
+      "url": "https://developers.googleblog.com/en/systems-engineering-playbook-optimizing-qwen-35-397b-moe-on-ironwood-tpu7x/",
+      "quote": "Custom memory layout aligning GDN recurrent state and GQA KV cache together ... reclaiming critical HBM headroom",
+      "hedge": "asserted",
+      "interpretation": "把 GDN 的遞迴狀態與 GQA 的 KV cache 用同一種記憶體佈局對齊排列，減少 padding 與碎片化。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n33",
+      "url": "https://developers.googleblog.com/en/systems-engineering-playbook-optimizing-qwen-35-397b-moe-on-ironwood-tpu7x/",
+      "quote": "incorporated a dedicated Numerical Verification Layer to audit accumulation precision ... verified that our Pallas-lowered gating weights maintain zero deviation from the high-precision Float32 reference path",
+      "hedge": "asserted",
+      "interpretation": "所有降精度、融合、重寫的改動之外，團隊額外加了一層持續比對高精度 FP32 參考路徑的驗證機制，確認 gating 權重沒有偏差。",
+      "timeliness": "durable"
+    }
+  ],
+  "claims": [],
+  "checked_at": "2026-07-15",
+  "checker_rounds": 0,
+  "coverage": { "candidate_claims": 33, "checked": 0, "dropped_low_load": 0 }
+}

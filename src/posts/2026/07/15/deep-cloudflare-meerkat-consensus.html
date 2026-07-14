@@ -1,0 +1,541 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">Cloudflare 自己承認過，跨資料中心的共識系統掛過不只一次，原因都一樣——leader 不見了。Meerkat 想解決的問題很直白：把「一定要先選出一個 leader」這個假設，從共識演算法裡整個拿掉。</p>
+  <h1 class="vg-post-title">Cloudflare Meerkat：拿掉 leader 的全球共識</h1>
+</header>
+
+<div class="vg-post-prose">
+
+<p><span class="vg-dropcap">看</span>完這篇，你會知道 Raft 為什麼在廣域網路上難搞、QuePaxa 怎麼在沒有 leader 的情況下讓好幾個副本對同一個 slot 收斂出同一個結果，以及 Cloudflare 現在打算拿這套機制做什麼——還有它現在還做不到什麼。</p>
+
+<h2>一個 leader 消失，330+ 座資料中心的控制平面會怎樣</h2>
+
+<p>Cloudflare Research 最近公開了一套內部共識服務，叫 Meerkat。它要解決的問題本身不新：「Many internal services at Cloudflare need to read and modify the same control-plane state from across our 330+ global data centers.」——內部很多服務要同時讀寫同一份控制平面狀態，而這份狀態散布在超過三百三十座資料中心。控制平面狀態不是使用者資料，是系統自己用來運作的中繼資訊，比方說哪台機器現在有權對某個資料庫寫入，或某個 AI model instance 現在放在哪一台機器上。</p>
+
+<p>要讓分散在全球的多份副本對同一份狀態達成共識，標準做法是跑一套共識演算法，Raft、Multi-Paxos 這類。這些演算法的共同設計是：先選出一個 leader，所有寫入都先過 leader，leader 負責替寫入排序、負責把結果複製到其他副本。這套設計在單一機房裡表現得很好，機房內部延遲穩定又低，leader 幾乎不會失聯。問題是 Cloudflare 自己踩過的坑很具體：「We have experienced multiple incidents caused by unavailable leaders in consensus-driven systems.」——leader 連不上不是理論風險，是實際發生過不只一次的事故，而且是跨資料中心規模下才會浮現的那種事故。</p>
+
+<p>這類狀態如果只放在單一資料中心，共識問題根本不會出現——一台機器自己記帳，不需要跟誰對齊。真正麻煩的是「哪台機器現在有權處理某個 key」這種資訊本身也要被複製到多個資料中心，才耐得住區域性故障；複製之後又必須保證所有讀到這份狀態的服務看到同一個答案，不然兩個資料中心可能同時以為自己拿到了寫入權，各自基於不同版本的事實做決定，卻都覺得自己是對的。這正是分散式系統裡最常見、也最難事後排查的一類 bug：兩邊都合理，只是各自的認知已經分岔。</p>
+
+<h2>Raft 的 timeout 邏輯，在廣域網路上是道死結</h2>
+
+<p>Raft 判斷 leader 是否還活著，靠的是 timeout：副本定期等 leader 送心跳，等不到就發起選舉，選一個新的 leader 出來。這套機制在同一個機房裡很好用，因為機器之間的延遲穩定又低，timeout 可以設得又緊又準——leader 真的斷線，幾十毫秒內就能偵測到。問題出在跨資料中心的距離：洲際延遲有時候幾十毫秒，有時候因為路由抖動衝到幾百毫秒，同一條連線今天量測起來正常，明天可能就卡在某個中繼節點上。</p>
+
+<p>timeout 設太短，正常的延遲抖動就會被誤判成 leader 掛了，觸發不必要的重新選舉，讓一個好端端的 leader 被拉下台；設太長，leader 真的掛掉的時候，叢集要等好一陣子才會發現、才會開始選新 leader——這段空窗期裡，整個系統對外表現就是不可寫入。Cloudflare 把這個困境叫「the 'tyranny of timeouts' imposed by protocols like Raft」——timeout 的暴政。不管怎麼調參數，廣域網路的延遲分布太寬，總有一個 timeout 值會在某個延遲尖峰被判斷錯誤。這不是工程沒調好，是 leader-based 設計在跨洲距離下的結構性代價：只要系統的進度綁在一個特定副本身上，那個副本的連線狀態，就變成了整個系統的單點瓶頸。</p>
+
+<p>實務上調 Raft 的 election timeout，常見做法是抓「觀察到的最大延遲乘以一個安全係數」，比方說平常兩百毫秒的心跳間隔配上一到兩秒的 timeout。這組參數擺在同一個機房裡綽綽有餘，換成跨洲連線，安全係數往往要拉到五倍以上才夠穩；而拉高安全係數的直接代價，是 leader 真正掛掉的時候，叢集要多等好幾秒才會反應過來。調得越保守，平時越穩，故障時的空窗期也越長，這條 trade-off 曲線在單一機房裡幾乎摸不到，只有把規模拉開到全球，才會冒出來。</p>
+
+<h2>QuePaxa：不選 leader，讓提案彼此建設性干涉</h2>
+
+<p>Meerkat 的共識演算法叫 QuePaxa，設計上直接迴避了「先選 leader」這一步。核心想法很簡單：任何一個副本，在任何時刻，都可以針對某個 slot 發起提案，不用等自己被選為 leader，也不用等目前的 leader 授權。多個副本同時對同一個 slot 提案時，「Concurrent proposals made by different replicas constructively interfere, unlike Raft's leadership elections.」——並行的提案彼此建設性干涉，不是互相排擠。Raft 的選舉是零和的：兩個候選人搶同一個任期，只有一個贏，輸的那個提案整個作廢重來；QuePaxa 的提案是可以疊加的，多個提案的訊息交換過程互相幫助收斂，而不是互相取消。</p>
+
+<p>沒有 leader，並不代表沒有紀律。所有副本共同維護一份複製 log，log 是一串 slot 組成的序列，每個 slot 裡面要嘛是空的，要嘛裝著一個已經決定的值。整套系統唯一不能違反的規則是：「if any two replicas decide on the value for a slot, those values are the same」——只要有任何兩個副本各自認定某個 slot 已經決定，它們認定的值一定相同。leader-based 系統靠「所有寫入先過 leader」來保證這件事；QuePaxa 靠多數決集合彼此重疊的性質來保證——只要任兩次達成多數決的副本集合一定有交集，交集裡的副本會擋下互相矛盾的兩個值，不讓第二個值也被判定為已決定。</p>
+
+<p>要做到「兩個副本判定同一個值」這件事，QuePaxa 靠的是跟經典 Paxos 一樣的兩階段結構：先用一輪訊息確認「這個 slot 上，沒有比我手上更新的提案在進行」，再用第二輪訊息把值真正釘死。差別在於，傳統 leader-based 系統把「誰有資格發起這兩輪」收斂成一個人；QuePaxa 允許任何副本隨時發起，靠訊息裡帶的版本號排序，而不是靠「誰是 leader」這個外部狀態去排序。</p>
+
+<p>這套設計不是空口白話。QuePaxa 論文的作者用刻意製造高延遲、高故障率的環境跑過模擬：「The authors found that it maintains much higher (~10x) throughput than Raft and Multi-Paxos during such conditions.」——在那種對 leader 選舉最不利的條件下，QuePaxa 的吞吐量比 Raft 和 Multi-Paxos 高了大約十倍。這是 QuePaxa 論文本身的實驗結果，Cloudflare 引用它來說明設計動機，並不是 Cloudflare 在 Meerkat 上重新量出來的數字。這個區別要記住：十倍是在「刻意製造高延遲、高故障」的對抗條件下量到的，不是說任何情況下 QuePaxa 都比 Raft 快十倍。在延遲穩定、leader 不太會掉的環境裡，兩者的差距會小很多——QuePaxa 的優勢本來就集中在 Raft 最脆弱的那個場景，也就是廣域網路下 leader 反覆失聯的時候。</p>
+
+<p>下面這個模擬把「建設性干涉」畫成一個可以看的東西：七個副本圍成一圈，沒有固定的 leader，任何一個都可能發起提案。把畫面裡那個「慣用提案者」殺掉，看看叢集的決議速度會不會腰斬——這正是 Cloudflare 自己在概念驗證叢集裡觀察到的現象：「Leaders in our proof-of-concept clusters constantly fail, and the cluster keeps operating with no increase in error-rate. We have run multiple proofs-of-concept with up to 50 replicas distributed around the world, to great success.」</p>
+
+<figure class="vg-w-canvas-meerkat-quorum" data-mobile="swap" data-mobile-summary="沒有 leader 時，任何副本都能發起提案，只要達到多數決就能判定 slot 的值。把慣用的提案者殺掉，決議速度也不會因此變慢。">
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="m9 9 5 12 1.8-5.2L21 14Z"/>
+      <path d="M7.2 2.2 8 5.1"/>
+      <path d="m5.1 8-2.9-.8"/>
+      <path d="M14 4.1 12 6"/>
+      <path d="m6 12-1.9 2"/>
+    </svg>
+    <span>播放模擬、切換慣用提案者存活狀態 · 7 個副本</span>
+  </p>
+  <style>
+    .vg-w-canvas-meerkat-quorum { display: grid; grid-template-rows: auto 1fr auto; gap: var(--s-2); }
+    .vg-w-canvas-meerkat-quorum .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+    .vg-w-canvas-meerkat-quorum button { font-family: var(--sans); font-size: var(--fs-sm); padding: 6px 14px; min-height: 44px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); cursor: pointer; }
+    .vg-w-canvas-meerkat-quorum button:hover { border-color: var(--accent); color: var(--accent-text); }
+    .vg-w-canvas-meerkat-quorum button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent-text); background: color-mix(in srgb, var(--accent) 14%, var(--bg)); }
+    .vg-w-canvas-meerkat-quorum canvas { width: 100%; height: auto; aspect-ratio: 16 / 9; display: block; }
+    .vg-w-canvas-meerkat-quorum figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    @media (max-width: 720px) {
+      .vg-w-canvas-meerkat-quorum canvas { aspect-ratio: 4 / 3; }
+    }
+  </style>
+
+  <div class="toolbar" data-vg-controls>
+    <button id="vg-w-canvas-meerkat-quorum-toggle">▷ 播放</button>
+    <button id="vg-w-canvas-meerkat-quorum-reset">↺ 重置</button>
+    <button id="vg-w-canvas-meerkat-quorum-kill" aria-pressed="false">殺掉慣用提案者</button>
+    <span style="margin-left: auto" id="vg-w-canvas-meerkat-quorum-clock">t = 0.0s · 已決定 0 個 slot</span>
+  </div>
+
+  <canvas id="vg-w-canvas-meerkat-quorum-canvas"></canvas>
+
+  <figcaption>七個副本圍成一圈，任何一個都可能發起提案並拉多數副本表態。殺掉慣用提案者後，其餘副本接手，決定 slot 的速度不會歸零。</figcaption>
+
+  <script>
+  (function () {
+    if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+    const root = document.querySelector('.vg-w-canvas-meerkat-quorum');
+    const canvas = root.querySelector('canvas');
+    const toggleBtn = root.querySelector('#vg-w-canvas-meerkat-quorum-toggle');
+    const resetBtn = root.querySelector('#vg-w-canvas-meerkat-quorum-reset');
+    const killBtn = root.querySelector('#vg-w-canvas-meerkat-quorum-kill');
+    const clock = root.querySelector('#vg-w-canvas-meerkat-quorum-clock');
+    const ctx = canvas.getContext('2d');
+
+    function cssVar(name) {
+      return getComputedStyle(root).getPropertyValue(name).trim() || '#888';
+    }
+
+    function resize() {
+      const dpr = window.devicePixelRatio || 1;
+      const rect = canvas.getBoundingClientRect();
+      canvas.width = Math.max(1, rect.width * dpr);
+      canvas.height = Math.max(1, rect.height * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+    new ResizeObserver(resize).observe(canvas);
+    resize();
+
+    const N = 7;
+    const USUAL = 0;
+    let running = false;
+    let killed = false;
+    let t = 0;
+    let decided = 0;
+    let nextProposalAt = 0.8;
+    let pulses = [];
+    let logStrip = [];
+
+    function shuffle(arr) {
+      for (let i = arr.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [arr[i], arr[j]] = [arr[j], arr[i]];
+      }
+      return arr;
+    }
+
+    function pickProposer() {
+      if (!killed && Math.random() < 0.65) return USUAL;
+      let idx;
+      do { idx = Math.floor(Math.random() * N); } while (killed && idx === USUAL);
+      return idx;
+    }
+
+    function step(dt) {
+      t += dt;
+      if (t >= nextProposalAt) {
+        const proposer = pickProposer();
+        const others = [];
+        for (let i = 0; i < N; i++) if (i !== proposer) others.push(i);
+        shuffle(others);
+        const targets = others.slice(0, 3);
+        pulses.push({ start: t, proposer, targets, resolved: false });
+        nextProposalAt = t + 0.75 + Math.random() * 0.55;
+      }
+      pulses.forEach((p) => {
+        if (!p.resolved && t - p.start > 0.62) {
+          p.resolved = true;
+          decided += 1;
+          logStrip.push(decided);
+          if (logStrip.length > 26) logStrip.shift();
+        }
+      });
+      pulses = pulses.filter((p) => t - p.start < 0.9);
+    }
+
+    function positions(W, H) {
+      const cx = W / 2, cy = H * 0.42, r = Math.min(W, H) * 0.32;
+      const pts = [];
+      for (let i = 0; i < N; i++) {
+        const a = (Math.PI * 2 * i) / N - Math.PI / 2;
+        pts.push({ x: cx + r * Math.cos(a), y: cy + r * Math.sin(a) });
+      }
+      return pts;
+    }
+
+    function draw() {
+      const W = canvas.getBoundingClientRect().width;
+      const H = canvas.getBoundingClientRect().height;
+      ctx.clearRect(0, 0, W, H);
+      const pts = positions(W, H);
+
+      ctx.font = '13px "Manrope", sans-serif';
+      ctx.fillStyle = cssVar('--muted');
+      ctx.fillText('replica ring · no fixed leader', 12, 18);
+
+      pulses.forEach((p) => {
+        const age = t - p.start;
+        const prog = Math.min(1, age / 0.62);
+        const from = pts[p.proposer];
+        p.targets.forEach((ti) => {
+          const to = pts[ti];
+          const mx = from.x + (to.x - from.x) * prog;
+          const my = from.y + (to.y - from.y) * prog;
+          ctx.strokeStyle = cssVar('--accent');
+          ctx.globalAlpha = 0.55;
+          ctx.lineWidth = 1.5;
+          ctx.beginPath();
+          ctx.moveTo(from.x, from.y);
+          ctx.lineTo(mx, my);
+          ctx.stroke();
+          ctx.globalAlpha = 1;
+        });
+      });
+
+      pts.forEach((p, i) => {
+        const isUsual = i === USUAL;
+        const isDead = isUsual && killed;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, isDead ? 9 : 11, 0, Math.PI * 2);
+        ctx.fillStyle = isDead ? cssVar('--bg-soft') : cssVar('--bg');
+        ctx.fill();
+        ctx.lineWidth = isUsual ? 2.5 : 1.5;
+        ctx.strokeStyle = isDead ? cssVar('--muted-2') : (isUsual ? cssVar('--sage-deep') : cssVar('--ink'));
+        if (isDead) ctx.setLineDash([3, 3]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      });
+
+      const stripY = H - 22;
+      const boxW = 12, gap = 3;
+      const shown = logStrip.slice(-Math.floor(W / (boxW + gap)));
+      shown.forEach((_, i) => {
+        ctx.fillStyle = cssVar('--sage-deep');
+        ctx.globalAlpha = 0.85;
+        ctx.fillRect(12 + i * (boxW + gap), stripY, boxW, 12);
+      });
+      ctx.globalAlpha = 1;
+    }
+
+    let last = performance.now();
+    function frame(now) {
+      const dt = Math.min(0.1, (now - last) / 1000);
+      last = now;
+      if (running) step(dt);
+      draw();
+      clock.textContent = `t = ${t.toFixed(1)}s · 已決定 ${decided} 個 slot`;
+      requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+
+    toggleBtn.addEventListener('click', () => {
+      running = !running;
+      toggleBtn.textContent = running ? '⏸ 暫停' : '▷ 播放';
+      last = performance.now();
+    });
+    resetBtn.addEventListener('click', () => {
+      running = false;
+      toggleBtn.textContent = '▷ 播放';
+      t = 0; decided = 0; pulses = []; logStrip = []; nextProposalAt = 0.8;
+      killed = false;
+      killBtn.setAttribute('aria-pressed', 'false');
+      killBtn.textContent = '殺掉慣用提案者';
+    });
+    killBtn.addEventListener('click', () => {
+      killed = !killed;
+      killBtn.setAttribute('aria-pressed', String(killed));
+      killBtn.textContent = killed ? '讓慣用提案者復活' : '殺掉慣用提案者';
+    });
+  })();
+  </script>
+</figure>
+
+<h2>一次決議要幾次來回：round trip、多數決與容錯</h2>
+
+<p>拿掉 leader 選舉，不代表拿掉延遲。決議一個提案要花多少時間，QuePaxa 給的答案是：「QuePaxa in particular takes one to three round trips (usually, although it can take more) between the initial proposer and a majority of replicas to decide on a proposal」——通常是一到三次來回，發生在最初提案的那個副本，跟某個多數副本之間。走一次來回的情況，接近 leader-based 系統裡「leader 直接下指令」的快速路徑；非 leader 副本發起提案時，因為要先確認沒有更晚的提案跟自己衝突，通常要多繞兩圈，變成三次來回。</p>
+
+<p>如果兩個副本剛好在同一個 slot 上同時發起提案，誰先讓多數副本承諾自己手上的版本號，誰的 Accept 就會被接受；運氣不好版本號被別人追過去，原本那個提案者會在承諾階段就被擋下來，得換一個更高的版本號重新來過。「建設性干涉」實際運作起來就是這樣：落敗的提案不是白費，它讓多數副本知道了目前最新的版本號是多少，反而幫下一輪提案更快達成一致，而不是像 Raft 選舉一樣整個作廢重選。</p>
+
+<p>下面這組 pseudocode 描述單一個 slot 從提出到決定，大致要檢查什麼：</p>
+
+<pre data-kind="pseudocode"><code><em>// 一個 slot 的提案生命週期（簡化版）</em>
+propose(slot, value):
+  round = my_local_round(slot)
+  send Prepare(slot, round) to all replicas
+  wait for Promise(round) from a majority
+  <em>// 多數副本承諾：不會再接受比 round 更舊的提案</em>
+  send Accept(slot, round, value) to that majority
+  wait for Accepted(round) from the same majority
+  <em>// 兩次多數決重疊，保證不會有第二個值也被判定為 decided</em>
+  mark slot as DECIDED(value)
+</code></pre>
+
+<p>快速路徑省下的，正是上面 Prepare／Promise 這一輪：如果提案者已經確認自己手上的 round 夠新（近似 leader 的角色），可以直接跳到 Accept，等一輪 Ack 就決定，也就是一次來回。非 leader 提案者沒有這個把握，得先走一輪 Prepare／Promise 確認沒人手上有更新的 round，再走 Accept／Accepted，湊成三次來回。下面這張圖把兩種路徑的步驟攤開，切換看兩者差在哪一段。</p>
+
+<p>這裡要注意來源本身的措辭：原文寫的是「one to three round trips (usually, although it can take more)」——一到三次是常見情況，不是硬性上界。在提案彼此撞車、版本號要反覆抬高才追得上的高競爭情境下，同一個 slot 可能繞超過三圈才收斂。這跟 Raft 的差別在於代價的性質：Raft 撞車時整場選舉作廢重來，是一段不可寫入的空窗；QuePaxa 撞車時只是多幾次來回，系統從頭到尾都還在收斂，只是慢一點。換句話說，QuePaxa 把「偶爾完全停擺」換成了「偶爾變慢」——對一個要對外承諾可用性的控制平面來說，可預測的慢，遠比不可預測的停要好處理。</p>
+
+<figure class="vg-w-morph-meerkat-roundtrip" data-mobile="static" data-svg-scroll="640">
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="m9 9 5 12 1.8-5.2L21 14Z"/>
+      <path d="M7.2 2.2 8 5.1"/>
+      <path d="m5.1 8-2.9-.8"/>
+      <path d="M14 4.1 12 6"/>
+      <path d="m6 12-1.9 2"/>
+    </svg>
+    <span>點擊切換 1 次與 3 次來回的路徑 · 兩種提案路徑</span>
+  </p>
+  <style>
+    .vg-w-morph-meerkat-roundtrip { display: grid; gap: var(--s-2); }
+    .vg-w-morph-meerkat-roundtrip svg.vg-w-morph-meerkat-roundtrip-main { width: 100%; height: auto; }
+    .vg-w-morph-meerkat-roundtrip .controls { display: flex; align-items: center; gap: var(--s-2); }
+    .vg-w-morph-meerkat-roundtrip button { font-family: var(--sans); font-size: var(--fs-sm); padding: 6px 14px; min-height: 44px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); cursor: pointer; }
+    .vg-w-morph-meerkat-roundtrip button:hover { border-color: var(--accent); color: var(--accent-text); }
+    .vg-w-morph-meerkat-roundtrip .steps { display: flex; flex-wrap: wrap; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); }
+    .vg-w-morph-meerkat-roundtrip .chip { padding: 4px 10px; border: 1px solid var(--line); color: var(--muted); }
+    .vg-w-morph-meerkat-roundtrip .chip.lit { border-color: var(--accent); color: var(--accent-text); background: color-mix(in srgb, var(--accent) 12%, var(--bg)); }
+    .vg-w-morph-meerkat-roundtrip figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+  </style>
+
+  <div class="controls" data-vg-controls>
+    <button id="vg-w-morph-meerkat-roundtrip-toggle">切換到 3 次來回</button>
+  </div>
+
+  <svg class="vg-w-morph-meerkat-roundtrip-main" viewBox="0 0 720 200" preserveAspectRatio="xMidYMid meet">
+    <path id="vg-w-morph-meerkat-roundtrip-p" d="M 40 100 Q 150 90 260 100 Q 370 110 480 100 Q 590 90 700 100" fill="none" stroke="var(--accent)" stroke-width="2.5" />
+    <circle cx="40" cy="100" r="7" fill="var(--sage-deep)" />
+    <circle cx="700" cy="100" r="7" fill="var(--ink-deep)" />
+  </svg>
+
+  <div class="steps" id="vg-w-morph-meerkat-roundtrip-steps">
+    <span class="chip lit">① proposer 送 Accept 給多數副本</span>
+    <span class="chip lit">② 多數副本回 Ack，決定完成</span>
+    <span class="chip" id="vg-w-morph-meerkat-roundtrip-chip3">③（非 leader 提案才需要）先送 Prepare 確認沒有更新的提案</span>
+  </div>
+
+  <figcaption id="vg-w-morph-meerkat-roundtrip-caption">目前顯示：leader 快速路徑，1 個 round trip。</figcaption>
+
+  <script>
+  (function () {
+    if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+    const root = document.querySelector('.vg-w-morph-meerkat-roundtrip');
+    const path = root.querySelector('#vg-w-morph-meerkat-roundtrip-p');
+    const btn = root.querySelector('#vg-w-morph-meerkat-roundtrip-toggle');
+    const chip3 = root.querySelector('#vg-w-morph-meerkat-roundtrip-chip3');
+    const caption = root.querySelector('#vg-w-morph-meerkat-roundtrip-caption');
+    const ONE_RT = 'M 40 100 Q 150 90 260 100 Q 370 110 480 100 Q 590 90 700 100';
+    const THREE_RT = 'M 40 100 Q 150 20 260 100 Q 370 180 480 100 Q 590 20 700 100';
+    let isThree = false;
+    btn.addEventListener('click', () => {
+      path.animate(
+        [{ d: `path('${isThree ? THREE_RT : ONE_RT}')` }, { d: `path('${isThree ? ONE_RT : THREE_RT}')` }],
+        { duration: 550, easing: 'ease-in-out', fill: 'forwards' }
+      );
+      isThree = !isThree;
+      chip3.classList.toggle('lit', isThree);
+      btn.textContent = isThree ? '切換回 1 次來回' : '切換到 3 次來回';
+      caption.textContent = isThree
+        ? '目前顯示：非 leader 提案路徑，3 個 round trip。'
+        : '目前顯示：leader 快速路徑，1 個 round trip。';
+    });
+  })();
+  </script>
+</figure>
+
+<p>容錯的算法沒有變：「Formally, we tolerate f faults in a system of 2f + 1 machines」——2f+1 台機器，容忍 f 台故障，靠的還是最基本的多數決算術：任兩個多數集合一定有交集，只要故障的機器不超過 f 台，剩下的多數還撐得住。把數字擺具體一點：3 台機器容忍 1 台掛掉（多數是 2），5 台容忍 2 台（多數是 3），7 台容忍 3 台（多數是 4）。想多撐一台故障，就得多加兩台機器——這個「加二才多容一」的比例，是多數決本身的算術，不是哪套實作的選擇。QuePaxa 沒有打破這條下限，它改變的是「誰可以發起提案」，不是「需要多少台機器才能決定」。</p>
+
+<p>這裡有個容易混淆的地方值得點破：拿掉 leader，容錯的機器數並沒有變好。2f+1 容忍 f 這條線，Raft 和 QuePaxa 一模一樣。QuePaxa 贏的不是「能撐更多台故障」，而是「故障發生的當下不會停擺」——Raft 掉了 leader 要停下來選新的，QuePaxa 掉了慣用提案者，其他副本立刻能接手提案，多數決的算術從頭到尾沒被打斷。副本數增加時，容錯上限跟著等比例變大，但每次決議需要湊齊的多數人數也跟著變大，拖動下面的滑桿看這兩個數字怎麼一起變。</p>
+
+<figure class="vg-w-range-meerkat-quorum" data-mobile="static" data-svg-scroll="640">
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M18 8L22 12L18 16"/>
+      <path d="M2 12H22"/>
+      <path d="M6 8L2 12L6 16"/>
+    </svg>
+    <span>拖動滑桿改變副本數 N · 容錯與多數決即時更新</span>
+  </p>
+  <style>
+    .vg-w-range-meerkat-quorum { display: grid; gap: var(--s-2); }
+    .vg-w-range-meerkat-quorum .controls { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+    .vg-w-range-meerkat-quorum input[type="range"] { flex: 1; height: 36px; accent-color: var(--accent); }
+    .vg-w-range-meerkat-quorum .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 6ch; text-align: right; }
+    .vg-w-range-meerkat-quorum svg.vg-w-range-meerkat-quorum-main { width: 100%; height: auto; }
+    .vg-w-range-meerkat-quorum p.result { font-family: var(--serif); }
+    .vg-w-range-meerkat-quorum figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+  </style>
+
+  <div class="controls" data-vg-controls>
+    <label for="vg-w-range-meerkat-quorum-x">副本數 N =</label>
+    <input id="vg-w-range-meerkat-quorum-x" type="range" min="3" max="21" step="2" value="7" />
+    <span class="readout" id="vg-w-range-meerkat-quorum-readout">7</span>
+  </div>
+
+  <svg class="vg-w-range-meerkat-quorum-main" viewBox="0 0 720 100" preserveAspectRatio="xMidYMid meet">
+    <g id="vg-w-range-meerkat-quorum-dots">
+      <circle cx="60" cy="50" r="16" fill="var(--accent)" />
+      <circle cx="140" cy="50" r="16" fill="var(--accent)" />
+      <circle cx="220" cy="50" r="16" fill="var(--accent)" />
+      <circle cx="300" cy="50" r="16" fill="var(--accent)" />
+      <circle cx="380" cy="50" r="16" fill="none" stroke="var(--muted-2)" stroke-width="2" />
+      <circle cx="460" cy="50" r="16" fill="none" stroke="var(--muted-2)" stroke-width="2" />
+      <circle cx="540" cy="50" r="16" fill="none" stroke="var(--muted-2)" stroke-width="2" />
+    </g>
+  </svg>
+
+  <p class="result" id="vg-w-range-meerkat-quorum-text">N = 7 → 最多容忍 <strong>f = 3</strong> 台故障，需要 <strong>4</strong> 台達成多數決（2f+1 = 7）。實心圓是達成多數決所需的副本，空心圓是容錯餘裕。</p>
+
+  <figcaption>副本數愈多，能撐住的故障數愈高，但每次決議要湊到的多數人數也跟著漲——這不是 QuePaxa 特有的代價，是任何多數決共識的算術。</figcaption>
+
+  <script>
+  (function () {
+    if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+    const root = document.querySelector('.vg-w-range-meerkat-quorum');
+    const input = root.querySelector('input');
+    const readout = root.querySelector('.readout');
+    const dotsG = root.querySelector('#vg-w-range-meerkat-quorum-dots');
+    const text = root.querySelector('#vg-w-range-meerkat-quorum-text');
+    const X0 = 60, X1 = 660;
+
+    function render(n) {
+      while (dotsG.firstChild) dotsG.removeChild(dotsG.firstChild);
+      const quorum = Math.floor(n / 2) + 1;
+      const f = quorum - 1;
+      const step = n > 1 ? (X1 - X0) / (n - 1) : 0;
+      for (let i = 0; i < n; i++) {
+        const c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+        c.setAttribute('cx', n === 1 ? (X0 + X1) / 2 : X0 + i * step);
+        c.setAttribute('cy', 50);
+        c.setAttribute('r', n > 15 ? 8 : 16);
+        if (i < quorum) {
+          c.setAttribute('fill', 'var(--accent)');
+        } else {
+          c.setAttribute('fill', 'none');
+          c.setAttribute('stroke', 'var(--muted-2)');
+          c.setAttribute('stroke-width', '2');
+        }
+        dotsG.appendChild(c);
+      }
+      readout.textContent = String(n);
+      text.innerHTML = `N = ${n} → 最多容忍 <strong>f = ${f}</strong> 台故障，需要 <strong>${quorum}</strong> 台達成多數決（2f+1 = ${2 * f + 1}）。實心圓是達成多數決所需的副本，空心圓是容錯餘裕。`;
+    }
+    input.addEventListener('input', () => render(Number(input.value)));
+    render(Number(input.value));
+  })();
+  </script>
+</figure>
+
+<p>批次寫入是另一個現實中的優化空間：「Writes can be batched. So if a replica receives 10 writes in a span of 10ms, it can place all of those in a single proposal, improving throughput.」——把多個寫入塞進同一個提案，均攤掉每次 round trip 的固定成本。這條優化跟有沒有 leader 無關，任何共識系統都適用，只是在「決議延遲正比於多數副本之間的來回時間」這個前提下，批次是少數可以真正壓低平均延遲的手段，而不是規避這個前提。</p>
+
+<p>「決議延遲正比於多數副本之間的延遲」這句話值得多想一層：「Proposal decision latency is proportional to the latency between some majority of replicas」——這是所有共識演算法共同的物理下限，QuePaxa 也逃不掉。這裡的關鍵字是「某個多數」，不是「所有副本」：決議不需要等最遠的那台回話，只需要等「最近的多數」湊齊。這在跨 330+ 座資料中心的部署裡有很實際的意涵——如果把副本刻意擺在地理上相近的幾個資料中心，那個「最近的多數」的往返時間就壓得下來，即使叢集裡還有幾台散在地球另一端。這也解釋了為什麼團隊把「副本擺放策略」列進了下一步的工作項目：擺放位置直接決定了每次決議的延遲下限。</p>
+
+<p>副本擺得越開，一次決議的下限越高；把副本擺近一點、允許從任一副本讀取稍舊的值、把多次寫入批次成一個提案，都是繞開這條下限的手段，而不是打破它。這三招各有代價：擺近會犧牲地理容錯的廣度，讀舊值會犧牲讀取的即時一致性，批次會犧牲單筆寫入的延遲。共識系統的設計，很大程度上就是在這幾個旋鈕之間權衡，而不是期待某個演算法把物理延遲變不見。下面這個小工具用兩個副本各自的投票進度，示範「不同副本可以在不同時間各自判定決定，但只要判定了，值一定一樣」這件事。</p>
+
+<div class="vg-w-anim-meerkat-slot">
+  <style>
+    .vg-w-anim-meerkat-slot { display: grid; gap: var(--s-2); margin: var(--s-3) 0; }
+    .vg-w-anim-meerkat-slot .row { display: grid; grid-template-columns: 8ch 1fr 16ch; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); }
+    .vg-w-anim-meerkat-slot .label { color: var(--muted); }
+    .vg-w-anim-meerkat-slot svg { width: 100%; height: auto; }
+    .vg-w-anim-meerkat-slot .badge { text-align: right; }
+    .vg-w-anim-meerkat-slot .badge.decided { color: var(--sage-deep); }
+    .vg-w-anim-meerkat-slot .badge.pending { color: var(--muted); }
+    .vg-w-anim-meerkat-slot button { font-family: var(--sans); font-size: var(--fs-sm); padding: 6px 14px; min-height: 44px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); cursor: pointer; width: fit-content; }
+    .vg-w-anim-meerkat-slot button:hover { border-color: var(--accent); color: var(--accent-text); }
+    .vg-w-anim-meerkat-slot figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+  </style>
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="m9 9 5 12 1.8-5.2L21 14Z"/>
+      <path d="M7.2 2.2 8 5.1"/>
+      <path d="m5.1 8-2.9-.8"/>
+      <path d="M14 4.1 12 6"/>
+      <path d="m6 12-1.9 2"/>
+    </svg>
+    <span>點擊重播，看 Replica B 何時收斂到跟 Replica A 一樣的值 · 兩條副本時間軸</span>
+  </p>
+  <div class="row">
+    <span class="label">Replica A</span>
+    <svg viewBox="0 0 300 30">
+      <line x1="10" y1="15" x2="290" y2="15" stroke="var(--muted-2)" stroke-width="2" />
+      <line x1="180" y1="4" x2="180" y2="26" stroke="var(--ink)" stroke-width="1.5" stroke-dasharray="3 3" />
+      <circle id="vg-w-anim-meerkat-slot-dot-a" cx="240" cy="15" r="7" fill="var(--sage-deep)" />
+    </svg>
+    <span class="badge decided" id="vg-w-anim-meerkat-slot-badge-a">已決定：value = v1</span>
+  </div>
+  <div class="row">
+    <span class="label">Replica B</span>
+    <svg viewBox="0 0 300 30">
+      <line x1="10" y1="15" x2="290" y2="15" stroke="var(--muted-2)" stroke-width="2" />
+      <line x1="180" y1="4" x2="180" y2="26" stroke="var(--ink)" stroke-width="1.5" stroke-dasharray="3 3" />
+      <circle id="vg-w-anim-meerkat-slot-dot-b" cx="90" cy="15" r="7" fill="var(--muted)" />
+    </svg>
+    <span class="badge pending" id="vg-w-anim-meerkat-slot-badge-b">尚未決定</span>
+  </div>
+  <button id="vg-w-anim-meerkat-slot-play">續跑 Replica B</button>
+  <figcaption>虛線是多數決門檻。Replica A 早就過線，判定 slot 為 v1；Replica B 繼續收票、跨過同一條門檻後，判定的值必然也是 v1——這是核心不變量本身保證的，不是巧合。</figcaption>
+  <script>
+  (function () {
+    if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+    const root = document.querySelector('.vg-w-anim-meerkat-slot');
+    const dotB = root.querySelector('#vg-w-anim-meerkat-slot-dot-b');
+    const badgeB = root.querySelector('#vg-w-anim-meerkat-slot-badge-b');
+    const btn = root.querySelector('#vg-w-anim-meerkat-slot-play');
+    let done = false;
+    btn.addEventListener('click', () => {
+      if (done) {
+        dotB.setAttribute('cx', 90);
+        badgeB.textContent = '尚未決定';
+        badgeB.classList.remove('decided');
+        badgeB.classList.add('pending');
+        done = false;
+        btn.textContent = '續跑 Replica B';
+        return;
+      }
+      const anim = dotB.animate(
+        [{ cx: 90 }, { cx: 240 }],
+        { duration: 900, easing: 'cubic-bezier(0.4, 0, 0.2, 1)', fill: 'forwards' }
+      );
+      anim.onfinish = () => {
+        dotB.setAttribute('cx', 240);
+        dotB.setAttribute('fill', 'var(--sage-deep)');
+        badgeB.textContent = '已決定：value = v1';
+        badgeB.classList.remove('pending');
+        badgeB.classList.add('decided');
+        done = true;
+        btn.textContent = '重置 Replica B';
+      };
+    });
+  })();
+  </script>
+</div>
+
+<h2>Meerkat 現在能做什麼，還不能做什麼</h2>
+
+<p>Meerkat 目前鎖定的資料類型很窄：「One example of control-plane data is placement information: where certain resources (like an AI model instance) are stored. Another example is leadership information: which machine is currently allowed to perform writes to a database.」——放置資訊、leadership 資訊，這類東西的共同特徵是寫入頻率低、但正確性要求高：判斷錯了，可能就是兩台機器同時以為自己有寫入權限。</p>
+
+<p>為什麼刻意選這麼窄的資料類型？因為這兩類資料的存取模式，剛好落在共識系統的甜蜜點上：寫入稀疏（leadership 換手、資源搬遷都不是每秒發生的事），但每一次寫入都要求強一致——判斷錯了，代價是兩台機器同時以為自己握有寫入權，或同一個資源被系統認為同時存在於兩個位置。這種「低頻但要求絕對正確」的資料，正好可以吃得起共識帶來的延遲；而一般資料庫的高頻讀寫落在光譜的另一端，每筆操作都繞一圈多數決是撐不住的。這也是為什麼 Meerkat 把自己框在控制平面，而不是往通用 KV store 或資料庫的方向走。</p>
+
+<p>官方講得很直白：「Meerkat has limitations. It is not designed to create general-purpose data systems like databases.」——它不是要取代資料庫。<span class="vg-w-pop-meerkat-glossary"><span class="term" tabindex="0">quorum（法定人數）</span><span class="pop">在一輪決議裡，必須有回應的最少副本數，通常取「總數的一半以上」，確保任兩次的 quorum 一定有交集。</span></span>與<span class="term" tabindex="0">linearizability（線性一致性）</span><span class="pop">多個 client 對同一把 key 的操作，看起來就像被排進同一條共同時間軸，沒有人會讀到比自己開始操作時更舊的值。</span>是 QuePaxa 給的一致性模型，具體來說：「If one client executes put k1 v1, a second client subsequently executes put k1 v11, and a third client subsequently executes get k1 (with a consistent read), they will always read v11.」——先寫 v1、再寫 v11 的兩個 client 之間沒有互相協調，但第三個 client 讀到的一定是最後寫入的 v11，不會夾在中間讀到過期的 v1。這個保證的代價就是延遲，一般資料庫的高頻讀寫用不起這種延遲，所以 Meerkat 現在只服務控制平面這種寫入頻率低的場景。</p>
+
+<style>
+.vg-w-pop-meerkat-glossary { position: relative; }
+.vg-w-pop-meerkat-glossary .term { anchor-name: --vgw-meerkat-glossary-anchor; text-decoration: underline dotted var(--muted); cursor: help; }
+.vg-w-pop-meerkat-glossary .pop {
+  position-anchor: --vgw-meerkat-glossary-anchor;
+  position: absolute;
+  top: anchor(bottom);
+  left: anchor(center);
+  translate: -50% var(--s-1);
+  padding: var(--s-1) var(--s-2);
+  background: var(--bg-soft);
+  border: 1px solid var(--line);
+  font-family: var(--scribed);
+  font-size: var(--fs-sm);
+  max-width: 32ch;
+  opacity: 0;
+  transition: opacity 100ms;
+  pointer-events: none;
+  z-index: 2;
+}
+.vg-w-pop-meerkat-glossary .term:hover + .pop,
+.vg-w-pop-meerkat-glossary .term:focus + .pop { opacity: 1; pointer-events: auto; }
+@supports not (anchor-name: --x) {
+  .vg-w-pop-meerkat-glossary .pop { position: static; opacity: 1; pointer-events: auto; display: inline; }
+}
+</style>
+
+<p>Meerkat 目前還停留在 Cloudflare 內部實驗階段，沒有對外開放，也還沒有取代任何生產系統。團隊列出的下一步包括：整理 QuePaxa 協定本身的技術細節、對 Rust 實作做形式驗證、叢集啟動與管理、副本擺放策略，以及用 deterministic simulation 做測試。這些都還在路上，沒有公開的時程。從概念驗證走到能對外開放，門檻通常不只是「跑得動」，還包括邊角情境要能重現——這也是為什麼 deterministic simulation 排進了下一步：比起在真實的三百三十座資料中心裡賭運氣，先在可重現的模擬環境裡把邊角案例榨乾，才是把一套新共識演算法送進生產環境前該做的事。</p>
+
+<p class="vg-deep-closer"><strong>Take-away</strong>：拿掉 leader 不是拿掉延遲，是把「進度綁在一個特定副本身上」這個單點，換成「進度綁在任一個多數集合身上」——決議還是要等多數副本回話，只是死掉的不再是那一個必經之地的副本了。</p>
+
+</div>
