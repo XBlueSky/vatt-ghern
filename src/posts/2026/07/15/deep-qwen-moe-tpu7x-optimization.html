@@ -1,0 +1,397 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">把 397B 參數的 MoE 塞進 TPU7x，Google 端出的不是一個乾脆的「整體加速倍數」，而是兩個各自貼著天花板的百分比——compute-bound 的 prefill 端摸到 discounted roofline 的 82.4%，memory-bound 的 decode 端摸到 79.6%。這篇要拆的，就是這兩個數字背後被切成幾層解決的工程問題。</p>
+  <h1 class="vg-post-title">把 397B MoE 榨進 TPU7x：Google 拿到 4.7 倍加速</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p><span class="vg-dropcap">把</span>397B 參數的模型放上一顆推論晶片，多數團隊的第一個動作是抄現成的 tensor parallelism 設定，再慢慢調 batch size。Qwen3.5-397B 不吃這一套——它是 397B 參數裡只有 17B 會在某個 token 的前向傳播裡被真正算到的 MoE，官方自己給的比例是 4.3%。60 層裡不是清一色的注意力機制，而是 3 層 Gated DeltaNet 線性注意力配 1 層標準 GQA 的固定節奏，兩種層各自掛著 512 個路由專家（top-10 選取）加 1 個永遠執行的共享專家。Google 這篇 systems engineering playbook 要講的，是這個結構逼著平行策略、kernel 設計、集體通訊全部重寫一輪的過程。</p>
+
+  <h2>稀疏在哪裡：397B 參數、17B 啟動</h2>
+
+  <p>稀疏度這件事在論文摘要裡常常只是一行，但它決定了每一步 forward pass 實際要搬多少 byte。GDN 層用 64 個線性注意力的 Value head 配 16 個 Query／Key head，head dimension 是 128；GQA 層反過來，是 32 個 query head 對上「只有」2 個 key-value head（Nkv=2）。這個「只有 2」的數字，是後面整章要處理的引信。512 個路由專家，每個 intermediate expert dimension 是 1024，每次前向傳播用 soft-max 機率選出 top 10，再加一個不管路由結果、每次都跑的共享專家路徑。換算下來，模型看起來像 397B，實際算力需求卻貼著 17B 走——但記憶體 footprint 仍然要放下整個 397B。這個「算得少、放得多」的落差，是 compute-bound 與 memory-bound 兩條優化路徑分岔的起點。</p>
+
+  <p>那個「永遠執行」的共享專家還有一層意義：不管路由結果怎麼分佈，這個專家在每個 device 上都固定被算到，等於是幫每次前向傳播墊了一個穩定的計算底噪，不會因為路由不均衡而完全空轉。</p>
+
+  <p>硬體那一邊，Ironwood（TPU v7x）每顆晶片有 2 個 Tensor Core、每個 Tensor Core 再配 2 個 MXU（Matrix Execution Unit），時脈 2.2 GHz，FP8 尖峰算力 4,614 TFLOPS，掛 192GB HBM。這組數字不是拿來炫耀的規格表——它是後面所有 roofline 計算的分母。模型的稀疏結構決定了「該搬多少資料、該算多少乘加」，硬體規格決定了「搬跟算各自能多快」，兩邊對不齊的地方，就是接下來要動刀的地方。</p>
+
+  <p>這個模型的上下文視窗原生是 262,144 個 token，搭配 YaRN RoPE scaling 可以再拉到超過 1,010,000 個 token。原文沒有明講兩者的因果，但把長上下文的需求跟「60 層裡 3/4 是 GDN 線性注意力」擺在一起看，方向是合理的：線性注意力的狀態大小不會隨序列長度等比例膨脹，GQA 的傳統 KV cache 才會——這也是為什麼超長上下文的推論場景，架構上常常偏好線性注意力。把這幾個數字放在一起看：17B 的活躍參數、2 個 KV head、512 選 10 的路由，任何一個現成推論框架的預設設定都沒辦法直接套用。接下來三節要拆的，分別是這個結構怎麼逼平行策略讓步、怎麼逼 kernel 重寫、怎麼逼通訊協定換一種打包方式。</p>
+
+  <h2>平行策略的物理極限：2 個 KV head 撞上 TP=8</h2>
+
+  <p>傳統推論框架的預設答案是 8-way tensor parallelism——把每一層的權重矩陣沿著某個維度切成 8 份，分給 8 個裝置。這招在大多數 attention 層上行得通，但 Qwen3.5-397B 的 GQA 層只有 2 個 KV head。切成 8 份，平均每個裝置分到 2/8=0.25 個 head——這在硬體上根本不存在，官方原文寫得很直接：「fractional head sharding（2/8 = 0.25 heads per device）, which is physically impossible on hardware」。</p>
+
+  <p>團隊換了一套切法：attention 部分不切，直接在 8 個裝置上各自複製一份完整權重（Data Parallelism，DP=8），維持每個裝置本地 KV cache 的一致性；MoE 部分反過來切，512 個路由專家平均分配到 8 個裝置，每台裝 64 個（Expert Parallelism，EP=8）。兩種平行各自負責模型的一半，而不是硬逼同一套切法套用在整個模型上。</p>
+
+  <p>這裡的 Data Parallelism 用詞跟一般認知的 DP 有一點微妙差異——訓練場景的 DP 通常是把不同的訓練資料切給不同副本、各自算完梯度再同步；這裡的 DP=8 只是單純的權重複製，8 個裝置各自服務不同的請求，彼此不需要同步任何梯度或狀態，是推論場景下更簡化的用法。Expert Parallelism 的切法則更接近直覺——每個裝置就是拿到一個固定子集的專家，永久常駐，不隨請求變動；一個 token 該去哪個專家，純粹看路由結果落在哪個裝置的子集裡，不需要額外的一輪資料搬移決策。</p>
+
+  <div class="vg-w-tabs-qwen-parallelism">
+    <style>
+      .vg-w-tabs-qwen-parallelism { display: grid; gap: var(--s-2); margin: var(--s-4) 0; border: 1px solid var(--line); padding: var(--s-3); background: var(--bg-soft); }
+      .vg-w-tabs-qwen-parallelism input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-tabs-qwen-parallelism .tabs { display: flex; gap: var(--s-3); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+      .vg-w-tabs-qwen-parallelism .tab { font-family: var(--sans); font-size: var(--fs-sm); padding: var(--s-1) var(--s-2); cursor: pointer; color: var(--muted); text-transform: uppercase; letter-spacing: 0.03em; }
+      .vg-w-tabs-qwen-parallelism .panel { display: none; padding: var(--s-3) 0 0 0; font-family: var(--serif); font-size: var(--fs-sm); line-height: 1.75; }
+      .vg-w-tabs-qwen-parallelism .panel h4 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-tabs-qwen-parallelism .panel .fail { color: var(--muted); }
+      .vg-w-tabs-qwen-parallelism .panel .ok { color: var(--sage-deep); }
+      .vg-w-tabs-qwen-parallelism:has(#vg-w-tabs-qwen-parallelism-t1:checked) .panel-1 { display: block; }
+      .vg-w-tabs-qwen-parallelism:has(#vg-w-tabs-qwen-parallelism-t1:checked) [for="vg-w-tabs-qwen-parallelism-t1"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-qwen-parallelism:has(#vg-w-tabs-qwen-parallelism-t2:checked) .panel-2 { display: block; }
+      .vg-w-tabs-qwen-parallelism:has(#vg-w-tabs-qwen-parallelism-t2:checked) [for="vg-w-tabs-qwen-parallelism-t2"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="3" y="4" width="7" height="16" rx="1"/><rect x="14" y="4" width="7" height="16" rx="1"/>
+      </svg>
+      <span>切換兩種切分策略 · 2 個標籤</span>
+    </p>
+    <input type="radio" id="vg-w-tabs-qwen-parallelism-t1" name="vg-w-tabs-qwen-parallelism-sel" checked />
+    <input type="radio" id="vg-w-tabs-qwen-parallelism-t2" name="vg-w-tabs-qwen-parallelism-sel" />
+    <div class="tabs">
+      <label class="tab" for="vg-w-tabs-qwen-parallelism-t1">TP=8（原始設定）</label>
+      <label class="tab" for="vg-w-tabs-qwen-parallelism-t2">DP=8 ＋ EP=8（實際部署）</label>
+    </div>
+    <div class="panel panel-1">
+      <h4 class="fail">為什麼切不下去</h4>
+      <p>8-way tensor parallelism 把每層權重沿 head 維度切 8 份。GQA 層 Nkv=2，切 8 份等於每個裝置分到 0.25 個 KV head——head 是不可分割的最小單位，0.25 個 head 在硬體上無法存在。attention 層卡死，後面 MoE 層的切法也失去意義。</p>
+    </div>
+    <div class="panel panel-2">
+      <h4 class="ok">實際切法</h4>
+      <p>attention 層改成 DP=8：8 個裝置各自持有一份完整的 GDN／GQA 權重與本地 KV cache，不切、只複製。MoE 層改成 EP=8：512 個路由專家平均分掉，每個裝置常駐 64 個專家，token 路由到哪個專家由對應裝置就近計算。兩層各自用最適合自己形狀的切法，不再共用同一套 8-way 方案。</p>
+    </div>
+  </div>
+
+  <p>DP=8 底下還有一個容易被忽略的細節：8 份複製的權重雖然完全一樣，但各自維護的本地 KV cache 卻對應不同的請求批次——換句話說，複製的是「能力」，不是「狀態」。這跟傳統 tensor parallelism 把同一個請求的計算拆給 8 個裝置合作完成，是完全不同的思路：那邊是分工，這邊是各自獨立值班。</p>
+
+  <p>這個混合設計省下的，是硬套 tensor parallelism 才會出現的記憶體代價——如果 attention 跟 MoE 一起套用舊的 TP 切法，400GB 級的參數 footprint 會在每個節點重複放一份。DP+EP 把這份重複拿掉，同樣的硬體才有餘裕把並發規模往上推，而不是被記憶體先卡死。</p>
+
+  <p>值得算一下這筆帳：397B 參數裡，絕大多數躺在 512 個路由專家裡，GDN 與 GQA 的權重相對只佔一小塊。DP=8 把這一小塊 attention 權重複製 8 份，代價可以接受；如果連 512 個專家的權重也跟著複製 8 份，那才是真正會撐爆 HBM 的地方——這正是 EP=8 存在的理由：把體積最大的那塊留給切分，體積最小的那塊留給複製。</p>
+
+  <h2>Kernel 手術台：RPA、Grouped GEMM v2、GDN 融合</h2>
+
+  <p>拓樸問題解決之後，剩下的效能差距要靠 kernel 本身去摳。Ragged Page Attention（RPA）原本的 KV block size 是 16 個 token——block 切得太細，每次讀取要處理的索引數量暴增，官方的說法是造成「massive indexing overhead」，讓 VPU（Vector Processing Unit）反覆停頓等資料。把 block size 拉到 256（對應 <code>--block-size=256</code> 這個設定），在 concurrency-512 下把 decode step latency 從 428µs 壓到 283µs，單一個參數帶來 33.8% 的 kernel 級加速。</p>
+
+  <figure class="vg-w-drag-qwen-rpa-blocksize" data-mobile="static" data-svg-scroll="720">
+    <style>
+      .vg-w-drag-qwen-rpa-blocksize { display: grid; gap: var(--s-2); }
+      .vg-w-drag-qwen-rpa-blocksize svg { width: 100%; height: auto; }
+      .vg-w-drag-qwen-rpa-blocksize .handle { cursor: grab; }
+      .vg-w-drag-qwen-rpa-blocksize .readout { padding: var(--s-2) var(--s-3); background: var(--bg-soft); border-left: 2px solid var(--accent); font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-drag-qwen-rpa-blocksize .readout strong { color: var(--accent-text); font-family: var(--sans); }
+      @media (hover: none) and (pointer: coarse) {
+        .vg-w-drag-qwen-rpa-blocksize .handle { cursor: default; }
+        .vg-w-drag-qwen-rpa-blocksize .drag-hint { display: none; }
+      }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m18 8 4 4-4 4"/><path d="M2 12h20"/><path d="m6 8-4 4 4 4"/>
+      </svg>
+      <span>拖動手把切換 block size · 16 對 256 兩個真實設定值</span>
+    </p>
+    <svg class="vg-w-drag-qwen-rpa-blocksize-main" viewBox="0 0 720 220" role="img" aria-label="Ragged Page Attention 的 KV block size 從 16 拉到 256，decode latency 從 428 微秒降到 283 微秒">
+      <text x="360" y="28" text-anchor="middle" fill="var(--ink)" font-family="EB Garamond, serif" font-size="15">RPA block size：拖到底看 decode latency 怎麼變</text>
+      <line x1="140" y1="120" x2="580" y2="120" stroke="var(--muted-2)" stroke-width="2"/>
+      <text x="140" y="150" text-anchor="middle" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="12">16</text>
+      <text x="580" y="150" text-anchor="middle" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="12">256</text>
+      <text x="360" y="168" text-anchor="middle" fill="var(--muted)" class="drag-hint" font-family="IM Fell English, serif" font-style="italic" font-size="12">block size（token 數）</text>
+      <circle class="handle" id="vg-w-drag-qwen-rpa-blocksize-h" cx="580" cy="120" r="14" fill="var(--accent)" stroke="var(--bg)" stroke-width="2" role="slider" tabindex="0" aria-label="調整 RPA block size" aria-valuemin="16" aria-valuemax="256" aria-valuenow="256"/>
+      <text id="vg-w-drag-qwen-rpa-blocksize-label" x="580" y="90" text-anchor="middle" fill="var(--ink)" font-family="JetBrains Mono, monospace" font-size="13">block=256</text>
+    </svg>
+    <div class="readout" id="vg-w-drag-qwen-rpa-blocksize-readout">
+      <strong>block=256（優化後）</strong>：decode step latency 283µs（↓33.8%）。連續讀取的區塊變大，索引開銷被攤薄，VPU 管線才有機會填滿。
+    </div>
+    <script>
+    (function () {
+      const root = document.querySelector('.vg-w-drag-qwen-rpa-blocksize');
+      const svg = root.querySelector('svg.vg-w-drag-qwen-rpa-blocksize-main');
+      const handle = root.querySelector('#vg-w-drag-qwen-rpa-blocksize-h');
+      const label = root.querySelector('#vg-w-drag-qwen-rpa-blocksize-label');
+      const readout = root.querySelector('#vg-w-drag-qwen-rpa-blocksize-readout');
+      const X_MIN = 140, X_MAX = 580, MID = (X_MIN + X_MAX) / 2;
+      const STATES = {
+        16: { x: X_MIN, text: 'block=16（legacy）', html: '<strong>block=16（legacy）</strong>：decode step latency 428µs。block 太細，索引數量暴增，造成 massive indexing overhead，VPU 反覆停頓等資料。' },
+        256: { x: X_MAX, text: 'block=256（優化後）', html: '<strong>block=256（優化後）</strong>：decode step latency 283µs（↓33.8%）。連續讀取的區塊變大，索引開銷被攤薄，VPU 管線才有機會填滿。' },
+      };
+      function applyState(key) {
+        const s = STATES[key];
+        handle.setAttribute('cx', s.x);
+        handle.setAttribute('aria-valuenow', key);
+        label.setAttribute('x', s.x);
+        label.textContent = s.text;
+        readout.innerHTML = s.html;
+      }
+      if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+      let dragging = false;
+      function clientToSvgX(clientX) {
+        const pt = svg.createSVGPoint();
+        pt.x = clientX; pt.y = 0;
+        const svgPt = pt.matrixTransform(svg.getScreenCTM().inverse());
+        return Math.max(X_MIN, Math.min(X_MAX, svgPt.x));
+      }
+      function snapFromX(x) { return x < MID ? 16 : 256; }
+      handle.addEventListener('pointerdown', (e) => {
+        dragging = true;
+        handle.setPointerCapture(e.pointerId);
+        handle.setAttribute('cursor', 'grabbing');
+      });
+      handle.addEventListener('pointermove', (e) => {
+        if (!dragging) return;
+        const x = clientToSvgX(e.clientX);
+        handle.setAttribute('cx', x);
+      });
+      handle.addEventListener('pointerup', (e) => {
+        if (!dragging) return;
+        dragging = false;
+        handle.setAttribute('cursor', 'grab');
+        applyState(snapFromX(Number(handle.getAttribute('cx'))));
+      });
+      handle.addEventListener('keydown', (e) => {
+        if (e.key === 'ArrowLeft') { e.preventDefault(); applyState(16); }
+        if (e.key === 'ArrowRight') { e.preventDefault(); applyState(256); }
+      });
+    })();
+    </script>
+  </figure>
+
+  <p>這不是單純調大一個數字就有效的巧合——block 越小，同一段連續記憶體被切成越多獨立的定址單位，VPU 要花更多時間算位址、更少時間做乘加；放大到 256，連續讀取的區塊變大，索引開銷被攤薄，VPU 才有機會把管線填滿。</p>
+
+  <p>MoE 層的 SwiGLU 前饋網路也挨了一刀：Grouped GEMM（GMM）v2 把 gating 與 up-projection 兩個矩陣乘法用 dual DMA read 融合進單一個 tile，再搭配 512-subchannel 的 FP8 量化，消掉了原本會發生的暫存器溢位（VREG spills），讓 VPU 的向量運算吞吐量直接翻倍。同一個 kernel 還加了動態邊界切片，讓每個專家實際拿到的 token 數量不一時，padding 也能壓到最低。</p>
+
+  <p>MoE 的路由天生會不均衡：512 個專家裡，熱門的幾個會被大量 token 選中，冷門的幾個可能整個 batch 都沒人選。Grouped GEMM v2 的動態邊界切片，就是在處理這種不均衡——每個專家實際收到的 token 數量不同，傳統做法是全部 padding 到最大值，GMM v2 讓每個專家按自己實際收到的數量計算，不平白浪費算力在填充的 0 上。</p>
+
+  <p>GDN 層的 Causal Conv1D 原本是獨立的一步：算完中間結果、寫回 HBM、下一步再讀出來接著算。融合後的版本把歷史 token 狀態直接留在 TPU 的 VPU 暫存器裡，用 register-level 的 sliding window 演算法邊算邊維護，原本一次前向要跑的 6 次 HBM 往返直接消失。</p>
+
+  <p>路由本身也有一顆專門的引擎可以借：TPU 的 SparseCore 天生擅長不規則的間接定址，團隊把 token 到專家的路由運算整段搬到 SparseCore 上執行，繞開原本會出現在 HBM 裡的大量填充、未對齊中間張量——原文的說法是「Bypasses heavily-padded, unaligned intermediate tensors in HBM, saving massive memory bandwidth」。MoE 路由的本質就是「決定誰去哪裡」的稀疏 gather/scatter，交給為此設計的硬體單元，比硬塞進通用矩陣運算單元划算。</p>
+
+  <p>decode 階段還有一個更直接的手法：把多個獨立的 decode stream 打包進同一個 Pallas kernel 呼叫，而不是每個請求各自發一次 kernel。好處官方列了三項——攤薄 VPU 指令派發的延遲、打斷循序請求之間的資料相依停頓、改善記憶體對齊。單一使用者的請求延遲看起來沒變，但當 TPU 上同時跑著上百個並發請求時，這種打包能把每個 kernel 呼叫的固定成本攤到更多實際工作量上。</p>
+
+  <p>這也解釋了為什麼 RPA 與 Batched RPA 的效果在高並發時特別明顯：並發數低的時候，系統沒有足夠多的獨立 decode stream 可以打包，固定開銷分攤不到太多請求上；並發數一拉高，打包空間變大，單位請求分攤到的固定成本才會真正下降。</p>
+
+  <p>GDN 的遞迴公式本身也被重新推導過：把方程式重新整理之後，原本必要的一次 rank-1 矩陣乘法被完全省略——官方原文是「completely skipped the expensive post-rank-1 matrix multiplication」。同一輪改動裡，遞迴狀態變數的精度從 Float32 降到 BFloat16，VPU 的向量運算吞吐量因此再翻一倍。這類改動的風險是精度：降精度換速度的交易，通常需要額外的驗證才敢上線——這點留到最後一節談。</p>
+
+  <p>前面提到的 Conv1D 融合後來又被推進一步：一個完全融合的 Pallas kernel 把 causal 1D convolution 跟整個 GDN recurrent block 合併成一次呼叫，中間序列與遞迴狀態全部留在區域暫存器裡，原文的講法是「Completely bypasses the need to read and write intermediate activation tensors to VMEM or HBM」——不只省了 HBM 往返，連 VMEM 這一層的讀寫都被跳過。搭配這個改動的，是一個把 GDN 遞迴狀態與 GQA 的 KV cache 對齊排列的自訂記憶體佈局，目的是減少 padding 與碎片化，「reclaiming critical HBM headroom」。</p>
+
+  <figure class="vg-w-3d-qwen-gdn-fusion" data-mobile="keep">
+    <style>
+      .vg-w-3d-qwen-gdn-fusion { display: grid; gap: var(--s-3); }
+      .vg-w-3d-qwen-gdn-fusion .toggle-row { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); }
+      .vg-w-3d-qwen-gdn-fusion .toggle-row input { width: 20px; height: 20px; accent-color: var(--accent); }
+      .vg-w-3d-qwen-gdn-fusion .stage { perspective: 1000px; height: 300px; display: flex; align-items: center; justify-content: center; }
+      .vg-w-3d-qwen-gdn-fusion .stack { transform-style: preserve-3d; transform: rotateX(-18deg) rotateY(-26deg); width: 260px; height: 220px; position: relative; }
+      .vg-w-3d-qwen-gdn-fusion .layer { position: absolute; left: 0; width: 260px; height: 30px; border: 1.5px solid var(--ink); background: var(--bg-soft); font-family: var(--sans); font-size: 12px; display: flex; align-items: center; justify-content: center; color: var(--ink); text-align: center; padding: 0 var(--s-1); }
+      .vg-w-3d-qwen-gdn-fusion .before .layer:nth-child(1) { top: 0px; transform: translateZ(0px); }
+      .vg-w-3d-qwen-gdn-fusion .before .layer:nth-child(2) { top: 32px; transform: translateZ(-24px); }
+      .vg-w-3d-qwen-gdn-fusion .before .layer:nth-child(3) { top: 64px; transform: translateZ(-48px); }
+      .vg-w-3d-qwen-gdn-fusion .before .layer:nth-child(4) { top: 96px; transform: translateZ(-72px); }
+      .vg-w-3d-qwen-gdn-fusion .before .layer:nth-child(5) { top: 128px; transform: translateZ(-96px); }
+      .vg-w-3d-qwen-gdn-fusion .before .layer:nth-child(6) { top: 160px; transform: translateZ(-120px); background: var(--accent); color: var(--bg); opacity: 0.85; }
+      .vg-w-3d-qwen-gdn-fusion .after { display: none; }
+      .vg-w-3d-qwen-gdn-fusion .after .layer { top: 80px; transform: translateZ(0px); background: var(--sage-deep); color: var(--bg); width: 260px; height: 50px; font-size: 13px; }
+      .vg-w-3d-qwen-gdn-fusion:has(#vg-w-3d-qwen-gdn-fusion-toggle:checked) .before { display: none; }
+      .vg-w-3d-qwen-gdn-fusion:has(#vg-w-3d-qwen-gdn-fusion-toggle:checked) .after { display: block; }
+      .vg-w-3d-qwen-gdn-fusion figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+      @media (max-width: 480px) {
+        .vg-w-3d-qwen-gdn-fusion .stack { transform: none; }
+        .vg-w-3d-qwen-gdn-fusion .layer { position: static; width: 100%; margin-bottom: 4px; transform: none !important; }
+        .vg-w-3d-qwen-gdn-fusion .stage { height: auto; }
+      }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+      </svg>
+      <span>勾選切換融合前後 · 6 層 HBM 往返對 1 個融合 kernel</span>
+    </p>
+    <div class="toggle-row" data-vg-controls>
+      <input type="checkbox" id="vg-w-3d-qwen-gdn-fusion-toggle" />
+      <label for="vg-w-3d-qwen-gdn-fusion-toggle">勾選查看融合後的版本</label>
+    </div>
+    <div class="stage">
+      <div class="stack before">
+        <div class="layer">① Conv1D 算輸出 → 寫 HBM</div>
+        <div class="layer">② 讀 HBM → 準備 gate 輸入</div>
+        <div class="layer">③ 算 gate → 寫 HBM</div>
+        <div class="layer">④ 讀 HBM → 準備 recurrent state</div>
+        <div class="layer">⑤ 更新 state → 寫 HBM</div>
+        <div class="layer">⑥ 讀 HBM → 進下一層 matmul</div>
+      </div>
+      <div class="stack after">
+        <div class="layer">全部留在 VPU 暫存器裡做完，0 次 HBM 往返</div>
+      </div>
+    </div>
+    <figcaption>融合前：Causal Conv1D 與 GDN recurrent 更新之間有 6 次讀寫 HBM 的往返。融合後：register-level sliding window 把歷史 token 狀態留在 VPU 暫存器，6 次往返全部消失。</figcaption>
+  </figure>
+
+  <h2>集體通訊瘦身：All-Gather 與 Reduce-Scatter</h2>
+
+  <p>EP=8 把專家攤開到 8 個裝置之後，每個 token 算完要送去哪個專家、算完又要收回來，都要靠集體通訊（collective communication）。原本的路由需要三次獨立的 All-Gather：一次收 token 的 hidden state、一次收專家索引、一次收 gating 權重。團隊把後兩者「stack, bitcast, and pack」成一個 single dense 32-bit 整數陣列，跟第一次 All-Gather 合併，三次變兩次，routing metadata 的 collective latency 直接砍半。</p>
+
+  <p>MoE 算完之後的 Reduce-Scatter 也拆成兩段：先在同一顆晶片內部走共享記憶體，速度是跨晶片路徑的 6 倍；再用遞迴倍增（recursive doubling）的方式跨晶片、透過 ICI 互連完成剩下的聚合。整批資料切成 2 到 4 個 micro-batch，讓 DMA 搬運跟計算重疊——搬第 i 批資料的同時，晶片還在算第 i-1 批，通訊不再是純粹等待的死時間。</p>
+
+  <p>拆成兩段的理由很直接：同一顆晶片內部的記憶體頻寬，天生比走 ICI 互連跨晶片快上一個數量級——先在近的地方把能合併的合併掉，才把真正必須跨晶片的那一小份資料送出去，是分散式系統裡常見的「先本地聚合、再跨節點聚合」的思路，只是這裡的節點是晶片。</p>
+
+  <p>這五項改動沒有一個是孤立生效的：RPA 影響的是 decode 階段每一步的延遲，GMM v2 與 GDN 融合影響的是 compute 端的浮點利用率，All-Gather 與 Reduce-Scatter 影響的是 EP=8 切分之後才會出現的通訊開銷。少了 DP+EP 的平行策略，後面這一整組 kernel 優化根本沒有適用的場景——這是為什麼工程順序要先定拓樸、才動 kernel。把這五個改動攤開來看，各自解決的瓶頸並不重疊：</p>
+
+  <figure class="vg-w-table-qwen-kernel-opts" data-mobile="keep">
+    <style>
+      .vg-w-table-qwen-kernel-opts { overflow-x: auto; }
+      .vg-w-table-qwen-kernel-opts table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-qwen-kernel-opts thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); }
+      .vg-w-table-qwen-kernel-opts tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+      .vg-w-table-qwen-kernel-opts td.result { font-family: JetBrains Mono, monospace; color: var(--sage-deep); white-space: nowrap; }
+      .vg-w-table-qwen-kernel-opts caption { text-align: left; caption-side: top; font-family: var(--scribed); font-style: italic; color: var(--muted); font-size: var(--fs-sm); padding: var(--s-1) 0; }
+    </style>
+    <table>
+      <caption>五個 kernel／通訊層優化各自的機制與量化效果，數字皆取自原文。</caption>
+      <thead>
+        <tr><th>技術</th><th>機制</th><th>量化效果</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>RPA block size 調整</td><td>KV block 從 16 拉到 256，消除 indexing overhead 造成的 VPU 停頓</td><td class="result">decode latency 428µs→283µs（↓33.8%）</td></tr>
+        <tr><td>Grouped GEMM v2</td><td>SwiGLU 的 gating／up-projection 融合單一 tile，512-subchannel FP8 量化</td><td class="result">VPU 向量吞吐量翻倍</td></tr>
+        <tr><td>GDN Causal Conv1D 融合</td><td>register-level sliding window，歷史狀態留在 VPU 暫存器</td><td class="result">消除 6 次 HBM 往返</td></tr>
+        <tr><td>All-Gather 合併</td><td>三次獨立 collective 打包成兩次 32-bit 整數陣列傳輸</td><td class="result">routing metadata collective latency 減半</td></tr>
+        <tr><td>Reduce-Scatter 分層</td><td>intra-chip 共享記憶體＋inter-chip 遞迴倍增，2–4 個 micro-batch pipeline</td><td class="result">intra-chip 段快 6 倍</td></tr>
+      </tbody>
+    </table>
+  </figure>
+
+  <h2>Roofline 記分板：兩個效率百分比</h2>
+
+  <p>Roofline model 的邏輯很直接：算出硬體在某個工作負載下理論上「最多」能跑多快，分成兩種瓶頸——如果乘加運算比資料搬運慢，問題出在算力，是 compute-bound；如果資料搬運比乘加運算慢，問題出在頻寬，是 memory-bound。Prefill 階段要重算整段輸入的 attention，乘加運算量隨輸入長度膨脹，天生偏 compute-bound；decode 階段每一步只算一個新 token，但要把整份 KV cache 從 HBM 掃過一遍，天生偏 memory-bound。這也是為什麼同一顆晶片、同一個模型，prefill 跟 decode 會撞上兩種不同形狀的天花板。</p>
+
+  <p>所有拓樸與 kernel 調整最後都要接受同一套檢驗：roofline model 算出的理論上限，實測吞吐量摸到了幾成。Prefill-heavy（8K 輸入／1K 輸出）是 compute-bound 場景，在 concurrency 64 下，理論上限是 5,170 tokens/s/chip（未打折）、排程打折後是 4,500；實測 3,707，官方自己算出來的效率是 82.4%。Decode-heavy（1K 輸入／8K 輸出）是 memory-bound 場景，理論上限 978（未打折）、打折後 850；實測 677，效率 79.6%。兩個場景撞到的天花板不一樣——一個被 FP8 算力卡住，一個被 HBM 頻寬卡住——但摸到的比例意外地接近。</p>
+
+  <figure class="vg-w-chart-qwen-roofline" data-mobile="static" data-svg-scroll="880">
+    <style>
+      .vg-w-chart-qwen-roofline { display: grid; gap: var(--s-3); }
+      .vg-w-chart-qwen-roofline svg { width: 100%; height: auto; }
+      .vg-w-chart-qwen-roofline .controls { display: flex; gap: var(--s-2); flex-wrap: wrap; }
+      .vg-w-chart-qwen-roofline .toggle-btn { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.04em; padding: var(--s-1) var(--s-2); border: 1px solid var(--line); background: var(--bg); color: var(--muted); cursor: pointer; min-height: 40px; }
+      .vg-w-chart-qwen-roofline .toggle-btn.active { color: var(--accent-text); border-color: var(--accent); }
+      .vg-w-chart-qwen-roofline .readout { display: flex; gap: var(--s-4); flex-wrap: wrap; }
+      .vg-w-chart-qwen-roofline .stat { display: flex; flex-direction: column; gap: 2px; }
+      .vg-w-chart-qwen-roofline .stat-label { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+      .vg-w-chart-qwen-roofline .stat-value { font-family: EB Garamond, serif; font-size: 1.8rem; color: var(--ink); font-variant-numeric: tabular-nums; }
+      .vg-w-chart-qwen-roofline figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+      @media (hover: none) and (pointer: coarse) {
+        .vg-w-chart-qwen-roofline .controls { display: none; }
+      }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/><path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+      </svg>
+      <span>切換 discounted／undiscounted 兩種天花板 · 2 場景 × 3 根柱</span>
+    </p>
+    <div class="controls" data-vg-controls>
+      <button type="button" class="toggle-btn active" data-ceiling="discounted">對比現實上限（discounted）</button>
+      <button type="button" class="toggle-btn" data-ceiling="undiscounted">對比理論上限（undiscounted）</button>
+    </div>
+    <svg class="vg-w-chart-qwen-roofline-main" viewBox="0 0 880 420" role="img" aria-label="Qwen3.5-397B 在 concurrency 64 下，prefill-heavy 與 decode-heavy 的實測吞吐量對比 discounted 與 undiscounted roofline 上限">
+      <g id="vg-w-chart-qwen-roofline-axes">
+        <line x1="40" y1="360" x2="420" y2="360" stroke="var(--muted-2)" stroke-width="1"/>
+        <line x1="40" y1="360" x2="40" y2="60" stroke="var(--muted-2)" stroke-width="1"/>
+        <text x="220" y="38" text-anchor="middle" fill="var(--ink)" font-family="EB Garamond, serif" font-size="15">Prefill-heavy（compute-bound）</text>
+        <text x="36" y="365" text-anchor="end" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="10">0</text>
+        <text x="36" y="303" text-anchor="end" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="10">1k</text>
+        <text x="36" y="245" text-anchor="end" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="10">2k</text>
+        <text x="36" y="187" text-anchor="end" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="10">3k</text>
+        <text x="36" y="129" text-anchor="end" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="10">4k</text>
+        <text x="36" y="72" text-anchor="end" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="10">5k</text>
+        <line x1="460" y1="360" x2="840" y2="360" stroke="var(--muted-2)" stroke-width="1"/>
+        <line x1="460" y1="360" x2="460" y2="60" stroke="var(--muted-2)" stroke-width="1"/>
+        <text x="640" y="38" text-anchor="middle" fill="var(--ink)" font-family="EB Garamond, serif" font-size="15">Decode-heavy（memory-bound）</text>
+        <text x="456" y="365" text-anchor="end" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="10">0</text>
+        <text x="456" y="290" text-anchor="end" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="10">250</text>
+        <text x="456" y="215" text-anchor="end" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="10">500</text>
+        <text x="456" y="140" text-anchor="end" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="10">750</text>
+        <text x="456" y="65" text-anchor="end" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="10">1000</text>
+        <text x="14" y="210" text-anchor="middle" fill="var(--muted)" font-family="IM Fell English, serif" font-style="italic" font-size="11" transform="rotate(-90 14 210)">tokens/s/chip</text>
+      </g>
+      <g id="vg-w-chart-qwen-roofline-bars">
+        <rect data-bar="prefill-actual" x="60" y="146" width="80" height="214" fill="var(--accent)" opacity="0.95"/>
+        <text x="100" y="138" text-anchor="middle" fill="var(--ink)" font-family="JetBrains Mono, monospace" font-size="12">3,707</text>
+        <text x="100" y="378" text-anchor="middle" fill="var(--muted)" font-family="Manrope, sans-serif" font-size="11">實測</text>
+        <rect data-bar="prefill-discounted" x="180" y="100" width="80" height="260" fill="var(--sage-deep)" opacity="0.85" stroke="var(--accent)" stroke-width="2"/>
+        <text x="220" y="92" text-anchor="middle" fill="var(--ink)" font-family="JetBrains Mono, monospace" font-size="12">4,500</text>
+        <text x="220" y="378" text-anchor="middle" fill="var(--muted)" font-family="Manrope, sans-serif" font-size="11">discounted</text>
+        <rect data-bar="prefill-undiscounted" x="300" y="62" width="80" height="298" fill="var(--ink-deep)" opacity="0.25"/>
+        <text x="340" y="54" text-anchor="middle" fill="var(--ink)" font-family="JetBrains Mono, monospace" font-size="12">5,170</text>
+        <text x="340" y="378" text-anchor="middle" fill="var(--muted)" font-family="Manrope, sans-serif" font-size="11">undiscounted</text>
+        <rect data-bar="decode-actual" x="480" y="157" width="80" height="203" fill="var(--accent)" opacity="0.95"/>
+        <text x="520" y="149" text-anchor="middle" fill="var(--ink)" font-family="JetBrains Mono, monospace" font-size="12">677</text>
+        <text x="520" y="378" text-anchor="middle" fill="var(--muted)" font-family="Manrope, sans-serif" font-size="11">實測</text>
+        <rect data-bar="decode-discounted" x="600" y="105" width="80" height="255" fill="var(--sage-deep)" opacity="0.85" stroke="var(--accent)" stroke-width="2"/>
+        <text x="640" y="97" text-anchor="middle" fill="var(--ink)" font-family="JetBrains Mono, monospace" font-size="12">850</text>
+        <text x="640" y="378" text-anchor="middle" fill="var(--muted)" font-family="Manrope, sans-serif" font-size="11">discounted</text>
+        <rect data-bar="decode-undiscounted" x="720" y="67" width="80" height="293" fill="var(--ink-deep)" opacity="0.25"/>
+        <text x="760" y="59" text-anchor="middle" fill="var(--ink)" font-family="JetBrains Mono, monospace" font-size="12">978</text>
+        <text x="760" y="378" text-anchor="middle" fill="var(--muted)" font-family="Manrope, sans-serif" font-size="11">undiscounted</text>
+      </g>
+    </svg>
+    <div class="readout">
+      <div class="stat"><span class="stat-label">Prefill-heavy 效率</span><span class="stat-value" data-eff="prefill">82.4%</span></div>
+      <div class="stat"><span class="stat-label">Decode-heavy 效率</span><span class="stat-value" data-eff="decode">79.6%</span></div>
+    </div>
+    <figcaption>Concurrency 64 下的實測吞吐量，對比 discounted（排程打折後）與 undiscounted（純理論）兩種 roofline 上限。效率百分比按目前選取的上限即時換算。數字取自原文，「discounted」下的 82.4%／79.6% 是官方原始計算值，「undiscounted」下的數字為依同一組實測值換算。</figcaption>
+    <script>
+    (function () {
+      const root = document.querySelector('.vg-w-chart-qwen-roofline');
+      const panels = [
+        { key: 'prefill', actual: 3707, discounted: 4500, undiscounted: 5170 },
+        { key: 'decode', actual: 677, discounted: 850, undiscounted: 978 },
+      ];
+      function updateReadout(mode) {
+        panels.forEach((p) => {
+          const ceilVal = mode === 'discounted' ? p.discounted : p.undiscounted;
+          const pct = (p.actual / ceilVal * 100).toFixed(1);
+          const effEl = root.querySelector('[data-eff="' + p.key + '"]');
+          if (effEl) effEl.textContent = pct + '%';
+        });
+        root.querySelectorAll('[data-bar]').forEach((r) => {
+          const kind = r.getAttribute('data-bar').split('-')[1];
+          if (kind === 'actual') return;
+          if (kind === mode) {
+            r.setAttribute('opacity', '0.85');
+            r.setAttribute('stroke', 'var(--accent)');
+            r.setAttribute('stroke-width', '2');
+          } else {
+            r.setAttribute('opacity', '0.25');
+            r.removeAttribute('stroke');
+          }
+        });
+      }
+      root.querySelectorAll('.toggle-btn').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          root.querySelectorAll('.toggle-btn').forEach((b) => b.classList.toggle('active', b === btn));
+          updateReadout(btn.dataset.ceiling);
+        });
+      });
+    })();
+    </script>
+  </figure>
+
+  <p>discounted 與 undiscounted 這兩個版本的差距，本身就是一個工程判斷：排程開銷、實際 batch 組成、記憶體對齊的損耗，都會讓真正能拿到的算力低於晶片規格表上的峰值。把 82.4% 這個數字念成「還有 17.6% 的手術空間」，還是念成「已經逼近實際可行的極限」，取決於你拿哪一個分母——這正是為什麼原文同時給出兩種 roofline，而不是只挑一個好看的數字。</p>
+
+  <p>文章用的「concurrency」指的是同時掛在系統上的並發請求數——64 到 512 這個範圍，對應的是一台推論伺服器在真實流量下可能同時服務的使用者數量。並發數越高，排隊等 batch 湊滿的時間通常拉長，但攤到每個 chip 的吞吐量效率也可能提升，這是為什麼同一組 kernel 優化在不同並發檔位下的效果不會完全一樣。</p>
+
+  <p>把鏡頭拉遠到整條時間軸：2026 年 4 月到 6 月之間，同樣的 512 concurrency 檔位，decode-heavy 提速約 3.1 倍、prefill-heavy 約 4.7 倍。原文沒有給這兩個倍數對應的絕對吞吐量，只給了倍數本身——對照的基準，是同一個團隊三個月前還沒套上這整套 playbook 的版本。兩個效率百分比與兩個加速倍數，量的是同一件事的兩種切面：前者是「離物理天花板還差多少」，後者是「跟自己的舊版本比，差了多少」。</p>
+
+  <h2>數值驗證：省下來的效能有沒有偷跑</h2>
+
+  <p>所有降精度、融合、跳過運算的改動，都有一個共同的疑問：數字還準不準？團隊為此另外加了一層檢查——「incorporated a dedicated Numerical Verification Layer to audit accumulation precision」。這層驗證不是跑一次測試就結案，而是持續比對 Pallas 降階後的實際計算路徑，跟高精度 Float32 參考路徑之間的差距。</p>
+
+  <p>FP8 矩陣乘法通常會在較高精度的累加器裡做加總，再把結果轉回低精度——這是業界處理低精度推論的標準做法，單一乘加的誤差可以接受，但成千上萬次加總疊在一起，誤差會被放大。Numerical Verification Layer 要盯的，正是這個累加路徑有沒有在某個環節悄悄引入偏移。</p>
+
+  <p>結果是「verified that our Pallas-lowered gating weights maintain zero deviation from the high-precision Float32 reference path」——路由用的 gating 權重，在降精度、融合、演算法重寫之後，跟原始 Float32 版本的計算結果沒有偏差。路由這件事對精度特別敏感：gating 網路算出的分數只要有一點點漂移，就可能讓 top-10 的排名洗牌，連帶影響哪個專家被選中——這也是為什麼數值驗證特別鎖定 gating weights，而不是籠統地說「整體精度沒問題」。這句話撐起了前面所有 kernel 手術的正當性：如果每一刀下去都要犧牲一點準確度才能換速度，這篇文章談的就不是同一個模型；數值驗證層存在的意義，是讓「快」跟「對」不必二選一。</p>
+
+  <p>把數值驗證擺在這裡看，前面 82.4%、79.6% 這兩個效率數字，以及 3.1 倍、4.7 倍這兩個加速倍數，才站得住腳——如果降精度的路徑本身就有偏差，那麼「更快」有可能只是「算得比較粗」，兩者在數字上很難分辨。有驗證層盯著 gating weights 零偏差，至少可以排除這一種混淆。</p>
+
+  <p>decode-heavy 情境下，單一個 token step 跨越全部 60 層的總執行延遲，官方算出來是 16.36 毫秒。這個數字是所有上述改動疊加後的總帳——RPA 的 block size、GMM v2 的融合、GDN 的暫存器內運算、集體通訊的兩段式 Reduce-Scatter，每一項各自省下的時間，最後都收斂成這一行每步驟的毫秒數。如果讀者要在自己的叢集上做類似的精度下修，這篇文章示範的不是「大膽下修就對了」，而是「每次下修都配一個可以量測偏差的驗證層」——沒有這一層，前面所有 kernel 手術都只是賭注。</p>
+
+  <p>這套系統工程流程被團隊自己定位成一種方法論，而不是一次性的調參紀錄：「Rather than tackling models as monolithic systems, we decompose them into self-contained, independent building blocks（such as Batched RPA, Grouped GEMMs, and SparseCore unpermutation）accompanied by hardware-aware cost models.」每個 building block 各自有自己的 cost model，換一個新模型上來，先套進去看哪一塊卡住，而不必從頭重跑一輪 trial-and-error。</p>
+
+  <p class="vg-deep-closer"><strong>這套方法論解鎖了什麼</strong>：把模型拆成 Batched RPA、Grouped GEMMs、SparseCore unpermutation 這類彼此獨立的 building block，每一塊配上自己的硬體感知 cost model——團隊自己的說法是，這樣才不必「每個新模型家族都重新花幾個月做 trial-and-error」。下一個 397B 級的 MoE 模型上 Ironwood，要重複的是查 roofline、換 kernel、調集體通訊這三個步驟，而不是從頭再走一次。</p>
+</div>
