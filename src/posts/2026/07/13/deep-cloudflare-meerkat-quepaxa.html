@@ -1,0 +1,341 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">Cloudflare 內部服務要跨 330 多個資料中心讀寫同一份 control-plane 狀態，用 Raft 撐這種規模的教訓是：跨地域延遲一抖動，timeout 設定就會失準，replica 開始搶著發起選舉，寫入全部卡住。QuePaxa 的答案不是調更聰明的 timeout，而是讓 leader 變成可有可無——沒有它，共識依然能推進，只是多繞兩個 round trip。</p>
+  <h1 class="vg-post-title">Cloudflare Meerkat：拋掉固定 leader，用 QuePaxa 做全球共識</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p><span class="vg-dropcap">M</span>eerkat 是 Cloudflare Research 正在開發的全球共識服務，目標是讓分散在世界各地的內部服務讀寫同一份 control-plane 狀態，同時保持強一致與容錯——官方的講法是要在它之上蓋出「像 key-value（KV）store 一樣」的應用：「a consensus service upon which we can build applications that exhibit the above properties（strong consistency and fault tolerance）like a key-value（KV）store.」撐著 Meerkat 的演算法叫 QuePaxa，2023 年由 Tennage 與 Băsescu 等人發表：「a consensus algorithm called QuePaxa, published in 2023 by Tennage &amp; Băsescu et al.」跟 Paxos、Raft 同屬多數決共識家族，但在「誰能推進共識」這件事上走了完全不同的路。</p>
+
+  <p>這篇文章要拆的就是這條「不同的路」：leader 從必要條件降級成加速選項之後，往返成本怎麼算、容錯門檻有沒有變、延遲的真正下限在哪裡，以及 Meerkat 現在能不能拿來用。材料全部來自 Cloudflare 官方部落格的介紹文章，沒有第三方獨立測試可以交叉核對，讀的時候要記得這一點。</p>
+
+  <p>掛在 Cloudflare Research 底下這件事本身有資訊量——不是已經排上產品路線圖、有明確交付日期的項目，而是研究團隊在驗證一個演算法層級的想法能不能撐住 Cloudflare 自己的規模。這篇文章讀起來更像是給同行看的技術備忘，不是給客戶看的產品公告，後面提到的每一個數字、每一句關於現況的描述，都該放在這個語境裡理解。</p>
+
+  <h2>leader 可選：往返成本從哪裡省下來</h2>
+
+  <p>Raft 的規則很直白：叢集裡只有一個 replica——leader——能推進共識，其他 replica 只能等它下指令，或是在它消失時發起選舉搶下這個位置。Cloudflare 在說明 QuePaxa 時特別把這句話拿出來對照：「Raft relies on an authoritative leader: the only replica in the cluster that can drive consensus.」QuePaxa 保留了 leader，但把它從必要條件降級成加速選項，原文寫得更直接：「There is a leader, but it is not required」——它唯一的優勢是能用比其他 replica 更少的 round trip 推進共識。</p>
+
+  <p>這個設計選擇也解釋了為什麼 QuePaxa 沒有必要徹底丟掉 leader 的角色。leader 幫不上忙的時候（掛掉、被攻擊、連線不穩），共識機制不會因此停擺；leader 幫得上忙的時候（正常運作），大家還是樂於用它換取更少的往返次數。leader 從系統正確性依賴的角色，降級成系統效能依賴的角色——這兩者是完全不同等級的依賴，前者出問題會讓系統停擺，後者出問題只是變慢。</p>
+
+  <p>把這句話拆開看，round trip 數才是 leader 唯一買到的東西。leader 出面提案，「It takes one if the leader is proposing（+ an extra broadcast to notify replicas of the decision）」——1 個 round trip，外加一次廣播通知其他 replica 決議結果。非 leader 出面提案，「and three if a non-leader is proposing（+ extra broadcast）」——至少 3 個 round trip，同樣外加一次廣播。leader 不在的時候，共識沒有停下來，只是換了一條比較繞的路徑；leader 在的時候，它單純是條捷徑，不是通行證。這個廣播不是裝飾——提案本身只需要湊到多數派同意就能定案，但定案這件事還沒有讓沒被問到的那些 replica 知道發生了什麼事，所以不管走哪條路徑，決議之後都要多一次廣播，把結果同步給整個叢集，而不只是同意的那群。這一步不算進「1 個 round trip」或「3 個以上 round trip」的計數，是額外疊加上去的。</p>
+
+  <p>用一個小例子把數字釘死：假設叢集有 5 個 replica，套進 2f+1 的公式，f 等於 2，也就是最多容忍 2 台故障，多數派門檻是 3 台。leader 健康時，其中一個 replica 提案，湊到多數派回應只要 1 個 round trip；leader 消失或被攻擊者掐斷連線時，換成任何一個非 leader 提案，同樣要湊到 3 台的多數派回應，但流程本身要 3 個以上 round trip 才能落定，差別不是能不能達成共識，是達成共識要繞幾趟路。如果這 5 台裡有 2 台真的故障了，容錯上限剛好用完，剩下 3 台還是能湊出多數派，系統繼續運作；但如果壞到 3 台，連多數派都湊不齊，系統就真的停擺了——這才是 2f+1 這個數字畫的那條線。</p>
+
+  <p>更底層的規則是：不管走哪條路徑，一次提案決議的延遲本質上「proportional to the latency between some majority of replicas」——正比於某個多數派 replica 之間的延遲。這才是 QuePaxa 跟 Raft 最根本的差異，不是換一種更聰明的選舉演算法，而是把「推進共識」這件事從「必須先確定領導者是誰」改成「先湊到多數派」。底下把兩邊的結構差異攤開比較：</p>
+
+  <figure class="vg-w-table-quepaxa-raft" data-mobile="keep">
+    <style>
+      .vg-w-table-quepaxa-raft { overflow-x: auto; }
+      .vg-w-table-quepaxa-raft table { width: 100%; min-width: 640px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-quepaxa-raft thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); }
+      .vg-w-table-quepaxa-raft tbody td { padding: var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+      .vg-w-table-quepaxa-raft td.name { font-family: var(--sans); font-weight: 600; color: var(--accent-text); white-space: nowrap; }
+      .vg-w-table-quepaxa-raft figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-2); }
+    </style>
+    <table>
+      <thead>
+        <tr>
+          <th>演算法</th>
+          <th>leader 是否必要</th>
+          <th>提案 round trip</th>
+          <th>leader 出狀況時</th>
+          <th>容錯模型</th>
+          <th>針對性連線攻擊下的吞吐量</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="name">QuePaxa</td>
+          <td>否，leader 存在但可選，只負責省 round trip</td>
+          <td>leader 提案 1 次（+1 廣播）<br>非 leader 提案 3 次以上（+1 廣播）</td>
+          <td>不受影響，直接改走非 leader 路徑繼續提案</td>
+          <td>2f+1 台機器容 f 個故障，多數存活即可運作</td>
+          <td>基準，約為 Raft 的 10 倍</td>
+        </tr>
+        <tr>
+          <td class="name">Raft</td>
+          <td>是，唯一能推進共識的 replica</td>
+          <td>只有 leader 能提案，非 leader 無法直接推進</td>
+          <td>寫入卡住，要等 timeout 觸發新一輪選舉才能恢復</td>
+          <td>2f+1 台機器容 f 個故障，多數存活即可運作</td>
+          <td>約為 QuePaxa 的十分之一（與 Multi-Paxos 同組受測）</td>
+        </tr>
+      </tbody>
+    </table>
+    <figcaption>結構差異集中在兩欄，leader 是否必要、leader 出狀況時的行為。容錯門檻兩者相同，吞吐量差距出現在有沒有 timeout 依賴。</figcaption>
+  </figure>
+
+  <h2>timeout 的暴政，以及 QuePaxa 怎麼閃開它</h2>
+
+  <p>Cloudflare 用一個詞形容 Raft 這類協定的弱點——「timeout 的暴政」（tyranny of timeouts）。多數協定在 leader 消失時靠 timeout 換人：「if a non-leader replica hasn't heard from the leader in some amount of time, they propose themselves as the leader. At that point, the old leader has been deposed, and the system cannot accept writes until a new leader has been elected.」非 leader 的 replica 只要一段時間沒收到 leader 的消息，就會提名自己當 leader；舊 leader 一旦被廢，系統在新 leader 選出之前完全不能接受寫入。</p>
+
+  <p>問題出在 timeout 這個數字兩邊都難調。設太短：「The problem is that when the timeout is shorter than the network delay between the original leader and that replica, replicas will constantly be timing out and thus blocking writes.」網路延遲一超過 timeout，replica 就不斷誤判 leader 已死，寫入因此不斷被卡住。設太長：「And when the timeout is too long, the system reacts slowly to a failed leader, during which writes are also blocked.」系統對真正的故障反應遲鈍，寫入一樣被卡住。多個 replica 同時提名自己當 leader 時，彼此的『競選』還會互相干擾，不斷重新提名、持續卡住寫入。Cloudflare 說這不是紙上談兵：「We have seen these exact issues with Cloudflare's systems that use Raft because our wide-area network delays can and do vary wildly, making tuning timeouts especially difficult.」</p>
+
+  <p>這個模型對工程師的意義是：Raft 的可用性其實藏著一個隱性依賴——不是叢集裡多數機器活著就夠，還要求 leader 的連線品質夠好、夠穩定，timeout 才調得準。跨州、跨洲的部署裡，這個隱性依賴會被放大成日常維運的麻煩，延遲抖動不是異常，是常態，而 Raft 把常態的抖動當成 leader 已死的訊號來源，兩者本來就分不清楚。QuePaxa 把這個隱性依賴拿掉，它不靠任何 replica 去判斷別人是死是活，共識能不能達成只看多數派訊息湊不湊得齊。</p>
+
+  <p>把這個弱點放進一個更惡劣的場景：如果有人刻意鎖定 leader 的連線發動攻擊呢？QuePaxa 論文測的正是這種情境——「networks in which an imaginary adversary can launch targeted attacks on replica connections」，網路裡有一個假想的敵人，能對 replica 之間的連線發動針對性攻擊。結果是：「The authors found that it maintains much higher（~10x）throughput than Raft and Multi-Paxos during such conditions.」原因就在上一節那條規則裡：攻擊者掐斷 leader 的連線，Raft 沒有 leader 就沒辦法推進，只能反覆等新一輪選舉；QuePaxa 沒有 leader 一樣能提案，只是所有 replica 一起繞遠路，3 個 round trip 起跳。針對性攻擊這個威脅模型，凸顯的是 Raft 類協定一個結構性的弱點：leader 是全叢集裡最值得攻擊的單一目標，打垮它一個，就能讓全部寫入停擺，報酬遠高於隨機打任何一台機器。QuePaxa 把這個誘因拆掉了：叢集裡沒有哪一個 replica 是打了就全滅的單點，攻擊者要嘛得同時癱瘓多數派，成本高很多，要嘛就只是讓系統多繞幾個 round trip，稱不上真正的攻擊成果。底下這個模擬把兩邊的行為攤開來看：</p>
+
+  <figure class="vg-w-canvas-quepaxa-attack" data-mobile="swap" data-mobile-summary="針對性攻擊掐斷 leader 連線後，Raft 陷入選舉風暴、寫入停擺；QuePaxa 改走非 leader 的三輪路徑，吞吐量仍是 Raft 十倍左右。">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M12 2v4"/><path d="m6.8 6.8-2.8-2.8"/><path d="M2 12h4"/><path d="m6.8 17.2-2.8 2.8"/><path d="M12 18v4"/><path d="m17.2 17.2 2.8 2.8"/><path d="M18 12h4"/><path d="m17.2 6.8 2.8-2.8"/>
+      </svg>
+      <span>按「模擬攻擊」看 leader 連線遭鎖定時兩種協定的反應 · 2 條 lane，各 5 個 replica</span>
+    </p>
+    <style>
+      .vg-w-canvas-quepaxa-attack { display: grid; grid-template-rows: auto auto 1fr auto; gap: var(--s-2); }
+      .vg-w-canvas-quepaxa-attack .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+      .vg-w-canvas-quepaxa-attack button { font-family: var(--sans); font-size: var(--fs-sm); padding: 6px 14px; min-height: 44px; min-width: 44px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); cursor: pointer; }
+      .vg-w-canvas-quepaxa-attack button:hover { border-color: var(--accent); color: var(--accent-text); }
+      .vg-w-canvas-quepaxa-attack button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent-text); }
+      .vg-w-canvas-quepaxa-attack canvas { width: 100%; height: auto; aspect-ratio: 16 / 9; display: block; }
+      .vg-w-canvas-quepaxa-attack figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+      @media (max-width: 720px) {
+        .vg-w-canvas-quepaxa-attack canvas { aspect-ratio: 4 / 3; }
+      }
+    </style>
+
+    <div class="toolbar">
+      <button type="button" data-action="toggle">▷ play</button>
+      <button type="button" data-action="reset">↺ reset</button>
+      <button type="button" data-action="attack" aria-pressed="false">⚡ 模擬針對性攻擊</button>
+      <span style="margin-left: auto" data-clock>t = 0.0s</span>
+    </div>
+
+    <canvas></canvas>
+
+    <figcaption>示意模擬，依 Cloudflare 引用 QuePaxa 論文的比例（針對性攻擊下約 10 倍吞吐量差距）校準兩條 lane 的完成速率，不是原始 benchmark 波形。</figcaption>
+
+    <script>
+    (function () {
+      if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+      var root = document.querySelector('.vg-w-canvas-quepaxa-attack');
+      var canvas = root.querySelector('canvas');
+      var ctx = canvas.getContext('2d');
+      var clock = root.querySelector('[data-clock]');
+      var toggleBtn = root.querySelector('[data-action="toggle"]');
+      var resetBtn = root.querySelector('[data-action="reset"]');
+      var attackBtn = root.querySelector('[data-action="attack"]');
+
+      function cssVar(name) { return getComputedStyle(root).getPropertyValue(name).trim() || '#888'; }
+
+      function resize() {
+        var dpr = window.devicePixelRatio || 1;
+        var rect = canvas.getBoundingClientRect();
+        canvas.width = rect.width * dpr;
+        canvas.height = rect.height * dpr;
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      }
+      window.addEventListener('resize', resize);
+      resize();
+
+      var running = false, attackOn = false, t = 0;
+      var raftProgress = 0, raftCompleted = 0;
+      var qpProgress = 0, qpCompleted = 0;
+      var BASE = 0.9;
+
+      function raftCycle() { return attackOn ? BASE * 30 : BASE; }
+      function qpCycle() { return attackOn ? BASE * 3 : BASE; }
+
+      function step(dt) {
+        t += dt;
+        raftProgress += dt / raftCycle();
+        if (raftProgress >= 1) { raftProgress -= 1; raftCompleted++; }
+        qpProgress += dt / qpCycle();
+        if (qpProgress >= 1) { qpProgress -= 1; qpCompleted++; }
+      }
+
+      function lane(y, label, replicas, progress, completed, blocked) {
+        var W = canvas.getBoundingClientRect().width;
+        ctx.font = '13px "EB Garamond", serif';
+        ctx.fillStyle = cssVar('--ink');
+        ctx.fillText(label, 16, y - 26);
+        ctx.font = '12px "JetBrains Mono", monospace';
+        ctx.fillStyle = cssVar('--accent-text');
+        ctx.fillText('完成 ' + completed + ' 次', W - 110, y - 26);
+
+        var cx0 = 60, cxSpan = W - 120, r = 9;
+        for (var i = 0; i < replicas; i++) {
+          var cx = cx0 + (cxSpan * i) / (replicas - 1);
+          ctx.beginPath();
+          ctx.arc(cx, y, r, 0, Math.PI * 2);
+          ctx.fillStyle = i === 0 ? cssVar('--accent') : cssVar('--bg-soft');
+          ctx.fill();
+          ctx.lineWidth = 1.3;
+          ctx.strokeStyle = blocked ? cssVar('--muted-2') : cssVar('--ink');
+          ctx.stroke();
+        }
+
+        var barX = cx0, barW = cxSpan;
+        ctx.strokeStyle = cssVar('--muted-2');
+        ctx.lineWidth = 1;
+        ctx.strokeRect(barX, y + 16, barW, 8);
+        ctx.fillStyle = blocked ? cssVar('--muted-2') : cssVar('--sage-deep');
+        ctx.fillRect(barX, y + 16, barW * progress, 8);
+
+        if (blocked) {
+          ctx.font = '11px "JetBrains Mono", monospace';
+          ctx.fillStyle = cssVar('--muted');
+          ctx.fillText('leader 連線遭鎖定，選舉風暴中', barX, y + 40);
+        }
+      }
+
+      function draw() {
+        var W = canvas.getBoundingClientRect().width;
+        var H = canvas.getBoundingClientRect().height;
+        ctx.clearRect(0, 0, W, H);
+        lane(H * 0.32, 'Raft', 5, raftProgress, raftCompleted, attackOn);
+        lane(H * 0.78, 'QuePaxa', 5, qpProgress, qpCompleted, false);
+      }
+
+      var last = performance.now();
+      function frame(now) {
+        var dt = Math.min(0.1, (now - last) / 1000);
+        last = now;
+        if (running) step(dt);
+        draw();
+        clock.textContent = 't = ' + t.toFixed(1) + 's';
+        requestAnimationFrame(frame);
+      }
+      requestAnimationFrame(frame);
+
+      toggleBtn.addEventListener('click', function () {
+        running = !running;
+        toggleBtn.textContent = running ? '⏸ pause' : '▷ play';
+        last = performance.now();
+      });
+      resetBtn.addEventListener('click', function () {
+        running = false;
+        toggleBtn.textContent = '▷ play';
+        t = 0; raftProgress = 0; raftCompleted = 0; qpProgress = 0; qpCompleted = 0;
+        attackOn = false;
+        attackBtn.setAttribute('aria-pressed', 'false');
+      });
+      attackBtn.addEventListener('click', function () {
+        attackOn = !attackOn;
+        attackBtn.setAttribute('aria-pressed', String(attackOn));
+      });
+    })();
+    </script>
+  </figure>
+
+  <p>leader 消失時，Raft 停下來等一輪新的選舉；QuePaxa 只是慢下來，繼續走。這個 10 倍的數字要注意出處：這是 QuePaxa 論文作者自己的實驗結果，經過 Cloudflare 轉述，不是 Cloudflare 拿自家系統重新驗證過的獨立測試。論文設定的假想敵人攻擊模型本身也是抽象化的威脅模型，跟真實世界攻擊者的行為模式未必完全對得上，這不代表數字不可信，只是提醒讀者這是理論測試環境的結果，不是生產環境的實測。</p>
+
+  <h2>容錯模型：2f+1 容 f，跟 Paxos 家族沒有分家</h2>
+
+  <p>QuePaxa 沒有在容錯模型上另起爐灶，用的仍是 Paxos 家族標準的多數決：「f faults in a system of 2f + 1 machines」——2f+1 台機器的系統可以容忍 f 個故障。可用性的前提也是同一句老話：「A majority of the machines in our system are alive and can communicate with one another.」這裡的「故障」指的是當機或網路分區，不是拜占庭式的惡意行為——QuePaxa 假設壞掉的 replica 就是停止回應，不會假裝自己還活著、發送錯誤訊息去干擾其他 replica 的判斷。</p>
+
+  <p>多數決模型另一個常被忽略的推論是：只要撐住多數，被隔開的少數 replica 完全不會影響叢集運作，它們既不能誤導其他 replica，也不能阻擋共識前進，等網路恢復再追上進度即可。這也是為什麼 Meerkat 的概念驗證特別強調持續讓 leader 故障這個測試方式：leader 只是叢集裡任何一個 replica 恰好扮演的角色，它掛掉不代表叢集裡的多數也跟著掛掉，兩者是完全不同層次的事件。</p>
+
+  <p>Meerkat 團隊把這個模型放到現實世界裡測：「Meerkat is not deployed to production, but we have run multiple proofs-of-concept with up to 50 replicas distributed around the world, to great success.」未上生產，但概念驗證測到最多 50 個全球分佈的 replica，官方形容結果良好，只是沒有附上具體的量化指標。更具體的觀察是：「Leaders in our proof-of-concept clusters constantly fail, and the cluster keeps operating with no increase in error-rate.」leader 在測試環境裡不斷掛掉，叢集照樣運作，錯誤率沒有跟著故障次數往上爬——這正是 leader-optional 設計要交出的答案：「the system never becomes unavailable or degraded due to a single replica（the leader）being down, unavailable, or degraded.」多數機器存活且能互相溝通這個前提，在 330 多個資料中心的規模下也不是理所當然。Meerkat 要撐住的不是同機房內幾台機器之間的共識，而是分散在全球的 replica 群，要嘛把所有 replica 攤開在夠多的資料中心，讓局部故障不至於啃掉多數；要嘛在放置策略上做取捨，犧牲一些地理覆蓋換取更低的 round trip 延遲。容錯與延遲兩件事在 replica 放置這個決策點上，天生就是互相拉扯的，這個張力會在後面談延遲最佳化時再展開。下面這個滑桿把 replica 數跟容錯上限的關係攤開：</p>
+
+  <figure class="vg-w-range-quepaxa-quorum" data-mobile="static" data-svg-scroll="720">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/><path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+      </svg>
+      <span>拖曳滑桿看 replica 數怎麼決定多數派門檻與容錯上限 · 範圍 3 到 51</span>
+    </p>
+    <style>
+      .vg-w-range-quepaxa-quorum { display: grid; gap: var(--s-3); }
+      .vg-w-range-quepaxa-quorum .controls { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); }
+      .vg-w-range-quepaxa-quorum .controls input[type="range"] { flex: 1; height: 36px; accent-color: var(--accent); }
+      .vg-w-range-quepaxa-quorum .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 24ch; text-align: right; }
+      .vg-w-range-quepaxa-quorum svg { width: 100%; height: auto; max-width: 720px; }
+      .vg-w-range-quepaxa-quorum figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+
+    <div class="controls" data-vg-controls>
+      <label for="vg-w-range-quepaxa-quorum-n">N =</label>
+      <input id="vg-w-range-quepaxa-quorum-n" type="range" min="3" max="51" step="1" value="21" />
+      <span class="readout" data-readout>N = 21 → 多數派 11、f = 10</span>
+    </div>
+
+    <svg class="vg-w-range-quepaxa-quorum-main" viewBox="0 0 720 160" role="img" aria-label="replica 數與多數派、容錯上限的關係長條圖">
+      <line x1="40" y1="70" x2="680" y2="70" stroke="var(--muted-2)" stroke-width="1"/>
+      <rect data-majority-bar x="40" y="56" width="0" height="28" fill="var(--accent)" opacity="0.55"/>
+      <rect data-fail-bar x="40" y="56" width="0" height="28" fill="var(--muted-2)" opacity="0.5"/>
+      <line x1="680" y1="40" x2="680" y2="100" stroke="var(--sage-deep)" stroke-width="1.5" stroke-dasharray="3,2"/>
+      <text x="680" y="30" text-anchor="end" fill="var(--sage-deep)" font-family="IM Fell English, serif" font-style="italic" font-size="12">概念驗證測到 N=50</text>
+      <text x="40" y="110" fill="var(--muted)" font-family="EB Garamond, serif" font-size="13">多數派（accent 色）：共識決議需要湊到的門檻</text>
+      <text x="40" y="128" fill="var(--muted)" font-family="EB Garamond, serif" font-size="13">可容忍故障 f（灰色）：最多能同時失聯這麼多台</text>
+    </svg>
+
+    <figcaption>2f+1 台機器容 f 個故障，門檻永遠卡在過半。Meerkat 概念驗證測過的規模上限是 50 個全球分佈的 replica。</figcaption>
+
+    <script>
+    (function () {
+      if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+      var root = document.querySelector('.vg-w-range-quepaxa-quorum');
+      var input = root.querySelector('input[type="range"]');
+      var readout = root.querySelector('[data-readout]');
+      var majBar = root.querySelector('[data-majority-bar]');
+      var failBar = root.querySelector('[data-fail-bar]');
+      var trackX = 40, trackW = 640;
+
+      function recompute() {
+        var n = Number(input.value);
+        var majority = Math.floor(n / 2) + 1;
+        var f = n - majority;
+        var majW = (trackW * majority) / 51;
+        var failW = (trackW * f) / 51;
+        majBar.setAttribute('width', String(majW));
+        failBar.setAttribute('x', String(trackX + majW));
+        failBar.setAttribute('width', String(failW));
+        readout.textContent = 'N = ' + n + ' → 多數派 ' + majority + '、f = ' + f;
+      }
+      input.addEventListener('input', recompute);
+      recompute();
+    })();
+    </script>
+  </figure>
+
+  <h2>延遲下限，以及四招把它壓低</h2>
+
+  <p>把 leader 拿掉解決的是被單點卡住的問題，沒有讓延遲消失。真正的下限前面已經寫過：一次決議需要湊到多數派回應，那次決議的延遲就等於「到齊多數派中最慢那一個」所花的時間，跟叢集裡有沒有 leader 無關。Meerkat 拿四種手段去壓低這個下限，而不是去挑戰它。</p>
+
+  <p>第一招是 replica 放置：「developers have control over where their replicas live, they can choose to move replicas closer together, reducing round-trip latency」，開發者自己決定 replica 擺在哪，把它們挪近一點就能直接縮短 round trip 延遲。第二招是批次寫入：「Writes can be batched. So if a replica receives 10 writes in a span of 10ms, it can place all of those in a single proposal, improving throughput.」十毫秒內收到的多筆寫入湊成一次提案一起送，吞吐量跟著上去。第三招是容忍 stale read：「Not all reads must trigger a consensus round. If a developer is OK with reading stale（but never inconsistent）data, they can read from any replica's local data.」不是所有讀取都要走一輪共識，只要能接受讀到舊值（但絕不是不一致的值），直接讀任何一個 replica 的本地資料就好。第四招是把交易打包進單輪共識：Meerkat 的 KV store「supports compare-and-swap-style writes in which writes execute only if a value has not changed since it was read」，而且「In fact, it supports general transactions」，CAS 與更一般的交易都能塞進同一輪共識，不必為了保序額外多繞一次。</p>
+
+  <p>這四招背後其實是同一個邏輯：延遲下限鎖死在多數派回應所需的時間，那就不要浪費任何一次已經湊齊的多數派，放置決定這次多數派要花多久湊齊，批次決定一次湊齊要處理多少寫入，stale read 決定哪些操作根本不需要湊多數派，CAS／交易打包決定一次湊齊的多數派能不能順便扛更複雜的邏輯。沒有一招真正繞過延遲正比於多數派延遲這條規則，全部是在這條規則畫出的邊界裡想辦法多做事。</p>
+
+  <figure class="vg-w-pop-quepaxa-tradeoffs" data-mobile="keep">
+    <style>
+      .vg-w-pop-quepaxa-tradeoffs .grid { display: grid; grid-template-columns: 1fr; gap: var(--s-3); }
+      @media (min-width: 720px) { .vg-w-pop-quepaxa-tradeoffs .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+      .vg-w-pop-quepaxa-tradeoffs .item { padding: var(--s-2); border-left: 2px solid var(--accent); }
+      .vg-w-pop-quepaxa-tradeoffs .term { display: block; font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); margin-bottom: var(--s-1); }
+      .vg-w-pop-quepaxa-tradeoffs .pop { font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink-soft); margin: 0; }
+      .vg-w-pop-quepaxa-tradeoffs figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-2); }
+    </style>
+    <div class="grid">
+      <div class="item">
+        <span class="term">replica 放置</span>
+        <p class="pop">把 replica 挪近彼此，直接縮短 round trip 的實體距離成本；犧牲的是 replica 越分散、地理容錯覆蓋越好這個特性。</p>
+      </div>
+      <div class="item">
+        <span class="term">批次寫入</span>
+        <p class="pop">十毫秒內的多筆寫入湊成一次提案，省下共識輪數；犧牲的是單筆寫入要等批次湊滿或逾時，延遲不再是即時的。</p>
+      </div>
+      <div class="item">
+        <span class="term">stale read</span>
+        <p class="pop">直接讀任一 replica 的本地資料，省下整輪共識延遲；犧牲的是讀到的值可能不是最新寫入，只保證不會讀到不一致的值。</p>
+      </div>
+      <div class="item">
+        <span class="term">CAS／交易打包</span>
+        <p class="pop">compare-and-swap 與一般交易都塞進同一輪共識，省下為了保序另外多繞的輪次；犧牲的是單輪提案要扛的邏輯變複雜。</p>
+      </div>
+    </div>
+    <figcaption>四招都只是把多數派湊齊的延遲下限往下壓，不是繞過它。</figcaption>
+  </figure>
+
+  <h2>現況：只給內部用，先解決哪類問題</h2>
+
+  <p>把三段內容串起來看，QuePaxa 對 Raft 做的修正不是調更好的參數，而是換一個問題的問法：Raft 問這一刻誰是 leader，QuePaxa 問這一刻誰湊得到多數派。前者的答案會因為網路抖動而不穩定，後者的答案只跟機器是否存活、彼此是否連得上有關，跟時間、跟猜測都無關。這個問法上的差異，才是往返成本、容錯門檻、延遲下限這三件事最後能串成一套一致邏輯的原因。</p>
+
+  <p>Cloudflare 內部服務要跨的資料中心數字不小：「Many internal services at Cloudflare need to read and modify the same control-plane state from across our 330+ global data centers.」這是 Meerkat 要撐住的規模量級。但 Meerkat 目前的定位很明確：「Meerkat is an experimental consensus service that is still in development.」而且「it will be kept internal-only for the immediate future」——短期內不會對外開放，也還沒有正式上生產環境。</p>
+
+  <p>適合它的場景也講得很清楚：「These limitations make it perfect, in the short term, for control plane information that is written infrequently but must remain consistent.」寫得不頻繁、但必須保持一致的 control-plane 資料，是目前唯一被點名的目標場景。留意這句話的用詞：「perfect」是很滿的斷言，但前面特別加了「in the short term」限定——Cloudflare 自己也只用這種帶保留的說法描述適用範圍，沒有承諾未來會不會擴大到寫入頻繁的一般資料，也沒有給出時間表。對照 330 多個資料中心這個規模，能理解為什麼「強一致但寫得少」是目前唯一敢拍胸脯的定位：leader-optional 拿掉的是單點故障，拿不掉的是多數派延遲下限，一個寫入頻繁、跨洲的系統遇到這個下限只會更痛。</p>
+
+  <p>50 個 replica 的概念驗證，跟 330 多個資料中心的目標規模之間還有明顯落差，文章沒有解釋這個落差怎麼補，也沒有給出實際上線的時間表。比較合理的推測是，不是每個資料中心都需要各自跑一個 replica，Meerkat 要撐的是跨資料中心的少數關鍵 replica 之間達成共識，而不是每個資料中心都變成叢集裡的一票——但這一點文章沒有明說，只能算是延伸的推測。</p>
+
+  <p class="vg-deep-closer"><strong>What this enables</strong>：當共識不再綁死在單一 leader 身上，Cloudflare 內部服務就有機會在 330 多個資料中心之間共用同一份強一致的 control-plane 狀態，而不必為了扛住跨地域延遲抖動去反覆調 Raft 的 timeout。</p>
+</div>
