@@ -1,0 +1,360 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">一個 100 GB 的資料庫要多生出一條可寫分支，Homescale 不會先複製那 100 GB。它靠的是 Ceph RBD 一個已經存在的機制——clone 剛生出來時跟來源共用所有資料，只有第一次寫入時才真正分家。</p>
+  <h1 class="vg-post-title">Homescale：從快照長出可寫的資料庫分支</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p><span class="vg-dropcap">H</span>omescale 想解決的問題，作者寫得很白：「A database process reads and writes a filesystem on what looks like a block device. I only need the storage behind that device to have a lifecycle independent of the process using it.」資料庫程式看到的只是一塊 block device，作者想讓「這塊儲存背後的生命週期」跟「用它的程式」脫鉤——不必讓每一種資料庫引擎自己重新發明一套分支邏輯，那件事整個下放給儲存層去處理。這是系列的第一篇，只談架構跟機制；作者自己講得清楚，Homescale 服務本身的實作——CLI 用的 API、管理資料庫資源的 controller、Postgres adapter——要留到下一篇才寫：「The next part will cover the Homescale services: the API used by the CLI, the controllers that manage database resources, and the Postgres adapter.」換句話說，這篇讀完，你會知道「分支為什麼便宜」跟「誰負責哪一段」，但還看不到一行 Homescale 自己的程式碼。</p>
+
+  <p>這也解釋了為什麼這件事被放在儲存層而不是資料庫引擎——資料庫引擎的責任是查詢與交易語意，不該同時扛著「怎麼有效率地生出一份自己的複本」這個儲存工程問題。這件事對工程團隊的實際意義很直接：每次要生一個乾淨的測試資料庫、給某個 feature branch 配一份跟正式環境資料同構的資料，過去的做法不是整份複製、就是靠特定資料庫引擎的邏輯複製工具，兩者都要付出跟資料量成正比的時間與空間。合理的推測是，如果分支的成本能壓到接近零，開發流程裡「每個 PR 都能有自己的資料庫分支」這件事才會變得可行，而不是只留給少數幾套共用的測試環境。</p>
+
+  <h2>RBD 的 copy-on-write：分支為什麼幾乎不占空間</h2>
+
+  <p>Homescale 的分支機制建在 Ceph 一個行之有年的機制上——RBD（RADOS Block Device）的 snapshot 與 clone。定義寫得很乾脆：「An RBD snapshot is a read-only view of an image at a point in time. A clone is a writable RBD image that refers back to that snapshot for data it does not yet own.」關鍵字是「refers back」——clone 剛生出來的時候不擁有任何自己的資料，它的每一個 block 都指回那份唯讀 snapshot。這解釋了開頭那句聽起來不合理的話：「A branch of a 100 GB database therefore appears as a complete 100 GB database without requiring another 100 GB copy up front.」讀者看到的是一個完整的 100 GB 卷，實際佔用的儲存空間卻接近零，因為所有 block 仍然是同一份資料，只是多了一層指標關係。</p>
+
+  <p>真正的複製只在寫入那一刻才發生：「On the first write to shared data, the storage layer copies the relevant allocation unit into the writable container and applies the change there.」分支跟來源共享的資料是唯讀的，某個 allocation unit 一旦被寫入，RBD 才把那個單位——不是整個卷——複製一份到可寫的 clone 裡，新資料寫在複製後的那份上。沒被碰過的 block 永遠留在原本的 snapshot，不會重複佔用空間。這跟資料庫自己實作分支的路數完全不同：如果分支邏輯寫在資料庫引擎裡，通常得整份匯出再匯入，或是靠邏輯複製把資料重新灌一次，兩者都跟資料量成正比。RBD 的做法把「分支」變成儲存層的操作，跟上面跑的是 Postgres 還是別的引擎完全無關——只要裝得進一個 block device，分支的成本模型都一樣。</p>
+
+  <p>這裡的 allocation unit 指的是 RBD 內部管理儲存空間的最小單位，不是檔案系統看到的單一檔案——一次寫入就算只改了一個檔案裡的幾個 byte，只要那幾個 byte 落在某個尚未複製過的 allocation unit 裡，RBD 也只需要複製那一個單位，不會牽動同一個檔案其他還沒被寫過的部分。這也代表 Homescale 不需要碰資料庫引擎的 write-ahead log 或任何邏輯層的一致性機制——分支這件事完全發生在 block 之下，資料庫程式甚至不會知道自己正在被拿去生一個分支，還是本來就在跑。合理的推測是，要保證快照那一刻的資料是可以安全復原的狀態，還是需要資料庫在拍照前做過一次 checkpoint 或短暫暫停寫入，只是這個協調細節原文沒有展開，作者留給後面服務層的 controller 去處理。</p>
+
+  <p>直接對著 RBD 下指令，分支的建立只有三個步驟。</p>
+
+  <figure class="vg-w-tabs-homescale-rbd-sequence" data-mobile="keep">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/>
+      </svg>
+      <span>切換三個分頁看每個 RBD 指令的作用 · 3 步驟</span>
+    </p>
+    <style>
+      .vg-w-tabs-homescale-rbd-sequence { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--s-2); min-width: 0; max-width: 100%; }
+      .vg-w-tabs-homescale-rbd-sequence input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-tabs-homescale-rbd-sequence .tabs { display: flex; gap: var(--s-2); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+      .vg-w-tabs-homescale-rbd-sequence .tab { font-family: var(--sans); font-size: var(--fs-sm); padding: var(--s-1) var(--s-2); cursor: pointer; color: var(--muted); text-transform: uppercase; letter-spacing: 0.03em; min-height: 44px; display: flex; align-items: center; }
+      .vg-w-tabs-homescale-rbd-sequence .panel { display: none; padding: var(--s-2) 0; min-width: 0; }
+      .vg-w-tabs-homescale-rbd-sequence .panel pre { margin: 0 0 var(--s-2) 0; overflow-x: auto; max-width: 100%; }
+      .vg-w-tabs-homescale-rbd-sequence .panel p { margin: 0; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-tabs-homescale-rbd-sequence:has(#vg-w-tabs-homescale-rbd-sequence-t1:checked) .panel-1 { display: block; }
+      .vg-w-tabs-homescale-rbd-sequence:has(#vg-w-tabs-homescale-rbd-sequence-t1:checked) [for="vg-w-tabs-homescale-rbd-sequence-t1"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-homescale-rbd-sequence:has(#vg-w-tabs-homescale-rbd-sequence-t2:checked) .panel-2 { display: block; }
+      .vg-w-tabs-homescale-rbd-sequence:has(#vg-w-tabs-homescale-rbd-sequence-t2:checked) [for="vg-w-tabs-homescale-rbd-sequence-t2"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-homescale-rbd-sequence:has(#vg-w-tabs-homescale-rbd-sequence-t3:checked) .panel-3 { display: block; }
+      .vg-w-tabs-homescale-rbd-sequence:has(#vg-w-tabs-homescale-rbd-sequence-t3:checked) [for="vg-w-tabs-homescale-rbd-sequence-t3"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    </style>
+    <input type="radio" id="vg-w-tabs-homescale-rbd-sequence-t1" name="vg-w-tabs-homescale-rbd-sequence-sel" checked />
+    <input type="radio" id="vg-w-tabs-homescale-rbd-sequence-t2" name="vg-w-tabs-homescale-rbd-sequence-sel" />
+    <input type="radio" id="vg-w-tabs-homescale-rbd-sequence-t3" name="vg-w-tabs-homescale-rbd-sequence-sel" />
+    <div class="tabs">
+      <label class="tab" for="vg-w-tabs-homescale-rbd-sequence-t1">1 · snap create</label>
+      <label class="tab" for="vg-w-tabs-homescale-rbd-sequence-t2">2 · snap protect</label>
+      <label class="tab" for="vg-w-tabs-homescale-rbd-sequence-t3">3 · clone</label>
+    </div>
+    <div class="panel panel-1">
+      <pre data-kind="shell"><code>rbd snap create homescale/dev-db@feature-login</code></pre>
+      <p>對 <code>dev-db</code> 這個來源容器拍一張唯讀快照，凍結它在這一刻的狀態。快照本身不可寫，之後所有分支的資料都會先指回這裡。</p>
+    </div>
+    <div class="panel panel-2">
+      <pre data-kind="shell"><code>rbd snap protect homescale/dev-db@feature-login</code></pre>
+      <p>把剛拍下的快照鎖住，禁止在還有 clone 依賴它的時候被刪除。合理的推測是，這一步是為了避免來源之後被清理時，把分支正在依賴的資料一併刪掉。</p>
+    </div>
+    <div class="panel panel-3">
+      <pre data-kind="shell"><code>rbd clone homescale/dev-db@feature-login homescale/feature-login</code></pre>
+      <p>從鎖住的快照生出一個可寫的新 image——這就是 <code>feature-login</code> 分支。它一出生就跟快照共用所有 block，直到第一次寫入才開始分家。</p>
+    </div>
+  </figure>
+
+  <p>三個步驟合起來，做的事情是先凍結來源在某個時間點的狀態、把那個凍結點鎖住不准刪，再從鎖住的凍結點長出一個可以寫的新分支——順序不能顛倒，沒有先拍照就沒有凍結點可以鎖，沒有鎖住就不能安全地從它 clone。</p>
+
+  <p>分支實際會占用多少額外空間，只跟一件事有關：建立之後有多少比例的 block 被寫入過。</p>
+
+  <figure class="vg-w-range-homescale-cow-growth" data-mobile="static" data-svg-scroll="720">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m18 8 4 4-4 4"/><path d="M2 12h20"/><path d="m6 8-4 4 4 4"/>
+      </svg>
+      <span>拖曳滑桿看寫入比例如何改變分支實際占用的空間</span>
+    </p>
+    <style>
+      .vg-w-range-homescale-cow-growth { display: grid; gap: var(--s-3); }
+      .vg-w-range-homescale-cow-growth .controls { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); flex-wrap: wrap; }
+      .vg-w-range-homescale-cow-growth .controls input[type="range"] { flex: 1; min-width: 160px; height: 36px; accent-color: var(--accent); }
+      .vg-w-range-homescale-cow-growth .readout { font-variant-numeric: tabular-nums; color: var(--accent-text); min-width: 5ch; text-align: right; font-family: JetBrains Mono, monospace; }
+      .vg-w-range-homescale-cow-growth svg.vg-w-range-homescale-cow-growth-main { width: 100%; height: auto; }
+      .vg-w-range-homescale-cow-growth .detail { font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink-soft); margin: 0; }
+      @media (hover: none) and (pointer: coarse) {
+        .vg-w-range-homescale-cow-growth .controls { display: none; }
+      }
+    </style>
+    <div class="controls" data-vg-controls>
+      <label for="vg-w-range-homescale-cow-growth-x">寫入比例 =</label>
+      <input id="vg-w-range-homescale-cow-growth-x" type="range" min="0" max="100" step="1" value="0" />
+      <span class="readout" data-readout>0%</span>
+    </div>
+    <svg class="vg-w-range-homescale-cow-growth-main" viewBox="0 0 720 240" role="img" aria-label="分支占用空間隨寫入比例增加的長條圖">
+      <text x="360" y="28" text-anchor="middle" fill="var(--ink)" font-family="IM Fell English, serif" font-style="italic" font-size="13">分支目前占用的空間（相對來源 100 GB）</text>
+      <rect x="60" y="100" width="640" height="40" fill="var(--sage)" opacity="0.55" data-bar-shared />
+      <rect x="60" y="100" width="0" height="40" fill="var(--accent)" opacity="0.75" data-bar-copied />
+      <line x1="60" y1="150" x2="60" y2="158" stroke="var(--muted-2)" stroke-width="1"/>
+      <line x1="700" y1="150" x2="700" y2="158" stroke="var(--muted-2)" stroke-width="1"/>
+      <text x="60" y="176" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="12">0%</text>
+      <text x="700" y="176" text-anchor="end" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="12">100%</text>
+      <text x="360" y="176" text-anchor="middle" fill="var(--muted)" font-family="IM Fell English, serif" font-style="italic" font-size="11">已寫入 block 的比例</text>
+      <rect x="60" y="204" width="14" height="14" fill="var(--accent)" opacity="0.75"/>
+      <text x="80" y="215" fill="var(--ink)" font-family="EB Garamond, serif" font-size="13">已複製到分支（可寫）</text>
+      <rect x="340" y="204" width="14" height="14" fill="var(--sage)" opacity="0.55"/>
+      <text x="360" y="215" fill="var(--ink)" font-family="EB Garamond, serif" font-size="13">仍與來源共用（唯讀 snapshot）</text>
+    </svg>
+    <p class="detail" data-detail>尚未寫入任何 block——分支跟來源的 snapshot 完全共用資料，新增儲存接近 0 GB。</p>
+  </figure>
+  <script>
+  (function () {
+    if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+    var root = document.querySelector('.vg-w-range-homescale-cow-growth');
+    var input = root.querySelector('input[type="range"]');
+    var readout = root.querySelector('[data-readout]');
+    var copied = root.querySelector('[data-bar-copied]');
+    var shared = root.querySelector('[data-bar-shared]');
+    var detail = root.querySelector('[data-detail]');
+    var totalW = 640;
+    function recompute() {
+      var pct = Number(input.value);
+      readout.textContent = pct + '%';
+      var copiedW = totalW * pct / 100;
+      copied.setAttribute('width', String(copiedW));
+      shared.setAttribute('x', String(60 + copiedW));
+      shared.setAttribute('width', String(Math.max(0, totalW - copiedW)));
+      if (pct === 0) {
+        detail.textContent = '尚未寫入任何 block——分支跟來源的 snapshot 完全共用資料，新增儲存接近 0 GB。';
+      } else {
+        detail.textContent = '約 ' + pct + '% 的 block 已經被寫入、複製到分支自己的空間；其餘 ' + (100 - pct) + '% 仍跟來源共用同一份資料。';
+      }
+    }
+    input.addEventListener('input', recompute);
+    recompute();
+  })();
+  </script>
+
+  <p>滑桿在 0% 那端對應的正是分支剛生出來那一刻——跟來源完全共用，新增儲存幾乎是 0；往右拉，每多一格代表更多 block 被複製走、寫進新資料，額外佔用的空間才跟著長大。這也是為什麼一個開發用的分支就算跑了幾週，只要沒人大量改寫舊資料，實際佔用空間通常還是遠小於來源本身——分支的儲存成本，量的是「改了多少」，不是「這份資料庫本來有多大」。</p>
+
+  <p>回到文章開頭那句反直覺的話——「幾乎不佔空間」指的是分支剛建立的那一刻，不是分支整個生命週期都維持零成本。一個被大量寫入、跑了很久的分支，最終還是會累積出跟一般資料庫差不多的儲存量；COW 換來的是「起手成本」的免除，不是「長期成本」的免費午餐。跟資料庫引擎自己做的邏輯複製比起來，這種差異更明顯：邏輯複製要把資料重新讀一遍、寫一遍，複製時間跟資料全量成正比，不管實際上分支之後會不會被大量修改；RBD 這條路徑把「複製」這件事推遲到真正需要的那一刻，賭的是大多數分支的生命週期裡，被寫入的比例遠小於 100%。</p>
+
+  <h2>image、container、branch：借用 Docker 的分層概念</h2>
+
+  <p>Homescale 把 Docker 的三層概念直接搬過來用：「A database image is an immutable starting point. A database container is a writable clone created from that image. A branch is another container created from the current state of an existing container.」Image 是不可變的起點，container 是從 image 生出來、可寫的 clone，branch 則是從某個 container「目前的狀態」再生出來的另一個 container——要注意 branch 在這個模型裡本質上還是一個 container，只是它的來源不是 image，而是另一個已經在跑的 container。CLI 上這三層各自對應一個指令：</p>
+
+  <pre data-kind="shell"><code>homescale image create --engine postgres postgres-base
+homescale container create --image postgres-base dev-db
+homescale branch create --container dev-db feature-login</code></pre>
+
+  <figure class="vg-w-3d-homescale-image-container-branch" data-mobile="keep">
+    <style>
+      .vg-w-3d-homescale-image-container-branch .stage { perspective: 1200px; height: 260px; }
+      .vg-w-3d-homescale-image-container-branch .stack { transform-style: preserve-3d; transform: rotateX(-18deg) rotateY(-26deg); width: 260px; height: 200px; margin: 30px auto; position: relative; }
+      .vg-w-3d-homescale-image-container-branch .layer { position: absolute; width: 260px; min-height: 56px; border: 1.5px solid var(--ink); background: var(--bg-soft); font-family: var(--sans); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; padding: var(--s-1); color: var(--ink); text-align: center; }
+      .vg-w-3d-homescale-image-container-branch .layer strong { font-family: var(--serif); font-size: var(--fs-sm); color: var(--accent-text); }
+      .vg-w-3d-homescale-image-container-branch .layer span { font-family: var(--scribed); font-style: italic; font-size: var(--fs-xs); color: var(--muted); }
+      .vg-w-3d-homescale-image-container-branch .l1 { transform: translateZ(0px); }
+      .vg-w-3d-homescale-image-container-branch .l2 { transform: translateZ(-50px); }
+      .vg-w-3d-homescale-image-container-branch .l3 { transform: translateZ(-100px); }
+      @media (max-width: 480px) {
+        .vg-w-3d-homescale-image-container-branch .stage { height: auto; perspective: none; }
+        .vg-w-3d-homescale-image-container-branch .stack { transform: none; height: auto; }
+        .vg-w-3d-homescale-image-container-branch .layer { position: relative; margin: 0 auto var(--s-2) auto; }
+      }
+    </style>
+    <div class="stage">
+      <div class="stack">
+        <div class="layer l1"><strong>branch · feature-login</strong><span>container 目前狀態的 clone</span></div>
+        <div class="layer l2"><strong>container · dev-db</strong><span>image 的可寫 clone</span></div>
+        <div class="layer l3"><strong>image · postgres-base</strong><span>不可變起點</span></div>
+      </div>
+    </div>
+    <figcaption>由下而上：每一層都是它下面那一層在某個時間點的可寫 clone——image 不知道自己身上長出過幾個 container 或 branch。</figcaption>
+  </figure>
+
+  <p>這三層疊起來看，每一層都只認自己緊鄰的那一層——container 知道自己是從哪個 image clone 出來的，branch 知道自己是從哪個 container 的哪個狀態 clone 出來的，但 image 完全不會知道自己身上長出過多少個 container 或 branch。這種「只認父層、不管子孫」的關係，正好對應著 RBD 那條 snapshot / clone 鏈——每往下 clone 一次，就是在儲存層多疊一層 COW 關係。跟 Docker image 的 layer 疊法邏輯相通，只是這裡疊的是一整個資料庫的區塊裝置，不是檔案系統的差異；也因為疊的單位是 block 而不是檔案，Homescale 才不需要理解資料庫內部的檔案格式，就能讓分支這件事在任何裝得進 block device 的資料庫引擎上一體適用。</p>
+
+  <p>借用 Docker 現成的詞彙，好處是工程師不用重新學一套詞彙——image、container、branch 這三個字，任何用過 Docker 的人都已經有直覺。差別在於 Docker 疊的是檔案系統的 layer，Homescale 疊的是一整個區塊裝置；概念相通，但實際運作的儲存機制完全不同。</p>
+
+  <p>這種分層結構也決定了誰會被誰的變動影響。修改 image 本身（例如升級 Postgres 版本、換一份新的種子資料）不會動到既有的 container 或 branch，因為它們早就 clone 出去、各自擁有自己的可寫層；但反過來，如果來源 container 被刪除，它底下的 branch 會失去父層可以指回的地方——這也是為什麼「protect」那一步存在的理由：不讓一個還有 branch 依賴的狀態被輕易刪掉。合理的推測是，這套 image / container / branch 的語言不會限定在 Postgres——只要資料庫程式讀寫的是同一種 block device 介面，理論上都能套用同一套 CLI 語意，差別只在每種引擎各自的 adapter 要怎麼寫，而 adapter 正是作者說要留到下一篇的部分。</p>
+
+  <h2>Kubernetes 當 control plane，Rook 顧 Ceph</h2>
+
+  <p>分支的語言（image / container / branch）要落到實際的 Ceph 叢集上，中間隔著三個責任分明的角色。Homescale 自己只做一件事：「Homescale creates database workloads, PVCs, and <code>VolumeSnapshot</code> resources.」它把「使用者想要一個分支」這件事翻成 Kubernetes 認得的宣告式物件——工作負載、PVC、VolumeSnapshot——然後就不再管接下來實際發生什麼。</p>
+
+  <p>真正把這些物件變成 Ceph 操作的是另外兩個角色，而且分工幾乎不重疊。Rook 負責叢集本身：「The Rook operator watches those resources and creates or updates the corresponding Ceph daemons and configuration.」它 watch 那些 Ceph 相關的自訂資源，決定 mon、osd、mgr 這些 daemon 該怎麼建立或更新，讓整個 Ceph 叢集維持在期望的狀態——這件事跟哪個 PVC 對應哪個資料庫分支完全無關，是叢集生命週期層級的工作，不在任何一次分支請求的路徑上。另一個角色是 Ceph CSI：「Ceph CSI translates the storage resources into RBD operations」——它才是把 PVC、VolumeSnapshot 這些請求即時翻成 RBD 的 snapshot、clone 呼叫的那一層，也就是使用者每次建立分支時真正被觸發的翻譯機。</p>
+
+  <p>這種三層分工不是 Homescale 發明的新模式，Kubernetes 的 CSI（Container Storage Interface）本來就是設計成讓任何儲存後端都能用同一套介面接進 K8s——Ceph 只是其中一種後端，Rook 也不是唯一的 Ceph 編排工具。Homescale 選擇這條組合，等於是站在一套已經被廣泛驗證過的介面上，把自己的複雜度集中在「分支」這個語意層，而不是重新發明儲存編排。</p>
+
+  <figure class="vg-w-annotated-homescale-control-plane" data-mobile="static" data-svg-scroll="720">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M9 9h1"/><path d="M9 15h1"/><path d="M14 9h1"/><path d="M14 15h1"/><rect x="3" y="3" width="18" height="18" rx="2"/>
+      </svg>
+      <span>點擊任一角色看它的責任邊界 · 4 個角色</span>
+    </p>
+    <style>
+      .vg-w-annotated-homescale-control-plane { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--s-3); align-items: start; }
+      .vg-w-annotated-homescale-control-plane input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-annotated-homescale-control-plane svg.vg-w-annotated-homescale-control-plane-main { width: 100%; height: auto; }
+      .vg-w-annotated-homescale-control-plane .role { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; transition: fill 200ms, stroke 200ms; }
+      .vg-w-annotated-homescale-control-plane .role:hover { stroke: var(--accent); }
+      .vg-w-annotated-homescale-control-plane .role:focus { outline: none; }
+      .vg-w-annotated-homescale-control-plane .role:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+      .vg-w-annotated-homescale-control-plane .role-text { pointer-events: none; font-family: EB Garamond, serif; }
+      .vg-w-annotated-homescale-control-plane .role-sub { pointer-events: none; font-family: IM Fell English, serif; font-style: italic; fill: var(--muted); }
+      .vg-w-annotated-homescale-control-plane .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+      .vg-w-annotated-homescale-control-plane .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-annotated-homescale-control-plane .detail p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-annotated-homescale-control-plane:has(#vg-w-annotated-homescale-control-plane-r1:checked) .role-1 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-annotated-homescale-control-plane:has(#vg-w-annotated-homescale-control-plane-r2:checked) .role-2 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-annotated-homescale-control-plane:has(#vg-w-annotated-homescale-control-plane-r3:checked) .role-3 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-annotated-homescale-control-plane:has(#vg-w-annotated-homescale-control-plane-r4:checked) .role-4 { fill: var(--sage-deep); fill-opacity: 0.3; stroke: var(--sage-deep); }
+      .vg-w-annotated-homescale-control-plane:has(#vg-w-annotated-homescale-control-plane-r1:checked) .detail-1 { display: block; }
+      .vg-w-annotated-homescale-control-plane:has(#vg-w-annotated-homescale-control-plane-r2:checked) .detail-2 { display: block; }
+      .vg-w-annotated-homescale-control-plane:has(#vg-w-annotated-homescale-control-plane-r3:checked) .detail-3 { display: block; }
+      .vg-w-annotated-homescale-control-plane:has(#vg-w-annotated-homescale-control-plane-r4:checked) .detail-4 { display: block; }
+      .vg-w-annotated-homescale-control-plane .hint { font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin: 0 0 var(--s-1) 0; }
+    </style>
+
+    <input type="radio" id="vg-w-annotated-homescale-control-plane-r1" name="vg-w-annotated-homescale-control-plane-sel" data-vg-controls checked />
+    <input type="radio" id="vg-w-annotated-homescale-control-plane-r2" name="vg-w-annotated-homescale-control-plane-sel" data-vg-controls />
+    <input type="radio" id="vg-w-annotated-homescale-control-plane-r3" name="vg-w-annotated-homescale-control-plane-sel" data-vg-controls />
+    <input type="radio" id="vg-w-annotated-homescale-control-plane-r4" name="vg-w-annotated-homescale-control-plane-sel" data-vg-controls />
+
+    <svg class="vg-w-annotated-homescale-control-plane-main" viewBox="0 0 720 340" role="img" aria-label="Kubernetes、Ceph CSI、Rook、Ceph RBD 四個角色與兩條路徑——請求路徑與叢集建置路徑">
+      <text x="360" y="24" text-anchor="middle" fill="var(--ink)" font-family="IM Fell English, serif" font-style="italic" font-size="13">請求路徑（實線）與叢集建置路徑（虛線）分開走</text>
+
+      <rect class="role role-1" data-target="vg-w-annotated-homescale-control-plane-r1" role="button" tabindex="0" aria-label="選 Kubernetes control plane" x="40" y="50" width="280" height="80"/>
+      <text class="role-text" x="180" y="82" text-anchor="middle" font-size="15" fill="var(--ink)">Kubernetes control plane</text>
+      <text class="role-sub" x="180" y="104" text-anchor="middle" font-size="11">workload / PVC / VolumeSnapshot</text>
+
+      <rect class="role role-2" data-target="vg-w-annotated-homescale-control-plane-r2" role="button" tabindex="0" aria-label="選 Ceph CSI driver" x="400" y="50" width="280" height="80"/>
+      <text class="role-text" x="540" y="82" text-anchor="middle" font-size="15" fill="var(--ink)">Ceph CSI driver</text>
+      <text class="role-sub" x="540" y="104" text-anchor="middle" font-size="11">翻譯成 RBD operations</text>
+
+      <rect class="role role-3" data-target="vg-w-annotated-homescale-control-plane-r3" role="button" tabindex="0" aria-label="選 Rook operator" x="40" y="210" width="280" height="80"/>
+      <text class="role-text" x="180" y="242" text-anchor="middle" font-size="15" fill="var(--ink)">Rook operator</text>
+      <text class="role-sub" x="180" y="264" text-anchor="middle" font-size="11">建立 / 更新 Ceph daemon</text>
+
+      <rect class="role role-4" data-target="vg-w-annotated-homescale-control-plane-r4" role="button" tabindex="0" aria-label="選 Ceph RBD" x="400" y="210" width="280" height="80"/>
+      <text class="role-text" x="540" y="242" text-anchor="middle" font-size="15" fill="var(--ink)">Ceph RBD</text>
+      <text class="role-sub" x="540" y="264" text-anchor="middle" font-size="11">COW snapshot / clone 儲存層</text>
+
+      <line x1="320" y1="90" x2="400" y2="90" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-annotated-homescale-control-plane-arrow)"/>
+      <line x1="540" y1="130" x2="540" y2="210" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-annotated-homescale-control-plane-arrow)"/>
+      <line x1="320" y1="250" x2="400" y2="250" stroke="currentColor" stroke-width="1.5" stroke-dasharray="4,4" marker-end="url(#vg-w-annotated-homescale-control-plane-arrow)"/>
+
+      <text x="360" y="316" text-anchor="middle" fill="var(--muted)" font-family="IM Fell English, serif" font-style="italic" font-size="11">Rook → Ceph RBD 是叢集建置路徑，不在單次分支請求的熱路徑上</text>
+
+      <defs>
+        <marker id="vg-w-annotated-homescale-control-plane-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+        </marker>
+      </defs>
+    </svg>
+
+    <div>
+      <p class="hint">click a role above</p>
+      <div class="detail detail-1">
+        <h3>Kubernetes · 責任邊界</h3>
+        <p>建立 database workload、PVC 與 VolumeSnapshot——這些宣告式資源代表「使用者想要一個分支」這件事。</p>
+        <p><strong>不知道的事</strong>：PVC 底下真正掛的是哪一種儲存系統、RBD clone 實際怎麼運作。</p>
+      </div>
+      <div class="detail detail-2">
+        <h3>Ceph CSI · 責任邊界</h3>
+        <p>把 PVC、VolumeSnapshot 這些 Kubernetes 物件即時翻譯成具體的 RBD snapshot / clone 操作。</p>
+        <p><strong>不知道的事</strong>：Ceph 叢集本身的 daemon 是怎麼被建立、設定從哪裡來——那是 Rook 的責任。</p>
+      </div>
+      <div class="detail detail-3">
+        <h3>Rook · 責任邊界</h3>
+        <p>watch Ceph 相關的自訂資源，建立或更新 mon、osd、mgr 這些 daemon 與設定，讓 Ceph 叢集維持在期望狀態。</p>
+        <p><strong>不知道的事</strong>：上層某個 PVC 對應到哪一個資料庫分支、CSI 什麼時候會呼叫 RBD。</p>
+      </div>
+      <div class="detail detail-4">
+        <h3>Ceph RBD · 責任邊界</h3>
+        <p>實際執行 snapshot / clone 的儲存引擎——唯讀 snapshot 加上會 refer back 的可寫 clone，撐住「分支幾乎零成本」這件事。</p>
+        <p><strong>不知道的事</strong>：上面是 Kubernetes 還是別的 orchestrator 在用它、PVC 的語意是什麼。</p>
+      </div>
+    </div>
+
+    <script>
+    (function () {
+      if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+      var root = document.querySelector('.vg-w-annotated-homescale-control-plane');
+      root.querySelectorAll('.role').forEach(function (rect) {
+        rect.addEventListener('click', function () {
+          var targetId = rect.getAttribute('data-target');
+          var radio = root.querySelector('#' + targetId);
+          if (radio) radio.checked = true;
+        });
+        rect.addEventListener('keydown', function (e) {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            rect.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+          }
+        });
+      });
+    })();
+    </script>
+  </figure>
+
+  <p>四個角色，其實走的是兩條不同的路徑。Kubernetes 到 Ceph CSI 再到 Ceph RBD，是每次分支請求都會即時觸發的路徑；Rook 到 Ceph RBD，走的是叢集建置與設定的路徑，不在請求的熱路徑上，卻是前面兩層能運作的前提——沒有 Rook 先把 Ceph 叢集組起來，Ceph CSI 手上根本沒有東西可以翻譯。這種分工讓 Homescale 不用碰任何 Ceph 部署細節，只要照著 Kubernetes 既有的介面建立資源就好，Ceph 叢集怎麼被組起來、用了哪個版本、跑在哪種硬體上，都交給 Rook 去擋。</p>
+
+  <p>對維運來說，這種切割也代表兩種故障各自獨立：如果 Ceph CSI 出問題，受影響的是新分支能不能建立，既有分支照常讀寫；如果 Rook 沒把叢集組好，問題會發生在更早的階段，甚至輪不到使用者建立分支。</p>
+
+  <p>這種 declarative 的做法，也代表 Homescale 本身不需要維護任何長時間執行的狀態機——它只要保證 PVC 與 VolumeSnapshot 這些物件被正確建立，後面 Rook 與 Ceph CSI 各自的 reconcile loop 會持續把實際狀態拉回宣告的狀態，就算中途某個 controller 重啟，宣告式資源本身還在，作業不會因此遺失。</p>
+
+  <h2>本機 Colima / Lima 與 Hetzner Talos：兩種部署形態</h2>
+
+  <p>同一套架構，作者規劃了兩種跑法，規模差了不只一個量級。本機開發環境上，原文這麼寫：「Homescale will run locally on macOS in a single-node Kubernetes cluster, probably using Colima or Lima. This local profile has one Kubernetes node, one Ceph OSD, and one storage device.」用詞是「probably」——這是還沒拍板的選擇，不是已經定案的結論，但單節點、一個 OSD、一個儲存裝置的規模已經足夠說明這個 profile 的目的：讓開發者在筆電上就能把整套 Homescale 跑起來，不是拿來扛真正的負載，也談不上任何容錯。</p>
+
+  <p>正式環境換到 Hetzner 上的 Talos Kubernetes 叢集，重點從「能不能跑」變成「掉了一個節點會不會出事」：「A replicated pool with <code>size: 3</code> and <code>failureDomain: host</code> can place each object's replicas across those nodes.」「can place」這個講法留了一點空間，但 <code>size: 3</code> 加上 <code>failureDomain: host</code> 這組設定的意圖很清楚——同一份資料的三個複本會分散到不同的實體節點上，任何單一節點掛掉，其餘兩份複本仍然完整。跟本機那個「一個 OSD、一個裝置」的極簡設定放在一起看，這兩個 profile 剛好是同一套 control plane 邏輯的兩端：一端追求開發者能立刻跑起來，另一端追求資料不會因為單點故障而消失——中間沒有另一套程式碼，差別只在 Rook 怎麼設定 Ceph 的 pool。</p>
+
+  <p><code>failureDomain: host</code> 這個設定藏著一個容易被忽略的機制：它讓 CRUSH（Ceph 用來決定資料要放在哪裡的演算法）在挑選複本位置時，強制排除同一台實體主機——即使兩個節點剛好是同一台機器上的不同虛擬機，也會被視為同一個 failure domain。對一個要保存使用者資料庫的系統而言，這個排除規則比「湊滿三份」更關鍵：三份複本如果剛好落在同一台主機的三顆硬碟上，主機當機時三份一起消失，複寫的保護等於零。</p>
+
+  <p>這種「先求本機能跑、正式環境才談容錯」的順序，對一個還在寫第一篇架構文章的專案來說很合理——合理的推測是，作者現階段更在意能不能在自己的筆電上驗證整條分支邏輯，正式環境的細節（例如要幾個 worker pool）目前還沒有需要拍板。兩種設定使用的是同一份 Rook 設定語言，差別只在 replica 數與 failure domain 的參數——這也回應了開頭那句「儲存生命週期跟程式脫鉤」的設計目標：換運行環境不需要換一套機制，只需要換幾個數字。</p>
+
+  <figure class="vg-w-table-homescale-deployment-targets" data-mobile="keep">
+    <style>
+      .vg-w-table-homescale-deployment-targets { overflow-x: auto; }
+      .vg-w-table-homescale-deployment-targets table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-homescale-deployment-targets thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); }
+      .vg-w-table-homescale-deployment-targets tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+      .vg-w-table-homescale-deployment-targets td.num { font-variant-numeric: tabular-nums; }
+      .vg-w-table-homescale-deployment-targets caption { text-align: left; caption-side: top; font-family: var(--scribed); font-style: italic; color: var(--muted); font-size: var(--fs-sm); padding: var(--s-1) 0; }
+    </style>
+    <table>
+      <caption>兩種部署 profile 的規模對照——數字直接取自原文，「多個 worker pool」是原文用詞，沒有給出確切節點數。</caption>
+      <thead>
+        <tr>
+          <th>部署目標</th>
+          <th>Kubernetes 節點</th>
+          <th>Ceph OSD</th>
+          <th>儲存裝置</th>
+          <th>Pool 複寫策略</th>
+          <th>用途</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>本機（Colima / Lima）</td>
+          <td class="num">1</td>
+          <td class="num">1</td>
+          <td class="num">1</td>
+          <td>單一 OSD，無 replicated pool</td>
+          <td>開發者筆電上跑起整套 Homescale</td>
+        </tr>
+        <tr>
+          <td>Hetzner Talos（正式環境）</td>
+          <td>多個 worker pool</td>
+          <td>跟 worker pool 對應</td>
+          <td>未指定</td>
+          <td><code>size: 3</code>，<code>failureDomain: host</code></td>
+          <td>容忍單一節點故障，資料仍完整</td>
+        </tr>
+      </tbody>
+    </table>
+  </figure>
+
+  <p class="vg-deep-closer"><strong>這篇留下什麼</strong>：分支的成本模型——起手幾乎零成本、隨寫入量才慢慢長大——這篇說清楚了儲存層怎麼撐住；把 image、container、branch 這套語言接上真正的 API、controller 跟 Postgres adapter，作者自己說了，要留到下一篇才寫。</p>
+</div>
