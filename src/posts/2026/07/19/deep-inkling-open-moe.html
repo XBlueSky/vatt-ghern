@@ -1,0 +1,509 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">Inkling 的 model card 上寫著一行規格：975B total, 41B active。同一顆模型，975B 個參數確實存在，但每算一個 token，真正被喚醒的只有 41B——這中間的落差，不是模型縮水了，是路由做出的選擇。</p>
+  <h1 class="vg-post-title">Thinking Machines 開源 Inkling：975B/41B 稀疏 MoE 多模態模型</h1>
+</header>
+
+<div class="vg-post-prose">
+
+<p><span class="vg-dropcap">看</span>完這篇之後，你會知道稀疏 MoE（Mixture-of-Experts）怎麼把一顆 975B 參數的模型，壓成每個 token 只算 41B 的實際運算量；也會知道 Inkling 的 66 層 decoder 內部長什麼樣、它吃得下哪些輸入、吐得出什麼、以及你要自己把它跑起來，實際有哪些路可以走。</p>
+
+<h2>「前沿模型只能租 API」這個假設，從哪裡來</h2>
+
+<p>過去兩年，如果你想用一顆前沿等級的多模態模型——同時吃得下文字、圖片、聲音，還能寫扎實的程式碼——幾乎只有一條路：找一家大廠，付月費，打他們的 API。權重不會給你，架構細節模糊帶過，你能做的最多是調 prompt、調 system message，模型本身是一個黑盒子。這不是誰的陰謀，是算力現實：能把一顆數百 B 參數的模型訓好又跑穩的團隊沒幾家，他們自然傾向把模型包成服務賣，而不是把權重直接公開。對打 API 的一方來說，這也代表成本結構完全綁在對方的定價策略上——對方漲價、限流，或直接下架某個模型版本，你能做的只有被動接受，換一家繼續打 API。</p>
+
+<p>Inkling 打破的正是這個預設的其中一半。Thinking Machines Lab 把這顆模型的權重，連同 model card 上的完整規格，直接放上了 Hugging Face，授權是「License: apache-2.0」——這代表你不只能免費拿去用，還能修改、微調、包進自己的產品裡再散布出去，不需要回頭問誰要授權。model card 上同時列出可以直接拿來部署的開源工具：SGLang、vLLM、TokenSpeed、Unsloth、Hugging Face Transformers。換句話說，這不是一份論文或一張成績單，是一份你可以拿去對著自己機房排產能的規格表。</p>
+
+<p>這類釋出在過去並不常見，原因不難理解：訓練一顆前沿等級的模型，成本本身就是門檻，而如果把權重全部公開，任何人都能直接部署、微調，原本仰賴 API 計費的生意模式就少了一層保護。多數團隊選擇的折衷，是把模型包成服務，只留一個輸入框跟一支帳單。Inkling 選的是另一條路。</p>
+
+<p>但「拿到權重」跟「跑得起來」中間還有一段路要走——這段路的起點，是先搞懂 Inkling 為什麼是 975B 總參數，卻只用 41B 活躍參數就能跑。這個落差，才是這篇文章真正要講的東西。</p>
+
+<h2>把 975B 參數擺上桌，為什麼不能整個跑起來</h2>
+
+<p>先把稠密（dense）模型的算法拿出來對照一次。一顆標準的 dense transformer，不管是 66 層還是 96 層，每一層的 feed-forward 子層都是同一組權重——處理每一個 token，都要把這一層的全部參數拿出來做矩陣乘法。這代表模型的總參數量跟每個 token 實際要算的量，是同一個數字：模型多大，算力就要多大，沒有折扣可打。</p>
+
+<p>這件事對一個 975B 參數等級的模型意味著什麼。先不談訓練，只談推論（inference）——把權重全部載進顯存，再對每一個輸出的 token 都跑一次 975B 參數規模的矩陣運算，這個吞吐量會慢到大部分應用場景都等不起，顯存需求本身也已經是一般團隊負擔不起的等級。這正是為什麼過去幾年前沿模型即使釋出，也很少有 dense 架構做到千億參數以上還維持著「大家都跑得起」的期待——dense 架構的規模跟成本綁在同一條直線上，沒有妥協空間。</p>
+
+<p>這裡的成本不只是「算得動」——顯存頻寬同樣是瓶頸。每算一個 token，都要把當下這一層要用到的權重從顯存搬進運算單元一次；模型越大，每個 token 要搬的資料量就越大，吞吐量的上限就被這條資料搬運的速度卡住，不是被算力卡住。這也是為什麼參數量跟每個 token 的成本，在 dense 架構下永遠是同一個數字——沒有辦法讓其中一個變小、另一個維持不變。</p>
+
+<p>Inkling 沒有選 dense。它選的是稀疏 MoE（Mixture-of-Experts）——一種讓模型的總容量，跟每個 token 實際要算的量脫鉤的架構。975B 只是模型裡存在的知識總量，不是每次算一個 token 要動用的量。要理解這怎麼做到，得先把 MoE 的路由機制，從零講一次。</p>
+
+<h2>稀疏 MoE：只啟動一部分參數的 transformer</h2>
+
+<p>普通的 dense transformer，每一層的 feed-forward 子層是一整塊權重，誰來都要過這一塊。MoE 的做法是把這一整塊拆成很多份「專家」（expert）——每個專家是一個獨立的小型 feed-forward 網路，擁有自己的一組權重。層裡再加一個路由器（router）：路由器看過這個 token 的表示法之後，決定要把它送去哪幾個專家處理，而不是全部專家都算一遍。</p>
+
+<p>這就是「稀疏」兩個字的意思：專家的總數量可以很多、總參數量可以很大，但任何一個 token 實際走過的專家只有一小撮。模型「知道」的東西（全部專家加起來的知識）跟模型「這一步算」的東西（被路由到的那幾個專家），是兩件事。這種設計在近幾年的稀疏 MoE 模型裡越來越常見——除了被路由挑中的專家之外，通常還會保留一到兩個「共享專家」（shared expert），這種專家不經過路由篩選，每個 token 都會經過，用來承擔比較通用、每個 token 都用得到的計算，讓被路由挑中的專家可以專心處理比較特化的部分。</p>
+
+<p>這種設計解決的是一個老問題：模型的容量（能記住、能分辨多少不同的模式）理論上應該跟參數量成正比，但如果每次都要把全部參數拿出來算，容量跟算力就被綁死在一起——想要更大的容量，就得付出等比例的算力。稀疏 MoE 把兩者拆開：專家數量、專家大小決定容量的上限，路由器每次只挑一小撮出來，決定的是算力的下限。理論上可以繼續加專家、把容量往上堆，只要路由器挑選的數量跟共享專家數量不變，算力幾乎不會多花。</p>
+
+<p>Inkling 的 model card 把這個機制寫得很具體：</p>
+
+<blockquote><p>「each token is routed to 6 of 256 experts, plus 2 shared experts active on every token」</p></blockquote>
+
+<p>翻成白話——這一層總共準備了 256 個專家，路由器幫每個 token 挑出 6 個來處理，另外再加 2 個不用挑、每個 token 都會過的共享專家。一個 token 實際走過的專家數量是 8 個，占 256 個裡的一小部分。這就是為什麼 975B 總參數可以壓成 41B 活躍參數——大部分的「專家」在任何一個瞬間都是閒置的，只有輪到它們被路由挑中，才會被真正用上。</p>
+
+<h2>Inkling 內部長什麼樣：66 層、256 選 6、2 個常駐專家</h2>
+
+<p>把上面的機制套進 Inkling 實際的架構數字裡，會拼出一張完整的圖。model card 寫明這是一個「66-layer decoder-only transformer」——66 層，每一層都重複同一組子層設計。attention 的部分，model card 只寫了一句「Attention is a hybrid of local and global layers」：有的層只看鄰近的一段序列（local），有的層看得到整個序列（global），兩種都存在、混著用，但確切的排列規律沒有公開，不必猜。</p>
+
+<p>為什麼要混著用兩種 attention。只看局部窗口的 local attention，運算量隨序列長度線性增加，划算，但看不到窗口外的東西；看得到整個序列的 global attention，能抓到很遠的關聯，但運算量隨序列長度成平方增加，序列一長就變貴。把兩種混在同一個 66 層的堆疊裡，是想同時要兩邊的好處——大部分層用便宜的 local，省下來的算力，留給少數幾層做真正需要看全局的 global。這是業界近年常見的組合，不是 Inkling 獨創，只是 model card 沒有公開它實際怎麼分配這兩種層。</p>
+
+<p>下面這張圖把整條路徑拆成四個元件，點下去看每一個元件實際負責什麼、又不知道什麼。</p>
+
+<figure class="vg-w-annotated-inkling-decoder" data-mobile="static" data-svg-scroll="720">
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="m3 8 4-4 4 4"/><path d="M7 4v16"/><path d="m21 16-4 4-4-4"/><path d="M17 20V4"/>
+    </svg>
+    <span>點擊任一元件看它的責任與不知道的事 · 4 個元件</span>
+  </p>
+  <style>
+    .vg-w-annotated-inkling-decoder { display: grid; grid-template-columns: 1fr; gap: var(--s-3); align-items: start; }
+    .vg-w-annotated-inkling-decoder svg.vg-w-annotated-inkling-decoder-main { width: 100%; height: auto; }
+    .vg-w-annotated-inkling-decoder input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+    .vg-w-annotated-inkling-decoder .component { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; transition: fill 200ms, stroke 200ms; }
+    .vg-w-annotated-inkling-decoder .component:hover { stroke: var(--accent); }
+    .vg-w-annotated-inkling-decoder .component:focus { outline: none; }
+    .vg-w-annotated-inkling-decoder .component:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .vg-w-annotated-inkling-decoder .component-text { pointer-events: none; }
+    .vg-w-annotated-inkling-decoder .component-sub { pointer-events: none; }
+    .vg-w-annotated-inkling-decoder .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+    .vg-w-annotated-inkling-decoder .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+    .vg-w-annotated-inkling-decoder .detail p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+    .vg-w-annotated-inkling-decoder:has(#vg-w-annotated-inkling-decoder-r1:checked) .component-1 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+    .vg-w-annotated-inkling-decoder:has(#vg-w-annotated-inkling-decoder-r2:checked) .component-2 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+    .vg-w-annotated-inkling-decoder:has(#vg-w-annotated-inkling-decoder-r3:checked) .component-3 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+    .vg-w-annotated-inkling-decoder:has(#vg-w-annotated-inkling-decoder-r4:checked) .component-4 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+    .vg-w-annotated-inkling-decoder:has(#vg-w-annotated-inkling-decoder-r1:checked) .detail-1 { display: block; }
+    .vg-w-annotated-inkling-decoder:has(#vg-w-annotated-inkling-decoder-r2:checked) .detail-2 { display: block; }
+    .vg-w-annotated-inkling-decoder:has(#vg-w-annotated-inkling-decoder-r3:checked) .detail-3 { display: block; }
+    .vg-w-annotated-inkling-decoder:has(#vg-w-annotated-inkling-decoder-r4:checked) .detail-4 { display: block; }
+    @media (max-width: 720px) {
+      .vg-w-annotated-inkling-decoder { grid-template-columns: 1fr; }
+    }
+  </style>
+
+  <input type="radio" id="vg-w-annotated-inkling-decoder-r1" name="vg-w-annotated-inkling-decoder-sel" data-vg-controls checked />
+  <input type="radio" id="vg-w-annotated-inkling-decoder-r2" name="vg-w-annotated-inkling-decoder-sel" data-vg-controls />
+  <input type="radio" id="vg-w-annotated-inkling-decoder-r3" name="vg-w-annotated-inkling-decoder-sel" data-vg-controls />
+  <input type="radio" id="vg-w-annotated-inkling-decoder-r4" name="vg-w-annotated-inkling-decoder-sel" data-vg-controls />
+
+  <svg class="vg-w-annotated-inkling-decoder-main" viewBox="0 0 720 260" role="img" aria-label="Inkling decoder pipeline">
+    <rect class="component component-1" data-target="vg-w-annotated-inkling-decoder-r1" role="button" tabindex="0" aria-label="選擇輸入嵌入層" x="10" y="60" width="150" height="110" />
+    <text class="component-text" x="85" y="110" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">輸入嵌入</text>
+    <text class="component-sub" x="85" y="130" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">text/image/audio</text>
+
+    <rect class="component component-2" data-target="vg-w-annotated-inkling-decoder-r2" role="button" tabindex="0" aria-label="選擇 Hybrid Attention" x="190" y="60" width="150" height="110" />
+    <text class="component-text" x="265" y="103" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">Hybrid</text>
+    <text class="component-text" x="265" y="121" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">Attention</text>
+    <text class="component-sub" x="265" y="141" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">x66 local/global</text>
+
+    <rect class="component component-3" data-target="vg-w-annotated-inkling-decoder-r3" role="button" tabindex="0" aria-label="選擇 MoE 路由器" x="370" y="60" width="150" height="110" />
+    <text class="component-text" x="445" y="110" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">MoE 路由器</text>
+    <text class="component-sub" x="445" y="130" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">256 選 6 + 2 共享</text>
+
+    <rect class="component component-4" data-target="vg-w-annotated-inkling-decoder-r4" role="button" tabindex="0" aria-label="選擇輸出文字頭" x="550" y="60" width="150" height="110" />
+    <text class="component-text" x="625" y="110" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">輸出文字頭</text>
+    <text class="component-sub" x="625" y="130" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">text only</text>
+
+    <line x1="160" y1="115" x2="190" y2="115" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-annotated-inkling-decoder-arrow)" />
+    <line x1="340" y1="115" x2="370" y2="115" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-annotated-inkling-decoder-arrow)" />
+    <line x1="520" y1="115" x2="550" y2="115" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-annotated-inkling-decoder-arrow)" />
+
+    <text x="360" y="215" text-anchor="middle" font-family="Manrope, sans-serif" font-size="12" fill="var(--muted)">Attention 與 MoE 路由器合起來，是 66 層裡每一層都重複的一組子層</text>
+
+    <defs>
+      <marker id="vg-w-annotated-inkling-decoder-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+      </marker>
+    </defs>
+  </svg>
+
+  <div>
+    <div class="detail detail-1">
+      <h3>輸入嵌入層 · 責任</h3>
+      <p>把文字（UTF-8）、圖片、音訊分別轉成模型看得懂的 token 序列，餵進後面的 66 層 decoder。</p>
+      <p><strong>不知道</strong>：後面每一層要怎麼路由、會用到哪個專家。</p>
+    </div>
+    <div class="detail detail-2">
+      <h3>Hybrid Attention · 責任（66 層）</h3>
+      <p>每一層都要決定這個 token 該往回看多遠——66 層裡有的看局部窗口（local），有的看整個序列（global），兩種都存在、混著出現，但 model card 沒有公開確切的排列規律。</p>
+      <p><strong>不知道</strong>：這個 token 之後會被路由到哪幾個專家。</p>
+    </div>
+    <div class="detail detail-3">
+      <h3>MoE 路由器＋共享專家 · 責任</h3>
+      <p>每一層的 FFN 子層都做同一件事：256 個專家裡選 6 個處理這個 token，另外 2 個「共享專家」不管路由結果，每個 token 都會經過。</p>
+      <p><strong>不知道</strong>：前面 attention 算出的注意力分佈長什麼樣——它只認 token 帶著的表示法本身。</p>
+    </div>
+    <div class="detail detail-4">
+      <h3>輸出文字頭 · 責任</h3>
+      <p>把跑完 66 層之後最後一層的表示法，轉回文字 token——不管輸入當初是文字、圖片還是音訊，輸出永遠只有 UTF-8 文字。</p>
+      <p><strong>不知道</strong>：輸入原本是哪一種模態。</p>
+    </div>
+  </div>
+
+  <script>
+  (function () {
+    if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+    var root = document.querySelector('.vg-w-annotated-inkling-decoder');
+    root.querySelectorAll('.component').forEach(function (rect) {
+      rect.addEventListener('click', function () {
+        var targetId = rect.getAttribute('data-target');
+        var radio = root.querySelector('#' + targetId);
+        if (radio) radio.checked = true;
+      });
+      rect.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          rect.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+        }
+      });
+    });
+  })();
+  </script>
+</figure>
+
+<p>「不知道」這一欄容易被略過，但正是這張圖真正想講的部分：每個元件只認得自己那一份輸入，不會去猜前後其他元件做了什麼。路由器不管 attention 算出的注意力權重長什麼樣，它只看 token 帶著的表示法本身；輸出頭不管輸入原本是文字、圖片還是語音，它只管把最後一層的表示法轉回文字。這種各管一段、不越界的設計，本身就是這條路徑可以疊到 66 層還維持穩定的原因之一。</p>
+
+<p>用最粗略的方式描述這條路徑，大概長這樣（下面是示意寫法，不是 Inkling 真正的原始碼）：</p>
+
+<pre data-kind="pseudocode"><code>for layer in range(66):
+    x = hybrid_attention(x, kind=layer.attn_kind)  <em>// local 或 global</em>
+    scores = router(x)                             <em>// 對 256 個 expert 打分</em>
+    top6 = pick_top_k(scores, k=6)                  <em>// 選出 6 個</em>
+    experts_to_run = top6 + [shared_1, shared_2]    <em>// 加 2 個常駐</em>
+    x = sum(e(x) for e in experts_to_run)
+
+output = text_head(x)   <em>// 只還原成文字</em></code></pre>
+
+<p>這段假想程式碼裡藏著一個容易忽略的細節：8 個專家（6 個路由挑的加 2 個常駐）要跑完之後才加總，不是二選一。所以「41B 活躍參數」這個數字，包含的是這 8 個專家的參數量，加上 attention 層、embedding 層這些每個 token 都要過的非專家部分。model card 沒有把這條算式拆給你看——這裡只能確認 41B 是官方給的活躍參數總數，沒辦法從 256 選 6 加 2 這個比例反推出精確的算式。</p>
+
+<h2>吃得下文字、圖片、語音，只吐文字——以及部署這件事</h2>
+
+<p>架構之外，Inkling 的 model card 把輸入輸出的模態也寫得很明確：</p>
+
+<blockquote><p>「general-purpose multimodal model that accepts text, image and audio inputs and generates text outputs」</p></blockquote>
+
+<p>文字用 UTF-8 編碼；圖片是「any pixel-based format」，邊長建議（ideally）落在 40px 到 4096px 之間；音訊要 WAV 格式、16kHz 取樣率，長度建議（ideally）在 20 分鐘以內。輸出只有一種——「generates output as UTF-8 encoded text」，不管輸入當初是哪一種模態。</p>
+
+<p>「建議」這兩個字要留意——model card 用的是 ideally，不是「僅接受」或「超出會報錯」。這代表 40px 到 4096px、20 分鐘這些數字，是官方建議的舒適區間，不是寫死的硬邊界。下面的滑桿可以拖動，看這兩條輸入邊界實際落在哪裡：</p>
+
+<figure class="vg-w-range-inkling-modality-bounds" data-mobile="static" data-svg-scroll="800">
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M8 18L4 14L8 10"/><path d="M4 14H20"/><path d="M16 6l4 4-4 4"/>
+    </svg>
+    <span>拖動兩條滑桿，看輸入邊界落在哪裡 · 2 組滑桿</span>
+  </p>
+  <style>
+    .vg-w-range-inkling-modality-bounds { display: grid; gap: var(--s-3); }
+    .vg-w-range-inkling-modality-bounds .controls { display: grid; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); }
+    .vg-w-range-inkling-modality-bounds .ctl-row { display: flex; align-items: center; gap: var(--s-2); }
+    .vg-w-range-inkling-modality-bounds .ctl-row label { min-width: 9ch; color: var(--muted); }
+    .vg-w-range-inkling-modality-bounds .ctl-row input[type="range"] { flex: 1; height: 36px; accent-color: var(--accent); }
+    .vg-w-range-inkling-modality-bounds .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 15ch; text-align: right; }
+    .vg-w-range-inkling-modality-bounds svg.vg-w-range-inkling-modality-bounds-main { width: 100%; height: auto; }
+    @media (max-width: 720px) {
+      .vg-w-range-inkling-modality-bounds .ctl-row label { min-width: 7ch; }
+    }
+  </style>
+
+  <div class="controls" data-vg-controls>
+    <div class="ctl-row">
+      <label for="vg-w-range-inkling-modality-bounds-px">圖片邊長</label>
+      <input id="vg-w-range-inkling-modality-bounds-px" type="range" min="16" max="6000" step="8" value="1024" />
+      <span class="readout" id="vg-w-range-inkling-modality-bounds-px-readout">1024px · 在建議範圍內</span>
+    </div>
+    <div class="ctl-row">
+      <label for="vg-w-range-inkling-modality-bounds-audio">音訊長度</label>
+      <input id="vg-w-range-inkling-modality-bounds-audio" type="range" min="0" max="30" step="1" value="10" />
+      <span class="readout" id="vg-w-range-inkling-modality-bounds-audio-readout">10 分鐘 · 在建議範圍內</span>
+    </div>
+  </div>
+
+  <svg class="vg-w-range-inkling-modality-bounds-main" viewBox="0 0 720 200" role="img" aria-label="輸入邊界示意">
+    <text x="80" y="30" font-family="Manrope, sans-serif" font-size="12" fill="var(--muted)">圖片邊長（px）· 建議 40 到 4096</text>
+    <line x1="80" y1="55" x2="680" y2="55" stroke="var(--muted-2)" stroke-width="2" />
+    <rect x="82" y="50" width="407" height="10" fill="var(--accent)" fill-opacity="0.25" />
+    <circle id="vg-w-range-inkling-modality-bounds-px-pointer" cx="181" cy="55" r="7" fill="var(--accent)" stroke="var(--ink)" stroke-width="1.5" />
+    <text x="78" y="75" font-family="JetBrains Mono, monospace" font-size="10" fill="var(--muted)">40</text>
+    <text x="468" y="75" font-family="JetBrains Mono, monospace" font-size="10" fill="var(--muted)">4096</text>
+
+    <text x="80" y="120" font-family="Manrope, sans-serif" font-size="12" fill="var(--muted)">音訊長度（分鐘）· 建議 0 到 20</text>
+    <line x1="80" y1="145" x2="680" y2="145" stroke="var(--muted-2)" stroke-width="2" />
+    <rect x="80" y="140" width="400" height="10" fill="var(--accent)" fill-opacity="0.25" />
+    <circle id="vg-w-range-inkling-modality-bounds-audio-pointer" cx="280" cy="145" r="7" fill="var(--accent)" stroke="var(--ink)" stroke-width="1.5" />
+    <text x="78" y="165" font-family="JetBrains Mono, monospace" font-size="10" fill="var(--muted)">0</text>
+    <text x="458" y="165" font-family="JetBrains Mono, monospace" font-size="10" fill="var(--muted)">20</text>
+  </svg>
+
+  <script>
+  (function () {
+    if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+    var root = document.querySelector('.vg-w-range-inkling-modality-bounds');
+    var pxInput = root.querySelector('#vg-w-range-inkling-modality-bounds-px');
+    var pxOut = root.querySelector('#vg-w-range-inkling-modality-bounds-px-readout');
+    var pxPointer = root.querySelector('#vg-w-range-inkling-modality-bounds-px-pointer');
+    var audioInput = root.querySelector('#vg-w-range-inkling-modality-bounds-audio');
+    var audioOut = root.querySelector('#vg-w-range-inkling-modality-bounds-audio-readout');
+    var audioPointer = root.querySelector('#vg-w-range-inkling-modality-bounds-audio-pointer');
+
+    function xOfPx(v) { return 80 + (v - 16) / (6000 - 16) * 600; }
+    function xOfAudio(v) { return 80 + v * 20; }
+
+    function renderPx() {
+      var v = Number(pxInput.value);
+      pxPointer.setAttribute('cx', xOfPx(v).toFixed(1));
+      var status = (v >= 40 && v <= 4096) ? '在建議範圍內' : (v < 40 ? '低於建議下限（40px）' : '高於建議上限（4096px）');
+      pxOut.textContent = v + 'px · ' + status;
+    }
+    function renderAudio() {
+      var v = Number(audioInput.value);
+      audioPointer.setAttribute('cx', xOfAudio(v).toFixed(1));
+      var status = (v <= 20) ? '在建議範圍內' : '超出建議的 20 分鐘';
+      audioOut.textContent = v + ' 分鐘 · ' + status;
+    }
+    pxInput.addEventListener('input', renderPx);
+    audioInput.addEventListener('input', renderAudio);
+    renderPx();
+    renderAudio();
+  })();
+  </script>
+</figure>
+
+<p>三種輸入模態最後匯進的是同一組 decoder——不管進來的是文字、圖片還是語音，都被轉成同一種 token 表示法，送進前面講過的 66 層 hybrid attention 加 MoE 路由，最後只有一條路可以出去：文字。</p>
+
+<figure class="vg-w-3d-inkling-modality-funnel" data-mobile="keep">
+  <style>
+    .vg-w-3d-inkling-modality-funnel .stage { perspective: 1200px; height: 260px; }
+    .vg-w-3d-inkling-modality-funnel .stack {
+      transform-style: preserve-3d;
+      transform: rotateX(-18deg) rotateY(-26deg);
+      width: 260px;
+      height: 220px;
+      margin: 20px auto;
+      position: relative;
+    }
+    .vg-w-3d-inkling-modality-funnel .layer {
+      position: absolute;
+      width: 260px;
+      height: 40px;
+      border: 1.5px solid var(--ink);
+      background: var(--bg-soft);
+      font-family: var(--sans);
+      font-size: var(--fs-sm);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--ink);
+      text-align: center;
+      padding: 0 var(--s-1);
+    }
+    .vg-w-3d-inkling-modality-funnel .l1 { transform: translateZ(0px); }
+    .vg-w-3d-inkling-modality-funnel .l2 { transform: translateZ(-50px); }
+    .vg-w-3d-inkling-modality-funnel .l3 { transform: translateZ(-100px); }
+    .vg-w-3d-inkling-modality-funnel .l4 { transform: translateZ(-150px); border-color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, var(--bg-soft)); }
+    .vg-w-3d-inkling-modality-funnel figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-2); }
+    @media (max-width: 480px) {
+      .vg-w-3d-inkling-modality-funnel .stack { transform: none; height: auto; }
+      .vg-w-3d-inkling-modality-funnel .layer { position: static; margin: 0 auto var(--s-1) auto; }
+    }
+  </style>
+  <div class="stage">
+    <div class="stack">
+      <div class="layer l1">文字輸入（UTF-8）</div>
+      <div class="layer l2">圖片輸入（40 到 4096px）</div>
+      <div class="layer l3">音訊輸入（16kHz WAV，20 分鐘以內）</div>
+      <div class="layer l4">輸出：只有文字（UTF-8）</div>
+    </div>
+  </div>
+  <figcaption>三種輸入各自獨立進入同一組 66 層 hybrid attention 加 MoE decoder，只有最後一層負責把結果重建成文字——不管上面三層哪一層被餵進去。</figcaption>
+</figure>
+
+<p>這裡有一段容易被忽略的落差：model card 另外寫了一句「Training data includes a broad variety of content types, including text, images, audio, video」——訓練資料裡有影片，但輸入模態清單裡沒有影片。訓練時看過的模態範圍，比推論時真正吃得下的輸入模態範圍更廣。model card 沒有解釋這個落差的原因，這裡也不替它猜。這類訓練看過、推論吃不下的落差，在多模態模型裡不算罕見——訓練階段本來就會盡量塞進多樣的資料類型，能不能同時開放對應的推論輸入，是另一層工程決定，跟訓練資料的廣度未必是同一回事。model card 另外提到「We conducted safety evaluations ahead of release, spanning both everyday human-AI interaction and dangerous-capability testing」，只說明有做過安全評估，沒有公布評估方法或結果，這裡同樣不延伸。</p>
+
+<p>分數的部分，model card 列出六項 benchmark：</p>
+
+<figure class="vg-w-table-inkling-benchmarks" data-mobile="keep">
+  <style>
+    .vg-w-table-inkling-benchmarks { overflow-x: auto; }
+    .vg-w-table-inkling-benchmarks table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+    .vg-w-table-inkling-benchmarks thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); }
+    .vg-w-table-inkling-benchmarks tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); }
+    .vg-w-table-inkling-benchmarks td.num { font-variant-numeric: tabular-nums; text-align: right; }
+  </style>
+  <table>
+    <thead>
+      <tr>
+        <th>benchmark</th>
+        <th class="num">分數</th>
+        <th>測的是什麼</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td>SWEBench Verified</td><td class="num">77.6%</td><td>真實世界的軟體工程任務</td></tr>
+      <tr><td>SWEBench Pro</td><td class="num">54.3%</td><td>進階、更長鏈的軟體工程任務</td></tr>
+      <tr><td>AIME 2026</td><td class="num">97.1%</td><td>數學競賽題</td></tr>
+      <tr><td>GPQA Diamond</td><td class="num">87.2%</td><td>研究生等級的科學問答</td></tr>
+      <tr><td>MMMU Pro</td><td class="num">73.3%</td><td>多模態理解</td></tr>
+      <tr><td>VoiceBench</td><td class="num">91.4%</td><td>語音理解</td></tr>
+    </tbody>
+  </table>
+</figure>
+
+<p>SWEBench Verified 跟 SWEBench Pro 測的是真實世界的軟體工程任務；AIME 2026 是數學競賽題；GPQA Diamond 是研究生等級的科學問答；MMMU Pro 測多模態理解；VoiceBench 測語音理解。六項橫跨 coding、數學、知識問答、多模態、語音——這張表想證明的事情很直接：開放權重不等於閹割版，這是一顆敢把分數攤在檯面上、跟緊閉源前沿模型放在同一張成績單上比的模型。六項橫跨五個不同能力面向，覆蓋的廣度本身就是一個訊號：這不是單一領域特化調校出來的分數，是同一顆通用模型在不同任務上分別交出的成績。要提醒的是，這些分數是 model card 自己公布的，不是第三方覆核過的結果。</p>
+
+<p>部署的部分，model card 列出五個可以直接拿來自架的開源工具：</p>
+
+<figure class="vg-w-stack-inkling-deploy" data-mobile="keep">
+  <style>
+    .vg-w-stack-inkling-deploy { display: flex; flex-direction: column; gap: var(--s-3); align-items: stretch; }
+    .vg-w-stack-inkling-deploy input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+    .vg-w-stack-inkling-deploy .stack-title { font-family: var(--scribed); font-style: italic; font-size: var(--fs-md); margin: 0 0 var(--s-1) 0; color: var(--ink); line-height: 1.4; }
+    .vg-w-stack-inkling-deploy .stack-cards { display: flex; flex-direction: column; gap: var(--s-1); list-style: none; padding: 0; margin: 0; }
+    .vg-w-stack-inkling-deploy .stack-cards label { display: block; padding: var(--s-2); border: 1px solid var(--muted-2); border-radius: 2px; cursor: pointer; transition: border-color 200ms, background 200ms; min-height: 44px; }
+    .vg-w-stack-inkling-deploy .stack-cards label:hover { border-color: var(--accent); }
+    .vg-w-stack-inkling-deploy .stack-cards .card-head { font-family: var(--display); font-size: var(--fs-md); margin: 0 0 4px 0; color: var(--ink); }
+    .vg-w-stack-inkling-deploy .stack-cards .card-sub { font-family: var(--scribed); font-style: italic; font-size: var(--fs-sm); color: var(--muted); margin: 0; line-height: 1.5; }
+    .vg-w-stack-inkling-deploy .hint { font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin: 0 0 var(--s-1) 0; }
+    .vg-w-stack-inkling-deploy .detail h3 { margin: 0 0 4px 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+    .vg-w-stack-inkling-deploy .detail p { margin: 0; font-family: var(--serif); font-size: var(--fs-sm); }
+    .vg-w-stack-inkling-deploy:has(#vg-w-stack-inkling-deploy-r1:checked) .card-1 { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+    .vg-w-stack-inkling-deploy:has(#vg-w-stack-inkling-deploy-r2:checked) .card-2 { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+    .vg-w-stack-inkling-deploy:has(#vg-w-stack-inkling-deploy-r3:checked) .card-3 { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+    .vg-w-stack-inkling-deploy:has(#vg-w-stack-inkling-deploy-r4:checked) .card-4 { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+    .vg-w-stack-inkling-deploy:has(#vg-w-stack-inkling-deploy-r5:checked) .card-5 { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+
+    .vg-w-stack-inkling-deploy svg.diagram { display: none; }
+    @media (min-width: 720px) {
+      .vg-w-stack-inkling-deploy svg.diagram { display: block; width: 100%; height: auto; max-width: 880px; }
+      .vg-w-stack-inkling-deploy .stack-title { display: none; }
+      .vg-w-stack-inkling-deploy .stack-cards { display: none; }
+    }
+    .vg-w-stack-inkling-deploy .layer { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; }
+    .vg-w-stack-inkling-deploy:has(#vg-w-stack-inkling-deploy-r1:checked) .layer-1 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+    .vg-w-stack-inkling-deploy:has(#vg-w-stack-inkling-deploy-r2:checked) .layer-2 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+    .vg-w-stack-inkling-deploy:has(#vg-w-stack-inkling-deploy-r3:checked) .layer-3 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+    .vg-w-stack-inkling-deploy:has(#vg-w-stack-inkling-deploy-r4:checked) .layer-4 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+    .vg-w-stack-inkling-deploy:has(#vg-w-stack-inkling-deploy-r5:checked) .layer-5 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+
+    .vg-w-stack-inkling-deploy .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+    .vg-w-stack-inkling-deploy:has(#vg-w-stack-inkling-deploy-r1:checked) .detail-1 { display: block; }
+    .vg-w-stack-inkling-deploy:has(#vg-w-stack-inkling-deploy-r2:checked) .detail-2 { display: block; }
+    .vg-w-stack-inkling-deploy:has(#vg-w-stack-inkling-deploy-r3:checked) .detail-3 { display: block; }
+    .vg-w-stack-inkling-deploy:has(#vg-w-stack-inkling-deploy-r4:checked) .detail-4 { display: block; }
+    .vg-w-stack-inkling-deploy:has(#vg-w-stack-inkling-deploy-r5:checked) .detail-5 { display: block; }
+  </style>
+
+  <input type="radio" id="vg-w-stack-inkling-deploy-r1" name="vg-w-stack-inkling-deploy-sel" checked aria-label="SGLang" />
+  <input type="radio" id="vg-w-stack-inkling-deploy-r2" name="vg-w-stack-inkling-deploy-sel" aria-label="vLLM" />
+  <input type="radio" id="vg-w-stack-inkling-deploy-r3" name="vg-w-stack-inkling-deploy-sel" aria-label="TokenSpeed" />
+  <input type="radio" id="vg-w-stack-inkling-deploy-r4" name="vg-w-stack-inkling-deploy-sel" aria-label="Unsloth" />
+  <input type="radio" id="vg-w-stack-inkling-deploy-r5" name="vg-w-stack-inkling-deploy-sel" aria-label="Hugging Face Transformers" />
+
+  <p class="stack-title" id="vg-w-stack-inkling-deploy-title">model card 列出的五個自架路徑</p>
+  <ul class="stack-cards" aria-labelledby="vg-w-stack-inkling-deploy-title">
+    <li class="card-1"><label for="vg-w-stack-inkling-deploy-r1">
+      <p class="card-head">SGLang</p>
+      <p class="card-sub">為結構化生成設計的推論引擎，擅長處理多輪、多分支的生成流程。</p>
+    </label></li>
+    <li class="card-2"><label for="vg-w-stack-inkling-deploy-r2">
+      <p class="card-head">vLLM</p>
+      <p class="card-sub">以 PagedAttention 聞名的高吞吐量推論服務框架，是業界最廣泛使用的自架服務選項之一。</p>
+    </label></li>
+    <li class="card-3"><label for="vg-w-stack-inkling-deploy-r3">
+      <p class="card-head">TokenSpeed</p>
+      <p class="card-sub">model card 列出的第五個部署選項，公開討論較少，這裡不臆測它的技術細節。</p>
+    </label></li>
+    <li class="card-4"><label for="vg-w-stack-inkling-deploy-r4">
+      <p class="card-head">Unsloth</p>
+      <p class="card-sub">專注於讓微調（fine-tuning）更省顯存、更快的工具鏈，適合想在 Inkling 上繼續微調的人。</p>
+    </label></li>
+    <li class="card-5"><label for="vg-w-stack-inkling-deploy-r5">
+      <p class="card-head">Hugging Face Transformers</p>
+      <p class="card-sub">官方參考實現，通用但吞吐量通常不是這幾個選項裡最高的，適合先驗證正確性。</p>
+    </label></li>
+  </ul>
+
+  <svg class="diagram" viewBox="0 0 880 360" role="img" aria-label="五個部署選項">
+    <text x="60" y="30" font-family="EB Garamond, serif" font-size="16" fill="var(--ink)">model card 列出的五個自架路徑</text>
+    <rect class="layer layer-1" x="60" y="46" width="760" height="56" role="button" tabindex="0" aria-label="SGLang" data-target="vg-w-stack-inkling-deploy-r1" />
+    <text x="80" y="70" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">SGLang</text>
+    <text x="80" y="90" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">結構化生成，多輪、多分支流程</text>
+
+    <rect class="layer layer-2" x="60" y="110" width="760" height="56" role="button" tabindex="0" aria-label="vLLM" data-target="vg-w-stack-inkling-deploy-r2" />
+    <text x="80" y="134" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">vLLM</text>
+    <text x="80" y="154" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">PagedAttention，高吞吐量服務框架</text>
+
+    <rect class="layer layer-3" x="60" y="174" width="760" height="56" role="button" tabindex="0" aria-label="TokenSpeed" data-target="vg-w-stack-inkling-deploy-r3" />
+    <text x="80" y="198" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">TokenSpeed</text>
+    <text x="80" y="218" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">model card 列出，公開討論較少</text>
+
+    <rect class="layer layer-4" x="60" y="238" width="760" height="56" role="button" tabindex="0" aria-label="Unsloth" data-target="vg-w-stack-inkling-deploy-r4" />
+    <text x="80" y="262" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">Unsloth</text>
+    <text x="80" y="282" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">微調（fine-tuning）優化工具鏈</text>
+
+    <rect class="layer layer-5" x="60" y="302" width="760" height="56" role="button" tabindex="0" aria-label="Hugging Face Transformers" data-target="vg-w-stack-inkling-deploy-r5" />
+    <text x="80" y="326" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">Hugging Face Transformers</text>
+    <text x="80" y="346" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">官方參考實現，先驗證正確性</text>
+  </svg>
+
+  <div>
+    <p class="hint">點選任一列看說明</p>
+    <div class="detail detail-1">
+      <h3>SGLang</h3>
+      <p>為結構化生成設計的推論引擎，擅長處理多輪、多分支的生成流程。</p>
+    </div>
+    <div class="detail detail-2">
+      <h3>vLLM</h3>
+      <p>以 PagedAttention 聞名的高吞吐量推論服務框架，是業界最廣泛使用的自架服務選項之一。</p>
+    </div>
+    <div class="detail detail-3">
+      <h3>TokenSpeed</h3>
+      <p>model card 列出的第五個部署選項，公開討論較少，這裡不臆測它的技術細節。</p>
+    </div>
+    <div class="detail detail-4">
+      <h3>Unsloth</h3>
+      <p>專注於讓微調（fine-tuning）更省顯存、更快的工具鏈，適合想在 Inkling 上繼續微調的人。</p>
+    </div>
+    <div class="detail detail-5">
+      <h3>Hugging Face Transformers</h3>
+      <p>官方參考實現，通用但吞吐量通常不是這幾個選項裡最高的，適合先驗證正確性。</p>
+    </div>
+  </div>
+
+  <script>
+  (function () {
+    if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+    var root = document.querySelector('.vg-w-stack-inkling-deploy');
+    root.querySelectorAll('.layer').forEach(function (rect) {
+      rect.addEventListener('click', function () {
+        var targetId = rect.getAttribute('data-target');
+        var radio = root.querySelector('#' + targetId);
+        if (radio) radio.checked = true;
+      });
+      rect.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          rect.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+        }
+      });
+    });
+  })();
+  </script>
+</figure>
+
+<p>權重、授權、部署路徑都齊了，剩下的問題是生態普不普及。中文技術部落格 gslin 在 7 月 17 日的觀察是：</p>
+
+<blockquote><p>「這是目前少數非中國的 open source license model，而且是能站上台的等級」</p></blockquote>
+
+<p>他也補上一句關於部署現況的觀察：</p>
+
+<blockquote><p>「看起來是有支援不少平台提供現成的服務，不過目前還沒在 OpenRouter 上看到」</p></blockquote>
+
+<p>按他的說法，這是目前少數非中國團隊釋出、站得上台面的開源授權前沿模型，但撰文當下，想直接透過現成的代管服務去試用，還沒有那條最方便的路。開放權重解決的是「能不能自己架」，生態普及解決的是「要不要自己架」——這是兩條進度不一樣的時間軸，前者已經到位，後者還在路上。</p>
+
+<p>對一個台灣的工程團隊來說，這張規格表能拿來做的事很具體：先用 41B 活躍參數去估算顯存與吞吐量，看跟現有機房的 GPU 排不排得上；再對照 model card 列出的五個部署工具，挑一個跟現有推論棧相容的；最後拿六項 benchmark 當基準，跟現在正在付費的 API 模型比對，看差距是不是小到可以承受自架帶來的維運成本。這三個步驟只要有一步卡住，答案都可能是「還不到時候」——但至少現在有規格表可以拿來算，不是只能猜。</p>
+
+<p class="vg-deep-closer"><strong>Take-away</strong>：Inkling 真正動搖的不是排行榜名次，是「前沿等級的多模態模型只能用 API 租」這個預設——975B 總參數、41B 活躍參數的稀疏 MoE 設計，配上 Apache-2.0 授權跟五個現成的部署工具，把「自己架一台前沿模型」從一句口號，變成一張可以拿去對著自己機房排產能的規格表。</p>
+
+</div>
