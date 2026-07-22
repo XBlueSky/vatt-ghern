@@ -1,0 +1,432 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">幾乎每個工程師都寫過這樣一段迴圈：一個陣列、一個游標、一個條件、一次只前進一格，簡單到不用多想。正是這種太過理所當然的簡單，讓「向量化」聽起來像另一個世界的技術——太複雜，不是寫日常程式的人該碰的東西。事實剛好相反：常見的 SIMD 用法幾乎都收斂成同一個固定形狀，跟「艱深指令集黑魔法」的刻板印象差很多。</p>
+  <h1 class="vg-post-title">每個工程師都該懂一點 SIMD</h1>
+</header>
+
+<div class="vg-post-prose">
+
+<p><span class="vg-dropcap">看</span>完這篇，你會知道一件事：SIMD 化一個純量迴圈其實只有五個固定步驟要做，而且可以直接對照一段真實的終端機程式碼，看懂它們分別在做什麼。真正需要記住的只有這五個動作，剩下的就是把它們套進你自己手上那個迴圈。</p>
+
+<h2>掃過一段位元組，一次比一個</h2>
+
+<p>先看一個你大概天天在寫的東西：一個陣列、一個游標、一個條件、一個 while。Hashimoto 舉的例子來自他自己維護的終端機模擬器 Ghostty——內部要掃過一段已經解碼好的 codepoint，找出第一個「數值小於等於 0xF」的位置，因為那代表遇到了一個 C0 control character，也就是終端機控制碼的分界點。原始寫法是最直覺的那種：</p>
+
+<pre><code class="language-zig">while (end < cps.len and cps[end] > 0xF) end += 1;</code></pre>
+
+<p>這行程式碼做的事情很單純：從 end 這個位置開始，只要還沒到陣列尾端、而且目前這個 codepoint 的值大於 0xF，就把游標往前推一格。CPU 每跑一次迴圈本體，只比較一個 codepoint。如果這段緩衝區有成千上萬個字元要掃，這個迴圈就要跑成千上萬次——每次都在做同一件事：讀一個值、比一次大小、決定要不要繼續。</p>
+
+<p>終端機收到的其實是一串連續的位元組，裡面混著要顯示在畫面上的文字，跟不會顯示、只負責控制游標位置與畫面狀態的控制字元——換行、歸位、色彩切換都是這一類。要正確渲染畫面，第一步永遠是先把這兩種東西分開，這正是上面那段迴圈存在的原因。而且這個形狀不是 Ghostty 獨有——任何程式只要需要「掃過一段連續資料，找到第一個滿足或不滿足某個簡單條件的位置」，寫出來的迴圈長得都差不多：一個游標、一個邊界檢查、一個條件、每次只前進一格。正因為這個形狀太普遍，也正因為它每次只處理一個元素，才會被工程師直覺地當成效能的天花板——後面兩節要拆穿的正是這個假設。</p>
+
+<p>終端機這種程式，吞吐量的壓力來自它幾乎不會停：使用者貼一大段 log、執行 <code>cat</code> 印出一個好幾 MB 的檔案、CI 把整段建置輸出倒進終端機——這些情境都會讓同一段掃描迴圈在短時間內被呼叫非常多次，每次都要重新掃過一大段位元組。迴圈本身寫得再簡潔，只要它是這種反覆被呼叫的熱路徑，每一輪省下來的時間都會被放大很多倍。</p>
+
+<h2>編譯器不會自動幫你把它變快</h2>
+
+<p>這裡有一個工程師常見的期待：反正編譯器很聰明，這種簡單迴圈它應該會自動向量化吧。現代 CPU 確實準備了成排的向量暫存器，一次可以塞進好幾個數值一起比較——問題是「硬體準備好了」跟「編譯器真的把你的迴圈轉成那樣的指令」是兩回事。Hashimoto 引的說法很直接：「Auto-vectorization has been an active area of compiler research for decades, and recent research still begins from the observation that production compilers regularly miss vectorization opportunities.」翻成白話：自動向量化被研究了幾十年，最近的研究論文開頭第一句話往往還是「正式編譯器仍然規律性地錯過向量化機會」。</p>
+
+<p>合理的推測是：像上面這種帶有「提前結束」條件的迴圈，編譯器要向量化它，必須先證明「往前多讀 lanes 個值、事後再判斷要不要丟掉多讀的部分」不會踩到記憶體邊界、不會讀到還沒配置的頁面。這個證明在很多情況下編譯器做不到，於是它選擇最安全的做法——維持 scalar。這不是某一款編譯器特別差，是整條研究路線到現在都還沒解決的通病。對 Hashimoto 來說，這個現實直接影響他的工程決定：「I want the vectorization to be explicit and predictable. I don't want an unrelated code change or compiler update to quietly turn it back into a scalar loop.」與其賭編譯器這次會不會幫你向量化，不如自己動手寫，讓這段熱路徑的行為不會因為一次不相關的程式碼改動、或一次編譯器版本升級，就悄悄退化回純量迴圈。</p>
+
+<p>傳統上，SIMD 給人的印象跟一長串像 <code>_mm256_cmpgt_epi32</code>、<code>_mm_shuffle_ps</code> 這種難記的 intrinsic 函式綁在一起——每個指令集一套命名，每個名字都要對照手冊才知道在做什麼。這可能才是「SIMD 太複雜」這個成見真正的來源：不是概念本身難，是傳統寫法的介面難用。Hashimoto 用 Zig 寫的版本刻意繞開了這條路：<code>@Vector</code>、<code>@splat</code>、<code>@reduce</code>、<code>@bitCast</code>、<code>@ctz</code> 都是語言內建、跨指令集共用的一組操作，同一段程式碼編譯到 NEON 或 AVX2 用的是同一套語法，差別只在編譯器實際產生的機器指令。</p>
+
+<p>一般來說，另一個容易被忽略的因素是分支預測：如果資料本身變化不規律，CPU 的分支預測器很難每次都猜對「這一輪要不要繼續比較」，猜錯了要付出管線清空的代價。SIMD 版本把逐一判斷的分支換成一次性的向量比較，這部分的猜測成本也跟著消失，是「lane 平行比較」這一步之外，容易被忽略的額外好處。</p>
+
+<p>這個選擇也有代價：手寫的 SIMD 版本比原本的 scalar 版本多了十幾行程式碼、多一組要留意的邊界條件，往後改動這段掃描邏輯時，兩個版本都要一起檢查。Hashimoto 顯然認為，對這種會被反覆執行的熱路徑，這筆多出來的維護成本，換來「效能不會因為編譯器版本更新而悄悄退化」的確定性，是划算的。</p>
+
+<h2>SIMD 的五步驟，其實只是同一件事做 N 份</h2>
+
+<p>Hashimoto 想推翻的成見說得很白：「I've met many very good software engineers who dismiss it as something too complex to learn or a niche optimization meant for only the highest-performance software」——很多很強的工程師直接把 SIMD 歸類成「太複雜、只有極端效能場景才需要」的東西。他的反駁也一樣直接：「SIMD can be simple to understand, and common 'process N values at a time' SIMD code to speed up a naive for loop almost always follows the same general shape.」常見的 SIMD 用法幾乎都是同一個形狀，一旦認得這個形狀，看到新的向量化程式碼就不會再覺得陌生。</p>
+
+<p>這個形狀他拆成五步：先把需要的常數廣播（broadcast）成整個 vector；接著把迴圈的步長從「一次一個元素」改成「一次一個 vector width」；每次迴圈本體對整批 lane 平行做比較或運算；把 vector 的運算結果 reduce 或存回去；最後——這是最容易被忽略的一步——用一段 scalar tail 收尾，處理湊不滿一整個 vector 的剩餘部分。</p>
+
+<p>這五步有一個共同的特徵：它們沒有改變迴圈「在找什麼」，只改變了「一次看幾個」。broadcast 只做一次，用意是把等一下要重複比較的常數準備好，不用在迴圈裡每輪重算；lane 平行比較把 N 次獨立的比較，摺成一次可以同時對 N 個值生效的向量運算；reduce 通常有兩種形態：一種是像 Ghostty 這裡的 AND 摺疊——把整批比較結果收斂成一個 bool，回答「這批裡有沒有例外」；另一種是把逐 lane 的結果原封不動寫回記憶體。scalar tail 存在的原因很直白：緩衝區的長度通常不是 lane 數的整數倍，最後剩下的幾個元素湊不滿一整批，只能退回最原始的做法逐一處理完。</p>
+
+<p>下面這個小模擬把「一次一個」跟「一次一批」的差距具體畫出來：同樣一段位元組緩衝區，scalar 游標每次前進 1 格，SIMD 游標（這裡先用 AVX2 的 8 個 lane 當代表）每次前進 8 格。按下播放，看兩個游標各自要走幾步才會到終點。</p>
+
+<figure class="vg-w-canvas-simd-lanes" data-mobile="swap" data-mobile-summary="scalar 一次走 1 byte、64 byte 要 64 步；SIMD 用 AVX2 一次 8 個 lane 只要 8 步——步數差距就是加速來源。">
+  <style>
+    .vg-w-canvas-simd-lanes { display: grid; grid-template-rows: auto auto 1fr auto; gap: var(--s-2); }
+    .vg-w-canvas-simd-lanes .toolbar { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); flex-wrap: wrap; }
+    .vg-w-canvas-simd-lanes button { font-family: var(--sans); font-size: var(--fs-sm); padding: 6px 14px; min-height: 44px; min-width: 44px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); cursor: pointer; }
+    .vg-w-canvas-simd-lanes button:hover { border-color: var(--accent); color: var(--accent-text); }
+    .vg-w-canvas-simd-lanes canvas { width: 100%; height: auto; aspect-ratio: 16 / 9; display: block; }
+    .vg-w-canvas-simd-lanes figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    @media (max-width: 720px) {
+      .vg-w-canvas-simd-lanes canvas { aspect-ratio: 4 / 3; }
+    }
+  </style>
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M9.62 12.6a1 1 0 0 0-1.3 1.3l3.7 9.5a1 1 0 0 0 1.88-.02l1.6-4.1a2 2 0 0 1 1.18-1.18l4.1-1.6a1 1 0 0 0 .02-1.88l-9.5-3.7Z"/>
+      <path d="M12 4v1"/><path d="M4 12H3"/><path d="m5.6 5.6-.7-.7"/><path d="m18.4 5.6.7-.7"/><path d="M17.5 17.5 21 21"/>
+    </svg>
+    <span>點擊播放，看兩個游標各自要走幾步才到終點 · 64 byte 緩衝區</span>
+  </p>
+  <div class="toolbar" data-vg-controls>
+    <button id="vg-w-canvas-simd-lanes-toggle" type="button">▷ 播放</button>
+    <button id="vg-w-canvas-simd-lanes-reset" type="button">↺ 重來</button>
+    <span style="margin-left: auto" id="vg-w-canvas-simd-lanes-clock">tick 0</span>
+  </div>
+  <canvas id="vg-w-canvas-simd-lanes-canvas"></canvas>
+  <figcaption>上排是 scalar，每個 tick 前進 1 byte；下排是 SIMD（AVX2，一次 8 個 lane），每個 tick 前進 8 byte。兩排掃的是同一段 64 byte 的資料——64 byte 與每個 tick 的節奏是為了讓動畫在幾秒內跑完而選的示意長度，不是原文數字；真正重點是下排每一步吃掉的 byte 數，直接對應 AVX2 的 8 個 lane。</figcaption>
+  <script>
+    (function () {
+      if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+      const root = document.querySelector('.vg-w-canvas-simd-lanes');
+      const canvas = root.querySelector('canvas');
+      const toggle = root.querySelector('#vg-w-canvas-simd-lanes-toggle');
+      const reset = root.querySelector('#vg-w-canvas-simd-lanes-reset');
+      const clock = root.querySelector('#vg-w-canvas-simd-lanes-clock');
+      const ctx = canvas.getContext('2d');
+
+      function resize() {
+        const dpr = window.devicePixelRatio || 1;
+        const rect = canvas.getBoundingClientRect();
+        canvas.width = rect.width * dpr;
+        canvas.height = rect.height * dpr;
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      }
+      new ResizeObserver(resize).observe(canvas);
+      resize();
+
+      const TOTAL = 64;
+      const SCALAR_STEP = 1;
+      const SIMD_LANES = 8;
+      const TICK_MS = 150;
+
+      let running = false;
+      let tick = 0;
+      let scalarPos = 0;
+      let simdPos = 0;
+      let acc = 0;
+      let last = performance.now();
+
+      function getCssVar(name) {
+        return getComputedStyle(root).getPropertyValue(name).trim() || '#000';
+      }
+
+      function draw() {
+        const rect = canvas.getBoundingClientRect();
+        const W = rect.width, H = rect.height;
+        ctx.clearRect(0, 0, W, H);
+
+        const padL = 16, padR = 16, padTop = 34, rowGap = 46;
+        const cellGap = 2;
+        const cellW = (W - padL - padR) / TOTAL - cellGap;
+        const cellH = 20;
+
+        ctx.font = '13px "Manrope", sans-serif';
+        ctx.fillStyle = getCssVar('--muted');
+        ctx.fillText('scalar · 每 tick 前進 1 byte', padL, padTop - 12);
+        ctx.fillText('SIMD (AVX2) · 每 tick 前進 8 byte', padL, padTop + rowGap - 12);
+
+        for (let row = 0; row < 2; row++) {
+          const y = padTop + row * rowGap;
+          const pos = row === 0 ? scalarPos : simdPos;
+          for (let i = 0; i < TOTAL; i++) {
+            const x = padL + i * (cellW + cellGap);
+            ctx.fillStyle = i < pos
+              ? (row === 0 ? getCssVar('--ink-deep') : getCssVar('--accent'))
+              : getCssVar('--line');
+            ctx.fillRect(x, y, cellW, cellH);
+          }
+        }
+      }
+
+      function step() {
+        tick += 1;
+        scalarPos = Math.min(TOTAL, scalarPos + SCALAR_STEP);
+        simdPos = Math.min(TOTAL, simdPos + SIMD_LANES);
+        if (scalarPos >= TOTAL && simdPos >= TOTAL) running = false;
+      }
+
+      function frame(now) {
+        const dt = now - last;
+        last = now;
+        if (running) {
+          acc += dt;
+          while (acc >= TICK_MS) {
+            acc -= TICK_MS;
+            step();
+          }
+        }
+        draw();
+        const simdDone = simdPos >= TOTAL ? '（已完成）' : '';
+        clock.textContent = `tick ${tick} · scalar ${scalarPos}/${TOTAL} byte · SIMD ${simdPos}/${TOTAL} byte${simdDone}`;
+        toggle.textContent = running ? '⏸ 暫停' : '▷ 播放';
+        requestAnimationFrame(frame);
+      }
+      requestAnimationFrame(frame);
+
+      toggle.addEventListener('click', () => {
+        running = !running;
+        last = performance.now();
+        acc = 0;
+      });
+      reset.addEventListener('click', () => {
+        running = false;
+        tick = 0;
+        scalarPos = 0;
+        simdPos = 0;
+        acc = 0;
+        last = performance.now();
+      });
+    })();
+  </script>
+</figure>
+
+<p>步數的差距不是視覺效果，是五步驟裡「以 vector width 為步長迴圈」這一步直接的後果：迴圈本體被執行的次數除以 lane 數，執行次數少了，總時間自然跟著掉。</p>
+
+<h2>Ghostty 的控制字元掃描：scalar 一行、SIMD 十二行</h2>
+
+<p>回到 Ghostty 真正的程式碼。Hashimoto 把同一段掃描邏輯改寫成 SIMD 版本之後貼出來，大概十二行：</p>
+
+<pre><code class="language-zig">if (simd.lanes(u32)) |lanes| {
+    const V = @Vector(lanes, u32);
+    const threshold: V = @splat(0xF);
+    while (end + lanes <= cps.len) : (end += lanes) {
+        const values: V = cps[end..][0..lanes].*;
+        const greater_than_threshold = values > threshold;
+        if (@reduce(.And, greater_than_threshold)) continue;
+        const mask: std.meta.Int(.unsigned, lanes) = @bitCast(greater_than_threshold);
+        end += @ctz(~mask);
+        break;
+    }
+}
+
+while (end < cps.len and cps[end] > 0xF) end += 1;</code></pre>
+
+<p>先看最後一行——它跟文章最前面那個純 scalar 版本逐字相同。Hashimoto 對 scalar tail 的定義就是這麼直白：「A scalar tail is just your _normal_ loop from before vectorizing, but it only processes the remainder that doesn't fit into a full vector.」你不需要為 scalar tail 另外想一段程式碼，它就是向量化之前你原本就會寫的那個迴圈，原封不動搬過來，只是現在只剩下湊不滿一整批 lane 的尾巴要處理。</p>
+
+<p>這段程式碼還藏著一個容易被忽略的細節：最外層是一個 <code>if (simd.lanes(u32)) |lanes|</code>，而不是直接假設 SIMD 一定存在。<code>simd.lanes(u32)</code> 回傳的是一個 optional——如果編譯目標找不到對應寬度的向量指令，這個 if 就直接略過，整個函式退回只跑最後那行 scalar 迴圈。換句話說，scalar tail 不只是「向量化之後剩下的尾巴」，在完全沒有 SIMD 支援的平台上，它還兼任整個函式的 fallback。合理的推測是，這裡的判斷在編譯期就已經決定——Zig 的 <code>@Vector(lanes, u32)</code> 要求 lanes 必須是編譯期常數，<code>simd.lanes(u32)</code> 因此只能是依照編譯目標（target CPU features）在編譯期算出來的結果，不是執行期動態偵測硬體後才選擇。</p>
+
+<p>中間那段才是新增的部分，可以跟前面講的五步驟一一對上——切到下面每個分頁看對應的程式碼片段。</p>
+
+<div class="vg-w-tabs-simd-steps">
+  <style>
+    .vg-w-tabs-simd-steps { display: grid; gap: var(--s-2); margin: var(--s-3) 0; }
+    .vg-w-tabs-simd-steps input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+    .vg-w-tabs-simd-steps .tabs { display: flex; gap: var(--s-2); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+    .vg-w-tabs-simd-steps .tab { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.04em; padding: var(--s-1) var(--s-2); cursor: pointer; color: var(--muted); min-height: 44px; display: flex; align-items: center; }
+    .vg-w-tabs-simd-steps .panel { display: none; padding: var(--s-2) 0; }
+    .vg-w-tabs-simd-steps .panel p { font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink); margin: 0 0 var(--s-2); }
+    .vg-w-tabs-simd-steps pre { margin: 0; }
+    .vg-w-tabs-simd-steps:has(#vg-w-tabs-simd-steps-t1:checked) .panel-1 { display: block; }
+    .vg-w-tabs-simd-steps:has(#vg-w-tabs-simd-steps-t1:checked) [for="vg-w-tabs-simd-steps-t1"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    .vg-w-tabs-simd-steps:has(#vg-w-tabs-simd-steps-t2:checked) .panel-2 { display: block; }
+    .vg-w-tabs-simd-steps:has(#vg-w-tabs-simd-steps-t2:checked) [for="vg-w-tabs-simd-steps-t2"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    .vg-w-tabs-simd-steps:has(#vg-w-tabs-simd-steps-t3:checked) .panel-3 { display: block; }
+    .vg-w-tabs-simd-steps:has(#vg-w-tabs-simd-steps-t3:checked) [for="vg-w-tabs-simd-steps-t3"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    .vg-w-tabs-simd-steps:has(#vg-w-tabs-simd-steps-t4:checked) .panel-4 { display: block; }
+    .vg-w-tabs-simd-steps:has(#vg-w-tabs-simd-steps-t4:checked) [for="vg-w-tabs-simd-steps-t4"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    .vg-w-tabs-simd-steps:has(#vg-w-tabs-simd-steps-t5:checked) .panel-5 { display: block; }
+    .vg-w-tabs-simd-steps:has(#vg-w-tabs-simd-steps-t5:checked) [for="vg-w-tabs-simd-steps-t5"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+  </style>
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <rect width="18" height="18" x="3" y="3" rx="2"/><path d="M3 9h18"/><path d="M9 21V9"/>
+    </svg>
+    <span>切換分頁比對五步驟各自對應的程式碼片段 · 5 個分頁</span>
+  </p>
+  <input type="radio" id="vg-w-tabs-simd-steps-t1" name="vg-w-tabs-simd-steps-sel" checked />
+  <input type="radio" id="vg-w-tabs-simd-steps-t2" name="vg-w-tabs-simd-steps-sel" />
+  <input type="radio" id="vg-w-tabs-simd-steps-t3" name="vg-w-tabs-simd-steps-sel" />
+  <input type="radio" id="vg-w-tabs-simd-steps-t4" name="vg-w-tabs-simd-steps-sel" />
+  <input type="radio" id="vg-w-tabs-simd-steps-t5" name="vg-w-tabs-simd-steps-sel" />
+  <div class="tabs">
+    <label class="tab" for="vg-w-tabs-simd-steps-t1">1 broadcast</label>
+    <label class="tab" for="vg-w-tabs-simd-steps-t2">2 vector-width 迴圈</label>
+    <label class="tab" for="vg-w-tabs-simd-steps-t3">3 平行比較</label>
+    <label class="tab" for="vg-w-tabs-simd-steps-t4">4 reduce</label>
+    <label class="tab" for="vg-w-tabs-simd-steps-t5">5 scalar tail</label>
+  </div>
+  <div class="panel panel-1">
+    <p>把門檻值 0xF 廣播成整個 vector 裡每個 lane 都相同的值，之後才能整批一起比較。</p>
+    <pre><code class="language-zig">const threshold: V = @splat(0xF);</code></pre>
+  </div>
+  <div class="panel panel-2">
+    <p>步長從「一次一個 codepoint」改成「一次 lanes 個」，迴圈本體執行的次數因此除以 lane 數。</p>
+    <pre><code class="language-zig">while (end + lanes <= cps.len) : (end += lanes) {</code></pre>
+  </div>
+  <div class="panel panel-3">
+    <p>一次讀進整批 lane 的值，跟廣播好的門檻做一次比較——lanes 個 codepoint 同時得到各自的比較結果。</p>
+    <pre><code class="language-zig">const values: V = cps[end..][0..lanes].*;
+const greater_than_threshold = values > threshold;</code></pre>
+  </div>
+  <div class="panel panel-4">
+    <p>先用 AND 把整批比較結果摺疊成一個 bool：全部符合就跳過整批。不是全部符合，就把比較結果轉成 bitmask，數出第一個不符合的 lane 位置。</p>
+    <pre><code class="language-zig">if (@reduce(.And, greater_than_threshold)) continue;
+const mask: std.meta.Int(.unsigned, lanes) = @bitCast(greater_than_threshold);
+end += @ctz(~mask);</code></pre>
+  </div>
+  <div class="panel panel-5">
+    <p>湊不滿一整批 lane 的剩餘部分，直接沿用向量化之前的原始迴圈，一個一個處理完。</p>
+    <pre><code class="language-zig">while (end < cps.len and cps[end] > 0xF) end += 1;</code></pre>
+  </div>
+</div>
+
+<p>第 4 步裡的位元運算值得多看一眼，因為它把「哪個 lane 最先違反條件」這個問題，轉成一次 bit 計數就能回答，不用逐個 lane 檢查。<code>mask</code> 是「大於門檻」這個比較結果組成的 bitmask，1 代表符合（數值大於 0xF，還不是控制字元）；取反（<code>~mask</code>）之後，符合門檻的 lane 變成 0，不符合門檻——也就是遇到控制字元——的 lane 變成 1。<code>@ctz</code> 從最低位數起，數到第一個 1 之前有幾個 0，那些 0 對應的正是「持續符合門檻」的連續 lane，數到的那個數字，正好就是這一批裡第一個違反門檻的 lane 位置，直接加進 <code>end</code>，游標就精準地停在正確的位置。如果不用這種位元技巧，改成逐一檢查每個 lane 的比較結果，等於把向量化省下來的分支又逐一加回來——<code>@bitCast</code> 加 <code>@ctz</code> 這兩步存在的意義，就是用一次位元運算取代「再跑一次長度為 lanes 的內層迴圈」，讓整段 reduce 維持在幾乎常數的時間內完成。</p>
+
+<div class="vg-w-pop-simd-glossary">
+  <style>
+    .vg-w-pop-simd-glossary { position: relative; margin: var(--s-3) 0; }
+    .vg-w-pop-simd-glossary p { font-family: var(--serif); font-size: var(--fs-md); color: var(--ink); margin: 0; }
+    .vg-w-pop-simd-glossary .term { text-decoration: underline dotted var(--muted); cursor: help; font-family: var(--mono); font-size: 0.92em; }
+    .vg-w-pop-simd-glossary .term-1 { anchor-name: --vg-w-pop-simd-glossary-a1; }
+    .vg-w-pop-simd-glossary .term-2 { anchor-name: --vg-w-pop-simd-glossary-a2; }
+    .vg-w-pop-simd-glossary .term-3 { anchor-name: --vg-w-pop-simd-glossary-a3; }
+    .vg-w-pop-simd-glossary .term-4 { anchor-name: --vg-w-pop-simd-glossary-a4; }
+    .vg-w-pop-simd-glossary .pop {
+      position: absolute;
+      translate: -50% var(--s-1);
+      padding: var(--s-1) var(--s-2);
+      background: var(--bg-soft);
+      border: 1px solid var(--line);
+      font-family: var(--scribed);
+      font-size: var(--fs-sm);
+      max-width: 34ch;
+      opacity: 0;
+      transition: opacity 100ms;
+      pointer-events: none;
+      z-index: 2;
+    }
+    .vg-w-pop-simd-glossary .pop-1 { position-anchor: --vg-w-pop-simd-glossary-a1; top: anchor(bottom); left: anchor(center); }
+    .vg-w-pop-simd-glossary .pop-2 { position-anchor: --vg-w-pop-simd-glossary-a2; top: anchor(bottom); left: anchor(center); }
+    .vg-w-pop-simd-glossary .pop-3 { position-anchor: --vg-w-pop-simd-glossary-a3; top: anchor(bottom); left: anchor(center); }
+    .vg-w-pop-simd-glossary .pop-4 { position-anchor: --vg-w-pop-simd-glossary-a4; top: anchor(bottom); left: anchor(center); }
+    .vg-w-pop-simd-glossary .term:hover + .pop,
+    .vg-w-pop-simd-glossary .term:focus + .pop { opacity: 1; }
+    @supports not (anchor-name: --x) {
+      .vg-w-pop-simd-glossary .pop { position: static; opacity: 1; pointer-events: auto; translate: none; margin: 4px 0 4px var(--s-2); display: block; }
+    }
+  </style>
+  <p>這幾個 Zig 內建函式，字面意思都直接對應它們在做的事：
+    <span class="term term-1" tabindex="0">@splat</span><span class="pop pop-1">把一個純量值廣播成整個 vector 每個 lane 都相同的值——五步驟裡的第一步。</span>、
+    <span class="term term-2" tabindex="0">@reduce(.And, …)</span><span class="pop pop-2">把整個 vector 的比較結果用邏輯 AND 摺疊成一個 bool，只要有一個 lane 不符合就會是 false。</span>、
+    <span class="term term-3" tabindex="0">@bitCast</span><span class="pop pop-3">把比較結果組成的 vector 重新詮釋成一個整數 bitmask，每個 bit 對應一個 lane 是否為真。</span>、
+    <span class="term term-4" tabindex="0">@ctz</span><span class="pop pop-4">count trailing zeros——從 bitmask 最低位數起，數到第一個 1 之前有幾個 0，那就是第一個不符合門檻的 lane 位置。</span>
+    ——把游標停在底線字上看說明。</p>
+</div>
+
+<h2>該不該動手：lane 數、實測 5x、和一個門檻</h2>
+
+<p>三種常見指令集能塞進一個 vector 的數量並不一樣，這直接決定了理論上的加速空間。Hashimoto 給的數字：「On ARM this returns 4, AVX2 returns 8, and AVX-512 returns 16.」對應到吞吐量：「This can improve the loop's throughput by up to 4x with ARM NEON (including Apple Silicon), 8x with AVX2 (most modern x86 CPUs), and 16x with AVX-512」。這裡列的 lane 數都是針對 <code>u32</code>（四個 byte）算出來的；lane 數本質上是「向量暫存器寬度除以元素大小」——如果 Ghostty 掃的是 <code>u8</code>（單一 byte）而不是 codepoint 大小的 <code>u32</code>，同一顆 CPU 一次能塞進的 lane 數會是這裡的四倍。同一段 SIMD 程式碼，換一種資料型別，理論加速比就會跟著變。這也對得上一般認知裡各指令集的暫存器寬度：NEON 通常是 128-bit、AVX2 是 256-bit、AVX-512 顧名思義是 512-bit——拿寬度除以 32-bit 的元素大小，128÷32=4、256÷32=8、512÷32=16，剛好對上表格裡的 lane 數。</p>
+
+<figure class="vg-w-table-lane-speedup" data-mobile="keep">
+  <style>
+    .vg-w-table-lane-speedup { overflow-x: auto; }
+    .vg-w-table-lane-speedup table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+    .vg-w-table-lane-speedup thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); }
+    .vg-w-table-lane-speedup tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+    .vg-w-table-lane-speedup td.num { font-variant-numeric: tabular-nums; text-align: right; }
+    .vg-w-table-lane-speedup figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-2); }
+  </style>
+  <table>
+    <thead>
+      <tr>
+        <th>指令集</th>
+        <th class="num">lane 數（u32）</th>
+        <th class="num">理論最高加速</th>
+        <th>常見硬體</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td>ARM NEON</td><td class="num">4</td><td class="num">最高 4x</td><td>含 Apple Silicon</td></tr>
+      <tr><td>AVX2</td><td class="num">8</td><td class="num">最高 8x</td><td>多數現代 x86 CPU</td></tr>
+      <tr><td>AVX-512</td><td class="num">16</td><td class="num">最高 16x</td><td>伺服器 / 高階桌機</td></tr>
+    </tbody>
+  </table>
+  <figcaption>「up to」是理論上限。Hashimoto 在 Ghostty 上實測的 end-to-end 吞吐量——AVX2 Intel 桌機上，從輸入到終端機狀態更新完成——量到的是約 5x，低於 8x 的理論上限。</figcaption>
+</figure>
+
+<p>差距的來源不難理解：這段 SIMD 化的迴圈只是整個 render pipeline 裡的一小段，其他還沒向量化、或本來就是 scalar 的部分會把整體加速拉下來。理論上限描述的是「這一段迴圈」，實測 5x 描述的是「整條路徑」，兩者本來就不該期待相等。</p>
+
+<p>下面這個小工具把「換一種 lane 寬度，同一段資料要跑幾次迴圈」直接算給你看——拖到 AVX-512 的 16，再拖回 NEON 的 4，看迭代次數怎麼變。</p>
+
+<figure class="vg-w-range-lane-width" data-mobile="static" data-svg-scroll="640">
+  <style>
+    .vg-w-range-lane-width { display: grid; gap: var(--s-2); }
+    .vg-w-range-lane-width .controls { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); flex-wrap: wrap; }
+    .vg-w-range-lane-width input[type="range"] { flex: 1; min-width: 160px; height: 36px; accent-color: var(--accent); }
+    .vg-w-range-lane-width .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 22ch; text-align: right; }
+    .vg-w-range-lane-width svg { width: 100%; height: auto; }
+    .vg-w-range-lane-width figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+  </style>
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="m18 8 4 4-4 4"/><path d="M2 12h20"/><path d="m6 8-4 4 4 4"/>
+    </svg>
+    <span>拖動滑桿切換 lane 寬度 4 / 8 / 16 · 看迭代次數變化</span>
+  </p>
+  <div class="controls" data-vg-controls>
+    <label for="vg-w-range-lane-width-input">lane 寬度：</label>
+    <input id="vg-w-range-lane-width-input" type="range" min="0" max="2" step="1" value="1" />
+    <span class="readout" id="vg-w-range-lane-width-readout">AVX2 · 8 lane → 512 次迭代</span>
+  </div>
+  <svg viewBox="0 0 640 260" preserveAspectRatio="xMidYMid meet" role="img" aria-label="lane 寬度與迭代次數對照">
+    <text x="10" y="20" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)" letter-spacing="0.05em">示意：假設一段 4096 byte 的緩衝區（非原文數字）</text>
+    <line x1="140" y1="30" x2="140" y2="220" stroke="var(--muted-2)" stroke-width="1" />
+
+    <g font-family="JetBrains Mono, monospace" font-size="13" fill="var(--ink)">
+      <text x="130" y="55" text-anchor="end">scalar</text>
+      <text x="130" y="100" text-anchor="end" id="vg-w-range-lane-width-label-neon">NEON · 4</text>
+      <text x="130" y="145" text-anchor="end" id="vg-w-range-lane-width-label-avx2">AVX2 · 8</text>
+      <text x="130" y="190" text-anchor="end" id="vg-w-range-lane-width-label-avx512">AVX-512 · 16</text>
+    </g>
+
+    <rect x="150" y="42" width="480" height="16" fill="var(--muted-2)" />
+    <text x="628" y="55" text-anchor="end" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--muted)">4096 次</text>
+
+    <rect x="150" y="87" width="120" height="16" fill="var(--line)" id="vg-w-range-lane-width-bar-neon" />
+    <text x="280" y="100" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--ink)" id="vg-w-range-lane-width-num-neon">1024 次</text>
+
+    <rect x="150" y="132" width="60" height="16" fill="var(--accent)" id="vg-w-range-lane-width-bar-avx2" />
+    <text x="220" y="145" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--ink)" id="vg-w-range-lane-width-num-avx2">512 次</text>
+
+    <rect x="150" y="177" width="30" height="16" fill="var(--line)" id="vg-w-range-lane-width-bar-avx512" />
+    <text x="190" y="190" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--ink)" id="vg-w-range-lane-width-num-avx512">256 次</text>
+  </svg>
+  <figcaption>灰色長條是 4096 byte 的示意緩衝區在各 lane 寬度下需要的迴圈迭代次數（4096 除以 lane 數），橘色標出目前選擇；scalar 一律要跑滿 4096 次。lane 數本身（4 / 8 / 16）取自原文。</figcaption>
+  <script>
+    (function () {
+      if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+      const root = document.querySelector('.vg-w-range-lane-width');
+      const input = root.querySelector('input');
+      const readout = root.querySelector('.readout');
+      const BUFFER = 4096;
+      const OPTIONS = [
+        { name: 'NEON', lanes: 4, bar: 'vg-w-range-lane-width-bar-neon', num: 'vg-w-range-lane-width-num-neon', label: 'vg-w-range-lane-width-label-neon' },
+        { name: 'AVX2', lanes: 8, bar: 'vg-w-range-lane-width-bar-avx2', num: 'vg-w-range-lane-width-num-avx2', label: 'vg-w-range-lane-width-label-avx2' },
+        { name: 'AVX-512', lanes: 16, bar: 'vg-w-range-lane-width-bar-avx512', num: 'vg-w-range-lane-width-num-avx512', label: 'vg-w-range-lane-width-label-avx512' },
+      ];
+      const MAXW = 480;
+
+      function render() {
+        const idx = Number(input.value);
+        OPTIONS.forEach((opt, i) => {
+          const iterations = Math.ceil(BUFFER / opt.lanes);
+          const w = (iterations / BUFFER) * MAXW;
+          const bar = root.querySelector('#' + opt.bar);
+          const num = root.querySelector('#' + opt.num);
+          const isActive = i === idx;
+          bar.setAttribute('width', Math.max(w, 6).toFixed(1));
+          bar.setAttribute('fill', isActive ? 'var(--accent)' : 'var(--line)');
+          num.setAttribute('x', 150 + Math.max(w, 6) + 12);
+          num.textContent = `${iterations} 次`;
+        });
+        const active = OPTIONS[idx];
+        readout.textContent = `${active.name} · ${active.lanes} lane → ${Math.ceil(BUFFER / active.lanes)} 次迭代`;
+      }
+      input.addEventListener('input', render);
+      render();
+    })();
+  </script>
+</figure>
+
+<p>最後是門檻問題：什麼樣的資料量才值得寫這一段。Hashimoto 講得很白：「The only real requirement for this to pay off is that you need to be regularly processing a large enough number of bytes. If you're doing these for loops across data that is only ever a handful or dozens of bytes, it's not worth it. But if this is iterating over hundreds, thousands, millions of bytes, the payoff will be huge.」換句話說，如果你的迴圈掃過的資料量常態性只有幾十個 byte，多寫的這十幾行程式碼、多維護的一段 scalar tail，換來的效能提升不值得。但只要規模到了成百上千、甚至上百萬個 byte，五步驟帶來的加速就會很可觀。</p>
+
+<p>這也是為什麼「5x」跟「hundreds, thousands, millions of bytes」這兩個數字要放在一起看：多寫的這十幾行 SIMD 程式碼、多維護的一段 scalar tail，是一次性的固定成本；只有當這段迴圈會被反覆執行在夠大量的資料上，這筆固定成本才划算得回來。對一個只在啟動時跑一次、只處理幾十個 byte 的迴圈來說，同樣這十幾行程式碼換來的是負回報——維護成本大於效能收益。回頭看最前面那個模擬：64 byte 縮短成 8 步，不是魔法，是把「一次一個」換成「一次一批」這一個念頭，套進五步驟裡就跑出來的結果；資料量越大，這個念頭省下的步數就越可觀。</p>
+
+<p>回到最前面那個成見：很多很強的工程師之所以覺得 SIMD 太複雜，往往是還沒把它拆解成這五步。拆解之後，決定要不要動手的問題，就從「我懂不懂 SIMD」變成「我的資料量夠不夠大」——這是一個好回答得多的問題。</p>
+
+<p class="vg-deep-closer"><strong>記住一件事就夠了</strong>：SIMD 不是新知識，只是同一個五步驟形狀反覆套用——broadcast、依 vector width 迴圈、lane 平行運算、reduce、scalar tail；認得出這五步，就認得出任何一段向量化程式碼在做什麼。要不要動手寫，只看一個數字：這段迴圈規律處理的資料量，是幾十個 byte，還是成百上千、甚至上百萬個 byte。</p>
+
+</div>
