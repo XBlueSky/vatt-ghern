@@ -1,0 +1,462 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">RocksDB 裡有一個 key 叫 dog，被寫入兩次：先寫 a，seqnum 記到 2；後來寫 b，seqnum 記到 5。有個 reader 是在 seqnum 4 的時候啟動的——它看得到 a，但完全不知道 b 存在，直接跳過。RocksDB 的整套 MVCC、快照、交易，都是這一個「跳過」動作的變形。</p>
+  <h1 class="vg-post-title">RocksDB 的 MVCC 與交易是怎麼運作的——從一個會遞增的數字講起</h1>
+</header>
+
+<div class="vg-post-prose">
+
+<p><span class="vg-dropcap">看</span>完這篇你會知道：RocksDB 怎麼讓多個 read 在 write 持續進行時仍然看到一致的資料，snapshot、WriteBatch 的原子性、SuperVersion 的引用計數、悲觀與樂觀交易的衝突偵測，全部歸結到同一件事——比較兩個 sequence number 誰大。這篇從零講起，不假設你已經懂 MVCC。</p>
+
+<h2>一個 read 正在進行，write 也沒停——這個場景要解決什麼問題</h2>
+
+<p>RocksDB 是個嵌入式 key-value store，同一時間常常有多個 read 在跑，也同時有 write 在進行。最直覺的做法是拿一把鎖：每次 read 或 write 都要先鎖住整個 db。這樣做問題很明顯——只要有一個 write 在跑，所有其他 read 都要排隊等它放手，read 之間互相打架不打緊，跟 write 打架就是全面停擺。另一個直覺做法是每次 read 開始前把整份資料複製一份，這樣 read 永遠看自己的副本，不用跟任何人搶。但複製的代價跟資料庫大小成正比，write 稍微密集一點，複製就跟不上。</p>
+
+<p>這個問題在讀多寫少的場景特別尖銳。假設一個服務的 read 遠比 write 頻繁，用大鎖的做法等於讓絕大多數請求陪著少數 write 一起排隊；用複製的做法則是讓每一次 write 都拖著一整份資料一起搬。兩種代價都跟資料庫實際大小或並發數綁死，規模一大就撐不住。</p>
+
+<p>RocksDB 選的路徑不鎖也不複製。它從最底層的儲存格式開始動手：每一筆寫進 memtable 或 SST 檔案的東西，不是單純的 (key, value)，而是一個三元組——「What actually gets into the memtable and SST files on disk is a triplet of (user_key, sequence_number, value_type)」。同一個 user_key 被寫入多次，不會覆蓋掉舊版本，而是各自留一筆記錄，用 sequence_number 區分先後。</p>
+
+<h2>同一個 key 的多個版本疊在一起——鎖不掉、也不用鎖</h2>
+
+<p>三元組帶來一個立即的問題：既然舊版本不會被覆蓋，memtable 裡同一個 user_key 就可能同時存在好幾筆記錄。RocksDB 用 skip list 存 memtable，排序規則是先比 user_key（遞增），同一個 user_key 之內再比 sequence_number（遞減）——「when two keys share the same user key, the one with the larger sequence number comes first」。最新版本永遠排在最前面，這件事本身不需要鎖：skip list 的併發插入靠原子指標操作完成，不是傳統的排他鎖。</p>
+
+<p>skip list 被選中不是巧合。B-tree 之類的結構做原地更新，插入新版本會牽動整個 page 的排列，通常得對 page 加鎖；skip list 的每個節點只靠幾個 forward 指標串起來，插入新節點只要把前後指標接上，不需要移動既有節點，也不需要碰既有節點的鎖。這讓「同一個 key 疊多個版本」這件事幾乎沒有額外代價——多出來的只是多一個節點，排序規則保證新節點永遠插在正確位置。</p>
+
+<p>但排序解決不了「read 應該看見哪一個版本」這個問題。如果一個 read 在 dog 的 b 版本（seqnum 5）寫入之後才啟動，它理所當然該看見 b；但如果它是在 b 寫入之前就啟動、只是還沒讀到這個 key，它該看見的是舊的 a，而不能被半途冒出來的 b 影響。鎖解決不了這件事，因為問題根本不是「誰先誰後搶到鎖」，是「這個 read 應該凍結在哪一個時間點」。這正是 RocksDB 引入 sequence number 比較的原因。</p>
+
+<h2>快照不是複製資料，是記一個數字</h2>
+
+<p>RocksDB 內部維護兩個關鍵的 sequence number：一個是最近配出去的號碼，另一個是「已發布」給 read 看的號碼。每個 read 查詢開始時，會記下當下的已發布 sequence number，之後所有的比較都拿這個數字當上限。原文用 dog 這個 key 舉的例子最直接：「The reader R, when it sees dog,b with the sequence number 5, will skip over it, as it is allowed to see only keys with a sequence number of 4 or below.」reader 只被允許看到 sequence number 4 或更低的版本，seqnum 5 的 b 直接跳過，改看排在它後面、seqnum 較小的 a。</p>
+
+<p>snapshot API 把這個機制包成一個顯式物件：「A snapshot is just the published sequence number recorded when db.snapshot() is called - reads through the snapshot skip keys with higher sequence numbers.」snapshot 不是複製任何東西，就是記錄呼叫當下的那個數字。之後不管透過這個 snapshot 讀幾次、讀哪個 key，比較邏輯都一樣：seqnum 大於 snapshot 記錄值的版本一律跳過。</p>
+
+<p>這兩個數字系統性地分工：一個記錄「目前配到哪個號」，另一個記錄「目前公開給 read 看到哪個號」。寫入的當下，配號動作先發生；號碼真正讓 read 看得到，是發布動作，兩者可以不同時發生——WriteBatch 的原子性正是利用了這個時間差，後面會講到。read 或 snapshot 要做的事，永遠只是記下當下已發布的那個數字，再拿它跟每個版本的 seqnum 比大小。compaction 也會尊重還活著的 snapshot：一份 snapshot 只要還活著，它記下的那個 seqnum 就還有 read 可能拿來當上限比對，compaction 想清掉某個舊版本之前，得先確認沒有任何還沒釋放的 snapshot 需要它——不然某個 read 半路發現自己要比對的版本已經被清空，語義就從「跳過」變成「查無此版本」，完全不是一回事。</p>
+
+<p>下面這個 widget 用 dog 這個 key（原文的例子）加一個示範用的第二個 key，讓你自己拖動快照捕捉到的 sequence number，看哪個版本會被判定可見、哪個被跳過。</p>
+
+<figure class="vg-w-param-snapshot-seqnum" data-mobile="static" data-svg-scroll="720">
+  <style>
+    .vg-w-param-snapshot-seqnum { display: grid; grid-template-rows: auto auto 1fr auto; gap: var(--s-2); }
+    .vg-w-param-snapshot-seqnum .controls { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+    .vg-w-param-snapshot-seqnum .controls input { flex: 1; height: 36px; accent-color: var(--accent); touch-action: none; }
+    .vg-w-param-snapshot-seqnum .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 8ch; text-align: right; }
+    .vg-w-param-snapshot-seqnum svg { width: 100%; height: auto; }
+    .vg-w-param-snapshot-seqnum .explain { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--ink-deep); min-height: 2.6em; }
+    .vg-w-param-snapshot-seqnum figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    @media (max-width: 720px) {
+      .vg-w-param-snapshot-seqnum .controls { flex-wrap: wrap; }
+    }
+  </style>
+
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="m18 8 4 4-4 4"/><path d="M2 12h20"/><path d="m6 8-4 4 4 4"/>
+    </svg>
+    <span>拖動滑桿設定快照捕捉到的 sequence number · 2 個 key、5 次寫入</span>
+  </p>
+
+  <div class="controls" data-vg-controls>
+    <label for="vg-w-param-snapshot-seqnum-x">快照 seqnum =</label>
+    <input id="vg-w-param-snapshot-seqnum-x" type="range" min="1" max="9" value="4" step="1" />
+    <span class="readout" id="vg-w-param-snapshot-seqnum-readout">4</span>
+  </div>
+
+  <svg id="vg-w-param-snapshot-seqnum-main" viewBox="0 0 720 300" preserveAspectRatio="xMidYMid meet" role="img" aria-label="snapshot sequence number 可見性">
+    <line x1="70" y1="250" x2="690" y2="250" stroke="var(--muted-2)" stroke-width="1" />
+    <g font-family="JetBrains Mono, monospace" font-size="12" fill="var(--muted)">
+      <text x="80"  y="268" text-anchor="middle">1</text>
+      <text x="155" y="268" text-anchor="middle">2</text>
+      <text x="230" y="268" text-anchor="middle">3</text>
+      <text x="305" y="268" text-anchor="middle">4</text>
+      <text x="380" y="268" text-anchor="middle">5</text>
+      <text x="455" y="268" text-anchor="middle">6</text>
+      <text x="530" y="268" text-anchor="middle">7</text>
+      <text x="605" y="268" text-anchor="middle">8</text>
+      <text x="680" y="268" text-anchor="middle">9</text>
+    </g>
+    <text x="380" y="288" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--muted)">sequence number</text>
+
+    <text x="18" y="106" font-family="Manrope, sans-serif" font-size="13" fill="var(--ink)">dog</text>
+    <text x="18" y="186" font-family="Manrope, sans-serif" font-size="13" fill="var(--ink)">key B</text>
+
+    <line id="vg-w-param-snapshot-seqnum-cut" x1="305" y1="30" x2="305" y2="250" stroke="var(--accent)" stroke-width="1.5" stroke-dasharray="5 4" />
+    <text id="vg-w-param-snapshot-seqnum-cut-label" x="305" y="20" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--accent-text)">快照 = 4</text>
+
+    <circle id="vg-w-param-snapshot-seqnum-dog-a" cx="155" cy="110" r="7" fill="var(--accent)" stroke="var(--ink)" stroke-width="1.5" />
+    <text x="155" y="132" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" fill="var(--muted)">a</text>
+    <circle id="vg-w-param-snapshot-seqnum-dog-b" cx="380" cy="110" r="6" fill="none" stroke="var(--muted-2)" stroke-width="1.5" stroke-dasharray="3 2" opacity="0.55" />
+    <text x="380" y="132" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" fill="var(--muted)">b</text>
+
+    <circle id="vg-w-param-snapshot-seqnum-b-v1" cx="80" cy="190" r="5" fill="var(--sage)" />
+    <circle id="vg-w-param-snapshot-seqnum-b-v2" cx="305" cy="190" r="7" fill="var(--accent)" stroke="var(--ink)" stroke-width="1.5" />
+    <circle id="vg-w-param-snapshot-seqnum-b-v3" cx="530" cy="190" r="6" fill="none" stroke="var(--muted-2)" stroke-width="1.5" stroke-dasharray="3 2" opacity="0.55" />
+
+    <g font-family="Manrope, sans-serif" font-size="11">
+      <circle cx="460" cy="42" r="6" fill="var(--accent)" stroke="var(--ink)" stroke-width="1.5" />
+      <text x="474" y="46" fill="var(--ink)">目前會回傳的版本</text>
+      <circle cx="460" cy="60" r="5" fill="var(--sage)" />
+      <text x="474" y="64" fill="var(--ink)">可見但不是最新</text>
+      <circle cx="460" cy="78" r="5" fill="none" stroke="var(--muted-2)" stroke-width="1.5" stroke-dasharray="3 2" />
+      <text x="474" y="82" fill="var(--ink)">seqnum 太新，被跳過</text>
+    </g>
+  </svg>
+
+  <p class="explain" id="vg-w-param-snapshot-seqnum-explain">快照記到 seqnum 4：dog 的 b（seqnum 5）比快照新，跳過，reader 改看 a（seqnum 2）；key B 的第三次寫入（seqnum 7）同樣被跳過，reader 看到 seqnum 4 那一版。</p>
+
+  <figcaption>dog 這個 key 與它 a／b 兩個版本的 seqnum（2 與 5）取自原文的例子；key B 是額外加的第二條版本鏈，用來示範 MVCC 是逐 key 獨立判斷的，不是整個資料庫共用一條時間線。</figcaption>
+
+  <script>
+    (function () {
+      if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+      var root = document.querySelector('.vg-w-param-snapshot-seqnum');
+      var input = root.querySelector('input');
+      var readout = root.querySelector('.readout');
+      var cut = root.querySelector('#vg-w-param-snapshot-seqnum-cut');
+      var cutLabel = root.querySelector('#vg-w-param-snapshot-seqnum-cut-label');
+      var explain = root.querySelector('#vg-w-param-snapshot-seqnum-explain');
+
+      var dogA = root.querySelector('#vg-w-param-snapshot-seqnum-dog-a');
+      var dogB = root.querySelector('#vg-w-param-snapshot-seqnum-dog-b');
+      var bV1 = root.querySelector('#vg-w-param-snapshot-seqnum-b-v1');
+      var bV2 = root.querySelector('#vg-w-param-snapshot-seqnum-b-v2');
+      var bV3 = root.querySelector('#vg-w-param-snapshot-seqnum-b-v3');
+
+      var X0 = 80, STEP = 75;
+      function xOf(n) { return X0 + (n - 1) * STEP; }
+
+      var dogSeq = { a: 2, b: 5 };
+      var bSeq = { v1: 1, v2: 4, v3: 7 };
+
+      function styleCircle(el, seq, snap, winnerSeq) {
+        el.setAttribute('cx', xOf(seq));
+        if (seq > snap) {
+          el.setAttribute('r', '6');
+          el.setAttribute('fill', 'none');
+          el.setAttribute('stroke', 'var(--muted-2)');
+          el.setAttribute('stroke-dasharray', '3 2');
+          el.setAttribute('opacity', '0.55');
+        } else if (seq === winnerSeq) {
+          el.setAttribute('r', '7');
+          el.setAttribute('fill', 'var(--accent)');
+          el.setAttribute('stroke', 'var(--ink)');
+          el.setAttribute('stroke-dasharray', 'none');
+          el.setAttribute('opacity', '1');
+        } else {
+          el.setAttribute('r', '5');
+          el.setAttribute('fill', 'var(--sage)');
+          el.setAttribute('stroke', 'none');
+          el.setAttribute('stroke-dasharray', 'none');
+          el.setAttribute('opacity', '1');
+        }
+      }
+
+      function winnerOf(seqs, snap) {
+        var best = null;
+        for (var k in seqs) {
+          if (seqs[k] <= snap && (best === null || seqs[k] > best)) best = seqs[k];
+        }
+        return best;
+      }
+
+      function update() {
+        var snap = Number(input.value);
+        readout.textContent = String(snap);
+        cut.setAttribute('x1', xOf(snap)); cut.setAttribute('x2', xOf(snap));
+        cutLabel.setAttribute('x', xOf(snap));
+        cutLabel.textContent = '快照 = ' + snap;
+
+        var dogWinner = winnerOf(dogSeq, snap);
+        styleCircle(dogA, dogSeq.a, snap, dogWinner);
+        styleCircle(dogB, dogSeq.b, snap, dogWinner);
+
+        var bWinner = winnerOf(bSeq, snap);
+        styleCircle(bV1, bSeq.v1, snap, bWinner);
+        styleCircle(bV2, bSeq.v2, snap, bWinner);
+        styleCircle(bV3, bSeq.v3, snap, bWinner);
+
+        var dogMsg = dogWinner === null
+          ? 'dog 在這個快照下還沒有任何版本存在'
+          : 'dog 目前回傳 seqnum ' + dogWinner + ' 那一版' + (dogSeq.b > snap ? '（b／seqnum 5 被跳過）' : '');
+        var bMsg = bWinner === null
+          ? 'key B 在這個快照下還沒有任何版本存在'
+          : 'key B 回傳 seqnum ' + bWinner + ' 那一版' + (bSeq.v3 > snap ? '（seqnum 7 被跳過）' : '');
+        explain.textContent = '快照記到 seqnum ' + snap + '：' + dogMsg + '；' + bMsg + '。';
+      }
+
+      input.addEventListener('input', update);
+      update();
+    })();
+  </script>
+</figure>
+
+<h2>三個地方把「比較 seqnum」用出實際效果——skip list、WriteBatch、SuperVersion</h2>
+
+<p>把同一個比較動作放到三個不同的地方，就組成了 RocksDB 併發控制的骨架。第一個是剛才講過的 skip list 排序：同 key 內 seqnum 遞減排列，讓最新版本永遠排最前面，read 只要沿著 skip list 往下找，遇到第一個 seqnum ≤ 快照上限的版本就是答案。用虛擬碼寫出來大概是這樣：</p>
+
+<pre data-kind="pseudocode"><code><em>// memtable skip list 排序規則：先比 user_key（遞增），
+// 同一個 user_key 內再比 sequence_number（遞減）</em>
+(dog, seq=5, put, b)      <em>// 排前面 —— 較新</em>
+(dog, seq=2, put, a)      <em>// 排後面 —— 較舊</em>
+
+<em>// 一個快照記到 seqnum 4 的 read，沿著這條 skip list 往下找 dog，
+// 遇到的第一筆 seq=5 大於 4，跳過；下一筆 seq=2 符合，就是答案</em></code></pre>
+
+<p>這段虛擬碼想強調的是一個容易被忽略的細節：排序規則本身不做任何「決定要不要顯示」的判斷，它只負責把版本排好隊；真正決定顯示與否的，是 read 走訪這條隊伍時各自帶著的那個 seqnum 上限。把排序跟過濾拆成兩個獨立的步驟，skip list 不需要知道任何一個 read 現在在哪個時間點，插入新版本也不需要通知任何正在進行中的 read——這正是為什麼寫入跟讀取可以完全不互相阻塞。</p>
+
+<p>第二個是 WriteBatch 的原子性。一個 batch 裡有多筆寫入時，RocksDB 不是一筆一筆各自配號、各自公開，而是整批一次配好一段連續的 seqnum，全部寫進 memtable 之後才一次性發布：「When the batch is applied to the database (the db.write call), sequence numbers for all keys are allocated atomically by incrementing the sequence number by 3 (the number of keys in the batch) and then publishing that number only after all three keys are inserted into the memtable.」關鍵在發布這一步——已發布的 sequence number 是任何 read 用來判斷可見性的唯一依據，只要這個數字還沒往前推，不管 memtable 裡實際上是不是已經寫了半批，read 都看不到。等三筆全部就位，數字一次跳過去，三筆同時對所有 read 可見。原子性不是靠鎖住 read，是靠「可見性只認發布後的那個數字」這個規則本身。</p>
+
+<p>下面這個 widget 把這個過程拆成兩個狀態，你可以按按鈕看它們怎麼切換。</p>
+
+<figure class="vg-w-vt-writebatch" data-mobile="static" data-svg-scroll="720" data-state="pending">
+  <style>
+    .vg-w-vt-writebatch { display: grid; gap: var(--s-2); }
+    .vg-w-vt-writebatch button { padding: 10px 16px; min-height: 44px; font-family: var(--sans); font-size: var(--fs-sm); color: var(--ink); background: var(--bg-soft); border: 1px solid var(--line); border-radius: 6px; cursor: pointer; }
+    .vg-w-vt-writebatch button:hover { border-color: var(--accent); color: var(--accent-text); }
+    .vg-w-vt-writebatch svg { width: 100%; height: auto; }
+    .vg-w-vt-writebatch .slot { transition: opacity 200ms; }
+    .vg-w-vt-writebatch[data-state="pending"] .slot-rect { opacity: 0.45; stroke-dasharray: 4 3; }
+    .vg-w-vt-writebatch[data-state="pending"] .slot-seq { opacity: 0.45; }
+    .vg-w-vt-writebatch[data-state="committed"] .slot-rect { opacity: 1; stroke-dasharray: none; }
+    .vg-w-vt-writebatch[data-state="committed"] .slot-seq { opacity: 1; }
+    .vg-w-vt-writebatch figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    @supports (view-transition-name: none) { ::view-transition-old(vgw-writebatch-state), ::view-transition-new(vgw-writebatch-state) { animation-duration: 260ms; } }
+    .vg-w-vt-writebatch .state-box { view-transition-name: vgw-writebatch-state; }
+  </style>
+
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M9 18v-6a9 9 0 0 1 9-9v0a9 9 0 0 1 9 9v6"/><path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3zM3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"/>
+    </svg>
+    <span>按按鈕看三筆寫入怎麼一起變成可見 · 一個 batch、三個 key</span>
+  </p>
+
+  <div data-vg-controls>
+    <button type="button" id="vg-w-vt-writebatch-btn">套用這批 WriteBatch（db.write）</button>
+  </div>
+
+  <div class="state-box">
+    <svg viewBox="0 0 720 220" preserveAspectRatio="xMidYMid meet" role="img" aria-label="WriteBatch 原子發布">
+      <g class="slot">
+        <rect class="slot-rect" x="40" y="30" width="180" height="70" rx="6" fill="none" stroke="var(--accent)" stroke-width="1.5" />
+        <text x="130" y="58" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--ink)">k1</text>
+        <text class="slot-seq" x="130" y="80" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--muted)" id="vg-w-vt-writebatch-k1-seq">seq=13</text>
+      </g>
+      <g class="slot">
+        <rect class="slot-rect" x="270" y="30" width="180" height="70" rx="6" fill="none" stroke="var(--accent)" stroke-width="1.5" />
+        <text x="360" y="58" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--ink)">k2</text>
+        <text class="slot-seq" x="360" y="80" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--muted)" id="vg-w-vt-writebatch-k2-seq">seq=14</text>
+      </g>
+      <g class="slot">
+        <rect class="slot-rect" x="500" y="30" width="180" height="70" rx="6" fill="none" stroke="var(--accent)" stroke-width="1.5" />
+        <text x="590" y="58" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--ink)">k3</text>
+        <text class="slot-seq" x="590" y="80" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--muted)" id="vg-w-vt-writebatch-k3-seq">seq=15</text>
+      </g>
+
+      <text x="40" y="140" font-family="Manrope, sans-serif" font-size="13" fill="var(--muted)">last_seq（已配好） = 15</text>
+      <text x="40" y="164" font-family="Manrope, sans-serif" font-size="13" fill="var(--ink)" id="vg-w-vt-writebatch-published">published_seq（read 看得到的上限） = 12</text>
+      <text x="40" y="196" font-family="EB Garamond, serif" font-size="13" font-style="italic" fill="var(--muted)" id="vg-w-vt-writebatch-status">狀態：三個 key 已寫進 memtable，但 published_seq 還沒推進 —— 任何 read 都還看不到它們</text>
+    </svg>
+  </div>
+
+  <figcaption>seq=13/14/15 與「incrementing by 3」的配號規則取自原文；published_seq 與 last_seq 是兩個不同的計數器，可見性只看 published_seq。</figcaption>
+
+  <script>
+    (function () {
+      if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+      var root = document.querySelector('.vg-w-vt-writebatch');
+      var btn = root.querySelector('#vg-w-vt-writebatch-btn');
+      var published = root.querySelector('#vg-w-vt-writebatch-published');
+      var status = root.querySelector('#vg-w-vt-writebatch-status');
+
+      function apply() {
+        var committed = root.dataset.state === 'committed';
+        root.dataset.state = committed ? 'pending' : 'committed';
+        if (root.dataset.state === 'committed') {
+          published.textContent = 'published_seq（read 看得到的上限） = 15';
+          status.textContent = '狀態：published_seq 一次跳到 15 —— k1、k2、k3 同時對所有 read 可見';
+          btn.textContent = '重設回 commit 之前';
+        } else {
+          published.textContent = 'published_seq（read 看得到的上限） = 12';
+          status.textContent = '狀態：三個 key 已寫進 memtable，但 published_seq 還沒推進 —— 任何 read 都還看不到它們';
+          btn.textContent = '套用這批 WriteBatch（db.write）';
+        }
+      }
+
+      btn.addEventListener('click', function () {
+        if (document.startViewTransition) {
+          document.startViewTransition(apply);
+        } else {
+          apply();
+        }
+      });
+    })();
+  </script>
+</figure>
+
+<p>第三個是 SuperVersion。RocksDB 把「一個 read 應該看到哪些 memtable 跟哪些 SST」打包成一個結構，程式碼大致是：</p>
+
+<pre data-kind="pseudocode"><code>struct SuperVersion {
+  active_memtable: ReferenceCounter&lt;Memtable&gt;,          <em>// memtable accepting writes</em>
+  immutable_memtables: Vec&lt;ReferenceCounter&lt;Memtable&gt;&gt;, <em>// memtables ready to be flushed or just flushed</em>
+  ssts: ReferenceCounter&lt;SstLevels&gt;,                    <em>// on-disk SSTs, each reference-counted individually</em>
+}</code></pre>
+
+<p>三個成分各自都用引用計數保護：一個正在接受寫入的 active memtable、一批正等著或剛 flush 完的 immutable memtables、一份磁碟上各自獨立計數的 SST 檔案。「When a read starts, it acquires a reference to the structure. The reference is released only after the read is done.」read 開始時對整個 SuperVersion 拿一份引用，結束才放，flush 或 compaction 想回收某個舊 memtable 或舊 SST，只要還有 read 在持有引用，就不能真的釋放底層記憶體。這跟前面提到的 snapshot 邏輯是同一件事的兩個層面：snapshot 靠 seqnum 攔住「不該被過濾掉的版本」，SuperVersion 的引用計數則攔住「不該被回收的整塊記憶體或檔案」——一個管邏輯上的可見性，一個管實體資源的生命週期，兩者合起來才讓 read 全程不用鎖任何東西。</p>
+
+<figure class="vg-w-3d-superversion" data-mobile="keep">
+  <style>
+    .vg-w-3d-superversion .stage { perspective: 1200px; height: 260px; }
+    .vg-w-3d-superversion .stack { transform-style: preserve-3d; transform: rotateX(-18deg) rotateY(-26deg); width: 260px; height: 200px; margin: 30px auto; position: relative; }
+    .vg-w-3d-superversion .layer { position: absolute; width: 260px; height: 44px; border: 1.5px solid var(--ink); background: var(--bg-soft); font-family: var(--sans); font-size: var(--fs-sm); display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; color: var(--ink); padding: 0 var(--s-1); }
+    .vg-w-3d-superversion .layer small { color: var(--muted); font-size: 0.78em; }
+    .vg-w-3d-superversion .l1 { transform: translateZ(0px); border-color: var(--accent); }
+    .vg-w-3d-superversion .l2 { transform: translateZ(-50px); }
+    .vg-w-3d-superversion .l3 { transform: translateZ(-100px); }
+    .vg-w-3d-superversion figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    @media (max-width: 480px) {
+      .vg-w-3d-superversion .stack { transform: none; margin: var(--s-2) auto; height: auto; position: static; display: grid; gap: var(--s-2); }
+      .vg-w-3d-superversion .layer { position: static; width: 100%; height: auto; padding: var(--s-2); }
+    }
+  </style>
+  <div class="stage">
+    <div class="stack">
+      <div class="layer l1">active_memtable<small>正在接受寫入</small></div>
+      <div class="layer l2">immutable_memtables[]<small>準備 flush 或剛 flush 完</small></div>
+      <div class="layer l3">ssts<small>磁碟上的 SST，個別各自計數</small></div>
+    </div>
+  </div>
+  <figcaption>三層各自獨立引用計數，合在一起叫 SuperVersion。read 開始時對整個結構拿一份引用，結束才釋放，任何一層都不會在有 read 持有引用時被回收。</figcaption>
+</figure>
+
+<h2>交易怎麼用同一套機制判斷衝突——悲觀鎖 key，樂觀鎖 commit 那一刻</h2>
+
+<p>把 sequence number 比較這件事往上疊一層，就是交易的衝突偵測。RocksDB 提供兩種交易：悲觀（pessimistic）跟樂觀（optimistic），差別在「什麼時候發現衝突」。兩種交易解決的是同一個問題——一群並發的操作，怎麼知道自己有沒有跟別人打架，差別只在於這件事什麼時候被發現：悲觀交易假設打架很常見，先把手伸出去擋；樂觀交易假設打架很少見，先讓大家各自做完，最後再核對一次。</p>
+
+<p>悲觀交易在寫入當下就鎖 key。鎖存在一個 per-DB 的 map 裡，把 key 對應到持有它的 transaction id：「If another transaction tries to update one of the locked keys concurrently, the conflicting transaction T2 blocks until T1 commits or rolls back.」拿到鎖之後，悲觀交易還要再檢查一次快照有效性：「After T1 acquires a lock on key a, it checks whether the key was updated after the snapshot was set」——確認的內容是「whether there is a version of the key in the database with a sequence number higher than the snapshot sequence number」。鎖負責擋住未來的衝突寫入，seqnum 比較負責檢查過去有沒有已經發生的衝突——兩件事分開做，但底層檢查的動作是同一種比較。</p>
+
+<p>樂觀交易的做法更輕量。它不追蹤每個 key 各自的鎖，而是把 key 雜湊進一組預先配置好的 mutex：「the lock manager hashes keys into 1M pre-allocated mutexes (yes, 1M is a lot - it trades off memory for reduced contention)」——一百萬個 mutex，用記憶體換低碰撞率。這個數字反映了一個具體的取捨：mutex 越多，不同 key 雜湊撞在同一個 mutex 上的機率越低，但每個 mutex 都要佔一份常駐記憶體，等於為「幾乎不會全部用滿」的容量先付一筆固定成本。換來的是不用維護一個會隨交易數量長大的鎖表——鎖表本身在高並發下也會變成熱點，把它換成固定大小、雜湊分散的 mutex 陣列，等於把熱點打散了。真正的衝突偵測延後到 commit 那一刻才做：交易記下每個讀過或寫過的 key 當時的 seqnum，commit 時重新比對一次，「If it contains a key with a sequence number larger than the recorded one, it means another transaction already committed the same key」——結果就是「the commit fails」。記錄的 seqnum 被超過，代表有別人搶先了，commit 直接失敗，交易要重來。</p>
+
+<p>樂觀交易有個具體的代價：它的驗證只查 memtable，不像悲觀交易會查整棵樹。「Optimistic transactions limit validation to memtables (pessimistic transactions check the whole tree). If the memtable is flushed mid-transaction, there is nothing left to validate against, so the commit fails.」如果交易進行到一半，memtable 剛好被 flush 到 SST 去，用來比對的那個 seqnum 記錄就消失了，commit 只能直接判失敗——不是真的偵測到衝突，是驗證對象不見了。兩種交易在負載形狀不同的情境下互有勝負：原文的測試裡，key 爭用激烈時「the throughput of optimistic transactions stays flat, while pessimistic transactions queue on the shared key's lock」，樂觀交易吞吐量維持平穩，悲觀交易則因為排隊等同一把鎖而下滑。</p>
+
+<figure class="vg-w-table-txn-compare" data-mobile="keep">
+  <style>
+    .vg-w-table-txn-compare { overflow-x: auto; }
+    .vg-w-table-txn-compare table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+    .vg-w-table-txn-compare thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); }
+    .vg-w-table-txn-compare tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+    .vg-w-table-txn-compare figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-2); }
+  </style>
+  <table>
+    <thead>
+      <tr><th>面向</th><th>悲觀交易</th><th>樂觀交易</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>鎖定時機</td><td>寫入當下就鎖 key，衝突方直接阻塞</td><td>不鎖，寫入先留在 buffer 裡</td></tr>
+      <tr><td>底層機制</td><td>per-DB map：key → transaction id</td><td>key 雜湊進 100 萬個預配 mutex</td></tr>
+      <tr><td>衝突偵測時機</td><td>鎖到 key 之後，比對 snapshot seqnum</td><td>commit 那一刻，比對 recorded seqnum</td></tr>
+      <tr><td>驗證範圍</td><td>查整棵樹</td><td>只查 memtable，中途被 flush 就直接失敗</td></tr>
+      <tr><td>高爭用 key 下的吞吐</td><td>排隊等共享鎖，會下滑</td><td>維持平穩</td></tr>
+    </tbody>
+  </table>
+  <figcaption>五個面向的差異全部取自原文；吞吐量的描述是原文對測試結果的定性說法，沒有附上具體數字。</figcaption>
+</figure>
+
+<h2>四種隔離等級的邊界，跟一個很少人用得到的 range lock</h2>
+
+<p>把 seqnum 比較機制套進標準的隔離等級詞彙，邊界在哪裡就很清楚。四個等級排下來，真正在變的不是「有沒有用 seqnum」——所有等級用的都是同一套比較機制，變的是比較的時機跟比較的範圍有多寬：Read Committed 每次 get 都重新記一次當下已發布的 seqnum；Snapshot Isolation 整個交易共用同一個；Serializable 想逼近的則是「連還沒發生的寫入都要考慮進去」，而這正是單純比較 seqnum 做不到的地方——phantom read 之所以是個洞，是因為它牽涉到一個當下根本不存在、還沒有 seqnum 可比的 key。</p>
+
+<figure class="vg-w-tabs-isolation" data-mobile="static" data-svg-scroll="720">
+  <style>
+    .vg-w-tabs-isolation { display: grid; gap: var(--s-2); }
+    .vg-w-tabs-isolation input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+    .vg-w-tabs-isolation .tabs { display: flex; flex-wrap: wrap; gap: var(--s-2); border-bottom: 1px solid var(--line); }
+    .vg-w-tabs-isolation .tab { font-family: var(--sans); font-size: var(--fs-sm); padding: var(--s-1) var(--s-2); cursor: pointer; color: var(--muted); min-height: 44px; display: flex; align-items: center; }
+    .vg-w-tabs-isolation .panel { display: none; padding: var(--s-2) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+    .vg-w-tabs-isolation:has(#vg-w-tabs-isolation-t1:checked) .panel-1 { display: block; }
+    .vg-w-tabs-isolation:has(#vg-w-tabs-isolation-t1:checked) [for="vg-w-tabs-isolation-t1"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    .vg-w-tabs-isolation:has(#vg-w-tabs-isolation-t2:checked) .panel-2 { display: block; }
+    .vg-w-tabs-isolation:has(#vg-w-tabs-isolation-t2:checked) [for="vg-w-tabs-isolation-t2"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    .vg-w-tabs-isolation:has(#vg-w-tabs-isolation-t3:checked) .panel-3 { display: block; }
+    .vg-w-tabs-isolation:has(#vg-w-tabs-isolation-t3:checked) [for="vg-w-tabs-isolation-t3"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    .vg-w-tabs-isolation:has(#vg-w-tabs-isolation-t4:checked) .panel-4 { display: block; }
+    .vg-w-tabs-isolation:has(#vg-w-tabs-isolation-t4:checked) [for="vg-w-tabs-isolation-t4"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+  </style>
+
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M3 3h18v4H3z"/><path d="M3 3v18h18"/>
+    </svg>
+    <span>切換看四種隔離等級各自的邊界 · 4 個分頁</span>
+  </p>
+
+  <input type="radio" id="vg-w-tabs-isolation-t1" name="vg-w-tabs-isolation-sel" checked />
+  <input type="radio" id="vg-w-tabs-isolation-t2" name="vg-w-tabs-isolation-sel" />
+  <input type="radio" id="vg-w-tabs-isolation-t3" name="vg-w-tabs-isolation-sel" />
+  <input type="radio" id="vg-w-tabs-isolation-t4" name="vg-w-tabs-isolation-sel" />
+  <div class="tabs" data-vg-controls>
+    <label class="tab" for="vg-w-tabs-isolation-t1">Read Uncommitted</label>
+    <label class="tab" for="vg-w-tabs-isolation-t2">Read Committed</label>
+    <label class="tab" for="vg-w-tabs-isolation-t3">Snapshot Isolation</label>
+    <label class="tab" for="vg-w-tabs-isolation-t4">Serializable</label>
+  </div>
+  <div class="panel panel-1">在 RocksDB 裡不存在。交易寫入的東西先待在一個 buffer，commit 時才原子套用到資料庫——「Impossible in RocksDB because transaction writes sit in a buffer that gets applied to the database atomically on commit.」別的交易連 buffer 裡的內容都碰不到，這個等級根本無從發生。</div>
+  <div class="panel panel-2">每次 get 都看當下最新已提交的資料，同一個交易內連續兩次 get 可能因為別人剛好 commit 而拿到不同的值——一致性最低，但也最新鮮。</div>
+  <div class="panel panel-3">整個交易期間讀到的是同一份快照，不會有 non-repeatable read。但「You avoid non-repeatable reads, but the write skew anomaly is possible.」write skew 這種兩個交易各自基於同一份快照做出「合起來看不合法」的決定，Snapshot Isolation 擋不住。</div>
+  <div class="panel panel-4">用 get_for_update() 搭配 snapshot isolation 去逼近，讀到的 key 會額外標記成待驗證。但這只是逼近，不是完全等價：「phantom reads anomaly is possible for transactions running range scans.」對單一 key 的讀寫這個逼近夠用，對範圍掃描就留了一個洞——掃描當下不存在、之後被別人插進範圍裡的 key，逼近不到。</div>
+</figure>
+
+<p>range scan 的 phantom read 有個專門的解法：range lock，鎖住的不是單一 key，是一整段 key range，插入這段範圍內的新 key 也會被擋下。但這個功能目前的處境有點尷尬：「It was contributed in 2020, but it's not documented anywhere on the RocksDB wiki and not exposed through the C or Java APIs, so the feature is usable only from C++.」2020 年就進了程式庫，六年後 wiki 上還是找不到說明，C 跟 Java binding 也沒補上，能摸到它的只有直接用 C++ API 的使用者。對大多數只用 get／put 的應用來說，這個限制不痛不癢——用不到 range lock，也就碰不到它的文件洞。但只要應用邏輯裡有「先掃一段 key range 再決定要不要插入」這種模式，像唯一性檢查或排隊之類的場景，Serializable 那個逼近就撐不住，這時候唯一能補上的機制卻卡在只有 C++ binding 摸得到的位置。</p>
+
+<figure class="vg-w-reveal-range-lock" data-mobile="keep" data-svg-scroll="640">
+  <style>
+    .vg-w-reveal-range-lock { display: grid; gap: var(--s-3); margin: var(--s-2) 0; }
+    .vg-w-reveal-range-lock svg { width: 100%; height: auto; }
+    .vg-w-reveal-range-lock .track { display: grid; gap: var(--s-2); }
+    .vg-w-reveal-range-lock .step { padding: var(--s-2); border-left: 3px solid var(--muted-2); font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink-soft); opacity: 0.55; transition: opacity 200ms, border-color 200ms; }
+    .vg-w-reveal-range-lock .step.active { opacity: 1; border-color: var(--accent); color: var(--ink); }
+    .vg-w-reveal-range-lock figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+  </style>
+
+  <svg viewBox="0 0 640 160" preserveAspectRatio="xMidYMid meet" role="img" aria-label="range lock 擋住 phantom insert">
+    <text x="30" y="26" font-family="Manrope, sans-serif" font-size="12" fill="var(--muted)">key range</text>
+    <line x1="30" y1="60" x2="610" y2="60" stroke="var(--muted-2)" stroke-width="1.5" />
+    <rect x="90" y="46" width="300" height="28" fill="none" stroke="var(--accent)" stroke-width="2" rx="4" />
+    <text x="240" y="43" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--accent-text)">[a, m) 被 T1 鎖住</text>
+    <circle cx="240" cy="60" r="4" fill="var(--ink)" />
+    <text x="240" y="100" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--ink)">insert f</text>
+    <line x1="240" y1="92" x2="240" y2="76" stroke="var(--ink)" stroke-width="1.5" marker-end="url(#vg-w-reveal-range-lock-arrow)" />
+    <text x="240" y="118" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" font-style="italic" fill="var(--muted)">T2 想插入 f，落在鎖住的範圍內</text>
+    <defs>
+      <marker id="vg-w-reveal-range-lock-arrow" markerWidth="8" markerHeight="8" refX="4" refY="4" orient="auto">
+        <path d="M0,0 L8,4 L0,8 Z" fill="var(--ink)" />
+      </marker>
+    </defs>
+  </svg>
+
+  <div class="track">
+    <div class="step" data-step="1">T1 對 key range [a, m) 開一個 range lock，不是鎖單一 key。</div>
+    <div class="step" data-step="2">T2 想在這段範圍裡插入一個新 key（比方說 f），這個 key 目前不存在，單一 key 的鎖完全擋不住它。</div>
+    <div class="step" data-step="3">range lock 直接擋下這次 insert，直到 T1 commit 或 rollback——這正是 range scan 情境下防住 phantom read 的方式，也是 get_for_update() 逼近不了的那塊。</div>
+  </div>
+
+  <figcaption>range lock 的存在與其 2020 年被貢獻、目前只有 C++ 能用這兩件事取自原文；[a, m)、key f 是示範用的具體值，不是原文的例子。</figcaption>
+
+  <script>
+    (function () {
+      if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+      var root = document.querySelector('.vg-w-reveal-range-lock');
+      var steps = root.querySelectorAll('.step');
+      var io = new IntersectionObserver(function (entries) {
+        entries.forEach(function (e) {
+          if (e.isIntersecting) e.target.classList.add('active');
+        });
+      }, { rootMargin: '-30% 0px -30% 0px', threshold: 0 });
+      steps.forEach(function (s) { io.observe(s); });
+    })();
+  </script>
+</figure>
+
+<p>真正在生產環境直接用 RocksDB 交易的專案不多。原文作者自己的觀察是：「MyRocks... and ArangoDB are the only large projects I'm aware of that rely on RocksDB transactions.」——這是他自己知道的範圍，不是窮舉。分散式資料庫大多不用：「RocksDB-native transactions are node-local... and with a distributed database you have to coordinate transactions across multiple nodes.」TiDB、YugabyteDB、CockroachDB 都自己蓋了一層交易協調，原因很直接——RocksDB 原生交易只管單一節點內的衝突，分散式系統要跨節點協調，這件事 RocksDB 本身管不到，得在它之上另起一層。這也說明「交易」在 RocksDB 裡的定位比較像是給單機應用用的便利功能，不是給分散式系統當地基：它解決的是同一份 seqnum 序列內部的衝突，一旦協調對象跨過單一行程、單一磁碟，seqnum 比較這個原語本身就不夠用了，分散式系統需要的是跨節點的時鐘或共識協議，那是完全不同的另一層機制。</p>
+
+<p class="vg-deep-closer"><strong>Take-away</strong>：RocksDB 沒有為 MVCC、快照、交易分別設計三套機制——它只有一個會遞增的 sequence number，snapshot 是記下它、WriteBatch 的原子性是延遲發布它、悲觀交易是鎖了 key 之後比它、樂觀交易是 commit 時重新比它。學會這一個數字怎麼被比較，上面所有名詞都只是它的應用場景。</p>
+
+</div>
