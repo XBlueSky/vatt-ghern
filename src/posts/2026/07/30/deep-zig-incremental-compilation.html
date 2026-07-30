@@ -1,0 +1,569 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">Zig 的增量重編譯落在 37 到 70 毫秒之間，但同一次追蹤裡真正做語意分析與 codegen 只花了 1.6 毫秒——大頭反而是 flush 階段那趟把整張參照圖走完的 30 毫秒。</p>
+  <h1 class="vg-post-title">Zig 增量編譯的內部機制</h1>
+</header>
+
+<div class="vg-post-body">
+
+<p><span class="vg-dropcap">Z</span>ig 的編譯器作者 mlugg 在部落格拆解了增量編譯怎麼把「改一行、重編一次」的成本從秒級壓到毫秒級，關鍵不是把某一步加速，而是把整條管線切成可以獨立追蹤、獨立失效的小單位，再把「確認什麼還活著」這件事跟「重新分析什麼」分開處理。以下五節照著這個順序拆：管線本身怎麼分五段、語意分析怎麼切出四種可以獨立失效的單位、依賴集合跟原始碼雜湊怎麼決定誰要重算、ZIR 快取與 link 階段的位元組級 patch 各自靠什麼機制省成本、以及為什麼即使前面全部做對，flush 這一步的花費還是甩不掉。</p>
+
+<h2>管線：從原始碼到機器碼之間的五段落差</h2>
+
+<p>Zig compiler 的起手式很直白：「Read in a source file from disk. Parse that file into an AST. Convert that AST into a format named 'ZIR'.」ZIR 是未型別化、SSA 形式的中介表示，不做型別檢查也不做 comptime 求值，純粹是原始碼的結構化版本。真正做語意工作的是下一段——語意分析直接解讀 ZIR，做型別檢查、跑 comptime，並且針對執行期函式的本體「building another intermediate representation (Analyzed Intermediate Representation, or AIR for short)」。codegen 再把 AIR 轉成「MIR (Machine Intermediate Representation)」，最後由 link 階段把 MIR 寫進輸出檔案的機器碼。五段落差各自解決自己那段的問題：AST 只管語法合不合法，ZIR 只管結構有沒有轉出來，AIR 只管型別跟 comptime 有沒有算完，MIR 只管指令選出來了沒有，link 只管位元組有沒有正確落地。下面這張圖把五個階段攤開，點任一段可以看到它的責任邊界，以及它刻意「不知道」的事。</p>
+
+<p>這也解釋了為什麼把 AST 轉成 ZIR 這一步要單獨算一段：剖析器跟 ZIR 產生器都只看單一檔案，不需要知道專案裡其他檔案發生了什麼事，天然就是各檔案互不干擾的一步。等到語意分析開始解讀 ZIR，才第一次需要跨檔案的資訊——一個宣告的型別可能定義在另一個檔案，comptime 求值也可能呼叫到其他模組的函式。跨檔案的複雜度被刻意留到語意分析這一段才處理，前面兩段（AST、ZIR）保持單純，也更容易被個別快取或重用。</p>
+
+<figure class="vg-w-annotated-pipeline" data-mobile="static" data-svg-scroll="880">
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="m9 18 6-6-6-6"/>
+    </svg>
+    <span>點任一段看責任邊界 · 5 個階段</span>
+  </p>
+  <style>
+    .vg-w-annotated-pipeline { display: grid; grid-template-columns: 1fr; gap: var(--s-3); align-items: start; }
+    .vg-w-annotated-pipeline svg { width: 100%; height: auto; max-width: 880px; }
+    .vg-w-annotated-pipeline input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+    .vg-w-annotated-pipeline .stage { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; transition: fill 200ms, stroke 200ms; }
+    .vg-w-annotated-pipeline .stage:hover { stroke: var(--accent); }
+    .vg-w-annotated-pipeline .stage:focus { outline: none; }
+    .vg-w-annotated-pipeline .stage:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .vg-w-annotated-pipeline .stage-text { pointer-events: none; font-family: EB Garamond, serif; }
+    .vg-w-annotated-pipeline .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+    .vg-w-annotated-pipeline .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+    .vg-w-annotated-pipeline .detail p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+    .vg-w-annotated-pipeline .hint { font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin: 0 0 var(--s-1) 0; }
+    .vg-w-annotated-pipeline:has(#vg-w-annotated-pipeline-r1:checked) .stage-1 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+    .vg-w-annotated-pipeline:has(#vg-w-annotated-pipeline-r2:checked) .stage-2 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+    .vg-w-annotated-pipeline:has(#vg-w-annotated-pipeline-r3:checked) .stage-3 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+    .vg-w-annotated-pipeline:has(#vg-w-annotated-pipeline-r4:checked) .stage-4 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+    .vg-w-annotated-pipeline:has(#vg-w-annotated-pipeline-r5:checked) .stage-5 { fill: var(--sage-deep); fill-opacity: 0.28; stroke: var(--sage-deep); }
+    .vg-w-annotated-pipeline:has(#vg-w-annotated-pipeline-r1:checked) .detail-1 { display: block; }
+    .vg-w-annotated-pipeline:has(#vg-w-annotated-pipeline-r2:checked) .detail-2 { display: block; }
+    .vg-w-annotated-pipeline:has(#vg-w-annotated-pipeline-r3:checked) .detail-3 { display: block; }
+    .vg-w-annotated-pipeline:has(#vg-w-annotated-pipeline-r4:checked) .detail-4 { display: block; }
+    .vg-w-annotated-pipeline:has(#vg-w-annotated-pipeline-r5:checked) .detail-5 { display: block; }
+  </style>
+
+  <div class="controls" data-vg-controls style="display:contents">
+    <input type="radio" id="vg-w-annotated-pipeline-r1" name="vg-w-annotated-pipeline-sel" checked />
+    <input type="radio" id="vg-w-annotated-pipeline-r2" name="vg-w-annotated-pipeline-sel" />
+    <input type="radio" id="vg-w-annotated-pipeline-r3" name="vg-w-annotated-pipeline-sel" />
+    <input type="radio" id="vg-w-annotated-pipeline-r4" name="vg-w-annotated-pipeline-sel" />
+    <input type="radio" id="vg-w-annotated-pipeline-r5" name="vg-w-annotated-pipeline-sel" />
+  </div>
+
+  <svg viewBox="0 0 880 300" role="img" aria-label="Zig 編譯管線：AST、ZIR、AIR、MIR、link 五段，點任一段查看責任邊界">
+    <text x="440" y="26" text-anchor="middle" fill="var(--muted)" font-family="IM Fell English, serif" font-style="italic" font-size="13">source → AST → ZIR → AIR → MIR → 輸出檔案</text>
+
+    <rect class="stage stage-1" data-target="vg-w-annotated-pipeline-r1" role="button" tabindex="0" aria-label="選取 AST" x="30" y="110" width="140" height="72" />
+    <text class="stage-text" x="100" y="150" text-anchor="middle" font-size="17" fill="var(--ink)">AST</text>
+    <text class="stage-text" x="100" y="168" text-anchor="middle" font-size="11" fill="var(--muted)">語法樹</text>
+
+    <line x1="170" y1="146" x2="200" y2="146" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-annotated-pipeline-arrow)" />
+
+    <rect class="stage stage-2" data-target="vg-w-annotated-pipeline-r2" role="button" tabindex="0" aria-label="選取 ZIR" x="200" y="110" width="140" height="72" />
+    <text class="stage-text" x="270" y="150" text-anchor="middle" font-size="17" fill="var(--ink)">ZIR</text>
+    <text class="stage-text" x="270" y="168" text-anchor="middle" font-size="11" fill="var(--muted)">未型別化 SSA</text>
+
+    <line x1="340" y1="146" x2="370" y2="146" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-annotated-pipeline-arrow)" />
+
+    <rect class="stage stage-3" data-target="vg-w-annotated-pipeline-r3" role="button" tabindex="0" aria-label="選取 AIR" x="370" y="110" width="140" height="72" />
+    <text class="stage-text" x="440" y="150" text-anchor="middle" font-size="17" fill="var(--ink)">AIR</text>
+    <text class="stage-text" x="440" y="168" text-anchor="middle" font-size="11" fill="var(--muted)">語意分析後</text>
+
+    <line x1="510" y1="146" x2="540" y2="146" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-annotated-pipeline-arrow)" />
+
+    <rect class="stage stage-4" data-target="vg-w-annotated-pipeline-r4" role="button" tabindex="0" aria-label="選取 MIR" x="540" y="110" width="140" height="72" />
+    <text class="stage-text" x="610" y="150" text-anchor="middle" font-size="17" fill="var(--ink)">MIR</text>
+    <text class="stage-text" x="610" y="168" text-anchor="middle" font-size="11" fill="var(--muted)">codegen 後</text>
+
+    <line x1="680" y1="146" x2="710" y2="146" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-annotated-pipeline-arrow)" />
+
+    <rect class="stage stage-5" data-target="vg-w-annotated-pipeline-r5" role="button" tabindex="0" aria-label="選取 link" x="710" y="110" width="140" height="72" />
+    <text class="stage-text" x="780" y="150" text-anchor="middle" font-size="17" fill="var(--ink)">link</text>
+    <text class="stage-text" x="780" y="168" text-anchor="middle" font-size="11" fill="var(--muted)">MappedFile + flush</text>
+
+    <text x="440" y="222" text-anchor="middle" fill="var(--muted)" font-family="IM Fell English, serif" font-style="italic" font-size="12">語意分析在 ZIR 上跑，四種分析單元的失效判定就發生在這一段</text>
+    <defs>
+      <marker id="vg-w-annotated-pipeline-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+      </marker>
+    </defs>
+  </svg>
+
+  <div>
+    <p class="hint">click a stage above</p>
+    <div class="detail detail-1">
+      <h3>AST · 責任邊界</h3>
+      <p>把原始碼剖析成語法樹，只驗證 token 序列合不合乎 Zig 的文法。</p>
+      <p><strong>不知道的事</strong>：型別、語意、任何跨宣告的依賴關係。</p>
+    </div>
+    <div class="detail detail-2">
+      <h3>ZIR · 責任邊界</h3>
+      <p>未型別化的 SSA 形式，逐檔案獨立產生，可以直接以一次 writev/readv 寫入或讀回磁碟快取，並帶著原始碼「有意義」區域的內容雜湊。</p>
+      <p><strong>不知道的事</strong>：型別是否正確、comptime 的結果、哪些宣告最終真的會被使用到。</p>
+    </div>
+    <div class="detail detail-3">
+      <h3>AIR · 責任邊界</h3>
+      <p>語意分析解讀 ZIR、做型別檢查與 comptime 求值後，針對執行期函式本體產出的中介表示；同時就是在這一段，四種分析單元各自的依賴集合被建立起來。</p>
+      <p><strong>不知道的事</strong>：最終要跑在哪種 CPU 上、輸出檔案裡的位元組要怎麼擺。</p>
+    </div>
+    <div class="detail detail-4">
+      <h3>MIR · 責任邊界</h3>
+      <p>codegen 把 AIR 轉成 MIR，這一步決定實際要用哪些指令。</p>
+      <p><strong>不知道的事</strong>：輸出檔案裡的絕對位址、其他函式的重定位怎麼解。</p>
+    </div>
+    <div class="detail detail-5">
+      <h3>link · 責任邊界</h3>
+      <p>把 MIR 寫進輸出檔案的機器碼，透過 MappedFile 處理位元組級的原地修補與重定位，flush 階段還要重新走一遍 reference-graph 確認可達性。</p>
+      <p><strong>不知道的事</strong>：語意分析階段做了什麼決定——它只認得最終要落進檔案的位元組。</p>
+    </div>
+  </div>
+
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-annotated-pipeline');
+      if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+      root.querySelectorAll('.stage').forEach((rect) => {
+        rect.addEventListener('click', () => {
+          const targetId = rect.getAttribute('data-target');
+          const radio = root.querySelector('#' + targetId);
+          if (radio) radio.checked = true;
+        });
+        rect.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            rect.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+          }
+        });
+      });
+    })();
+  </script>
+</figure>
+
+<p>「容器層級」這個詞在下一節會反覆出現，指的是寫在 struct、union、enum 或檔案頂層的宣告——跟寫在函式內部的區域變數是不同層級。這個區分很重要：只有容器層級的型別、值、佈局才會被拆成獨立的分析單元跟依賴集合；函式內部的區域計算，是被函式本體這個單元整個包起來的，不會再往下細分。</p>
+
+<h2>四種分析單元：把重新編譯這件事切成顆粒</h2>
+
+<p>語意分析不是把整個檔案當一個黑盒子重跑，而是拆成四種各自獨立追蹤的「分析單元」。mlugg 列出的邊界是：「struct 或 union 型別的 layout（大小、對齊等）、容器層級宣告的型別、容器層級 const 宣告的值、執行期函式的本體」。這四種單位彼此獨立——改一個函式本體不代表要重算它所在 struct 的 layout，改一個 struct 的 layout 也不代表每個引用它的函式本體都要重跑，除非那個函式真的依賴到變動的部分。這個切法把「整個檔案重編」的粒度打散成「哪些具體的東西真的變了」，也是接下來所有失效邏輯要操作的最小單位。下表把四種單元的追蹤內容、依賴邊的方向、跟觸發失效的條件並排列出來——特別是「依賴方向」這一欄，函式本體是唯一一種只進不出的單元，這一點下一節會展開。</p>
+
+<p>把分析單位切成四種而不是一種，是因為它們的失效條件本來就不一樣——佈局只在乎大小跟對齊有沒有變，型別只在乎宣告的型別本身，值只在乎 const 算出來的結果，函式本體只在乎它會產生出什麼指令。如果把這四件事包在同一個單位裡，任何一種變化都會連帶讓其他三種一起被標記為可疑，即使它們根本沒受影響。拆開之後，每種單位只回答一個窄問題，依賴集合也就能記得更精確。</p>
+
+<figure class="vg-w-table-analysis-units" data-mobile="keep">
+  <style>
+    .vg-w-table-analysis-units { overflow-x: auto; }
+    .vg-w-table-analysis-units table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+    .vg-w-table-analysis-units thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); }
+    .vg-w-table-analysis-units tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+    .vg-w-table-analysis-units td.dir { font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); color: var(--accent-text); white-space: nowrap; }
+    .vg-w-table-analysis-units tr.special td { background: color-mix(in srgb, var(--accent) 8%, transparent); }
+  </style>
+  <table>
+    <thead>
+      <tr>
+        <th>分析單元</th>
+        <th>追蹤內容</th>
+        <th>依賴方向</th>
+        <th>失效觸發</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>struct / union 佈局</td>
+        <td>型別的大小、對齊</td>
+        <td class="dir">有進有出</td>
+        <td>依賴的型別或原始碼雜湊改變</td>
+      </tr>
+      <tr>
+        <td>宣告型別</td>
+        <td>容器層級宣告的型別</td>
+        <td class="dir">有進有出</td>
+        <td>依賴的型別／值或原始碼雜湊改變</td>
+      </tr>
+      <tr>
+        <td>宣告 const 值</td>
+        <td>容器層級 const 宣告的值</td>
+        <td class="dir">有進有出</td>
+        <td>依賴的值或原始碼雜湊改變</td>
+      </tr>
+      <tr class="special">
+        <td>函式本體</td>
+        <td>執行期函式的程式碼</td>
+        <td class="dir">只有出邊</td>
+        <td>依賴的型別／值或原始碼雜湊改變</td>
+      </tr>
+    </tbody>
+  </table>
+</figure>
+
+<p>舉例說明這四種單元怎麼互相獨立：假設一個 struct 裡有一個 const 宣告的查找表，跟三個使用它的函式。改動查找表的值，只會讓「這個 const 宣告的值」這個分析單元失效，連帶重算三個函式本體——因為它們都依賴這個值。但如果只是替其中一個函式加一行 log，只有那個函式本體的分析單元失效，查找表的值、struct 的佈局、其他兩個函式完全不受影響。傳統「整個檔案重編」的做法分不出這個差異，因為它的最小單位是檔案，不是宣告。</p>
+
+<h2>依賴集合與原始碼雜湊：誰知道自己該重算</h2>
+
+<p>語意分析每處理一個單元，就順便記錄它依賴了誰——這些依賴分成兩種：依賴另一個分析單元（例如某個函式本體依賴另一個宣告的型別），或是依賴原始碼裡一段特定區域的內容雜湊。ZIR 本身就保留了這些雜湊：「ZIR contains hashes for specific 'interesting' regions of source code (e.g. the entire source code for each container-level declaration).」下次重新剖析同一份檔案，只要某段區域的雜湊對不上，跟它綁定的分析單元就直接判定失效，失效再沿著依賴集合往外傳播到依賴它的其他單元。這跟「檔案層級」的增量判斷完全不同——一個檔案裡十個宣告，改動落在第三個，只有依賴第三個的那條鏈需要重算，另外九個原封不動。</p>
+
+<p>值得停下來看的是函式本體這一種單元的特殊之處：沒有任何東西可以依賴一個函式的本體。mlugg 講得直接：「Dependencies on the body of a runtime function are impossible」，他自己也標註這是簡化過的說法，但結論成立——函式本體在依賴圖裡只有出邊、沒有入邊。它可以依賴型別、依賴其他宣告的值，但反過來，不會有其他單元因為「這個函式的本體變了」而被拖著重算。這條規則直接把失效沿依賴圖繞回自己的風險擋掉：失效永遠是從「原始碼雜湊變了」出發，往外流向依賴它的單元，流到函式本體就是終點，不會再往回流，圖裡也就不存在循環失效鏈。下面這個 widget 用一張固定的小依賴圖模擬這個傳播過程——拖動滑桿改變失效沿依賴集合傳播的深度，看有多少下游單元被連鎖標記，以及函式本體節點為什麼永遠是傳播鏈的盡頭。</p>
+
+<figure class="vg-w-range-invalidation" data-mobile="static" data-svg-scroll="640">
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="m18 8 4 4-4 4"/><path d="M2 12h20"/>
+    </svg>
+    <span>拖滑桿看失效沿依賴圖傳播多深 · 7 個節點</span>
+  </p>
+  <style>
+    .vg-w-range-invalidation { display: grid; gap: var(--s-2); }
+    .vg-w-range-invalidation .controls { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+    .vg-w-range-invalidation .controls input { flex: 1; accent-color: var(--accent); height: 36px; touch-action: none; }
+    .vg-w-range-invalidation .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 14ch; text-align: right; }
+    .vg-w-range-invalidation svg { width: 100%; height: auto; }
+    .vg-w-range-invalidation .node { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; transition: fill 200ms, stroke 200ms; }
+    .vg-w-range-invalidation .node.hit { fill: var(--accent); fill-opacity: 0.28; stroke: var(--accent); }
+    .vg-w-range-invalidation .node.leaf { stroke-dasharray: 3 2; }
+    .vg-w-range-invalidation .edge { stroke: var(--muted-2); stroke-width: 1.2; }
+    .vg-w-range-invalidation .edge.hit { stroke: var(--accent); }
+    .vg-w-range-invalidation text { font-family: EB Garamond, serif; font-size: 12px; fill: var(--ink); }
+    .vg-w-range-invalidation .sub { font-size: 11px; fill: var(--muted); }
+  </style>
+  <div class="controls" data-vg-controls>
+    <label for="vg-w-range-invalidation-x">傳播深度 =</label>
+    <input id="vg-w-range-invalidation-x" type="range" min="0" max="3" step="1" value="0" />
+    <span class="readout" id="vg-w-range-invalidation-readout">0 深度 · 1 個單元失效</span>
+  </div>
+  <svg viewBox="0 0 640 260" role="img" aria-label="依賴圖傳播模擬：拖曳滑桿控制失效沿依賴集合傳播的深度">
+    <line class="edge" data-e="0-1" x1="90" y1="130" x2="230" y2="70" />
+    <line class="edge" data-e="0-2" x1="90" y1="130" x2="230" y2="190" />
+    <line class="edge" data-e="1-3" x1="290" y1="70" x2="410" y2="45" />
+    <line class="edge" data-e="1-4" x1="290" y1="70" x2="410" y2="105" />
+    <line class="edge" data-e="2-5" x1="290" y1="190" x2="410" y2="165" />
+    <line class="edge" data-e="4-6" x1="470" y1="105" x2="560" y2="105" />
+
+    <g data-n="0">
+      <rect class="node" x="30" y="106" width="120" height="48" rx="3" />
+      <text x="90" y="128" text-anchor="middle">宣告 A</text>
+      <text class="sub" x="90" y="142" text-anchor="middle">原始碼雜湊改變</text>
+    </g>
+    <g data-n="1">
+      <rect class="node" x="230" y="46" width="120" height="48" rx="3" />
+      <text x="290" y="68" text-anchor="middle">型別單元</text>
+      <text class="sub" x="290" y="82" text-anchor="middle">依賴 A</text>
+    </g>
+    <g data-n="2">
+      <rect class="node" x="230" y="166" width="120" height="48" rx="3" />
+      <text x="290" y="188" text-anchor="middle">const 值單元</text>
+      <text class="sub" x="290" y="202" text-anchor="middle">依賴 A</text>
+    </g>
+    <g data-n="3">
+      <rect class="node" x="410" y="21" width="120" height="48" rx="3" />
+      <text x="470" y="43" text-anchor="middle">佈局單元</text>
+      <text class="sub" x="470" y="57" text-anchor="middle">依賴型別單元</text>
+    </g>
+    <g data-n="4">
+      <rect class="node leaf" x="410" y="81" width="120" height="48" rx="3" />
+      <text x="470" y="103" text-anchor="middle">函式本體 F1</text>
+      <text class="sub" x="470" y="117" text-anchor="middle">依賴型別單元</text>
+    </g>
+    <g data-n="5">
+      <rect class="node leaf" x="410" y="141" width="120" height="48" rx="3" />
+      <text x="470" y="163" text-anchor="middle">函式本體 F2</text>
+      <text class="sub" x="470" y="177" text-anchor="middle">依賴 const 值單元</text>
+    </g>
+    <g data-n="6">
+      <rect class="node" x="560" y="81" width="60" height="48" rx="3" opacity="0.35" />
+      <text x="590" y="103" text-anchor="middle" font-size="11">（無此邊）</text>
+    </g>
+    <text x="320" y="248" text-anchor="middle" class="sub">函式本體只有出邊，不會有東西指向它</text>
+  </svg>
+
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-range-invalidation');
+      if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+      const input = root.querySelector('input');
+      const readout = root.querySelector('.readout');
+      const nodes = root.querySelectorAll('[data-n]');
+      const edges = root.querySelectorAll('[data-e]');
+      // adjacency by depth from node 0 (F1/F2 = depth 2, layout = depth 2 too via 1; node 6 unreachable, no edge 4-6 in the model)
+      const depthOf = { 0: 0, 1: 1, 2: 1, 3: 2, 4: 2, 5: 2 };
+      function update() {
+        const d = Number(input.value);
+        let count = 0;
+        nodes.forEach((g) => {
+          const n = Number(g.dataset.n);
+          const rect = g.querySelector('rect');
+          if (n === 6) { return; }
+          const reached = depthOf[n] !== undefined && depthOf[n] <= d;
+          rect.classList.toggle('hit', reached);
+          if (reached) count++;
+        });
+        edges.forEach((e) => {
+          const [a, b] = e.dataset.e.split('-').map(Number);
+          e.classList.toggle('hit', depthOf[b] !== undefined && depthOf[b] <= d && depthOf[a] <= d);
+        });
+        readout.textContent = d + ' 深度 · ' + count + ' 個單元失效';
+      }
+      input.addEventListener('input', update);
+      update();
+    })();
+  </script>
+</figure>
+
+<p>這裡的雜湊比對值得跟一個更粗糙的做法對照：如果編譯器只用「檔案的修改時間變了」判斷要不要重編，那麼一個檔案裡任何一處變動，包括加一個空白或改一個註解，都會讓整個檔案的所有宣告被視為可疑，逼得語意分析全部重跑一遍。ZIR 對「有意義」區域個別做內容雜湊，等於把「這個檔案是否被觸碰過」這種粗粒度的訊號，換成「這段具體的宣告內容有沒有真的變」這種細粒度訊號——空白、註解的變動不會讓雜湊改變，自然也就不會觸發任何失效。</p>
+
+<h2>ZIR 的 zero-copy 快取與 MappedFile 的指數成長 patch</h2>
+
+<p>ZIR 快取到磁碟這一步刻意設計成不做任何轉換：「ZIR can be trivially written to and read from disk with one writev/readv system call.」用 mlugg 自己的話說，中間「there is no 'serialization' step」。ZIR 在記憶體裡的佈局跟它寫到磁碟上的位元組佈局是同一個形狀，所以快取不需要一個把記憶體結構轉成檔案格式的中間步驟，讀寫各一次系統呼叫就完成——省下的不是 CPU 算力，是「序列化」這個步驟本身。下面這個 widget 把「記憶體裡的 ZIR」跟「磁碟上的 ZIR」畫成同一個位元組區塊圖形，切換兩種標籤時圖形本身完全不動，這正是「一次系統呼叫就夠」的原因。</p>
+
+<figure class="vg-w-morph-zir-serialize" data-mobile="static" data-svg-scroll="560">
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M3 12h18"/><path d="m15 6 6 6-6 6"/>
+    </svg>
+    <span>點按鈕切換記憶體／磁碟呈現 · 形狀不變</span>
+  </p>
+  <style>
+    .vg-w-morph-zir-serialize { display: grid; gap: var(--s-2); }
+    .vg-w-morph-zir-serialize svg { width: 100%; height: auto; }
+    .vg-w-morph-zir-serialize button { min-height: 44px; padding: 6px 16px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); cursor: pointer; font-family: var(--sans); font-size: var(--fs-sm); align-self: start; }
+    .vg-w-morph-zir-serialize button:hover { border-color: var(--accent); color: var(--accent-text); }
+    .vg-w-morph-zir-serialize .label { font-family: JetBrains Mono, monospace; font-size: 13px; fill: var(--accent-text); }
+    .vg-w-morph-zir-serialize .note { font-family: IM Fell English, serif; font-style: italic; font-size: 12px; fill: var(--muted); }
+  </style>
+  <svg viewBox="0 0 560 160" role="img" aria-label="ZIR 記憶體佈局與磁碟佈局是同一個形狀">
+    <text id="vg-w-morph-zir-serialize-label" class="label" x="20" y="26">記憶體中的 ZIR buffer</text>
+    <path id="vg-w-morph-zir-serialize-p" d="M 20 40 L 140 40 L 140 90 L 220 90 L 220 40 L 340 40 L 340 90 L 420 90 L 420 40 L 540 40 L 540 90 L 20 90 Z" fill="var(--accent)" fill-opacity="0.28" stroke="var(--accent)" stroke-width="1.5" />
+    <text class="note" x="20" y="118">一次 writev(2) 寫下去 / 一次 readv(2) 讀回來——中間沒有轉換步驟</text>
+  </svg>
+  <button id="vg-w-morph-zir-serialize-toggle" type="button" data-vg-controls>切換到磁碟上的 ZIR</button>
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-morph-zir-serialize');
+      if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+      const label = root.querySelector('#vg-w-morph-zir-serialize-label');
+      const btn = root.querySelector('#vg-w-morph-zir-serialize-toggle');
+      let onDisk = false;
+      btn.addEventListener('click', () => {
+        onDisk = !onDisk;
+        label.textContent = onDisk ? '磁碟上的 ZIR 檔案位元組' : '記憶體中的 ZIR buffer';
+        btn.textContent = onDisk ? '切換回記憶體呈現' : '切換到磁碟上的 ZIR';
+      });
+    })();
+  </script>
+</figure>
+
+<p>link 階段面對的是另一個問題：怎麼在不重寫整個輸出檔案的前提下，把改動的機器碼位元組補進去。mlugg 描述的抽象是 MappedFile——「memory-maps the output file...tracks a tree of 'nodes' in that file」，每個 node 對應輸出檔案裡的一段區域。當某個 node 需要更多空間，直接原地擴充最省事，但原地擴充勢必要跟鄰居搶空間；MappedFile 的做法是「By using exponential growth factors on nodes (similar to how dynamic data structures like ArrayList work), we amortize this cost」——跟 dynamic array 擴充容量的邏輯一樣，每個 node 預留的容量比目前用到的還大一截，容量夠的更新永遠不必搬家，只有真的超出目前配額才觸發一次重新配置與搬遷，下一次的容量又會翻倍。攤提下來，大部分增量更新都能原地補位元組，完全不必動到檔案裡的其他區域。</p>
+
+<p>MappedFile 追蹤的「node 樹」不是攤平的位元組陣列，而是一棵樹——輸出檔案裡巢狀的區段結構對應到樹裡的節點與子節點，一段位元組要搬遷時，牽動的只是它在樹裡對應的那一段，不必驚動整份檔案。這跟前面依賴集合的精神一致：範圍越窄，代價越低。下面這個 widget 讓你直接拖：拖著「目前用掉的位元組」這個把手往右走，一旦超出容量邊界就會觸發一次搬遷，容量翻倍，搬遷次數加一。</p>
+
+<figure class="vg-w-drag-mappedfile-growth" data-mobile="static" data-svg-scroll="560">
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M18 8L22 12L18 16"/><path d="M6 8L2 12L6 16"/><path d="M2 12H22"/>
+    </svg>
+    <span>拖橙色把手模擬 node 用量成長 · 超出容量觸發搬遷</span>
+  </p>
+  <style>
+    .vg-w-drag-mappedfile-growth { display: grid; gap: var(--s-2); }
+    .vg-w-drag-mappedfile-growth svg { width: 100%; height: auto; touch-action: none; }
+    .vg-w-drag-mappedfile-growth .stat { font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); font-variant-numeric: tabular-nums; }
+    .vg-w-drag-mappedfile-growth .cap-box { fill: none; stroke: var(--muted-2); stroke-width: 1.5; }
+    .vg-w-drag-mappedfile-growth .used-box { fill: var(--sage-deep); fill-opacity: 0.28; }
+    .vg-w-drag-mappedfile-growth .handle { fill: var(--accent); cursor: grab; }
+    .vg-w-drag-mappedfile-growth text { font-family: JetBrains Mono, monospace; font-size: 12px; fill: var(--ink); }
+    .vg-w-drag-mappedfile-growth .note { font-family: IM Fell English, serif; font-style: italic; font-size: 11px; fill: var(--muted); }
+  </style>
+  <span class="stat" id="vg-w-drag-mappedfile-growth-stat">容量 64 · 已用 20 · 搬遷 0 次</span>
+  <svg class="vg-w-drag-mappedfile-growth-main" viewBox="0 0 560 120" role="img" aria-label="拖曳把手模擬 MappedFile node 的指數成長">
+    <rect class="cap-box" id="vg-w-drag-mappedfile-growth-cap" x="30" y="40" width="256" height="30" />
+    <rect class="used-box" id="vg-w-drag-mappedfile-growth-used" x="30" y="40" width="80" height="30" />
+    <circle class="handle" id="vg-w-drag-mappedfile-growth-h" cx="110" cy="55" r="11" />
+    <text id="vg-w-drag-mappedfile-growth-label" x="30" y="90">已用 20 / 容量 64</text>
+    <text class="note" x="30" y="108">拖過方框右緣：觸發搬遷、容量翻倍</text>
+  </svg>
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-drag-mappedfile-growth');
+      if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+      const svg = root.querySelector('svg.vg-w-drag-mappedfile-growth-main');
+      const handle = root.querySelector('#vg-w-drag-mappedfile-growth-h');
+      const capBox = root.querySelector('#vg-w-drag-mappedfile-growth-cap');
+      const usedBox = root.querySelector('#vg-w-drag-mappedfile-growth-used');
+      const label = root.querySelector('#vg-w-drag-mappedfile-growth-label');
+      const stat = root.querySelector('#vg-w-drag-mappedfile-growth-stat');
+      const X0 = 30, PX_PER_BYTE = 4;
+      let capacity = 64, used = 20, relocations = 0, dragging = false;
+
+      function xForUsed(u) { return X0 + Math.min(u, capacity) * PX_PER_BYTE; }
+      function render() {
+        capBox.setAttribute('width', capacity * PX_PER_BYTE);
+        usedBox.setAttribute('width', Math.min(used, capacity) * PX_PER_BYTE);
+        handle.setAttribute('cx', xForUsed(used));
+        label.textContent = '已用 ' + used + ' / 容量 ' + capacity;
+        stat.textContent = '容量 ' + capacity + ' · 已用 ' + used + ' · 搬遷 ' + relocations + ' 次';
+      }
+      function clientToSvgX(clientX) {
+        const pt = svg.createSVGPoint();
+        pt.x = clientX; pt.y = 0;
+        return pt.matrixTransform(svg.getScreenCTM().inverse()).x;
+      }
+      function update(x) {
+        const rawUsed = Math.max(4, Math.round((x - X0) / PX_PER_BYTE));
+        used = rawUsed;
+        if (used > capacity) {
+          relocations++;
+          capacity = capacity * 2;
+        }
+        render();
+      }
+      handle.addEventListener('pointerdown', (e) => { dragging = true; handle.setPointerCapture(e.pointerId); handle.setAttribute('cursor', 'grabbing'); });
+      handle.addEventListener('pointermove', (e) => { if (dragging) update(clientToSvgX(e.clientX)); });
+      handle.addEventListener('pointerup', () => { dragging = false; handle.setAttribute('cursor', 'grab'); });
+      render();
+    })();
+  </script>
+</figure>
+
+<p>換成假設的具體數字感受一下這個指數成長：如果一個 node 目前的容量是 64 bytes、已經用了 60 bytes，這次更新只加 3 bytes，不會超出容量，原地寫完；等到某次更新把用量推過 64，MappedFile 才會把容量翻倍到 128，連帶搬遷這個 node 裡原本的內容。之後再寫多少次，只要沒超過 128，又是一路原地補位元組，直到下一次翻倍發生在 128 那個邊界。翻倍的間距越走越寬，搬遷發生的頻率也就越來越低——這正是「攤提」這個字的意思：少數幾次貴的搬遷，平攤到大量便宜的原地寫入上（這是依機制推算的假設例子，實際容量數字未見於原文）。</p>
+
+<h2>flush 階段的 reference-graph 全走訪：為什麼它才是大頭</h2>
+
+<p>一份針對 Fizzy（一個用 Zig 寫的 WASM 直譯器）的實測給出具體數字：「The initial build takes around 5 seconds, and then every time I make a change, a rebuild completes in 50–70ms.」mlugg 進一步追蹤了單一一次更新，量到「This particular update took 37ms」，而其中真正花在語意分析加 codegen 上的時間「comes in at around 1.6ms for this update」。1.6 毫秒跟 37 毫秒之間的落差，指向前面幾節講的機制確實有效：分析單元夠小、依賴集合夠精準，真正需要重算的東西非常少。</p>
+
+<p>那剩下的 30 幾毫秒去了哪裡？mlugg 指出「Basically all of the remaining time is spent in one function, resolveReferencesInner」，這個函式在 flush 階段跑——每次要把更新寫進輸出檔案之前，編譯器得先確定哪些宣告現在仍然被引用得到，因為死碼不該留在輸出裡。這一步沒辦法只看「這次改了什麼」，它得把整張參照圖從進入點開始走一遍，才能確認整體的可達性沒有因為這次改動而變。分析單元的增量設計省下的是「重新分析」的成本，但「重新確認整張圖的形狀」是另一件事——即使圖本身結構沒變，走訪它仍然要付出跟圖大小成正比的時間。這解釋了為什麼即使語意分析壓到 1.6 毫秒，一次增量重編仍然要三十幾毫秒——瓶頸從「算什麼」搬到了「確認什麼還活著」。下面用一個簡化的動畫把這個對比畫出來：左邊是語意分析加 codegen 的 1.6 毫秒，幾乎一瞬間跑完；右邊是 flush 走訪整張參照圖的過程，逐一「訪問」每個節點，時間跟節點數成正比。</p>
+
+<figure class="vg-w-loop-flush-traversal" data-mobile="static" data-svg-scroll="720">
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <polygon points="5 3 19 12 5 21 5 3"/>
+    </svg>
+    <span>播放看 flush 走訪整張參照圖 · 對比語意分析的 1.6ms</span>
+  </p>
+  <style>
+    .vg-w-loop-flush-traversal { display: grid; gap: var(--s-2); }
+    .vg-w-loop-flush-traversal canvas { width: 100%; height: auto; aspect-ratio: 16 / 9; display: block; }
+    .vg-w-loop-flush-traversal .toolbar { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); flex-wrap: wrap; }
+    .vg-w-loop-flush-traversal button { min-height: 44px; padding: 4px 14px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); cursor: pointer; }
+    .vg-w-loop-flush-traversal button:hover { border-color: var(--accent); color: var(--accent-text); }
+    .vg-w-loop-flush-traversal [data-clock] { margin-left: auto; font-variant-numeric: tabular-nums; color: var(--muted); }
+    @media (max-width: 720px) { .vg-w-loop-flush-traversal canvas { aspect-ratio: 4 / 3; } }
+  </style>
+  <div class="toolbar" data-vg-controls>
+    <button data-act="toggle">▷ play</button>
+    <button data-act="reset">↺ reset</button>
+    <span data-clock>模擬 t = 0.0 / 30ms（sem+codegen 1.6ms 已完成）</span>
+  </div>
+  <canvas></canvas>
+  <script>
+    (function () {
+      const root = document.querySelector('.vg-w-loop-flush-traversal');
+      if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+      const canvas = root.querySelector('canvas');
+      const toggleBtn = root.querySelector('[data-act=toggle]');
+      const resetBtn = root.querySelector('[data-act=reset]');
+      const clock = root.querySelector('[data-clock]');
+      const ctx = canvas.getContext('2d');
+
+      let cssW = 0, cssH = 0;
+      function resize() {
+        const dpr = window.devicePixelRatio || 1;
+        const rect = canvas.getBoundingClientRect();
+        cssW = rect.width; cssH = rect.height;
+        canvas.width = cssW * dpr; canvas.height = cssH * dpr;
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      }
+      new ResizeObserver(resize).observe(canvas);
+      resize();
+
+      function cssVar(n) { return getComputedStyle(root).getPropertyValue(n).trim() || '#888'; }
+
+      const N = 18;
+      const nodes = [];
+      for (let i = 0; i < N; i++) {
+        nodes.push({ a: (i / N) * Math.PI * 2, visited: false });
+      }
+      let running = false, simMs = 0;
+      const TOTAL_MS = 30; // scaled from the ~30ms traced flush cost
+      let speedMsPerSec = 12;
+
+      function step(dt) {
+        simMs = Math.min(TOTAL_MS, simMs + dt * speedMsPerSec);
+        const visitedCount = Math.floor((simMs / TOTAL_MS) * N);
+        nodes.forEach((n, i) => { n.visited = i < visitedCount; });
+      }
+
+      function draw() {
+        ctx.clearRect(0, 0, cssW, cssH);
+        const cx = cssW * 0.32, cy = cssH * 0.55, r = Math.min(cssW, cssH) * 0.32;
+
+        ctx.font = '12px "EB Garamond", serif';
+        ctx.fillStyle = cssVar('--muted');
+        ctx.fillText('reference-graph（flush · resolveReferencesInner）', 10, 18);
+
+        nodes.forEach((n, i) => {
+          const x = cx + Math.cos(n.a) * r, y = cy + Math.sin(n.a) * r;
+          ctx.beginPath();
+          ctx.arc(x, y, 6, 0, Math.PI * 2);
+          ctx.fillStyle = n.visited ? cssVar('--accent') : cssVar('--bg-soft');
+          ctx.strokeStyle = cssVar('--muted-2');
+          ctx.lineWidth = 1.2;
+          ctx.fill(); ctx.stroke();
+        });
+
+        // sem+codegen mini bar, always instantly "done"
+        const barX = cssW * 0.68, barY = cssH * 0.3, barW = Math.min(cssW * 0.22, 90);
+        ctx.font = '11px "Manrope", sans-serif';
+        ctx.fillStyle = cssVar('--muted');
+        ctx.fillText('語意分析 + codegen', barX, barY - 8);
+        ctx.fillStyle = cssVar('--bg-soft');
+        ctx.fillRect(barX, barY, barW, 10);
+        ctx.fillStyle = cssVar('--sage-deep');
+        ctx.fillRect(barX, barY, barW, 10);
+        ctx.fillStyle = cssVar('--ink');
+        ctx.fillText('1.6ms', barX + barW + 8, barY + 9);
+
+        const barY2 = cssH * 0.55;
+        ctx.fillStyle = cssVar('--muted');
+        ctx.fillText('flush 走訪進度', barX, barY2 - 8);
+        ctx.fillStyle = cssVar('--bg-soft');
+        ctx.fillRect(barX, barY2, barW, 10);
+        ctx.fillStyle = cssVar('--accent');
+        ctx.fillRect(barX, barY2, barW * (simMs / TOTAL_MS), 10);
+        ctx.fillStyle = cssVar('--ink');
+        ctx.fillText(simMs.toFixed(1) + 'ms', barX + barW + 8, barY2 + 9);
+      }
+
+      let last = performance.now();
+      function frame(now) {
+        const dt = Math.min(0.1, (now - last) / 1000); last = now;
+        if (running) step(dt);
+        draw();
+        clock.textContent = '模擬 t = ' + simMs.toFixed(1) + ' / ' + TOTAL_MS + 'ms（sem+codegen 1.6ms 已完成）';
+        requestAnimationFrame(frame);
+      }
+      requestAnimationFrame(frame);
+
+      toggleBtn.addEventListener('click', () => {
+        running = !running;
+        toggleBtn.textContent = running ? '⏸ pause' : '▷ play';
+        last = performance.now();
+      });
+      resetBtn.addEventListener('click', () => {
+        running = false; toggleBtn.textContent = '▷ play';
+        simMs = 0; nodes.forEach((n) => (n.visited = false));
+      });
+    })();
+  </script>
+</figure>
+
+<p>「確認什麼還活著」這件事，本質上跟垃圾回收器判斷可達性是同一類問題——沒辦法只看「這次新增或刪除了什麼」就推出整張圖有沒有變，必須真的把圖走一遍。差別在於一般垃圾回收器可以選擇分代、增量標記等策略把單次走訪的成本攤開，而 flush 階段目前的做法是每次都做一次完整走訪。這也是為什麼即使前面四段分析單元跟依賴集合已經把「分析」的成本壓到 1.6 毫秒，30 毫秒的走訪還是原封不動地留在那裡，成為下一個可以被優化的目標。</p>
+
+<p>這也留下一個原文沒有直接數字可以回答的問題：30 毫秒是對 Fizzy 這種規模的專案量到的，如果專案的宣告數量成長十倍，走訪整張圖的時間大機率也會跟著往上走，除非之後針對 flush 本身做進一步優化——例如把可達性判斷也改成增量式的，而不是每次都整張圖重走一遍。這一段是依照目前公開的機制推算的方向，原文並未對更大規模的專案給出對照數字。</p>
+
+<p>目前這整套機制「will only really work if you target x86_64-linux, because our other code generation and linker backends are not mature enough yet」——mlugg 特別用「at the time of writing」限定時效。增量編譯本身的設計（分析單元、依賴集合、ZIR 快取、MappedFile）是通用的，卡住的是其餘 target 的 codegen 與 linker backend 還沒補齊到能承接這套依賴追蹤的成熟度。換句話說，這篇文章講的不是「Zig 已經全面變快」，而是「在一個 target 上，這套顆粒化的依賴追蹤已經把大部分編譯時間從語意分析搬到了 flush 的圖走訪」——這個搬運本身，就是接下來優化的下一個目標。</p>
+
+<p>對寫 Zig 或設計自己的增量建置系統的工程師來說，這裡真正可複製的框架是三個問題：有哪幾種東西可以獨立分析、每種東西怎麼記錄自己依賴了什麼、有沒有一種類型的依賴邊被設計成只能往外以避免循環。flush 這種「即使沒事也要巡一遍」的步驟，也是評估任何增量系統時該主動去找的隱藏成本——它不會因為改動變小而跟著變快，圖有多大，走訪就要付多少。</p>
+
+<p class="vg-deep-closer"><strong>能力解鎖</strong>：把首次建置的 5 秒跟增量重編的 37 到 70 毫秒放在一起看，這套機制真正解鎖的不是「更快的編譯器」，而是把 edit-compile-test 這個迴圈的成本壓到能跟得上輸入節奏的程度——目前只在 x86_64-linux 上算成熟。</p>
+
+</div>
