@@ -1,0 +1,571 @@
+{
+  "output_path": "src/posts/2026/07/31/deep-postgres-queue-scaling.html",
+  "spine": [
+    "1. DBOS 的 Postgres-backed workflow 佇列要從約 100 個 workflow 每秒撐到 30,000 個以上，靠的是三個疊加的 SQL 層機制修正，不是換資料庫。",
+    "2. 第一個瓶頸：naive dequeue 查詢讓所有 worker 撈到同一批最舊列，大部分 worker 白跑重試；SELECT ... FOR UPDATE SKIP LOCKED 讓每個 worker 只拿『還沒被鎖住』的最舊列，鎖定與跳過兩件事同時發生。",
+    "3. 修完鎖競爭後，約 1,000 個每秒撞上第二瓶頸：REPEATABLE READ 底下多 worker 修改重疊列會觸發序列化失敗，規模化後重試耗時超過實際處理時間。",
+    "4. 修法不是整體降級成 READ COMMITTED，而是條件式：需要全域併發上限的佇列留在 REPEATABLE READ，不需要的改用 READ COMMITTED，徹底消除序列化失敗。",
+    "5. 修完隔離等級後，約 8,000 個每秒撞上第三瓶頸：CPU 而非鎖或重試——每次狀態變化都要維護每一個索引，加上 autovacuum 清理消耗大量 CPU。",
+    "6. 修法是部分索引：只對 status = 'ENQUEUED' 的列建索引，dequeue 查詢省掉排序步驟，且列一旦被 dequeue 索引項就直接刪除，不必維護到 workflow 生命週期結束。",
+    "7. 三個機制疊加把吞吐量從約 100 個每秒推到 30,000 個以上、約 800 億次每月，橫跨數千台伺服器——任何一層拿掉，對應的瓶頸就會回來。"
+  ],
+  "sources": [
+    {
+      "url": "https://www.dbos.dev/blog/making-postgres-queues-scale",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": "2026-06-02",
+      "perspective": {
+        "mechanism": "DBOS 展示如何用三個疊加的 Postgres 機制——SELECT ... FOR UPDATE SKIP LOCKED 鎖定跳過、依佇列是否需要全域流控條件式選用交易隔離等級、只涵蓋 ENQUEUED 狀態列的部分索引——把單一資料庫佇列從約 100 個 workflow 每秒撐到 30,000 個以上。",
+        "tradeoff": "每個修法都用局部代價換吞吐量：SKIP LOCKED 犧牲嚴格的『最舊優先』保證，換不必要的等待；READ COMMITTED 犧牲全域一致快照，換掉序列化失敗與重試；部分索引犧牲對非 ENQUEUED 狀態列的索引覆蓋，換掉索引維護與 autovacuum 開銷。",
+        "reader_use": "自己拿 Postgres 當佇列用的工程師，可以照這三個檢查點回頭看：dequeue 查詢有沒有 SKIP LOCKED、交易隔離等級是不是預設用了比實際需求高的等級、索引有沒有還在替『已經處理完』的列維護。"
+      }
+    }
+  ],
+  "notes": [
+    {
+      "id": "n01",
+      "url": "https://www.dbos.dev/blog/making-postgres-queues-scale",
+      "quote": "Locking clauses make Postgres-backed queues possible (which is why SKIP LOCKED is one of those old Postgres tricks that keeps getting rediscovered). Without them, contention between workers prevents scaling beyond ~100 workflows per second.",
+      "hedge": "asserted",
+      "interpretation": "SKIP LOCKED 被定位為必要前提而非最佳化選項；沒有它，吞吐量卡在約 100 個 workflow 每秒的基準線。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n02",
+      "url": "https://www.dbos.dev/blog/making-postgres-queues-scale",
+      "quote": "Every worker sees the same oldest queued workflows and attempts to dequeue them at the same time.",
+      "hedge": "asserted",
+      "interpretation": "問題成因：naive dequeue 查詢排序後，所有 worker 撈到同一批最舊列。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n03",
+      "url": "https://www.dbos.dev/blog/making-postgres-queues-scale",
+      "quote": "But each workflow can only be dequeued by a single worker, so most workers will fail to find new work and have to try again.",
+      "hedge": "asserted",
+      "interpretation": "上一句成因的直接後果：大部分 worker 白跑一趟、形成無謂重試。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n04",
+      "url": "https://www.dbos.dev/blog/making-postgres-queues-scale",
+      "quote": "Selecting rows in this way does two things. First, it locks the rows so that other workers cannot also select them. Second, it skips rows that are already locked, selecting not the N oldest enqueued workflows, but the N oldest enqueued workflows that are not already locked by another worker.",
+      "hedge": "asserted",
+      "interpretation": "SKIP LOCKED 機制拆解：鎖定＋跳過已鎖定列兩件事合起來，讓每個 worker 拿到的其實是『還沒被別人鎖住的最舊 N 筆』而非固定的『最舊 N 筆』。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n05",
+      "url": "https://www.dbos.dev/blog/making-postgres-queues-scale",
+      "quote": "The dequeue transaction originally ran at REPEATABLE READ so it could support global queue limits like 'run at most N workflows concurrently across all workers.'",
+      "hedge": "asserted",
+      "interpretation": "選用 REPEATABLE READ 的原始理由：要支援跨 worker 的全域併發上限。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n06",
+      "url": "https://www.dbos.dev/blog/making-postgres-queues-scale",
+      "quote": "If multiple workers concurrently modify overlapping rows, Postgres aborts one of them with a serialization failure.",
+      "hedge": "asserted",
+      "interpretation": "REPEATABLE READ 在高併發下的代價：重疊列修改觸發序列化失敗，必須重試整筆交易。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n07",
+      "url": "https://www.dbos.dev/blog/making-postgres-queues-scale",
+      "quote": "When dequeueing more than ~1000 workflows per second, the majority of dequeue operations encountered serialization failures, creating a performance bottleneck.",
+      "hedge": "asserted",
+      "interpretation": "具體門檻：約 1,000 個每秒之後，序列化失敗開始佔多數，形成第二個瓶頸。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n08",
+      "url": "https://www.dbos.dev/blog/making-postgres-queues-scale",
+      "quote": "At scale, workers spent more time retrying transactions than processing workflows.",
+      "hedge": "asserted",
+      "interpretation": "序列化失敗在規模化後的具體代價：重試耗時超過真正處理時間。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n09",
+      "url": "https://www.dbos.dev/blog/making-postgres-queues-scale",
+      "quote": "Queues with global flow control continue using REPEATABLE READ, while queues without it use READ COMMITTED, which eliminates serialization failures entirely and dramatically improves throughput.",
+      "hedge": "asserted",
+      "interpretation": "修法是條件式交易隔離：非全域限制的佇列改用 READ COMMITTED，徹底避免序列化失敗。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n10",
+      "url": "https://www.dbos.dev/blog/making-postgres-queues-scale",
+      "quote": "However, when running more than ~8000 workflows per second, we saw a new bottleneck: high CPU usage.",
+      "hedge": "asserted",
+      "interpretation": "修完隔離等級後，新瓶頸浮現在約 8,000 個每秒，轉為 CPU 而非鎖等待。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n11",
+      "url": "https://www.dbos.dev/blog/making-postgres-queues-scale",
+      "quote": "Every workflow status update (enqueue, dequeue, completion) requires updating every index. Moreover, after indexes are updated, Postgres autovacuum has to clean up outdated index entries. At high throughput, index maintenance and vacuuming consume a substantial fraction of database CPU.",
+      "hedge": "asserted",
+      "interpretation": "CPU 瓶頸成因：每次狀態轉換都要維護每一個索引，加上 autovacuum 清理，兩者疊加吃掉大量 CPU。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n12",
+      "url": "https://www.dbos.dev/blog/making-postgres-queues-scale",
+      "quote": "This improves performance for two reasons. First, the dequeue query no longer needs an expensive sort step. Second, when the workflow is dequeued, Postgres can simply delete its index entry instead of maintaining it for the rest of the workflow's lifetime, reducing maintenance and auto-vacuum cost.",
+      "hedge": "asserted",
+      "interpretation": "部分索引（只索引 ENQUEUED 列）的效果：省掉排序步驟，且列被 dequeue 後索引項直接被刪除，而不是繼續維護到 workflow 生命週期結束。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n13",
+      "url": "https://www.dbos.dev/blog/making-postgres-queues-scale",
+      "quote": "In this blog post, we'll show how we optimized Postgres-backed queues at scale, achieving 30K workflow executions per second across thousands of servers.",
+      "hedge": "asserted",
+      "interpretation": "最終達成的吞吐量與部署規模：30K workflow 每秒，橫跨數千台伺服器。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n14",
+      "url": "https://www.dbos.dev/blog/making-postgres-queues-scale",
+      "quote": "Combined, these optimizations cut CPU usage dramatically, allowing queues to scale to over 30K workflows per second, or 80B per month.",
+      "hedge": "asserted",
+      "interpretation": "三個機制合起來的總效果，換算成月執行量約 800 億次。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n15",
+      "url": "https://www.dbos.dev/blog/making-postgres-queues-scale",
+      "quote": "Lesson 1: (Re-)Discovering SKIP LOCKED / Lesson 2: Mind the Transaction Isolation Levels / Lesson 3: Indexes Aren't Free",
+      "hedge": "asserted",
+      "interpretation": "文章的三段標題結構，確認三個機制對應三個獨立小節（依序：SKIP LOCKED、交易隔離等級、索引），支撐本文以三個 H2 對應三段的結構安排。",
+      "timeliness": "durable"
+    }
+  ],
+  "claims": [
+    {
+      "id": "c01",
+      "claim_text": "DBOS 靠三個 SQL 層調整把吞吐量從約 100 個 workflow 每秒推到 30,000 個以上、橫跨數千台伺服器",
+      "location": "vg-deep-opener",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n01",
+        "n13"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Without them, contention between workers prevents scaling beyond ~100 workflows per second. / achieving 30K workflow executions per second across thousands of servers",
+      "note": "兩端數字都在來源，來源用 ~ 表近似，貼文用「大約」對應。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c02",
+      "claim_text": "「Locking clauses make Postgres-backed queues possible」",
+      "location": "第 1 段",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n01"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Locking clauses make Postgres-backed queues possible",
+      "note": "重抓確認逐字存在。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c03",
+      "claim_text": "天真寫法下，這張表卡在大約 100 個 workflow 每秒",
+      "location": "第 1 段",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n01"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Without them, contention between workers prevents scaling beyond ~100 workflows per second.",
+      "note": "語意對應正確，未上調強度。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c04",
+      "claim_text": "「achieving 30K workflow executions per second across thousands of servers」",
+      "location": "第 1 段",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n13"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "achieving 30K workflow executions per second across thousands of servers",
+      "note": "引文逐字存在。貼文加了「正式環境」限定詞，來源只說 at scale；數字無誤。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c05",
+      "claim_text": "「allowing queues to scale to over 30K workflows per second, or 80B per month」",
+      "location": "第 3 段",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n14"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Combined, these optimizations cut CPU usage dramatically, allowing queues to scale to over 30K workflows per second, or 80B per month.",
+      "note": "80B/月為來源直接寫出，非貼文自行換算。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c06",
+      "claim_text": "「Every worker sees the same oldest queued workflows and attempts to dequeue them at the same time.」",
+      "location": "H2 SKIP LOCKED 第 1 段",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n02"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Every worker sees the same oldest queued workflows and attempts to dequeue them at the same time.",
+      "note": "逐字存在。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c07",
+      "claim_text": "「But each workflow can only be dequeued by a single worker...」",
+      "location": "H2 SKIP LOCKED 第 1 段",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n03"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "But each workflow can only be dequeued by a single worker, so most workers will fail to find new work and have to try again.",
+      "note": "逐字存在。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c08",
+      "claim_text": "「one of those old Postgres tricks that keeps getting rediscovered」",
+      "location": "H2 SKIP LOCKED 第 2 段",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n01"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "deflated",
+      "evidence": "which is why SKIP LOCKED is one of those old Postgres tricks that keeps getting rediscovered",
+      "note": "引文逐字存在；貼文的推測標記包住的是自己的解讀，標記正確。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c09",
+      "claim_text": "SKIP LOCKED 拆成鎖定與跳過兩件事的雙引文",
+      "location": "H2 SKIP LOCKED 第 3 段",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n04"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "First, it locks the rows so that other workers cannot also select them. Second, it skips rows that are already locked...",
+      "note": "兩段引文逐字存在，忠於原文 First/Second 結構。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c10",
+      "claim_text": "「The dequeue transaction originally ran at REPEATABLE READ so it could support global queue limits...」",
+      "location": "H2 條件式交易隔離 第 1 段",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n05"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The dequeue transaction originally ran at REPEATABLE READ so it could support global queue limits like 'run at most N workflows concurrently across all workers.'",
+      "note": "逐字存在，含內層單引號。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c11",
+      "claim_text": "「If multiple workers concurrently modify overlapping rows, Postgres aborts one of them with a serialization failure.」",
+      "location": "H2 條件式交易隔離 第 4 段",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [
+        "n06"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "If multiple workers concurrently modify overlapping rows, Postgres aborts one of them with a serialization failure.",
+      "note": "因果鏈由來源自己斷言。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c12",
+      "claim_text": "「When dequeueing more than ~1000 workflows per second...serialization failures...」",
+      "location": "H2 條件式交易隔離 第 4 段",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n07"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "When dequeueing more than ~1000 workflows per second, the majority of dequeue operations encountered serialization failures, creating a performance bottleneck.",
+      "note": "逐字存在；貼文一律寫「大約 1,000」。來源 2026-06-02、貼文 2026-07-31，無時效問題。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c13",
+      "claim_text": "「At scale, workers spent more time retrying transactions than processing workflows.」",
+      "location": "H2 條件式交易隔離 第 4 段",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n08"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "At scale, workers spent more time retrying transactions than processing workflows.",
+      "note": "逐字存在。同段推斷已明確標記。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c14",
+      "claim_text": "「Queues with global flow control continue using REPEATABLE READ, while queues without it use READ COMMITTED...」",
+      "location": "H2 條件式交易隔離 第 5 段",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n09"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Queues with global flow control continue using REPEATABLE READ, while queues without it use READ COMMITTED, which eliminates serialization failures entirely and dramatically improves throughput.",
+      "note": "「徹底消除序列化失敗」對應 eliminates ... entirely，強度相符。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c15",
+      "claim_text": "「However, when running more than ~8000 workflows per second, we saw a new bottleneck: high CPU usage.」",
+      "location": "H2 部分索引 第 1 段",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n10"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "However, when running more than ~8000 workflows per second, we saw a new bottleneck: high CPU usage.",
+      "note": "逐字存在，含 ~ 近似符號。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c16",
+      "claim_text": "索引維護與 autovacuum 吃掉大量 CPU 的三句引文",
+      "location": "H2 部分索引 第 1 段",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [
+        "n11"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Every workflow status update (enqueue, dequeue, completion) requires updating every index. Moreover, after indexes are updated, Postgres autovacuum has to clean up outdated index entries. At high throughput, index maintenance and vacuuming consume a substantial fraction of database CPU.",
+      "note": "三句逐字存在；a substantial fraction 譯為「大量」屬同強度。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c17",
+      "claim_text": "部分索引改善效能的兩個理由引文",
+      "location": "H2 部分索引 第 3 段",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n12"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "This improves performance for two reasons. First, the dequeue query no longer needs an expensive sort step. Second, when the workflow is dequeued, Postgres can simply delete its index entry...",
+      "note": "逐字存在。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c18",
+      "claim_text": "只對 status = 'ENQUEUED' 的列建索引，也就是 Postgres 的部分索引",
+      "location": "H2 部分索引 第 3 段",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [
+        "n12"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "we converted it into a partial index that's only maintained when workflow status is ENQUEUED",
+      "note": "來源確有其文；notes[] 未單獨收錄此句，建議作者補一則 note 補齊 trace（記錄性提醒）。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c19",
+      "claim_text": "文章沒有提到 SERIALIZABLE，抉擇卡在 REPEATABLE READ 與 READ COMMITTED 之間",
+      "location": "H2 條件式交易隔離 第 3 段",
+      "type": "attribution",
+      "load": "low",
+      "note_ids": [
+        "n09",
+        "n15"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Queues with global flow control continue using REPEATABLE READ, while queues without it use READ COMMITTED",
+      "note": "以定向缺席檢查驗證：重抓後確認全文未出現 SERIALIZABLE。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c20",
+      "claim_text": "HOT（Heap-Only Tuple）最佳化在被更新欄位被索引涵蓋時幫不上忙",
+      "location": "H2 部分索引 第 2 段",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "重抓後定向確認：來源全文未出現 HOT / Heap-Only Tuple。作者自行補進的 Postgres 機制推理，原以斷言語氣寫成且無推斷標記。 || Round 2: re-fetch re-confirms the source never uses HOT / Heap-Only Tuple. Marker 「一個說得通的解釋是，」 opens the sentence and governs the whole HOT claim through its conclusion. No new mechanism detail introduced.",
+      "action": "mark-inferred",
+      "resolution": "marked-inferred"
+    },
+    {
+      "id": "c21",
+      "claim_text": "SKIP LOCKED 要跟 ORDER BY 用同一個索引配合才能維持挑最舊的語意",
+      "location": "H2 SKIP LOCKED 第 5 段",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "trace 失敗：無 note 支撐，重抓來源亦無對應敘述。屬有承重的未標記推斷。 || Round 2: source says nothing about SKIP LOCKED sharing an index with ORDER BY. Paragraph split; 「推測起來，」 governs the index-alignment clause that the following sentence leans on. Advisory: the trailing 「讓排序更穩定」 phrasing exceeds n12's 「no longer needs an expensive sort step」 but reads as continuation of the marked inference.",
+      "action": "mark-inferred",
+      "resolution": "marked-inferred"
+    },
+    {
+      "id": "c22",
+      "claim_text": "這個組合原本是為了「搶第一個能處理的工作」這種場景設計的",
+      "location": "H2 SKIP LOCKED 第 4 段",
+      "type": "attribution",
+      "load": "low",
+      "note_ids": [],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "關於設計意圖的斷言，無 note 支撐；來源未談原始設計目的。 || Round 2: source never states design intent for FOR UPDATE SKIP LOCKED. 「可以合理推想，」 governs the clause through its em-dash continuation.",
+      "action": "mark-inferred",
+      "resolution": "marked-inferred"
+    },
+    {
+      "id": "c23",
+      "claim_text": "SKIP LOCKED 在 MySQL 8 之後也有類似支援",
+      "location": "結尾第 3 段",
+      "type": "date-version",
+      "load": "low",
+      "note_ids": [],
+      "independence": "single-source",
+      "verdict": "unverifiable",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "trace 失敗且無推斷標記：ledger 唯一來源是 DBOS 的 Postgres 文章，重抓後全文未提及 MySQL。不得以檢查者自身知識充當證據。 || Round 2: deletion verified complete across all 340 lines — zero occurrences of MySQL and no residual cross-database portability assertion. Surviving line 「這三個修法都貼著 Postgres 自己的語法與語義。」 is a Postgres-only statement.",
+      "action": "delete",
+      "resolution": "deleted"
+    },
+    {
+      "id": "c24",
+      "claim_text": "range widget 的 N=20 / K=10 競爭模型數字",
+      "location": "vg-w-range-postgres-queue-contention",
+      "type": "number",
+      "load": "low",
+      "note_ids": [],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "deflated",
+      "evidence": null,
+      "note": "作者宣告的 hedge 已確認落實且足夠：affordance 明寫「模型示意，非文中效能數字」，正文亦標明 K 為示範任意取值。已正確標記的推斷。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c25",
+      "claim_text": "CREATE INDEX ... WHERE status = 'ENQUEUED' 的 DDL 片段",
+      "location": "H2 部分索引 第 3 段 pre",
+      "type": "attribution",
+      "load": "low",
+      "note_ids": [],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "第一段 SQL 帶有「不是文中原始碼」完整標記，此段 DDL 只有「大致長這樣」。來源 SQL 以圖片呈現、文字層取不到，更需明確標示為示意。 || Round 2: provenance marker 「（不是文中原始碼，是這個模式一般會寫成的樣子）」 added, byte-identical to the marker on the post's other pseudocode lead-in. SQL unchanged.",
+      "action": "mark-inferred",
+      "resolution": "marked-inferred"
+    }
+  ],
+  "checked_at": "2026-07-31",
+  "checker_rounds": 2,
+  "coverage": {
+    "candidate_claims": 33,
+    "checked": 25,
+    "dropped_low_load": 8
+  }
+}
