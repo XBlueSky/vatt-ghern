@@ -6,6 +6,8 @@
 <div class="vg-post-prose">
   <p><span class="vg-dropcap">G</span>itHub 的程式碼搜尋引擎 Blackbird 索引超過 1.8 億個 repository、480TB 原始碼；每個位元組進 index 之前要先 case-fold 一次，使用者送出查詢時還要再 fold 一次做比對。這條路徑上任何逐 byte 的浪費，都會被規模乘出巨大差異——GitHub 自己的說法是「每個 byte 在抽 ngram、建 index 之前都要先 case-fold，之後每一次查詢比對，隱含或明講，都還要再做一次同樣的操作」。</p>
 
+  <p>這類位元技巧本身並不新——用算術取代分支是效能工程裡的老手法。這篇文章的價值，在於把它系統性地、有條理地套用在一個要處理 480TB 原始碼的真實系統上，並且給出每一步的具體吞吐量數字，而不是紙上談兵的教科書範例。</p>
+
   <h2>break 怎麼讓 LLVM 放棄向量化</h2>
 
   <p>最直覺的寫法逐個位元組掃：遇到非 ASCII 就 <code>break</code>，把剩下的交給 Unicode 慢路徑；是大寫字母就加 32 變成小寫。程式碼大致長這樣：</p>
@@ -21,6 +23,12 @@ for (i, b) in bytes.iter_mut().enumerate() {
 }</code></pre>
 
   <p>在 Apple M4 上，這支迴圈大約 3 GiB/s。乍看沒什麼問題——一次比較、一次加法，該有的分支預測也都在。但這個數字離理論上限差了十幾倍，而差距的來源不是「運算太多」，是那個 <code>break</code>。</p>
+
+  <p>GitHub 用「about 3 GiB/s」而不是精確到小數點後幾位的數字來描述這個基準，這類量測本來就會隨著輸入內容、CPU 頻率調度、快取狀態有一定波動；後面幾個階段的數字（2.6、7.6、45+ GiB/s）延續同一種量級感，與其說是精確的科學測量，不如說是用來比較「改一步動多少」的相對指標。</p>
+
+  <p>「記憶體頻寬」是這類迴圈能達到的實際天花板：CPU 算得再快，如果每個位元組都要從主記憶體讀進來、處理完再寫出去，整段運算的速度終究被記憶體匯流排能搬多少資料綁住。3 GiB/s 離這個天花板差了十幾倍，代表 CPU 大部分時間根本沒有在等資料，而是在等分支判斷的結果——這正是後面幾節要拆解的地方。</p>
+
+  <p>向量化之後，CPU 不再是一次讀一個位元組、判斷、寫回，而是一次把一整批位元組（例如 16 個或 32 個）搬進一個寬暫存器，同時對整批資料做同一組運算，再一次寫回去。運算次數沒有變少，但「一次指令處理的資料量」從 1 變成幾十，這才是十幾倍差距的真正來源。</p>
 
   <figure class="vg-w-scrub-casefold-steps" data-mobile="static" data-svg-scroll="800">
     <p class="vg-w-affordance">
@@ -141,6 +149,14 @@ if high_bit_acc &amp; 0x80 == 0 {
 }</code></pre>
 
   <p><code>high_bit_acc</code> 是一個累加器，每個位元組進來就 OR 進去；迴圈跑完之後只要看它的最高位元是不是 0，就知道整段輸入是不是純 ASCII。這個判斷完全搬出迴圈本體，迴圈裡不再有任何跟輸入資料相關的分支，包括原本那個 <code>break</code>。順帶一提，如果整段真的是純 ASCII，函式直接回傳同一塊記憶體——折疊是原地做完的，不需要另外配一塊緩衝區。</p>
+
+  <p>合理的推測是，在 480TB 的規模上，這省下的不只是 CPU cycle，還有每次呼叫可能觸發的一次記憶體配置與資料搬移。</p>
+
+  <p>把兩支迴圈並排看最清楚：naive 版本每個位元組要過兩次判斷——先問「是不是非 ASCII，要不要提前結束」，再問「是不是大寫，要不要加 32」；無分支版本同樣每個位元組跑一次身體，但兩次判斷都被換成了純算術，迴圈本身完全不含任何 if 或 break。位元組數量不變、要做的事情不變，變的只是「用分支問問題」還是「用算術直接算答案」。</p>
+
+  <p>這種寫法的代價通常出現在可讀性跟除錯上：naive 版本的 if 敘述本身就是文件，一眼看得出「這裡在處理非 ASCII」；無分支版本要靠註解跟對照原始邏輯才看得懂。這篇文章逐步展示每一次改寫，某種程度上也是在示範怎麼替這類效能程式碼留下可以被追溯的推導過程。</p>
+
+  <p>wrapping_sub 在 Rust 裡的意思是允許整數運算溢位或下溢、結果直接截斷回同一個位元寬度，而不是 panic 或改成更大的型別。對 u8 而言，這代表任何小於減數的值減完之後會「繞一圈」變成接近 256 的大數——這正是這個技巧能一次篩掉「不在 A 到 Z 範圍內的所有位元組」的原因，不管它們原本比 A 小、比 Z 大，還是高位元組的非 ASCII 值。</p>
 
   <p>真正取代 <code>if b.is_ascii_uppercase()</code> 的是 <code>b.wrapping_sub(b'A') &lt; 26</code>。ASCII 的「A」到「Z」剛好是連續 26 個位元組；用 wraparound 減法減去 <code>'A'</code>，這段區間會落在 0 到 25 之間，其他所有位元組——小寫字母、數字、符號、還有高位元組的非 ASCII 值——都會下溢，變成一個很大的無號數，跟 26 比一次就篩掉。整個過程沒有任何跳轉指令，只有一次減法跟一次比較，CPU 不需要猜測分支方向。</p>
 
@@ -279,7 +295,15 @@ fn scan_end_low(lo: usize, n: usize, low_v: u8) -&gt; usize {
 
   <p><code>ONES</code> 是 8 個 <code>0x01</code> 排在一起、<code>HIGH</code> 是 8 個 <code>0x80</code> 排在一起。把要找的目標值 <code>low_v</code> 乘上 <code>ONES</code>，等於把同一個位元組複製 8 份塞滿一個 <code>u64</code>——這就是 SWAR（SIMD within a register）的核心想法：把一個 64 位元暫存器當成 8 條並排的 8 位元通道，用一次整數運算同時操作全部 8 條通道。<code>(chunk | HIGH).wrapping_sub(bcast) &amp; HIGH</code> 是經典的「同時比較 8 個位元組」寫法：對每一條通道做一次帶保護位元的減法，只要某條通道原本的值大於等於目標值，減完之後那條通道的最高位元就會被清成 0；反過來看 <code>HIGH</code> 遮罩下哪個位元組還留著非 0 的值，就知道是哪個位置最先達成條件。同一段迴圈原本要跑 8 次的逐位元組比較，這裡濃縮成一次 64 位元的算術運算，迴圈本身跳過的次數也少了 8 倍。</p>
 
-  <figure class="vg-w-anim-casefold-swar" data-mobile="swap" data-svg-scroll="640" data-mobile-summary="SWAR 把 8 個位元組打包進一個 64 位元暫存器，一次 wrapping_sub 位元運算就同時完成 8 個位置的比較，不必像逐位元組迴圈一樣跑滿 8 次。">
+  <p>換句話說，掃到的某個位元組如果大於等於 <code>low_v</code>，帶保護位元的減法會讓那個通道留下一個仍然帶著最高位元的結果；小於 <code>low_v</code> 的通道則會下溢，減法把最高位元吃掉變成 0。最後用 <code>&amp; HIGH</code> 一濾，非 0 的位置就是「大於等於 low_v」的那幾個通道位置，一次掃完 8 個候選，不用寫任何巢狀迴圈。</p>
+
+  <p>找到答案之後還有一個小細節：<code>ge.trailing_zeros() / 8</code> 是怎麼從一個 64 位元的遮罩結果，換算成「第幾個位元組」的。<code>trailing_zeros()</code> 數的是從最低位元開始，有多少個連續的 0；因為每個通道佔 8 個位元，這個數字除以 8 取整數，剛好就是第一個非 0 通道的索引——同樣是一個算術運算，不需要另外寫迴圈去逐位元組檢查。</p>
+
+  <p>合理的推測是，選 <code>u64</code> 而非依賴特定架構的 SIMD 指令集（AVX、NEON），是為了讓這段程式碼不必綁定特定平台就能編譯——SWAR 用一般整數算術就能拿到類似 SIMD 的效果，代價是每批只能處理 8 個位元組，比真正的向量暫存器窄。</p>
+
+  <p>byte 層級的 <code>wrapping_sub</code> 與暫存器層級的 SWAR，本質上是同一個想法在兩種尺度上的重複：把「符合條件的位置在哪裡」這個問題，從一連串的條件判斷，改寫成一次可以直接算出答案的算術運算。差別只在於一次處理的資料量——前者一次一個位元組，後者一次八個。</p>
+
+  <figure class="vg-w-anim-casefold-swar" data-mobile="swap" data-svg-scroll="640" data-mobile-summary="SWAR 把 8 個位元組打包進一個 64 位元暫存器，一次 wrapping_sub 位元運算就同時完成 8 個位置的比較，不必像逐位元組迴圈跑滿 8 次。">
     <p class="vg-w-affordance">
       <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <circle cx="12" cy="12" r="9"/>
@@ -371,7 +395,15 @@ fn scan_end_low(lo: usize, n: usize, low_v: u8) -&gt; usize {
 
   <p>Unicode 16.0 有 1,484 組 simple-fold 對應——大寫、小寫，還有少數需要特殊處理的碼點，兩兩配對存成 <code>[(u32, u32); 1484]</code> 的原始表要花 11.6 KB。這個 crate 把它壓到 1,776 bytes，壓縮比超過 6 倍。</p>
 
+  <p>壓縮表帶來的好處不只是省磁碟或省二進位檔大小。查表這件事在 case folding 裡會被觸發極多次——每個非 ASCII 碼點都要查一次，而查詢比對階段還要再查一次；表格越小，越有機會整段留在 CPU 的資料快取裡，每次查表的實際成本就越接近一次暫存器等級的存取，而不是一次真正打到主記憶體的存取。</p>
+
+  <p>page bitmap 搭配累計 popcount，是一種常見的「rank」結構：知道某一頁在 bitmap 裡排第幾個 1，就能算出它在後面陣列裡對應到第幾筆資料，不必整個陣列掃過去找。累計 popcount 表存的是每隔幾頁的「目前已經有幾個 1」，查詢時只要從最近的取樣點往後數幾個 bit，不必從頭數到尾。</p>
+
   <p>第一步靠稀疏性：把整個碼點空間切成 64 個碼點一組的「頁」，1,484 組 fold 只碰到 59 個頁，在將近 1,960 個可能的頁裡連 3% 都不到。第二步靠連續性：「相鄰碼點壓倒性地共用同一個 fold delta——A 到 Z 全部是 <code>+32</code>，Latin Extended 裡則是大量『每兩個碼點才 fold 一次』的交替 run，像 0x0100、0x0102、0x0104 這樣」。把這兩種結構拆開存，六個各司其職的陣列疊起來剛好是 1,776 bytes：</p>
+
+  <p>「Run」在這裡的意思是一段連續碼點都共用同一個 fold delta：只要記錄這段區間的起點、跨距（stride）跟共用的 delta，就不必每個碼點各存一筆。A 到 Z 是最單純的例子——26 個碼點一個 run，delta 都是 +32；碰到「每兩個碼點才 fold 一次」的交替 pattern，run 的 stride 就設成 2，一樣只需要一筆記錄。</p>
+
+  <p>這套結構對「沒有 fold」的碼點特別友善：只要 page bitmap 裡對應的那一個 bit 是 0，就代表整頁都不需要 fold，查詢直接結束，連 popcount、run 陣列都不用碰。1,960 個頁裡有 fold 的只有 59 個，意味著絕大多數查詢會在第一步就提前結束。</p>
 
   <figure class="vg-w-cq-casefold-table" data-mobile="keep" data-svg-scroll="880">
     <style>
@@ -415,7 +447,13 @@ fn scan_end_low(lo: usize, n: usize, low_v: u8) -&gt; usize {
     <figcaption>page bitmap 標記哪個 64 碼點頁裡有 fold；累計 popcount 加 page offset 把頁號換算成後面 run 陣列的起始位置；run end markers 與 run start/stride 定位到哪一段連續區間；byte delta 存實際的 little-endian 偏移量。單一 byte delta 陣列就佔了整張表過半的空間，因為它是唯一沒辦法再靠稀疏性壓縮的部分。</figcaption>
   </figure>
 
+  <p>合理的推測是，這個壓縮版本很可能跟 <code>HIGH</code>、<code>ONES</code> 這些常數一樣是直接寫進二進位檔的 const 陣列——1,776 bytes 跟 11.6 KB 的差距，意味著每一份依賴這個 crate 的執行檔都能少嵌入一截靜態資料。</p>
+
   <p>六個陣列裡最大的 <code>byte delta</code> 也只有 952 bytes，加上其餘五個仍然遠小於一般 CPU 的 L1 data cache 容量——合理的推測是，查表付出的成本因此大幅集中在幾次幾乎必定命中的存取上，而不是原始 11.6 KB pair 表可能觸發的 cache miss。</p>
+
+  <p><code>byte delta</code> 沒辦法再靠分頁或 run 縮小，是因為它記的正是「run 與 run 之間對不上的個別差異值」——這一層的資訊量本身就對應著實際存在的 fold 筆數，能靠稀疏性與 run 編碼省下來的空間，在前面兩步已經省完了，剩下的 952 bytes 是壓不動的底線。</p>
+
+  <p>這種犧牲一部分可讀性換取速度與空間的取捨，貫穿了整篇文章的三個層次——byte 層級的位元運算、暫存器層級的 SWAR、還有資料結構層級的分頁壓縮——每一層都用「多花一點設計成本」換「查詢時少做一點工作」。</p>
 
   <h2>三種實作、三種資料形狀的對比</h2>
 
@@ -450,6 +488,14 @@ fn scan_end_low(lo: usize, n: usize, low_v: u8) -&gt; usize {
   </figure>
 
   <p>純 ASCII 的 5.7 KB 輸入上，<code>simple_fold</code> 超過 45 GiB/s，把 <code>simd_normalizer</code> 的 1.21 GiB/s 跟 <code>HashMap</code> 的 213 MiB/s 都遠遠甩開——這是 <code>high_bit_acc</code> 判斷式生效的情境，整段輸入完全不用碰 Unicode 慢路徑。CJK、不需要 fold 的 8.1 KB 輸入上，<code>simple_fold</code> 仍然領先，2.95 GiB/s 對 1.97 GiB/s。但在每個字元都要 fold 的 worst case 上，情勢反過來：<code>simple_fold</code> 掉到 869 MiB/s，反而略輸給 <code>simd_normalizer</code> 的 922 MiB/s。快取友善的壓縮表跟無分支迴圈，省下來的是「不需要走慢路徑」那一段；當慢路徑變成常態，這個優勢也跟著收斂回普通水準。</p>
+
+  <p>合理的推測是，「worst case」不是純假設情境——任何原始碼裡的字串常值、註解、甚至變數名稱只要大量使用重音字母或非拉丁字母，效能就會往這個方向靠。</p>
+
+  <p>把這三個數字放在一起看，設計取捨很清楚：<code>simple_fold</code> 賭的是輸入以 ASCII 為主的情境。合理的推測是，這個賭注在原始碼這個資料集上相對安全——畢竟絕大多數程式語言的語法本身就是 ASCII，變數名稱、字串內容才可能出現大量非 ASCII 字元。</p>
+
+  <p><code>HashMap</code> 版本在三種情境下都墊底，落差最大時甚至差了兩個數量級——這點反而印證前面的設計選擇：查表這件事本身要嘛靠分支／雜湊這種天生不 SIMD 友善的操作，要嘛靠這篇文章描述的無分支位元技巧與壓縮陣列，兩者中間沒有太多模糊地帶。</p>
+
+  <p>對正在寫索引熱路徑的工程師來說，這三組數字給了一個具體的檢查清單：先確認自己的資料集實際上以 ASCII 為主，再決定要不要為了無分支/壓縮表這種設計多花工程時間——如果輸入本來就大量需要走 Unicode 慢路徑，那麼一般的 SIMD normalizer 反而更穩，不需要為了少數情境去優化多數情境會犧牲的那一小段效能。</p>
 
   <p class="vg-deep-closer"><strong>The unlock</strong>：拿掉 <code>break</code> 不是刪掉一個檢查，而是刪掉一個「資料相關的跳轉」——LLVM 只要看到迴圈出口取決於輸入內容，就不敢把它攤開成 SIMD 指令。把提前退出、if 判斷、寫回全部改寫成同一種形狀（只有算術跟位元運算，不含分支），再讓非 ASCII 偵測搬到迴圈之後才做，一支要處理超過 480TB 原始碼的迴圈就能跑到接近記憶體頻寬——前提是輸入真的以 ASCII 為主，一旦每個位元組都得走 Unicode 慢路徑，這個優勢就會收斂回普通水準。</p>
 </div>
