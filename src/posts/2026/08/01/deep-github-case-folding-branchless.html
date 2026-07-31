@@ -1,0 +1,455 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">GitHub 的程式碼搜尋引擎 Blackbird 要為超過 1.8 億個 repository、480TB 原始碼做 case folding。把最容易被當成最佳化的那一行 <code>if *b &gt;= 0x80 { break; }</code> 整個拿掉，這支迴圈在 Apple M4 上的吞吐量從約 3 GiB/s 衝到超過 45 GiB/s——多出來的十幾倍不是新演算法，是讓編譯器終於能把迴圈向量化。</p>
+  <h1 class="vg-post-title">把 break 拿掉，case-fold 才跑得動</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p><span class="vg-dropcap">G</span>itHub 的程式碼搜尋引擎 Blackbird 索引超過 1.8 億個 repository、480TB 原始碼；每個位元組進 index 之前要先 case-fold 一次，使用者送出查詢時還要再 fold 一次做比對。這條路徑上任何逐 byte 的浪費，都會被規模乘出巨大差異——GitHub 自己的說法是「每個 byte 在抽 ngram、建 index 之前都要先 case-fold，之後每一次查詢比對，隱含或明講，都還要再做一次同樣的操作」。</p>
+
+  <h2>break 怎麼讓 LLVM 放棄向量化</h2>
+
+  <p>最直覺的寫法逐個位元組掃：遇到非 ASCII 就 <code>break</code>，把剩下的交給 Unicode 慢路徑；是大寫字母就加 32 變成小寫。程式碼大致長這樣：</p>
+
+  <pre><code class="language-rust">let bytes = s.as_bytes_mut();
+for (i, b) in bytes.iter_mut().enumerate() {
+    if *b &gt;= 0x80 {
+        break; // non-ASCII at index i: hand the rest to the Unicode path
+    }
+    if b.is_ascii_uppercase() {
+        *b += 32; // 'A'..='Z' → 'a'..='z'
+    }
+}</code></pre>
+
+  <p>在 Apple M4 上，這支迴圈大約 3 GiB/s。乍看沒什麼問題——一次比較、一次加法，該有的分支預測也都在。但這個數字離理論上限差了十幾倍，而差距的來源不是「運算太多」，是那個 <code>break</code>。</p>
+
+  <figure class="vg-w-scrub-casefold-steps" data-mobile="static" data-svg-scroll="800">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M18 8L22 12L18 16"/>
+        <path d="M6 8L2 12L6 16"/>
+        <path d="M2 12H22"/>
+      </svg>
+      <span>拖曳上方把手掃過四個最佳化階段 · 4 個階段</span>
+    </p>
+    <style>
+      .vg-w-scrub-casefold-steps { display: grid; gap: var(--s-2); }
+      .vg-w-scrub-casefold-steps svg.vg-w-scrub-casefold-steps-main { width: 100%; height: auto; min-width: 800px; }
+      .vg-w-scrub-casefold-steps .state { font-family: var(--serif); font-size: var(--fs-sm); padding: var(--s-2) var(--s-3); background: var(--bg-soft); border-left: 2px solid var(--accent); }
+      .vg-w-scrub-casefold-steps .handle { cursor: grab; touch-action: none; }
+    </style>
+    <svg class="vg-w-scrub-casefold-steps-main" viewBox="0 0 720 220" role="img" aria-label="四個最佳化階段的吞吐量：naive 加 break 約 3 GiB/s、無分支判斷但留 break 2.6 GiB/s、拿掉 break 留 if 7.6 GiB/s、全部無分支超過 45 GiB/s">
+      <line x1="70" y1="40" x2="650" y2="40" stroke="var(--muted-2)" stroke-width="1.5"/>
+      <circle cx="70" cy="40" r="4" fill="var(--muted)"/>
+      <circle cx="263.3" cy="40" r="4" fill="var(--muted)"/>
+      <circle cx="456.7" cy="40" r="4" fill="var(--muted)"/>
+      <circle cx="650" cy="40" r="4" fill="var(--muted)"/>
+
+      <text x="70" y="60" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">naive + break</text>
+      <text x="70" y="74" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--ink)">3 GiB/s</text>
+      <text x="263.3" y="60" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">留 break，改無分支</text>
+      <text x="263.3" y="74" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--ink)">2.6 GiB/s</text>
+      <text x="456.7" y="60" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">拿掉 break，留 if</text>
+      <text x="456.7" y="74" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--ink)">7.6 GiB/s</text>
+      <text x="650" y="60" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">全部無分支</text>
+      <text x="650" y="74" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--accent-text)">&gt;45 GiB/s</text>
+
+      <rect data-bar x="590" y="90" width="80" height="12.6" fill="var(--sage-deep)" opacity="0.85"/>
+      <line x1="70" y1="190" x2="670" y2="190" stroke="var(--muted-2)" stroke-width="1"/>
+      <text data-bar-label x="590" y="205" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--ink)">3 GiB/s</text>
+
+      <line class="handle" data-handle-line x1="70" y1="20" x2="70" y2="58" stroke="var(--accent)" stroke-width="2"/>
+      <circle class="handle" data-handle cx="70" cy="40" r="9" fill="var(--accent)" cursor="grab" tabindex="0" role="slider" aria-label="拖曳選擇最佳化階段" aria-valuemin="0" aria-valuemax="3" aria-valuenow="0"/>
+    </svg>
+    <div class="state" data-state>naive ＋ break——約 3 GiB/s。每個位元組都做一次資料相關分支，遇到非 ASCII 就整條指令流跳走。</div>
+
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        var root = document.querySelector('.vg-w-scrub-casefold-steps');
+        var svg = root.querySelector('svg.vg-w-scrub-casefold-steps-main');
+        var handle = root.querySelector('[data-handle]');
+        var handleLine = root.querySelector('[data-handle-line]');
+        var bar = root.querySelector('[data-bar]');
+        var barLabel = root.querySelector('[data-bar-label]');
+        var stateDiv = root.querySelector('[data-state]');
+
+        var stages = [
+          { x: 70, h: 12.6, v: '3 GiB/s', t: 'naive ＋ break——約 3 GiB/s。每個位元組都做一次資料相關分支，遇到非 ASCII 就整條指令流跳走。' },
+          { x: 263.3, h: 8.15, v: '2.6 GiB/s', t: '改寫成無分支比較與寫回，但迴圈出口還是那個 break——2.6 GiB/s，反而比 naive 還慢。' },
+          { x: 456.7, h: 41.5, v: '7.6 GiB/s', t: '拿掉 break，判斷式仍是舊的 if——7.6 GiB/s，這一步開始有局部向量化空間。' },
+          { x: 650, h: 96.7, v: '>45 GiB/s', t: '無分支比較、無分支寫回、沒有提前退出——超過 45 GiB/s，幾乎頂到記憶體頻寬。' }
+        ];
+        var X0 = 70, X1 = 650;
+
+        function nearestIndex(x) {
+          var best = 0, bestDist = Infinity;
+          for (var i = 0; i < stages.length; i++) {
+            var d = Math.abs(stages[i].x - x);
+            if (d < bestDist) { bestDist = d; best = i; }
+          }
+          return best;
+        }
+
+        function render(i) {
+          var s = stages[i];
+          handle.setAttribute('cx', s.x);
+          handleLine.setAttribute('x1', s.x); handleLine.setAttribute('x2', s.x);
+          handle.setAttribute('aria-valuenow', String(i));
+          bar.setAttribute('y', String(190 - s.h));
+          bar.setAttribute('height', String(s.h));
+          barLabel.setAttribute('y', String(190 - s.h - 6));
+          barLabel.textContent = s.v;
+          stateDiv.textContent = s.t;
+        }
+
+        function clientToSvgX(clientX) {
+          var pt = svg.createSVGPoint();
+          pt.x = clientX; pt.y = 0;
+          var svgPt = pt.matrixTransform(svg.getScreenCTM().inverse());
+          return Math.max(X0, Math.min(X1, svgPt.x));
+        }
+
+        var dragging = false;
+        handle.addEventListener('pointerdown', function (e) { dragging = true; handle.setPointerCapture(e.pointerId); });
+        handle.addEventListener('pointermove', function (e) { if (!dragging) return; render(nearestIndex(clientToSvgX(e.clientX))); });
+        handle.addEventListener('pointerup', function () { dragging = false; });
+        handle.addEventListener('keydown', function (e) {
+          var cur = Number(handle.getAttribute('aria-valuenow'));
+          if (e.key === 'ArrowRight') { e.preventDefault(); render(Math.min(3, cur + 1)); }
+          if (e.key === 'ArrowLeft') { e.preventDefault(); render(Math.max(0, cur - 1)); }
+        });
+
+        render(0);
+      })();
+    </script>
+  </figure>
+
+  <p>只把大寫判斷式改寫成無分支版本、迴圈出口卻還留著那個 <code>break</code>，吞吐量不進反退，掉到 2.6 GiB/s；反過來，判斷式維持原本的 <code>if</code>，只拿掉提前退出的 <code>break</code>，吞吐量跳到 7.6 GiB/s。單獨看這兩步，「拿掉 break」比「把判斷式改成無分支」重要得多。GitHub 的說法是：「一個資料相關的迴圈出口本身就足以讓迴圈保持純量，只有 break 真的消失，編譯器才能向量化。」換句話說，只要出口的位置取決於輸入內容，LLVM 就不敢把迴圈攤開成 SIMD 指令——不管迴圈內部的運算本身有沒有分支。</p>
+
+  <h2>用 wrapping_sub 與位移取代 if</h2>
+
+  <p>完全無分支的版本把兩件事一次做了：判斷用位元算術，寫回用無條件的位元運算，非 ASCII 偵測也從迴圈中間搬到迴圈結束之後：</p>
+
+  <pre><code class="language-rust">let mut high_bit_acc: u8 = 0;
+for b in &amp;mut bytes {
+    high_bit_acc |= *b; // detect any non-ASCII byte
+    let is_upper = b.wrapping_sub(b'A') &lt; 26; // branchless A..=Z test
+    *b |= u8::from(is_upper) &lt;&lt; 5; // set bit 5 → lowercase, else no-op
+}
+if high_bit_acc &amp; 0x80 == 0 {
+    return bytes; // pure ASCII: already folded in place, no second buffer
+}</code></pre>
+
+  <p><code>high_bit_acc</code> 是一個累加器，每個位元組進來就 OR 進去；迴圈跑完之後只要看它的最高位元是不是 0，就知道整段輸入是不是純 ASCII。這個判斷完全搬出迴圈本體，迴圈裡不再有任何跟輸入資料相關的分支，包括原本那個 <code>break</code>。順帶一提，如果整段真的是純 ASCII，函式直接回傳同一塊記憶體——折疊是原地做完的，不需要另外配一塊緩衝區。</p>
+
+  <p>真正取代 <code>if b.is_ascii_uppercase()</code> 的是 <code>b.wrapping_sub(b'A') &lt; 26</code>。ASCII 的「A」到「Z」剛好是連續 26 個位元組；用 wraparound 減法減去 <code>'A'</code>，這段區間會落在 0 到 25 之間，其他所有位元組——小寫字母、數字、符號、還有高位元組的非 ASCII 值——都會下溢，變成一個很大的無號數，跟 26 比一次就篩掉。整個過程沒有任何跳轉指令，只有一次減法跟一次比較，CPU 不需要猜測分支方向。</p>
+
+  <p>寫回同樣不需要判斷式。ASCII 大寫跟小寫在位元表示上只差第 5 個位元——「A」是 0x41，「a」是 0x61。<code>u8::from(is_upper) &lt;&lt; 5</code> 把布林值轉成 0 或 0x20，<code>*b |= …</code> 用無條件的 OR 把這個遮罩蓋上去：是大寫就把第 5 位元設成 1，不是大寫就 OR 上 0，等於什麼都沒做。CPU 對兩種情況執行的是同一串指令，唯一的差別是遮罩本身的值——這正是「無分支」在硬體層面的意思：兩個結果分支合併成同一條指令流，用乘法或位元運算讓其中一支自動歸零，而不是靠 CPU 去猜要走哪一支。</p>
+
+  <p>同樣的精神在這支 crate 裡不只出現一次。判斷一個 UTF-8 lead byte 後面還跟幾個 byte，慣常寫法要按高位元 pattern 一段一段判斷；這裡把答案直接編碼成一個查表常數 <code>UTF8_LEN_BY_LEAD</code>，每 4 個位元存一組長度值：<code>const UTF8_LEN_BY_LEAD: u64 = 0x4322_1111_1111_1111;</code>，查詢時只要 <code>(UTF8_LEN_BY_LEAD &gt;&gt; (4 * (lead &gt;&gt; 4))) &amp; 0xF</code> 一次位移加一次遮罩就拿到長度，不必再走一串 if-else。跟 <code>wrapping_sub</code> 的邏輯一樣：把分支變成算術，把判斷變成查一張塞進暫存器裡的表。</p>
+
+  <figure class="vg-w-param-casefold-byte" data-mobile="static" data-svg-scroll="800">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M18 8L22 12L18 16"/>
+        <path d="M6 8L2 12L6 16"/>
+        <path d="M2 12H22"/>
+      </svg>
+      <span>拖曳滑桿掃過 0 到 255 · 藍色視窗是 wrapping_sub 判定為大寫的區間</span>
+    </p>
+    <style>
+      .vg-w-param-casefold-byte { display: grid; gap: var(--s-2); }
+      .vg-w-param-casefold-byte .controls { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+      .vg-w-param-casefold-byte .controls input { flex: 1; height: 36px; accent-color: var(--accent); touch-action: none; }
+      .vg-w-param-casefold-byte .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 4ch; text-align: right; }
+      .vg-w-param-casefold-byte svg.vg-w-param-casefold-byte-main { width: 100%; height: auto; min-width: 800px; }
+      .vg-w-param-casefold-byte .steps { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s-1) var(--s-3); font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); }
+      @media (min-width: 720px) { .vg-w-param-casefold-byte .steps { grid-template-columns: repeat(5, minmax(0, 1fr)); } }
+      .vg-w-param-casefold-byte .step dt { color: var(--muted); font-family: var(--sans); text-transform: uppercase; letter-spacing: 0.04em; }
+      .vg-w-param-casefold-byte .step dd { margin: 0; color: var(--ink); }
+      .vg-w-param-casefold-byte figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+
+    <div class="controls" data-vg-controls>
+      <label for="vg-w-param-casefold-byte-x">byte 值</label>
+      <input id="vg-w-param-casefold-byte-x" type="range" min="0" max="255" value="71"/>
+      <span class="readout" data-b-readout>71</span>
+    </div>
+
+    <svg class="vg-w-param-casefold-byte-main" viewBox="0 0 720 280" role="img" aria-label="b.wrapping_sub(0x41) 隨 byte 值變化的鋸齒曲線，65 到 90 之間落在門檻 26 以下即判定為大寫">
+      <line x1="60" y1="240" x2="700" y2="240" stroke="var(--muted-2)" stroke-width="1"/>
+      <line x1="60" y1="20" x2="60" y2="240" stroke="var(--muted-2)" stroke-width="1"/>
+      <text x="380" y="270" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--muted)">byte 值（0 到 255）</text>
+      <text x="24" y="130" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--muted)" transform="rotate(-90 24 130)">wrapping_sub(0x41) 結果</text>
+
+      <rect x="223.1" y="217.57" width="62.8" height="22.43" fill="var(--accent)" opacity="0.14" stroke="none"/>
+      <text x="254.5" y="212" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--accent-text)">A-Z：is_upper = true</text>
+
+      <line x1="60" y1="217.57" x2="700" y2="217.57" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="3,3"/>
+      <text x="700" y="213" text-anchor="end" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">threshold 26</text>
+
+      <path d="M60,75.25 L220.6,20 M223.1,240 L700,76.1" fill="none" stroke="var(--ink-deep)" stroke-width="2"/>
+
+      <circle data-dot cx="238.04" cy="234.82" r="6" fill="var(--accent)"/>
+    </svg>
+
+    <dl class="steps">
+      <div class="step"><dt>b</dt><dd><span data-b-dec>71</span> / <span data-b-hex>0x47</span> / 「<span data-b-char>G</span>」</dd></div>
+      <div class="step"><dt>wrapping_sub(0x41)</dt><dd data-sub>6</dd></div>
+      <div class="step"><dt>is_upper = sub &lt; 26</dt><dd data-upper>true</dd></div>
+      <div class="step"><dt>mask = is_upper &lt;&lt; 5</dt><dd data-mask>0x20</dd></div>
+      <div class="step"><dt>b | mask</dt><dd><span data-result-hex>0x67</span>（「<span data-result-char>g</span>」）</dd></div>
+    </dl>
+
+    <figcaption>曲線是 (b 減 0x41) mod 256 的鋸齒形狀：b 小於 65 時下溢成一個大數（落在圖表上緣），b 落在 65 到 90 之間時結果是 0 到 25，剛好小於門檻 26。整條曲線只算一次，拖曳滑桿只是移動當前 byte 在曲線上的位置。</figcaption>
+
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        var root = document.querySelector('.vg-w-param-casefold-byte');
+        var input = root.querySelector('input[type="range"]');
+        var readout = root.querySelector('[data-b-readout]');
+        var dot = root.querySelector('[data-dot]');
+        var bDec = root.querySelector('[data-b-dec]');
+        var bHex = root.querySelector('[data-b-hex]');
+        var bChar = root.querySelector('[data-b-char]');
+        var subVal = root.querySelector('[data-sub]');
+        var upperVal = root.querySelector('[data-upper]');
+        var maskVal = root.querySelector('[data-mask]');
+        var resultHex = root.querySelector('[data-result-hex]');
+        var resultChar = root.querySelector('[data-result-char]');
+
+        var X0 = 60, X1 = 700, Y0 = 240, Y1 = 20;
+        function xOf(b) { return X0 + (b / 255) * (X1 - X0); }
+        function yOf(v) { return Y0 - (v / 255) * (Y0 - Y1); }
+        function wrappingSub(b) { return ((b - 65) % 256 + 256) % 256; }
+        function hex2(n) { return '0x' + n.toString(16).toUpperCase().padStart(2, '0'); }
+        function printable(n) { return (n >= 32 && n <= 126) ? String.fromCharCode(n) : '·'; }
+
+        function update() {
+          var b = Number(input.value);
+          readout.textContent = String(b);
+          var sub = wrappingSub(b);
+          var isUpper = sub < 26;
+          var mask = isUpper ? 0x20 : 0x00;
+          var result = b | mask;
+          bDec.textContent = String(b);
+          bHex.textContent = hex2(b);
+          bChar.textContent = printable(b);
+          subVal.textContent = String(sub);
+          upperVal.textContent = isUpper ? 'true' : 'false';
+          maskVal.textContent = hex2(mask);
+          resultHex.textContent = hex2(result);
+          resultChar.textContent = printable(result);
+          dot.setAttribute('cx', xOf(b));
+          dot.setAttribute('cy', yOf(sub));
+          dot.setAttribute('fill', isUpper ? 'var(--accent)' : 'var(--muted)');
+        }
+        input.addEventListener('input', update);
+        update();
+      })();
+    </script>
+  </figure>
+
+  <h2>SWAR：一次 64 位元運算同時比完 8 個位元組</h2>
+
+  <p>位元組層級的技巧只解決「這一個 byte 是不是大寫」。往上一層，查表時常常要在一段候選陣列裡找到第一個符合條件的位置——比如在壓縮過的 Unicode fold table 裡，掃過一段 run 邊界陣列，找出目前碼點落在哪一個 run。這裡再用一次同樣的無分支精神，但一次處理 8 個位元組：</p>
+
+  <pre><code class="language-rust">#[inline]
+fn scan_end_low(lo: usize, n: usize, low_v: u8) -&gt; usize {
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    let bcast = (low_v as u64).wrapping_mul(ONES);
+    let mut base = 0;
+    while base &lt; n {
+        let chunk = u64::from_le_bytes(
+            RUN_END_LOW[lo + base..lo + base + 8]
+                .try_into()
+                .expect("8-byte slice"),
+        );
+        let ge = (chunk | HIGH).wrapping_sub(bcast) &amp; HIGH;
+        if ge != 0 {
+            let j = base + (ge.trailing_zeros() / 8) as usize;
+            return if j &lt; n { j } else { n };
+        }
+        base += 8;
+    }
+    n
+}</code></pre>
+
+  <p><code>ONES</code> 是 8 個 <code>0x01</code> 排在一起、<code>HIGH</code> 是 8 個 <code>0x80</code> 排在一起。把要找的目標值 <code>low_v</code> 乘上 <code>ONES</code>，等於把同一個位元組複製 8 份塞滿一個 <code>u64</code>——這就是 SWAR（SIMD within a register）的核心想法：把一個 64 位元暫存器當成 8 條並排的 8 位元通道，用一次整數運算同時操作全部 8 條通道。<code>(chunk | HIGH).wrapping_sub(bcast) &amp; HIGH</code> 是經典的「同時比較 8 個位元組」寫法：對每一條通道做一次帶保護位元的減法，只要某條通道原本的值大於等於目標值，減完之後那條通道的最高位元就會被清成 0；反過來看 <code>HIGH</code> 遮罩下哪個位元組還留著非 0 的值，就知道是哪個位置最先達成條件。同一段迴圈原本要跑 8 次的逐位元組比較，這裡濃縮成一次 64 位元的算術運算，迴圈本身跳過的次數也少了 8 倍。</p>
+
+  <figure class="vg-w-anim-casefold-swar" data-mobile="swap" data-svg-scroll="640" data-mobile-summary="SWAR 把 8 個位元組打包進一個 64 位元暫存器，一次 wrapping_sub 位元運算就同時完成 8 個位置的比較，不必像逐位元組迴圈一樣跑滿 8 次。">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <circle cx="12" cy="12" r="9"/>
+        <path d="M12 7v5l3 3"/>
+      </svg>
+      <span>按下播放比較逐位元組迴圈與 SWAR 的節奏 · 8 個位元組</span>
+    </p>
+    <style>
+      .vg-w-anim-casefold-swar { display: grid; gap: var(--s-2); }
+      .vg-w-anim-casefold-swar button { min-height: 44px; padding: 0 var(--s-3); font-family: var(--sans); font-size: var(--fs-sm); background: var(--bg-soft); border: 1px solid var(--line); color: var(--ink); cursor: pointer; }
+      .vg-w-anim-casefold-swar button:hover { border-color: var(--accent); }
+      .vg-w-anim-casefold-swar svg.vg-w-anim-casefold-swar-main { width: 100%; height: auto; min-width: 640px; }
+      .vg-w-anim-casefold-swar .row-label { font-family: var(--scribed); font-style: italic; font-size: var(--fs-sm); fill: var(--muted); }
+      .vg-w-anim-casefold-swar figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+
+    <button type="button" data-play>播放比較</button>
+
+    <svg class="vg-w-anim-casefold-swar-main" viewBox="0 0 640 200" role="img" aria-label="上排逐位元組迴圈依序點亮 8 格，下排 SWAR 一次同時點亮 8 格">
+      <text x="20" y="40" class="row-label">逐位元組迴圈</text>
+      <text x="20" y="130" class="row-label">SWAR（一次 8 位元組）</text>
+
+      <g data-row="scalar">
+        <rect data-cell x="120" y="50" width="56" height="40" fill="var(--bg-soft)" stroke="var(--muted-2)"/>
+        <rect data-cell x="184" y="50" width="56" height="40" fill="var(--bg-soft)" stroke="var(--muted-2)"/>
+        <rect data-cell x="248" y="50" width="56" height="40" fill="var(--bg-soft)" stroke="var(--muted-2)"/>
+        <rect data-cell x="312" y="50" width="56" height="40" fill="var(--bg-soft)" stroke="var(--muted-2)"/>
+        <rect data-cell x="376" y="50" width="56" height="40" fill="var(--bg-soft)" stroke="var(--muted-2)"/>
+        <rect data-cell x="440" y="50" width="56" height="40" fill="var(--bg-soft)" stroke="var(--muted-2)"/>
+        <rect data-cell x="504" y="50" width="56" height="40" fill="var(--bg-soft)" stroke="var(--muted-2)"/>
+        <rect data-cell x="568" y="50" width="56" height="40" fill="var(--bg-soft)" stroke="var(--muted-2)"/>
+        <text x="148" y="75" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--ink)">A</text>
+        <text x="212" y="75" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--ink)">m</text>
+        <text x="276" y="75" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--ink)">Z</text>
+        <text x="340" y="75" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--ink)">9</text>
+        <text x="404" y="75" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--ink)">!</text>
+        <text x="468" y="75" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--ink)">B</text>
+        <text x="532" y="75" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--ink)">k</text>
+        <text x="596" y="75" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--ink)">_</text>
+      </g>
+
+      <g data-row="swar">
+        <rect data-cell x="120" y="140" width="56" height="40" fill="var(--bg-soft)" stroke="var(--muted-2)"/>
+        <rect data-cell x="184" y="140" width="56" height="40" fill="var(--bg-soft)" stroke="var(--muted-2)"/>
+        <rect data-cell x="248" y="140" width="56" height="40" fill="var(--bg-soft)" stroke="var(--muted-2)"/>
+        <rect data-cell x="312" y="140" width="56" height="40" fill="var(--bg-soft)" stroke="var(--muted-2)"/>
+        <rect data-cell x="376" y="140" width="56" height="40" fill="var(--bg-soft)" stroke="var(--muted-2)"/>
+        <rect data-cell x="440" y="140" width="56" height="40" fill="var(--bg-soft)" stroke="var(--muted-2)"/>
+        <rect data-cell x="504" y="140" width="56" height="40" fill="var(--bg-soft)" stroke="var(--muted-2)"/>
+        <rect data-cell x="568" y="140" width="56" height="40" fill="var(--bg-soft)" stroke="var(--muted-2)"/>
+        <text x="148" y="165" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--ink)">A</text>
+        <text x="212" y="165" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--ink)">m</text>
+        <text x="276" y="165" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--ink)">Z</text>
+        <text x="340" y="165" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--ink)">9</text>
+        <text x="404" y="165" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--ink)">!</text>
+        <text x="468" y="165" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--ink)">B</text>
+        <text x="532" y="165" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--ink)">k</text>
+        <text x="596" y="165" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--ink)">_</text>
+      </g>
+    </svg>
+
+    <figcaption>上排每格依序點亮，模擬逐位元組迴圈跑滿 8 次；下排 8 格同時點亮，模擬 (chunk | HIGH).wrapping_sub(bcast) &amp; HIGH 一次算完全部 8 個通道。動畫節奏是示意，實際硬體時序不對應真實 GiB/s 數字。</figcaption>
+
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        var root = document.querySelector('.vg-w-anim-casefold-swar');
+        var btn = root.querySelector('[data-play]');
+        var scalarCells = root.querySelectorAll('[data-row="scalar"] [data-cell]');
+        var swarCells = root.querySelectorAll('[data-row="swar"] [data-cell]');
+
+        function flash(el, delay) {
+          el.animate([
+            { fill: 'var(--bg-soft)' },
+            { fill: 'var(--accent)' },
+            { fill: 'var(--bg-soft)' }
+          ], { duration: 320, delay: delay, easing: 'ease-out', fill: 'none' });
+        }
+
+        btn.addEventListener('click', function () {
+          scalarCells.forEach(function (el, i) { flash(el, i * 140); });
+          swarCells.forEach(function (el) { flash(el, 0); });
+        });
+      })();
+    </script>
+  </figure>
+
+  <h2>把 1,484 組 fold 壓進 1,776 bytes</h2>
+
+  <p>Unicode 16.0 有 1,484 組 simple-fold 對應——大寫、小寫，還有少數需要特殊處理的碼點，兩兩配對存成 <code>[(u32, u32); 1484]</code> 的原始表要花 11.6 KB。這個 crate 把它壓到 1,776 bytes，壓縮比超過 6 倍。</p>
+
+  <p>第一步靠稀疏性：把整個碼點空間切成 64 個碼點一組的「頁」，1,484 組 fold 只碰到 59 個頁，在將近 1,960 個可能的頁裡連 3% 都不到。第二步靠連續性：「相鄰碼點壓倒性地共用同一個 fold delta——A 到 Z 全部是 <code>+32</code>，Latin Extended 裡則是大量『每兩個碼點才 fold 一次』的交替 run，像 0x0100、0x0102、0x0104 這樣」。把這兩種結構拆開存，六個各司其職的陣列疊起來剛好是 1,776 bytes：</p>
+
+  <figure class="vg-w-cq-casefold-table" data-mobile="keep" data-svg-scroll="880">
+    <style>
+      .vg-w-cq-casefold-table { container-type: inline-size; container-name: vgwcasefoldtable; display: grid; gap: var(--s-3); }
+      .vg-w-cq-casefold-table svg.vg-w-cq-casefold-table-main { width: 100%; height: auto; min-width: 880px; }
+      .vg-w-cq-casefold-table .legend { display: grid; grid-template-columns: 1fr; gap: var(--s-2); font-family: var(--serif); font-size: var(--fs-sm); }
+      @container vgwcasefoldtable (min-width: 480px) { .vg-w-cq-casefold-table .legend { grid-template-columns: 1fr 1fr; } }
+      @container vgwcasefoldtable (min-width: 720px) { .vg-w-cq-casefold-table .legend { grid-template-columns: 1fr 1fr 1fr; } }
+      .vg-w-cq-casefold-table .item { display: flex; align-items: baseline; gap: var(--s-1); }
+      .vg-w-cq-casefold-table .swatch { display: inline-block; width: 10px; height: 10px; flex: none; }
+      .vg-w-cq-casefold-table .name { color: var(--ink); }
+      .vg-w-cq-casefold-table .bytes { font-family: JetBrains Mono, monospace; color: var(--muted); font-variant-numeric: tabular-nums; }
+      .vg-w-cq-casefold-table .swatch-1 { background: var(--accent); }
+      .vg-w-cq-casefold-table .swatch-2 { background: var(--muted-2); }
+      .vg-w-cq-casefold-table .swatch-3 { background: var(--sage); }
+      .vg-w-cq-casefold-table .swatch-4 { background: var(--ink-deep); }
+      .vg-w-cq-casefold-table .swatch-5 { background: var(--sage-deep); }
+      .vg-w-cq-casefold-table .swatch-6 { background: var(--muted); }
+    </style>
+
+    <svg class="vg-w-cq-casefold-table-main" viewBox="0 0 880 140" role="img" aria-label="1,776 bytes 依六個元件分段的堆疊長條圖">
+      <text x="440" y="24" text-anchor="middle" font-family="IM Fell English, serif" font-style="italic" font-size="13" fill="var(--ink)">1,776 bytes 分成六個陣列</text>
+      <rect x="40" y="40" width="111.7" height="48" fill="var(--accent)"/>
+      <rect x="151.7" y="40" width="14.4" height="48" fill="var(--muted-2)"/>
+      <rect x="166.1" y="40" width="27.0" height="48" fill="var(--sage)"/>
+      <rect x="193.1" y="40" width="110.8" height="48" fill="var(--ink-deep)"/>
+      <rect x="303.9" y="40" width="107.2" height="48" fill="var(--sage-deep)"/>
+      <rect x="411.1" y="40" width="428.8" height="48" fill="var(--muted)"/>
+      <text x="40" y="106" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">0 B</text>
+      <text x="840" y="106" text-anchor="end" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--muted)">1,776 B</text>
+    </svg>
+
+    <div class="legend">
+      <div class="item"><span class="swatch swatch-1"></span><span class="name">page bitmap</span><span class="bytes">248 B</span></div>
+      <div class="item"><span class="swatch swatch-2"></span><span class="name">累計 popcount</span><span class="bytes">32 B</span></div>
+      <div class="item"><span class="swatch swatch-3"></span><span class="name">page offset</span><span class="bytes">60 B</span></div>
+      <div class="item"><span class="swatch swatch-4"></span><span class="name">run end markers</span><span class="bytes">246 B</span></div>
+      <div class="item"><span class="swatch swatch-5"></span><span class="name">run start/stride</span><span class="bytes">238 B</span></div>
+      <div class="item"><span class="swatch swatch-6"></span><span class="name">byte delta</span><span class="bytes">952 B</span></div>
+    </div>
+    <figcaption>page bitmap 標記哪個 64 碼點頁裡有 fold；累計 popcount 加 page offset 把頁號換算成後面 run 陣列的起始位置；run end markers 與 run start/stride 定位到哪一段連續區間；byte delta 存實際的 little-endian 偏移量。單一 byte delta 陣列就佔了整張表過半的空間，因為它是唯一沒辦法再靠稀疏性壓縮的部分。</figcaption>
+  </figure>
+
+  <p>六個陣列裡最大的 <code>byte delta</code> 也只有 952 bytes，加上其餘五個仍然遠小於一般 CPU 的 L1 data cache 容量——合理的推測是，查表付出的成本因此大幅集中在幾次幾乎必定命中的存取上，而不是原始 11.6 KB pair 表可能觸發的 cache miss。</p>
+
+  <h2>三種實作、三種資料形狀的對比</h2>
+
+  <p>壓縮表跟無分支迴圈疊起來，最終效果要看資料形狀。GitHub 把這個 crate（表格裡的 <code>simple_fold</code>）跟一個既有的 <code>simd_normalizer</code>、還有一個用 <code>HashMap</code> 查表的版本放在一起測了三種情境：</p>
+
+  <figure class="vg-w-table-casefold-bench" data-mobile="keep">
+    <style>
+      .vg-w-table-casefold-bench { overflow-x: auto; }
+      .vg-w-table-casefold-bench table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-casefold-bench thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); }
+      .vg-w-table-casefold-bench tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); }
+      .vg-w-table-casefold-bench td.num { font-variant-numeric: tabular-nums; text-align: right; }
+      .vg-w-table-casefold-bench td.win { color: var(--sage-deep); font-family: JetBrains Mono, monospace; }
+      .vg-w-table-casefold-bench caption { text-align: left; caption-side: top; font-family: var(--scribed); font-style: italic; color: var(--muted); font-size: var(--fs-sm); padding: var(--s-1) 0; }
+    </style>
+    <table>
+      <caption>三種輸入形狀下的吞吐量，數字取自 GitHub 原文的實測表格。</caption>
+      <thead>
+        <tr>
+          <th>情境</th>
+          <th class="num">simple_fold</th>
+          <th class="num">simd_normalizer</th>
+          <th class="num">HashMap</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>純 ASCII（5.7 KB）</td><td class="num win">&gt;45 GiB/s</td><td class="num">1.21 GiB/s</td><td class="num">213 MiB/s</td></tr>
+        <tr><td>CJK，無 fold（8.1 KB）</td><td class="num win">2.95 GiB/s</td><td class="num">1.97 GiB/s</td><td class="num">558 MiB/s</td></tr>
+        <tr><td>worst case（全部要 fold）</td><td class="num">869 MiB/s</td><td class="num win">922 MiB/s</td><td class="num">334 MiB/s</td></tr>
+      </tbody>
+    </table>
+  </figure>
+
+  <p>純 ASCII 的 5.7 KB 輸入上，<code>simple_fold</code> 超過 45 GiB/s，把 <code>simd_normalizer</code> 的 1.21 GiB/s 跟 <code>HashMap</code> 的 213 MiB/s 都遠遠甩開——這是 <code>high_bit_acc</code> 判斷式生效的情境，整段輸入完全不用碰 Unicode 慢路徑。CJK、不需要 fold 的 8.1 KB 輸入上，<code>simple_fold</code> 仍然領先，2.95 GiB/s 對 1.97 GiB/s。但在每個字元都要 fold 的 worst case 上，情勢反過來：<code>simple_fold</code> 掉到 869 MiB/s，反而略輸給 <code>simd_normalizer</code> 的 922 MiB/s。快取友善的壓縮表跟無分支迴圈，省下來的是「不需要走慢路徑」那一段；當慢路徑變成常態，這個優勢也跟著收斂回普通水準。</p>
+
+  <p class="vg-deep-closer"><strong>The unlock</strong>：拿掉 <code>break</code> 不是刪掉一個檢查，而是刪掉一個「資料相關的跳轉」——LLVM 只要看到迴圈出口取決於輸入內容，就不敢把它攤開成 SIMD 指令。把提前退出、if 判斷、寫回全部改寫成同一種形狀（只有算術跟位元運算，不含分支），再讓非 ASCII 偵測搬到迴圈之後才做，一支要處理超過 480TB 原始碼的迴圈就能跑到接近記憶體頻寬——前提是輸入真的以 ASCII 為主，一旦每個位元組都得走 Unicode 慢路徑，這個優勢就會收斂回普通水準。</p>
+</div>
