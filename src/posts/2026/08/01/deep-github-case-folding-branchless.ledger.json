@@ -1,0 +1,789 @@
+{
+  "output_path": "src/posts/2026/08/01/deep-github-case-folding-branchless.html",
+  "spine": [
+    "1. Blackbird 要為超過 1.8 億個 repository、480TB 原始碼做 case folding，每個 byte 在建 index 前 fold 一次，查詢比對時再 fold 一次，規模讓逐 byte 的浪費值得優化。",
+    "2. 原始寫法逐位元組掃描，遇到非 ASCII 就 break 跳到 Unicode 慢路徑，是大寫就加 32；在 Apple M4 上約 3 GiB/s（表格給出的精確值是 3.1 GiB/s）。",
+    "3. 只把大寫判斷式改成無分支寫法但保留 break：2.6 GiB/s，反而更慢；只拿掉 break、判斷式仍是 if：7.6 GiB/s，開始有向量化空間——GitHub 把差距歸因於 if 分支：資料相關的迴圈出口本身就足以讓迴圈保持純量，只有 break 真的消失，編譯器才能向量化。",
+    "4. 兩者都做——用 wrapping_sub 做無分支比較、用位移寫回、非 ASCII 偵測搬到迴圈後才做——整段迴圈完全無分支，吞吐量衝到 45+ GiB/s（三項改寫合起來的效果，不是單獨拿掉 break 的效果），同一套精神也用在 UTF-8 lead byte 長度查表上。",
+    "5. 更大顆粒度的比較用 SWAR：把 8 個位元組打包進一個 u64，用 (chunk | HIGH).wrapping_sub(bcast) & HIGH 一次對 8 個位置做比較，取代逐位元組迴圈。",
+    "6. Unicode 16.0 有 1,484 組 simple-fold 對應，原始 pair 表要 11.6 KB；靠稀疏頁面（59/1960 頁有 fold，約 3%）與相鄰碼點共用 delta 的 run 編碼，壓縮成 1,776 bytes（六個具名陣列）。",
+    "7. 效果視資料形狀而定：GitHub 原文的完整表格測了五種輸入形狀，純 ASCII 上 simple_fold 超過 45 GiB/s 遠勝其他實作；但在每個字元都要 fold 的 worst case 上，simple_fold 869 MiB/s 反而略輸給 simd_normalizer 的 922 MiB/s。"
+  ],
+  "sources": [
+    {
+      "url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": null,
+      "perspective": {
+        "mechanism": "把一個資料相關的迴圈提前退出（break）拿掉，配合無分支的位元運算與事後才做的 non-ASCII 偵測，讓編譯器能把整段 case-fold 迴圈向量化；同樣『用算術與位元運算取代分支/查表』的精神也用在 SWAR 8-way 比較與 UTF-8 長度查表上。>45 GiB/s 是三項改寫（無分支判斷、無分支寫回、拿掉 break）合起來的結果，不是拿掉 break 單一項的結果。",
+        "tradeoff": "無分支、快取友善的設計在輸入以 ASCII 為主時吞吐量最高，但在每個位元組都需要 Unicode fold 的 worst case 下，反而略輸給既有的 simd_normalizer——優化針對的是常見情境，不是所有情境。",
+        "reader_use": "工程師在寫任何『逐 byte 掃描、資料相關提前退出』的熱路徑時，可以檢查提前退出本身是否阻止了向量化，並考慮用 wrapping 算術／位元遮罩取代分支，把邊界情況的偵測挪到迴圈之後再做。"
+      }
+    }
+  ],
+  "notes": [
+    {
+      "id": "n01",
+      "url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "quote": "Blackbird, GitHub's code search engine, indexes over 180 million repositories—more than 480TB of source code.",
+      "hedge": "asserted",
+      "interpretation": "建立全文的規模脈絡：case folding 發生在如此大量資料上，逐 byte 的成本才值得優化。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n02",
+      "url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "quote": "On an Apple M4 this runs at about 3 GiB/s.",
+      "hedge": "hedged",
+      "interpretation": "最直覺、帶提前退出 break 的迴圈寫法的基準吞吐量，源文正文用「about」而非精確數字（同一篇文章的階段表格另給出精確值 3.1 GiB/s，見 n18）。此句只描述 naive 版本，未提及最終 >45 GiB/s 版本的硬體平台。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n03",
+      "url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "quote": "let bytes = s.as_bytes_mut();\nfor (i, b) in bytes.iter_mut().enumerate() {\n    if *b >= 0x80 {\n        break; // non-ASCII at index i: hand the rest to the Unicode path\n    }\n    if b.is_ascii_uppercase() {\n        *b += 32; // 'A'..='Z' → 'a'..='z'\n    }\n}",
+      "hedge": "asserted",
+      "interpretation": "逐位元組迴圈的原始寫法，帶資料相關的提前退出，是全文對照的起點。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n04",
+      "url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "quote": "let mut high_bit_acc: u8 = 0;\nfor b in &mut bytes {\n    high_bit_acc |= *b; // detect any non-ASCII byte\n    let is_upper = b.wrapping_sub(b'A') < 26; // branchless A..=Z test\n    *b |= u8::from(is_upper) << 5; // set bit 5 → lowercase, else no-op\n}\nif high_bit_acc & 0x80 == 0 {\n    return bytes; // pure ASCII: already folded in place, no second buffer\n}",
+      "hedge": "asserted",
+      "interpretation": "消除提前退出後的完全無分支版本，是全文效能提升的核心機制——判斷、寫回、迴圈出口三件事同時改寫，>45 GiB/s 是這三件事合起來的結果。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n05",
+      "url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "quote": "branchless test/write, keep break: 2.6 GiB/s",
+      "hedge": "asserted",
+      "interpretation": "只做無分支改寫但保留 break，吞吐量反而下降，證明 break 本身才是瓶頸，不是判斷式本身。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n06",
+      "url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "quote": "drop the early-exit break: 7.6 GiB/s",
+      "hedge": "asserted",
+      "interpretation": "只拿掉 break、判斷式仍是舊的 if，吞吐量已顯著提升，但只到 7.6 GiB/s——遠低於 >45 GiB/s，說明拿掉 break 單獨不足以解釋最終的加速倍數，需要三項改寫合起來才能到 >45。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n07",
+      "url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "quote": "the whole thing runs at > 45 GiB/s—essentially memory bandwidth.",
+      "hedge": "asserted",
+      "interpretation": "完全無分支版本（三項改寫都做）的最終吞吐量，作者將其類比為記憶體頻寬上限；未指明測試硬體。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n08",
+      "url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "quote": "A data-dependent loop exit is enough on its own to keep the loop scalar. Only once the break is gone can the compiler vectorize.",
+      "hedge": "asserted",
+      "interpretation": "解釋為什麼拿掉 break 才是向量化的關鍵，而不是單純的分支數量減少；也是 naive 版本『因為 if 分支』落後理論值的原因（見 n02 旁的差距說明）。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n09",
+      "url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "quote": "#[inline]\nfn scan_end_low(lo: usize, n: usize, low_v: u8) -> usize {\n    const HIGH: u64 = 0x8080_8080_8080_8080;\n    const ONES: u64 = 0x0101_0101_0101_0101;\n    let bcast = (low_v as u64).wrapping_mul(ONES);\n    let mut base = 0;\n    while base < n {\n        let chunk = u64::from_le_bytes(\n            RUN_END_LOW[lo + base..lo + base + 8]\n                .try_into()\n                .expect(\"8-byte slice\"),\n        );\n        let ge = (chunk | HIGH).wrapping_sub(bcast) & HIGH;\n        if ge != 0 {\n            let j = base + (ge.trailing_zeros() / 8) as usize;\n            return if j < n { j } else { n };\n        }\n        base += 8;\n    }\n    n\n}",
+      "hedge": "asserted",
+      "interpretation": "用來在壓縮 fold 表的 RUN_END_LOW 陣列裡做 8-way 同時比較的 SWAR 技巧，取代逐位元組掃描。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n10",
+      "url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "quote": "Unicode 16.0 has 1484 simple-fold mappings / Naïve [(u32, u32); 1484] ~11.6 KB / This crate (paged bitmap + packed runs) 1776 B",
+      "hedge": "asserted",
+      "interpretation": "壓縮前後的表格大小對比，是編碼設計小節的量化基礎，壓縮比約 6.5 倍。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n11",
+      "url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "quote": "Slice the code space into 64-code-point 'pages' and the ~1484 folds touch just 59 of ~1960 possible pages.",
+      "hedge": "asserted",
+      "interpretation": "解釋分頁 bitmap 之所以有效，是因為 fold 在碼點空間裡高度稀疏（59/1960 頁 ≈ 3.01%，即約 3%，不是「不到 3%」）。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n12",
+      "url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "quote": "Adjacent code points overwhelmingly share the same delta to their fold: A–Z all map +32, and Latin Extended is full of alternating runs like 0x0100, 0x0102, 0x0104, … where every second code point folds.",
+      "hedge": "asserted",
+      "interpretation": "run 編碼之所以能省空間，是因為相鄰碼點共用同一個 delta 的比例很高；這是 GitHub 原文的直接說法，正文引用時應標明「GitHub 的說法是」。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n13",
+      "url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "quote": "Every byte is case-folded before we extract ngrams and build the index, and for every potential query result, another (implicit or explicit) case folding operation is needed to locate matches.",
+      "hedge": "asserted",
+      "interpretation": "說明 case folding 在 index 建置與查詢比對兩端都會被觸發，是開場「規模為何重要」的依據。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n14",
+      "url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "quote": "Pure ASCII: simple_fold >45 GiB/s, simd_normalizer 1.21 GiB/s, HashMap 213 MiB/s / CJK no folds: simple_fold 2.95 GiB/s, simd_normalizer 1.97 GiB/s, HashMap 558 MiB/s / Worst case: simple_fold 869 MiB/s, simd_normalizer 922 MiB/s, HashMap 334 MiB/s",
+      "hedge": "asserted",
+      "interpretation": "三種實作在三種資料形狀下（取自完整五種形狀表格中的三行，見 n20）的實測吞吐量，揭露 worst case 下 simple_fold 略輸給 simd_normalizer 的反例。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n15",
+      "url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "quote": "PAGE_BITMAP: 248 bytes / POPCNT_SAMPLES: 32 bytes / PAGE_OFFSET: 60 bytes / RUN_END_LOW: 246 bytes / RUN_START_STRIDE: 238 bytes / BYTE_DELTA: 952 bytes / Total: 1776 bytes",
+      "hedge": "asserted",
+      "interpretation": "六個具名陣列的位元組分配，變數名稱與 SWAR 程式碼裡的 RUN_END_LOW 互相印證，是壓縮表視覺化小節的資料來源。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n16",
+      "url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "quote": "Alexander Neubeck / Greg Orzell",
+      "hedge": "asserted",
+      "interpretation": "文章作者署名，供歸屬使用；正文未直接引用姓名。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n17",
+      "url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "quote": "const UTF8_LEN_BY_LEAD: u64 = 0x4322_1111_1111_1111; / ((UTF8_LEN_BY_LEAD >> (4 * (lead >> 4))) & 0xF) as usize",
+      "hedge": "asserted",
+      "interpretation": "同一套「無分支查表」精神在 UTF-8 長度判斷上的另一個例子，佐證這是整支 crate 的設計哲學而非單一技巧。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n18",
+      "url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "quote": "naive (break + branch test) | 3.1 GiB/s | no (0 vector instrs) / → branchless test/write, keep break | 2.6 GiB/s | no (0 vector instrs) / → drop the early-exit break | 7.6 GiB/s | partially (25 vector instrs)",
+      "hedge": "asserted",
+      "interpretation": "階段表格給出比正文「about 3 GiB/s」更精確的數值 3.1 GiB/s，且各階段的向量化指令數（0 → 0 → 25）直接顯示拿掉 break 才開始出現向量指令，但尚未到完全向量化。加入於 Step 7.6c 修正回合，用來訂正原稿把 3.1 誤述為「刻意避免小數精度」的說法。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n19",
+      "url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "quote": "Measured, the cumulative ladder on pure ASCII (Apple M4, 5.7 KB buffer):",
+      "hedge": "asserted",
+      "interpretation": "階段表格的量測條件說明；不單獨作為「>45 GiB/s 明確歸屬於 Apple M4」的依據——正文只在 naive 版本那句明講 Apple M4（見 n02），故行文避免把 M4 直接綁定到 >45 GiB/s 那一行。加入於 Step 7.6c 修正回合。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n20",
+      "url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "quote": "Pure ASCII (5.7 KB) / Chinese/Japanese/Korean, no folds (8.1 KB) / Symbols / Myanmar, no folds (9.0 KB) / Worst case: Latin/Greek/Cyrillic (Unicode U+0000–U+FFFF), all folding (8.8 KB) / Length-changing folds (1.7 KB)",
+      "hedge": "asserted",
+      "interpretation": "GitHub 完整基準表格的五個輸入情境列標；本文表格只挑其中三行（Pure ASCII、CJK no folds、Worst case）呈現，正文措辭需標明是五取三而非全部。加入於 Step 7.6c 修正回合。",
+      "timeliness": "durable"
+    }
+  ],
+  "claims": [
+    {
+      "id": "c01",
+      "claim_text": "GitHub 的程式碼搜尋引擎 Blackbird 索引超過 1.8 億個 repository、480TB 原始碼",
+      "text": "GitHub 的程式碼搜尋引擎 Blackbird 索引超過 1.8 億個 repository、480TB 原始碼",
+      "note_ids": [
+        "n01"
+      ],
+      "source_url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "type": "number",
+      "load": "high",
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Blackbird, GitHub's code search engine, indexes over 180 million repositories—more than 480TB of source code.",
+      "action": "none",
+      "resolution": "none-needed",
+      "note": "逐字命中。",
+      "archive_url": null
+    },
+    {
+      "id": "c02",
+      "claim_text": "GitHub 自己的說法是「每個 byte 在抽 ngram、建 index 之前都要先 case-fold，之後每一次查詢比對，隱含或明講，都還要再做一次同樣的操作」",
+      "text": "GitHub 自己的說法是「每個 byte 在抽 ngram、建 index 之前都要先 case-fold，之後每一次查詢比對，隱含或明講，都還要再做一次同樣的操作」",
+      "note_ids": [
+        "n13"
+      ],
+      "source_url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "type": "quote",
+      "load": "high",
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Every byte is case-folded before we extract ngrams and build the index, and for every potential query result, another (implicit or explicit) case folding operation is needed to locate matches.",
+      "action": "none",
+      "resolution": "none-needed",
+      "note": "逐字命中，帶句內歸屬。",
+      "archive_url": null
+    },
+    {
+      "id": "c03",
+      "claim_text": "hero：把判斷式、寫回、還有提前退出全部改寫成無分支的位元運算，迴圈才衝上超過 45 GiB/s；Apple M4 只掛在約 3 GiB/s 的基準上",
+      "text": "hero：把判斷式、寫回、還有提前退出全部改寫成無分支的位元運算，迴圈才衝上超過 45 GiB/s；Apple M4 只掛在約 3 GiB/s 的基準上",
+      "note_ids": [
+        "n02",
+        "n06",
+        "n07"
+      ],
+      "source_url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "type": "causal",
+      "load": "high",
+      "independence": "single-source",
+      "verdict": "unverifiable",
+      "hedge_delta": "none",
+      "evidence": "naive (break + branch test) 3.1 GiB/s → branchless test/write, keep break 2.6 GiB/s → drop the early-exit break 7.6 GiB/s → branchless test + write (the loop) >45 GiB/s",
+      "action": "correct",
+      "resolution": "corrected",
+      "note": "ORIGINAL hero 把 3→45+ 的整段跳躍歸給「把 break 整個拿掉」這一個動作，與來源階梯表牴觸（只拿掉 break 是 7.6 GiB/s）；來源也只在 3 GiB/s 那句提到 Apple M4。CORRECTED：改為三項改寫合計才到 45+，M4 只掛在基準值上；sidecar summary 一併修正。",
+      "archive_url": null
+    },
+    {
+      "id": "c04",
+      "claim_text": "naive 迴圈程式碼區塊（含兩行 inline 註解）",
+      "text": "naive 迴圈程式碼區塊（含兩行 inline 註解）",
+      "note_ids": [
+        "n03"
+      ],
+      "source_url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "type": "quote",
+      "load": "high",
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "let bytes = s.as_bytes_mut();\nfor (i, b) in bytes.iter_mut().enumerate() {\n    if *b >= 0x80 {\n        break; // non-ASCII at index i: hand the rest to the Unicode path\n    }\n    if b.is_ascii_uppercase() {\n        *b += 32; // 'A'..='Z' → 'a'..='z'\n    }\n}",
+      "action": "none",
+      "resolution": "none-needed",
+      "note": "逐行命中，含兩行註解。",
+      "archive_url": null
+    },
+    {
+      "id": "c05",
+      "claim_text": "在 Apple M4 上，這支迴圈大約 3 GiB/s",
+      "text": "在 Apple M4 上，這支迴圈大約 3 GiB/s",
+      "note_ids": [
+        "n02"
+      ],
+      "source_url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "type": "number",
+      "load": "high",
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "On an Apple M4 this runs at about 3 GiB/s.",
+      "action": "none",
+      "resolution": "none-needed",
+      "note": "機器歸屬確在來源，來源的 about 譯為「大約」，強度一致。",
+      "archive_url": null
+    },
+    {
+      "id": "c06",
+      "claim_text": "GitHub 的正文用「about 3 GiB/s」，同篇的階段表格給的是 3.1 GiB/s",
+      "text": "GitHub 的正文用「about 3 GiB/s」，同篇的階段表格給的是 3.1 GiB/s",
+      "note_ids": [
+        "n02",
+        "n18"
+      ],
+      "source_url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "type": "attribution",
+      "load": "medium",
+      "independence": "single-source",
+      "verdict": "unverifiable",
+      "hedge_delta": "none",
+      "evidence": "naive (break + branch test) | 3.1 GiB/s | no (0 vector instrs)",
+      "action": "correct",
+      "resolution": "corrected",
+      "note": "ORIGINAL 寫「而不是精確到小數點後幾位的數字」，與來源牴觸——同一基準在階梯表裡就是 3.1，2.6／7.6 也都是一位小數。CORRECTED：改為指出正文與表格兩種寫法並存；同時刪去無來源支撐的「更像相對指標而非精確測量」評價句。",
+      "archive_url": null
+    },
+    {
+      "id": "c07",
+      "claim_text": "3 GiB/s 離上限差了十幾倍，GitHub 把這個差距直接歸因於 if 分支",
+      "text": "3 GiB/s 離上限差了十幾倍，GitHub 把這個差距直接歸因於 if 分支",
+      "note_ids": [
+        "n08",
+        "n02"
+      ],
+      "source_url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "type": "causal",
+      "load": "high",
+      "independence": "single-source",
+      "verdict": "unverifiable",
+      "hedge_delta": "none",
+      "evidence": "That sounds fine in isolation, but it is more than 15× short of \"optimal\" because of the if branches. / A data-dependent loop exit is enough on its own to keep the loop scalar.",
+      "action": "correct",
+      "resolution": "corrected",
+      "note": "ORIGINAL（由 coordinator 於 Step 8.5 前改寫）主張「指令數與迴圈開銷先撞到上限，記憶體匯流排根本還沒被餵飽」——來源從未討論記憶體匯流排飽和或迴圈開銷。CORRECTED：改為來源自己的歸因（if 分支使迴圈維持純量、無法向量化），綁回 n08 與 n02。",
+      "archive_url": null
+    },
+    {
+      "id": "c08",
+      "claim_text": "只改判斷式、保留 break：2.6 GiB/s，不進反退",
+      "text": "只改判斷式、保留 break：2.6 GiB/s，不進反退",
+      "note_ids": [
+        "n05"
+      ],
+      "source_url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "type": "number",
+      "load": "high",
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "branchless test/write, keep break: 2.6 GiB/s",
+      "action": "none",
+      "resolution": "none-needed",
+      "note": "數字與標籤逐字對應；來源另有 \"Branchless is a pessimization in scalar code\" 佐證。",
+      "archive_url": null
+    },
+    {
+      "id": "c09",
+      "claim_text": "只拿掉 break、判斷式仍是 if：7.6 GiB/s",
+      "text": "只拿掉 break、判斷式仍是 if：7.6 GiB/s",
+      "note_ids": [
+        "n06"
+      ],
+      "source_url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "type": "number",
+      "load": "high",
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "drop the early-exit break: 7.6 GiB/s",
+      "action": "none",
+      "resolution": "none-needed",
+      "note": "widget state 文案與來源的 partially (25 vector instrs) 一致。",
+      "archive_url": null
+    },
+    {
+      "id": "c10",
+      "claim_text": "無分支比較、無分支寫回、沒有提前退出——超過 45 GiB/s，幾乎頂到記憶體頻寬",
+      "text": "無分支比較、無分支寫回、沒有提前退出——超過 45 GiB/s，幾乎頂到記憶體頻寬",
+      "note_ids": [
+        "n07"
+      ],
+      "source_url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "type": "number",
+      "load": "high",
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "LLVM emits 16-byte-at-a-time NEON and the whole thing runs at > 45 GiB/s—essentially memory bandwidth.",
+      "action": "none",
+      "resolution": "none-needed",
+      "note": "逐字命中；這是全文正確把 45+ 綁在三項改寫上的位置，用作 c03 的修正依據。",
+      "archive_url": null
+    },
+    {
+      "id": "c11",
+      "claim_text": "GitHub 的說法是：「一個資料相關的迴圈出口本身就足以讓迴圈保持純量，只有 break 真的消失，編譯器才能向量化。」",
+      "text": "GitHub 的說法是：「一個資料相關的迴圈出口本身就足以讓迴圈保持純量，只有 break 真的消失，編譯器才能向量化。」",
+      "note_ids": [
+        "n08"
+      ],
+      "source_url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "type": "quote",
+      "load": "high",
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "A data-dependent loop exit is enough on its own to keep the loop scalar. Only once the break is gone can the compiler vectorize.",
+      "action": "none",
+      "resolution": "none-needed",
+      "note": "逐字命中，帶句內歸屬。",
+      "archive_url": null
+    },
+    {
+      "id": "c12",
+      "claim_text": "完全無分支版本程式碼區塊",
+      "text": "完全無分支版本程式碼區塊",
+      "note_ids": [
+        "n04"
+      ],
+      "source_url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "type": "quote",
+      "load": "high",
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "let mut high_bit_acc: u8 = 0;\nfor b in &mut bytes {\n    high_bit_acc |= *b; // detect any non-ASCII byte\n    let is_upper = b.wrapping_sub(b'A') < 26; // branchless A..=Z test\n    *b |= u8::from(is_upper) << 5; // set bit 5 → lowercase, else no-op\n}",
+      "action": "none",
+      "resolution": "none-needed",
+      "note": "逐行命中，四行註解經單獨複查皆存在於來源。",
+      "archive_url": null
+    },
+    {
+      "id": "c13",
+      "claim_text": "b.wrapping_sub(b'A') < 26 是範圍測試：其他位元組下溢成大數，跟 26 比一次就篩掉",
+      "text": "b.wrapping_sub(b'A') < 26 是範圍測試：其他位元組下溢成大數，跟 26 比一次就篩掉",
+      "note_ids": [
+        "n04"
+      ],
+      "source_url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "type": "causal",
+      "load": "high",
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "`b.wrapping_sub(b'A') < 26` is true exactly for `A..=Z` (any other byte wraps to ≥ 26), yielding a 0/1 mask with no branch.",
+      "action": "none",
+      "resolution": "none-needed",
+      "note": "機制說明由來源條列直接支持。",
+      "archive_url": null
+    },
+    {
+      "id": "c14",
+      "claim_text": "u8::from(is_upper) << 5 轉成 0 或 0x20，OR 無條件寫回",
+      "text": "u8::from(is_upper) << 5 轉成 0 或 0x20，OR 無條件寫回",
+      "note_ids": [
+        "n04"
+      ],
+      "source_url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "type": "causal",
+      "load": "high",
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "`| (is_upper << 5)` sets bit 5—turning an upper-case letter lower-case and being a no-op on everything else—the byte is always written, never branched on.",
+      "action": "none",
+      "resolution": "none-needed",
+      "note": "逐項對應；A=0x41／a=0x61 屬可自證的 ASCII 背景。",
+      "archive_url": null
+    },
+    {
+      "id": "c15",
+      "claim_text": "const UTF8_LEN_BY_LEAD 與其查表表達式",
+      "text": "const UTF8_LEN_BY_LEAD 與其查表表達式",
+      "note_ids": [
+        "n17"
+      ],
+      "source_url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "type": "quote",
+      "load": "medium",
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "const UTF8_LEN_BY_LEAD: u64 = 0x4322_1111_1111_1111;  ((UTF8_LEN_BY_LEAD >> (4 * (lead >> 4))) & 0xF) as usize",
+      "action": "none",
+      "resolution": "none-needed",
+      "note": "常數字面值與表達式皆逐字命中。",
+      "archive_url": null
+    },
+    {
+      "id": "c16",
+      "claim_text": "scan_end_low 的 SWAR 實作與三個關鍵行",
+      "text": "scan_end_low 的 SWAR 實作與三個關鍵行",
+      "note_ids": [
+        "n09"
+      ],
+      "source_url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "type": "quote",
+      "load": "high",
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "const HIGH: u64 = 0x8080_8080_8080_8080;  const ONES: u64 = 0x0101_0101_0101_0101;  let ge = (chunk | HIGH).wrapping_sub(bcast) & HIGH;",
+      "action": "none",
+      "resolution": "none-needed",
+      "note": "整段函式確認存在；trailing_zeros()/8 的換算屬可自證算術。",
+      "archive_url": null
+    },
+    {
+      "id": "c17",
+      "claim_text": "1,484 組 simple-fold、原始表約 11.6 KB、壓到 1,776 bytes、壓縮比超過 6 倍",
+      "text": "1,484 組 simple-fold、原始表約 11.6 KB、壓到 1,776 bytes、壓縮比超過 6 倍",
+      "note_ids": [
+        "n10"
+      ],
+      "source_url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "type": "number",
+      "load": "high",
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Unicode 16.0 has 1484 simple-fold mappings；Naïve [(u32, u32); 1484] ~11.6 KB；This crate (paged bitmap + packed runs) 1776 B",
+      "action": "none",
+      "resolution": "none-needed",
+      "note": "三個數字全部命中；「超過 6 倍」為保守換算（實際約 6.5–6.7）。",
+      "archive_url": null
+    },
+    {
+      "id": "c18",
+      "claim_text": "64 個碼點一組的頁，1,484 組 fold 只碰到 59 個頁（共約 1,960 頁）",
+      "text": "64 個碼點一組的頁，1,484 組 fold 只碰到 59 個頁（共約 1,960 頁）",
+      "note_ids": [
+        "n11"
+      ],
+      "source_url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "type": "number",
+      "load": "high",
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Slice the code space into 64-code-point \"pages\" and the ~1484 folds touch just 59 of ~1960 possible pages.",
+      "action": "none",
+      "resolution": "none-needed",
+      "note": "三個數字皆對應。",
+      "archive_url": null
+    },
+    {
+      "id": "c19",
+      "claim_text": "59 個頁在約 1,960 個可能的頁裡約佔 3%",
+      "text": "59 個頁在約 1,960 個可能的頁裡約佔 3%",
+      "note_ids": [
+        "n11"
+      ],
+      "source_url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "type": "number",
+      "load": "medium",
+      "independence": "single-source",
+      "verdict": "unverifiable",
+      "hedge_delta": "none",
+      "evidence": "Slice the code space into 64-code-point \"pages\" and the ~1484 folds touch just 59 of ~1960 possible pages.",
+      "action": "correct",
+      "resolution": "corrected",
+      "note": "ORIGINAL 寫「連 3% 都不到」，但 59 ÷ 1960 = 3.01%，略高於 3%——這是讀者可直接驗算的數字。CORRECTED 為「約佔 3%」。",
+      "archive_url": null
+    },
+    {
+      "id": "c20",
+      "claim_text": "「相鄰碼點壓倒性地共用同一個 fold delta——A 到 Z 全部是 +32…」",
+      "text": "「相鄰碼點壓倒性地共用同一個 fold delta——A 到 Z 全部是 +32…」",
+      "note_ids": [
+        "n12"
+      ],
+      "source_url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "type": "quote",
+      "load": "high",
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Adjacent code points overwhelmingly share the same delta to their fold: A–Z all map `+32`, and Latin Extended is full of _alternating_ runs like `0x0100`, `0x0102`, `0x0104`, … where every second code point folds.",
+      "action": "none",
+      "resolution": "none-needed",
+      "note": "逐字命中，確為來源措辭。修訂中已補上「GitHub 的說法是」句內歸屬。",
+      "archive_url": null
+    },
+    {
+      "id": "c21",
+      "claim_text": "六個陣列疊起來 1,776 bytes：248／32／60／246／238／952",
+      "text": "六個陣列疊起來 1,776 bytes：248／32／60／246／238／952",
+      "note_ids": [
+        "n15"
+      ],
+      "source_url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "type": "number",
+      "load": "high",
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "PAGE_BITMAP 248 ; POPCNT_SAMPLES 32 ; PAGE_OFFSET 60 ; RUN_END_LOW 246 ; RUN_START_STRIDE 238 ; BYTE_DELTA 952 ; Total 1776",
+      "action": "none",
+      "resolution": "none-needed",
+      "note": "六格逐一命中，總和一致；952/1776 = 53.6% 換算正確。",
+      "archive_url": null
+    },
+    {
+      "id": "c22",
+      "claim_text": "GitHub 測了五種輸入形狀，本文挑其中三種",
+      "text": "GitHub 測了五種輸入形狀，本文挑其中三種",
+      "note_ids": [
+        "n14",
+        "n20"
+      ],
+      "source_url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "type": "attribution",
+      "load": "medium",
+      "independence": "single-source",
+      "verdict": "unverifiable",
+      "hedge_delta": "none",
+      "evidence": "Pure ASCII (5.7 KB) / Chinese-Japanese-Korean, no folds (8.1 KB) / Symbols / Myanmar, no folds (9.0 KB) / Worst case: Latin/Greek/Cyrillic, all folding (8.8 KB) / Length-changing folds (1.7 KB)",
+      "action": "correct",
+      "resolution": "corrected",
+      "note": "ORIGINAL 寫「測了三種情境」，把自己的節選講成來源的全部測項（來源實測五種 workload）。CORRECTED：明說來源測五種、本文挑三種；表格 caption 一併更新。",
+      "archive_url": null
+    },
+    {
+      "id": "c23",
+      "claim_text": "九格 benchmark 數字，含 worst case simple_fold 869 MiB/s 輸給 simd_normalizer 922 MiB/s",
+      "text": "九格 benchmark 數字，含 worst case simple_fold 869 MiB/s 輸給 simd_normalizer 922 MiB/s",
+      "note_ids": [
+        "n14"
+      ],
+      "source_url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "type": "number",
+      "load": "high",
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Pure ASCII (5.7 KB) | >45 GiB/s | 1.21 GiB/s | 213 MiB/s ; CJK no folds (8.1 KB) | 2.95 GiB/s | 1.97 GiB/s | 558 MiB/s ; Worst case (8.8 KB) | 869 MiB/s | 922 MiB/s | 334 MiB/s",
+      "action": "none",
+      "resolution": "none-needed",
+      "note": "九格全部逐字命中；反例未被隱藏，正文與 closer 兩處都寫明。",
+      "archive_url": null
+    },
+    {
+      "id": "c24",
+      "claim_text": "HashMap 版本三種情境都墊底，落差最大時差了兩個數量級",
+      "text": "HashMap 版本三種情境都墊底，落差最大時差了兩個數量級",
+      "note_ids": [
+        "n14"
+      ],
+      "source_url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "type": "number",
+      "load": "medium",
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Pure ASCII (5.7 KB) | >45 GiB/s | 1.21 GiB/s | 213 MiB/s",
+      "action": "none",
+      "resolution": "none-needed",
+      "note": ">45 GiB/s ≈ >46,080 MiB/s 對 213 MiB/s 為 216 倍以上，「兩個數量級」成立且保守。",
+      "archive_url": null
+    },
+    {
+      "id": "c25",
+      "claim_text": "合理的推測是，在 480TB 的規模上省下的不只是 CPU cycle，還有每次呼叫可能觸發的記憶體配置與搬移",
+      "text": "合理的推測是，在 480TB 的規模上省下的不只是 CPU cycle，還有每次呼叫可能觸發的記憶體配置與搬移",
+      "note_ids": [
+        "n01"
+      ],
+      "source_url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "type": "causal",
+      "load": "medium",
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": "Blackbird, GitHub's code search engine, indexes over 180 million repositories—more than 480TB of source code.",
+      "action": "none",
+      "resolution": "none-needed",
+      "note": "推斷標記真實存在；唯一帶數字的成分 480TB 綁回 n01，未夾帶無出處量化宣稱。",
+      "archive_url": null
+    },
+    {
+      "id": "c26",
+      "claim_text": "合理的推測是，選 u64 而非 AVX／NEON 是為了跨平台，代價是每批只有 8 個位元組",
+      "text": "合理的推測是，選 u64 而非 AVX／NEON 是為了跨平台，代價是每批只有 8 個位元組",
+      "note_ids": [
+        "n09"
+      ],
+      "source_url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "type": "causal",
+      "load": "medium",
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": "const HIGH: u64 = 0x8080_8080_8080_8080; let ge = (chunk | HIGH).wrapping_sub(bcast) & HIGH;",
+      "action": "none",
+      "resolution": "none-needed",
+      "note": "推斷標記存在；8 bytes 是 u64 的定義寬度、可自證。",
+      "archive_url": null
+    },
+    {
+      "id": "c27",
+      "claim_text": "合理的推測是，壓縮表很可能是寫進二進位檔的 const 陣列",
+      "text": "合理的推測是，壓縮表很可能是寫進二進位檔的 const 陣列",
+      "note_ids": [
+        "n10"
+      ],
+      "source_url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "type": "causal",
+      "load": "low",
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": "Naïve [(u32, u32); 1484] ~11.6 KB ; This crate (paged bitmap + packed runs) 1776 B",
+      "action": "none",
+      "resolution": "none-needed",
+      "note": "推斷標記存在；兩個數字綁回 n10，未夾帶新數字。",
+      "archive_url": null
+    },
+    {
+      "id": "c28",
+      "claim_text": "合理的推測是，1,776 bytes 遠小於一般 L1 data cache，查表成本集中在幾乎必定命中的存取上",
+      "text": "合理的推測是，1,776 bytes 遠小於一般 L1 data cache，查表成本集中在幾乎必定命中的存取上",
+      "note_ids": [
+        "n15",
+        "n10"
+      ],
+      "source_url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "type": "causal",
+      "load": "low",
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": "BYTE_DELTA 952 ; Total 1776",
+      "action": "none",
+      "resolution": "none-needed",
+      "note": "推斷標記存在；未給出任何具體 L1 容量數值，故不構成假裝有出處的數字。",
+      "archive_url": null
+    },
+    {
+      "id": "c29",
+      "claim_text": "合理的推測是，worst case 不是純假設情境",
+      "text": "合理的推測是，worst case 不是純假設情境",
+      "note_ids": [],
+      "source_url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "type": "causal",
+      "load": "medium",
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "action": "none",
+      "resolution": "none-needed",
+      "note": "推斷標記存在，全段不含數字；來源未討論 worst case 在真實原始碼中的出現頻率。",
+      "archive_url": null
+    },
+    {
+      "id": "c30",
+      "claim_text": "合理的推測是，ASCII 這個賭注在原始碼資料集上相對安全",
+      "text": "合理的推測是，ASCII 這個賭注在原始碼資料集上相對安全",
+      "note_ids": [],
+      "source_url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "type": "causal",
+      "load": "medium",
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "action": "none",
+      "resolution": "none-needed",
+      "note": "推斷標記存在，全段無數字、無比例；來源未給 ASCII 佔比統計，本文也未偽造。",
+      "archive_url": null
+    },
+    {
+      "id": "c31",
+      "claim_text": "closer：資料相關的迴圈出口讓 LLVM 不敢向量化；改寫後一支處理 480TB 的迴圈跑到接近記憶體頻寬",
+      "text": "closer：資料相關的迴圈出口讓 LLVM 不敢向量化；改寫後一支處理 480TB 的迴圈跑到接近記憶體頻寬",
+      "note_ids": [
+        "n08",
+        "n01",
+        "n07"
+      ],
+      "source_url": "https://github.blog/engineering/architecture-optimization/dont-stop-early-case-folding-source-code-at-memory-speed/",
+      "type": "causal",
+      "load": "high",
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "A data-dependent loop exit is enough on its own to keep the loop scalar. / LLVM emits 16-byte-at-a-time NEON and the whole thing runs at > 45 GiB/s—essentially memory bandwidth.",
+      "action": "none",
+      "resolution": "none-needed",
+      "note": "三個成分各自有據；closer 正確把 45+ 的前提寫成三項改寫合計，並保留 worst case 但書。",
+      "archive_url": null
+    }
+  ],
+  "checked_at": "2026-08-01",
+  "checker_rounds": 1,
+  "coverage": {
+    "candidate_claims": 38,
+    "checked": 31,
+    "dropped_low_load": 7
+  }
+}
