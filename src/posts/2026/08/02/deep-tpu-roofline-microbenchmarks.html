@@ -1,0 +1,363 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">Google 工程團隊量到一個 110B 參數的 MoE 模型，forward pass 打到 1.85 PFLOPS；同一次訓練裡，routing 與 attention 原語卻只跑到 speed-of-light 的 30% 到 60%——同一顆晶片、同一個 step，兩種完全不同的瓶頸同時發生，光問「TPU 夠不夠快」回答不了任何問題。</p>
+  <h1 class="vg-post-title">別猜瓶頸：TPU 的 Roofline 怎麼讀</h1>
+</header>
+
+<div class="vg-post-prose">
+
+<p><span class="vg-dropcap">看</span>到 step time 卡住的時候，多數工程師的第一反應是猜——是不是 collective communication 太慢？還是 HBM 頻寬不夠？還是純粹算力不足？Google 在 7 月底的一篇文章裡介紹了 accelerator-microbenchmarks 這套已公開的工具（GitHub：AI-Hypercomputer/accelerator-microbenchmarks），主張把這個猜測的過程換成量測。文章開場把方法論講得很直白：「Determining the empirical performance of TPUs requires moving beyond product specifications to granular, real-world measurements.」——TPU 的真實效能，得靠拆到更細分項的實測，不能只看規格表上的峰值。這篇文章要講的是這套量測方法怎麼運作：量什麼、怎麼分類瓶頸，以及一個真實案例裡，量出來的結果怎麼變成訓練 step time 減少 21.2% 的具體改動。</p>
+
+<h2>step time 卡住的時候，你通常是在猜</h2>
+
+<p>Google 團隊在文章裡舉了一個具體案例：「In one example, we analyzed the performance tuning of a 110B Mixture-of-Experts (MoE) training workload deployed on a 4x4x4 TPU 7x configuration, leveraging microbenchmarks to establish hardware baselines and drive optimization for complex, sparse workloads.」110B 參數的 MoE 模型，訓練跑在 4x4x4 拓撲的 TPU 7x（也就是 Ironwood）上。案例的重點不是「這個模型有多大」，是團隊怎麼從「step time 不夠快」這句抱怨，走到「routing 卡在 memory-bound、forward pass 卡在 compute-bound」這句診斷——中間靠的不是經驗法則，是把整條 pipeline 拆成五個可以獨立量測的面向。</p>
+
+<p>文章把這個階段稱作「establish hardware baselines」——在真正動手最佳化之前，先確認這批硬體在理想情況下能跑到多快、五個面向各自的數字長什麼樣子。沒有這個基準線，後面看到的任何進步都無法判斷是真的把瓶頸解決了，還是量測本身的雜訊。</p>
+
+<p>這裡說的 step time，指的是訓練迴圈跑完一個 batch、更新一次參數所花的時間——forward pass 算出預測、backward pass 算出梯度、optimizer 更新權重，一個 step 走完這整圈才算數。step time 越短，單位時間內能跑的 step 越多，同樣的訓練預算下能看到更多資料、迭代更多次。這也是為什麼 21.2% 這個數字直接對應訓練成本與時間：同一批硬體、同一個訓練目標，step time 少兩成，整個訓練排程也跟著縮短。</p>
+
+<p>MoE 模型稀疏在什麼地方，要先說清楚：一般的稠密模型每個 token 都會經過全部參數；MoE 模型每個 token 只會被路由到少數幾個 expert，大部分參數對這個 token 來說是閒置的。這帶來的後果是，同一個模型裡不同運算路徑的效能特性天差地遠——dense-core 的計算量固定、行為可預期，routing 決定哪些 expert 被啟用，運算量隨輸入變動，這正是為什麼團隊要先做細分項量測，而不是直接看一個模型級的平均數字。</p>
+
+<h2>規格表給的是峰值，答不出瓶頸在哪</h2>
+
+<p>一顆晶片的 TFLOPS 峰值規格，量的是理想條件下、MXU 全速運轉、資料永遠準時送到的上限——這是這類規格數字的通用性質，不是這篇文章獨有的主張。真實訓練 pipeline 很少符合這個理想條件：collective communication 要等、HBM 頻寬有限、host 端搬資料要花時間。同一顆晶片跑同一個模型，某個 kernel 可能貼著峰值跑，另一個 kernel 可能只用到峰值的三成——峰值數字本身分不出這兩種情況。</p>
+
+<p>峰值數字量不出這件事，跟 MXU 這種硬體的排列方式有關：systolic array 是由一整排乘加運算單元排成陣列，資料像水流一樣從一端流進去，經過整排單元、從另一端流出來，每個單元同時做一次乘加。這種排列只有在陣列被完全填滿、資料源源不絕流入時才跑得動峰值——運算矩陣的形狀得配合陣列大小，形狀不對，陣列填不滿，實際吃到的算力自然比峰值低。這是硬體排列方式決定的限制，不是軟體寫得好不好的問題。</p>
+
+<p>單一個 MFU 數字（實際打到的 FLOPs 除以硬體理論峰值）也回答不了這個問題——MFU 低，可能是算力真的不夠，也可能是 collective 通訊卡住讓 MXU 空等、或是 HBM 頻寬跟不上餵資料。同一個 MFU 讀數背後可以是三種完全不同的原因，這正是為什麼不能只看一個彙總指標，得往下拆到子系統層級。accelerator-microbenchmarks 把這個問題拆成五個各自獨立的量測面向，對應 TPU pipeline 裡五個不同的硬體子系統。網路面向量 collective 通訊：「Key tests include all-gather, all-reduce, reduce-scatter, and all-to-all. Metrics include throughput (GB/s), and latency (seconds).」運算面向量 GEMM：「The primary operation is General Matrix Multiply (GEMM/Matmul), measured in TFLOPs and Model FLOPs Utilization (MFU).」記憶體面向只看一個數字：「The core metric is memory bandwidth measured in GB/s.」host transfer 量的是 CPU 與加速器之間的搬運：「Host-to-Device (H2D) and Device-to-Host (D2H) transfers, measured in GB/s」。最後是針對推論路徑的 RPAv3：「Ragged-Paged Attention (RPAv3): Focuses on benchmarks tailored for transformer-based models, specifically measuring throughput for primitives like Attention (tokamax splash) and Batch Matrix Multiplication (BMM).」五個面向各量各的，五個數字擺在一起，才看得出瓶頸落在哪一塊。</p>
+
+<figure class="vg-w-table-tpu-benchmarks" data-mobile="keep">
+  <style>
+    .vg-w-table-tpu-benchmarks { overflow-x: auto; }
+    .vg-w-table-tpu-benchmarks table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+    .vg-w-table-tpu-benchmarks thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); }
+    .vg-w-table-tpu-benchmarks tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+    .vg-w-table-tpu-benchmarks figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-2); }
+  </style>
+  <table>
+    <thead>
+      <tr><th>面向</th><th>量什麼</th><th>指標</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>collective 通訊</td><td>all-gather · all-reduce · reduce-scatter · all-to-all</td><td>throughput（GB/s）、latency（秒）</td></tr>
+      <tr><td>運算（GEMM）</td><td>General Matrix Multiply／Matmul</td><td>TFLOPs、Model FLOPs Utilization（MFU）</td></tr>
+      <tr><td>HBM 頻寬</td><td>memory bandwidth</td><td>GB/s</td></tr>
+      <tr><td>host transfer</td><td>Host-to-Device／Device-to-Host</td><td>GB/s</td></tr>
+      <tr><td>RPAv3</td><td>Attention（tokamax splash）、Batch Matrix Multiplication（BMM）</td><td>throughput</td></tr>
+    </tbody>
+  </table>
+  <figcaption>accelerator-microbenchmarks 涵蓋的五個量測面向，各自對應 TPU pipeline 裡不同的硬體子系統。資料來源：Google Developers Blog，2026-07-30。</figcaption>
+</figure>
+
+<p>從這五個面向各自量什麼，可以合理推出「數字不好看」時該往哪裡查：collective 通訊的吞吐量低、延遲高，通常代表 sharding topology 或 overlap 策略有問題；GEMM 的 TFLOPs 或 MFU 低，指向 kernel 實作或 operand 形狀不對；HBM 頻寬量出來遠低於硬體上限，代表資料存取模式該調；host transfer 的 H2D／D2H 數字差，通常是餵資料的 input pipeline 拖慢了訓練；RPAv3 的吞吐量低，則是推論路徑本身的 attention 或 BMM 實作效率不夠。五個面向各自指向不同的修法，這也是為什麼不能只看一個總分。</p>
+
+<p>H2D 指的是資料從 CPU 端的 host 記憶體搬進加速器；D2H 是反方向，把運算結果搬回 host。這條路徑通常是 input pipeline 的最後一段——前面的資料前處理、shuffle、batch 組裝都在 CPU 上做，做完才透過 H2D 送進 TPU。這段搬運如果慢，TPU 端就算算力、頻寬都沒問題，也會因為等資料而閒置。</p>
+
+<p>這五個面向裡，只有 collective 通訊同時報 throughput 與 latency 兩個數字。文章沒有解釋為什麼，合理的推測是：訓練 pipeline 裡的 collective op 常常在等待而不是在跑，吞吐量高不代表等待時間短，一次 all-reduce 如果延遲高，其他晶片一樣得閒置等它做完。GEMM 或 HBM 頻寬這類面向主要在乎搬了多少、算了多少，因為這些操作通常連續發生、可以互相重疊，單次延遲不是主要問題。</p>
+
+<p>這些量測不是紙上談兵——repo 裡的 collective benchmark 直接用 JAX 的 shard_map 實作：「psum, all_gather, all_to_all, reduce_scatter (using shard_map)」，跑起來的是真的 collective op，數字不是模擬出來的。</p>
+
+<p>RPAv3 名字裡的 ragged 與 paged 各自對應一個工程問題：推論的時候，同一個 batch 裡每個請求已經生成的 token 數不一樣長，把它們硬湊成同一個矩陣形狀會浪費算力，「ragged」就是允許每個請求維持自己實際的長度；「paged」借用作業系統分頁記憶體的概念，把 KV cache 切成固定大小的頁面，需要的時候才分配，減少長度不一時造成的記憶體碎片。文章把 RPAv3 獨立列成一個量測面向，量的是 Attention（tokamax splash 實作）與 Batch Matrix Multiplication 的吞吐量。</p>
+
+<p>前面四個面向——collective、GEMM、HBM 頻寬、host transfer——量的是訓練時期的行為；RPAv3 量的是推論服務階段的行為。同一顆晶片、同一個模型，訓練與推論的瓶頸型態通常不一樣：訓練時 batch size 大、運算連續，容易撞上 compute-bound 或 network-bound；推論時每個請求長度不同、常常小 batch，記憶體存取型態更破碎，memory-bound 出現的機率更高。文章沒有說明它為什麼不把 RPAv3 併進 GEMM 或 collective 一起算；合理的推測是推論路徑的存取模式跟訓練路徑差得夠遠，混在一起量會失去意義。</p>
+
+<h2>Roofline：一張圖把瓶頸分成三種</h2>
+
+<p>量完五個面向的數字之後，下一步是分類——文章用的是 Roofline 模型，把結果歸到三種瓶頸類型之一。compute-bound 的判準是：「The model is hitting the MXU plateau. Tuning memory access will yield no benefit.」如果瓶頸真的在算力天花板，花時間調記憶體存取模式是白工。memory-bound 的判準是：「Performance can be improved by optimizing data locality (VMEM) or reducing HBM traffic.」這裡用的是「can be improved」，不是保證——調 VMEM 資料局部性或減少 HBM traffic 有機會改善，但不一定，得看實際卡在哪個環節。network-bound 的判準是：「Stalls in ICI or DCN prevent the chips from reaching their compute potential.」晶片間（ICI）或資料中心內（DCN）的通訊停等，讓算力潛力打不出來。</p>
+
+<p>這三種分類不是互斥的選項，而是分別檢查：compute-bound 要看是不是打到 MXU 天花板，memory-bound 要看 HBM 頻寬夠不夠，network-bound 要看 ICI／DCN 有沒有停等。三個問題可以對同一個模型的不同部分分別問——110B MoE 案例就是最好的例子，forward pass 的答案是 compute-bound，routing 與 attention 的答案是 memory-bound，同一次訓練裡兩個答案都成立。</p>
+
+<figure class="vg-w-pop-tpu-glossary" data-mobile="keep">
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/>
+      <path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+    </svg>
+    <span>滑鼠移到縮寫上看完整說明 · 6 個縮寫</span>
+  </p>
+  <style>
+    .vg-w-pop-tpu-glossary { position: relative; }
+    .vg-w-pop-tpu-glossary p.glossary-body { font-family: var(--serif); font-size: var(--fs-sm); line-height: 1.9; }
+    .vg-w-pop-tpu-glossary .term { text-decoration: underline dotted var(--muted); cursor: help; color: var(--ink); }
+    .vg-w-pop-tpu-glossary .pop {
+      position: absolute; padding: var(--s-1) var(--s-2); background: var(--bg-soft);
+      border: 1px solid var(--line); font-family: var(--scribed); font-size: var(--fs-sm);
+      max-width: 32ch; opacity: 0; transition: opacity 100ms; pointer-events: none; z-index: 2;
+    }
+    .vg-w-pop-tpu-glossary .term-mxu { anchor-name: --vgw-tpu-g1; }
+    .vg-w-pop-tpu-glossary .pop-mxu { position-anchor: --vgw-tpu-g1; top: anchor(bottom); left: anchor(center); translate: -50% var(--s-1); }
+    .vg-w-pop-tpu-glossary .term-mxu:hover + .pop-mxu, .vg-w-pop-tpu-glossary .term-mxu:focus + .pop-mxu { opacity: 1; pointer-events: auto; }
+    .vg-w-pop-tpu-glossary .term-vmem { anchor-name: --vgw-tpu-g2; }
+    .vg-w-pop-tpu-glossary .pop-vmem { position-anchor: --vgw-tpu-g2; top: anchor(bottom); left: anchor(center); translate: -50% var(--s-1); }
+    .vg-w-pop-tpu-glossary .term-vmem:hover + .pop-vmem, .vg-w-pop-tpu-glossary .term-vmem:focus + .pop-vmem { opacity: 1; pointer-events: auto; }
+    .vg-w-pop-tpu-glossary .term-ici { anchor-name: --vgw-tpu-g3; }
+    .vg-w-pop-tpu-glossary .pop-ici { position-anchor: --vgw-tpu-g3; top: anchor(bottom); left: anchor(center); translate: -50% var(--s-1); }
+    .vg-w-pop-tpu-glossary .term-ici:hover + .pop-ici, .vg-w-pop-tpu-glossary .term-ici:focus + .pop-ici { opacity: 1; pointer-events: auto; }
+    .vg-w-pop-tpu-glossary .term-dcn { anchor-name: --vgw-tpu-g4; }
+    .vg-w-pop-tpu-glossary .pop-dcn { position-anchor: --vgw-tpu-g4; top: anchor(bottom); left: anchor(center); translate: -50% var(--s-1); }
+    .vg-w-pop-tpu-glossary .term-dcn:hover + .pop-dcn, .vg-w-pop-tpu-glossary .term-dcn:focus + .pop-dcn { opacity: 1; pointer-events: auto; }
+    .vg-w-pop-tpu-glossary .term-mfu { anchor-name: --vgw-tpu-g5; }
+    .vg-w-pop-tpu-glossary .pop-mfu { position-anchor: --vgw-tpu-g5; top: anchor(bottom); left: anchor(center); translate: -50% var(--s-1); }
+    .vg-w-pop-tpu-glossary .term-mfu:hover + .pop-mfu, .vg-w-pop-tpu-glossary .term-mfu:focus + .pop-mfu { opacity: 1; pointer-events: auto; }
+    .vg-w-pop-tpu-glossary .term-sol { anchor-name: --vgw-tpu-g6; }
+    .vg-w-pop-tpu-glossary .pop-sol { position-anchor: --vgw-tpu-g6; top: anchor(bottom); left: anchor(center); translate: -50% var(--s-1); }
+    .vg-w-pop-tpu-glossary .term-sol:hover + .pop-sol, .vg-w-pop-tpu-glossary .term-sol:focus + .pop-sol { opacity: 1; pointer-events: auto; }
+    @supports not (anchor-name: --x) {
+      .vg-w-pop-tpu-glossary .pop { position: static; opacity: 1; pointer-events: auto; display: inline; margin-left: 4px; }
+    }
+    @media (hover: none) and (pointer: coarse) {
+      .vg-w-pop-tpu-glossary .pop { position: static !important; opacity: 1 !important; pointer-events: auto !important; display: block; margin: 2px 0 6px 1.2em; max-width: none; border-left: 2px solid var(--accent); border-top: none; border-right: none; border-bottom: none; background: transparent; }
+      .vg-w-pop-tpu-glossary .term { text-decoration: none; cursor: default; color: var(--accent-text); }
+    }
+  </style>
+  <p class="glossary-body">這幾個縮寫會反覆出現：<span class="term term-mxu" tabindex="0">MXU</span><span class="pop pop-mxu">矩陣乘法運算單元，TPU 內執行 GEMM 的硬體核心。</span>、<span class="term term-vmem" tabindex="0">VMEM</span><span class="pop pop-vmem">晶片上的向量記憶體，比 HBM 快、但容量小得多。</span>、<span class="term term-ici" tabindex="0">ICI</span><span class="pop pop-ici">inter-chip interconnect，同一個 pod 內晶片之間的高速連結。</span>、<span class="term term-dcn" tabindex="0">DCN</span><span class="pop pop-dcn">data-center network，跨機櫃、跨 pod 的網路層。</span>、<span class="term term-mfu" tabindex="0">MFU</span><span class="pop pop-mfu">Model FLOPs Utilization——實際打到的 FLOPs 除以硬體理論峰值。</span>，以及<span class="term term-sol" tabindex="0">SOL</span><span class="pop pop-sol">speed-of-light，某個 kernel 在理想條件下能跑到的效能上限；文章用「佔 SOL 的百分比」表示量測結果離這個上限有多近。</span>。</p>
+</figure>
+
+<figure class="vg-w-stack-tpu-bottlenecks" data-mobile="keep">
+  <style>
+    .vg-w-stack-tpu-bottlenecks { display: flex; flex-direction: column; gap: var(--s-3); align-items: stretch; }
+    .vg-w-stack-tpu-bottlenecks input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+    .vg-w-stack-tpu-bottlenecks .stack-title { font-family: IM Fell English, serif; font-style: italic; font-size: var(--fs-md); margin: 0 0 var(--s-1) 0; color: var(--ink); line-height: 1.4; }
+    .vg-w-stack-tpu-bottlenecks .stack-cards { display: flex; flex-direction: column; gap: var(--s-1); list-style: none; padding: 0; margin: 0; }
+    .vg-w-stack-tpu-bottlenecks .stack-cards label { display: block; padding: var(--s-2); border: 1px solid var(--muted-2); border-radius: 2px; cursor: pointer; transition: border-color 200ms, background 200ms; min-height: 44px; }
+    .vg-w-stack-tpu-bottlenecks .stack-cards label:hover { border-color: var(--accent); }
+    .vg-w-stack-tpu-bottlenecks .card-head { font-family: EB Garamond, serif; font-size: var(--fs-md); margin: 0 0 4px 0; color: var(--ink); display: flex; align-items: baseline; justify-content: space-between; gap: var(--s-2); flex-wrap: wrap; }
+    .vg-w-stack-tpu-bottlenecks .card-sub { font-family: IM Fell English, serif; font-style: italic; font-size: var(--fs-sm); color: var(--muted); margin: 0; line-height: 1.6; }
+    .vg-w-stack-tpu-bottlenecks .card-tag { font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); color: var(--accent-text); font-style: normal; }
+    .vg-w-stack-tpu-bottlenecks:has(#vg-w-stack-tpu-bottlenecks-r1:checked) .card-1 { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+    .vg-w-stack-tpu-bottlenecks:has(#vg-w-stack-tpu-bottlenecks-r2:checked) .card-2 { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+    .vg-w-stack-tpu-bottlenecks:has(#vg-w-stack-tpu-bottlenecks-r3:checked) .card-3 { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+    .vg-w-stack-tpu-bottlenecks svg.diagram { display: none; }
+    @media (min-width: 720px) {
+      .vg-w-stack-tpu-bottlenecks svg.diagram { display: block; width: 100%; height: auto; max-width: 880px; }
+      .vg-w-stack-tpu-bottlenecks .stack-title { display: none; }
+      .vg-w-stack-tpu-bottlenecks .stack-cards { display: none; }
+    }
+    .vg-w-stack-tpu-bottlenecks .layer { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; }
+    .vg-w-stack-tpu-bottlenecks:has(#vg-w-stack-tpu-bottlenecks-r1:checked) .layer-1 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+    .vg-w-stack-tpu-bottlenecks:has(#vg-w-stack-tpu-bottlenecks-r2:checked) .layer-2 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+    .vg-w-stack-tpu-bottlenecks:has(#vg-w-stack-tpu-bottlenecks-r3:checked) .layer-3 { fill: var(--accent); fill-opacity: 0.22; stroke: var(--accent); }
+    .vg-w-stack-tpu-bottlenecks figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-2); }
+  </style>
+
+  <input type="radio" id="vg-w-stack-tpu-bottlenecks-r1" name="vg-w-stack-tpu-bottlenecks-sel" checked aria-label="compute-bound" />
+  <input type="radio" id="vg-w-stack-tpu-bottlenecks-r2" name="vg-w-stack-tpu-bottlenecks-sel" aria-label="memory-bound" />
+  <input type="radio" id="vg-w-stack-tpu-bottlenecks-r3" name="vg-w-stack-tpu-bottlenecks-sel" aria-label="network-bound" />
+
+  <p class="stack-title" id="vg-w-stack-tpu-bottlenecks-title">Roofline 的三種瓶頸分類</p>
+  <ul class="stack-cards" aria-labelledby="vg-w-stack-tpu-bottlenecks-title">
+    <li class="card-1"><label for="vg-w-stack-tpu-bottlenecks-r1">
+      <p class="card-head"><span>compute-bound</span><code class="card-tag">MXU plateau</code></p>
+      <p class="card-sub">「The model is hitting the MXU plateau. Tuning memory access will yield no benefit.」——瓶頸在算力天花板，調記憶體沒用。</p>
+    </label></li>
+    <li class="card-2"><label for="vg-w-stack-tpu-bottlenecks-r2">
+      <p class="card-head"><span>memory-bound</span><code class="card-tag">VMEM／HBM</code></p>
+      <p class="card-sub">「Performance can be improved by optimizing data locality (VMEM) or reducing HBM traffic.」——調 VMEM 局部性或減少 HBM traffic，有機會改善。</p>
+    </label></li>
+    <li class="card-3"><label for="vg-w-stack-tpu-bottlenecks-r3">
+      <p class="card-head"><span>network-bound</span><code class="card-tag">ICI／DCN</code></p>
+      <p class="card-sub">「Stalls in ICI or DCN prevent the chips from reaching their compute potential.」——晶片間或跨機櫃的通訊停等，打不出算力潛力。</p>
+    </label></li>
+  </ul>
+
+  <svg class="diagram" viewBox="0 0 880 320" role="img" aria-label="三種 Roofline 瓶頸分類">
+    <text x="40" y="34" font-family="EB Garamond, serif" font-size="16" fill="var(--ink)">Roofline 的三種瓶頸分類</text>
+
+    <rect class="layer layer-1" x="40" y="56" width="800" height="70" role="button" tabindex="0" aria-label="compute-bound" />
+    <text x="60" y="82" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">compute-bound</text>
+    <text x="60" y="104" font-family="Manrope, sans-serif" font-size="12" fill="var(--muted)">MXU plateau · 調記憶體沒用</text>
+
+    <rect class="layer layer-2" x="40" y="136" width="800" height="70" role="button" tabindex="0" aria-label="memory-bound" />
+    <text x="60" y="162" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">memory-bound</text>
+    <text x="60" y="184" font-family="Manrope, sans-serif" font-size="12" fill="var(--muted)">VMEM／HBM traffic · 可能有解</text>
+
+    <rect class="layer layer-3" x="40" y="216" width="800" height="70" role="button" tabindex="0" aria-label="network-bound" />
+    <text x="60" y="242" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">network-bound</text>
+    <text x="60" y="264" font-family="Manrope, sans-serif" font-size="12" fill="var(--muted)">ICI／DCN 停等 · 打不到算力潛力</text>
+  </svg>
+
+  <figcaption>三種判準都取自文章原文；點選任一張卡片（桌面版點圖層）只是切換高亮，三段判準本身一直是完整可讀的。</figcaption>
+
+  <script>
+  (function () {
+    if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+    var root = document.querySelector('.vg-w-stack-tpu-bottlenecks');
+    if (!root) return;
+    var layers = root.querySelectorAll('svg.diagram .layer');
+    var radios = { 'layer-1': 'vg-w-stack-tpu-bottlenecks-r1', 'layer-2': 'vg-w-stack-tpu-bottlenecks-r2', 'layer-3': 'vg-w-stack-tpu-bottlenecks-r3' };
+    layers.forEach(function (layer) {
+      var cls = Array.prototype.find.call(layer.classList, function (c) { return radios[c]; });
+      var radioId = radios[cls];
+      if (!radioId) return;
+      function activate() {
+        var radio = document.getElementById(radioId);
+        if (radio) radio.checked = true;
+      }
+      layer.addEventListener('click', activate);
+      layer.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); activate(); }
+      });
+    });
+  })();
+  </script>
+</figure>
+
+<p>Roofline 模型本身是效能工程裡的通用工具（這是背景知識，不是這篇文章的獨有主張）：橫軸是 arithmetic intensity，愈往右代表每搬一個 byte 能做的運算愈多；縱軸是實際打到的效能。這個模型的核心公式很簡單：可達到的效能等於算力天花板與（arithmetic intensity 乘以記憶體頻寬）兩者的較小值。intensity 低的時候，第二項比較小，效能被記憶體頻寬卡住，這時候不管硬體算力多強都沒用；intensity 高到一定程度，第二項超過算力天花板，效能就被天花板卡住，這時候記憶體再快也沒用。兩條線的交叉點，就是圖上那個從斜率轉平的轉折點。低 intensity 的 kernel 沿著記憶體頻寬的斜率往上爬，直到撞上算力天花板——這條天花板，就是前面說的 compute-bound 判準。三種瓶頸類型分別對應圖上不同的位置：靠著斜率爬升代表 memory-bound，貼著天花板代表 compute-bound；network-bound 則是另一種情況——理論上有機會貼近天花板，卻被 ICI 或 DCN 的停等硬生生攔在半路，看起來像是天花板被人為壓低了一截。</p>
+
+<p>這套框架不是 TPU 專屬的——GPU、CPU、甚至網路硬體的效能分析都在用同一套邏輯，差別只在天花板由哪個硬體規格決定、斜率由哪種記憶體頻寬決定。放在 TPU 上，天花板是 MXU 的峰值算力，斜率是 HBM 頻寬；換成別的硬體，同樣的圖形換一組數字，判讀邏輯不變。</p>
+
+<h2>110B MoE 在 4x4x4 Ironwood 上：兩種瓶頸同時出現</h2>
+
+<p>回到文章開頭那個 110B MoE 案例。Ironwood（TPU7x）的硬體本身就對某些運算形狀設了限制：「For example, on the Ironwood (TPU7x) architecture, the 256x256 systolic array imposes a physical constraint on operand shapes.」256x256 的 systolic array 是 compute-bound 天花板的具體來源之一：operand 形狀不對，MXU 沒辦法全速運轉，天花板自然比理論峰值低。</p>
+
+<p>團隊在這個 110B MoE 案例裡量到兩種瓶頸同時發生：「The forward-pass and dense-core operations were primarily compute-bound, reaching 1.85 PFLOPS.」forward pass 與 dense-core 運算貼著算力天花板跑，量到 1.85 PFLOPS；同一個模型裡，MoE 架構特有的 routing 與 attention 原語卻卡在 memory-bound 區，只打到 SOL 的三成到六成。同一個模型、同一次訓練，兩個部分落在 Roofline 圖上完全不同的位置。</p>
+
+<p>文章沒有另外拆解 backward pass 的 Roofline 分類——量到的是 forward pass 與 dense-core 部分落在 compute-bound。訓練一個 step 除了 forward，還有 backward 與 optimizer update 兩個階段，這兩段各自的瓶頸類型，文章沒有公佈對應的數字，也是這篇案例目前沒有涵蓋到的部分。</p>
+
+<p>合理的推測是，這個落差跟 MoE 架構本身的計算型態有關：dense-core 的矩陣乘法是規則的大矩陣運算，資料存取模式固定，容易把 MXU 填滿；routing 決定每個 token 要送去哪幾個 expert，屬於 gather／scatter 一類的不規則存取，attention 也要頻繁讀寫 KV cache，這類存取模式對 HBM 頻寬的依賴比對算力的依賴更重。文章本身沒有把這個機制寫出來，只公佈了量測結果——但落在哪個象限，跟這兩類運算存取記憶體的方式很不一樣，是說得通的。</p>
+
+<figure class="vg-w-chart-tpu-roofline" data-mobile="keep" data-svg-scroll="720">
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/>
+      <path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+    </svg>
+    <span>110B MoE 案例的兩個量測點在 Roofline 圖上的位置</span>
+  </p>
+  <style>
+    .vg-w-chart-tpu-roofline { display: grid; gap: var(--s-2); }
+    .vg-w-chart-tpu-roofline svg.vg-w-chart-tpu-roofline-main { width: 100%; height: auto; }
+    .vg-w-chart-tpu-roofline figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+  </style>
+
+  <svg class="vg-w-chart-tpu-roofline-main" viewBox="0 0 720 400" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Roofline 圖：110B MoE 案例的兩個量測點">
+    <g id="vg-w-chart-tpu-roofline-grid"></g>
+    <path id="vg-w-chart-tpu-roofline-diagonal" fill="none" stroke="var(--muted-2)" stroke-width="2" />
+    <path id="vg-w-chart-tpu-roofline-ceiling" fill="none" stroke="var(--muted-2)" stroke-width="2" />
+    <path id="vg-w-chart-tpu-roofline-netline" fill="none" stroke="var(--sage-deep)" stroke-width="1.5" stroke-dasharray="5 4" />
+    <rect id="vg-w-chart-tpu-roofline-band" fill="var(--sage-deep)" fill-opacity="0.14" stroke="none" />
+    <g id="vg-w-chart-tpu-roofline-points"></g>
+    <text x="70" y="365" font-family="EB Garamond, serif" font-size="13" fill="var(--muted)">arithmetic intensity（FLOPs／byte）→</text>
+    <text x="26" y="215" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--muted)" transform="rotate(-90 26 215)">achievable 效能（相對於此案例的 compute ceiling）</text>
+    <text x="470" y="128" font-family="Manrope, sans-serif" font-size="11" fill="var(--sage-deep)">network-bound（ICI／DCN 停等，示意）</text>
+  </svg>
+
+  <figcaption>斜率與天花板是 Roofline 模型的通用畫法（背景知識，非本文獨有）；橫軸沒有標實際數值，文章沒有提供 arithmetic intensity 的具體數字。橙點與綠點是文章實際回報的量測結果：forward pass／dense-core 打到 1.85 PFLOPS，屬 compute-bound；routing 與 attention 原語落在 memory-bound 區，只有 SOL 的 30% 到 60%。</figcaption>
+
+  <script>
+  (function () {
+    var root = document.querySelector('.vg-w-chart-tpu-roofline');
+    var gridG = root.querySelector('#vg-w-chart-tpu-roofline-grid');
+    var pointsG = root.querySelector('#vg-w-chart-tpu-roofline-points');
+    var diagonal = root.querySelector('#vg-w-chart-tpu-roofline-diagonal');
+    var ceiling = root.querySelector('#vg-w-chart-tpu-roofline-ceiling');
+    var netline = root.querySelector('#vg-w-chart-tpu-roofline-netline');
+    var band = root.querySelector('#vg-w-chart-tpu-roofline-band');
+
+    var BASE_X = 90, RIDGE_X = 300, CEIL_X1 = 660;
+    var BASE_Y = 340, CEIL_Y = 60;
+    function yOf(p) { return BASE_Y - p * (BASE_Y - CEIL_Y); }
+    function xOfDiagonal(p) { return BASE_X + p * (RIDGE_X - BASE_X); }
+
+    var NS = 'http://www.w3.org/2000/svg';
+    function el(tag, attrs) {
+      var e = document.createElementNS(NS, tag);
+      for (var k in attrs) e.setAttribute(k, attrs[k]);
+      return e;
+    }
+
+    diagonal.setAttribute('d', 'M ' + BASE_X + ' ' + BASE_Y + ' L ' + RIDGE_X + ' ' + CEIL_Y);
+    ceiling.setAttribute('d', 'M ' + RIDGE_X + ' ' + CEIL_Y + ' L ' + CEIL_X1 + ' ' + CEIL_Y);
+    netline.setAttribute('d', 'M ' + RIDGE_X + ' 140 L ' + CEIL_X1 + ' 140');
+
+    var TICKS = [
+      { p: 0, label: '0%' },
+      { p: 0.3, label: '30%' },
+      { p: 0.6, label: '60%' },
+      { p: 1.0, label: '100%' }
+    ];
+    TICKS.forEach(function (t) {
+      var y = yOf(t.p);
+      gridG.appendChild(el('line', { x1: BASE_X, y1: y, x2: CEIL_X1, y2: y, stroke: 'var(--muted-2)', 'stroke-width': 1, 'stroke-dasharray': t.p === 0 ? 'none' : '2 4' }));
+      var lbl = el('text', { x: BASE_X - 8, y: y + 4, 'text-anchor': 'end', 'font-family': 'JetBrains Mono, monospace', 'font-size': 11, fill: 'var(--muted)' });
+      lbl.textContent = t.label;
+      gridG.appendChild(lbl);
+    });
+    gridG.appendChild(el('line', { x1: BASE_X, y1: BASE_Y, x2: BASE_X, y2: CEIL_Y, stroke: 'var(--muted-2)', 'stroke-width': 1 }));
+
+    var bandY1 = yOf(0.6), bandY0 = yOf(0.3);
+    band.setAttribute('x', BASE_X);
+    band.setAttribute('y', bandY1);
+    band.setAttribute('width', RIDGE_X - BASE_X);
+    band.setAttribute('height', bandY0 - bandY1);
+
+    var POINTS = [
+      { p: 1.0, x: 480, color: 'var(--accent)', l1: 'forward pass／dense-core', l2: '1.85 PFLOPS · compute-bound', ly1: -34, ly2: -16 },
+      { p: 0.45, onDiagonal: true, color: 'var(--sage-deep)', l1: 'routing＋attention 原語', l2: 'SOL 30–60% · memory-bound', ly1: -18, ly2: 18 }
+    ];
+    POINTS.forEach(function (pt) {
+      var x = pt.onDiagonal ? xOfDiagonal(pt.p) : pt.x;
+      var y = yOf(pt.p);
+      pointsG.appendChild(el('circle', { cx: x, cy: y, r: 6, fill: pt.color }));
+      var t1 = el('text', { x: x, y: y + pt.ly1, 'text-anchor': 'middle', 'font-family': 'EB Garamond, serif', 'font-size': 13, fill: 'var(--ink)' });
+      t1.textContent = pt.l1;
+      pointsG.appendChild(t1);
+      var t2 = el('text', { x: x, y: y + pt.ly2, 'text-anchor': 'middle', 'font-family': 'Manrope, sans-serif', 'font-size': 11, fill: 'var(--muted)' });
+      t2.textContent = pt.l2;
+      pointsG.appendChild(t2);
+    });
+  })();
+  </script>
+</figure>
+
+<p>這張圖想說的是同一件事的兩種讀法：forward pass 落在天花板上，代表這部分的效能已經頂到硬體極限，除非換更快的晶片，不然沒有太多再進步的空間；routing 與 attention 原語落在斜率區，代表這部分還有調整空間——沿著斜率往右移，不用換硬體，靠 kernel 或存取模式的調整就有機會把效能往上推。同一個 Roofline 分類，對應到完全不同的下一步動作，這正是分類本身的價值所在。</p>
+
+<p>把這兩個數字放在一起看，能大致理解為什麼最後的改善是 21.2%，而不是更高或更低：forward pass 已經貼著天花板，能擠出的空間有限；routing 與 attention 原語還在 SOL 三到六成，代表這裡才是真正有空間可以拉的地方。合理的推測是，介入的重心會落在後者——把落後的部分拉起來，比在已經頂到天花板的部分硬擠，報酬更高。文章沒有把 21.2% 分攤到個別介入上，只公佈了合計後的結果。</p>
+
+<p>分類清楚之後，團隊照 Roofline 診斷去做介入，結果是：「Microbenchmark results directly guided interventions that reduced the training step time by 21.2%.」量測結果直接導向的改動，把訓練 step time 砍了 21.2%。想自己重現這類量測，repo 裡就有現成的執行方式，用 bazel 帶一份 YAML config 跑：</p>
+
+<pre data-kind="config"><code><em>// configs/sample.yaml 節錄</em>
+global:
+  warmup_tries: 2
+  num_runs: 5
+  dtype: "bfloat16"
+
+benchmarks:
+  - name: hbm_bandwidth
+    sweep:
+      size:
+        start: 1024
+        end: 8192
+        multiplier: 2
+</code></pre>
+
+<pre data-kind="shell"><code>bazel run //src/accelerator_microbenchmarks:main -- --config configs/sample.yaml</code></pre>
+
+<p>跑完之後，repo 輸出兩份檔案：「detailed.json and summary.csv」——前者是每一筆量測的明細，後者是彙整過的摘要，兩份都是把數字餵進 Roofline 圖之前的原始輸入。</p>
+
+<p>README 只列出 warmup_tries 與 num_runs 兩個參數名稱，沒有解釋語意；照 benchmark 的一般慣例推測，warmup_tries 是讓 JAX 先把運算圖編譯完、把資料搬進暫存，跳過第一次執行常有的編譯延遲，num_runs 則是正式量測要跑幾次，取多次結果才不會被單次的雜訊誤導。size 的 sweep 範圍（1024 到 8192，倍增）則是讓同一個 benchmark 在不同資料量下各跑一次，畫出頻寬隨資料量變化的曲線，而不是只看單一個點。</p>
+
+<p>合理的起手式是先跑 HBM 頻寬：這是設定最簡單、跑最快的一項，config 裡只要換 size 的 sweep 範圍，幾分鐘內就能拿到這批硬體的頻寬曲線，作為後面比對 collective 與 GEMM 數字時的基準。collective 通訊牽涉到多晶片協調，GEMM 要挑對 kernel 與資料型別，設定起來都比單一晶片的 HBM 頻寬測試複雜，適合排在後面——但這是使用上的合理猜測，文章本身沒有規定跑的順序。</p>
+
+<h2>量出瓶頸之後，能轉的三個旋鈕</h2>
+
+<p>分類只是第一步，後面要對症下藥。針對 compute-bound、或懷疑實作效率不夠的 kernel，文章給的做法是換實作比較：「You can compare standard JAX operations against specialized Pallas kernels or Tokamax Splash Attention.」拿標準 JAX op 跟手寫的 Pallas kernel 或 Tokamax Splash Attention 對比，看哪個實作能把同一個運算塞進更接近天花板的效能。</p>
+
+<p>Pallas 是 JAX 生態裡讓工程師直接寫 TPU kernel 的框架，比標準 JAX op 更能控制記憶體存取模式與並行方式；Tokamax Splash Attention 是針對 attention 運算寫的專門 kernel，對應的是 flash-attention 那類「減少 HBM 讀寫次數」的最佳化思路。標準 JAX op 泛用但不見得貼近硬體特性，專門 kernel 換來的是更接近天花板的效能，代價是維護成本更高。</p>
+
+<p>針對 network-bound、或需要重新分配運算的情況，做法是調拓撲：「By measuring collective performance across different topologies (e.g., 2x2x2 vs 4x2x1), you can optimize Fully Sharded Data Parallel (FSDP) parameters.」同一批晶片，用 2x2x2 還是 4x2x1 的拓撲排列，collective 通訊的效能會不一樣，量出差異之後才知道 FSDP 的分片參數該怎麼調。</p>
+
+<p>2x2x2 與 4x2x1 這兩種寫法，描述的是同一批晶片在三維 mesh 上怎麼切：每個維度的晶片數量不同，collective 通訊要走的實體連線長度與跳數也不同，量出來的 all-gather、all-reduce 吞吐量自然不一樣。FSDP 的分片維度如果跟通訊效能差的那個維度對齊，就會把慢的那條路徑用得最頻繁——這正是為什麼要先量再決定怎麼切，而不是憑經驗選一個看起來合理的拓撲。</p>
+
+<p>針對 memory-bound、尤其是 HBM 頻寬吃緊的情況，還有第三個旋鈕：要不要把算過的中間結果存在記憶體裡，還是乾脆丟掉、要用的時候重算一次。「Microbenchmarks help calculate the exact trade-off between compute cycles and memory pressure, guiding decisions on when to store calculated data in memory vs. 'rematerialize' (recalculate) it.」這個 trade-off 沒有標準答案：存記憶體省算力、但吃頻寬；重算省頻寬、但吃算力。量出實際的 compute cycle 與 memory pressure 數字，才知道哪邊划算。</p>
+
+<p>memory-bound 除了 rematerialization，還有另一個方向是判準裡提到的 data locality：VMEM 是晶片上、離 MXU 最近的一層記憶體，比 HBM 快一個數量級以上，但容量小得多。優化 data locality 的意思是盡量讓運算需要的資料留在 VMEM 裡重複使用，減少來回 HBM 搬資料的次數——同一份資料如果要用兩次，寧可留在 VMEM 裡等第二次用，也不要用完就丟、下次再從 HBM 重新搬一次。這跟 rematerialization 是兩個獨立的旋鈕：一個決定資料要不要留著，一個決定留著的話放在哪一層記憶體。</p>
+
+<p>三個旋鈕對應三種不同的瓶頸診斷，這也是這套方法論真正的重點：110B MoE 這個案例本身是單一個案（in one example），21.2% 的 step time 改善也是這一次訓練跑出來的結果，不是可以直接套用到任何 workload 的固定倍率。真正可以複製的是流程本身——量五個面向、用 Roofline 分類、再挑對應的旋鈕，而不是看到 step time 慢就照著別人的改法抄一遍。對正在跑大型模型訓練的團隊來說，這套流程可以直接套進自己的 pipeline：先把 collective、GEMM、HBM、host transfer、RPAv3 這五個面向的數字量出來，畫進同一張 Roofline 圖，看每個 kernel 落在哪一區，再決定值不值得花時間換 kernel、調 sharding topology，或是接受 rematerialization 的計算換記憶體代價——量測本身不貴，貴的是分類錯了、把力氣花在調一個其實沒有卡住的環節。</p>
+
+<p>這套流程對負責訓練基礎設施的團隊（而不是模型研究本身）特別有用：模型研究關心的是準確率、loss 曲線；基礎設施團隊關心的是同樣的模型能不能用更少的晶片、更短的時間跑完，而這正是 Roofline 分類直接回答的問題。兩邊的目標不衝突，但用的是完全不同的一套指標。</p>
+
+<p>這篇文章由 Junjie Qian、Chi Shuen Lee、Yu-Hsuan（Amy）Lin、Haixiong（Sean）Wang 四人具名，發表於 2026 年 7 月 30 日的 Google Developers Blog，文章介紹的 accelerator-microbenchmarks repo 是公開的——文章裡引用的每個數字，理論上都可以拿這個 repo 的 config 重新跑一次去對照。</p>
+
+<p class="vg-deep-closer"><strong>Take-away</strong>：瓶頸不是用猜的——先照五個面向量出數字，再用 Roofline 把每個 kernel 歸到 compute-bound、memory-bound、network-bound 其中一類，最後才決定要換 kernel、調 sharding，還是拿 rematerialization 換頻寬。</p>
+
+</div>

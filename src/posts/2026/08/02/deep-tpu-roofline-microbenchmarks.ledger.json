@@ -1,0 +1,806 @@
+{
+  "output_path": "src/posts/2026/08/02/deep-tpu-roofline-microbenchmarks.html",
+  "spine": [
+    "1. TPU 規格表給的是理論峰值，量不出真實 workload 卡在哪；Google 開源 accelerator-microbenchmarks 把『TPU 快不快』換成五個可重複量測的面向。",
+    "2. 五個量測面向各自對應不同硬體子系統：collective 通訊（all-gather/all-reduce/reduce-scatter/all-to-all 的 GB/s 與延遲）、GEMM（TFLOPs、MFU）、HBM 頻寬（GB/s）、host transfer（H2D/D2H GB/s）、RPAv3（attention 與 BMM 的推論吞吐量）。",
+    "3. 量完之後用 Roofline 模型分類：compute-bound（打到 MXU 上限，調記憶體沒用）、memory-bound（VMEM data locality 或 HBM traffic 可以調）、network-bound（ICI 或 DCN 停等）——三種瓶頸對應三種完全不同的修法。",
+    "4. Ironwood（TPU7x）的 256x256 systolic array 對 operand shape 有實際的硬體限制，這是 compute-bound 天花板的具體來源之一。",
+    "5. 案例：110B MoE 訓練在 4x4x4 TPU7x 上，forward pass／dense-core 量到 1.85 PFLOPS、屬 compute-bound；同一次訓練裡，routing 與 attention 原語卻是 memory-bound，只跑到 SOL 的 30% 到 60%——同一個模型的兩個部分落在不同的瓶頸類型。",
+    "6. 分類結果直接導向三個可調的旋鈕：kernel selection（標準 JAX op 換成 Pallas kernel 或 Tokamax Splash Attention）、sharding/topology 調整（例如 2x2x2 換 4x2x1 影響 FSDP）、以及 rematerialization 的計算換記憶體取捨。",
+    "7. 最終結果是訓練 step time 減少 21.2%——方法論的重點是先量、再歸類、再對症下藥，而不是憑經驗猜。"
+  ],
+  "sources": [
+    {
+      "url": "https://developers.googleblog.com/en/how-to-use-google-microbenchmarks-for-evaluating-tpu-performance/",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": "2026-07-30",
+      "perspective": {
+        "mechanism": "把 TPU 效能拆成五個獨立量測面向，再用 Roofline 模型將結果分類為 compute-bound / memory-bound / network-bound 三種瓶頸，各自對應不同的最佳化路徑。",
+        "tradeoff": "量測方法論的代價是要先建置 benchmark harness、逐一針對 workload 解讀 Roofline 分類，比套用單一 vendor 規格數字麻煩得多；換來的是找到真正卡住的地方，而不是憑直覺猜。",
+        "reader_use": "ML infra 工程師可以照這五個面向逐項量測自己的訓練 pipeline，把結果放進同一張 Roofline 圖，再決定要換 kernel、調 sharding topology、還是接受 rematerialization 的計算換記憶體代價。"
+      }
+    },
+    {
+      "url": "https://github.com/AI-Hypercomputer/accelerator-microbenchmarks",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": null,
+      "perspective": {
+        "mechanism": "開源 repo 提供可直接執行的 benchmark harness——用 YAML config 定義 warmup/run 次數與掃描範圍，bazel 執行後輸出 detailed.json 與 summary.csv，把 collective/GEMM/HBM 等量測變成可重現的腳本，而不是一次性手動測試。",
+        "tradeoff": "現成腳本降低了量測門檻，但仍需要工程師自己把輸出數字對應到 Roofline 的三個分類，並判斷該調哪個旋鈕——repo 本身不做分類判讀。",
+        "reader_use": "想重現案例的工程師可以直接 clone repo、改 sample.yaml 的 sweep 範圍，針對自己的 TPU pod 拓撲跑一輪，拿到的 GB/s、TFLOPs、latency 數字就是 Roofline 圖的原始輸入。"
+      }
+    }
+  ],
+  "notes": [
+    {
+      "id": "n01",
+      "url": "https://developers.googleblog.com/en/how-to-use-google-microbenchmarks-for-evaluating-tpu-performance/",
+      "quote": "Determining the empirical performance of TPUs requires moving beyond product specifications to granular, real-world measurements.",
+      "hedge": "asserted",
+      "interpretation": "文章開場定調：TPU 的真實效能得靠拆到細粒度的實測，不能只看規格表峰值。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n02",
+      "url": "https://developers.googleblog.com/en/how-to-use-google-microbenchmarks-for-evaluating-tpu-performance/",
+      "quote": "Key tests include all-gather, all-reduce, reduce-scatter, and all-to-all. Metrics include throughput (GB/s), and latency (seconds).",
+      "hedge": "asserted",
+      "interpretation": "collective 通訊量測涵蓋四種原語，兩個指標：吞吐量與延遲。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n03",
+      "url": "https://developers.googleblog.com/en/how-to-use-google-microbenchmarks-for-evaluating-tpu-performance/",
+      "quote": "The primary operation is General Matrix Multiply (GEMM/Matmul), measured in TFLOPs and Model FLOPs Utilization (MFU).",
+      "hedge": "asserted",
+      "interpretation": "運算面向的核心量測是 GEMM，指標是 TFLOPs 與 MFU。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n04",
+      "url": "https://developers.googleblog.com/en/how-to-use-google-microbenchmarks-for-evaluating-tpu-performance/",
+      "quote": "The core metric is memory bandwidth measured in GB/s.",
+      "hedge": "asserted",
+      "interpretation": "HBM 面向只有一個核心指標：頻寬（GB/s）。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n05",
+      "url": "https://developers.googleblog.com/en/how-to-use-google-microbenchmarks-for-evaluating-tpu-performance/",
+      "quote": "Host-to-Device (H2D) and Device-to-Host (D2H) transfers, measured in GB/s",
+      "hedge": "asserted",
+      "interpretation": "host transfer 量測 H2D／D2H 兩個方向，指標同樣是 GB/s；來源沒有在這句明確寫出 PCIe 字樣，行文時不特別強調匯流排種類。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n06",
+      "url": "https://developers.googleblog.com/en/how-to-use-google-microbenchmarks-for-evaluating-tpu-performance/",
+      "quote": "Ragged-Paged Attention (RPAv3): Focuses on benchmarks tailored for transformer-based models, specifically measuring throughput for primitives like Attention (tokamax splash) and Batch Matrix Multiplication (BMM).",
+      "hedge": "asserted",
+      "interpretation": "RPAv3 鎖定 transformer 推論路徑，量 Attention（tokamax splash 實作）與 BMM 的吞吐量。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n07",
+      "url": "https://developers.googleblog.com/en/how-to-use-google-microbenchmarks-for-evaluating-tpu-performance/",
+      "quote": "The model is hitting the MXU plateau. Tuning memory access will yield no benefit.",
+      "hedge": "asserted",
+      "interpretation": "compute-bound 的定義與其推論：既然瓶頸在 MXU 天花板，調記憶體存取沒有意義。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n08",
+      "url": "https://developers.googleblog.com/en/how-to-use-google-microbenchmarks-for-evaluating-tpu-performance/",
+      "quote": "Performance can be improved by optimizing data locality (VMEM) or reducing HBM traffic.",
+      "hedge": "hedged",
+      "interpretation": "memory-bound 的定義與修法：VMEM data locality 或減少 HBM traffic 有機會改善（can be improved，非保證）。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n09",
+      "url": "https://developers.googleblog.com/en/how-to-use-google-microbenchmarks-for-evaluating-tpu-performance/",
+      "quote": "Stalls in ICI or DCN prevent the chips from reaching their compute potential.",
+      "hedge": "asserted",
+      "interpretation": "network-bound 的定義：ICI 或 DCN 上的停等讓晶片打不到算力潛力。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n10",
+      "url": "https://developers.googleblog.com/en/how-to-use-google-microbenchmarks-for-evaluating-tpu-performance/",
+      "quote": "In one example, we analyzed the performance tuning of a 110B Mixture-of-Experts (MoE) training workload deployed on a 4x4x4 TPU 7x configuration, leveraging microbenchmarks to establish hardware baselines and drive optimization for complex, sparse workloads.",
+      "hedge": "hedged",
+      "interpretation": "案例研究本身用『in one example』框住，是單一案例而非通用結論：110B MoE、4x4x4 TPU7x 拓撲、用 microbenchmark 建 baseline 再做最佳化。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n11",
+      "url": "https://developers.googleblog.com/en/how-to-use-google-microbenchmarks-for-evaluating-tpu-performance/",
+      "quote": "The forward-pass and dense-core operations were primarily compute-bound, reaching 1.85 PFLOPS. Conversely, the routing and attention primitives in the MoE architecture remained memory-bound, operating at 30–60% of the SOL.",
+      "hedge": "hedged",
+      "interpretation": "同一次訓練裡兩種瓶頸並存：forward pass／dense-core 主要是 compute-bound（primarily，非絕對），量到 1.85 PFLOPS；routing／attention 原語則是 memory-bound，卡在 SOL 的 30-60%。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n12",
+      "url": "https://developers.googleblog.com/en/how-to-use-google-microbenchmarks-for-evaluating-tpu-performance/",
+      "quote": "Microbenchmark results directly guided interventions that reduced the training step time by 21.2%.",
+      "hedge": "asserted",
+      "interpretation": "量測結果直接導向的介入手段，把 step time 砍了 21.2%——這是單一案例的成果，非通用保證。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n13",
+      "url": "https://developers.googleblog.com/en/how-to-use-google-microbenchmarks-for-evaluating-tpu-performance/",
+      "quote": "For example, on the Ironwood (TPU7x) architecture, the 256x256 systolic array imposes a physical constraint on operand shapes.",
+      "hedge": "asserted",
+      "interpretation": "Ironwood 的 256x256 systolic array 是硬體限制，對 operand shape 有實際約束，是 compute-bound 天花板的具體來源之一。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n14",
+      "url": "https://developers.googleblog.com/en/how-to-use-google-microbenchmarks-for-evaluating-tpu-performance/",
+      "quote": "You can compare standard JAX operations against specialized Pallas kernels or Tokamax Splash Attention.",
+      "hedge": "hedged",
+      "interpretation": "kernel selection 的具體做法：拿標準 JAX op 跟 Pallas kernel 或 Tokamax Splash Attention 比較（you can，屬建議語氣）。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n15",
+      "url": "https://developers.googleblog.com/en/how-to-use-google-microbenchmarks-for-evaluating-tpu-performance/",
+      "quote": "By measuring collective performance across different topologies (e.g., 2x2x2 vs 4x2x1), you can optimize Fully Sharded Data Parallel (FSDP) parameters.",
+      "hedge": "hedged",
+      "interpretation": "sharding 調整的具體做法：比較不同拓撲（例如 2x2x2 對 4x2x1）下的 collective 效能，來調 FSDP 參數。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n16",
+      "url": "https://developers.googleblog.com/en/how-to-use-google-microbenchmarks-for-evaluating-tpu-performance/",
+      "quote": "Microbenchmarks help calculate the exact trade-off between compute cycles and memory pressure, guiding decisions on when to store calculated data in memory vs. 'rematerialize' (recalculate) it.",
+      "hedge": "hedged",
+      "interpretation": "rematerialization 的取捨：用 microbenchmark 算出計算週期與記憶體壓力的實際 trade-off，決定該存還是該重算（help calculate，屬輔助語氣）。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n17",
+      "url": "https://developers.googleblog.com/en/how-to-use-google-microbenchmarks-for-evaluating-tpu-performance/",
+      "quote": "Publication: July 30, 2026. Authors: Junjie Qian, Chi Shuen Lee, Yu-Hsuan (Amy) Lin, Haixiong (Sean) Wang",
+      "hedge": "asserted",
+      "interpretation": "文章發布日期與四位掛名作者，屬 byline metadata。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n18",
+      "url": "https://github.com/AI-Hypercomputer/accelerator-microbenchmarks",
+      "quote": "psum, all_gather, all_to_all, reduce_scatter (using shard_map)",
+      "hedge": "asserted",
+      "interpretation": "repo README 列出的 collective 量測操作，用 JAX 的 shard_map 實作。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n19",
+      "url": "https://github.com/AI-Hypercomputer/accelerator-microbenchmarks",
+      "quote": "bazel run //src/accelerator_microbenchmarks:main -- --config configs/sample.yaml",
+      "hedge": "asserted",
+      "interpretation": "repo 提供的實際執行指令：用 bazel 跑 main target，帶一個 YAML config。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n20",
+      "url": "https://github.com/AI-Hypercomputer/accelerator-microbenchmarks",
+      "quote": "global:\n  warmup_tries: 2\n  num_runs: 5\n  dtype: \"bfloat16\"\n\nbenchmarks:\n  - name: hbm_bandwidth\n    sweep:\n      size: \n        start: 1024\n        end: 8192\n        multiplier: 2",
+      "hedge": "asserted",
+      "interpretation": "repo 提供的範例 config，示範 warmup/執行次數、dtype，以及 hbm_bandwidth benchmark 的 size sweep 設定。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n21",
+      "url": "https://github.com/AI-Hypercomputer/accelerator-microbenchmarks",
+      "quote": "detailed.json and summary.csv",
+      "hedge": "asserted",
+      "interpretation": "跑完 benchmark 後的輸出檔案格式：逐筆明細的 detailed.json 與彙整的 summary.csv。",
+      "timeliness": "annual"
+    }
+  ],
+  "claims": [
+    {
+      "id": "c01",
+      "claim_text": "forward pass 打到 1.85 PFLOPS；routing 與 attention 原語只跑到 SOL 的 30% 到 60%",
+      "location": "vg-deep-opener",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n10",
+        "n11"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The forward-pass and dense-core operations were primarily compute-bound, reaching 1.85 PFLOPS. Conversely, the routing and attention primitives in the MoE architecture remained memory-bound, operating at 30-60% of the SOL.",
+      "note": "Both figures verbatim in source. Hook omits 'primarily' but the body retains the full quote, so strength is not upgraded.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c02",
+      "claim_text": "「Determining the empirical performance of TPUs requires moving beyond product specifications to granular, real-world measurements.」",
+      "location": "開場段",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n01"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Determining the empirical performance of TPUs requires moving beyond product specifications to granular, real-world measurements.",
+      "note": "Verbatim.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c03",
+      "claim_text": "accelerator-microbenchmarks（GitHub：AI-Hypercomputer/accelerator-microbenchmarks）",
+      "location": "開場段",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n18",
+        "n19"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "bazel run //src/accelerator_microbenchmarks:main -- --config configs/sample.yaml",
+      "note": "Repo path re-fetched and confirmed as a JAX benchmark harness.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c04",
+      "claim_text": "Google 在 7 月底的一篇文章裡介紹了 accelerator-microbenchmarks 這套已公開的工具",
+      "location": "開場段",
+      "type": "date-version",
+      "load": "medium",
+      "note_ids": [
+        "n17"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Publication: July 30, 2026",
+      "note": "Round 1 found a trace failure: the post said Google 『7 月底開源』 the repo, but no note supports a first-release date, and the README's legacy v1.1 tag implies the repo predates the article. Corrected in the fix loop to attribute the July date to the article and describe the repo as already public.",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c05",
+      "claim_text": "「In one example, we analyzed the performance tuning of a 110B Mixture-of-Experts (MoE) training workload deployed on a 4x4x4 TPU 7x configuration...」",
+      "location": "H2 step time",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n10"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "a 110B Mixture-of-Experts (MoE) training workload deployed on a 4x4x4 TPU 7x configuration",
+      "note": "Verbatim; 110B / 4x4x4 / TPU 7x all present.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c06",
+      "claim_text": "TPU 7x（也就是 Ironwood）",
+      "location": "H2 step time",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n13"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "on the Ironwood (TPU7x) architecture",
+      "note": "The equivalence is established by the source itself.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c07",
+      "claim_text": "文章把這個階段稱作「establish hardware baselines」",
+      "location": "H2 step time",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n10"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "leveraging microbenchmarks to establish hardware baselines and drive optimization for complex, sparse workloads",
+      "note": "Phrase is from the same source sentence as n10.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c08",
+      "claim_text": "五個面向的五段引文",
+      "location": "H2 規格表 + 表格 widget",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n02",
+        "n03",
+        "n04",
+        "n05",
+        "n06"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Key tests include all-gather, all-reduce, reduce-scatter, and all-to-all. Metrics include throughput (GB/s), and latency (seconds).",
+      "note": "All five quotes compared individually and present in source; the table widget's five rows match.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c09",
+      "claim_text": "這五個面向裡，只有 collective 通訊同時報 throughput 與 latency 兩個數字",
+      "location": "H2 規格表",
+      "type": "superlative",
+      "load": "medium",
+      "note_ids": [
+        "n02",
+        "n03",
+        "n04",
+        "n05",
+        "n06"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Metrics include throughput (GB/s), and latency (seconds).",
+      "note": "Direct induction over the five listed metric sets; only the collective section lists latency.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c10",
+      "claim_text": "文章沒有解釋為什麼，合理的推測是：訓練 pipeline 裡的 collective op 常常在等待而不是在跑...",
+      "location": "H2 規格表",
+      "type": "causal",
+      "load": "low",
+      "note_ids": [],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "Round 1: the causal explanation for why collective reports latency was authored background presented without an inference marker. Corrected in the fix loop — the sentence now states the source is silent and opens with 合理的推測是.",
+      "action": "mark-inferred",
+      "resolution": "marked-inferred"
+    },
+    {
+      "id": "c11",
+      "claim_text": "「psum, all_gather, all_to_all, reduce_scatter (using shard_map)」",
+      "location": "H2 規格表",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n18"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "psum, all_gather, all_to_all, reduce_scatter (using shard_map)",
+      "note": "README re-fetched, verbatim.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c12",
+      "claim_text": "文章把 RPAv3 獨立列成一個量測面向，量的是 Attention（tokamax splash 實作）與 Batch Matrix Multiplication 的吞吐量。",
+      "location": "H2 規格表",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n06"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Ragged-Paged Attention (RPAv3): Focuses on benchmarks tailored for transformer-based models, specifically measuring throughput for primitives like Attention (tokamax splash) and Batch Matrix Multiplication (BMM).",
+      "note": "Round 1 flagged two problems: 『第三代實作』 was unsourced, and a rationale was attributed to the article that the article never states. Corrected in the fix loop — the generation claim was deleted and the sentence now says only what the source says RPAv3 measures.",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c13",
+      "claim_text": "文章沒有說明它為什麼不把 RPAv3 併進 GEMM 或 collective 一起算；合理的推測是...",
+      "location": "H2 規格表",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "Round 1: the post asserted 『這是為什麼文章把 RPAv3 獨立出來』 — an attribution frame for a rationale that is ABSENT from the source (specifically re-queried). Corrected in the fix loop to state the source is silent and mark the explanation as the author's inference.",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c14",
+      "claim_text": "三段 Roofline 判準引文",
+      "location": "H2 Roofline + stack-cards widget",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n07",
+        "n08",
+        "n09"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "deflated",
+      "evidence": "Performance can be improved by optimizing data locality (VMEM) or reducing HBM traffic.",
+      "note": "All three verbatim. The compute-bound quote is truncated at a sentence boundary, a legitimate cut. The post actively points out that the memory-bound wording is 'can be improved', not a guarantee — deflation, recorded and passed.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c15",
+      "claim_text": "「the 256x256 systolic array imposes a physical constraint on operand shapes.」",
+      "location": "H2 案例",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n13"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "on the Ironwood (TPU7x) architecture, the 256x256 systolic array imposes a physical constraint on operand shapes",
+      "note": "Verbatim.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c16",
+      "claim_text": "forward pass 與 dense-core 運算量到 1.85 PFLOPS",
+      "location": "H2 案例",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n11"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The forward-pass and dense-core operations were primarily compute-bound, reaching 1.85 PFLOPS.",
+      "note": "English quote retains 'primarily'; the Chinese gloss does not upgrade strength.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c17",
+      "claim_text": "routing 與 attention 原語卻卡在 memory-bound 區，只打到 SOL 的三成到六成。",
+      "location": "H2 案例",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [
+        "n11"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Conversely, the routing and attention primitives in the MoE architecture remained memory-bound, operating at 30-60% of the SOL.",
+      "note": "Round 1: the post appended 『原因是 HBM 頻寬撐不住這些原語的存取模式』 in an asserted voice, a causal clause absent from the source and contradicting the post's own later admission that the source publishes only results. The clause was deleted in the fix loop.",
+      "action": "mark-inferred",
+      "resolution": "marked-inferred"
+    },
+    {
+      "id": "c18",
+      "claim_text": "文章沒有另外拆解 backward pass 的 Roofline 分類",
+      "location": "H2 案例",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n11"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The forward-pass and dense-core operations were primarily compute-bound, reaching 1.85 PFLOPS.",
+      "note": "Negative attribution specifically re-queried: the source classifies only forward-pass/dense-core and routing/attention. The 'does not' statement is correct.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c19",
+      "claim_text": "合理的推測是，這個落差跟 MoE 架構本身的計算型態有關...文章本身沒有把這個機制寫出來",
+      "location": "H2 案例",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [
+        "n11"
+      ],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "Opens with 合理的推測是 and self-declares the source silence — a legitimately marked inference.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c20",
+      "claim_text": "文章沒有把 21.2% 分攤到個別介入上，只公佈了合計後的結果。",
+      "location": "H2 案例",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n12"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Microbenchmark results directly guided interventions that reduced the training step time by 21.2%.",
+      "note": "Round 1: the post said the article 『沒有拆解 21.2% 具體來自哪個介入』, but re-fetching shows the article does name interventions (SparseCore collective offloading, Tokamax Splash Attention) — it simply does not apportion the figure. Corrected in the fix loop to say exactly that.",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c21",
+      "claim_text": "「Microbenchmark results directly guided interventions that reduced the training step time by 21.2%.」",
+      "location": "H2 案例",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n12"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Microbenchmark results directly guided interventions that reduced the training step time by 21.2%.",
+      "note": "Verbatim; source voice is asserted and the Chinese gloss matches.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c22",
+      "claim_text": "bazel run //src/accelerator_microbenchmarks:main -- --config configs/sample.yaml",
+      "location": "H2 案例 shell block",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n19"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "bazel run //src/accelerator_microbenchmarks:main -- --config configs/sample.yaml",
+      "note": "README shows it with a line continuation; joining to one line is a trivial reformat. Target path and flag identical.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c23",
+      "claim_text": "warmup_tries: 2 / num_runs: 5 / dtype bfloat16 / hbm_bandwidth sweep 1024-8192 multiplier 2",
+      "location": "H2 案例 config block",
+      "type": "number",
+      "load": "medium",
+      "note_ids": [
+        "n20"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "global:\n  warmup_tries: 2\n  num_runs: 5\n  dtype: \"bfloat16\"",
+      "note": "Raw README fetched on the second attempt; all six values match. The excerpt label matches the README's example nature.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c24",
+      "claim_text": "跑完之後 repo 輸出「detailed.json and summary.csv」",
+      "location": "H2 案例",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n21"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "the benchmark runner aggregates results and writes them to the `results/` directory as `detailed.json` and `summary.csv`",
+      "note": "Filenames verbatim.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c25",
+      "claim_text": "README 只列出 warmup_tries 與 num_runs 兩個參數名稱，沒有解釋語意；照 benchmark 的一般慣例推測...",
+      "location": "H2 案例",
+      "type": "causal",
+      "load": "low",
+      "note_ids": [],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "Round 1: the semantics of the two config keys were authored background stated without an inference marker. Corrected in the fix loop — the sentence now states the README does not explain them and marks the gloss as a conventional inference.",
+      "action": "mark-inferred",
+      "resolution": "marked-inferred"
+    },
+    {
+      "id": "c26",
+      "claim_text": "合理的起手式是先跑 HBM 頻寬...但這是使用上的合理猜測，文章本身沒有規定跑的順序。",
+      "location": "H2 案例",
+      "type": "causal",
+      "load": "low",
+      "note_ids": [],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "Double-marked as inference at both ends and self-declares the source silence — legitimate author synthesis.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c27",
+      "claim_text": "「You can compare standard JAX operations against specialized Pallas kernels or Tokamax Splash Attention.」",
+      "location": "H2 旋鈕",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n14"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "standard JAX operations against specialized Pallas kernels or Tokamax Splash Attention",
+      "note": "Verbatim; the Chinese gloss preserves the suggestive voice.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c28",
+      "claim_text": "「By measuring collective performance across different topologies (e.g., 2x2x2 vs 4x2x1), you can optimize Fully Sharded Data Parallel (FSDP) parameters.」",
+      "location": "H2 旋鈕",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n15"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "2x2x2 vs 4x2x1 ... optimize Fully Sharded Data Parallel (FSDP) parameters",
+      "note": "Both topology strings and FSDP verbatim.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c29",
+      "claim_text": "「Microbenchmarks help calculate the exact trade-off between compute cycles and memory pressure...」",
+      "location": "H2 旋鈕",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n16"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Microbenchmarks help calculate the exact trade-off between compute cycles and memory pressure, guiding decisions on when to store calculated data in memory vs. 'rematerialize' (recalculate) it.",
+      "note": "Verbatim; the hedged 'help calculate' is not upgraded.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c30",
+      "claim_text": "110B MoE 這個案例本身是單一個案（in one example），21.2% 不是可以直接套用的固定倍率。",
+      "location": "H2 旋鈕",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n10",
+        "n12"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "deflated",
+      "evidence": "In one example, we analyzed the performance tuning of a 110B Mixture-of-Experts (MoE) training workload",
+      "note": "The post surfaces the source's own 'in one example' qualifier to the reader; strength at or below source.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c31",
+      "claim_text": "四位具名作者，發表於 2026 年 7 月 30 日的 Google Developers Blog",
+      "location": "結尾段",
+      "type": "date-version",
+      "load": "high",
+      "note_ids": [
+        "n17"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Junjie Qian, Chi Shuen Lee, Yu-Hsuan (Amy) Lin, Haixiong (Sean) Wang - July 30, 2026",
+      "note": "Byline re-fetched and confirmed; three days before the post date, so timeliness is fine.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c32",
+      "claim_text": "文章介紹的 accelerator-microbenchmarks repo 是公開的",
+      "location": "結尾段",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [
+        "n18"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "psum, all_gather, all_to_all, reduce_scatter (using shard_map)",
+      "note": "Round 1: the post said the repo was released 『配著一起放出來』 with the article, which no note supports and the README's legacy tag contradicts. Corrected in the fix loop to state only that the repo is public.",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c33",
+      "claim_text": "五個面向對應 TPU pipeline 裡五個不同的硬體子系統",
+      "location": "H2 規格表",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n02",
+        "n03",
+        "n04",
+        "n05",
+        "n06"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The core metric is memory bandwidth measured in GB/s.",
+      "note": "The count of five and the category names map directly onto the source's five benchmark categories.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c34",
+      "claim_text": "從這五個面向各自量什麼，可以合理推出「數字不好看」時該往哪裡查",
+      "location": "H2 規格表",
+      "type": "causal",
+      "load": "low",
+      "note_ids": [
+        "n02",
+        "n03",
+        "n04",
+        "n05",
+        "n06"
+      ],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "Opens with 可以合理推出, explicitly marked as the author's extension rather than a source recommendation.",
+      "action": "none",
+      "resolution": "none-needed"
+    }
+  ],
+  "checked_at": "2026-08-02",
+  "checker_rounds": 2,
+  "coverage": {
+    "candidate_claims": 45,
+    "checked": 34,
+    "dropped_low_load": 11
+  }
+}
