@@ -1,0 +1,363 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">get_mut_or_default 這段程式碼一直編不過 NLL——不是因為不安全，是因為 NLL 分不出「這個分支根本沒用到那個借用」。Polonius Alpha 上了 nightly，靠的正是這個區分。</p>
+  <h1 class="vg-post-title">{{ title }}</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p><span class="vg-dropcap">P</span>olonius Alpha 是 Rust 借用檢查器的下一代實作。Jack Huey 代表 Polonius 工作組在 8 月 4 日發文，宣布它上了 nightly，目標是幾個月內穩定化。它要處理的問題很具體：NLL 判斷一個借用還活著沒，看的是回傳型別要求的生命週期範圍，不看程式實際走了哪條分支——像 get_mut_or_default 這種「某個分支根本沒用到這個借用」的寫法，因此一直過不了。這篇文章要講四件事：這個新分析從哪裡來、flow-sensitive 具體改變了什麼判斷方式、拿真實 crate 量出來的效能代價要怎麼讀、以及它現在還做不到什麼。對已經在寫大量可變借用、或者踩過「NLL 說這個借用還活著」這種報錯的人，這是借用檢查器規則本身的變動：判斷一個借用「存活」與否的邏輯換了一套，日常寫法、語法都不用跟著改。</p>
+
+  <h2>從 2018 到 2023：原始 Polonius 為什麼卡住</h2>
+
+  <p>Polonius 這個名字不是 2026 年才出現。Rust 最早的借用檢查器「AST borrowck」很有限，2019 年被 NLL（non-lexical lifetimes）取代；Polonius 則是在 NLL 開發的過程裡，於 2018 年獨立分出來的下一步。原始版本比 NLL 更寬——用團隊自己的話說，它「passed the NLL test suite and accepted (sound) code that NLL did not」。問題不在正確性，在效能：「generally borrow check was slower than NLL, but certain programs were considerably slower than NLL to the extent that using that implementation/formulation of Polonius was a non-starter」。一般情況就比 NLL 慢，某些程式甚至慢到讓這一版 Polonius 直接沒法用——換掉 rustc 預設借用檢查器這件事，因此擱置了很多年。</p>
+
+  <p>轉折在 2023 年。團隊想出一套新表述，「required minimal rearchitecture of the existing NLL implementation and could be extended to allow more code to compile」——只在既有 NLL 的骨架上加細節，重構幅度壓到最小。這句話同時解釋了兩件事：2018 年的原始版本為什麼卡住（大概是把整套分析全部換掉，才會慢到不能用），2023 年的新表述為什麼真的能實作出來（借了 NLL 現成的機制，只在需要更細緻判斷的地方加東西，不用重新發明一遍）。團隊原本盼著 2024 年就能把這個新表述穩定化，沒趕上；Polonius Alpha 是這條路線在 2026 年 8 月 4 日第一次真正上 nightly 的樣子，團隊現在的目標是「stabilize prior to the end of the year」。</p>
+
+  <p>這個時間軸也說明了「穩定化」對編譯器基礎設施有多貴：Polonius 2018 年就從 NLL 分出來，比 NLL 隔年（2019）才正式取代 AST borrowck 還要早——新一代借用檢查器的起點，比上一代站穩的時間還早。中間跳過了整整一版效能不可用的原型，2023 年才等到一個真正划算的表述方式，2026 年才第一次讓一般開發者在 nightly 上摸得到。對編譯器這種底層基礎設施，「概念可行」跟「可以端上生產環境」之間，往往隔著好幾年的重新設計：這中間的每一步——新表述、效能實測、邊界案例排查——都要花掉整年整年的時間，2018 到 2026 這八年就是這樣一步步走過來的——中間任何一步卡住，Polonius Alpha 可能到現在都還上不了 nightly。</p>
+
+  <figure class="vg-w-scrub-polonius-timeline" data-mobile="static" data-svg-scroll="720">
+    <style>
+      .vg-w-scrub-polonius-timeline { display: flex; flex-direction: column; gap: var(--s-2); }
+      .vg-w-scrub-polonius-timeline svg { width: 100%; height: auto; }
+      .vg-w-scrub-polonius-timeline .head { font-family: EB Garamond, serif; font-size: 15px; }
+      .vg-w-scrub-polonius-timeline .year { font-family: JetBrains Mono, monospace; font-size: 13px; }
+      .vg-w-scrub-polonius-timeline .label { font-family: IM Fell English, serif; font-style: italic; font-size: 12px; }
+      .vg-w-scrub-polonius-timeline .state { font-family: var(--serif); font-size: var(--fs-sm); padding: var(--s-2); background: var(--bg-soft); border-left: 2px solid var(--accent); }
+      @media (hover: none) and (pointer: coarse) {
+        .vg-w-scrub-polonius-timeline #vg-w-scrub-polonius-timeline-handle { cursor: default; }
+      }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m18 8 4 4-4 4" /><path d="M2 12h20" /><path d="m6 8-4 4 4 4" />
+      </svg>
+      <span>drag handle along the timeline · 5 events, 2018 到年底前</span>
+    </p>
+
+    <svg class="vg-w-scrub-polonius-timeline-main" viewBox="0 0 720 200" role="img" aria-label="Polonius 借用檢查器路線圖：2018 年分出、2023 年新表述、2024 年錯過、2026 年 8 月上 nightly、年底前目標穩定">
+      <text x="360" y="30" text-anchor="middle" fill="var(--ink)" class="head">從 2018 到年底前——Polonius 的路線圖</text>
+      <line x1="90" y1="130" x2="650" y2="130" stroke="var(--muted-2)" stroke-width="1.5" />
+
+      <circle cx="90" cy="130" r="4" fill="var(--muted)" />
+      <text x="90" y="110" text-anchor="middle" fill="var(--ink)" class="year">2018</text>
+      <text x="90" y="158" text-anchor="middle" fill="var(--muted)" class="label">分出</text>
+
+      <circle cx="230" cy="130" r="4" fill="var(--muted)" />
+      <text x="230" y="110" text-anchor="middle" fill="var(--ink)" class="year">2023</text>
+      <text x="230" y="158" text-anchor="middle" fill="var(--muted)" class="label">新表述</text>
+
+      <circle cx="370" cy="130" r="4" fill="var(--muted)" />
+      <text x="370" y="110" text-anchor="middle" fill="var(--ink)" class="year">2024</text>
+      <text x="370" y="158" text-anchor="middle" fill="var(--muted)" class="label">錯過目標</text>
+
+      <circle cx="510" cy="130" r="4" fill="var(--sage-deep)" />
+      <text x="510" y="110" text-anchor="middle" fill="var(--sage-deep)" class="year">2026-08</text>
+      <text x="510" y="158" text-anchor="middle" fill="var(--muted)" class="label">上 nightly</text>
+
+      <circle cx="650" cy="130" r="4" fill="var(--muted)" />
+      <text x="650" y="110" text-anchor="middle" fill="var(--ink)" class="year">年底前</text>
+      <text x="650" y="158" text-anchor="middle" fill="var(--muted)" class="label">目標穩定</text>
+
+      <line id="vg-w-scrub-polonius-timeline-handle-line" x1="510" y1="102" x2="510" y2="158" stroke="var(--accent)" stroke-width="2" />
+      <circle id="vg-w-scrub-polonius-timeline-handle" cx="510" cy="130" r="9" fill="var(--accent)" cursor="grab"
+              role="slider" tabindex="0" aria-label="拖曳查看各年度狀態" aria-valuemin="0" aria-valuemax="4" aria-valuenow="3" aria-valuetext="2026-08" />
+    </svg>
+
+    <div class="state" id="vg-w-scrub-polonius-timeline-state">2026-08——Jack Huey 代表 Polonius 工作組發文，Polonius Alpha 作為新表述的實作上了 nightly，成為預設分析。</div>
+
+    <figcaption>資料來源：<a href="https://blog.rust-lang.org/2026/08/04/enabling-polonius-alpha-on-nightly/">Rust Blog，2026-08-04</a>。</figcaption>
+
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        var root = document.querySelector('.vg-w-scrub-polonius-timeline');
+        if (!root) return;
+        var svg = root.querySelector('svg.vg-w-scrub-polonius-timeline-main');
+        var handle = root.querySelector('#vg-w-scrub-polonius-timeline-handle');
+        var handleLine = root.querySelector('#vg-w-scrub-polonius-timeline-handle-line');
+        var stateDiv = root.querySelector('#vg-w-scrub-polonius-timeline-state');
+        var events = [
+          [90, '2018', 'Polonius 從 NLL 分出來——比 NLL 寬，能編 NLL 拒絕的合法程式，代價是某些程式慢到沒法用。'],
+          [230, '2023', '新表述出現——只需要在既有 NLL 實作上做最小限度的重構，還能擴充讓更多程式編過。'],
+          [370, '2024', '團隊原本盼著這一年就能把新表述穩定化，沒有趕上這個時間表。'],
+          [510, '2026-08', 'Jack Huey 代表 Polonius 工作組發文，Polonius Alpha 作為新表述的實作上了 nightly，成為預設分析。'],
+          [650, '年底前', '團隊的目標是把 Polonius Alpha 穩定化，這段期間持續觀察效能迴歸與邊界案例。']
+        ];
+        function nearest(x) {
+          var best = events[0], bd = Infinity;
+          events.forEach(function (e) {
+            var d = Math.abs(e[0] - x);
+            if (d < bd) { bd = d; best = e; }
+          });
+          return best;
+        }
+        function idxOf(ev) { return events.indexOf(ev); }
+        function setTo(ev) {
+          handle.setAttribute('cx', ev[0]);
+          handleLine.setAttribute('x1', ev[0]);
+          handleLine.setAttribute('x2', ev[0]);
+          handle.setAttribute('aria-valuenow', String(idxOf(ev)));
+          handle.setAttribute('aria-valuetext', ev[1]);
+          stateDiv.textContent = ev[1] + '——' + ev[2];
+        }
+        function clientToSvgX(clientX) {
+          var pt = svg.createSVGPoint();
+          pt.x = clientX; pt.y = 0;
+          var p = pt.matrixTransform(svg.getScreenCTM().inverse());
+          return Math.max(90, Math.min(650, p.x));
+        }
+        var dragging = false;
+        handle.addEventListener('pointerdown', function (e) { dragging = true; handle.setPointerCapture(e.pointerId); });
+        handle.addEventListener('pointermove', function (e) {
+          if (!dragging) return;
+          setTo(nearest(clientToSvgX(e.clientX)));
+        });
+        handle.addEventListener('pointerup', function () { dragging = false; });
+        handle.addEventListener('keydown', function (e) {
+          var cur = Number(handle.getAttribute('cx'));
+          var idx = events.findIndex(function (ev) { return ev[0] === cur; });
+          if (e.key === 'ArrowLeft' && idx > 0) { e.preventDefault(); setTo(events[idx - 1]); }
+          if (e.key === 'ArrowRight' && idx < events.length - 1) { e.preventDefault(); setTo(events[idx + 1]); }
+        });
+      })();
+    </script>
+  </figure>
+
+  <h2>flow-sensitive 到底是什麼——get_mut_or_default 的例子</h2>
+
+  <p>「flow-sensitive」這個詞，文章用在解釋 get_mut_or_default 為什麼過得了 Polonius Alpha、卻過不了 NLL。文章特別標注，這是「你會更常看到」的例子——暗示這類分支不對稱的借用模式，在真實 Rust 程式裡並不罕見。這是教科書等級的例子——從一個 map 裡按 key 找值，找到了就回傳可變借用，找不到就先插入一個預設值，再回傳新插入那格的可變借用：</p>
+
+  <pre><code class="language-rust">fn get_mut_or_default&lt;'r, K: Hash + Eq + Copy, V: Default&gt;(
+    map: &amp;'r mut HashMap&lt;K, V&gt;,
+    key: K,
+) -&gt; &amp;'r mut V {
+    match map.get_mut(&amp;key) {
+        Some(value) =&gt; value,
+        None =&gt; {
+            map.insert(key, V::default());
+            map.get_mut(&amp;key).unwrap()
+        }
+    }
+}
+</code></pre>
+
+  <p>文章對 NLL 為什麼拒絕這段的說法是：「the Some(value) => value branch causes the borrow checker to think that the borrow returned by map.get_mut(&key) lives for the entire function (because of the &'r mut V return type), even though that borrow isn't live in the None branch」。換句話說，NLL 只看函式簽章上寫的生命週期範圍——回傳型別是 &'r mut V，NLL 就假設這個借用要撐到 'r 標記的整個範圍，不管程式實際走的是哪條分支。它把一個借用的死活，當成整個函式共用的單一區間，不分岔。Polonius Alpha 反過來：「its analysis is flow-sensitive, and it knows that the borrow isn't live in the None branch」。同一段程式，兩種分析看到的是兩張不同的圖——一張看的是型別簽章暗示的最大可能存活範圍，一張看的是每條控制流路徑各自的存活範圍，None 分支既然沒用到那個借用，Polonius Alpha 就不會把它算進去。</p>
+
+  <p>這也回答了一個自然的疑問：為什麼不是一開始就做 flow-sensitive？合理的猜測是效能——只看型別簽章、不追蹤每條路徑，分析速度快、實作也單純，NLL 當年選這條路多半是為了能準時穩定。flow-sensitive 分析要對每個控制流節點都算一次「這裡活著嗎」，運算量天生比「整個函式一個答案」大，2023 年的新表述能把重構幅度壓到最小，關鍵大概也在於只在少數真正需要的地方觸發完整的路徑分析，多數借用還是沿用 NLL 原有的判斷。對寫 Rust 的人來說，這個差異平常感覺不到，直到寫出一個邏輯上明明安全、卻被 NLL 拒絕的函式，翻遍文件才發現問題出在生命週期標註逼借用檢查器把範圍算大了。get_mut_or_default 正是這種案例的代表，卡關純粹是分析能力不夠細，程式本身的邏輯從頭到尾都沒有錯。這是分析引擎本身換了一套判斷方式，唯一會變的是編譯器願意放行的程式範圍，跟寫法、風格都無關。</p>
+
+  <figure class="vg-w-tabs-borrow-view" data-mobile="static" data-svg-scroll="560">
+    <style>
+      .vg-w-tabs-borrow-view { display: flex; flex-direction: column; gap: var(--s-2); }
+      .vg-w-tabs-borrow-view input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-tabs-borrow-view .tabs { display: flex; gap: var(--s-2); border-bottom: 1px solid var(--line); }
+      .vg-w-tabs-borrow-view .tab { font-family: var(--sans); font-size: var(--fs-sm); padding: var(--s-1) var(--s-2); cursor: pointer; color: var(--muted); }
+      .vg-w-tabs-borrow-view .panel { display: none; }
+      .vg-w-tabs-borrow-view:has(#vg-w-tabs-borrow-view-t1:checked) .panel-1 { display: block; }
+      .vg-w-tabs-borrow-view:has(#vg-w-tabs-borrow-view-t1:checked) [for="vg-w-tabs-borrow-view-t1"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-borrow-view:has(#vg-w-tabs-borrow-view-t2:checked) .panel-2 { display: block; }
+      .vg-w-tabs-borrow-view:has(#vg-w-tabs-borrow-view-t2:checked) [for="vg-w-tabs-borrow-view-t2"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-borrow-view .code-frame { background: var(--bg-soft); border-left: 2px solid var(--muted-2); padding: var(--s-2); overflow-x: auto; }
+      .vg-w-tabs-borrow-view .code-frame pre { margin: 0; font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); line-height: 1.7; }
+      .vg-w-tabs-borrow-view .hl { background: color-mix(in oklch, var(--accent) 22%, transparent); border-radius: 2px; }
+      .vg-w-tabs-borrow-view .panel-note { font-family: var(--serif); font-size: var(--fs-sm); margin: var(--s-2) 0 0; }
+      @media (hover: none) and (pointer: coarse) {
+        .vg-w-tabs-borrow-view .tabs { display: none; }
+      }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect width="18" height="18" x="3" y="3" rx="2" /><path d="M3 9h18" /><path d="M9 21V9" />
+      </svg>
+      <span>switch tabs to compare 2 views · NLL vs Polonius Alpha</span>
+    </p>
+
+    <input type="radio" id="vg-w-tabs-borrow-view-t1" name="vg-w-tabs-borrow-view-sel" checked />
+    <input type="radio" id="vg-w-tabs-borrow-view-t2" name="vg-w-tabs-borrow-view-sel" />
+    <div class="tabs" data-vg-controls>
+      <label class="tab" for="vg-w-tabs-borrow-view-t1">NLL 怎麼看</label>
+      <label class="tab" for="vg-w-tabs-borrow-view-t2">Polonius Alpha 怎麼看</label>
+    </div>
+
+    <div class="panel panel-1">
+      <div class="code-frame"><pre><code>match map.get_mut(&amp;key) {
+<span class="hl">    Some(value) =&gt; value,
+    None =&gt; {
+        map.insert(key, V::default());
+        map.get_mut(&amp;key).unwrap()
+    }</span>
+}</code></pre></div>
+      <p class="panel-note">NLL 認為 <code>map.get_mut(&amp;key)</code> 回傳的借用活到整個函式結束——連 <code>None</code> 分支也算進去，即使那裡完全沒用到它。整段 match 都在「可能還活著」的範圍裡，NLL 不會去區分兩個分支各自實際用到了什麼。</p>
+    </div>
+    <div class="panel panel-2">
+      <div class="code-frame"><pre><code>match map.get_mut(&amp;key) {
+<span class="hl">    Some(value) =&gt; value,</span>
+    None =&gt; {
+        map.insert(key, V::default());
+        map.get_mut(&amp;key).unwrap()
+    }
+}</code></pre></div>
+      <p class="panel-note">Polonius Alpha 只把借用畫在 <code>Some</code> 分支——<code>None</code> 分支被視為借用沒有存活，可以放心呼叫 <code>map.insert</code> 插入新值。</p>
+    </div>
+  </figure>
+
+  <h2>拿 crates.io 前一萬個 crate 量出來的代價</h2>
+
+  <p>多一層分析，原則上就要多付一點編譯時間。團隊挑了 crates.io 下載量前一萬名的 crate 實測，結論是「relatively few 'significant' regressions」——顯著的迴歸相對少見。判斷「顯著」用的門檻線，原文寫的是「an arbitrary threshold of significance, set to a 1% regression and quadratically scaled below 30 seconds」。拆開讀：編譯本來要 30 秒以上的 crate，迴歸超過 1% 才算數；編譯本來就很快的 crate，1% 的差異換算成絕對時間可能只有幾毫秒，跟量測雜訊沒兩樣，門檻線因此隨編譯時間變短而放寬，避免把抖動當成真的迴歸。前一萬名之外，團隊挑的是借用比較多的 crate 繼續測——這類 crate 更可能踩中 flow-sensitive 分析新增的判斷路徑，「the worst case we've seen is a 2-3x regression」。團隊自己的結論是，即使修不掉這些迴歸，考慮到它們有多罕見、幅度有多小，這個代價「fairly reasonable」——用詞選在「fairly」，這是團隊自己留的一點餘地。</p>
+
+  <p>效能代價從哪裡來，文章給了一句明確的定性：「Polonius Alpha currently does strictly equal or more work compared to NLL, so we have been paying particular attention to potential performance regressions」。翻譯過來：不管走到哪個分支，Polonius Alpha 至少做了 NLL 原本會做的所有事，再疊加上 flow-sensitive 需要的額外路徑判斷，工作量只會打平或變多，不會因為換了分析方式反而變少。這也是為什麼團隊把前一萬大 crate 的量測做得這麼仔細，新分析在設計上就沒有天生更快這個選項，效能風險只能靠量測跟修補去壓。團隊自己的說法是，對已經看到的迴歸「done some initial triage of the causes」，還在想怎麼修最好——目前公開的只是量測結果，修復時間表還沒有出現。</p>
+
+  <p>拿真實世界的一萬個 crate 當測試集，這個方法論本身有意義：合成 benchmark 容易只覆蓋作者想到的模式，真實 crate 裡的程式碼形狀五花八門，能把邊界案例逼出來的機率高得多。前一萬大這個範圍也不是隨便挑的——這一萬個 crate 純粹按 crates.io 下載量排序取前段，不是隨機抽樣。門檻為什麼要隨基準時間拉長而放寬，文章沒有解釋；合理的讀法是，編譯本來就快的 crate，任何一次量測都可能因為機器忙不忙、快取熱不熱而抖動個百分之幾，把門檻設死在 1%，容易把這些抖動當成迴歸——門檻隨基準時間拉長而放寬，或許正是為了濾掉這類雜訊，但這是我的推測，文章本身沒有這樣寫。</p>
+
+  <p>這組數字對讀者的意義，比「效能有沒有退步」更具體：如果專案本身借用密集（大量泛型加大量可變引用），開下 Polonius Alpha 之後編譯時間值得盯一下；普通應用程式碼這次升級多半無感，真正會踩到 2-3 倍那端的，是團隊自己刻意挑出來測的少數案例。團隊把它預設打開在 nightly、沒有藏在額外的 flag 後面。這背後的判斷文章沒有明說；合理的猜測是，多數專案根本不會踩進那個少數案例的範圍。</p>
+
+  <figure class="vg-w-chart-polonius-regression" data-mobile="static" data-svg-scroll="720">
+    <style>
+      .vg-w-chart-polonius-regression { display: flex; flex-direction: column; gap: var(--s-2); }
+      .vg-w-chart-polonius-regression svg { width: 100%; height: auto; }
+      .vg-w-chart-polonius-regression input[type="checkbox"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-chart-polonius-regression .reveal-btn { display: inline-block; font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); border: 1px solid var(--line); padding: var(--s-1) var(--s-2); cursor: pointer; min-height: 44px; box-sizing: border-box; display: inline-flex; align-items: center; }
+      .vg-w-chart-polonius-regression .reveal-panel { display: none; font-family: var(--serif); font-size: var(--fs-sm); padding: var(--s-2); background: var(--bg-soft); border-left: 2px solid var(--accent); }
+      .vg-w-chart-polonius-regression:has(#vg-w-chart-polonius-regression-reveal:checked) .reveal-panel { display: block; }
+      .vg-w-chart-polonius-regression figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+      @media (hover: none) and (pointer: coarse) {
+        .vg-w-chart-polonius-regression [data-vg-controls] { display: none; }
+      }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M14 4.1 12 6" /><path d="m5.1 8-2.9-.8" /><path d="m6 12-1.9 2" /><path d="M7.2 2.2 8 5.1" /><path d="M9.037 9.69a.498.498 0 0 1 .653-.653l11 4.5a.5.5 0 0 1-.074.949l-4.349 1.041a1 1 0 0 0-.74.739l-1.04 4.35a.5.5 0 0 1-.95.074z" />
+      </svg>
+      <span>click to reveal how the sub-30s threshold loosens</span>
+    </p>
+
+    <svg viewBox="0 0 720 260" role="img" aria-label="前一萬大 crate 的迴歸幅度對照顯著門檻：多數落在 1% 以下，前萬大之外借用密集的 crate 最差到 2 到 3 倍">
+      <text x="360" y="28" text-anchor="middle" fill="var(--ink)" font-family="EB Garamond, serif" font-size="15">前一萬大 crate 的迴歸幅度・對照「顯著」的門檻</text>
+
+      <rect x="90" y="180" width="94" height="20" fill="var(--sage)" opacity="0.4" />
+      <rect x="596" y="180" width="32" height="20" fill="var(--accent)" opacity="0.55" />
+      <line x1="90" y1="200" x2="650" y2="200" stroke="var(--muted-2)" stroke-width="1.5" />
+
+      <line x1="184" y1="196" x2="184" y2="204" stroke="var(--muted-2)" />
+      <line x1="363" y1="196" x2="363" y2="204" stroke="var(--muted-2)" />
+      <line x1="542" y1="196" x2="542" y2="204" stroke="var(--muted-2)" />
+
+      <text x="90" y="222" text-anchor="middle" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="12">≈0%</text>
+      <text x="184" y="222" text-anchor="middle" fill="var(--ink)" font-family="JetBrains Mono, monospace" font-size="12">1%</text>
+      <text x="363" y="222" text-anchor="middle" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="12">10%</text>
+      <text x="542" y="222" text-anchor="middle" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="12">100%</text>
+      <text x="612" y="222" text-anchor="middle" fill="var(--accent-text)" font-family="JetBrains Mono, monospace" font-size="12">2-3x</text>
+
+      <text x="137" y="165" text-anchor="middle" fill="var(--sage-deep)" font-family="IM Fell English, serif" font-style="italic" font-size="12">多數受測 crate</text>
+      <text x="137" y="245" text-anchor="middle" fill="var(--sage-deep)" font-family="IM Fell English, serif" font-style="italic" font-size="11">「relatively few significant regressions」</text>
+
+      <line x1="184" y1="176" x2="184" y2="140" stroke="var(--muted-2)" stroke-width="1" />
+      <text x="184" y="128" text-anchor="middle" fill="var(--ink)" font-family="IM Fell English, serif" font-style="italic" font-size="12">顯著門檻</text>
+      <text x="184" y="144" text-anchor="middle" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="11">≥30 秒基準</text>
+
+      <text x="612" y="165" text-anchor="middle" fill="var(--accent-text)" font-family="IM Fell English, serif" font-style="italic" font-size="12">worst case</text>
+      <text x="612" y="245" text-anchor="middle" fill="var(--accent-text)" font-family="IM Fell English, serif" font-style="italic" font-size="11">借用密集・前萬大之外</text>
+    </svg>
+
+    <input type="checkbox" id="vg-w-chart-polonius-regression-reveal" />
+    <div data-vg-controls><label class="reveal-btn" for="vg-w-chart-polonius-regression-reveal">30 秒以下的門檻怎麼算？</label></div>
+    <div class="reveal-panel">迴歸幅度低於 1% 的差異，在編譯只要幾秒的 crate 上很可能只是雜訊——量測本身的抖動就有機會超過 1%。原文的用詞是「quadratically scaled below 30 seconds」，30 秒以上用固定的 1%；但往哪個方向縮放、為什麼要縮放，原文沒有明說。合理的猜測是：編譯越快的 crate，判定「顯著」需要的百分比越高，這樣才濾得掉抖動——但這是推測，不是文章寫的。原文也沒有附精確的係數，所以這裡沒辦法畫成一條實際的曲線，只標出唯一已知的定錨點：30 秒處是 1%。</div>
+
+    <figcaption>資料來源：<a href="https://blog.rust-lang.org/2026/08/04/enabling-polonius-alpha-on-nightly/">Rust Blog，2026-08-04</a>——前一萬大 crate 的量測與門檻定義，原文未附個別 crate 的迴歸數字。</figcaption>
+  </figure>
+
+  <h2>還是會被拒絕的程式：while let Some(now) = p</h2>
+
+  <p>Polonius Alpha 不是原始 Polonius 的完整替代品。文章自己承認：「Polonius Alpha is not perfect; some programs that would compile under legacy Polonius (the slow original implementation) don't compile with Polonius Alpha」——方向反過來了，這次是新版比舊版更嚴。舉的例子是一段鏈結串列走訪。</p>
+
+  <figure class="vg-w-pop-linked-list" data-mobile="keep">
+    <style>
+      .vg-w-pop-linked-list { position: relative; display: grid; gap: var(--s-2); }
+      .vg-w-pop-linked-list pre { background: var(--bg-soft); border-left: 2px solid var(--muted-2); padding: var(--s-2); margin: 0; font-family: JetBrains Mono, monospace; font-size: var(--fs-xs); line-height: 1.7; overflow-x: auto; }
+      .vg-w-pop-linked-list .walk { font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-pop-linked-list .term { position: relative; text-decoration: underline dotted var(--muted); cursor: help; }
+      .vg-w-pop-linked-list .term-1 { anchor-name: --vgw-ll-anchor-1; }
+      .vg-w-pop-linked-list .term-2 { anchor-name: --vgw-ll-anchor-2; }
+      .vg-w-pop-linked-list .pop-1 { position-anchor: --vgw-ll-anchor-1; }
+      .vg-w-pop-linked-list .pop-2 { position-anchor: --vgw-ll-anchor-2; }
+      .vg-w-pop-linked-list .pop {
+        position: absolute;
+        top: anchor(bottom);
+        left: anchor(center);
+        translate: -50% var(--s-1);
+        padding: var(--s-1) var(--s-2);
+        background: var(--bg-soft);
+        border: 1px solid var(--line);
+        font-family: var(--scribed);
+        font-size: var(--fs-xs);
+        max-width: 32ch;
+        opacity: 0;
+        transition: opacity 100ms;
+        pointer-events: none;
+        z-index: 2;
+      }
+      .vg-w-pop-linked-list .term:hover + .pop,
+      .vg-w-pop-linked-list .term:focus + .pop { opacity: 1; }
+      @supports not (anchor-name: --x) {
+        .vg-w-pop-linked-list .pop { position: static; opacity: 1; pointer-events: auto; display: block; margin-top: 2px; }
+      }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M14 4.1 12 6" /><path d="m5.1 8-2.9-.8" /><path d="m6 12-1.9 2" /><path d="M7.2 2.2 8 5.1" /><path d="M9.037 9.69a.498.498 0 0 1 .653-.653l11 4.5a.5.5 0 0 1-.074.949l-4.349 1.041a1 1 0 0 0-.74.739l-1.04 4.35a.5.5 0 0 1-.95.074z" />
+      </svg>
+      <span>hover or tap underlined terms for detail · 2 個名詞</span>
+    </p>
+
+    <pre><code>struct X { next: Option&lt;Box&lt;X&gt;&gt; }
+
+fn conditional() {
+    let mut b = Some(Box::new(X { next: None }));
+    let mut p = &amp;mut b;
+    while let Some(now) = p {
+        if true {
+            p = &amp;mut now.next;
+        }
+    }
+}</code></pre>
+
+    <p class="walk">迴圈每一輪都重新借用 <span class="term term-1" tabindex="0">p</span><span class="pop pop-1">while let Some(now) = p 這一行，每輪迴圈都要重新借用 p 才能判斷它是不是 None——這個借用要從迴圈頂端一路撐到迴圈底部。</span>，條件成立時把 <span class="term term-2" tabindex="0">p = &amp;mut now.next</span><span class="pop pop-2">把 p 重新指向目前節點的下一格，遞迴地往鏈結串列後面走一格，是合法、常見的走訪寫法。</span>。這段迴圈整體在做的事很單純：從串列頭一路走到尾，每一輪重新確認手上的節點還存不存在，是任何寫過鏈結資料結構的人都會寫的樣子。原始 Polonius 編得過這段，Polonius Alpha 編不過。</p>
+  </figure>
+
+  <p>文章沒有解釋 Polonius Alpha 具體卡在哪一步，但從程式的形狀能看出方向：while let 這個迴圈把 p 的借用往回接到迴圈頂端，形成一個會繞回自己起點的環。flow-sensitive 分析原本要處理的是「不同分支各自的存活範圍」——這在 get_mut_or_default 那種一次性分岔的程式裡足夠；換到迴圈裡的可變重借用，存活範圍要跨過迴圈的回邊才算得清楚，判斷難度明顯不同。這是我的推測，文章本身沒有寫出原因；能確定的一件事是，Polonius Alpha 目前覆蓋的範圍，還沒有完全追上原始 Polonius 能覆蓋的範圍，換取效能與可行性，代價是暫時讓出一部分能力。借用檢查器的老規矩是寧可拒絕、不可放過：多攔一段合法程式是可以接受的成本，放過一個不安全的借用不行。Polonius Alpha 在這個例子上選的是保守的那一邊，鏈結串列這種迴圈內可變重借用的寫法，要嘛等分析追上，要嘛先繼續用其他寫法繞過去。換個角度想，NLL 當年會把借用的存活範圍算成整個函式共用一段，某種程度上也是因為這樣最不容易出錯，不用去煩惱迴圈、遞迴、跨函式呼叫這些會讓控制流變複雜的結構，只要看型別簽章就能得到一個保守但正確的答案。Polonius Alpha 往前走的第一步，挑的是最常見、結構最單純的分支型態，迴圈這種存活範圍會繞回自己起點的結構，複雜度明顯高一截，目前還排在後面處理。</p>
+
+  <h2>退場路徑，以及三代借用檢查器擺在一起看</h2>
+
+  <p>對現在就想試用、卻被這類邊界案例卡住的人，團隊留了退路。文章原文：「if you want to disable Polonius Alpha, and only use the stable NLL, you can pass -Zpolonius=off to rustc」——一個 flag，退回 NLL 的行為。Polonius Alpha 現在是 nightly 上的預設分析，退回舊行為才需要主動加這個參數。這句「至少做等量工作」的定性，也解釋了 -Zpolonius=off 為什麼會被留著：新分析在設計上就不可能比舊分析輕，穩定化之前讓使用者隨時能退回舊行為，是控制風險最直接的做法，選擇權留給遇到問題的人。踩到問題怎麼辦，文章也留了明確的管道，可以回報到 GitHub 上的追蹤議題（issue #160456），或是 Zulip 的 t-types / polonius 頻道。對正在用 nightly 的人來說，這代表 Polonius Alpha 目前還在收集真實世界案例的階段，效能迴歸也好、原本編得過現在被拒也好，都是團隊想看到的回報內容——GitHub 議題與 Zulip 頻道，是文章原文明確寫出的兩個管道。</p>
+
+  <p>如果年底前真的照計畫穩定化，對一般使用者來說，感覺不到的部分才是重點：不需要加任何 flag，不需要換工具鏈版本，只是下一次 cargo build 用的借用檢查邏輯換了。真正會有感的，只有那一小群長期被「NLL 說借用還活著」擋下來、卻怎麼看都覺得程式沒問題的人，對他們來說，這是借用檢查器規則本身難得放寬的一次。</p>
+
+  <p>從 2018 年原始 Polonius 因為效能擱置，到 2023 年想出可以套進既有 NLL 骨架的新表述，再到 2026 年 8 月這個新表述終於作為 Polonius Alpha 進 nightly、目標年底前穩定化——三個世代各自留下的能力邊界，收在下面這張表。原始 Polonius 換不掉 NLL 是因為效能，Polonius Alpha 換不掉原始 Polonius 是因為能力還沒完全追上；中間這一步能不能真的走完，看的大概就是接下來幾個月能不能把「前萬大之外」的邊界案例修掉幾個、還有像鏈結串列走訪這種現在還被拒絕的模式能不能追上。三代的共同限制都指向同一個平衡點：多一分正確的判斷，就少一分效能餘裕，Polonius Alpha 目前站的位置，是團隊認為現階段划算的那一格。</p>
+
+  <figure class="vg-w-table-borrow-eras" data-mobile="keep">
+    <style>
+      .vg-w-table-borrow-eras { overflow-x: auto; }
+      .vg-w-table-borrow-eras table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-borrow-eras thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); }
+      .vg-w-table-borrow-eras tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+      .vg-w-table-borrow-eras caption { text-align: left; caption-side: top; font-family: var(--scribed); font-style: italic; color: var(--muted); font-size: var(--fs-sm); padding: var(--s-1) 0; }
+    </style>
+    <table>
+      <caption>三代借用檢查器的能力與限制擺在一起看：從效能不可用、到成為預設但判斷保守、再到 flow-sensitive 但仍有邊界案例——數字與引語出自同一篇 Rust Blog 文章。</caption>
+      <thead>
+        <tr><th>世代</th><th>年份 / 現況</th><th>效能</th><th>已知限制</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>原始 Polonius</td><td>2018 年從 NLL 分出</td><td>某些程式慢到「a non-starter」</td><td>比 NLL 寬，能編 NLL 拒絕的合法程式，但效能差到沒法換掉預設</td></tr>
+        <tr><td>NLL（今日 stable 預設）</td><td>沿用至今</td><td>基準</td><td>借用視為活到函式結尾、不分支路徑——拒絕 get_mut_or_default 這類寫法</td></tr>
+        <tr><td>Polonius Alpha</td><td>2026-08-04 上 nightly，目標年底前穩定</td><td>多數 crate 幾乎無感；前萬大之外借用密集的 crate 最差 2-3 倍</td><td>flow-sensitive，編得過 get_mut_or_default，但 while let Some(now) = p 這類環狀重借用仍被拒——比原始 Polonius 更嚴</td></tr>
+      </tbody>
+    </table>
+  </figure>
+
+  <p>這張表裡「已知限制」欄位並不是隨時間單調變好——原始 Polonius 比 NLL 寬，Polonius Alpha 卻在部分程式上比原始 Polonius 更嚴。借用檢查器的演進是在正確性、效能、實作複雜度三者之間反覆重新找平衡點，每一代都是當下條件允許的折衷。這張表也能倒過來讀：如果只看「現在做得到什麼」，容易誤以為 Polonius Alpha 是單純的升級版；把三代擺在一起，才看得出每一步都是拿一部分能力換一部分效能，沒有一步是純粹的加分。</p>
+
+  <p class="vg-deep-closer"><strong>What this enables</strong>：借用檢查器從「整個函式共用一個存活區間」換成「每條路徑各自算」，get_mut_or_default 這類長年過不了 NLL 的模式現在編得過。換來的是一個效能代價可控、還在補齊邊界案例的新基準線，-Zpolonius=off 是現在唯一、也足夠用的退路——距離 2018 年那個效能不堪用的原型，這是八年後第一次有人能在自己的專案上摸到它。</p>
+</div>
