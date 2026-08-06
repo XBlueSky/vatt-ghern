@@ -1,0 +1,790 @@
+{
+  "output_path": "src/posts/2026/08/07/deep-luajit-nyi-blacklist-hot-loop.html",
+  "spine": [
+    "1. Sander Bos 幫自己的 Lua 引擎 grug-for-lua 跑 benchmark，發現同一段沒有改過的迴圈，固定時間內某次跑完 60 億次迭代，某次只有 3 億次，相差 20 倍。",
+    "2. 第一個猜測：程式碼裡唯一可疑的地方是包在 pcall 裡的 unpack——LuaJIT NYI wiki 把它列為 stitch 類，他一開始以為是 stitch 本身要臨時掉回直譯器才變慢。",
+    "3. 用 luajit -jv 追蹤後推翻了這個猜測：unpack 從頭到尾沒有出現在慢的那次 trace log 裡，問題顯然不在 unpack 執行的當下。",
+    "4. 縮小成 MRE（empty_fn + run_unpack，pcall 包 unpack({})）後，同一份程式兩次執行分別跑出 0.050325 秒與 0.725689 秒；兩次 trace log 只差在收尾：快版編譯成一條 loop，慢版收在 blacklisted。",
+    "5. 機制：unpack 觸發 stitch，讓 recorder 從下一條 bytecode 重新開始錄成一條新 root trace，這條新 trace 不記得自己是從 pcall 的 FRAME_PCALL 裡進來的，返回時 recording 中止，丟出 NYI: return to lower frame。",
+    "6. 重試次數用盡後，含 pcall 呼叫的那段 bytecode 整個被黑名單；empty_fn 自己沒碰過 pcall 或 unpack，卻因為被同一段熱迴圈呼叫而連帶掉回直譯器，快慢版最終跑出哪一種，取決於 benchmark loop 開始前已經跑掉多少次 stitch attempt，是 JIT 內部啟發式決定的。",
+    "7. 修法分兩層：先用 get_pcall_wrapper 產生的特化 wrapper 取代 unpack（commit db94c5a）；再向 OpenResty 的 luajit2 fork 送出 PR #269，新增 recff_unpack 教 trace recorder 直接編譯 unpack，但因為多數人用的是內嵌、極少升級的 LuaJIT，wrapper 仍是大多數人實際要用的解法。"
+  ],
+  "sources": [
+    {
+      "url": "https://streamhpc.com/blog/2026-08-05/the-luajit-nyi-that-silently-poisoned-an-unrelated-hot-loop/",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": "2026-08-05",
+      "perspective": {
+        "mechanism": "LuaJIT 的 trace stitching 遇到 unpack 這類 stitch-NYI 時，會讓 recorder 從下一條 bytecode 重新開始錄成一條新的 root trace；這條新 trace 不記得自己是從 pcall 建立的 FRAME_PCALL 裡進來的，導致返回時 recording 中止，重試用盡後整段 bytecode 被黑名單，連沒碰過 pcall/unpack 的呼叫者都被牽連。",
+        "tradeoff": "繞開 unpack 用手寫 wrapper 可以馬上解決問題，但只是治標；真正教會編譯器處理 unpack（recff_unpack）只在 OpenResty 的 luajit2 fork 有效，絕大多數內嵌 LuaJIT 又不常升級的環境還是得繼續用 wrapper。",
+        "reader_use": "任何用 tracing JIT（LuaJIT、V8、PyPy 等）的工程師，遇到效能異常時應該先看 -jv/-jdump 這類 trace log 裡有沒有 NYI 或 blacklisted，而不是單靠直覺猜哪一行程式碼寫壞；也可以把這類檢查接進 CI，提早攔下會被黑名單的熱路徑。"
+      }
+    },
+    {
+      "url": "https://lobste.rs/",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": null,
+      "perspective": {
+        "mechanism": "lobste.rs 是聚合站，本身不產生技術內容，只是把 streamhpc 的原文貼上首頁並標上 lua、performance 兩個 tag。",
+        "tradeoff": "沒有獨立技術內容，不能當作第二個獨立來源使用，只能拿來確認這篇文章當天在社群有被轉貼與討論的興趣。",
+        "reader_use": "讀者可以從這裡的標籤（lua、performance）快速判斷這篇文章屬於哪個技術社群圈子，但技術細節仍須回原文查證。"
+      }
+    }
+  ],
+  "notes": [
+    {
+      "id": "n01",
+      "url": "https://streamhpc.com/blog/2026-08-05/the-luajit-nyi-that-silently-poisoned-an-unrelated-hot-loop/",
+      "quote": "I ran into this while benchmarking grug-for-lua, my Lua implementation of the grug modding language.",
+      "hedge": "asserted",
+      "interpretation": "建立背景與作者身分，說明這個 bug 是在作者自己真實專案的 benchmark 中發現的，不是刻意構造的合成測試。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n02",
+      "url": "https://streamhpc.com/blog/2026-08-05/the-luajit-nyi-that-silently-poisoned-an-unrelated-hot-loop/",
+      "quote": "in some benchmark runs my code performs 6 billion iterations, and in other benchmark runs it can perform as little as 300 million iterations, a 20× difference",
+      "hedge": "asserted",
+      "interpretation": "全文的核心觀察（puzzle），開篇 hook 與 hero chart 的資料來源；固定時間視窗內的迭代數變化 20 倍。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n03",
+      "url": "https://streamhpc.com/blog/2026-08-05/the-luajit-nyi-that-silently-poisoned-an-unrelated-hot-loop/",
+      "quote": "My initial assumption was that the stitch itself caused the slowdown by temporarily dropping back to the interpreter.",
+      "hedge": "asserted",
+      "interpretation": "第一個猜測（candidate 1）：作者一開始以為 stitch 本身臨時掉回直譯器的動作有代價，稍後被 -jv 輸出推翻。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n04",
+      "url": "https://streamhpc.com/blog/2026-08-05/the-luajit-nyi-that-silently-poisoned-an-unrelated-hot-loop/",
+      "quote": "But when I profiled the benchmark with LuaJIT 2.1.1774896198 using -jv, unpack never appeared in the trace log at all.",
+      "hedge": "asserted",
+      "interpretation": "推翻猜測一的直接證據：unpack 完全沒有出現在慢的那次 trace log 裡，同時給出使用的 LuaJIT 版本號。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n05",
+      "url": "https://streamhpc.com/blog/2026-08-05/the-luajit-nyi-that-silently-poisoned-an-unrelated-hot-loop/",
+      "quote": "To isolate it, I wrote an MRE (minimal reproducible example):",
+      "hedge": "asserted",
+      "interpretation": "敘事轉折句，從真實專案的 benchmark 轉進最小可重現案例（MRE）的建構。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n06",
+      "url": "https://streamhpc.com/blog/2026-08-05/the-luajit-nyi-that-silently-poisoned-an-unrelated-hot-loop/",
+      "quote": "local function empty_fn() end\n\nlocal function run_unpack()\n    pcall(empty_fn, unpack({}))\nend\n\nfor _ = 1, 80000 do\n    run_unpack()\nend\n\nlocal start = os.clock()\n\nfor _ = 1, 100000000 do\n    empty_fn()\nend\n\nprint(os.clock() - start)",
+      "hedge": "asserted",
+      "interpretation": "MRE 完整原始碼，逐字用於文中程式碼區塊；empty_fn 完全沒有碰過 pcall/unpack，是被連累的對象。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n07",
+      "url": "https://streamhpc.com/blog/2026-08-05/the-luajit-nyi-that-silently-poisoned-an-unrelated-hot-loop/",
+      "quote": "[TRACE   1 pcall_mre.lua:12 return]\n[TRACE --- pcall_mre.lua:2 -- NYI: return to lower frame]\n[TRACE   2 pcall_mre.lua:4 return]\n[TRACE   3 pcall_mre.lua:22 loop]\n0.050325",
+      "hedge": "asserted",
+      "interpretation": "快版執行的完整 trace log 與計時輸出；收尾在編譯成功的 loop trace，widget『before-after-slider』的 before 面板依據。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n08",
+      "url": "https://streamhpc.com/blog/2026-08-05/the-luajit-nyi-that-silently-poisoned-an-unrelated-hot-loop/",
+      "quote": "[TRACE   1 pcall_mre.lua:12 return]\n[TRACE --- pcall_mre.lua:2 -- NYI: return to lower frame]\n[TRACE   2 pcall_mre.lua:4 return]\n[TRACE --- pcall_mre.lua:22 -- blacklisted at pcall_mre.lua:2]\n0.725689",
+      "hedge": "asserted",
+      "interpretation": "慢版執行的完整 trace log 與計時輸出；收尾在 blacklisted，widget『before-after-slider』的 after 面板依據，也是 0.725689/0.050325 換算 14 倍多落差的來源數字。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n09",
+      "url": "https://streamhpc.com/blog/2026-08-05/the-luajit-nyi-that-silently-poisoned-an-unrelated-hot-loop/",
+      "quote": "Because trace stitching resumes recording as a fresh root trace, the new trace has no record of entering the FRAME_PCALL, so recording aborts with exactly the error shown above: \"NYI: return to lower frame\".",
+      "hedge": "asserted",
+      "interpretation": "機制解釋的核心句：新錄製的 root trace 遺失 FRAME_PCALL 上下文，導致返回時 recording 中止，丟出對應錯誤訊息。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n10",
+      "url": "https://streamhpc.com/blog/2026-08-05/the-luajit-nyi-that-silently-poisoned-an-unrelated-hot-loop/",
+      "quote": "The key observation is that unpack never appears in the trace log. Instead, the recorder \"forgets\" that execution is inside a pcall, resuming recording as if that pcall had never happened. The failure doesn't happen at unpack itself; it happens later, when execution returns through that pcall.",
+      "hedge": "asserted",
+      "interpretation": "補強機制解釋：強調失敗發生在『返回』pcall 的時候，而不是 unpack 執行的當下——文中『log 裡沒有出現的東西才是線索』段落的依據。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n11",
+      "url": "https://streamhpc.com/blog/2026-08-05/the-luajit-nyi-that-silently-poisoned-an-unrelated-hot-loop/",
+      "quote": "pcall was never the problem here; it's fully traceable by LuaJIT. Only unpack triggers the stitch, which is why...",
+      "hedge": "asserted",
+      "interpretation": "澄清 pcall 本身完全可被 LuaJIT 追蹤、不是問題根源；真正觸發 stitch 的是 pcall 呼叫裡的 unpack。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n12",
+      "url": "https://streamhpc.com/blog/2026-08-05/the-luajit-nyi-that-silently-poisoned-an-unrelated-hot-loop/",
+      "quote": "Instead of failing immediately, LuaJIT performs a _stitch_, which lets it resume trace recording after the NYI instruction executes.",
+      "hedge": "asserted",
+      "interpretation": "stitch 機制的定義：遇到 NYI 指令時不直接放棄整條 trace，而是讓那條指令執行完後恢復錄製。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n13",
+      "url": "https://streamhpc.com/blog/2026-08-05/the-luajit-nyi-that-silently-poisoned-an-unrelated-hot-loop/",
+      "quote": "[TRACE --- pcall_mre.lua:2 -- NYI: return to lower frame]",
+      "hedge": "asserted",
+      "interpretation": "逐行的 trace log 錯誤訊息，文中直接以「」引用「NYI: return to lower frame」字面訊息的依據，也是 tab-switcher widget 第 3 階段的依據。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n14",
+      "url": "https://streamhpc.com/blog/2026-08-05/the-luajit-nyi-that-silently-poisoned-an-unrelated-hot-loop/",
+      "quote": "Whether empty_fn ends up blacklisted depends on how many stitch attempts through the pcall complete before the benchmark loop begins, an outcome governed by the JIT's internal heuristics rather than anything in the code.",
+      "hedge": "asserted",
+      "interpretation": "解釋快慢版結果為何不可預測：由 JIT 內部啟發式演算法決定，不是程式碼本身決定的。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n15",
+      "url": "https://streamhpc.com/blog/2026-08-05/the-luajit-nyi-that-silently-poisoned-an-unrelated-hot-loop/",
+      "quote": "The fix in db94c5a removes the final unpack() call and replaces it with generated wrapper functions:\n\nlocal loader = loadstring or load\n\nlocal pcall_wrappers = {}\n\nlocal function get_pcall_wrapper(arg_count)\n    if pcall_wrappers[arg_count] then\n        return pcall_wrappers[arg_count]\n    end\n\n    local arg_list = {}\n    for i = 1, arg_count do\n        arg_list[i] = \"args[\" .. i .. \"]\"\n    end\n\n    local args_str = #arg_list > 0 and (\", \" .. table.concat(arg_list, \", \")) or \"\"\n    local code = string.format(\"return function(fn, args) return pcall(fn%s) end\", args_str)\n\n    local wrapper = loader(code)()\n    pcall_wrappers[arg_count] = wrapper\n    return wrapper\nend\n\nInstead of forwarding arguments through unpack, each arity gets a specialized wrapper that indexes the args table directly.",
+      "hedge": "asserted",
+      "interpretation": "修法一（wrapper）的完整程式碼與說明，含 commit hash db94c5a（完整 hash db94c5ab3438f17b9b7191d4b72250215687440c）。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n16",
+      "url": "https://streamhpc.com/blog/2026-08-05/the-luajit-nyi-that-silently-poisoned-an-unrelated-hot-loop/",
+      "quote": "I named my pull request perf: get unpack() out of the NYI list, which targets luajit2, OpenResty's fork of LuaJIT, rather than upstream LuaJIT. [targets luajit2](https://github.com/openresty/luajit2/pull/269)",
+      "hedge": "asserted",
+      "interpretation": "修法二（上游 PR）：PR 標題與目標 repo，PR URL 為 https://github.com/openresty/luajit2/pull/269（PR #269）。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n17",
+      "url": "https://streamhpc.com/blog/2026-08-05/the-luajit-nyi-that-silently-poisoned-an-unrelated-hot-loop/",
+      "quote": "Here's the new, gnarly recff_unpack function the PR adds, which teaches the trace recorder to compile unpack directly instead of falling back to a stitch",
+      "hedge": "asserted",
+      "interpretation": "recff_unpack 函式的介紹句：直接教 trace recorder 編譯 unpack，不必再靠 stitch 繞路。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n18",
+      "url": "https://streamhpc.com/blog/2026-08-05/the-luajit-nyi-that-silently-poisoned-an-unrelated-hot-loop/",
+      "quote": "Writing 30 tests confirming recff_unpack no longer stitches, throws NYIs, or gets blacklisted... surfaced 2 more edge cases the initial 30 tests missed. unimut systematically mutates the function's logic and checks whether the test suite still catches each change, surfacing gaps that plain line and branch coverage can't.",
+      "hedge": "asserted",
+      "interpretation": "mutation testing（unimut）補強測試涵蓋率的例子：30 個手寫測試之外，mutation testing 又多找出 2 個邊界情況。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n19",
+      "url": "https://streamhpc.com/blog/2026-08-05/the-luajit-nyi-that-silently-poisoned-an-unrelated-hot-loop/",
+      "quote": "Even once this is merged, the get_pcall_wrapper workaround from earlier in this post isn't going anywhere. Almost nobody uses OpenResty's luajit2 fork specifically, and plenty of programs that do embed some LuaJIT never update the version they ship.",
+      "hedge": "asserted",
+      "interpretation": "作者對 PR 實際影響範圍的坦承評估：幾乎沒人專門用 luajit2 fork，多數內嵌 LuaJIT 的專案不常升級，wrapper 仍是多數人實際解法。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n20",
+      "url": "https://streamhpc.com/blog/2026-08-05/the-luajit-nyi-that-silently-poisoned-an-unrelated-hot-loop/",
+      "quote": "local start = os.clock()\n\nfor _ = 1, 100000000 do\n    local function nested() end\n    nested()\nend\n\nprint(os.clock() - start)\n\n[TRACE --- closure_mre.lua:3 -- NYI: bytecode FNEW   at closure_mre.lua:4]\n\nresulting in a 60× slowdown compared to the optimized version.",
+      "hedge": "asserted",
+      "interpretation": "第二個 NYI 案例（closure/FNEW，硬 NYI、不會 stitch）的原始碼、trace log 與效能落差數字，用於文中對照表格。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n21",
+      "url": "https://streamhpc.com/blog/2026-08-05/the-luajit-nyi-that-silently-poisoned-an-unrelated-hot-loop/",
+      "quote": "The broader danger of tracing JITs is that performance bugs don't always show up where you'd expect.",
+      "hedge": "asserted",
+      "interpretation": "全文的方法論主旨，對應 closer 與文末討論 tracing JIT 通用風險的段落。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n22",
+      "url": "https://streamhpc.com/blog/2026-08-05/the-luajit-nyi-that-silently-poisoned-an-unrelated-hot-loop/",
+      "quote": "Written by Sander Bos on 5 August 2026",
+      "hedge": "asserted",
+      "interpretation": "作者與發布日期。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n23",
+      "url": "https://lobste.rs/",
+      "quote": "title: The LuaJIT NYI That Silently Poisoned an Unrelated Hot Loop; submitter: Snektron; tags: lua, performance",
+      "hedge": "asserted",
+      "interpretation": "確認這是同一篇文章在 lobste.rs 上的分享，證實這是同日話題而非單一來源孤例；不作為獨立技術內容引用（echo，非 corroborated）。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n24",
+      "url": "https://streamhpc.com/blog/2026-08-05/the-luajit-nyi-that-silently-poisoned-an-unrelated-hot-loop/",
+      "quote": "If you want to inspect traces like this manually, luajit.me is a fantastic tool that is similar to Compiler Explorer. It is often much nicer than passing -jdump locally.",
+      "hedge": "asserted",
+      "interpretation": "診斷工具段落：luajit.me 可把 trace 輸出跟原始碼並排對照、NYI 標紅；luajit -jdump 是本機替代方案但較不順手。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n25",
+      "url": "https://streamhpc.com/blog/2026-08-05/the-luajit-nyi-that-silently-poisoned-an-unrelated-hot-loop/",
+      "quote": "I configure my CI's build.yml to run benchmarks under luajit -jv. It lets the build fail if any NYI other than the known-sporadic return to lower frame case shows up in the trace log, or if any blacklisted line shows up.\n\nCLEANED_LOG=$(sed '/NYI: return to lower frame/d' luajit.log)\n\nif echo \"$CLEANED_LOG\" | grep -q 'NYI'; then\n    echo \"ERROR: Unexpected NYI detected in LuaJIT trace output\" >&2\n    echo \"$CLEANED_LOG\" | grep 'NYI' >&2\n    exit 1\nfi\n\nif echo \"$CLEANED_LOG\" | grep -q 'blacklisted'; then\n    echo \"ERROR: Blacklisted function detected in LuaJIT trace output\" >&2\n    echo \"$CLEANED_LOG\" | grep 'blacklisted' >&2\n    exit 1\nfi",
+      "hedge": "asserted",
+      "interpretation": "CI 整合段落：把 luajit -jv 輸出接進 build.yml，過濾掉已知的『NYI: return to lower frame』行後，抓到 NYI 或 blacklisted 就讓 build 失敗；文中 CI 段落與 shell 程式碼區塊的逐字依據。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n26",
+      "url": "https://streamhpc.com/blog/2026-08-05/the-luajit-nyi-that-silently-poisoned-an-unrelated-hot-loop/",
+      "quote": "Guard the length, since it wasn't given as a constant",
+      "hedge": "asserted",
+      "interpretation": "recff_unpack 程式碼裡的原始註解，用於文中說明其陣列長度防呆邏輯；周邊敘述（非 table 引數擋下、start/end 索引可能非常數、allocation sinking）綜合自同一段程式碼與其上下文描述。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n27",
+      "url": "https://streamhpc.com/blog/2026-08-05/the-luajit-nyi-that-silently-poisoned-an-unrelated-hot-loop/",
+      "quote": "function Entity:_run_game_fn(name, ...)\n    local game_fn = self.file.game_fns[name]\n\n    local ok, result = pcall(game_fn, self.state, ...)\nend\n\nIt was called like so:\n\n    self:_run_game_fn(call_expr.fn_name, unpack(args))",
+      "hedge": "asserted",
+      "interpretation": "grug-for-lua 觸發路徑的實際程式碼：方法本身收一個 vararg 後直接轉手給 pcall，unpack(args) 出現在呼叫端而不是方法內部。開場段落描述這段程式碼的逐字依據。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n28",
+      "url": "https://streamhpc.com/blog/2026-08-05/the-luajit-nyi-that-silently-poisoned-an-unrelated-hot-loop/",
+      "quote": "In theory, LuaJIT could optimize the allocation away, much as it already does for tables using [its Allocation Sinking optimization](https://github.com/tarantool/tarantool/wiki/LuaJIT-Allocation-Sinking-Optimization).",
+      "hedge": "hedged",
+      "interpretation": "Allocation Sinking 在原文只出現這一次，且位於後段 closure/FNEW 討論，主題是「閉包配置理論上有沒有可能被最佳化掉」，而不是 recff_unpack；原句自帶 in theory / could 的假設語氣，引用時必須保留。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n29",
+      "url": "https://streamhpc.com/blog/2026-08-05/the-luajit-nyi-that-silently-poisoned-an-unrelated-hot-loop/",
+      "quote": "Unlike unpack, FNEW (function new) is a hard NYI rather than a stitched one. As soon as the recorder reaches it, recording aborts outright. The NYI wiki correspondingly lists its Compiled? status as no. There's no race to win or lose here; the loop is simply stuck in the interpreter every time.",
+      "hedge": "asserted",
+      "interpretation": "原文對 FNEW 為何是硬 NYI 的全部說明：只講到 recorder 一碰到就中止錄製、wiki 的 Compiled? 欄位為 no，並未給出「沒有固定不變的編譯目標」這個理由——後者是本文自己的推測，行文中須標記。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n30",
+      "url": "https://streamhpc.com/blog/2026-08-05/the-luajit-nyi-that-silently-poisoned-an-unrelated-hot-loop/",
+      "quote": "After enough failed attempts, LuaJIT blacklists empty_fn's bytecode, so the hot loop calling it can no longer be JIT-compiled and falls back to the interpreter, even though the loop itself never touches pcall or unpack.",
+      "hedge": "asserted",
+      "interpretation": "黑名單因果方向的逐字依據：被列入黑名單的是 empty_fn 自己的 bytecode，因此「呼叫 empty_fn 的那個熱迴圈」才編譯不成 trace；不是 empty_fn 因為呼叫了別的被黑名單函式而被牽連。trace log 的 blacklisted at pcall_mre.lua:2 指的正是 empty_fn 的定義那一行。",
+      "timeliness": "durable"
+    }
+  ],
+  "claims": [
+    {
+      "id": "c01",
+      "claim_text": "有時跑完 60 億次迭代，有時只有 3 億次，相差 20 倍",
+      "location": "H2 六十億次或三億次 + hero + chart + 表格",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n02"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The same benchmark, with identical code and inputs, sometimes reported 6 billion iterations and other times only 300 million, a 20x difference.",
+      "note": "Three figures in the same sentence, which also supports identical code and inputs.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c02",
+      "claim_text": "benchmark 回報的迭代數（原稿寫成「固定時間內」）",
+      "location": "hero opener + chart 軸標籤 + 表格判定依據",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n02"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "sometimes reported 6 billion iterations and other times only 300 million",
+      "note": "The source never says the benchmark was time-bounded; 固定時間內 was an unmarked author qualifier added so the two counts would be comparable, and it appeared in five places. FIXED: the qualifier was dropped everywhere (opener, the same-script paragraph, the chart y-axis label and aria-label, the table cell, and the scrub widget step 1 in both the static div and the JS array). No replacement qualifier invented.",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c03",
+      "claim_text": "Sander Bos 在自己的 Lua 引擎 grug-for-lua 上跑 benchmark 時撞見",
+      "location": "開場首段",
+      "type": "attribution",
+      "load": "high",
+      "note_ids": [
+        "n01",
+        "n22"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "I ran into this while benchmarking grug-for-lua, my Lua implementation of the grug modding language. / Written by Sander Bos",
+      "note": "Byline confirmed Sander Bos, 5 August 2026. Single-source self-report with visible attribution in the post.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c04",
+      "claim_text": "Entity:_run_game_fn 方法接收 vararg 轉交 pcall；unpack(args) 寫在呼叫端",
+      "location": "開場首段",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n27"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "function Entity:_run_game_fn(name, ...) local game_fn = self.file.game_fns[name] local ok, result = pcall(game_fn, self.state, ...) end",
+      "note": "The original draft said unpack(args) was used inside the method; the source shows the method takes a vararg and forwards it, while unpack(args) sits at the call site. No note covered the code at all. FIXED: note n27 added with the verbatim method body and call site, and the sentence corrected to describe it accurately.",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c05",
+      "claim_text": "LuaJIT NYI 清單上 unpack 被標成 stitch 類",
+      "location": "H2 猜測 + tab widget 階段 1",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n12"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "A list of features it cannot record into these traces is documented on the LuaJIT Not Yet Implemented wiki page, and unpack is one of them, marked 2.1 stitch.",
+      "note": "Verbatim support. Trace binding is slightly weak (n12 records the stitch definition rather than the wiki classification) but no factual drift.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c06",
+      "claim_text": "作者一開始猜 stitch 本身臨時掉回直譯器就有代價",
+      "location": "H2 猜測",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n03"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "My initial assumption was that the stitch itself caused the slowdown by temporarily dropping back to the interpreter.",
+      "note": "Verbatim confirmed.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c07",
+      "claim_text": "用 LuaJIT 2.1.1774896198 搭配 -jv 追蹤，unpack 沒有出現在 trace log",
+      "location": "H2 猜測",
+      "type": "date-version",
+      "load": "high",
+      "note_ids": [
+        "n04",
+        "n10"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "But when I profiled the benchmark with LuaJIT 2.1.1774896198 using -jv, unpack never appeared in the trace log at all.",
+      "note": "Build string verbatim. The post adds a 慢的那次 qualifier where the source is more universal — a deflation, not an error.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c08",
+      "claim_text": "luajit.me 類似 Compiler Explorer，可並排對照並把 NYI 標紅",
+      "location": "H2 猜測",
+      "type": "attribution",
+      "load": "low",
+      "note_ids": [
+        "n24"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "luajit.me is a fantastic tool that is similar to Compiler Explorer. It is often much nicer than passing -jdump locally, as it interleaves the generated bytecode with your Lua source code and highlights NYIs in red in its trace graph.",
+      "note": "n24 quote was truncated before the supporting clause; re-fetch confirmed the clause exists verbatim.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c09",
+      "claim_text": "MRE 熱身 8 萬次，計時迴圈 1 億次 empty_fn，迴圈裡沒有 pcall 或 unpack",
+      "location": "H2 縮小成 MRE",
+      "type": "number",
+      "load": "medium",
+      "note_ids": [
+        "n05",
+        "n06"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "for _ = 1, 80000 do run_unpack() end ... for _ = 1, 100000000 do empty_fn() end",
+      "note": "Both loop bounds present in the source MRE block; the absence of pcall/unpack in the timed loop is readable from the code.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c10",
+      "claim_text": "兩次執行印出 0.050325 秒與 0.725689 秒，慢版是快版的 14 倍多",
+      "location": "H2 縮小成 MRE + before-after widget + 表格",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n07",
+        "n08"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "0.050325 / 0.725689 / That s why it suffers the 14x slowdown.",
+      "note": "Both seconds verbatim in the trace-log outputs; 14x is asserted by the source itself, and the post 換算下來 framing is more conservative.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c11",
+      "claim_text": "快版收在 loop trace，慢版收在 blacklisted at pcall_mre.lua:2",
+      "location": "H2 縮小成 MRE + widget 面板",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n07",
+        "n08"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "[TRACE   3 pcall_mre.lua:22 loop] / [TRACE --- pcall_mre.lua:22 -- blacklisted at pcall_mre.lua:2]",
+      "note": "Both lines verbatim. Line 2 is `local function empty_fn() end` and line 22 is the timed loop, so the blacklisted target is empty_fn — this paragraph stated it correctly.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c12",
+      "claim_text": "兩次 -jv 輸出前段幾乎相同，都是重複的 NYI: return to lower frame",
+      "location": "H2 縮小成 MRE + tab widget 階段 3",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n13",
+        "n07",
+        "n08"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "[TRACE --- pcall_mre.lua:2 -- NYI: return to lower frame]",
+      "note": "Literal message verbatim and present in multiple places in the source.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c13",
+      "claim_text": "pcall 建立 FRAME_PCALL，新 trace 沒有這段記憶，返回時 recording 中止",
+      "location": "H2 一個從沒呼叫過 pcall 的函式",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [
+        "n09",
+        "n10"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Because trace stitching resumes recording as a fresh root trace, the new trace has no record of entering the FRAME_PCALL, so recording aborts with exactly the error shown above: \"NYI: return to lower frame\".",
+      "note": "Every link of the mechanism chain corresponds verbatim.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c14",
+      "claim_text": "pcall 本身不是問題，LuaJIT 完全能追蹤它；觸發 stitch 的是 unpack",
+      "location": "H2 一個從沒呼叫過 pcall 的函式",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [
+        "n11"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "pcall was never the problem here; it s fully traceable by LuaJIT.",
+      "note": "First clause verbatim; the second is consistent with the wiki classification and the mechanism chain.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c15",
+      "claim_text": "重試用盡後 LuaJIT 把 empty_fn 自己的 bytecode 列入黑名單，呼叫它的熱迴圈因此編譯不成",
+      "location": "H2 一個從沒呼叫過 pcall 的函式 + tab widget 階段 4 + scrub 步驟 5 + closer",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [
+        "n14",
+        "n30"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "After enough failed attempts, LuaJIT blacklists empty_fn s bytecode, so the hot loop calling it can no longer be JIT-compiled and falls back to the interpreter, even though the loop itself never touches pcall or unpack.",
+      "note": "THE POST S CORE MECHANISM, and the original draft inverted it: it said the pcall-containing bytecode was blacklisted and empty_fn was collateral for calling a blacklisted function — but empty_fn calls nothing. The draft also contradicted its own earlier, correct paragraph. FIXED in four places (main paragraph, tab widget stage 4 including its symptom line, scrub widget step 5, closer) plus note n30 added with the verbatim sentence. Direction is now consistent everywhere.",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c16",
+      "claim_text": "empty_fn 會不會被黑名單，取決於 benchmark loop 開始前跑完多少次 stitch attempt",
+      "location": "H2 一個從沒呼叫過 pcall 的函式",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [
+        "n14"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Whether empty_fn ends up blacklisted depends on how many stitch attempts through the pcall complete before the benchmark loop begins, an outcome governed by the JIT s internal heuristics rather than anything in the code.",
+      "note": "Sentence-for-sentence correspondence. Also independent confirmation that the source treats empty_fn as the blacklisted subject (see c15).",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c17",
+      "claim_text": "get_pcall_wrapper 為每種引數個數產生特化 wrapper，改動進了 commit db94c5a",
+      "location": "H2 一個從沒呼叫過 pcall 的函式",
+      "type": "date-version",
+      "load": "high",
+      "note_ids": [
+        "n15"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The fix in db94c5a removes the final unpack() call and replaces it with generated wrapper functions... each arity gets a specialized wrapper that indexes the args table directly.",
+      "note": "Commit hash verbatim; the post code block matches the source line for line.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c18",
+      "claim_text": "PR 標題 perf: get unpack() out of the NYI list，送往 openresty/luajit2 PR #269，不是上游 LuaJIT",
+      "location": "H2 一個從沒呼叫過 pcall 的函式",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n16"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "I named my pull request perf: get unpack() out of the NYI list, which targets luajit2, OpenResty s fork of LuaJIT, rather than upstream LuaJIT.",
+      "note": "Title verbatim, link resolves to openresty/luajit2/pull/269, and the source explicitly says rather than upstream LuaJIT.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c19",
+      "claim_text": "PR 新增 recff_unpack，直接教 trace recorder 編譯 unpack",
+      "location": "H2 一個從沒呼叫過 pcall 的函式",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n17"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Here s the new, gnarly recff_unpack function the PR adds, which teaches the trace recorder to compile unpack directly instead of falling back to a stitch.",
+      "note": "Verbatim. The checker also confirmed the source states no line count for recff_unpack and that the post correctly asserts none.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c20",
+      "claim_text": "recff_unpack 註解 Guard the length, since it wasn t given as a constant",
+      "location": "H2 一個從沒呼叫過 pcall 的函式",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n26"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "/* Guard the length, since it wasn t given as a constant. */",
+      "note": "Comment verbatim in the C code block; the post drops the trailing period, a trivial reformat.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c21",
+      "claim_text": "理論上 LuaJIT 有機會用 allocation sinking 把閉包配置最佳化掉",
+      "location": "FNEW/closure 段（原稿誤置於 recff_unpack 段）",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [
+        "n28"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "In theory, LuaJIT could optimize the allocation away, much as it already does for tables using its Allocation Sinking optimization.",
+      "note": "The source mentions Allocation Sinking exactly once, in the closure/FNEW section, and explicitly hedged with In theory... could. The original draft moved it to the recff_unpack paragraph and turned it into an unconditional assertion about stack slots. FIXED: deleted from recff_unpack and restated in the FNEW section with the hedge preserved; note n28 added with the verbatim hedged sentence.",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c22",
+      "claim_text": "30 個測試，unimut mutation testing 又多抓出 2 個邊界情況",
+      "location": "H2 一個從沒呼叫過 pcall 的函式",
+      "type": "number",
+      "load": "medium",
+      "note_ids": [
+        "n18"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Writing 30 tests confirming recff_unpack no longer stitches, throws NYIs, or gets blacklisted... which surfaced 2 more edge cases the initial 30 tests missed.",
+      "note": "Both counts, the tool name and the three confirmation criteria all verbatim.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c23",
+      "claim_text": "行覆蓋率、分支覆蓋率這類量測本身照不出這類缺口",
+      "location": "H2 一個從沒呼叫過 pcall 的函式",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n18"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "unimut systematically mutates the function s logic and checks whether the test suite still catches each change, surfacing gaps that plain line and branch coverage can t.",
+      "note": "The original draft asserted the 30 tests had already covered every line and every branch — a fact about those tests the source never states. FIXED: rewritten to the source s actual claim about what coverage as a measure cannot catch, asserting nothing about what the 30 tests covered.",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c24",
+      "claim_text": "幾乎沒人專門用 luajit2 fork，內嵌 LuaJIT 的程式多半不升級，所以 wrapper 不會退場",
+      "location": "H2 一個從沒呼叫過 pcall 的函式",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n19"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Even once this is merged, the get_pcall_wrapper workaround from earlier in this post isn t going anywhere. Almost nobody uses OpenResty s luajit2 fork specifically, and plenty of programs that do embed some LuaJIT never update the version they ship.",
+      "note": "Sentence-for-sentence; the post marks it as the author s own admission.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c25",
+      "claim_text": "FNEW 是硬 NYI，不會 stitch；把 nested 搬出迴圈前後差 60 倍",
+      "location": "H2 一個從沒呼叫過 pcall 的函式 + 表格",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n20"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Unlike unpack, FNEW (function new) is a hard NYI rather than a stitched one. As soon as the recorder reaches it, recording aborts outright. ... resulting in a 60x slowdown compared to the optimized version.",
+      "note": "hard NYI rather than a stitched one and the 60x figure both verbatim, and the source names the optimized version as the comparison baseline.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c26",
+      "claim_text": "為什麼 FNEW 連 stitch 都做不到——原文沒有說明，以下為推測",
+      "location": "H2 一個從沒呼叫過 pcall 的函式",
+      "type": "causal",
+      "load": "low",
+      "note_ids": [
+        "n29"
+      ],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": "As soon as the recorder reaches it, recording aborts outright.",
+      "note": "The every-iteration-allocates-a-fresh-closure reason was the author s own mechanism reasoning, presented in factual voice with no marking and no note. FIXED: marked as inference (原文沒有說明；合理的推測是) with note n29 carrying the verbatim FNEW passage.",
+      "action": "mark-inferred",
+      "resolution": "marked-inferred"
+    },
+    {
+      "id": "c27",
+      "claim_text": "CI 的 build.yml 在 luajit -jv 下跑 benchmark，過濾已知行後遇 NYI 或 blacklisted 就失敗",
+      "location": "文末 CI 段落",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n25"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "CLEANED_LOG=$(sed /NYI: return to lower frame/d luajit.log) ... if echo \"$CLEANED_LOG\" | grep -q blacklisted; then ... exit 1 fi",
+      "note": "Every line of the post shell block matches the source build.yml fragment, including the stderr redirections. Only the comments were translated.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c28",
+      "claim_text": "tracing JIT 這類技術共通的風險（原稿另點名 V8、PyPy）",
+      "location": "文末段落",
+      "type": "attribution",
+      "load": "high",
+      "note_ids": [
+        "n21"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The broader danger of tracing JITs is that performance bugs don t always show up where you d expect.",
+      "note": "The checker searched the full source twice: it never mentions V8, PyPy, JavaScript or Python. Only the class-level sentence is supported, and it names no engine. The ledger perspective.reader_use mentions V8/PyPy but perspective is the author s reading, not source text. FIXED: the named engines were deleted; only the class-level risk remains.",
+      "action": "delete",
+      "resolution": "deleted"
+    },
+    {
+      "id": "c29",
+      "claim_text": "黑名單不丟錯誤、不當掉，只是讓程式碼從此用直譯器跑",
+      "location": "文末段落",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [
+        "n21",
+        "n14"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "an innocent call silently blacklisted a completely unrelated hot loop, so benchmarks and profilers pointed at the wrong place entirely.",
+      "note": "The source uses silently twice to describe the absence of any visible signal, and adds that benchmarks and profilers point elsewhere.",
+      "action": "none",
+      "resolution": "none-needed"
+    }
+  ],
+  "checked_at": "2026-08-07",
+  "checker_rounds": 2,
+  "coverage": {
+    "candidate_claims": 38,
+    "checked": 29,
+    "dropped_low_load": 9
+  }
+}
