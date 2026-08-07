@@ -1,0 +1,689 @@
+{
+  "output_path": "src/posts/2026/08/08/deep-zig-io-threaded-cancelation.html",
+  "spine": [
+    "1. Concurrency 必然牽涉取消：兩個非同步計算同時進行時，一方遲早會發現另一方不再需要，必須主動取消它——這不是附加功能，是並行本身的必然結果。",
+    "2. 「乾脆開 thread」在取消這件事上撞牆：thread 一旦阻塞在 kernel 的 syscall 裡，語言層 API 通常沒辦法把它叫醒，也沒辦法無限開 thread（系統層限制）。",
+    "3. Signal 本身不是可靠的取消機制：signal 天生 racy，可能在 syscall 開始前或結束後才送達，光靠 signal 賭不到正確的時機窗口。",
+    "4. Zig 的協定：canceling thread 在 shared memory 設一個 flag，循環對 cancelee 發 signal 直到 acknowledge；被阻塞的 syscall 收到 signal 後回傳 EINTR，thread 檢查 flag 決定 retry 還是 acknowledge 並 unwind——signalCanceledSyscall 與 fileReadPositionalPosix 是這個協定的兩半實作。",
+    "5. Windows 有更直接的手段 NtCancelSynchronousIoFile，作者認為 NT 在 fiber、IOCP、Job object 等機制上，並行設計比 Unix 想得更透徹。",
+    "6. Prior art 對照：Java 的 thread interrupt 不能真的打斷阻塞中的 syscall；pthread_cancel 有類似的 signal+flag 機制，但不整合語言層的 try/defer 清理，善後麻煩又慢。",
+    "7. Zig 的 Io 介面把「可能同時發生」(io.async) 與「必須同時發生」(io.concurrent) 在介面層拆開命名：concurrent 恆可能失敗、async 則不會因此失敗；concurrent 由 thread pool 支撐，池滿才 spawn 新 thread——效果類似 C++ std::launch policy，但顯式命名讓語意更清楚。"
+  ],
+  "sources": [
+    {
+      "url": "https://matklad.github.io/2026/08/06/neat-io-threaded.html",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": "2026-08-06",
+      "perspective": {
+        "mechanism": "示範一個只用阻塞 syscall、shared-memory flag、與 POSIX signal 就能做到可靠取消的協定，並用 io.async / io.concurrent 的命名把「可能」與「一定」同時發生的兩種並行語意分開。",
+        "tradeoff": "換到的是不必引入 io_uring 或全新的 async runtime、標準阻塞 API 加一個 protocol 就能取消；付出的代價是要自己處理 signal 的競態視窗、EINTR 之後的分支邏輯，以及 signal handler 的限制。",
+        "reader_use": "工程師在自己的框架或 runtime 裡設計 timeout / cancel 機制時，可以拿這個協定當對照組：自己的方案有沒有踩到『signal 本身 racy』或『取消機制不整合語言層清理』這兩個常見坑。"
+      }
+    }
+  ],
+  "notes": [
+    {
+      "id": "n01",
+      "url": "https://matklad.github.io/2026/08/06/neat-io-threaded.html",
+      "quote": "Whenever you have two asynchronous computations happening at the same time, there comes a moment when one computation becomes aware that the second computation is no longer necessary, and must be canceled, actively.",
+      "hedge": "asserted",
+      "interpretation": "這是 cancelation 存在必要性的核心定義——不是可有可無的附加功能，而是任何兩個生命週期彼此獨立又互相依賴的並行計算，遲早會走到的局面。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n02",
+      "url": "https://matklad.github.io/2026/08/06/neat-io-threaded.html",
+      "quote": "the thread is instead blocked inside the syscall in the kernel, programming language APIs generally doesn't give any way to unblock it.",
+      "hedge": "asserted",
+      "interpretation": "說明「乾脆開 thread」這條路在取消這件事上為什麼撞牆——語言層通常沒有把 kernel 裡的阻塞狀態暴露出來給你操作。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n03",
+      "url": "https://matklad.github.io/2026/08/06/neat-io-threaded.html",
+      "quote": "Wouldn't it be cool if we could just use standard OS threads, blocking APIs, avoid new shinies like io_uring, but still get to cancel any work reliably?",
+      "hedge": "hedged",
+      "interpretation": "作者把整篇文章要解決的問題濃縮成一句話——這是 std.Io.Threaded 存在的動機，用反問句框出目標而非斷言已經達成。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n04",
+      "url": "https://matklad.github.io/2026/08/06/neat-io-threaded.html",
+      "quote": "By itself, signals are not a cancelation mechanism — signaling a thread is inherently racy, the signal might get delivered before the relevant syscall starts, or after it finishes.",
+      "hedge": "asserted",
+      "interpretation": "解釋純 signal 方案為什麼不可靠：時序上無法保證信號送達恰好落在 syscall 正在阻塞的那個窗口內。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n05",
+      "url": "https://matklad.github.io/2026/08/06/neat-io-threaded.html",
+      "quote": "the canceling thread sets a flag in shared memory to request cancelation, and then signals the cancelee, in a loop, until the cancelation is acknowledged (a different value for a flag in the shared memory).",
+      "hedge": "asserted",
+      "interpretation": "這是協定本體：flag 負責傳遞「已經有取消請求」的狀態，signal 只負責把已阻塞的 thread 叫醒去檢查這個 flag，循環直到確認取消為止。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n06",
+      "url": "https://matklad.github.io/2026/08/06/neat-io-threaded.html",
+      "quote": "When a thread is blocked in the kernel, and a signal is delivered to the thread, the thread is woken up and the syscall returns EINTR.",
+      "hedge": "asserted",
+      "interpretation": "EINTR 是整個協定能運作的物理基礎——沒有它，signal 送達也沒辦法把執行權交還給使用者態程式碼。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n07",
+      "url": "https://matklad.github.io/2026/08/06/neat-io-threaded.html",
+      "quote": "It is customary to just loop re-try the syscall in such cases, but one doesn't have to.",
+      "hedge": "hedged",
+      "interpretation": "點出 EINTR 之後的分岔點：預設習慣是重試，但取消協定正是利用了「不一定要重試」這個自由度，改成先檢查 flag 再決定。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n08",
+      "url": "https://matklad.github.io/2026/08/06/neat-io-threaded.html",
+      "quote": "Upon receiving EINTR from a syscall, the thread potentially being canceled checks the value of the flag and either retries the syscall, or acknowledges the cancelation and begins unwinding.",
+      "hedge": "asserted",
+      "interpretation": "這是協定的判斷邏輯本體——EINTR 之後的分支正是本文 worked example 要走一遍的核心步驟。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n09",
+      "url": "https://matklad.github.io/2026/08/06/neat-io-threaded.html",
+      "quote": "This protocol is implemented in signalCanceledSyscall and fileReadPositionalPosix",
+      "hedge": "asserted",
+      "interpretation": "指出協定的兩個實作落點：一個負責發 signal / 設 flag 的那一側，一個負責實際阻塞的 syscall 與 EINTR 檢查那一側——原文稱兩者是『the two halves of the protocol』。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n10",
+      "url": "https://matklad.github.io/2026/08/06/neat-io-threaded.html",
+      "quote": "On Windows, there's a much more direct NtCancelSynchronousIoFile",
+      "hedge": "asserted",
+      "interpretation": "Windows 不需要 signal+flag 這套間接手段，核心本身就提供直接取消同步 I/O 的 API。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n11",
+      "url": "https://matklad.github.io/2026/08/06/neat-io-threaded.html",
+      "quote": "In general, between fibers, IO Completion Ports, Job objects, and this, it seems that NT has a better thought through concurrency story than Unix.",
+      "hedge": "hedged",
+      "interpretation": "作者對兩個作業系統核心並行設計的價值判斷，用『it seems』明確保留這是個人觀點，不是斷言式定論。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n12",
+      "url": "https://matklad.github.io/2026/08/06/neat-io-threaded.html",
+      "quote": "Zig's Io solves this problem ingeniously, separating, at the interface level, 'may run concurrently' from 'must run concurrently'.",
+      "hedge": "asserted",
+      "interpretation": "Io 介面的設計核心——把兩種不同的『同時』語意在命名層面拆開，而不是都塞進同一個『spawn』動作裡。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n13",
+      "url": "https://matklad.github.io/2026/08/06/neat-io-threaded.html",
+      "quote": "By naming what is happening (io.async vs io.concurrent), Zig makes it easier to understand what is actually going on, and also gets more precise signatures (concurrent is always fallible, async never is).",
+      "hedge": "asserted",
+      "interpretation": "具體說明命名拆開後的實際後果：concurrent 因為承諾『一定同時跑』，可能因資源不足而失敗；async 沒有這個承諾，所以不會因此失敗。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n14",
+      "url": "https://matklad.github.io/2026/08/06/neat-io-threaded.html",
+      "quote": "This achieves an effect similar to that of std::launch policy (item 36 in effective modern C++, if you have that around).",
+      "hedge": "hedged",
+      "interpretation": "作者自己把 Zig 的 may/must 拆分類比為 C++ std::launch::async 與 std::launch::deferred 的策略選擇，但用詞是『similar』而非『identical』。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n15",
+      "url": "https://matklad.github.io/2026/08/06/neat-io-threaded.html",
+      "quote": "Of course concurrent is backed by a thread pool, falling back on spawning a fresh thread only when the pool is exhausted.",
+      "hedge": "asserted",
+      "interpretation": "must-run-concurrently 的實作細節：預設重用 thread pool，只有池子被榨乾才真的開新 thread——這是為什麼『必須同時』不等於『每次都 spawn』。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n16",
+      "url": "https://matklad.github.io/2026/08/06/neat-io-threaded.html",
+      "quote": "In Java, there's a similarly looking thread interruption mechanism. Critically, it doesn't support interrupting syscalls: IOException and InterruptedException are both checked and unrelated, meaning that IOing functions are not interruptible.",
+      "hedge": "asserted",
+      "interpretation": "Java 的 thread interrupt 表面上跟這套協定很像，但關鍵缺陷是它不能真的打斷阻塞在 syscall 裡的 I/O。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n17",
+      "url": "https://matklad.github.io/2026/08/06/neat-io-threaded.html",
+      "quote": "pthread_cancel implements a similar signal+flag machinery. However, it doesn't integrate with language-level cancelation (try, defer) which makes post-cancelation cleanup cumbersome and slow.",
+      "hedge": "asserted",
+      "interpretation": "pthread_cancel 已經用了跟 Zig 幾乎一樣的 signal+flag 機制，但沒跟語言層的 try/defer 整合，清理邏輯寫起來麻煩又慢——這正是 Zig 方案要補的那塊。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n18",
+      "url": "https://matklad.github.io/2026/08/06/neat-io-threaded.html",
+      "quote": "there are more, the chief being that, while you totally can spawn many threads, this often requires system-wide configuration change, which is a non-starter for most application. But absence of cancelation really makes you hit a wall sooner or later.",
+      "hedge": "asserted",
+      "interpretation": "解釋「乾脆開更多 thread」為什麼不是萬靈丹：一是系統層限制常需要改設定，多數應用做不到；二是就算 thread 數量夠，沒有取消能力遲早會卡住。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n19",
+      "url": "https://matklad.github.io/2026/08/06/neat-io-threaded.html",
+      "quote": "Concurrency is about handling (asynchronous, nondeterministic) events.",
+      "hedge": "asserted",
+      "interpretation": "concurrency 的定義，用來跟下面 parallelism 的定義對照，區分本文談的是哪一種『同時』。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n20",
+      "url": "https://matklad.github.io/2026/08/06/neat-io-threaded.html",
+      "quote": "Parallelism is about using hardware resources to do more at the same time.",
+      "hedge": "asserted",
+      "interpretation": "parallelism 的定義，用來跟 concurrency 對照——本文的取消協定談的是 concurrency 那一半，不是 parallelism。",
+      "timeliness": "durable"
+    }
+  ],
+  "claims": [
+    {
+      "id": "c01",
+      "claim_text": "std::launch policy 只有兩個值：std::launch::async 保證另開一條執行路徑，std::launch::deferred 則允許實作把工作留到真的被呼叫時才做。",
+      "location": "H2「may 與 must」下、《Effective Modern C++》段落",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n14"
+      ],
+      "independence": "single-source",
+      "verdict": "unverifiable",
+      "hedge_delta": "none",
+      "evidence": "This achieves an effect similar to that of std::launch policy (item 36 in effective modern C++, if you have that around).",
+      "note": "TRACE FAILURE + not-in-source. The source names std::launch policy exactly once and never writes std::launch::async or std::launch::deferred, nor describes their guarantees. The enumeration was external C++ knowledge with no note behind it. FIXED: rewritten to state that the source says only 「類似」 and does not expand on the policy; re-check round 2 confirms no unsourced C++ semantics survive as sourced fact.",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c02",
+      "claim_text": "效果類似 C++ 的 std::launch policy——std::launch::async 與 std::launch::deferred 也是在區分「保證另外執行」與「不保證」",
+      "location": "vg-w-pop-io-modes widget term-para (widget-visible text)",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n14"
+      ],
+      "independence": "single-source",
+      "verdict": "unverifiable",
+      "hedge_delta": "none",
+      "evidence": "This achieves an effect similar to that of std::launch policy (item 36 in effective modern C++, if you have that around).",
+      "note": "Same defect as c01, inside widget text. FIXED in two passes: the first rewrite removed the two policy values but introduced a new unsourced characterisation (「留給一個容易被忽略的執行期參數」), which the round-2 re-check caught; the clause was then cut so the widget now reads 「效果類似 C++ 的 std::launch policy；原文只說「類似」，沒有再往下展開。」",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c03",
+      "claim_text": "這也是為什麼會有觀察認為，把 fiber、IO Completion Port、Job object 這些機制放在一起看，NT 對並行這件事的設計，似乎比 Unix 想得更透徹",
+      "location": "H2「EINTR 之後」下、Windows 段落",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n11"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "In general, between fibers, IO Completion Ports, Job objects, and this, it seems that NT has a better thought through concurrency story than Unix.",
+      "note": "Content and hedge both matched the source, but the attribution laundered a single author's judgement into an agentless 「會有觀察認為」. FIXED: now attributed to 「原文作者」, with the 「似乎」 hedge and the 個人觀點 marker retained.",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c04",
+      "claim_text": "發起端 thread 在共享記憶體把 flag 設成 CANCEL_REQUESTED。",
+      "location": "vg-w-scrub-cancel-protocol widget steps (widget-visible text)",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "The source says only that acknowledgement is 「a different value for a flag in the shared memory」 and names no constants. CANCEL_REQUESTED / CANCEL_ACKNOWLEDGED were the post's illustrative naming; the pseudocode block carried a 示意 marker but the widget, read two sections later, did not. FIXED: step texts now say 「要求取消」/「已確認」 and the widget's default state line carries the disclaimer that the two values are illustrative.",
+      "action": "mark-inferred",
+      "resolution": "marked-inferred"
+    },
+    {
+      "id": "c05",
+      "claim_text": "可能是一個跟這次呼叫完全無關的計時器、一個子行程狀態變化的通知",
+      "location": "H2「EINTR 之後」下、談既有 EINTR 習慣的那段",
+      "type": "causal",
+      "load": "low",
+      "note_ids": [],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "The source states only that a syscall may be interrupted by a signal unrelated to cancelation; the timer and child-process examples were invented texture. FIXED: replaced with 「打斷它的訊號可能跟這次呼叫毫無關係」, which tracks the source one-to-one.",
+      "action": "mark-inferred",
+      "resolution": "marked-inferred"
+    },
+    {
+      "id": "c06",
+      "claim_text": "只要有兩個非同步的計算同時在跑，遲早會有那麼一刻，其中一個計算發現另一個已經不再需要了，而且必須主動把它取消掉",
+      "location": "H2「「兩個非同步計算同時發生」」下第二段",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n01"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Whenever you have two asynchronous computations happening at the same time, there comes a moment when one computation becomes aware that the second computation is no longer necessary, and must be canceled, actively.",
+      "note": "Sentence-for-sentence match including 「必須主動」 for 'must be canceled, actively'.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c07",
+      "claim_text": "那個 signal 也可能在 syscall 真正開始阻塞之前就已經送達，或是等到 syscall 自己結束之後才姍姍來遲",
+      "location": "vg-deep-opener",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [
+        "n04"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "signaling a thread is inherently racy, the signal might get delivered before the relevant syscall starts, or after it finishes",
+      "note": "Both timing directions match; 「也可能」 preserves the source's 'might'.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c08",
+      "claim_text": "Zig 的 std.Io.Threaded 只靠一個共享記憶體裡的 flag、一個 POSIX signal、加上 EINTR 這個回傳值，怎麼把「取消一個正在阻塞的 syscall」這件事做成可靠的",
+      "location": "dropcap 首段",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [
+        "n05",
+        "n06",
+        "n03"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "the canceling thread sets a flag in shared memory to request cancelation, and then signals the cancelee, in a loop, until the cancelation is acknowledged (a different value for a flag in the shared memory).",
+      "note": "flag + signal + EINTR each supported by n05/n06; 「可靠」 tracks n03's 'cancel any work reliably'.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c09",
+      "claim_text": "Parallelism 是用硬體資源同時做更多事，concurrency 是處理非同步、不確定的事件",
+      "location": "H2「「兩個非同步計算同時發生」」下第一段",
+      "type": "attribution",
+      "load": "low",
+      "note_ids": [
+        "n19",
+        "n20"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Parallelism is about using hardware resources to do more at the same time. / Concurrency is about handling (asynchronous, nondeterministic) events.",
+      "note": "Both definitions verbatim; the post does not claim them as matklad's original.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c10",
+      "claim_text": "一旦某個 thread 真的阻塞在 kernel 的 syscall 裡，程式語言的 API 通常沒有辦法把它叫醒",
+      "location": "H2「「兩個非同步計算同時發生」」下第三段",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [
+        "n02"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "the thread is instead blocked inside the syscall in the kernel, programming language APIs generally doesn't give any way to unblock it.",
+      "note": "「通常」 precisely tracks 'generally'; no upgrade to an absolute.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c11",
+      "claim_text": "能開的 thread 數量往往受系統層限制……就算 thread 數量真的夠，沒有取消能力這件事遲早會讓你撞牆",
+      "location": "H2「「兩個非同步計算同時發生」」下第四段",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [
+        "n18"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "while you totally can spawn many threads, this often requires system-wide configuration change, which is a non-starter for most application. But absence of cancelation really makes you hit a wall sooner or later.",
+      "note": "Both reasons map one-to-one; 「往往」/「多數應用程式」 track 'often'/'most application'.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c12",
+      "claim_text": "這正是 std.Io.Threaded 想解的問題：能不能繼續用標準的 OS thread、標準的阻塞 API，不去碰 io_uring 這類新東西，但同時拿到可靠取消任何工作的能力",
+      "location": "H2「「兩個非同步計算同時發生」」下第四段結尾",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n03"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Wouldn't it be cool if we could just use standard OS threads, blocking APIs, avoid new shinies like io_uring, but still get to cancel any work reliably?",
+      "note": "n03 is a rhetorical question (hedged); the post writes 「想解的問題」 rather than claiming it is achieved.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c13",
+      "claim_text": "thread 阻塞在 kernel 裡，收到 signal 之後確實會被喚醒，syscall 確實會回傳 EINTR",
+      "location": "H2「signal 為什麼靠不住」下第一段",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [
+        "n06"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "When a thread is blocked in the kernel, and a signal is delivered to the thread, the thread is woken up and the syscall returns EINTR.",
+      "note": "Also supports the annotated-diagram widget's kernel role text.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c14",
+      "claim_text": "Signal 天生是 racy 的：signal 送達的時間點，跟你想要它發生的那個「syscall 正在阻塞」的那段時間，兩者之間沒有任何同步保證",
+      "location": "H2「signal 為什麼靠不住」下第二、三段",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [
+        "n04"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "By itself, signals are not a cancelation mechanism — signaling a thread is inherently racy, the signal might get delivered before the relevant syscall starts, or after it finishes.",
+      "note": "「本身不能算是一個取消機制」 and 「天生是 racy」 both track the source directly.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c15",
+      "claim_text": "發起取消的那個 thread，先在一塊共享記憶體裡設一個旗標……確認的方式，是旗標被改成另一個代表「已確認」的值",
+      "location": "H2「flag 在共享記憶體裡，signal 只是敲門」下第一段",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [
+        "n05"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "the canceling thread sets a flag in shared memory to request cancelation, and then signals the cancelee, in a loop, until the cancelation is acknowledged (a different value for a flag in the shared memory).",
+      "note": "Includes the parenthetical detail about the different value; also supports the annotated-diagram widget's canceling-thread role text.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c16",
+      "claim_text": "收到 EINTR 之後檢查 flag：沒被設就重試原本的 syscall，被設了就把 flag 改成「已確認」，接著開始 unwind。",
+      "location": "vg-w-annotated-cancel-protocol widget detail-4 (widget-visible text)",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [
+        "n08",
+        "n05"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Upon receiving EINTR from a syscall, the thread potentially being canceled checks the value of the flag and either retries the syscall, or acknowledges the cancelation and begins unwinding.",
+      "note": "Widget text maps item-for-item onto the source's branch logic.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c17",
+      "claim_text": "收到 EINTR 之後，習慣上是直接重試那個 syscall，但這不是唯一的選項",
+      "location": "H2「EINTR 之後」下第一段",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [
+        "n07"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "It is customary to just loop re-try the syscall in such cases, but one doesn't have to.",
+      "note": "「習慣上」/「不是唯一的選項」 track 'customary'/'one doesn't have to'; the note records the source as hedged and the post does not harden it.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c18",
+      "claim_text": "如果 flag 沒被設，那就是一次無關的中斷，照舊重試 syscall……如果 flag 已經被設成「要求取消」，thread 就不重試了，改成確認取消……然後開始 unwind",
+      "location": "H2「EINTR 之後」下第二段",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [
+        "n08"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Upon receiving EINTR from a syscall, the thread potentially being canceled checks the value of the flag and either retries the syscall, or acknowledges the cancelation and begins unwinding.",
+      "note": "Both branches match; unwind tracks 'begins unwinding'.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c19",
+      "claim_text": "下面這段用 pseudocode 把上面這個判斷邏輯畫出來——不是原始碼的逐行重現，只是把協定的分岔畫成看得懂的形狀",
+      "location": "pre[data-kind=pseudocode] 前的引導句與 pseudocode 區塊本身",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "Already marked as illustrative in text, which satisfies the inference-marking requirement, so the block's CANCEL_REQUESTED / CANCEL_ACKNOWLEDGED / read_from_kernel / begin_unwind names are acceptable there; the branch structure itself matches n08. The unmarked reuse of the same names in the scrubber widget was tracked and fixed separately as c04.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c20",
+      "claim_text": "這套判斷邏輯落在原始碼裡的兩個函式上——原文點名的是 signalCanceledSyscall 與 fileReadPositionalPosix……兩者合起來才是完整的協定。",
+      "location": "H2「EINTR 之後」下、scrubber widget 前的段落",
+      "type": "attribution",
+      "load": "high",
+      "note_ids": [
+        "n09"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "See signalCanceledSyscall and, eg fileReadPositionalPosix for the two halves of the protocol.",
+      "note": "Both identifiers re-verified character for character in round 2 (single-l 'Canceled'), and the source does call them the two halves of the protocol. The per-function role split is the post's own reading, following from the names and the protocol description.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c21",
+      "claim_text": "核心直接提供一個更直白的 API：NtCancelSynchronousIoFile，讓你直接對著一個正在進行同步 I/O 的 thread 喊停",
+      "location": "H2「EINTR 之後」下、Windows 段落",
+      "type": "attribution",
+      "load": "high",
+      "note_ids": [
+        "n10"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "On Windows, there's a much more direct NtCancelSynchronousIoFile",
+      "note": "API name correct; 「更直白」 tracks 'much more direct'. The 一等公民 gloss is immediately self-disclosed in text as read off the name.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c22",
+      "claim_text": "Zig 的做法是在介面層把這兩種「同時」拆開命名：io.async 代表「可能」同時發生，io.concurrent 代表「必須」同時發生",
+      "location": "H2「may 與 must」下第二段",
+      "type": "attribution",
+      "load": "high",
+      "note_ids": [
+        "n12",
+        "n13"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Zig's Io solves this problem ingeniously, separating, at the interface level, 'may run concurrently' from 'must run concurrently'.",
+      "note": "「介面層」 tracks 'at the interface level'; the io.async / io.concurrent pairing comes from n13.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c23",
+      "claim_text": "concurrent 因為承諾了一定要真的同時跑，所以永遠有失敗的可能；async 沒有這個承諾，所以它從不會因為「必須同時」這件事而失敗",
+      "location": "H2「may 與 must」下第二段，並見 popover widget",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [
+        "n13"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "gets more precise signatures (concurrent is always fallible, async never is)",
+      "note": "「永遠有失敗的可能」/「從不會」 track 'always fallible'/'never is'; the causal connective is the post's explanation layer and stays inside the source's meaning.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c24",
+      "claim_text": "預設由 thread pool 撐著，只有 pool 被榨乾時才真的 spawn 一條新 thread",
+      "location": "vg-w-pop-io-modes widget io.concurrent popover，並於結尾兩段重述",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [
+        "n15"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Of course concurrent is backed by a thread pool, falling back on spawning a fresh thread only when the pool is exhausted.",
+      "note": "「只有…才」 precisely tracks 'only when the pool is exhausted'.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c25",
+      "claim_text": "原文特別把這個類比釘在一個具體出處上——《Effective Modern C++》書裡第 36 條",
+      "location": "H2「may 與 must」下、popover widget 之後的段落",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n14"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "This achieves an effect similar to that of std::launch policy (item 36 in effective modern C++, if you have that around).",
+      "note": "Book title and item number both match. The source's aside is casual; the post's 「特別…釘在」 is slightly dramatised but does not upgrade the claim's strength.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c26",
+      "claim_text": "IOException 跟 InterruptedException 是兩個互不相關的 checked exception，也就是說做 I/O 的函式並不會因為 interrupt 而真的被打斷",
+      "location": "prior-art 段落，並於 matter-of-fact 表格 Java 列重述",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [
+        "n16"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "IOException and InterruptedException are both checked and unrelated, meaning that IOing functions are not interruptible.",
+      "note": "Class names, both properties and the inference all map one-to-one; the table cell shares the same source.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c27",
+      "claim_text": "POSIX 自己的 pthread_cancel 反而更接近 Zig 這套做法——同樣是 signal 加 flag 的機制——但它不整合語言層的取消（try、defer），取消之後的善後清理因此變得又麻煩又慢",
+      "location": "prior-art 段落，並於表格 pthread_cancel 列重述",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [
+        "n17"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "pthread_cancel implements a similar signal+flag machinery. However, it doesn't integrate with language-level cancelation (try, defer) which makes post-cancelation cleanup cumbersome and slow.",
+      "note": "All three elements present in the source.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c28",
+      "claim_text": "收到取消確認後開始 unwind（原文稱 begins unwinding），走完前面走過的完整協定。",
+      "location": "matter-of-fact 表格 Zig Io.Threaded 列第三欄",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n08"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "acknowledges the cancelation and begins unwinding",
+      "note": "The table explicitly marks 'begins unwinding' as the source's wording, and the string matches.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c29",
+      "claim_text": "canceling thread 設 flag 並送 signal，被卡住的 thread 醒來後檢查 flag，決定重試或確認取消。",
+      "location": "vg-w-scrub-cancel-protocol data-mobile-summary (行動版唯一可見文字)",
+      "type": "causal",
+      "load": "low",
+      "note_ids": [
+        "n05",
+        "n08"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "the canceling thread sets a flag in shared memory to request cancelation, and then signals the cancelee, in a loop, until the cancelation is acknowledged (a different value for a flag in the shared memory).",
+      "note": "The mobile summary describes the protocol flow only and never used the illustrative constant names, so it was unaffected by c04.",
+      "action": "none",
+      "resolution": "none-needed"
+    }
+  ],
+  "checked_at": "2026-08-08",
+  "checker_rounds": 2,
+  "coverage": {
+    "candidate_claims": 33,
+    "checked": 29,
+    "dropped_low_load": 4
+  }
+}
