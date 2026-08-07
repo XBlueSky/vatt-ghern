@@ -1,0 +1,831 @@
+{
+  "output_path": "src/posts/2026/08/08/deep-b300-power-telemetry-triage.html",
+  "spine": [
+    "1. 16 張 B300、FSDP／ZeRO-3 全參數微調 Qwen3-32B，團隊發現 nvidia-smi 的 utilization 在 NCCL 整個 deadlock 期間仍讀 100%，吞吐量卻是零——utilization 是會說謊的遙測。",
+    "2. 團隊原本懷疑的一個瓶頸是共享儲存 NFS——因為先前發生過一次「52k→21k tok/s」的崩潰；但受控 A/B 測試顯示 NFS 逐步讀取跟 pretokenized 本地快取的吞吐量差在 0.5% 以內，因為約 4GB 語料塞得進 4TB per-node RAM 的 page cache。",
+    "3. 那次崩潰被重新診斷為單執行緒 tokenize 加上壅塞的共享 NFS 造成的 CPU/NFS contention，不是儲存介質本身的問題。",
+    "4. 團隊用 board 功耗建了一張五段頻段表（compute ~940–1040W、communication ~640W、data starvation ~575W、deadlock ~190–195W、idle ~135W），藉此排除「通訊沒藏好」這個候選——健康時期 GPU 全程停在 compute 頻段，證明通訊確實被蓋在計算底下。",
+    "5. 真正的 deadlock 發生在 epoch 結束存 checkpoint 時：16 個 rank 裡有一個（rank 3）因為 persona 資料長度不一、切 packing block 時少了 53 個 block（0.17% 的差距），提早跑完迴圈走進 save barrier，其他 15 個 rank 還在做 gradient all-reduce，兩種 collective op 互相卡死，靜默了三小時才被 NCCL watchdog 抓到。",
+    "6. 修法 evenfix 讓每個 rank 在迴圈開始前先用 all_reduce 的 MIN 把自己的 block 數降到全域最小值，所有 rank 跑一樣的迭代次數，save barrier 的轉場天生對稱，deadlock 在結構上不可能發生。",
+    "7. 團隊把這次事故的代價量化成約 130 GPU·h，並加裝 2.71 秒的 pre-run 驗證 gate 加上一個獨立於訓練 session 的外部 watcher，把原本要三小時才會被人發現的靜默失敗，變成啟動前就被打回票。"
+  ],
+  "sources": [
+    {
+      "url": "https://arxiv.org/abs/2608.05944v1",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": null,
+      "perspective": {
+        "mechanism": "board 功耗依 workload phase（matmul-bound compute、NCCL 通訊、data starvation、deadlock、idle）落在不同區間，而 nvidia-smi 的 utilization 只回報『有沒有 kernel 在排程』，兩者在 deadlock 時會分岔，所以把功耗當作比 utilization 更誠實的遙測訊號。",
+        "tradeoff": "換用功耗 triage 需要先做一次 B300 專屬的頻段校準，且 Threats to Validity 一節明白說明這些 wattage 閾值換到別台硬體要重新校準，不能直接搬；NFS vs pretokenized cache 的結論也只在資料集塞得進 page cache 時成立，資料集遠大於 RAM 時會反過來。",
+        "reader_use": "在自己的多 GPU 訓練叢集上，先量幾個已知 healthy 跟已知 hang 的狀態各自的 board 功耗當基準線，再拿這個基準線去做故障分類，而不是死盯 nvidia-smi 的 utilization 欄位；上生產前的 invariant gate（cache 完整性、per-rank block 平衡、token 總量、埠是否被佔用、磁碟空間）也是可以直接抄的 checklist。"
+      }
+    }
+  ],
+  "notes": [
+    {
+      "id": "n01",
+      "url": "https://arxiv.org/abs/2608.05944v1",
+      "quote": "We report operational experience full-fine-tuning a 32.76B-parameter dense model (Qwen3-32B) on 16 x NVIDIA B300 (two nodes, FSDP / ZeRO-3) -- among the first published field accounts on this accelerator.",
+      "hedge": "asserted",
+      "interpretation": "確立整篇文章的規模與設定背景：16 張 B300、兩節點、FSDP/ZeRO-3、32.76B 參數的 Qwen3-32B。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n02",
+      "url": "https://arxiv.org/abs/2608.05944v1",
+      "quote": "(1) A B300-calibrated power-draw triage table that distinguishes compute / communication / data-starvation / checkpoint-or-deadlock / idle by board wattage (utilization% reads 100% during an NCCL hang).",
+      "hedge": "asserted",
+      "interpretation": "全文核心主張：utilization 在 NCCL hang 時仍讀 100%，功耗 triage 表是替代訊號。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n03",
+      "url": "https://arxiv.org/abs/2608.05944v1",
+      "quote": "nvidia-smi's utilization percentage reports only that a kernel is scheduled, not that it does useful compute... During a full NCCL deadlock utilization stays pinned at 100% even though throughput is exactly zero.",
+      "hedge": "asserted",
+      "interpretation": "utilization 語義解釋——它量的是『kernel 有沒有被排程』，不是『有沒有做有用的工作』，這是解謎的核心機制。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n04",
+      "url": "https://arxiv.org/abs/2608.05944v1",
+      "quote": "∼940–1040 W, 100%, uniform — compute (matmul-bound)—healthy",
+      "hedge": "asserted",
+      "interpretation": "Table 3 compute 頻段的定義：940-1040W、utilization 均勻 100%，代表健康的矩陣運算階段。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n05",
+      "url": "https://arxiv.org/abs/2608.05944v1",
+      "quote": "∼640 W, 100%, uniform — communication; if sustained, overlap failing",
+      "hedge": "asserted",
+      "interpretation": "Table 3 communication 頻段：640W，若持續出現代表通訊沒有被計算蓋住。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n06",
+      "url": "https://arxiv.org/abs/2608.05944v1",
+      "quote": "∼575 W, 55–100%, uneven — data starvation (stragglers)",
+      "hedge": "asserted",
+      "interpretation": "Table 3 data starvation 頻段：575W、utilization 不均，代表部分 rank 在等資料。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n07",
+      "url": "https://arxiv.org/abs/2608.05944v1",
+      "quote": "∼190–195 W, 1 rank 0% / rest 100% (deadlock) — hang / IO or rank 0 only 0% (checkpoint). In a deadlock the shape is asymmetric the other way—one rank at 0% and the rest pinned at 100% with power floored—and never recovers.",
+      "hedge": "asserted",
+      "interpretation": "Table 3 deadlock 頻段：190-195W，一個 rank 0%、其餘 100% 的不對稱訊號，是解謎的關鍵判讀。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n08",
+      "url": "https://arxiv.org/abs/2608.05944v1",
+      "quote": "∼135 W, 0%, all ranks — idle",
+      "hedge": "asserted",
+      "interpretation": "Table 3 idle 頻段：135W、全部 rank 0%，用來跟 deadlock 的不對稱訊號做對照。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n09",
+      "url": "https://arxiv.org/abs/2608.05944v1",
+      "quote": "GPUs sat at ∼940–1040 W (compute regime) throughout, confirming communication was hidden behind compute.",
+      "hedge": "asserted",
+      "interpretation": "排除『通訊沒藏好』這個候選懷疑的直接證據：正常運行期間功耗全程停在 compute 頻段。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n10",
+      "url": "https://arxiv.org/abs/2608.05944v1",
+      "quote": "Path A — NFS per-step read + tokenize, cold (post drop_caches): 52.8k tok/s; warm: 53.0k tok/s. Path B — pretokenized packed node-local cache: 53.0k tok/s. All three are within ~0.5%.",
+      "hedge": "asserted",
+      "interpretation": "負面結果一：本地 pretokenized cache 相對 NFS 沒有帶來吞吐量優勢，三條路徑幾乎重疊。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n11",
+      "url": "https://arxiv.org/abs/2608.05944v1",
+      "quote": "The corpus is ~4 GB against 4 TB of per-node RAM, so after first touch it is resident in page cache; and even a true cold miss is cheap—a 32B FSDP step takes ~5 s while reading 4 GB cold takes ~3 s at the measured floor.",
+      "hedge": "asserted",
+      "interpretation": "解釋為何 NFS 追得上本地 cache：語料遠小於 per-node RAM，第一次讀過就進 page cache，冷讀也蓋得過一個訓練 step 的時間。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n12",
+      "url": "https://arxiv.org/abs/2608.05944v1",
+      "quote": "a sustained data-starvation collapse from 52k to 21k tok/s ... single-threaded tokenization (TOKENIZERS_PARALLELISM=false, CPU load average ~15) and a contended, cooling shared NFS.",
+      "hedge": "asserted",
+      "interpretation": "先前那次吞吐量崩潰事件的原始數字與初步歸因：單執行緒 tokenize 加上壅塞的共享 NFS。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n13",
+      "url": "https://arxiv.org/abs/2608.05944v1",
+      "quote": "With parallel tokenization and an uncontended fabric, even a fully cold NFS read matches the local cache. The bottleneck was therefore tokenization-CPU throughput and NFS contention, never the storage medium.",
+      "hedge": "asserted",
+      "interpretation": "負面結果二：重新診斷後，那次崩潰的根因是 CPU/NFS contention，不是儲存介質本身。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n14",
+      "url": "https://arxiv.org/abs/2608.05944v1",
+      "quote": "4 GPUs, 0.5 nodes, 13.4k tok/s, 3,350 tok/s/GPU, 20.9h/epoch, 83.7 GPU-h, 100% eff; 8 GPUs, 1 node, 26.7k tok/s, 3,338 tok/s/GPU, 10.5h, 84.1 GPU-h, 100% eff; 16 GPUs, 2 nodes (IB), 53.0k tok/s, 3,313 tok/s/GPU, 5.3h, 84.7 GPU-h, 99% eff. Per-GPU throughput is flat within ~1% (3,313–3,350) and GPU·h per epoch is conserved at ~84.",
+      "hedge": "asserted",
+      "interpretation": "Table 7 強擴展參考數字：4/8/16 GPU 的吞吐量、per-GPU 吞吐量、epoch 時長、GPU·h、效率，近乎線性。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n15",
+      "url": "https://arxiv.org/abs/2608.05944v1",
+      "quote": "1. Cache integrity + per-rank block balance 2. Token-total sanity (~1.01B ±10%) 3. GPU occupancy ≠0 on both nodes 4. master_port free 5. Checkpoint disk headroom (≥150 GB) 6. (optional) IB bus-bandwidth probe. Measured wall-clock to run all six checks across both nodes: 2.71 s.",
+      "hedge": "asserted",
+      "interpretation": "Table 6 preflight gate 的六項檢查內容與總耗時 2.71 秒。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n16",
+      "url": "https://arxiv.org/abs/2608.05944v1",
+      "quote": "Rank 3 ran out 53 blocks (≈7 optimizer steps, at 8 blocks/step) before rank 11, exited the loop, and walked into the save barrier while others reduced gradients. The 53-block spread is 0.17% of the per-rank workload—invisible to every metric except the one that mattered.",
+      "hedge": "asserted",
+      "interpretation": "deadlock 根因的核心敘述：rank 3 因少 53 個 block 提早結束迴圈，走進 save barrier 造成 collective op 互相卡死。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n17",
+      "url": "https://arxiv.org/abs/2608.05944v1",
+      "quote": "The loader shards rows evenly, but persona records vary in length, so the per-rank token count varies and, after packing into 2048-token blocks, the block counts differ (min: 30,835; max: 30,888).",
+      "hedge": "asserted",
+      "interpretation": "解釋 block 數量不平衡的機制：loader 按列平均切分，但 persona 紀錄長度不一，packing 後 block 數不再相等，最小 30,835、最大 30,888。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n18",
+      "url": "https://arxiv.org/abs/2608.05944v1",
+      "quote": "A from-pretrained run progressed normally for ∼5 hours: loss 1.60→0.74→∼0.68, throughput ∼53k tok/s, all 16 GPUs at 100% utilization. At step 3,850 of 3,857—entering the end-of-epoch checkpoint—all 16 GPUs hung for three hours until the NCCL watchdog surfaced it. No dmesg OOM, no segfault, no error: pure silence, with utilization still reading 100%.",
+      "hedge": "asserted",
+      "interpretation": "整起事故的時間軸：五小時正常運行、loss 數字、進入 checkpoint 的確切 step、三小時卡死、watchdog 才發現，且沒有任何常見錯誤訊號。這是 hero widget 的資料來源。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n19",
+      "url": "https://arxiv.org/abs/2608.05944v1",
+      "quote": "Before the loop, each rank reduces its local block count to the global minimum: local_blocks = file_bytes // 4 // seq_len; min_blocks = dist.all_reduce(torch.tensor(local_blocks), op=ReduceOp.MIN); if blk_idx >= min_blocks: break. All ranks now run an identical number of iterations, so the terminal save-barrier transition is symmetric and the deadlock is structurally impossible.",
+      "hedge": "asserted",
+      "interpretation": "evenfix 修法的完整機制：每個 rank 用 all_reduce MIN 把 block 數降到全域最小值，迴圈統一停下，讓 deadlock 在結構上不可能發生。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n20",
+      "url": "https://arxiv.org/abs/2608.05944v1",
+      "quote": "A session-independent watcher on a separate host detects completion (epoch checkpoint appears), crash (process gone, no checkpoint), hang (step counter stalls, or the power/utilization deadlock signature persists across two samples).",
+      "hedge": "asserted",
+      "interpretation": "外部 watcher 的三種判斷邏輯：完成、崩潰、卡住（含功耗/利用率 deadlock 訊號連續兩次採樣仍在）。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n21",
+      "url": "https://arxiv.org/abs/2608.05944v1",
+      "quote": "The hang itself (16 GPU × ∼3 h before watchdog): ∼48 GPU·h. Unrecoverable progress (pre-fix epoch-end-only save; ∼5 h × 16 GPU): ∼85 GPU·h. Total per incident: ∼130 GPU·h.",
+      "hedge": "asserted",
+      "interpretation": "這次事故的量化成本：卡住本身 48 GPU·h，加上白跑的進度 85 GPU·h，總計約 130 GPU·h。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n22",
+      "url": "https://arxiv.org/abs/2608.05944v1",
+      "quote": "The transferable takeaways are operational: watch power, not utilization, and verify invariants before launch—a passing smoke test is not evidence of a safe full run.",
+      "hedge": "asserted",
+      "interpretation": "結論一節的方法論收尾，直接對應本文 closer 的兩句話。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n23",
+      "url": "https://arxiv.org/abs/2608.05944v1",
+      "quote": "This is an experience report. We do not introduce a new training algorithm, a new parallelism strategy, or a new optimizer. Instead we share what it actually took to operate a multi-node full fine-tuning job on NVIDIA B300—brand-new hardware (Blackwell Ultra, 2025–26) for which little operational experience is yet public.",
+      "hedge": "asserted",
+      "interpretation": "Introduction 開場，定位這篇為操作層面的實戰報告，並指出 B300（Blackwell Ultra）公開實戰經驗稀少。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n24",
+      "url": "https://arxiv.org/abs/2608.05944v1",
+      "quote": "Authors: Seon Ho Kim, Ui Jeong Jeon, Su Hyeon Kim, Min Tae Hwang. Institution: Samsung SDS.",
+      "hedge": "asserted",
+      "interpretation": "作者與機構資訊，用於 intro 的具體歸屬色彩。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n25",
+      "url": "https://arxiv.org/abs/2608.05944v1",
+      "quote": "We measured to 16 GPUs / 2 nodes. The deadlock mechanism is scale-independent, but the efficiency numbers (§6) should not be extrapolated past the two-node IB boundary. The generality argument is structural, not empirical across models. The §3 wattages are B300 values; the taxonomy and shape discriminators should transfer, absolute thresholds must be re-calibrated. The §4 conclusion holds only while the dataset fits in page cache; it inverts for datasets >> RAM.",
+      "hedge": "hedged",
+      "interpretation": "Threats to Validity and Scope 一節的完整限制聲明：規模外推限制、單一模型未經驗證、B300 專屬閾值需重新校準、page cache 前提。用於文中多處明確保留 hedge，不讓結論過度外推。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n26",
+      "url": "https://arxiv.org/abs/2608.05944v1",
+      "quote": "5.4 Prior art: this is Join / drop_last, at the packing layer",
+      "hedge": "asserted",
+      "interpretation": "論文把這次 deadlock 歸類為分散式訓練裡熟悉的 Join/drop_last 失敗模式家族，只是發生在 packing 層而非樣本層。",
+      "timeliness": "durable"
+    }
+  ],
+  "claims": [
+    {
+      "id": "c01",
+      "claim_text": "合理的推測是跨 node 的 IB 通訊開始收一點點稅，但論文本身沒有把這 1% 的差距拆解成具體原因，只把整組數字當成參考資料。",
+      "location": "under H2「懷疑二：這次也是通訊沒藏好嗎？」— final paragraph of the scaling discussion",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [
+        "n14"
+      ],
+      "independence": "single-source",
+      "verdict": "unverifiable",
+      "hedge_delta": "deflated",
+      "evidence": "Per-GPU throughput is flat within ~1% (3,313-3,350) and GPU-h per epoch is conserved at ~84 (4-GPU baseline; the only loss is a ~1% tax at 16 GPUs from the two-node IB boundary—4/8 GPUs are NVLink-only).",
+      "note": "CONTRADICTED by the source: the paper does attribute the 1% loss, to the two-node IB boundary. The post told the reader the paper was silent where it is not. Note n14 truncated the source sentence immediately before the explanatory parenthetical, which is how the error entered. FIXED: rewritten to attribute the IB tax to the paper and drop the 'paper is silent' assertion.",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c02",
+      "claim_text": "3,313 tok/s/GPU，5.3 小時跑完一個 epoch，累積 84.7 GPU·h，效率 99%——唯一沒有守住 100% 的一格，論文沒有拆解原因，只當成參考數字。",
+      "location": "widget-visible text — vg-w-pop-b300-scaling popover on the 16-GPU row",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n14"
+      ],
+      "independence": "single-source",
+      "verdict": "unverifiable",
+      "hedge_delta": "none",
+      "evidence": "…the only loss is a ~1% tax at 16 GPUs from the two-node IB boundary—4/8 GPUs are NVLink-only.",
+      "note": "Same defect as c01, restated inside the popover so it would have survived a body-only fix. The four numbers are all verified against the section 6 scaling table; only the trailing clause was false. FIXED together with c01.",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c03",
+      "claim_text": "功耗數字取自 Table 3 的頻段區間中位數，非逐秒遙測記錄。",
+      "location": "widget-visible text — figcaption of vg-w-chart-b300-deadlock",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n04",
+        "n07"
+      ],
+      "independence": "single-source",
+      "verdict": "unverifiable",
+      "hedge_delta": "none",
+      "evidence": "~940-1040 W, 100%, uniform — compute (matmul-bound)—healthy / ~190-195 W, 1 rank 0% / rest 100% (deadlock) — hang / IO or rank 0 only 0% (checkpoint)",
+      "note": "Half right: the figures do come from Table 3 and Table 3 is a band table, not a per-second trace. Wrong: 「頻段區間中位數」 — 940-1040 W and 190-195 W are the band ranges reproduced verbatim, not medians. FIXED: caption now reads 「取自 Table 3 回報的功耗區間」.",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c04",
+      "claim_text": "大多數吞吐量或效能監控設的容許誤差都以百分之幾起跳，53 個 block 的差距連邊都摸不到，也就難怪沒有任何常規儀表板會為這種程度的不平衡跳出警示。",
+      "location": "under H2「真正的原因：一個 rank 比別人少算了 53 個 block」",
+      "type": "number",
+      "load": "medium",
+      "note_ids": [],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "Unmarked empirical generalisation about monitoring practice at large, presented declaratively alongside verified source numbers. The paper supports only the narrower statement about its own run. FIXED: now quotes the paper's own 「invisible to every metric except the one that mattered」 and marks the generalisation with 「合理的推測是」.",
+      "action": "mark-inferred",
+      "resolution": "marked-inferred"
+    },
+    {
+      "id": "c05",
+      "claim_text": "十六張 NVIDIA B300、兩個節點、FSDP／ZeRO-3——Samsung SDS 一個四人團隊（Seon Ho Kim、Ui Jeong Jeon、Su Hyeon Kim、Min Tae Hwang）拿這套硬體全參數微調 Qwen3-32B，一個 32.76B 參數的稠密模型。",
+      "location": "opening paragraph of .vg-post-body",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n01",
+        "n24"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "We report operational experience full-fine-tuning a 32.76B-parameter dense model (Qwen3-32B) on 16 x NVIDIA B300 (two nodes, FSDP / ZeRO-3) -- among the first published field accounts on this accelerator.",
+      "note": "Configuration re-verified against the abstract and section 2.2; author names and Samsung SDS affiliation confirmed on both the abs page and the rendered HTML.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c06",
+      "claim_text": "論文自己講得很白：「We do not introduce a new training algorithm, a new parallelism strategy, or a new optimizer.」",
+      "location": "opening paragraph of .vg-post-body",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n23"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "This is an experience report. We do not introduce a new training algorithm, a new parallelism strategy, or a new optimizer.",
+      "note": "Verbatim match in the Introduction.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c07",
+      "claim_text": "論文把定位講在最前面：「We claim no new algorithm. The individual mechanisms we use are established practice; our contribution is the integrated field experience and a set of calibrated measurements on new hardware.」",
+      "location": "opening paragraph of .vg-post-body",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n01",
+        "n23"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "We claim no new algorithm. The individual mechanisms we use are established practice; our contribution is the integrated field experience and a set of calibrated measurements on new hardware.",
+      "note": "Quote verified verbatim in the abstract. Trace gap only: no ledger note carries this exact sentence; bound to n01/n23 as nearest neighbours. No prose change required.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c08",
+      "claim_text": "他們把這份紀錄定位成「among the first published field accounts on this accelerator」——檢索得到的 B300 實戰經驗幾乎是空白",
+      "location": "opening paragraph of .vg-post-body",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n01",
+        "n23"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "among the first published field accounts on this accelerator",
+      "note": "Quote verbatim; the gloss is supported by 「brand-new hardware (Blackwell Ultra, 2025-26) for which little operational experience is yet public」. The post keeps the source's own 「among the first」 hedge rather than claiming 第一篇.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c09",
+      "claim_text": "B300 屬於 2025 到 2026 年才出貨的 Blackwell Ultra 世代，公開的實戰經驗幾乎是空白",
+      "location": "opening paragraph of .vg-post-body",
+      "type": "date-version",
+      "load": "medium",
+      "note_ids": [
+        "n23"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "brand-new hardware (Blackwell Ultra, 2025-26) for which little operational experience is yet public",
+      "note": "Generation name and 2025-26 dating both re-verified in the Introduction.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c10",
+      "claim_text": "前五個小時 loss 從 1.60 掉到 0.74、再掉到大約 0.68，吞吐量穩定在 53k tok/s 上下，16 張 GPU 的 utilization 全部釘在 100%。跑到第 3,850 步（總共 3,857 步），系統要進入 epoch 結尾的 checkpoint 存檔，16 張 GPU 同時卡住",
+      "location": "under H2「「利用率 100%」，騙過了整個當機的三小時」",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n18"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "A from-pretrained run progressed normally for ~5 hours: loss 1.60->0.74->~0.68, throughput ~53k tok/s, all 16 GPUs at 100% utilization. At step 3,850 of 3,857—entering the end-of-epoch checkpoint—all 16 GPUs hung for three hours until the NCCL watchdog surfaced it.",
+      "note": "Every figure re-verified verbatim in section 5.1; also underpins the hero SVG labels.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c11",
+      "claim_text": "作者形容得很乾脆：「No dmesg OOM, no segfault, no error: pure silence, with utilization still reading 100%.」",
+      "location": "under H2「「利用率 100%」，騙過了整個當機的三小時」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n18"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "No dmesg OOM, no segfault, no error: pure silence, with utilization still reading 100%",
+      "note": "Verbatim match in section 5.1. Also the grounding for the rewritten opener.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c12",
+      "claim_text": "論文寫得直接：「nvidia-smi's utilization percentage reports only that a kernel is scheduled, not that it does useful compute... During a full NCCL deadlock utilization stays pinned at 100% even though throughput is exactly zero.」",
+      "location": "under H2「「利用率 100%」，騙過了整個當機的三小時」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n03",
+        "n02"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "nvidia-smi's utilization percentage reports only that a kernel is scheduled, not that it does useful compute. … During a full NCCL deadlock utilization stays pinned at 100% even though throughput is exactly zero.",
+      "note": "Both halves verified verbatim; the post's ellipsis correctly marks the elision. This is the load-bearing mechanism of the whole piece and it holds.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c13",
+      "claim_text": "健康的 compute phase 功耗落在 940 到 1040 瓦之間……通訊為主的階段功耗會掉到大約 640 瓦……data starvation 功耗落在 575 瓦左右……deadlock 的訊號很特別：190 到 195 瓦……跟單純的 idle（功耗只剩 135 瓦）完全不一樣",
+      "location": "under H2「把功耗切成五段，才看得出正在發生什麼事」— prose, table cells and hero SVG labels",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n04",
+        "n05",
+        "n06",
+        "n07",
+        "n08"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "~940-1040 W, 100%, uniform — compute (matmul-bound)—healthy; ~640 W, 100%, uniform — communication; if sustained, overlap failing; ~575 W, 55-100%, uneven — data starvation (stragglers); ~190-195 W, 1 rank 0% / rest 100% (deadlock) — hang / IO or rank 0 only 0% (checkpoint); ~135 W, 0%, all ranks — idle",
+      "note": "All five bands re-verified row by row against Table 3, including the utilization-pattern and interpretation columns. The post preserves the source's ~ approximations as 大約/左右.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c14",
+      "claim_text": "而且是「一個 rank 是 0%、其他全部釘在 100%」——這個不對稱的形狀，跟單純的 idle 完全不一樣",
+      "location": "under H2「把功耗切成五段」; also the table cell about checkpoint vs deadlock",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [
+        "n07",
+        "n08"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "In a deadlock the shape is asymmetric the other way—one rank at 0% and the rest pinned at 100% with power floored—and never recovers.",
+      "note": "Asymmetry discriminator verified; the checkpoint contrast is section 3.3's 「only rank 0 drops to 0% … resuming within ~2 min」.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c15",
+      "claim_text": "論文在最後的 Threats to Validity 一節先把話說在前面：deadlock 機制跟規模無關，但效率數字不該被外推到兩個 node、InfiniBand 互連範圍以外；瓦數是 B300 專屬數值，分類邏輯應該可以搬，絕對閾值必須重新校準",
+      "location": "under H2「把功耗切成五段」",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n25"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The deadlock mechanism is scale-independent, but the efficiency numbers (section 6) should not be extrapolated past the two-node IB boundary. … The section 3 wattages are B300 values; the taxonomy and shape discriminators should transfer, absolute thresholds must be re-calibrated.",
+      "note": "Substance verified clause by clause; the source's 「should transfer」/「should not be extrapolated」 hedges are preserved.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c16",
+      "claim_text": "論文也老實承認，這些結論目前只在一個模型、一份資料集上驗證過：「The generality argument is structural, not empirical across models.」",
+      "location": "under H2「把功耗切成五段」",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n25"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Single model/dataset. The generality argument is structural, not empirical across models.",
+      "note": "Verbatim match.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c17",
+      "claim_text": "三個數字幾乎重疊：NFS 冷讀 52.8k tok/s、NFS 熱讀 53.0k tok/s、本地 pretokenized cache 53.0k tok/s。",
+      "location": "under H2「懷疑一：是不是共享儲存又拖慢了訓練？」— prose plus vg-w-table-b300-pipeline-ab",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n10"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Path A — NFS per-step read + tokenize, cold (post drop_caches): 52.8k tok/s; warm: 53.0k tok/s. Path B — pretokenized packed node-local cache: 53.0k tok/s. All three are within ~0.5%.",
+      "note": "All three throughputs and the ~0.5% spread re-verified, as is the cold-path construction.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c18",
+      "claim_text": "整個語料只有大約 4GB，攤在每個 node 有 4TB 記憶體的機器上……32B 模型的 FSDP 一個 step 要花大約 5 秒，讀 4GB 冷資料只要 3 秒",
+      "location": "under H2「懷疑一」",
+      "type": "number",
+      "load": "medium",
+      "note_ids": [
+        "n11"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "the corpus is ~4 GB against 4 TB of per-node RAM, so after first touch it is resident in page cache; and even a true cold miss is cheap—a 32B FSDP step takes ~5 s while reading 4 GB cold takes ~3 s",
+      "note": "Verified verbatim.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c19",
+      "claim_text": "但這個結論有前提：只在資料集塞得進 page cache 時成立，換成遠大於 RAM 的資料集，結論會反過來",
+      "location": "under H2「懷疑一」",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [
+        "n11",
+        "n25"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The section 4 conclusion holds only while the dataset fits in page cache; it inverts for datasets >> RAM. … we report it as scale-conditional.",
+      "note": "The conditional is verbatim in section 9 and restated in section 4; checked adversarially and allowed to stand.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c20",
+      "claim_text": "更早之前，這套 pipeline 發生過一次「52k → 21k tok/s」的吞吐量崩潰，當時被歸咎給共享儲存 NFS。",
+      "location": "under H2「懷疑一」",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n12"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "a sustained data-starvation collapse from 52k to 21k tok/s … The earlier incident is real; our initial framing of it as a 'storage bottleneck' was imprecise, and we correct it here.",
+      "note": "Both the figures and the initial misattribution are verified — the paper explicitly owns and corrects its earlier framing.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c21",
+      "claim_text": "肇因是單執行緒 tokenize（TOKENIZERS_PARALLELISM=false，CPU load average 大約 15）疊加上一段壅塞、正在冷卻的共享 NFS……瓶頸從頭到尾都是 tokenize 的 CPU 吞吐量跟 NFS 的併發爭用，從來不是儲存介質本身太慢。",
+      "location": "under H2「懷疑一」",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [
+        "n12",
+        "n13"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The collapse occurred under single-threaded tokenization (TOKENIZERS_PARALLELISM=false, CPU load average ~15) and a contended, cooling shared NFS. … With parallel tokenization and an uncontended fabric, even a fully cold NFS read matches the local cache. The bottleneck was therefore tokenization-CPU throughput and NFS contention, never the storage medium.",
+      "note": "Env-var name, load average, the embedded English quote and the causal conclusion all verified verbatim without strengthening.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c22",
+      "claim_text": "那五個小時的正常 run 裡，GPU 全程停在 940 到 1040 瓦，「confirming communication was hidden behind compute」",
+      "location": "under H2「懷疑二：這次也是通訊沒藏好嗎？」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n09"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "GPUs sat at ~940-1040 W (compute regime) throughout, confirming communication was hidden behind compute.",
+      "note": "Verbatim match in section 6. This is the elimination step the investigation turns on.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c23",
+      "claim_text": "4 張 GPU 量到 13.4k tok/s……8 張量到 26.7k tok/s……16 張（走 InfiniBand）量到 53.0k tok/s",
+      "location": "widget-visible text — vg-w-pop-b300-scaling row and its three popovers",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n14"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "4 GPUs, 0.5 nodes, 13.4k tok/s, 3,350 tok/s/GPU, 20.9 h/epoch, 83.7 GPU-h, 100%; 8 GPUs, 1 node, 26.7k tok/s, 3,338 tok/s/GPU, 10.5 h, 84.1 GPU-h, 100%; 16 GPUs, 2 nodes (IB), 53.0k tok/s, 3,313 tok/s/GPU, 5.3 h, 84.7 GPU-h, 99%",
+      "note": "All fifteen cells of the section 6 scaling table re-verified.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c24",
+      "claim_text": "作者自己講得保守：「near-linear strong scaling for a compute-bound model at this size is the expected regime」，他們把這組數字當成參考資料",
+      "location": "under H2「懷疑二」",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n14",
+        "n25"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "We report 4/8/16-GPU scaling as reference data, not a finding: near-linear strong scaling for a compute-bound model at this size is the expected regime.",
+      "note": "Quote verbatim; the gloss is the source's own framing.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c25",
+      "claim_text": "loader 是按「列」平均切給每個 rank 的，但每一筆 persona 紀錄的長度不一樣……最少的一個 rank 是 30,835 個 block，最多是 30,888 個，差了 53 個。",
+      "location": "under H2「真正的原因：一個 rank 比別人少算了 53 個 block」",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n17"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The loader shards rows evenly, but persona records vary in length, so the per-rank token count varies and, after packing into 2048-token blocks, the block counts differ (min: 30,835; max: 30,888).",
+      "note": "ROOT CAUSE CONFIRMED — this is what the sidecar summary rests on. 30,888 - 30,835 = 53, and the rank identification is the paper's own.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c26",
+      "claim_text": "53 個 block 換算成優化器步數，大約是 7 步（每 8 個 block 對應 1 個 optimizer step）。「The 53-block spread is 0.17% of the per-rank workload」……分到最少 block 的 rank 3 提早跑完自己的迴圈，直接走進 epoch 結尾的 save barrier",
+      "location": "under H2「真正的原因」",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n16"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Rank 3 ran out 53 blocks (~7 optimizer steps, at 8 blocks/step) before rank 11, exited the loop, and walked into the save barrier while others reduced gradients. The 53-block spread is 0.17% of the per-rank workload—invisible to every metric except the one that mattered.",
+      "note": "0.17%, ~7 optimizer steps, 8 blocks/step and rank 3's early exit all verified verbatim; 53/30,888 = 0.17% is internally consistent.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c27",
+      "claim_text": "PyTorch 的 DDP 文件早就描述過這種失敗模式……PyTorch 官方給的解法是 Join 這個 context manager，或者乾脆設定 drop_last=True",
+      "location": "under H2「真正的原因」",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n26"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "That uneven per-rank inputs desynchronize collectives and hang the job is the stated motivation for DistributedDataParallel.join() … The tutorial states it directly: 'if a rank has fewer inputs, then the other ranks will hang or error.' The standard remedy … is DataLoader(drop_last=True).",
+      "note": "Trace thin (n26 carries only the section heading) but authenticity clean: every element is genuinely in section 5.4. Independence recorded as single-source because the PyTorch docs are reached only through this paper's citation.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c28",
+      "claim_text": "讓每個 rank 在進迴圈前，先用一次 all_reduce 把自己的 block 數量降到全 domain 的最小值……deadlock 在結構上不可能再發生",
+      "location": "under H2「真正的原因」— prose plus the pseudocode block",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [
+        "n19"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "local_blocks = file_bytes // 4 // seq_len; min_blocks = dist.all_reduce(torch.tensor(local_blocks), op=ReduceOp.MIN); if blk_idx >= min_blocks: break. All ranks now run an identical number of iterations, so the terminal save-barrier transition is symmetric and the deadlock is structurally impossible.",
+      "note": "Code lines and the structural-impossibility conclusion verified verbatim; the post's block is labelled pseudocode and drops the dist./torch wrappers while keeping the operative semantics.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c29",
+      "claim_text": "跑六項檢查……六項全部跑完，兩個 node 合計量到的時間是 2.71 秒。",
+      "location": "under H2「把三小時的靜默，變成 2.71 秒就打回票」— prose plus vg-w-stack-b300-preflight",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n15"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "1. Cache integrity + per-rank block balance 2. Token-total sanity (~1.01B +/-10%) 3. GPU occupancy !=0 on both nodes 4. master_port free 5. Checkpoint disk headroom (>=150 GB) 6. (optional) IB bus-bandwidth probe. Measured wall-clock to run all six checks across both nodes: 2.71 s.",
+      "note": "All six checks and the 2.71 s wall-clock verified, including the optional status of the IB probe.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c30",
+      "claim_text": "負責從外部判斷三種狀態：完成、崩潰、卡住（step 計數器停滯不動，或者「the power/utilization deadlock signature persists across two samples」",
+      "location": "under H2「把三小時的靜默」",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n20"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "A session-independent watcher on a separate host detects completion (epoch checkpoint appears), crash (process gone, no checkpoint), hang (step counter stalls, or the section 3 power/utilization deadlock signature persists across two samples).",
+      "note": "All three detection branches and the embedded English quote verified.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c31",
+      "claim_text": "卡住本身耗掉大約 48 GPU·h……又賠上大約 85 GPU·h，一次事故總共大約 130 GPU·h",
+      "location": "under H2「把三小時的靜默」",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n21"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The hang itself (16 GPU x ~3 h before watchdog): ~48 GPU-h. Unrecoverable progress (pre-fix epoch-end-only save; ~5 h x 16 GPU): ~85 GPU-h. Total per incident: ~130 GPU-h.",
+      "note": "All three cost figures verified verbatim; the post keeps the source's ~ as 大約.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c32",
+      "claim_text": "換算下來，相當於一台 16 張 GPU 的機器平白多跑了超過 8 個小時",
+      "location": "under H2「把三小時的靜默」",
+      "type": "number",
+      "load": "low",
+      "note_ids": [
+        "n21"
+      ],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "Already marked as the author's derivation by the in-text 「換算下來」. Arithmetic checks out on a verified base: ~130 GPU-h / 16 = 8.125 h. The paper does not state this per-machine figure.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c33",
+      "claim_text": "作者把結論寫成三句話——「watch power, not utilization」、「verify invariants before launch」、「a passing smoke test is not evidence of a safe full run」",
+      "location": "p.vg-deep-closer (rewritten in Step 7.5d)",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n22"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The transferable takeaways are operational: watch power, not utilization, and verify invariants before launch—a passing smoke test is not evidence of a safe full run.",
+      "note": "All three fragments verified verbatim in the Conclusion; the rewrite for inter-post diversity changed the framing around them, not the quotes.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c34",
+      "claim_text": "光是參數、梯度、optimizer state 三份加起來，用混合精度粗估都要逼近半 TB，塞不進單張 GPU 的顯示記憶體",
+      "location": "opening paragraph of .vg-post-body",
+      "type": "number",
+      "load": "low",
+      "note_ids": [],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "Not in any note and not in the paper — the author's own back-of-envelope for why ZeRO-3 is needed, marked with 「粗估」. Arithmetic is sound at mixed precision and the figure is scene-setting rather than load-bearing.",
+      "action": "none",
+      "resolution": "none-needed"
+    }
+  ],
+  "checked_at": "2026-08-08",
+  "checker_rounds": 2,
+  "coverage": {
+    "candidate_claims": 42,
+    "checked": 34,
+    "dropped_low_load": 8
+  }
+}

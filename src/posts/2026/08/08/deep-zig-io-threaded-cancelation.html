@@ -1,0 +1,373 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">Signal 送到一個正阻塞在 kernel syscall 裡的 thread，你以為它馬上就會醒——但那個 signal 也可能在 syscall 真正開始阻塞之前就已經送達，或是等到 syscall 自己結束之後才姍姍來遲。單靠 signal，你賭不到正確的時機。</p>
+  <h1 class="vg-post-title">阻塞的 syscall 也能被取消</h1>
+</header>
+
+<div class="vg-post-prose">
+
+<p><span class="vg-dropcap">看</span>完這篇，你會知道阻塞的 read()、recv() 這類呼叫為什麼平常沒辦法取消，也會知道 Zig 的 std.Io.Threaded 只靠一個共享記憶體裡的 flag、一個 POSIX signal、加上 EINTR 這個回傳值，怎麼把「取消一個正在阻塞的 syscall」這件事做成可靠的。</p>
+
+<h2>「兩個非同步計算同時發生」——為什麼取消是 concurrency 最難的一塊</h2>
+
+<p>先把 concurrency 和 parallelism 分開講，這篇文章談的是前者。Parallelism 是用硬體資源同時做更多事，concurrency 是處理非同步、不確定的事件——這兩件事常常被混在一起講，但它們解決的是不同的問題：一個關心吞吐量，一個關心事件何時發生、以什麼順序發生。</p>
+
+<p>Concurrency 之所以難，核心原因只有一個：只要有兩個非同步的計算同時在跑，遲早會有那麼一刻，其中一個計算發現另一個已經不再需要了，而且必須主動把它取消掉。這不是一個可以事後補上去的功能，是並行本身結構性帶來的問題——你不會遇到「要不要支援取消」這個選項，你只會遇到「這次取消做得可不可靠」。</p>
+
+<p>而「可靠地取消」在大多數語言的標準工具裡都很難做到。最直覺的方案是乾脆開一堆 thread：每個請求一個 thread，阻塞就阻塞，反正 thread 彼此獨立。這條路能撐一陣子，但撞牆的地方很具體——一旦某個 thread 真的阻塞在 kernel 的 syscall 裡，程式語言的 API 通常沒有辦法把它叫醒。你可以在使用者態的迴圈裡檢查一個「該不該取消」的旗標，但如果程式碼此刻正卡在 read() 或 recv() 裡等 kernel 回應，那個迴圈根本沒有機會執行到檢查那一行。</p>
+
+<p>光靠開更多 thread 也撐不了太久，理由有兩個：能開的 thread 數量往往受系統層限制，多數應用程式沒有能力去改這種系統設定；就算 thread 數量真的夠，沒有取消能力這件事遲早會讓你撞牆——某個請求逾時了、某個查詢的結果已經不需要了，這些情境都需要主動叫停，而不是等它自己跑完。這正是 std.Io.Threaded 想解的問題：能不能繼續用標準的 OS thread、標準的阻塞 API，不去碰 io_uring 這類新東西，但同時拿到可靠取消任何工作的能力。</p>
+
+<h2>signal 為什麼靠不住——競態出在哪一段時間</h2>
+
+<p>既然問題是「thread 卡在 kernel 裡叫不醒」，第一個直覺的答案是 POSIX signal：對著那個 thread 送一個 signal，kernel 會把它從阻塞的 syscall 裡踢出來，thread 醒過來，syscall 回傳 EINTR。這件事本身沒錯——thread 阻塞在 kernel 裡，收到 signal 之後確實會被喚醒，syscall 確實會回傳 EINTR。問題出在「光靠 signal」這件事本身撐不起一個可靠的取消機制。</p>
+
+<p>Signal 天生是 racy 的：signal 送達的時間點，跟你想要它發生的那個「syscall 正在阻塞」的那段時間，兩者之間沒有任何同步保證。Signal 可能在相關的 syscall 真正開始之前就已經送到——這種情況下它什麼都沒打斷，因為那時候 thread 根本還沒進到 kernel；也可能在 syscall 已經結束之後才送達——這種情況下它打斷的是下一段完全無關的程式碼。單獨看 signal 這個機制，你沒有辦法保證「我發的這個 signal，一定會落在對方正卡在 syscall 裡的那一刻」。</p>
+
+<p>這也是為什麼 signal 本身不能算是一個取消機制——它只是一個喚醒的手段，不是一個協調的手段。要把喚醒變成可靠的取消，中間還缺一塊：一個雙方都看得到、不會因為時序而失真的狀態。</p>
+
+<p>把前面兩段並起來看，問題的輪廓就浮現了：乾脆開更多 thread 解決不了取消，因為 thread 本身可以撐住，但一旦某個 thread 真的阻塞在 kernel 裡，你連碰都碰不到它；靠 signal 硬闖也解決不了，因為 signal 送達的時機跟你想要它發生的那段時間對不上。兩條路都撞在同一面牆上——你需要的不是「多開幾個 thread」或「送個訊號」這種單點手段，而是一個能撐住時間差、讓雙方都讀得到同一個真相的協調機制。</p>
+
+<h2>flag 在共享記憶體裡，signal 只是敲門——取消協定的形狀</h2>
+
+<p>Zig 補的就是這一塊：把「取消請求」這件事，從「一次性送達的 signal」搬到「持續存在的狀態」上。實際的協定是這樣運作的——發起取消的那個 thread，先在一塊共享記憶體裡設一個旗標，表示「我要求取消」；接著它不停地對目標 thread 送 signal，一直送，送到取消被確認為止，確認的方式，是旗標被改成另一個代表「已確認」的值。</p>
+
+<p>這個設計把責任拆得很乾淨：flag 負責記住「有人要求取消」這個事實，不管 signal 什麼時候送達、送達幾次，這個事實都不會因為時序而消失或重複；signal 只負責一件事——把可能正卡在 kernel 裡的 thread 叫醒，讓它有機會去看一眼那個 flag。喚醒可以早、可以晚、可以送好幾次，都無所謂，因為真正的狀態不靠 signal 本身傳遞，靠的是那塊共享記憶體。</p>
+
+<p>下面這張圖把協定裡的四個角色攤開：發起取消的 thread、共享記憶體裡的那個 flag、負責送達 signal 的 kernel、以及正被取消的那個 thread。點開每一個角色，看它實際負責什麼、又刻意不知道什麼——這種各自的責任邊界，正是這個協定能保持簡單的原因。</p>
+
+<figure class="vg-w-annotated-cancel-protocol" data-mobile="static" data-svg-scroll="880">
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <circle cx="12" cy="12" r="3"/>
+      <path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M4.9 19.1L7 17M17 7l2.1-2.1"/>
+    </svg>
+    <span>點擊任一角色看它的職責 · 4 個角色</span>
+  </p>
+  <style>
+    .vg-w-annotated-cancel-protocol { display: grid; grid-template-columns: 1fr; gap: var(--s-3); }
+    .vg-w-annotated-cancel-protocol svg.vg-w-annotated-cancel-protocol-main { width: 100%; height: auto; }
+    .vg-w-annotated-cancel-protocol input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+    .vg-w-annotated-cancel-protocol .component { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; transition: fill 200ms, stroke 200ms; }
+    .vg-w-annotated-cancel-protocol .component:hover { stroke: var(--accent); }
+    .vg-w-annotated-cancel-protocol .component:focus { outline: none; }
+    .vg-w-annotated-cancel-protocol .component:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .vg-w-annotated-cancel-protocol .component-text { pointer-events: none; }
+    .vg-w-annotated-cancel-protocol .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+    .vg-w-annotated-cancel-protocol .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+    .vg-w-annotated-cancel-protocol .detail p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+    .vg-w-annotated-cancel-protocol:has(#vg-w-annotated-cancel-protocol-r1:checked) .component-1 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+    .vg-w-annotated-cancel-protocol:has(#vg-w-annotated-cancel-protocol-r2:checked) .component-2 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+    .vg-w-annotated-cancel-protocol:has(#vg-w-annotated-cancel-protocol-r3:checked) .component-3 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+    .vg-w-annotated-cancel-protocol:has(#vg-w-annotated-cancel-protocol-r4:checked) .component-4 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+    .vg-w-annotated-cancel-protocol:has(#vg-w-annotated-cancel-protocol-r1:checked) .detail-1 { display: block; }
+    .vg-w-annotated-cancel-protocol:has(#vg-w-annotated-cancel-protocol-r2:checked) .detail-2 { display: block; }
+    .vg-w-annotated-cancel-protocol:has(#vg-w-annotated-cancel-protocol-r3:checked) .detail-3 { display: block; }
+    .vg-w-annotated-cancel-protocol:has(#vg-w-annotated-cancel-protocol-r4:checked) .detail-4 { display: block; }
+  </style>
+
+  <div class="radios" data-vg-controls>
+    <input type="radio" id="vg-w-annotated-cancel-protocol-r1" name="vg-w-annotated-cancel-protocol-sel" checked />
+    <input type="radio" id="vg-w-annotated-cancel-protocol-r2" name="vg-w-annotated-cancel-protocol-sel" />
+    <input type="radio" id="vg-w-annotated-cancel-protocol-r3" name="vg-w-annotated-cancel-protocol-sel" />
+    <input type="radio" id="vg-w-annotated-cancel-protocol-r4" name="vg-w-annotated-cancel-protocol-sel" />
+  </div>
+
+  <svg class="vg-w-annotated-cancel-protocol-main" viewBox="0 0 880 300">
+    <rect class="component component-1" data-target="vg-w-annotated-cancel-protocol-r1" role="button" tabindex="0" aria-label="選取發起端 thread" x="20" y="100" width="190" height="90" />
+    <text class="component-text" x="115" y="140" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">發起端 thread</text>
+    <text class="component-text" x="115" y="162" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">canceling thread</text>
+
+    <rect class="component component-2" data-target="vg-w-annotated-cancel-protocol-r2" role="button" tabindex="0" aria-label="選取共享記憶體 flag" x="230" y="100" width="190" height="90" />
+    <text class="component-text" x="325" y="140" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">共享記憶體 flag</text>
+    <text class="component-text" x="325" y="162" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">shared flag</text>
+
+    <rect class="component component-3" data-target="vg-w-annotated-cancel-protocol-r3" role="button" tabindex="0" aria-label="選取 kernel signal 傳遞" x="440" y="100" width="190" height="90" />
+    <text class="component-text" x="535" y="140" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">kernel</text>
+    <text class="component-text" x="535" y="162" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">signal 傳遞</text>
+
+    <rect class="component component-4" data-target="vg-w-annotated-cancel-protocol-r4" role="button" tabindex="0" aria-label="選取被取消端 thread" x="650" y="100" width="190" height="90" />
+    <text class="component-text" x="745" y="140" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">被取消端 thread</text>
+    <text class="component-text" x="745" y="162" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">cancelee</text>
+
+    <line x1="210" y1="145" x2="230" y2="145" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-annotated-cancel-protocol-arrow)" />
+    <text x="220" y="130" text-anchor="middle" font-family="Manrope, sans-serif" font-size="10" fill="var(--muted)">設</text>
+    <line x1="420" y1="145" x2="440" y2="145" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-annotated-cancel-protocol-arrow)" />
+    <line x1="630" y1="145" x2="650" y2="145" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-annotated-cancel-protocol-arrow)" />
+    <text x="640" y="130" text-anchor="middle" font-family="Manrope, sans-serif" font-size="10" fill="var(--muted)">喚醒</text>
+
+    <path d="M 745 190 C 745 240, 325 240, 325 190" fill="none" stroke="var(--muted-2)" stroke-width="1.3" stroke-dasharray="4 3" marker-end="url(#vg-w-annotated-cancel-protocol-arrow-dim)" />
+    <text x="535" y="235" text-anchor="middle" font-family="Manrope, sans-serif" font-size="10" fill="var(--muted)">EINTR 之後回頭檢查</text>
+
+    <defs>
+      <marker id="vg-w-annotated-cancel-protocol-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+      </marker>
+      <marker id="vg-w-annotated-cancel-protocol-arrow-dim" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--muted-2)" />
+      </marker>
+    </defs>
+  </svg>
+
+  <div>
+    <div class="detail detail-1">
+      <h3>發起端 thread · 職責</h3>
+      <p>在共享記憶體設一個「要求取消」的旗標，接著循環對目標 thread 送 signal，一直送到看到旗標被改成「已確認」為止。</p>
+      <p><strong>不知道</strong>：對方目前執行到哪一行、卡在哪個 syscall 裡——它只管把請求送出去、把 signal 一直送。</p>
+    </div>
+    <div class="detail detail-2">
+      <h3>共享記憶體 flag · 職責</h3>
+      <p>記住「有沒有取消請求」這個事實，狀態在「要求取消」與「已確認」之間切換，不因為 signal 送達的時間點而失真或消失。</p>
+      <p><strong>不知道</strong>：是哪個 thread 在讀它、讀了幾次——它只是一塊被動的共享狀態。</p>
+    </div>
+    <div class="detail detail-3">
+      <h3>kernel · 職責</h3>
+      <p>收到 signal 之後，把正阻塞在 syscall 裡的目標 thread 喚醒，讓對應的 syscall 回傳 EINTR。</p>
+      <p><strong>不知道</strong>：這個 signal 是不是跟取消有關、對方醒來後會不會去檢查 flag——kernel 只負責喚醒這一件事。</p>
+    </div>
+    <div class="detail detail-4">
+      <h3>被取消端 thread · 職責</h3>
+      <p>收到 EINTR 之後檢查 flag：沒被設就重試原本的 syscall，被設了就把 flag 改成「已確認」，接著開始 unwind。</p>
+      <p><strong>不知道</strong>：是誰、為什麼要取消自己——它只根據 flag 的值做決定。</p>
+    </div>
+  </div>
+
+  <script>
+    (function () {
+      if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+      const root = document.querySelector('.vg-w-annotated-cancel-protocol');
+      root.querySelectorAll('.component').forEach((rect) => {
+        rect.addEventListener('click', () => {
+          const targetId = rect.getAttribute('data-target');
+          const radio = root.querySelector('#' + targetId);
+          if (radio) radio.checked = true;
+        });
+        rect.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            rect.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+          }
+        });
+      });
+    })();
+  </script>
+</figure>
+
+<p>四個角色各司其職，沒有一個角色需要知道全貌。發起取消的 thread 不需要知道對方目前執行到哪一行；被取消的 thread 不需要知道是誰、為什麼要取消它；kernel 只是單純地把 signal 轉成一次喚醒。整個協定的可靠性，建立在「flag 是唯一的真相來源、signal 只是通知」這個分工上，而不是建立在「signal 一定準時送達」這種做不到的假設上。</p>
+
+<h2>EINTR 之後：retry 還是 acknowledge，走一遍這個迴圈</h2>
+
+<p>把鏡頭拉近到被取消的那個 thread，看它在收到 signal 之後具體做了什麼。它原本正阻塞在某個 syscall 裡，比方說一次檔案讀取。Signal 送達，kernel 把它喚醒，syscall 回傳 EINTR。到這裡為止，都還只是「訊號打斷了阻塞」這個標準機制，跟取消沒有直接關係——收到 EINTR 之後，習慣上是直接重試那個 syscall，但這不是唯一的選項。</p>
+
+<p>取消協定用的正是「不一定要重試」這個自由度：thread 收到 EINTR 之後，先去檢查共享記憶體裡的那個 flag。如果 flag 沒被設，那就是一次無關的中斷，照舊重試 syscall，繼續等它真正完成；如果 flag 已經被設成「要求取消」，thread 就不重試了，改成確認取消，把 flag 改成「已確認」的值，然後開始 unwind——沿著呼叫堆疊往回收拾，執行該執行的清理。</p>
+
+<p>下面這段用 pseudocode 把上面這個判斷邏輯畫出來——不是原始碼的逐行重現，只是把協定的分岔畫成看得懂的形狀：</p>
+
+<pre data-kind="pseudocode"><code>// 被取消端 thread：EINTR 之後的判斷
+loop {
+    result = read_from_kernel(fd, buf)      <em>// 阻塞中</em>
+    if result == EINTR {
+        if shared_flag.load() == CANCEL_REQUESTED {
+            shared_flag.store(CANCEL_ACKNOWLEDGED)
+            begin_unwind()                  <em>// 沿呼叫堆疊往回收拾</em>
+            return error.Canceled
+        }
+        continue                            <em>// 無關中斷，重試</em>
+    }
+    return result
+}
+
+// 發起端 thread
+shared_flag.store(CANCEL_REQUESTED)
+while shared_flag.load() != CANCEL_ACKNOWLEDGED {
+    send_signal(target_thread)              <em>// 循環送，直到確認</em>
+}</code></pre>
+
+<p>這個迴圈之所以能成立，靠的是 EINTR 提供了一個明確的、回到使用者態、有機會檢查 flag 的時機——沒有這個時機，flag 設得再對也沒用，因為 thread 一直卡在 kernel 裡，永遠沒機會讀它。這套判斷邏輯落在原始碼裡的兩個函式上——原文點名的是 <code>signalCanceledSyscall</code> 與 <code>fileReadPositionalPosix</code>：前者負責送 signal、管理 flag 的那一側，後者負責實際的阻塞讀取、處理 EINTR 那一側，兩者合起來才是完整的協定。下面的時間軸把整個流程按步驟攤開，拖動看每一步協定各自在哪個狀態：</p>
+
+<p>這裡藏著一個容易被忽略的選擇：多數阻塞 syscall 的呼叫端，收到 EINTR 之後，本來就不知道是什麼把自己打斷的——打斷它的訊號可能跟這次呼叫毫無關係，這種情況下，照舊重試、繼續等待原本要做的事，才是正確反應。取消協定並沒有把這個既有習慣整個換掉，而是在它上面多加一層判斷：多數 EINTR 還是照舊重試，只有「被要求取消」這個特例才會走向確認取消、開始 unwind 的那條路。協定能只靠一個 flag 就完成，靠的正是這種不破壞既有形狀、只在分支裡多問一句「是不是我」的做法。</p>
+
+<figure class="vg-w-scrub-cancel-protocol" data-svg-scroll="720" data-mobile="swap" data-mobile-summary="canceling thread 設 flag 並送 signal，被卡住的 thread 醒來後檢查 flag，決定重試或確認取消。">
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M3 12h18"/><path d="M7 8l-4 4 4 4"/><path d="M17 8l4 4-4 4"/>
+    </svg>
+    <span>拖動看協定走過的六個步驟 · 6 步</span>
+  </p>
+  <style>
+    .vg-w-scrub-cancel-protocol { display: grid; gap: var(--s-2); }
+    .vg-w-scrub-cancel-protocol svg { width: 100%; height: auto; }
+    .vg-w-scrub-cancel-protocol .controls { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+    .vg-w-scrub-cancel-protocol .controls input[type="range"] { flex: 1; height: 36px; accent-color: var(--accent); touch-action: none; }
+    .vg-w-scrub-cancel-protocol .controls .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 6ch; text-align: right; }
+    .vg-w-scrub-cancel-protocol .state { font-family: var(--serif); font-size: var(--fs-sm); padding: var(--s-2); background: var(--bg-soft); border-left: 2px solid var(--accent); }
+    .vg-w-scrub-cancel-protocol .controls,
+    .vg-w-scrub-cancel-protocol .state { position: sticky; left: 0; max-width: calc(100vw - 2rem); box-sizing: border-box; }
+  </style>
+
+  <div class="controls" data-vg-controls>
+    <label for="vg-w-scrub-cancel-protocol-x">step =</label>
+    <input id="vg-w-scrub-cancel-protocol-x" type="range" min="0" max="5" value="0" step="1" />
+    <span class="readout" id="vg-w-scrub-cancel-protocol-readout">0 / 5</span>
+  </div>
+
+  <svg class="vg-w-scrub-cancel-protocol-main" viewBox="0 0 720 200">
+    <line x1="40" y1="50" x2="680" y2="50" stroke="var(--muted-2)" stroke-width="1.5" />
+    <g id="vg-w-scrub-cancel-protocol-events"></g>
+    <line id="vg-w-scrub-cancel-protocol-handle-line" x1="40" y1="30" x2="40" y2="70" stroke="var(--accent)" stroke-width="2" />
+    <circle id="vg-w-scrub-cancel-protocol-handle" cx="40" cy="50" r="7" fill="var(--accent)" />
+    <text id="vg-w-scrub-cancel-protocol-action" x="360" y="130" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)" font-style="italic">（尚未開始）</text>
+  </svg>
+
+  <div class="state" id="vg-w-scrub-cancel-protocol-state">拖動滑桿，看每一步協定的狀態（flag 的兩個值是示意說法，原文只說「另一個代表已確認的值」）</div>
+
+  <script>
+    (function () {
+      if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+      const root = document.querySelector('.vg-w-scrub-cancel-protocol');
+      const input = root.querySelector('#vg-w-scrub-cancel-protocol-x');
+      const readout = root.querySelector('#vg-w-scrub-cancel-protocol-readout');
+      const handle = root.querySelector('#vg-w-scrub-cancel-protocol-handle');
+      const handleLine = root.querySelector('#vg-w-scrub-cancel-protocol-handle-line');
+      const actionText = root.querySelector('#vg-w-scrub-cancel-protocol-action');
+      const stateDiv = root.querySelector('#vg-w-scrub-cancel-protocol-state');
+      const eventsG = root.querySelector('#vg-w-scrub-cancel-protocol-events');
+
+      const steps = [
+        ['設 flag',        '發起端 thread 在共享記憶體把 flag 設成「要求取消」。'],
+        ['送出 signal',     '發起端 thread 開始循環對目標 thread 送 signal。'],
+        ['signal 送達',     'kernel 把正阻塞在 syscall 裡的目標 thread 喚醒。'],
+        ['回傳 EINTR',      '被喚醒的 syscall 回傳 EINTR，thread 拿回執行權。'],
+        ['檢查 flag',       'thread 讀取共享記憶體，看到 flag 已經是「要求取消」。'],
+        ['acknowledge',     'thread 把 flag 改成另一個代表「已確認」的值，開始 unwind，發起端的迴圈才會停止送 signal。'],
+      ];
+      const X0 = 40, X1 = 680;
+      const xOf = i => X0 + (i / (steps.length - 1)) * (X1 - X0);
+
+      const NS = 'http://www.w3.org/2000/svg';
+      steps.forEach((s, i) => {
+        const c = document.createElementNS(NS, 'circle');
+        c.setAttribute('cx', xOf(i)); c.setAttribute('cy', 50); c.setAttribute('r', 4);
+        c.setAttribute('fill', 'var(--muted)');
+        eventsG.appendChild(c);
+        const tx = document.createElementNS(NS, 'text');
+        tx.setAttribute('x', xOf(i)); tx.setAttribute('y', 80);
+        tx.setAttribute('text-anchor', 'middle');
+        tx.setAttribute('font-family', 'Manrope, sans-serif');
+        tx.setAttribute('font-size', 10);
+        tx.setAttribute('fill', 'var(--muted)');
+        tx.textContent = s[0];
+        eventsG.appendChild(tx);
+      });
+
+      function update(i) {
+        const x = xOf(i);
+        handle.setAttribute('cx', x);
+        handleLine.setAttribute('x1', x); handleLine.setAttribute('x2', x);
+        actionText.textContent = `${i}. ${steps[i][0]}`;
+        stateDiv.textContent = steps[i][1];
+        readout.textContent = `${i} / 5`;
+      }
+      input.addEventListener('input', () => update(Number(input.value)));
+      update(0);
+    })();
+  </script>
+</figure>
+
+<p>Windows 這邊走的是完全不同的路——不需要 signal、不需要 flag、也不需要 EINTR 這套間接手段，核心直接提供一個更直白的 API：NtCancelSynchronousIoFile，讓你直接對著一個正在進行同步 I/O 的 thread 喊停。少了 POSIX 那套「送 signal、猜時機、檢查旗標」的迂迴，Windows 核心本身就把「取消一個同步 I/O」當成一等公民。原文作者也順著這條線判斷，把 fiber、IO Completion Port、Job object 這些機制放在一起看，NT 對並行這件事的設計似乎比 Unix 想得更透徹——這是個人觀點式的判斷，不是量化的結論，但值得留意的是：Unix 這邊要靠使用者態拼出來的協定，Windows 核心直接就有對應的一等 API。</p>
+
+<p>回頭看這條路徑，會發現它把前面那整段「signal 天生 racy」的麻煩繞了過去。POSIX 這邊要處理的競態，源頭在於喚醒的手段（signal）跟真相的來源（flag）是兩個獨立的東西，中間隔著一段不受控制的時間差，才需要一整套「設旗標、循環送、檢查旗標」的協定去補；NtCancelSynchronousIoFile 光是名字就講白了它要做的事——直接取消一次同步 I/O，不必再繞道使用者態的旗標。少了這層間接，也就少了「旗標放在哪裡」「什麼時候該檢查」這些 POSIX 這邊得自己煩惱的協定細節。</p>
+
+<h2>may 與 must：把兩種「同時發生」拆開命名，再看看前人做到哪裡</h2>
+
+<p>取消協定解決的是「怎麼安全地打斷」，Zig 的 Io 介面還處理了另一個相關但不同的問題：一段程式碼「可能」跟別的東西同時跑，跟一段程式碼「必須」跟別的東西同時跑，這兩件事在大多數語言裡是混在一起的——你呼叫 spawn，至於它是不是真的另外開了一條執行路徑，往往要看實作、看當下的資源，而不是看你寫的程式碼本身。</p>
+
+<p>Zig 的做法是在介面層把這兩種「同時」拆開命名：io.async 代表「可能」同時發生，io.concurrent 代表「必須」同時發生。這個拆分帶來的不只是可讀性——它讓兩者的型別簽章變得更精確：concurrent 因為承諾了一定要真的同時跑，所以永遠有失敗的可能；async 沒有這個承諾，所以它從不會因為「必須同時」這件事而失敗。命名把語意攤開了，簽章跟著誠實了。</p>
+
+<figure class="vg-w-pop-io-modes" data-mobile="keep">
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <circle cx="12" cy="12" r="3"/>
+      <path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M4.9 19.1L7 17M17 7l2.1-2.1"/>
+    </svg>
+    <span>點選或觸碰底線詞看定義 · 2 個名詞</span>
+  </p>
+  <style>
+    .vg-w-pop-io-modes { position: relative; }
+    .vg-w-pop-io-modes p.term-para { font-family: var(--serif); font-size: var(--fs-md); }
+    .vg-w-pop-io-modes .term { anchor-name: --vgw-io-anchor; text-decoration: underline dotted var(--muted); cursor: help; }
+    .vg-w-pop-io-modes .pop {
+      position-anchor: --vgw-io-anchor;
+      position: absolute;
+      top: anchor(bottom);
+      left: anchor(center);
+      translate: -50% var(--s-1);
+      padding: var(--s-1) var(--s-2);
+      background: var(--bg-soft);
+      border: 1px solid var(--line);
+      font-family: var(--scribed);
+      font-size: var(--fs-sm);
+      max-width: 34ch;
+      opacity: 0;
+      transition: opacity 100ms;
+      pointer-events: none;
+      z-index: 2;
+    }
+    .vg-w-pop-io-modes .term:hover + .pop,
+    .vg-w-pop-io-modes .term:focus + .pop { opacity: 1; }
+    @supports not (anchor-name: --x) {
+      .vg-w-pop-io-modes .pop { position: static; opacity: 1; pointer-events: auto; display: block; margin-top: var(--s-1); translate: none; }
+    }
+  </style>
+  <p class="term-para">
+    Zig 用 <span class="term" tabindex="0">io.async</span><span class="pop">可能與其他工作同時執行，但不保證一定會——原文說它「never」因為必須同時發生而失敗，簽章永遠不會因為這個承諾而多出一個失敗分支。</span>
+    跟 <span class="term" tabindex="0">io.concurrent</span><span class="pop">承諾一定會跟其他工作同時執行，因此永遠有失敗的可能；預設由 thread pool 撐著，只有 pool 被榨乾時才真的 spawn 一條新 thread。</span>
+    這兩個詞，把「可能同時發生」跟「必須同時發生」在介面層拆開，效果類似 C++ 的 std::launch policy；原文只說「類似」，沒有再往下展開。
+  </p>
+</figure>
+
+<p>原文特別把這個類比釘在一個具體出處上——《Effective Modern C++》書裡第 36 條。原文只說效果「類似」std::launch policy，沒有再往下展開那個 policy 本身，所以能對照的只有形狀：一組讓呼叫端在「保證另外跑」與「不保證」之間表態的選項，跟 io.async「可能」同時發生、io.concurrent「必須」同時發生的分野對得上——一個承諾「不一定」，一個承諾「一定」，各自換來的失敗語意也對稱。</p>
+
+<p>把這套取消協定放進更大的脈絡裡看，會發現它不是第一個嘗試用 signal 取消阻塞中 thread 的方案。Java 有一套外觀類似的 thread interruption 機制，但關鍵缺陷在於它沒辦法真的打斷正在阻塞的 syscall：IOException 跟 InterruptedException 是兩個互不相關的 checked exception，也就是說做 I/O 的函式並不會因為 interrupt 而真的被打斷。POSIX 自己的 pthread_cancel 反而更接近 Zig 這套做法——同樣是 signal 加 flag 的機制——但它不整合語言層的取消（try、defer），取消之後的善後清理因此變得又麻煩又慢。下面這張表把三種手段擺在一起比較：</p>
+
+<figure class="vg-w-table-cancel-mechanisms" data-mobile="keep">
+  <style>
+    .vg-w-table-cancel-mechanisms { overflow-x: auto; }
+    .vg-w-table-cancel-mechanisms table { width: 100%; min-width: 560px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+    .vg-w-table-cancel-mechanisms thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); }
+    .vg-w-table-cancel-mechanisms tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+  </style>
+  <table>
+    <thead>
+      <tr>
+        <th>手段</th>
+        <th>核心機制</th>
+        <th>在取消阻塞 syscall 這件事上</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Java thread interrupt</td>
+        <td>thread interruption flag，配合獨立的 checked exception</td>
+        <td>打不斷阻塞中的 syscall——IOException 與 InterruptedException 互不相關，I/O 函式不會因為 interrupt 被打斷。</td>
+      </tr>
+      <tr>
+        <td>pthread_cancel</td>
+        <td>signal + shared flag，機制與 Zig 這套協定相近</td>
+        <td>沒有整合語言層的 try / defer，取消後的清理因此麻煩又慢。</td>
+      </tr>
+      <tr>
+        <td>Zig Io.Threaded</td>
+        <td>signal + shared memory flag + EINTR 迴圈</td>
+        <td>收到取消確認後開始 unwind（原文稱 begins unwinding），走完前面走過的完整協定。</td>
+      </tr>
+    </tbody>
+  </table>
+</figure>
+
+<p>三種手段擺在一起看，會發現 Zig 要補的那塊很明確：既要真的能打斷阻塞中的 syscall（Java 做不到），又要跟語言層的清理機制整合（pthread_cancel 沒做到）。signal 加 flag 這個機制本身不是新發明，pthread_cancel 早就有類似的機制；新的地方是把它跟一個原生就有 defer 的語言整合起來，讓取消之後的清理跟寫其他錯誤處理一樣自然。而 concurrent 由 thread pool 撐著、池滿才 spawn 新 thread 這個細節，也說明「必須同時發生」不等於「每次都要付出開新 thread 的成本」——大部分時候，concurrent 用的是已經存在、被重複利用的 thread。</p>
+
+<p>這個細節也回答了一個容易被忽略的問題：如果「必須同時發生」代價這麼高，為什麼 Zig 還敢把它做成一個隨手可呼叫的介面，而不是留給少數效能敏感的路徑？答案就在 thread pool 這一層——真正需要開一條新 thread 的情況，只發生在 pool 被榨乾的時候，大部分呼叫拿到的都是已經存在、被重複利用的 thread。concurrent 付出的「永遠有失敗可能」這個代價，換到的是一個明確的保證，而不是每次呼叫都要付出開新 thread 的成本；async 那一側連這個保證都不承諾，也就不需要面對「pool 被榨乾怎麼辦」這個問題。</p>
+
+<p class="vg-deep-closer"><strong>Take-away</strong>：可取消的阻塞 syscall，不是把 blocking API 換掉，是在它旁邊多放一個雙方都看得到的旗標——signal 只負責敲門，真正的狀態永遠留在那塊共享記憶體裡。</p>
+
+</div>
