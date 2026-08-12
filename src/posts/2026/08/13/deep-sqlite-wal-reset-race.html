@@ -10,6 +10,27 @@
 
   <p>事情的起點很平淡：一條讀取 S3 備份的資料管線回報某個資料庫有錯誤。Tailscale 跑了 SQLite 的 <code>PRAGMA integrity_check</code> 對備份做檢查，確認損毀是真的。這不是單一事件——往回攤開時間軸，六個月裡一共發生了十九次獨立的資料庫損毀。事故的節奏也不規律：十月到十二月之間曾經有連續六週沒有任何事故，工程團隊一度以為問題已經消失，結果它在聖誕節前後又回來了，像一份不受歡迎的節日禮物。</p>
 
+  <figure class="vg-w-table-wal-timeline-stats" data-mobile="keep">
+    <style>
+      .vg-w-table-wal-timeline-stats table { width: 100%; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-wal-timeline-stats thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); }
+      .vg-w-table-wal-timeline-stats tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); }
+      .vg-w-table-wal-timeline-stats td.num { font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; color: var(--accent-text); font-family: var(--mono); }
+    </style>
+    <table>
+      <thead>
+        <tr><th>指標</th><th class="num">數值</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>六個月內的資料庫損毀事故</td><td class="num">19 次</td></tr>
+        <tr><td>十到十二月間的無事故空窗</td><td class="num">6 週</td></tr>
+        <tr><td>3.52.0 復原嘗試同時回報損毀的資料庫</td><td class="num">13 個</td></tr>
+        <tr><td>加裝重疊警告後，等到警報觸發的時間</td><td class="num">2 個月</td></tr>
+        <tr><td>警報觸發後的穩定運作時間（寫作當下）</td><td class="num">4 個月</td></tr>
+      </tbody>
+    </table>
+  </figure>
+
   <p>受影響的範圍有清楚的邊界。Tailscale 的控制平面只處理設定資料，這些資料庫存放的是使用者 tailnet 與裝置的 metadata，不含私鑰，也不含實際的網路流量。早期幾次事故造成的實際損失是：少數剛新增的裝置或設定變更沒能存住，得手動把一小部分 metadata 重新輸入一次——麻煩，但不是資料外洩等級的事故。</p>
 
   <p>問題出在「為什麼會是 Tailscale」。多數團隊讓 SQLite 用預設方式跑，checkpoint 由資料庫自己按節奏處理；Tailscale 為了跑得又快又一致的備份，選擇自己接管 checkpoint 流程，並且把 checkpoint 頻率調得很積極。搭配這套機制，他們另外建了一條交易紀錄管線，把每一句會改動資料庫的 SQL 陳述都串流寫進一個獨立的 log 檔，用來支援快速復原。這個決定當時看起來合理——直到它變成整起事故裡最關鍵的變數。下面把整條調查——從發現、到工具化、到最後確認——攤開成三段。</p>
@@ -62,6 +83,8 @@
 
   <p>SQLite 把儲存層拆成一組可替換的介面，官方稱之為 VFS（virtual filesystem）：真正碰觸磁碟的所有操作都要經過這一層。這個設計原本是為了讓 SQLite 能跑在各種平台上，但它也順帶留了一個好用的切入點——只要包一層新的 VFS，就能在不動核心邏輯的前提下，側錄每一次檔案操作。SQLite 開發者正是這麼做的：為了替 Tailscale 這起事故除錯，他們寫了一個包住既有 VFS 的 shim，額外寫出關於資料庫變動的追蹤資訊與 log，取名 <code>tmstmpvfs</code>。</p>
 
+  <p>這一層額外的追蹤資訊，SQLite 平常並不會留——這正是為什麼開發者得專門另外打造一個 shim，而不是直接從既有的 log 裡回頭找答案：沒有 <code>tmstmpvfs</code>，這場調查大概會停在「我們知道資料庫壞了，但看不到 checkpoint 那一刻到底發生了什麼事」這一步。</p>
+
   <div class="vg-w-pop-wal-glossary">
     <style>
       .vg-w-pop-wal-glossary { position: relative; margin: var(--s-3) 0; }
@@ -104,6 +127,10 @@
   <h2>checkpoint 數錯頁的那一刻</h2>
 
   <p>要理解這個 race，得先知道 checkpoint 正常時在做什麼。SQLite 官方文件把這個動作定義得很直接：把 WAL 檔案裡的交易搬回資料庫本身。搬的方式也有規矩——checkpointer 會盡量依照頁面編號遞增的順序，把頁面從 WAL 依序搬回主資料庫檔案；如果搬到某個還在被某個 reader 讀取範圍內的頁面，就必須停下來，避免覆寫 reader 正在用的內容。WAL 模式也規定同一時間只能有一個 writer，因為整個資料庫只有一份 WAL 檔案。這一整套規則本身就不簡單，而 race 恰好就藏在「checkpoint 進行到一半，又剛好有新的寫入介入」這個邊界情況裡。</p>
+
+  <p>這裡還有一個容易被忽略的機制：checkpoint 做完，不代表 WAL 檔案本身會馬上清空重來。WAL 檔案格式裡有兩個關鍵欄位——<code>mxFrame</code> 記錄目前 WAL 裡最後一筆有效交易的位置，<code>nBackfill</code> 記錄 checkpoint 已經搬回主資料庫的進度；官方文件把兩者的關係說得很直接：「當 mxFrame 等於 nBackfill 時，代表 WAL 裡的所有內容都已經寫回資料庫。」真正把 WAL 檔案倒回起點、讓新交易從頭開始寫的動作，官方稱之為 reset：「WAL reset 意味著把 WAL 倒回去，從檔案開頭重新加入新的訊框。」而且這個 reset 判斷不是 checkpoint 自己觸發的，而是下一次寫入發生時，由 writer 順便檢查：「每次發生寫入操作時，writer 都會檢查 checkpoint 的進度；如果整個 WAL 都已經搬進資料庫並且同步完成，也沒有 reader 還在用這份 WAL，writer 就會把 WAL 倒回起點，讓新的交易從頭開始寫。」checkpoint、reset、下一次寫入，三個動作分屬 checkpointer 與 writer 兩個不同的執行緒，卻共用同一份「WAL 現在寫到哪裡」的認知——這正是 race 有機可乘的結構性原因。reader 這邊又是另一套路徑：它不會逐筆掃描檔案，而是透過一份存在共享記憶體裡的 wal-index 快速定位，官方的說法是「wal-index 維護在共享記憶體裡，幫助 reader 快速找到 WAL 裡的頁面，同時把 I/O 降到最低。」整個 WAL 模式因此同時跑著三種角色：writer 只管 append、reader 靠 wal-index 找頁面、checkpointer 負責把頁面搬回主檔案並在條件成立時觸發 reset——三者對「目前狀態」的認知理論上該是一致的，WAL-Reset bug 正是這個「理論上一致」在某個時間點失守的具體案例。</p>
+
+  <p>把 mxFrame 與 nBackfill 放在一起看，race 發生的那個瞬間會更清楚一點：mxFrame 記錄的是 checkpointer「自認為」已經搬到哪裡，nBackfill 才是主資料庫實際收到的頁面數；正常情況下兩者只會有極短暫的落差，一輪 checkpoint 跑完就會同步。race 發生的瞬間，恰好就是這個落差被一次新的寫入操作永久卡住的時刻——checkpointer 後續所有判斷，全部建立在一個已經跟事實脫節的 nBackfill 數字上，直到下一次 <code>PRAGMA integrity_check</code> 之類的檢查，才會被發現。</p>
 
   <figure class="vg-w-annotated-wal-checkpoint-race" data-mobile="static" data-svg-scroll="720">
     <style>
@@ -211,6 +238,8 @@
     </script>
   </figure>
 
+  <p>把上面這個結構放進時間軸看：checkpointer 已經開始依序把 WAL 的頁面搬回主資料庫，這時如果剛好有一次 write transaction 介入，checkpointer 對「目前搬到第幾頁」的判斷就會出錯——它會誤以為某個範圍的頁面已經複製完成，實際上並沒有真的寫入主資料庫檔案。這些頁面之後不會再被搬一次，因為 checkpointer 已經把它們標記成「做過了」；但同一段時間裡，其他會引用這些頁面的結構（例如索引）卻照常被寫進資料庫。之後有人讀取這個索引時，它指向的頁面早已不在原地——資料庫的角度看不出任何一次寫入失敗或報錯，只是那部分資料悄悄消失了。</p>
+
   <p>可觀察到的症狀相當具體：SQLite 回報自己從 WAL 複製的頁數，會超過 WAL 檔案裡實際存在的頁數。作者舉的例子很直白——如果 WAL 裡只有 10 頁，資料庫卻回報複製了 20 頁，那顯然出了問題。下面這組對照，把「正常 checkpoint」跟「race 觸發時」的這個頁數指標並排放。</p>
 
   <figure class="vg-w-ba-wal-page-mismatch" data-mobile="swap" data-mobile-summary="正常 checkpoint 複製頁數等於 WAL 頁數；race 觸發時 WAL 10 頁卻回報複製 20 頁，多出的頁面其實沒寫入，資料就此消失。" data-interactive="drag" data-svg-scroll="640">
@@ -279,11 +308,13 @@
 
   <p>SQLite 開發者也解釋了為什麼是 Tailscale 更容易踩到它：手動接管 checkpoint 流程、而且 checkpoint 得很積極，即使是一個由罕見條件觸發的 bug，遲早也會被撞上。這句話呼應了作者自己的反思——用非標準方式操作一項「無聊但可靠」的技術本身就是風險：常見路徑與標準配置經過遠更充分的測試與驗證，多數 SQLite 使用者用預設方式跑，從來不會碰到這種問題。</p>
 
+  <p>「手動接管 checkpoint」具體做的事情，是繞過 SQLite 預設的自動排程，直接呼叫 checkpoint 介面自己決定時機——官方文件把這個介面寫得很清楚：「應用程式可以在任何一個可寫入的資料庫連線上，直接呼叫 <code>sqlite3_wal_checkpoint()</code> 或 <code>sqlite3_wal_checkpoint_v2()</code> 來啟動一次 checkpoint。」這條路徑本身沒有問題，SQLite 官方就是為此開放這個介面；差別在於使用頻率。多數團隊讓 SQLite 用預設的被動節奏，WAL 累積到一定大小才自動觸發一次 checkpoint，兩次之間往往有充裕的間隔。Tailscale 為了備份的速度與一致性，選擇高頻率、主動觸發，等於把「checkpoint 進行中、同時有新寫入介入」這個時間窗口，從偶爾出現變成反覆出現。官方文件也提到另一個方向相反、但同樣跟 checkpoint 節奏有關的風險：如果資料庫同時有很多重疊的 reader、而且隨時都有 reader 在使用，checkpoint 反而會完全跑不完，WAL 檔案只會持續膨脹。兩種問題的成因不同，但共同點是——checkpoint 節奏一旦偏離預設，各種原本被「大家都很少踩到」掩蓋掉的邊界情況，命中率都會被推高。</p>
+
   <h2>修復撤回又重來，警報確認了兇手</h2>
 
   <p>第一版修復在 3.52.0 裡登場：官方 changelog 記載，這個版本替 checkpoint 函式加了一項額外檢查，用來偵測 WAL 是否已經被另一個執行緒重置過。但這個修復本身帶出了另一個問題——一個獨立的 stale expression index 缺陷，讓 3.52.0 整個版本被撤回，原訂功能全部併入下一個版本。巧的是，Tailscale 在用 3.52.0 嘗試復原的過程中，監控立刻亮紅燈，一次回報十三個資料庫同時損毀——這正是撤回背後那個副作用的現場證據。</p>
 
-  <p>撤回之後，官方改發只含 WAL-Reset 修復、不含其他功能的 3.51.3；接著在 3.53.0 裡，除了同樣的 WAL-Reset 修復，又加入了 self-healing index 這項新功能，專門用來處理 stale expression index 問題本身。三個版本號各自的角色可以並排看：</p>
+  <p>三個版本號背後其實是同一套修復邏輯分兩批交付。3.52.0 想一次到位——除了 WAL-Reset 修復，也把其他既定功能一起放了進去；額外加的那項檢查，專門用來偵測「WAL 是否已經被另一個執行緒 reset 過」，但這個檢查改動了 checkpoint 函式本身的行為，連帶讓一個原本無關的 stale expression index 缺陷浮出水面。撤回之後，官方把範圍切得更小——3.51.3 只帶走 WAL-Reset 修復，其餘功能全部延後，換來的是把「修一個問題」跟「不要牽動其他東西」分開處理。等到 3.53.0，被延後的功能才跟 WAL-Reset 修復一起回到同一個版本裡，其中的 self-healing index 讓過期的 expression index 能自動修復，等於是替 3.52.0 那個副作用另外補了一個正式方案，而不是繞開它不管。三個版本號各自的角色可以並排看：</p>
 
   <figure class="vg-w-table-wal-reset-releases" data-mobile="keep">
     <style>
@@ -321,7 +352,11 @@
     </table>
   </figure>
 
+  <p>對正在追蹤這次修復的維運團隊來說，這個順序也決定了升級的節奏：如果只是要盡快堵住 WAL-Reset 這個坑，3.51.3 已經足夠；如果連 stale expression index 這個副作用也想一併解決，才需要等到 3.53.0。中間的 3.52.0 除了紀錄一段修復過程的插曲，實務上不建議任何人真的拿來用。</p>
+
   <p>修復上線之後，Tailscale 又加了一層驗證：一個會偵測 checkpoint 與寫入是否重疊的警告。邏輯很簡單——如果警告觸發了、但資料庫沒有損毀，就代表修復真的擋下了一次原本會發生的事故。這個等待持續了兩個月，直到一則取名 <code>SQLitePartyMode</code> 的警報觸發，訊息寫著：SQLite 在 <code>shard2.corp.ts.net:8383</code> 上，在 party mode 裡試圖造成損毀，但系統擋下了它。作者的說法是，這則警報證明了 WAL-Reset bug 的確切觸發條件，真的會在正式環境裡出現——這也代表它很可能就是過去六個月不穩定的元兇，儘管作者用的措辭是「likely culprit」，沒有把話說死。自那則警報觸發之後，Tailscale 又穩定運作了四個月，沒有再出現任何資料庫事故。</p>
+
+  <p>對照著看，這起事故給「要不要自己接管 checkpoint」這個決定補上了一個罕見但真實的下限：多數團隊維持預設節奏，其實是在用「經過充分測試的路徑」換取「幾乎不會撞到這類邊界情況」的機率；一旦決定繞過預設、自己控制 checkpoint 的時機與頻率，等於同時把自己移出那條路徑原本的測試覆蓋範圍。Tailscale 這次踩到的是一個已經在 SQLite 原始碼裡躺了至少十六年的 race，換一個角度說，也是這十六年來第一次有人用夠高的頻率去敲它的門。</p>
 
   <p class="vg-deep-closer"><strong>非標準路徑的代價</strong>：這個 race 在 SQLite 原始碼裡躺了至少十六年，靠的不是誰更聰明才被找到，而是 Tailscale 剛好用了一種夠激進的方式去操作 checkpoint，把命中率從「幾乎不可能」推到「六個月十九次」。任何團隊繞過資料庫預設節奏、自己接管 checkpoint 或類似機制去換取速度時，都在用同一種方式，把自己推向那些標準配置測試不到的角落。</p>
 </div>
