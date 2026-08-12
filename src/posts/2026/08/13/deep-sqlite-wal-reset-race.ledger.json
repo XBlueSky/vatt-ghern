@@ -1,0 +1,1082 @@
+{
+  "output_path": "src/posts/2026/08/13/deep-sqlite-wal-reset-race.html",
+  "spine": [
+    "1. Tailscale 的 control plane 資料庫在六個月內發生 19 次損毀，起點是一次 S3 備份跑 PRAGMA integrity_check 時抓到的損毀。",
+    "2. Tailscale 自己採取非標準做法：手動接管 checkpoint 流程、checkpoint 得很積極，為的是快速、一致的備份——這個做法後來被 SQLite 開發者指出，是他們比其他人更容易踩到這個 race 的原因。",
+    "3. SQLite 開發者打造 tmstmpvfs shim（包一層 VFS，側錄額外的追蹤 log），靠下一次損毀事故的 log 找到問題：一個介於 checkpoint 與 write transaction 之間、極罕見的 data race。",
+    "4. race 的機制：checkpoint 進行中如果在特定時間點發生寫入，checkpointer 會誤判哪些頁已經從 WAL 複製到主資料庫檔案；沒被真正寫入的頁面就永久遺失，但引用這些頁的其他頁（例如索引）仍照常寫入，資料庫因此損毀。可觀察到的症狀是頁數對不上：WAL 裡只有 10 頁，資料庫卻回報複製了 20 頁。",
+    "5. SQLite 開發者估計這個 race 已經存在至少 16 年，因為太罕見，連測試環境都得刻意加程式碼去觸發它；他們把這個問題命名為『WAL-Reset bug』。",
+    "6. 修復版本鏈並不順利：3.52.0 加了偵測 WAL 被其他執行緒重置的檢查，但引發另一個 stale expression index 的副作用而被撤回；SQLite 改發只含 WAL-Reset 修復的 3.51.3；3.53.0 同時含 WAL-Reset 修復，並加入 self-healing index 功能解決 stale expression index 問題。",
+    "7. Tailscale 加了偵測 checkpoint 與 write 重疊的警報；兩個月後名為 SQLitePartyMode 的警報觸發，證實這個 race 真的會在正式環境發生，此後又運作了四個月沒有再出現資料庫事故。"
+  ],
+  "sources": [
+    {
+      "url": "https://tailscale.com/blog/sqlite-wal-reset-bug",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": "2026-08-12",
+      "perspective": {
+        "mechanism": "checkpoint 把 WAL 裡累積的異動搬回主資料庫檔案；一個介於 checkpoint 執行緒與 write transaction 之間的 data race，會讓 checkpointer 誤判『哪些頁已經複製完成』，導致部分頁面永久遺失，但仍有其他頁引用它們，資料庫因此損毀。",
+        "tradeoff": "Tailscale 為了快速、一致的備份，選擇手動接管 checkpoint 流程並且積極 checkpoint——這個非標準用法讓一個原本極罕見（存在至少 16 年才被發現）的 race 在六個月內被踩中 19 次；標準配置下的使用者幾乎不會遇到。",
+        "reader_use": "任何自建 backup / snapshot pipeline 而繞過資料庫預設 checkpoint 節奏的團隊，都該重新評估『非標準但更快』的取捨——常見路徑的可靠性測試遠比自訂路徑扎實，換來的速度背後有踩到冷門 bug 的機率成本。"
+      }
+    },
+    {
+      "url": "https://sqlite.org/changes.html",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": null,
+      "perspective": {
+        "mechanism": "SQLite 官方 changelog 記錄了三個版本的實際內容：3.52.0（2026-03-06，撤回）、3.51.3（2026-03-13，只含 WAL-reset 修復）、3.53.0（2026-04-09，含 WAL-reset 修復＋新增 self-healing index 功能處理 stale expression index 問題）。",
+        "tradeoff": "先發的修復（3.52.0）解決了一個問題卻引入另一個問題（stale expression index），逼得官方撤回並拆成『先給最小修復（3.51.3）、再給完整方案（3.53.0）』兩步——修 data race 這種深層 bug 時，修復本身的副作用範圍常常比預期大。",
+        "reader_use": "升級 SQLite 修正 bug 時，值得看 changelog 裡『這個版本改了什麼』的完整清單，而不是只看標題——3.52.0 的教訓是，一個看似無關的 checkpoint 修復連帶影響了 expression index 的行為。"
+      }
+    },
+    {
+      "url": "https://sqlite.org/wal.html",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": null,
+      "perspective": {
+        "mechanism": "WAL 模式下，寫入先 append 到 WAL 檔案；checkpoint 把 WAL 裡的異動搬回主資料庫檔案，過程中會盡量依序（頁面編號遞增）搬移，且在遇到還在被某個 reader 使用的頁面時必須停下，避免覆寫 reader 正在讀的內容。",
+        "tradeoff": "WAL 允許 writer 與 reader 同時進行（因為 writer 只 append，不直接動主檔案），但同一時間只能有一個 writer；checkpoint 可以跟 reader 並行，卻必須在遇到某個 reader 的讀取邊界時停下——這些並行規則本身就複雜，留給 checkpoint 與新寫入交錯時的邊界條件足夠的空間藏一個十六年沒被抓到的 race。",
+        "reader_use": "理解 WAL 檔案『被搬回主資料庫』與『被某個 reader 占用』兩種狀態如何互相牽制，是判斷『我的資料庫要不要手動介入 checkpoint 節奏』這個決定的基礎知識。"
+      }
+    },
+    {
+      "url": "https://sqlite.org/walformat.html",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": null,
+      "perspective": {
+        "mechanism": "WAL 檔案格式用 mxFrame（最後一筆有效交易的位置）與 nBackfill（checkpoint 已搬回主資料庫的進度）兩個欄位追蹤狀態；兩者相等時代表 WAL 內容已全數寫回資料庫；『reset』則是把 WAL 倒回起點、從頭寫入新訊框的動作，這個名詞正是 WAL-Reset bug 命名的由來。",
+        "tradeoff": "mxFrame／nBackfill 這組欄位是 checkpoint 進度的唯一真相來源；一旦 checkpointer 對這組欄位的認知在某個時間點被寫入操作打斷，『已複製』與『實際複製』就會分岔，而且沒有任何機制會主動告警。",
+        "reader_use": "遇到 WAL 相關的損毀或效能問題時，值得先查 mxFrame／nBackfill 這組欄位的定義，而不是只看應用層的錯誤訊息——很多 WAL 異常的根因都在這一層。"
+      }
+    }
+  ],
+  "notes": [
+    {
+      "id": "n01",
+      "url": "https://tailscale.com/blog/sqlite-wal-reset-bug",
+      "quote": "In total, we faced 19 separate instances of database corruption over six months",
+      "hedge": "asserted",
+      "interpretation": "六個月內、19 次獨立的資料庫損毀事故，這是全文的核心統計數字。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n02",
+      "url": "https://tailscale.com/blog/sqlite-wal-reset-bug",
+      "quote": "a six-week period between October and December when there were no corruption incidents, before they returned as an unwelcome Christmas present",
+      "hedge": "asserted",
+      "interpretation": "十到十二月間有六週沒有事故，之後又在聖誕節前後復發——說明這個 race 沒有規律可循，不是持續惡化也不是被意外修好。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n03",
+      "url": "https://tailscale.com/blog/sqlite-wal-reset-bug",
+      "quote": "Because our control plane only handles configuration data, these databases contain metadata about your tailnet and devices, but never your private encryption keys or network traffic.",
+      "hedge": "asserted",
+      "interpretation": "損毀範圍限定在 tailnet／裝置的 metadata，不涉及私鑰或網路流量本身，是這起事故的影響範圍聲明。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n04",
+      "url": "https://tailscale.com/blog/sqlite-wal-reset-bug",
+      "quote": "a handful of newly added devices or configuration changes didn't persist, and a small amount of metadata had to be re-entered",
+      "hedge": "asserted",
+      "interpretation": "早期事故造成的具體損失：少數新增裝置或設定變更沒有存住，需要手動補打。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n05",
+      "url": "https://tailscale.com/blog/sqlite-wal-reset-bug",
+      "quote": "a data pipeline that reads those S3 backups reported an error in one of our databases. We ran SQLite's PRAGMA integrity_check command against the backup, and found it was indeed corrupted.",
+      "hedge": "asserted",
+      "interpretation": "整起調查的起點：讀取 S3 備份的資料管線先報錯，接著用 PRAGMA integrity_check 確認損毀。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n06",
+      "url": "https://tailscale.com/blog/sqlite-wal-reset-bug",
+      "quote": "Our backup monitor promptly turned red, and reported corruption in 13 different databases.",
+      "hedge": "asserted",
+      "interpretation": "修正（原欄位曾誤寫成『復原嘗試』，來源實際描述的是分階段上線）：Tailscale 把 3.52.0 分階段上線——先幾個 canary shard，穩定後才推到整個控制平面；上線後備份監控立刻亮紅燈，一次回報 13 個資料庫同時損毀。這 13 個後來證實不是真的損毀（見 n40）。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n07",
+      "url": "https://tailscale.com/blog/sqlite-wal-reset-bug",
+      "quote": "created a wrapper around the virtual filesystem that writes additional tracing information and logs about changes to the database. This wrapper is called the tmstmpvfs shim.",
+      "hedge": "asserted",
+      "interpretation": "SQLite 開發者做的除錯工具：包一層 VFS，額外側錄資料庫變動的追蹤資訊，取名 tmstmpvfs shim。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n08",
+      "url": "https://tailscale.com/blog/sqlite-wal-reset-bug",
+      "quote": "After our next corruption incident, the additional logs from the new tmstmpvfs shim allowed the SQLite developers to find and fix the bug: a rare data race in the SQLite source code between a checkpoint and a write transaction.",
+      "hedge": "asserted",
+      "interpretation": "shim 部署後，下一次損毀事故的 log 讓 SQLite 開發者找到並修復問題根源：checkpoint 與 write transaction 之間的 data race。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n09",
+      "url": "https://tailscale.com/blog/sqlite-wal-reset-bug",
+      "quote": "If a write occurs at a specific time during a checkpoint, the checkpointing process gets confused—it thinks some of the pages have been copied from the WAL into the main database file, but they haven't. Those pages never get written to the database file, and that data is permanently lost.",
+      "hedge": "asserted",
+      "interpretation": "race 的核心機制：特定時間點的寫入會讓 checkpoint 誤判某些頁已經複製完成，實際上沒有，那些頁面的資料因此永久遺失。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n10",
+      "url": "https://tailscale.com/blog/sqlite-wal-reset-bug",
+      "quote": "SQLite would report copying more pages from the WAL file than were actually available. If there are 10 pages in the WAL file and 20 pages get copied to the database, something is clearly wrong.",
+      "hedge": "asserted",
+      "interpretation": "可觀察的異常指標：SQLite 回報複製的頁數超過 WAL 檔案裡實際存在的頁數，作者舉的例子是 10 頁變 20 頁。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n11",
+      "url": "https://tailscale.com/blog/sqlite-wal-reset-bug",
+      "quote": "The database file becomes corrupt, because other pages which reference those pages—such as an index—are written to the database.",
+      "hedge": "asserted",
+      "interpretation": "損毀的連鎖反應：遺失的頁面沒被寫入，但引用它們的其他頁（例如索引）照常被寫入，資料庫因此不一致而損毀。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n12",
+      "url": "https://tailscale.com/blog/sqlite-wal-reset-bug",
+      "quote": "named this the 'WAL-Reset bug.'",
+      "hedge": "asserted",
+      "interpretation": "SQLite 開發者為這個問題取的正式名稱：WAL-Reset bug。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n13",
+      "url": "https://tailscale.com/blog/sqlite-wal-reset-bug",
+      "quote": "estimate it was present in SQLite for at least 16 years. It could exist that long because it was rare—so rare, the SQLite developers had to add code to deliberately trigger it in their testing environments.",
+      "hedge": "hedged",
+      "interpretation": "這是 SQLite 開發者自己的『估計』（estimate、at least），不是精確認定的年份；文中必須保留這個估計語氣，不能寫成『恰好存在了 16 年』。它存在這麼久是因為太罕見，測試環境得刻意加程式碼才能觸發它。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n14",
+      "url": "https://sqlite.org/changes.html",
+      "quote": "Withdrawn — All of the features that were originally scheduled for the 3.52.0 release have been moved forward into version 3.53.0.",
+      "hedge": "asserted",
+      "interpretation": "官方 changelog 對 3.52.0（2026-03-06）的紀錄：整個版本被撤回，原訂功能全部併入 3.53.0。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n15",
+      "url": "https://tailscale.com/blog/sqlite-wal-reset-bug",
+      "quote": "The SQLite developers withdrew the 3.52.0 release and instead published 3.51.3, which only contained a fix for the WAL-Reset bug.",
+      "hedge": "asserted",
+      "interpretation": "3.52.0 被撤回後，官方改發只含 WAL-Reset 修復、不含其他功能的 3.51.3。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n16",
+      "url": "https://sqlite.org/changes.html",
+      "quote": "1. Fix the WAL-reset database corruption bug (wal.html#walresetbug). 2. Other minor bug fixes.",
+      "hedge": "asserted",
+      "interpretation": "官方 changelog 對 3.51.3（2026-03-13）的紀錄：內容只有 WAL-reset 修復與其他小修正。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n17",
+      "url": "https://sqlite.org/changes.html",
+      "quote": "10. Added the self-healing index (staleexpridx.html#selfheal) feature to deal with the stale expression index problem.",
+      "hedge": "asserted",
+      "interpretation": "官方 changelog 對 3.53.0（2026-04-09）的紀錄之一：新增 self-healing index 功能，用來處理 stale expression index 問題；同一版本的紀錄第 1 條也重複列出 WAL-reset 修復。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n18",
+      "url": "https://tailscale.com/blog/sqlite-wal-reset-bug",
+      "quote": "In our control plane, we take manual control of the checkpoint process so we can run fast and consistent backups.",
+      "hedge": "asserted",
+      "interpretation": "Tailscale 的非標準做法：自己接管 checkpoint 流程，理由是要跑快速又一致的備份。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n19",
+      "url": "https://tailscale.com/blog/sqlite-wal-reset-bug",
+      "quote": "To do this, we built a transaction logging pipeline. We streamed every SQL statement that modified the database to a separate log file",
+      "hedge": "asserted",
+      "interpretation": "為了支援手動 checkpoint 與快速復原，Tailscale 另外建了一條交易紀錄管線，把每一句異動 SQL 都串流寫進獨立的 log 檔。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n20",
+      "url": "https://tailscale.com/blog/sqlite-wal-reset-bug",
+      "quote": "we take manual control of the checkpointing process, and we checkpoint very aggressively. Even a bug triggered by a rare condition was bound to hit us eventually.",
+      "hedge": "asserted",
+      "interpretation": "SQLite 開發者對『為什麼是 Tailscale』的解釋：手動接管 checkpoint、checkpoint 得很積極，讓一個原本罕見的 race 遲早會被踩到。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n21",
+      "url": "https://tailscale.com/blog/sqlite-wal-reset-bug",
+      "quote": "Running boring technology in a non-standard way is a risk. The common paths and standard configurations are incredibly well-tested and reliable. Most people use SQLite in a standard configuration and never face this sort of issue.",
+      "hedge": "asserted",
+      "interpretation": "作者自己的反思：用非標準方式操作『無聊但可靠』的技術本身就是風險，標準路徑經過遠更充分的測試。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n22",
+      "url": "https://tailscale.com/blog/sqlite-wal-reset-bug",
+      "quote": "to warn when these two operations overlap. If the warning fired but the database remained uncorrupted, we'd know the fix had saved us from a potential corruption incident.",
+      "hedge": "asserted",
+      "interpretation": "修復上線後，Tailscale 加了偵測『checkpoint 與寫入重疊』的警告，用來驗證修復是否真的擋下了原本會發生的損毀。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n23",
+      "url": "https://tailscale.com/blog/sqlite-wal-reset-bug",
+      "quote": "SQLite attempted corruption on shard2.corp.ts.net:8383 in party mode, but the system prevented it.",
+      "hedge": "asserted",
+      "interpretation": "兩個月後，名為 SQLitePartyMode 的警報實際觸發，訊息內容明確指出這次 race 的條件出現了、但被新的防護擋下。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n24",
+      "url": "https://tailscale.com/blog/sqlite-wal-reset-bug",
+      "quote": "This alert proved that the precise conditions for the WAL-Reset bug do occur in our production environment, which means it was the likely culprit for our six months of shaky uptime.",
+      "hedge": "hedged",
+      "interpretation": "作者對『WAL-Reset bug 是不是六個月不穩的元兇』只給到『likely culprit（很可能是元兇）』的措辭，不是斷言『就是』，文中要保留這個保留語氣。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n25",
+      "url": "https://tailscale.com/blog/sqlite-wal-reset-bug",
+      "quote": "Since that weirdly joyous alert fired, we've run for another four months without any database incidents, as of this writing.",
+      "hedge": "asserted",
+      "interpretation": "警報觸發後又穩定運作了四個月沒有再發生資料庫事故，寫作當下的最新狀態；作者用『weirdly joyous（詭異地令人開心）』形容這則警報。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n26",
+      "url": "https://sqlite.org/wal.html",
+      "quote": "Moving the WAL file transactions back into the database is called a 'checkpoint'.",
+      "hedge": "asserted",
+      "interpretation": "checkpoint 的官方定義：把 WAL 檔案裡的交易搬回資料庫本身。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n27",
+      "url": "https://sqlite.org/wal.html",
+      "quote": "the checkpointer makes an effort to do as many sequential page writes to the database as it can (the pages are transferred from WAL to database in ascending order)",
+      "hedge": "asserted",
+      "interpretation": "checkpoint 正常運作時，會盡量依照頁面編號遞增的順序，把頁面從 WAL 依序搬回主資料庫檔案。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n28",
+      "url": "https://sqlite.org/wal.html",
+      "quote": "A checkpoint can run concurrently with readers, however the checkpoint must stop when it reaches a page in the WAL that is past the end mark of any current reader.",
+      "hedge": "asserted",
+      "interpretation": "checkpoint 可以跟 reader 同時進行，但一旦搬到某個 reader 還在讀取範圍之後的頁面，就必須停下，避免覆寫 reader 正在用的內容。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n29",
+      "url": "https://sqlite.org/wal.html",
+      "quote": "there can only be one writer at a time",
+      "hedge": "asserted",
+      "interpretation": "WAL 模式下同一時間只能有一個 writer，因為只有一份 WAL 檔案。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n30",
+      "url": "https://sqlite.org/walformat.html",
+      "quote": "A WAL reset means to rewind the WAL and start adding new frames at the beginning.",
+      "hedge": "asserted",
+      "interpretation": "『reset』的官方定義：把 WAL 倒回起點，從頭開始寫入新的訊框——這是 WAL-Reset bug 命名的由來。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n31",
+      "url": "https://sqlite.org/walformat.html",
+      "quote": "The 32-bit unsigned integer at offset 16 (and repeated at offset 64) is the number of valid frames in the WAL.",
+      "hedge": "asserted",
+      "interpretation": "mxFrame 欄位的定義：WAL 檔案裡有效訊框的數量，存在檔案 offset 16（與重複的 offset 64）。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n32",
+      "url": "https://sqlite.org/walformat.html",
+      "quote": "When mxFrame is equal to nBackfill, that indicates that all content in the WAL has been written back into the database.",
+      "hedge": "asserted",
+      "interpretation": "mxFrame 與 nBackfill 相等時，代表 WAL 裡的所有內容都已經寫回主資料庫——這是判斷 checkpoint 是否『真的做完』的依據。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n33",
+      "url": "https://sqlite.org/wal.html",
+      "quote": "Whenever a write operation occurs, the writer checks how much progress the checkpointer has made, and if the entire WAL has been transferred into the database and synced and if no readers are making use of the WAL, then the writer will rewind the WAL back to the beginning and start putting new transactions at the beginning of the WAL.",
+      "hedge": "asserted",
+      "interpretation": "reset 的觸發者其實是 writer，不是 checkpointer：每次寫入發生時，writer 會檢查 checkpoint 進度，條件滿足才把 WAL 倒回起點。checkpoint、reset 判斷、下一次寫入分屬不同執行緒，卻共用同一份『WAL 現在寫到哪裡』的認知。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n34",
+      "url": "https://sqlite.org/wal.html",
+      "quote": "if a database has many concurrent overlapping readers and there is always at least one active reader, then no checkpoints will be able to complete and hence the WAL file will grow without bound",
+      "hedge": "asserted",
+      "interpretation": "checkpoint 節奏偏離預設會有兩個方向的風險：Tailscale 踩到的是『checkpoint 太積極』，官方文件描述的另一端是『reader 太密集導致 checkpoint 永遠做不完、WAL 無限膨脹』——兩者成因相反，但都是 checkpoint 節奏被打亂的後果。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n35",
+      "url": "https://sqlite.org/wal.html",
+      "quote": "The wal-index is maintained in shared memory which helps readers locate pages in the WAL quickly and with a minimum of I/O.",
+      "hedge": "asserted",
+      "interpretation": "reader 定位 WAL 頁面靠的是存在共享記憶體裡的 wal-index，不是逐筆掃描檔案——這是 WAL 模式裡第三種角色（reader）的運作機制。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n36",
+      "url": "https://sqlite.org/wal.html",
+      "quote": "An application can initiate a checkpoint using any writable database connection on the database simply by invoking sqlite3_wal_checkpoint() or sqlite3_wal_checkpoint_v2().",
+      "hedge": "asserted",
+      "interpretation": "『手動接管 checkpoint』在 API 層面的具體意義：直接呼叫 sqlite3_wal_checkpoint() / sqlite3_wal_checkpoint_v2()，繞過預設的自動觸發節奏——這是官方開放的正式介面，不是非法操作，差別在使用頻率。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n37",
+      "url": "https://tailscale.com/blog/sqlite-wal-reset-bug",
+      "quote": "Their fix adds an additional check to the checkpointing function which detects when the WAL has been reset by another thread.",
+      "hedge": "asserted",
+      "interpretation": "3.52.0 修復的技術內容——這句話出自 Tailscale 的部落格文章，不是 SQLite 官方 changelog（changelog 對 3.52.0 只記錄撤回，見 n14）。c27 修復：先前的草稿把這句技術描述誤植為『官方 changelog 記載』，已改為正確歸因給 Tailscale。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n38",
+      "url": "https://tailscale.com/blog/sqlite-wal-reset-bug",
+      "quote": "We rolled out SQLite 3.52.0 carefully—first to a few canary shards, then, when we saw it running smoothly, we deployed it to the rest of the control plane.",
+      "hedge": "asserted",
+      "interpretation": "3.52.0 是分階段上線的（先 canary shard、再推全部控制平面），不是『拿來做復原嘗試』——c29 修復：先前把這段描述成『用 3.52.0 嘗試復原』是沒有來源支持的錯誤框架，已改為正確的分階段上線敘述。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n39",
+      "url": "https://tailscale.com/blog/sqlite-wal-reset-bug",
+      "quote": "It turned out these databases had not suffered real corruption, but were subject to a second problem in the version of SQLite.",
+      "hedge": "asserted",
+      "interpretation": "3.52.0 上線後回報損毀的那 13 個資料庫，後來證實並非真的損毀，而是撞上 3.52.0 帶的另一個問題（stale expression index）——這個『假性損毀』的細節先前遺漏，c29 修復時補上。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n40",
+      "url": "https://tailscale.com/blog/sqlite-wal-reset-bug",
+      "quote": "Because this change caused false corruption warnings, the SQLite developers withdrew the 3.52.0 release and instead published 3.51.3, which only contained a fix for the WAL-Reset bug.",
+      "hedge": "asserted",
+      "interpretation": "這句的 this change 指的是 3.52.0 裡文字轉浮點數的捨入行為最佳化，不是 WAL-Reset 修復；正是這項最佳化讓 Tailscale 的 expression index 變成 stale，導致 3.52.0 被撤回。引用時不要把 this change 讀成 WAL-Reset 修復。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n41",
+      "url": "https://sqlite.org/wal.html",
+      "quote": "By default, SQLite will automatically checkpoint whenever a COMMIT occurs that causes the WAL file to be 1000 pages or more in size, or when the last database connection on a database file closes.",
+      "hedge": "asserted",
+      "interpretation": "SQLite 預設的自動 checkpoint 門檻是 WAL 檔案達到 1000 頁；c25 的追加佐證，支持文中『WAL 累積到一定大小才自動觸發一次 checkpoint』這句話（該句刻意不寫死數字，這裡補上依據）。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n42",
+      "url": "https://sqlite.org/wal.html",
+      "quote": "the checkpoint must stop when it reaches a page in the WAL that is past the end mark of any current reader",
+      "hedge": "asserted",
+      "interpretation": "c13 修復所依據的原始引文（與 n28 相同來源同一句）：checkpoint 在搬到『超出』目前任一 reader 讀取終點的頁面時才必須停下——終點以內的頁面可以照常搬。先前草稿寫反了，已訂正。",
+      "timeliness": "durable"
+    }
+  ],
+  "claims": [
+    {
+      "id": "c01",
+      "claim_text": "六個月裡，Tailscale 的控制平面資料庫壞了十九次",
+      "location": "hero opener／H2「十九次損毀，找不到規律」／統計表",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n01"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "In total, we faced 19 separate instances of database corruption over six months",
+      "note": "Re-fetched 2026-08-13; string present exact. 數字與期間皆與來源一致。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c02",
+      "claim_text": "六個月裡，Tailscale 的控制平面資料庫壞了十九次；第一次，是在 PRAGMA integrity_check 這一關現形的。",
+      "location": "hero opener",
+      "type": "attribution",
+      "load": "high",
+      "note_ids": [
+        "n05"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "deflated",
+      "evidence": "In our current backup pipeline, we take a complete snapshot of the database every few minutes, then upload the entire SQLite file to an S3 bucket. We'd been running this setup without incident since early 2023. Fast forward to August last year, when a data pipeline that reads those S3 backups reported an error in one of our databases. We ran SQLite's PRAGMA integrity_check command against the backup, and found it was indeed corrupted. ／（後期才部署的監控）Deploying an automated backup monitor that continuously ran PRAGMA integrity_check over our backups",
+      "note": "Round 2：修復落地。全稱句『每一次都在 PRAGMA integrity_check 這一關現形』已改寫為『第一次，是在 PRAGMA integrity_check 這一關現形的』，新句只主張第一次，未再擴及 19 次全部。重抓 tailscale.com 逐字確認：該段前一句為 We'd been running this setup without incident since early 2023，隨即 Fast forward to August last year 才出現第一次報錯，因此『第一次』的框架有來源支撐（來源以敘事順序與『此前無事故』表述，未使用 first 一詞——屬合理壓縮而非新事實）。持續跑 integrity_check 的自動備份監控仍是後期才部署，新句已不再暗示它涵蓋所有事故。殘留可議點（不需改稿）：來源的發現順序是資料管線先報錯、integrity_check 才確認損毀為真，『現形』一詞略偏向把發現歸給 integrity_check；但正文第一段（『資料管線回報錯誤……確認損毀是真的』）已把順序寫對，opener 屬摘要性壓縮。",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c03",
+      "claim_text": "SQLite 原始碼裡一段至少蟄伏了十六年的 data race（hero）／這個 race 在 SQLite 原始碼裡躺了至少十六年（closer）",
+      "location": "hero opener 與 vg-deep-closer",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n13"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "estimate it was present in SQLite for at least 16 years",
+      "note": "刻意檢查是否把 hedge 拉高：hero 與 closer 省略了『估計』但保留了下限詞『至少』，而正文段落完整寫成『他們估計這個 race 已經存在至少十六年』，把來源的 estimate 語氣還原並歸屬給 SQLite 開發者。下限語意未被改動，不構成 inflated。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c04",
+      "claim_text": "他們估計這個 race 已經存在至少十六年……罕見到連 SQLite 自己的測試環境都得刻意加程式碼去觸發它",
+      "location": "under H2「checkpoint 數錯頁的那一刻」",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n13"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "estimate it was present in SQLite for at least 16 years. It could exist that long because it was rare—so rare, the SQLite developers had to add code to deliberately trigger it in their testing environments.",
+      "note": "『估計』『至少』兩層 hedge 均保留，測試環境刻意加程式碼觸發亦逐字對應。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c05",
+      "claim_text": "十月到十二月之間曾經有連續六週沒有任何事故……結果它在聖誕節前後又回來了",
+      "location": "under H2「十九次損毀，找不到規律」／統計表",
+      "type": "number",
+      "load": "medium",
+      "note_ids": [
+        "n02"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "a six-week period between October and December when there were no corruption incidents, before they returned as an unwelcome Christmas present",
+      "note": "六週、十至十二月、聖誕節復發三要素皆逐字對應。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c06",
+      "claim_text": "這些資料庫存放的是使用者 tailnet 與裝置的 metadata，不含私鑰，也不含實際的網路流量",
+      "location": "under H2「十九次損毀，找不到規律」",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n03"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Because our control plane only handles configuration data, these databases contain metadata about your tailnet and devices, but never your private encryption keys or network traffic.",
+      "note": "逐字對應，範圍聲明未被放大或縮小。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c07",
+      "claim_text": "少數剛新增的裝置或設定變更沒能存住，得手動把一小部分 metadata 重新輸入一次",
+      "location": "under H2「十九次損毀，找不到規律」",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n04"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "a handful of newly added devices or configuration changes didn't persist, and a small amount of metadata had to be re-entered",
+      "note": "a handful／a small amount 的『少量』語氣在譯文中保留為『少數』『一小部分』。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c08",
+      "claim_text": "Tailscale 為了跑得又快又一致的備份，選擇自己接管 checkpoint 流程，並且把 checkpoint 頻率調得很積極",
+      "location": "under H2「十九次損毀，找不到規律」",
+      "type": "attribution",
+      "load": "high",
+      "note_ids": [
+        "n18",
+        "n20"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "In our control plane, we take manual control of the checkpoint process so we can run fast and consistent backups. / we take manual control of the checkpointing process, and we checkpoint very aggressively.",
+      "note": "兩個 note 同源（同一篇 Tailscale 文章的不同段落），不構成獨立佐證，但文中亦未宣稱多方證實。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c09",
+      "claim_text": "他們另外建了一條交易紀錄管線，把每一句會改動資料庫的 SQL 陳述都串流寫進一個獨立的 log 檔",
+      "location": "under H2「十九次損毀，找不到規律」",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n19"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "To do this, we built a transaction logging pipeline. We streamed every SQL statement that modified the database to a separate log file",
+      "note": "『每一句』對應 every SQL statement，未超譯。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c10",
+      "claim_text": "SQLite 開發者正是這麼做的：為了替 Tailscale 這起事故除錯，他們寫了一個包住既有 VFS 的 shim……取名 tmstmpvfs",
+      "location": "under H2「一個影子檔案系統，錄下了真相」／tabs widget",
+      "type": "attribution",
+      "load": "high",
+      "note_ids": [
+        "n07"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "To help diagnose our problem, the SQLite developers created a wrapper around the virtual filesystem that writes additional tracing information. / This wrapper is called the tmstmpvfs shim.",
+      "note": "特別查證了施作主體：來源明確為 the SQLite developers（非 Tailscale 自建），post 的歸屬正確。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c11",
+      "claim_text": "下一次損毀事故發生時，新增的追蹤 log 讓 SQLite 開發者第一次看清楚問題現場——原因是 SQLite 原始碼裡一段極罕見的 data race，發生在 checkpoint 與一次 write transaction 之間",
+      "location": "under H2「一個影子檔案系統，錄下了真相」",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [
+        "n08"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "After our next corruption incident, the additional logs from the new tmstmpvfs shim allowed the SQLite developers to find and fix the bug: a rare data race in the SQLite source code between a checkpoint and a write transaction.",
+      "note": "因果鏈（shim → 下次事故的 log → 找到 race）與來源一致。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c12",
+      "claim_text": "SQLite 官方文件把這個動作定義得很直接：把 WAL 檔案裡的交易搬回資料庫本身",
+      "location": "under H2「checkpoint 數錯頁的那一刻」",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n26"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Moving the WAL file transactions back into the database is called a 'checkpoint'.",
+      "note": "官方定義逐字對應。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c13",
+      "claim_text": "一旦搬到某一頁已經超出目前所有現存 reader 的讀取終點，就必須停下來，避免覆寫 reader 之後還可能用到的內容；終點以內的頁面，正常情況下照樣可以搬（正文）／一旦搬到超出所有現存 reader 讀取終點的頁面，就必須停下。終點以內的頁面，正常情況下這套規則運作良好（annotated diagram detail-2）",
+      "location": "under H2「checkpoint 數錯頁的那一刻」（正文第一段）；annotated diagram 的 detail-2 面板",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n28",
+        "n42"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "the checkpoint must stop when it reaches a page in the WAL that is past the end mark of any current reader",
+      "note": "Round 2：方向修對了，但同時引入了新的錯誤，兩處皆然，因此維持 unverifiable。（1）方向：兩處都已從『還在 reader 讀取範圍內就停下』改成『超出讀取終點才停下』，與來源的 past the end mark 同向，這一半的修復確實落地。（2）新錯誤：來源寫的是 past the end mark of ANY current reader（任一 reader），也就是以『最早的那個 reader 邊界』為界、碰到第一個被超過的 end mark 就必須停；正文與 detail-2 都寫成『超出所有現存 reader 的讀取終點』（ALL），量詞被翻轉成『要超過每一個 reader 的終點才停』，等於允許 checkpointer 越過進度落後 reader 的邊界——正好是這條規則要防止的覆寫，也與同句自帶的理由子句『避免覆寫 reader 之後還可能用到的內容』自相矛盾。ledger 自己的 n28／n42 interpretation 用的是『某個』『任一』，可對照確認 post 的『所有』是改寫時新增的偏差。（3）附帶缺陷：detail-2 第二句『終點以內的頁面，正常情況下這套規則運作良好』是斷裂句——主題是『終點以內的頁面』，述語卻換成『這套規則運作良好』，並未如正文那樣說出『終點以內的頁面照樣可以搬』，圖說面板等於只落地了半句修復。修正方向：兩處把『所有現存 reader』改為『任一現存 reader』（或『進度最落後的 reader』），detail-2 第二句補回『終點以內的頁面照樣可以搬』。",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c14",
+      "claim_text": "WAL 模式也規定同一時間只能有一個 writer，因為整個資料庫只有一份 WAL 檔案",
+      "location": "under H2「checkpoint 數錯頁的那一刻」／annotated diagram detail-1",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n29"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "However, since there is only one WAL file, there can only be one writer at a time.",
+      "note": "因果（只有一份 WAL 檔 → 只能有一個 writer）與來源同向。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c15",
+      "claim_text": "mxFrame 記錄目前 WAL 裡最後一筆有效交易的位置，nBackfill 記錄 checkpoint 已經搬回主資料庫的進度",
+      "location": "under H2「checkpoint 數錯頁的那一刻」（首次定義段）",
+      "type": "attribution",
+      "load": "high",
+      "note_ids": [
+        "n31",
+        "n32"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Because WAL frames are numbered starting with 1, mxFrame is also the index of the last valid commit frame in the WAL. / A commit frame is a frame that has a non-zero 'size of database' value in bytes 4 through 7 of the frame header, and that indicates the end of a transaction. / The 32-bit unsigned integer at offset 128 in the WAL-index header is called the 'nBackfill'. this field holds the number of frames in the WAL file which have been copied back into the main database.",
+      "note": "重點複查（前一稿曾把兩個欄位角色對調）：本稿角色正確，未對調。mxFrame 對應『最後一筆有效交易的位置』有據——walformat.html 明言 mxFrame 亦即 last valid commit frame 的 index，而 commit frame 標記一筆交易的結尾。nBackfill 對應『已搬回主資料庫的進度』亦逐字有據。惟 ledger 只收錄了 n31 的『number of valid frames』一句，未收錄支撐『最後一筆有效交易的位置』說法的 commit-frame 句；建議補一則 note 收錄上述 evidence 第一、二句，以補齊 trace。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c16",
+      "claim_text": "「當 mxFrame 等於 nBackfill 時，代表 WAL 裡的所有內容都已經寫回資料庫。」",
+      "location": "under H2「checkpoint 數錯頁的那一刻」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n32"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "When mxFrame is equal to nBackfill, that indicates that all content in the WAL has been written back into the database.",
+      "note": "引號內譯文與原句逐字對應，無增補。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c17",
+      "claim_text": "「WAL reset 意味著把 WAL 倒回去，從檔案開頭重新加入新的訊框。」",
+      "location": "under H2「checkpoint 數錯頁的那一刻」",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n30"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "A WAL reset means to rewind the WAL and start adding new frames at the beginning.",
+      "note": "逐字對應。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c18",
+      "claim_text": "這個 reset 判斷不是 checkpoint 自己觸發的，而是下一次寫入發生時，由 writer 順便檢查：「每次發生寫入操作時，writer 都會檢查 checkpoint 的進度……」",
+      "location": "under H2「checkpoint 數錯頁的那一刻」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n33"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Whenever a write operation occurs, the writer checks how much progress the checkpointer has made, and if the entire WAL has been transferred into the database and synced and if no readers are making use of the WAL, then the writer will rewind the WAL back to the beginning and start putting new transactions at the beginning of the WAL.",
+      "note": "『reset 由 writer 而非 checkpointer 觸發』是本段最容易寫反的一點，經查與 wal.html 完全一致；引號內三個條件（全部搬完並同步、無 reader 使用、倒回起點）亦無遺漏或增添。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c19",
+      "claim_text": "「wal-index 維護在共享記憶體裡，幫助 reader 快速找到 WAL 裡的頁面，同時把 I/O 降到最低。」",
+      "location": "under H2「checkpoint 數錯頁的那一刻」",
+      "type": "quote",
+      "load": "low",
+      "note_ids": [
+        "n35"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "a data structure called the 'wal-index' is maintained in shared memory which helps readers locate pages in the WAL quickly and with a minimum of I/O.",
+      "note": "note 的 quote 為原句去掉前綴 a data structure called 的簡化版，屬 trivial reformatting；語意不變。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c20",
+      "claim_text": "mxFrame 隨著新的 write transaction 一路往前推進……nBackfill 則是 checkpointer 實際把內容搬回主資料庫的進度，兩者相等時代表 WAL 的內容已經全部寫回",
+      "location": "under H2「checkpoint 數錯頁的那一刻」（「把 mxFrame 與 nBackfill 放在一起看」段）",
+      "type": "attribution",
+      "load": "high",
+      "note_ids": [
+        "n31",
+        "n32"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The nBackfill number is never greater than mxFrame. / The mxFrame value is always greater than or equal to both nBackfill and nBackfillAttempted. / When mxFrame is equal to nBackfill, that indicates that all content in the WAL has been written back into the database.",
+      "note": "指定複查項：本段與 c15 的首次定義段角色一致（mxFrame＝寫入前緣、nBackfill＝回填進度），兩段互不矛盾，且與 walformat.html 的 nBackfill ≤ mxFrame 單調關係相符。『落差只會短暫存在』屬作者對正常情形的描述性補述，未逾越來源。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c21",
+      "claim_text": "如果 WAL 裡只有 10 頁，資料庫卻回報複製了 20 頁，那顯然出了問題",
+      "location": "under H2「checkpoint 數錯頁的那一刻」／before-after slider",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n10"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "If there are 10 pages in the WAL file and 20 pages get copied to the database, something is clearly wrong.",
+      "note": "10／20 兩個數字與『作者舉的例子』這個歸屬皆正確，post 未把示例當成實測值。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c22",
+      "claim_text": "那些沒被真正寫入的頁面永久遺失，但引用它們的其他頁——比如索引——卻照常寫進資料庫，資料庫因此不一致而損毀",
+      "location": "under H2「checkpoint 數錯頁的那一刻」",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [
+        "n09",
+        "n11"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Those pages never get written to the database file, and that data is permanently lost. / The database file becomes corrupt, because other pages which reference those pages—such as an index—are written to the database.",
+      "note": "『永久遺失』對應 permanently lost，『索引』對應 such as an index，因果方向一致。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c23",
+      "claim_text": "SQLite 開發者把這個問題正式命名為「WAL-Reset bug」",
+      "location": "under H2「checkpoint 數錯頁的那一刻」",
+      "type": "attribution",
+      "load": "high",
+      "note_ids": [
+        "n12"
+      ],
+      "independence": "corroborated",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "named this the 'WAL-Reset bug.' / (changes.html) Fix the WAL-reset database corruption bug",
+      "note": "命名同時見於 Tailscale 文章與 sqlite.org changelog 條目，屬真正獨立的兩處出處（廠商事後文＋上游官方 changelog），故判 corroborated。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c24",
+      "claim_text": "「應用程式可以在任何一個可寫入的資料庫連線上，直接呼叫 sqlite3_wal_checkpoint() 或 sqlite3_wal_checkpoint_v2() 來啟動一次 checkpoint。」",
+      "location": "under H2「checkpoint 數錯頁的那一刻」",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n36"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "An application can initiate a checkpoint using any writable database connection on the database simply by invoking sqlite3_wal_checkpoint() or sqlite3_wal_checkpoint_v2().",
+      "note": "逐字對應，兩個函式名皆正確。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c25",
+      "claim_text": "多數團隊讓 SQLite 用預設的被動節奏，WAL 累積到一定大小才自動觸發一次 checkpoint",
+      "location": "under H2「checkpoint 數錯頁的那一刻」",
+      "type": "attribution",
+      "load": "low",
+      "note_ids": [
+        "n41"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "deflated",
+      "evidence": "By default, SQLite will automatically checkpoint whenever a COMMIT occurs that causes the WAL file to be 1000 pages or more in size, or when the last database connection on a database file closes.",
+      "note": "Round 2：n41 的 quote 經重抓 sqlite.org/wal.html 逐字比對，字串完全存在（含 whenever a COMMIT occurs 與 1000 pages or more in size 兩段），trace gap 已補齊。prose 未動，仍寫『累積到一定大小』而不寫死 1000 頁，比來源保守（deflated），依 hedge delta 規則不構成錯誤。附帶說明：來源同時另有一句 threshold size of 1000 pages 的敘述（round 1 引用的版本），兩句並存，n41 選的是 Automatic Checkpoint 段落的完整句，較精確。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c26",
+      "claim_text": "如果資料庫同時有很多重疊的 reader、而且隨時都有 reader 在使用，checkpoint 反而會完全跑不完，WAL 檔案只會持續膨脹",
+      "location": "under H2「checkpoint 數錯頁的那一刻」",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [
+        "n34"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "However, if a database has many concurrent overlapping readers and there is always at least one active reader, then no checkpoints will be able to complete and hence the WAL file will grow without bound.",
+      "note": "條件（many concurrent overlapping readers＋always at least one active reader）與結論（no checkpoints complete、grow without bound）逐項對應。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c27",
+      "claim_text": "第一版修復在 3.52.0 裡登場：按 Tailscale 的說法，這次的修復「替 checkpointing 函式加了一項額外檢查，用來偵測 WAL 是否已經被另一個執行緒重置」；官方 changelog 對這個版本的紀錄則只有撤回本身，寫著原訂功能全部併入下一個版本，沒有列出這項技術細節",
+      "location": "under H2「修復撤回又重來，警報確認了兇手」",
+      "type": "attribution",
+      "load": "high",
+      "note_ids": [
+        "n14",
+        "n37"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "(tailscale.com) Their fix adds an additional check to the checkpointing function which detects when the WAL has been reset by another thread. ／ (changes.html，3.52.0 全區段逐字) 2026-03-06 (3.52.0) — Withdrawn — All of the features that were originally scheduled for the 3.52.0 release have been moved forward into version 3.53.0.",
+      "note": "Round 2：修復落地，citation drift 已解除。（1）n37 的 quote 經重抓 tailscale.com 逐字確認存在，post 引號內譯文（替 checkpointing 函式加了一項額外檢查，用來偵測 WAL 是否已經被另一個執行緒重置）與原句一一對應，未增添細節。（2）歸屬已從『官方 changelog 記載』改為『按 Tailscale 的說法』，與實際出處相符。（3）對 changelog 的描述本身也已重抓核對：changes.html 的 3.52.0 區段確實只有 Withdrawn 一行加上 moved forward into version 3.53.0，沒有任何編號變更清單，因此 post 寫『只有撤回本身……沒有列出這項技術細節』屬正確描述（對照組：同頁 3.51.3 區段有編號清單 1./2./3./4.）。（4）下一段（三個版本號的重述段）已改寫為只講 WAL-Reset 修復＋其他既定功能＋stale expression index 副作用，未再無出處地重述 checkpoint 函式那項技術細節，重複斷言的問題不存在。",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c28",
+      "claim_text": "一個獨立的 stale expression index 缺陷，讓 3.52.0 整個版本被撤回，原訂功能全部併入下一個版本",
+      "location": "under H2「修復撤回又重來，警報確認了兇手」／版本表",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [
+        "n14",
+        "n40"
+      ],
+      "independence": "corroborated",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "(tailscale.com) Because this change caused false corruption warnings, the SQLite developers withdrew the 3.52.0 release and instead published 3.51.3, which only contained a fix for the WAL-Reset bug. ／ We shared our errors with the SQLite developers, which uncovered a bug in SQLite related to stale expression indexes. ／ the SQLite 3.52.0 release that fixed our data race also made an optimisation that subtly changed the rounding behaviour for text-to-floating-point conversions ／ (changes.html) All of the features that were originally scheduled for the 3.52.0 release have been moved forward into version 3.53.0.",
+      "note": "Round 2：n40 的 quote 經重抓 tailscale.com 逐字確認存在，撤回因果句的 trace 已補齊；prose 未動，維持 verified。追加查證了 n40 裡 this change 的指涉：來源上文顯示它指的是 3.52.0 裡『另一項把 text 轉 float 的捨入行為悄悄改掉的最佳化』，該最佳化讓 Tailscale 建在 VIRTUAL generated column 上的 expression index 變成 stale，被 PRAGMA integrity_check 報成損毀——不是 WAL-Reset 修復本身。post 正文（3.52.0 除了 WAL-Reset 修復，也想把其他既定功能一併放進去，卻連帶讓 stale expression index 缺陷浮出水面而被撤回）與這條鏈相符，『獨立』一詞對應來源的 a second problem（獨立於 WAL-Reset bug），成立。提醒（不影響本 claim 判定，且 interpretation 欄依規定保持原樣）：n40 的 interpretation 把 this change 讀成『這項修復改動』，與來源實際指涉的最佳化不同，日後若有段落直接沿用該 interpretation 需重新查證。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c29",
+      "claim_text": "Tailscale 把 3.52.0 分階段上線——先讓幾個 canary shard 跑一段，確認穩定後才推到整個控制平面；上線後，備份監控立刻亮紅燈，一次回報十三個資料庫同時損毀。後來查清楚，這批資料庫其實沒有真的損毀……（統計表列「3.52.0 上線後同時回報異常的資料庫（後證實非真損毀）13 個」）",
+      "location": "under H2「修復撤回又重來，警報確認了兇手」；統計表 vg-w-table-wal-timeline-stats",
+      "type": "number",
+      "load": "medium",
+      "note_ids": [
+        "n06",
+        "n38",
+        "n39"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "We rolled out SQLite 3.52.0 carefully—first to a few canary shards, then, when we saw it running smoothly, we deployed it to the rest of the control plane. ／ Our backup monitor promptly turned red, and reported corruption in 13 different databases. ／ It turned out these databases had not suffered real corruption, but were subject to a second problem in the version of SQLite. ／ We shared our errors with the SQLite developers, which uncovered a bug in SQLite related to stale expression indexes. If you create an index on a computed value, and then the computation changes, the index will contain mismatched values, which gets reported as corruption by PRAGMA integrity_check.",
+      "note": "Round 2：兩處都改對了。（1）正文：『用 3.52.0 嘗試復原』的錯誤框架已刪除，改寫為 n38 逐字支撐的分階段上線（先 canary shard、確認穩定後才推全控制平面），且補上 n39 的『後來查清楚並非真的損毀』與成因（3.52.0 帶的另一個問題，stale expression index 讓 integrity_check 誤判）。n38、n39 兩則 quote 均經重抓逐字確認存在。（2）統計表：該列標籤已從『3.52.0 復原嘗試同時回報損毀的資料庫』改為『3.52.0 上線後同時回報異常的資料庫（後證實非真損毀）』，13 這個數字保留且情境正確，用『回報異常』而非『損毀』也與『非真損毀』一致，表列與正文不再互相矛盾。未引入新的數字或新事實。",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c30",
+      "claim_text": "版本表：3.52.0 = 2026-03-06、3.51.3 = 2026-03-13、3.53.0 = 2026-04-09",
+      "location": "vg-w-table-wal-reset-releases",
+      "type": "date-version",
+      "load": "high",
+      "note_ids": [
+        "n14",
+        "n16",
+        "n17"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "2026-03-06 (3.52.0) ／ 2026-03-13 (3.51.3)，SQLITE_SOURCE_ID: 2026-03-13 10:38:09 ／ 2026-04-09 (3.53.0)",
+      "note": "三個版本號與三個日期均直接對照 sqlite.org/changes.html 的版本標題逐一核對，不是照部落格敘事推得。3.51.3（2026-03-13）晚於 3.52.0（2026-03-06）的『倒序』時間關係亦與 changelog 相符，正是撤回情境的必然結果。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c31",
+      "claim_text": "3.51.3 只帶走 WAL-Reset 修復，其餘功能全部延後",
+      "location": "under H2「修復撤回又重來，警報確認了兇手」／版本表",
+      "type": "date-version",
+      "load": "high",
+      "note_ids": [
+        "n15",
+        "n16"
+      ],
+      "independence": "corroborated",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "(changes.html 3.51.3) 1. Fix the WAL-reset database corruption bug. 2. Other minor bug fixes. ／ (tailscale.com) The SQLite developers withdrew the 3.52.0 release and instead published 3.51.3, which only contained a fix for the WAL-Reset bug.",
+      "note": "官方 changelog 的兩項條目與部落格說法互相印證，屬獨立來源（上游 changelog 與下游使用者敘述）。版本表『只包含 WAL-reset 損毀修復與其他小型修正』的措辭比正文更精確，與 changelog 完全一致。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c32",
+      "claim_text": "等到 3.53.0，被延後的功能才跟 WAL-Reset 修復一起回到同一個版本裡，其中的 self-healing index 讓過期的 expression index 能自動修復",
+      "location": "under H2「修復撤回又重來，警報確認了兇手」／版本表",
+      "type": "date-version",
+      "load": "high",
+      "note_ids": [
+        "n17",
+        "n14"
+      ],
+      "independence": "corroborated",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "(changes.html 3.53.0) Fix the WAL-reset database corruption bug. ／ Added the self-healing index feature to deal with the stale expression index problem. ／ (tailscale.com) the SQLite developers created an automated, self-healing index feature in 3.53.0, which prevents the stale expression index problem.",
+      "note": "3.53.0 同時含 WAL-reset 修復與 self-healing index 兩項，經 changelog 逐條確認；『被延後的功能一起回到同一版本』對應 Withdrawn 通知的 moved forward into version 3.53.0。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c33",
+      "claim_text": "這個等待持續了兩個月，直到一則取名 SQLitePartyMode 的警報觸發",
+      "location": "under H2「修復撤回又重來，警報確認了兇手」／統計表／tabs widget",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n22",
+        "n23"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Then, two months later, the alert we were waiting for finally fired ／ 警報名稱 SQLitePartyMode 見於文中警報通知圖說",
+      "note": "兩個月的等待期與警報名稱皆確認。警報用途（偵測 checkpoint 與寫入重疊；警告觸發但資料庫未損毀即代表修復生效）對應 n22 逐字內容。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c34",
+      "claim_text": "訊息寫著：SQLite 在 shard2.corp.ts.net:8383 上，在 party mode 裡試圖造成損毀，但系統擋下了它",
+      "location": "under H2「修復撤回又重來，警報確認了兇手」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n23"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "SQLite attempted corruption on shard2.corp.ts.net:8383 in party mode, but the system prevented it.",
+      "note": "指定複查項：警報文字與主機名 shard2.corp.ts.net:8383（含連接埠 8383）逐字元核對無誤，未見杜撰或改寫。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c35",
+      "claim_text": "這則警報證明了 WAL-Reset bug 的確切觸發條件，真的會在正式環境裡出現——這也代表它很可能就是過去六個月不穩定的元兇，儘管作者用的措辭是「likely culprit」，沒有把話說死",
+      "location": "under H2「修復撤回又重來，警報確認了兇手」",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [
+        "n24"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "This alert proved that the precise conditions for the WAL-Reset bug do occur in our production environment, which means it was the likely culprit for our six months of shaky uptime.",
+      "note": "指定複查項：hedge 完整保留。post 用『很可能就是』對應 likely culprit，並額外顯性標註原文措辭與『沒有把話說死』，屬 hedge 的強化揭露而非稀釋；『證明了觸發條件會出現』對應 proved…do occur，該部分來源本身即為斷言，未被降級亦未被升級。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c36",
+      "claim_text": "自那則警報觸發之後，Tailscale 又穩定運作了四個月，沒有再出現任何資料庫事故（統計表標註「寫作當下」）",
+      "location": "under H2「修復撤回又重來，警報確認了兇手」／統計表",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n25"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Since that weirdly joyous alert fired, we've run for another four months without any database incidents, as of this writing.",
+      "note": "四個月與『沒有再出現任何資料庫事故』逐字對應；來源的 as of this writing 時間限定在統計表以「（寫作當下）」保留，volatile 聲明已帶時間界定，符合時效分層要求（來源 2026-08-12，距本文 1 天）。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c37",
+      "claim_text": "最後靠一則工程師形容為「詭異地令人開心」的監控警報收尾",
+      "location": "首段導言",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n25"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Since that weirdly joyous alert fired",
+      "note": "『詭異地令人開心』為 weirdly joyous 的直譯，歸屬給文章作者（Tailscale 工程師）正確。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c38",
+      "claim_text": "用非標準方式操作一項「無聊但可靠」的技術本身就是風險：常見路徑與標準配置經過遠更充分的測試與驗證，多數 SQLite 使用者用預設方式跑，從來不會碰到這種問題",
+      "location": "under H2「checkpoint 數錯頁的那一刻」",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n21"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Running boring technology in a non-standard way is a risk. The common paths and standard configurations are incredibly well-tested and reliable. Most people use SQLite in a standard configuration and never face this sort of issue.",
+      "note": "三句反思逐句對應；『無聊但可靠』對應文中 boring technology—in a good way 的語境，歸屬為作者自我反思正確。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c39",
+      "claim_text": "SQLite 開發者也解釋了為什麼是 Tailscale 更容易踩到它：手動接管 checkpoint 流程、而且 checkpoint 得很積極，即使是一個由罕見條件觸發的 bug，遲早也會被撞上",
+      "location": "under H2「checkpoint 數錯頁的那一刻」",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [
+        "n20"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "we take manual control of the checkpointing process, and we checkpoint very aggressively. Even a bug triggered by a rare condition was bound to hit us eventually.",
+      "note": "『遲早也會被撞上』對應 was bound to hit us eventually，強度相同（來源即為斷言）。",
+      "action": "none",
+      "resolution": "none-needed"
+    }
+  ],
+  "checked_at": "2026-08-13",
+  "checker_rounds": 2,
+  "coverage": {
+    "candidate_claims": 47,
+    "checked": 39,
+    "dropped_low_load": 8
+  }
+}
