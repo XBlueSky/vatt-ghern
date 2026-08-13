@@ -1,0 +1,818 @@
+{
+  "output_path": "src/posts/2026/08/14/deep-heygen-avatar-iv-trillium-tpu.html",
+  "spine": [
+    "1. Avatar IV 的 diffusion transformer 加 super-resolution transformer 合計超過 36 GB bf16 權重，Trillium v6e 每顆晶片只有 32 GB HBM，權重本身就裝不進單一晶片，逼出跨八顆晶片的 FSDP 切分。",
+    "2. FSDP 切權重、Ulysses sequence parallelism 切影片序列本身，兩種切法疊在同一個八晶片 mesh 上，不是分開兩個 mesh 處理。",
+    "3. SparseCore 這個共處理器非同步搬每一層的權重，讓因記憶體算術被迫做的切分，在關鍵路徑（matrix unit）上幾乎不花時間。",
+    "4. 把 attention head 拆成獨立群組後，all-to-all collective 佔用 compute stream 的時間窗大約縮小 5 倍，而 attention 本身耗時不變。",
+    "5. Sparse attention kernel 的 block 大小限制從 128 的倍數放寬到硬體支援的最細粒度 16 的倍數，去掉了 mask predicate、第二次掃描與 padding，把 kernel 利用率從約一半推到接近四分之三，最後到約 86%。",
+    "6. 用 Cauchy-Schwarz 不等式算出的上界取代 softmax 原本逐 row 維護的 running maximum，去掉內迴圈裡的序列相依 rescaling；這個界對 98–99% 的 head 夠緊，可以直接套用。",
+    "7. 所有改動都要先過兩層驗證（保序改動要逐幀 hash 相同、改變 reduction order 的改動要落在 bf16 重結合誤差帶內）才能上線，一個看似更快的候選（把 residual stream 降到 bf16）因為沒過驗證被打回；疊加後的結果是比第一個可運作版本快 1.86 倍，每分鐘生成影片成本比 8×H100 最多低 25%。"
+  ],
+  "sources": [
+    {
+      "url": "https://developers.googleblog.com/en/heygen-x-google-cloud-bringing-avatar-iv-to-tpus/",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": "2026-08-13",
+      "perspective": {
+        "mechanism": "把一個 36 GB bf16 權重（18B+ 參數、每 chunk 三個模型：diffusion transformer、super-resolution transformer、VAE decoder）的 pipeline 塞進每顆只有 32 GB HBM 的八晶片 Trillium v6e host：FSDP 切權重與 Ulysses sequence parallelism 切序列共用同一個 mesh，SparseCore 非同步搬權重讓切分不佔關鍵路徑，attention head 分組讓 all-to-all collective 的 compute-stream 佔用縮小約 5 倍，sparse attention block 限制從 128 的倍數放寬到 16 的倍數消掉 mask predicate 與 padding，Cauchy-Schwarz 上界取代 softmax running maximum 拿掉內迴圈的序列相依。",
+        "tradeoff": "每個優化都不是免費的：SparseCore 卸載要重接權重搬運路徑；block 放寬到 16 犧牲了較粗批次換來較少 padding 浪費；Cauchy-Schwarz 界只在 98–99% 的 head 上夠緊，不是全部適用；把 residual stream 降到 bf16 確實測出更快，但輸出跌出驗證帶，最後被打回。所有改動都得先過兩層驗證（逐幀 hash 相同、或落在 bf16 重結合誤差帶內）才能上線，不能只看單一 benchmark 數字就採用。",
+        "reader_use": "工程師如果要把「權重總量大於單一晶片記憶體」的多模型 pipeline 搬上 TPU，可以照抄這個順序思考：先算清楚是什麼逼出切分（權重還是 activation），把互補的並行切法疊在同一個 mesh 上而不是疊多個獨立 mesh，能用非同步協處理器搬資料就別讓它佔 matmul 的關鍵路徑，任何犧牲精度換速度的核心改動都要先設兩層正確性驗證再上線，不能只信一次跑分。"
+      }
+    }
+  ],
+  "notes": [
+    {
+      "id": "n01",
+      "url": "https://developers.googleblog.com/en/heygen-x-google-cloud-bringing-avatar-iv-to-tpus/",
+      "quote": "Avatar IV, the diffusion stack behind our talking-head videos, runs on more than 18B parameters and is available via Web and API.",
+      "hedge": "asserted",
+      "interpretation": "Avatar IV 模型本體超過 18B 參數，屬 HeyGen 已上線的 Web／API 產品。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n02",
+      "url": "https://developers.googleblog.com/en/heygen-x-google-cloud-bringing-avatar-iv-to-tpus/",
+      "quote": "The two transformers total more than 36 GB of bf16 weights against 32 GB of HBM per Trillium chip, so the weights are FSDP-sharded across the eight chips.",
+      "hedge": "asserted",
+      "interpretation": "36GB 權重（兩個 transformer 合計）大於單顆 Trillium v6e 的 32GB HBM，這個落差直接是 FSDP 跨八晶片切分的成因；36/32/8 三個數字與因果關係都在同一句。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n03",
+      "url": "https://developers.googleblog.com/en/heygen-x-google-cloud-bringing-avatar-iv-to-tpus/",
+      "quote": "Ulysses sequence parallelism combines with the weight sharding over the same mesh, splitting the video sequence itself.",
+      "hedge": "asserted",
+      "interpretation": "Ulysses 序列並行與 FSDP 權重切分共用同一個 mesh，不是分開建兩個 mesh；Ulysses 切的是影片序列本身。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n04",
+      "url": "https://developers.googleblog.com/en/heygen-x-google-cloud-bringing-avatar-iv-to-tpus/",
+      "quote": "Trillium's SparseCore, a co-processor that runs alongside the main core, carries each layer's weight gathers asynchronously.",
+      "hedge": "asserted",
+      "interpretation": "SparseCore 是與主核心並行運作的協處理器，非同步執行每一層的權重 gather。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n05",
+      "url": "https://developers.googleblog.com/en/heygen-x-google-cloud-bringing-avatar-iv-to-tpus/",
+      "quote": "running them on the co-processor physically frees the matrix unit from weight movement, so a sharding forced by memory arithmetic costs nothing on the critical path.",
+      "hedge": "asserted",
+      "interpretation": "把權重搬運丟給協處理器後，matmul 用的 matrix unit 完全不用等權重搬運，記憶體算術逼出的切分因此不佔關鍵路徑時間。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n06",
+      "url": "https://developers.googleblog.com/en/heygen-x-google-cloud-bringing-avatar-iv-to-tpus/",
+      "quote": "In the traces, the collective's footprint on the compute stream collapsed roughly 5×, with attention time itself unchanged.",
+      "hedge": "hedged",
+      "interpretation": "把 attention head 拆成獨立群組後（讓 all-to-all 可以非同步 start/done），collective 佔用 compute stream 的時間窗約縮小 5 倍，attention 本身運算耗時沒變——省下來的是等待 collective 完成的時間，不是 attention 算得更快。原文用 roughly，保留「約」。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n07",
+      "url": "https://developers.googleblog.com/en/heygen-x-google-cloud-bringing-avatar-iv-to-tpus/",
+      "quote": "We relaxed the kernel's block-size constraint from multiples of 128 down to multiples of 16, the finest bf16 tiling the hardware supports along the sequence dimension.",
+      "hedge": "asserted",
+      "interpretation": "sparse attention kernel 的 block-size 限制從「128 的倍數」放寬到「16 的倍數」，16 是硬體在序列維度上支援的最細 bf16 tiling 粒度。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n08",
+      "url": "https://developers.googleblog.com/en/heygen-x-google-cloud-bringing-avatar-iv-to-tpus/",
+      "quote": "Live blocks are full by construction, and the reference frame's blocks are simply more full blocks in the same online softmax, so a single pass covers the whole mask. With that, the mask predicates, the second pass, and the padding all disappear.",
+      "hedge": "asserted",
+      "interpretation": "block 放寬到 16 的倍數後，block 邊界正好對齊真實資料邊界（不再需要處理半滿的 partial block），因此 mask predicate、第二次掃描與 padding 三樣東西都可以直接省掉。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n09",
+      "url": "https://developers.googleblog.com/en/heygen-x-google-cloud-bringing-avatar-iv-to-tpus/",
+      "quote": "The alignment round lifted the kernel from about half of the ceiling this attention shape can reach on the hardware to nearly three-quarters of it, and the rebuilt body closed to about 86%.",
+      "hedge": "hedged",
+      "interpretation": "kernel 利用率分兩階段進步：先從約一半的理論上限推進到接近四分之三，重寫 kernel 主體後再收斂到約 86%。三個數字都是對「這個 attention 形狀在此硬體上的理論上限」的百分比，原文用 about/nearly，保留「約」「接近」。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n10",
+      "url": "https://developers.googleblog.com/en/heygen-x-google-cloud-bringing-avatar-iv-to-tpus/",
+      "quote": "By the Cauchy–Schwarz inequality, a query's largest possible logit is bounded by its norm times the largest key norm.",
+      "hedge": "asserted",
+      "interpretation": "用 Cauchy-Schwarz 不等式，query 向量的最大可能 logit 有一個上界：query 的 norm 乘上該區塊裡最大的 key norm，這個上界可以事先算出來，不必等看過所有 key 才知道當前最大值。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n11",
+      "url": "https://developers.googleblog.com/en/heygen-x-google-cloud-bringing-avatar-iv-to-tpus/",
+      "quote": "Flash-style attention carries a running maximum per query row, rescaling its accumulator whenever a new block of keys raises it. That bookkeeping is a serial dependency in the hottest inner loop of the pipeline's attention kernels.",
+      "hedge": "asserted",
+      "interpretation": "標準 flash attention 每個 query row 要維護一個逐步更新的最大值，每次新 key block 把最大值推高就要重新縮放累加器；這個維護動作在 attention kernel 最熱的內迴圈裡形成一條序列相依鏈，是效能瓶頸來源。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n12",
+      "url": "https://developers.googleblog.com/en/heygen-x-google-cloud-bringing-avatar-iv-to-tpus/",
+      "quote": "With the max fixed up front, the rescaling and its serial chain drop out of the inner loop entirely.",
+      "hedge": "asserted",
+      "interpretation": "改用 Cauchy-Schwarz 上界之後，最大值變成一開始就用預先算好的 norm 決定，不必逐 block 更新，rescaling 與它帶來的序列相依鏈整條從內迴圈消失。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n13",
+      "url": "https://developers.googleblog.com/en/heygen-x-google-cloud-bringing-avatar-iv-to-tpus/",
+      "quote": "On our production data, 98–99% of heads qualify.",
+      "hedge": "asserted",
+      "interpretation": "在 HeyGen 自己的生產資料上量測，98–99% 的 attention head 符合套用 Cauchy-Schwarz 上界這個近似的條件（意味著仍有 1–2% 的 head 不適用，需要另外處理或保留原本的 running maximum）。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n14",
+      "url": "https://developers.googleblog.com/en/heygen-x-google-cloud-bringing-avatar-iv-to-tpus/",
+      "quote": "we brought Avatar IV to an eight-chip Trillium (v6e) host and made it 1.86× faster than our first working version.",
+      "hedge": "asserted",
+      "interpretation": "疊加所有優化後，Avatar IV 在八晶片 Trillium v6e host 上的速度是「第一個可運作版本」的 1.86 倍；基準點是團隊自己最早跑通的版本，不是外部系統。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n15",
+      "url": "https://developers.googleblog.com/en/heygen-x-google-cloud-bringing-avatar-iv-to-tpus/",
+      "quote": "The result is a pipeline that streams at performance comparable to what we see from our 8×H100 production setup while being up to 25% more cost efficient per minute of generated video.",
+      "hedge": "hedged",
+      "interpretation": "最終這條 TPU pipeline 的串流效能跟 HeyGen 自己 8×H100 生產環境相當，但每分鐘生成影片的成本最多可以低 25%；原文是 up to，代表這是上限值不是保證值，也是跟自家 H100 產線比，不是跟任意 H100 配置比。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n16",
+      "url": "https://developers.googleblog.com/en/heygen-x-google-cloud-bringing-avatar-iv-to-tpus/",
+      "quote": "a diffusion transformer that renders motion conditioned on the audio, a second transformer that super-resolves it, and a VAE decoder that turns latents into pixels",
+      "hedge": "asserted",
+      "interpretation": "每個 chunk 依序過三個模型：diffusion transformer（依音訊把動作算出來）、第二個 transformer 做 super-resolution、VAE decoder 把 latent 轉成像素。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n17",
+      "url": "https://developers.googleblog.com/en/heygen-x-google-cloud-bringing-avatar-iv-to-tpus/",
+      "quote": "Tier one is byte-identical. The delivered video must hash equal to baseline, frame for frame.",
+      "hedge": "asserted",
+      "interpretation": "驗證第一層：不改變 reduction order 的改動，輸出影片必須跟基準版本逐幀 hash 完全相等，沒有模糊地帶。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n18",
+      "url": "https://developers.googleblog.com/en/heygen-x-google-cloud-bringing-avatar-iv-to-tpus/",
+      "quote": "Tier two covers changes that alter the compiled program's reduction order. Those are held to the narrow similarity band that bf16 reassociation itself produces",
+      "hedge": "asserted",
+      "interpretation": "驗證第二層給會改變編譯後 reduction order 的改動：容許誤差就是 bf16 重結合本身天生會產生的那個窄誤差帶，不是隨意放寬的門檻。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n19",
+      "url": "https://developers.googleblog.com/en/heygen-x-google-cloud-bringing-avatar-iv-to-tpus/",
+      "quote": "One candidate moved the diffusion transformers' residual stream down to bf16 and measured faster end to end, but its output fell below the band.",
+      "hedge": "asserted",
+      "interpretation": "有一個候選改動（把 diffusion transformer 的 residual stream 降到 bf16）實測端對端更快，但輸出跌出 tier 2 的相似度帶，因此被打回，沒有上線。這是「跑分更快不等於能上線」的具體案例。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n20",
+      "url": "https://developers.googleblog.com/en/heygen-x-google-cloud-bringing-avatar-iv-to-tpus/",
+      "quote": "The output is 720p or 1080p video at 25 frames per second, streamed as chunks complete",
+      "hedge": "asserted",
+      "interpretation": "輸出規格：720p 或 1080p、25fps，並且是每算完一個 chunk 就串流出去，不是整支影片算完才輸出。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n21",
+      "url": "https://developers.googleblog.com/en/heygen-x-google-cloud-bringing-avatar-iv-to-tpus/",
+      "quote": "Avatar IV turns a single photo and an audio track into a talking, moving person.",
+      "hedge": "asserted",
+      "interpretation": "文章開場定義 Avatar IV：輸入一張照片加一段音訊，輸出一個會說話、會動的人像影片。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n22",
+      "url": "https://developers.googleblog.com/en/heygen-x-google-cloud-bringing-avatar-iv-to-tpus/",
+      "quote": "AUG. 13, 2026",
+      "hedge": "asserted",
+      "interpretation": "文章發布日期為 2026 年 8 月 13 日。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n23",
+      "url": "https://developers.googleblog.com/en/heygen-x-google-cloud-bringing-avatar-iv-to-tpus/",
+      "quote": "HeyGen Team: Alireza Dolatabadi, Rui Zhang, Onee Yekeh, Rong Yan, Charly Hong; Google Cloud AI Team: Rishabh Manoj, Sagar Chapara, Prisha Jain, Hitesh Yadav, Shamik Ray; Google Cloud Field & Customer Engineering Teams: Travis Martin, Jennifer Liang",
+      "hedge": "asserted",
+      "interpretation": "文章由三個團隊聯名具名：HeyGen 團隊（5人）、Google Cloud AI 團隊（5人）、Google Cloud Field 與 Customer Engineering 團隊（2人），合計十二位具名工程師，屬多方工程團隊的技術部落格文章，非單一公司單方面公告。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n24",
+      "url": "https://developers.googleblog.com/en/heygen-x-google-cloud-bringing-avatar-iv-to-tpus/",
+      "quote": "Eligibility is checked per attention head, and heads whose bound is too loose fall back to the standard online path inside the same kernel.",
+      "hedge": "asserted",
+      "interpretation": "是否適用 Cauchy-Schwarz 上界是逐個 attention head 檢查的；上界不夠緊的 head，會在同一個 kernel 裡退回標準的 online softmax 路徑，不是被晾在一邊沒人處理——文章對「不適用的那一小部分 head 後續怎麼走」其實有明確交代，並非留白。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n25",
+      "url": "https://developers.googleblog.com/en/heygen-x-google-cloud-bringing-avatar-iv-to-tpus/",
+      "quote": "A tiny array of precomputed norms, fed to the kernel through scalar prefetch, lets each row derive its bound as it starts, and the online max is no longer needed.",
+      "hedge": "asserted",
+      "interpretation": "讓每個 query row 一開始就能算出自己上界的，是一小組預先算好的 norm，透過 scalar prefetch 這個機制餵進 kernel；原文沒有明說「兩邊（query 與 key）的 norm 都預先算好」，只講了一個預先算好的 norm 陣列。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n26",
+      "url": "https://developers.googleblog.com/en/heygen-x-google-cloud-bringing-avatar-iv-to-tpus/",
+      "quote": "The attention heads split into a few independent groups, each running its own all-to-all, attention, all-to-all pattern, and each group's transfer now has sibling attention to hide behind, so XLA switches to asynchronous start/done pairs.",
+      "hedge": "asserted",
+      "interpretation": "head 拆成幾個獨立群組後，每個群組各自跑自己的 all-to-all、attention、all-to-all 這個順序；每個群組的搬資料動作因此有另一個群組的 attention 運算可以躲在後面重疊，是這個條件讓 XLA 把搬資料動作換成非同步的 start/done pair——非同步是 XLA 編譯器的決定，不是群組自己主動發起的動作。",
+      "timeliness": "durable"
+    }
+  ],
+  "claims": [
+    {
+      "id": "c01",
+      "claim_text": "兩個 transformer 疊起來超過 36 GB 的 bf16 權重，Trillium（v6e）一顆晶片卻只有 32 GB HBM",
+      "location": "hero opener（vg-deep-opener）",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n02"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The two transformers total more than 36 GB of bf16 weights against 32 GB of HBM per Trillium chip, so the weights are FSDP-sharded across the eight chips.",
+      "note": "Re-fetched and matched verbatim. The post's later qualifier that 36 GB covers only the two transformers and not the VAE decoder is also correct: the source scopes the 36 GB to \"the two transformers\".",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c02",
+      "claim_text": "Avatar IV 整體超過 18B 參數",
+      "location": "under H2「一個 chunk，三個模型」",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n01"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Avatar IV, the diffusion stack behind our talking-head videos, runs on more than 18B parameters and is available via Web and API.",
+      "note": "「超過 18B」matches \"more than 18B parameters\" at the same strength.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c03",
+      "claim_text": "輸出是 720p 或 1080p、每秒 25 幀的影片，而且是每算完一個 chunk 就往外串流",
+      "location": "opening paragraph",
+      "type": "number",
+      "load": "medium",
+      "note_ids": [
+        "n20",
+        "n21"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The output is 720p or 1080p video at 25 frames per second, streamed as chunks complete",
+      "note": "Both the resolution/framerate spec and the chunk-streaming behaviour are in one source sentence.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c04",
+      "claim_text": "每個 chunk 依序過三個模型：diffusion transformer、super-resolution transformer、VAE decoder",
+      "location": "under H2「一個 chunk，三個模型」",
+      "type": "attribution",
+      "load": "high",
+      "note_ids": [
+        "n16"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "a diffusion transformer that renders motion conditioned on the audio, a second transformer that super-resolves it, and a VAE decoder that turns latents into pixels",
+      "note": "Three-model composition and ordering match the source enumeration.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c05",
+      "claim_text": "Trillium（v6e）host 有八顆晶片，但每顆晶片只有 32 GB HBM",
+      "location": "under H2「一個 chunk，三個模型」",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n02",
+        "n14"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "we brought Avatar IV to an eight-chip Trillium (v6e) host and made it 1.86× faster than our first working version.",
+      "note": "Eight-chip v6e host from n14; 32 GB HBM per chip from n02. Both re-fetched verbatim.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c06",
+      "claim_text": "它是 HeyGen 已經透過 Web 與 API 對外開放的產品",
+      "location": "under H2「一個 chunk，三個模型」",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n01"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Avatar IV ... is available via Web and API.",
+      "note": "\"available via Web and API\" supports the shipped-product framing.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c07",
+      "claim_text": "HeyGen 把權重跨八顆晶片做 FSDP 切分，正是因為 36 GB 大於單顆 32 GB 的容量",
+      "location": "under H2「同一個 mesh，兩種切法」",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [
+        "n02"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The two transformers total more than 36 GB of bf16 weights against 32 GB of HBM per Trillium chip, so the weights are FSDP-sharded across the eight chips.",
+      "note": "The causal link is the source's own \"so\" — not an authorial inference.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c08",
+      "claim_text": "團隊另外疊上 Ulysses sequence parallelism，把影片序列本身切開；兩種切法「共用同一個 mesh」",
+      "location": "under H2「同一個 mesh，兩種切法」",
+      "type": "attribution",
+      "load": "high",
+      "note_ids": [
+        "n03"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Ulysses sequence parallelism combines with the weight sharding over the same mesh, splitting the video sequence itself.",
+      "note": "Same-mesh combination and \"splitting the video sequence itself\" both present verbatim.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c09",
+      "claim_text": "文章沒有細說如果分別建兩組獨立 mesh 會發生什麼，但合理的推測是通訊路徑會更複雜",
+      "location": "under H2「同一個 mesh，兩種切法」",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "Inference marking is physically present and precedes the synthesis. Legitimate marked inference; empty binding permitted for verdict `inferred`.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c10",
+      "claim_text": "真正讓這套切分不用付出代價的是 Trillium 的 SparseCore——一個跟主核心並行運作的協處理器，非同步搬運每一層的權重 gather",
+      "location": "under H2「同一個 mesh，兩種切法」",
+      "type": "attribution",
+      "load": "high",
+      "note_ids": [
+        "n04"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Trillium's SparseCore, a co-processor that runs alongside the main core, carries each layer's weight gathers asynchronously.",
+      "note": "Co-processor / alongside main core / asynchronous per-layer weight gathers all match.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c11",
+      "claim_text": "matrix unit 完全不用等資料就位；因記憶體算術被迫做的切分幾乎不佔用關鍵路徑",
+      "location": "under H2「同一個 mesh，兩種切法」",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [
+        "n05"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "deflated",
+      "evidence": "running them on the co-processor physically frees the matrix unit from weight movement, so a sharding forced by memory arithmetic costs nothing on the critical path.",
+      "note": "Source asserts \"costs nothing on the critical path\"; post says 「幾乎不佔用」 — weaker than the source. Deflation is never an error per the spec; recorded and passed.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c12",
+      "claim_text": "文章沒有解釋 all-to-all 為什麼特別容易卡在關鍵路徑上；一般而言，這類 collective 得等所有參與的晶片都到齊才算完成",
+      "location": "under H2「讓 all-to-all 別擋路」",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "deflated",
+      "evidence": null,
+      "note": "Round 1 判 unverifiable（未標記的推論以斷言語氣呈現）。Round 2 確認標記已實際存在於該句，採本文既有的兩段式（「文章沒有解釋…」＋「一般而言…」）。重新抓取確認來源確實沒有解釋 all-to-all 為何卡在關鍵路徑，只描述了編譯器層面的後果，因此本文的免責敘述正確，後續概化亦正確標示為作者自述。未引入任何新的具來源語氣的斷言。",
+      "action": "mark-inferred",
+      "resolution": "marked-inferred"
+    },
+    {
+      "id": "c13",
+      "claim_text": "把 attention 的 head 拆成幾個互相獨立的群組，各自跑自己的 all-to-all、attention、all-to-all；XLA 因此把搬資料動作換成非同步的 start/done pair",
+      "location": "under H2「讓 all-to-all 別擋路」",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n26"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The attention heads split into a few independent groups, each running its own all-to-all, attention, all-to-all pattern, and each group's transfer now has sibling attention to hide behind, so XLA switches to asynchronous start/done pairs.",
+      "note": "Round 1 為追溯缺口（無 note 支撐）。Round 2 補上 n26，其引文經重新抓取確認逐字存在，改寫後的 prose 與引文逐句對應，且非同步性已正確歸屬給 XLA（編譯器的決定）而非群組本身。",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c14",
+      "claim_text": "collective 佔用 compute stream 的時間窗大約收窄了 5 倍，而 attention 本身的運算耗時沒有變",
+      "location": "under H2「讓 all-to-all 別擋路」",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n06"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "In the traces, the collective's footprint on the compute stream collapsed roughly 5×, with attention time itself unchanged.",
+      "note": "Source hedges with \"roughly\"; post preserves it as 「大約」. The follow-up disambiguation matches \"with attention time itself unchanged\". No inflation.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c15",
+      "claim_text": "block 大小限制從 128 的倍數放寬到 16 的倍數——16 是硬體在序列維度上支援的最細 bf16 tiling 粒度",
+      "location": "under H2「把 block 縮到 16」",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n07"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "We relaxed the kernel's block-size constraint from multiples of 128 down to multiples of 16, the finest bf16 tiling the hardware supports along the sequence dimension.",
+      "note": "128→16 and the finest-bf16-tiling qualifier both matched verbatim.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c16",
+      "claim_text": "mask predicate、多跑一次的掃描、還有 padding，三樣東西可以一次全部拿掉",
+      "location": "under H2「把 block 縮到 16」",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [
+        "n08"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "With that, the mask predicates, the second pass, and the padding all disappear.",
+      "note": "All three eliminated items and the single-pass cause are in the source.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c17",
+      "claim_text": "從理論上限的一半左右推到接近四分之三；重寫 kernel 主體之後再收斂到大約 86%",
+      "location": "under H2「把 block 縮到 16」",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n09"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The alignment round lifted the kernel from about half of the ceiling this attention shape can reach on the hardware to nearly three-quarters of it, and the rebuilt body closed to about 86%.",
+      "note": "Progression and the attribution of the second step to the rebuilt kernel body both match; about/nearly hedging preserved.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c18",
+      "claim_text": "（已刪除）這兩次躍進靠的是同一個動作——縮小 block…",
+      "location": "under H2「把 block 縮到 16」",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [],
+      "independence": "single-source",
+      "verdict": "unverifiable",
+      "hedge_delta": "none",
+      "evidence": "The alignment round lifted the kernel from about half of the ceiling this attention shape can reach on the hardware to nearly three-quarters of it, and the rebuilt body closed to about 86%.",
+      "note": "Round 1 判 unverifiable：該句把兩次躍進歸給同一個改動，與來源的因果切分相反，也與本文下一段自相矛盾。Round 2 確認該句已從文中刪除，替代段落正確地把兩次躍進拆給「邊界對齊」與「重寫 kernel 主體」兩批改動。",
+      "action": "delete",
+      "resolution": "deleted"
+    },
+    {
+      "id": "c19",
+      "claim_text": "一個 query 向量能算出的最大 logit，有一個現成的上界——它自己的 norm 乘上這個 key block 裡最大的 key norm",
+      "location": "under H2「拿掉 softmax 的序列相依」",
+      "type": "attribution",
+      "load": "high",
+      "note_ids": [
+        "n10"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "By the Cauchy–Schwarz inequality, a query's largest possible logit is bounded by its norm times the largest key norm.",
+      "note": "The bound's form and its Cauchy–Schwarz provenance match verbatim.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c20",
+      "claim_text": "標準 flash-style attention 每個 query row 要維護一個逐步更新的目前最大值",
+      "location": "under H2「拿掉 softmax 的序列相依」",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n11"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Flash-style attention carries a running maximum per query row, rescaling its accumulator whenever a new block of keys raises it. That bookkeeping is a serial dependency in the hottest inner loop of the pipeline's attention kernels.",
+      "note": "Running maximum per query row, the rescale trigger, and the inner-loop serial dependency framing are all the source's own words.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c21",
+      "claim_text": "最大值一旦固定，rescaling 的序列相依鏈整條從內迴圈消失",
+      "location": "under H2「拿掉 softmax 的序列相依」",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [
+        "n12"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "With the max fixed up front, the rescaling and its serial chain drop out of the inner loop entirely.",
+      "note": "\"entirely\" supports 「整條…消失」 at equal strength.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c22",
+      "claim_text": "一小組預先算好的 norm，透過 scalar prefetch 餵進 kernel，讓每一個 row 一開始就能算出自己的上界",
+      "location": "under H2「拿掉 softmax 的序列相依」",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n25",
+        "n12"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "A tiny array of precomputed norms, fed to the kernel through scalar prefetch, lets each row derive its bound as it starts, and the online max is no longer needed.",
+      "note": "Round 1 判 unverifiable：原文「兩邊的 norm 都可以預先算好」比來源更具體（來源未說 query 與 key 兩側都預先算好）。Round 2 確認已改寫為來源實際說法並補上 n25。Round 2 另指出 n25 引文為來源句的截斷前綴，parent 已將其補齊為完整句。",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c23",
+      "claim_text": "在 HeyGen 自己的生產資料上量測，98% 到 99% 的 head 符合套用條件",
+      "location": "under H2「拿掉 softmax 的序列相依」",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n13"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "On our production data, 98–99% of heads qualify.",
+      "note": "Matched verbatim, including the visible attribution to HeyGen's own production data. Source dated one day before the post, so no dated-hedge action is triggered.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c24",
+      "claim_text": "符合資格與否是逐 head 檢查的，上界不夠緊的那些 head，會在同一個 kernel 裡退回標準的 online softmax 路徑",
+      "location": "under H2「拿掉 softmax 的序列相依」",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n24",
+        "n13"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Eligibility is checked per attention head, and heads whose bound is too loose fall back to the standard online path inside the same kernel.",
+      "note": "Round 1 最重要的一項：原文宣稱「文章沒有交代那一小部分後續怎麼走，這是目前公開材料留下的空白」，與來源直接矛盾——來源明確說明逐 head 檢查、上界過鬆者在同一 kernel 內退回標準 online 路徑。Round 2 確認該錯誤敘述已完全移除，新句保留來源三個載重要素且未過度延伸。",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c25",
+      "claim_text": "第一層：輸出影片必須跟基準版本逐幀 hash 完全相等",
+      "location": "under H2「兩層驗證，才敢說數字」",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n17"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Tier one is byte-identical. The delivered video must hash equal to baseline, frame for frame.",
+      "note": "Byte-identical / frame-for-frame hash equality matched verbatim.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c26",
+      "claim_text": "第二層容許的誤差就是 bf16 重結合本身天生會產生的那個窄誤差帶，不是團隊自己另外放寬的門檻",
+      "location": "under H2「兩層驗證，才敢說數字」",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n18"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Tier two covers changes that alter the compiled program's reduction order. Those are held to the narrow similarity band that bf16 reassociation itself produces",
+      "note": "Supports both the band's definition and the not-self-relaxed reading.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c27",
+      "claim_text": "一個合理的解讀是：如果所有改動都要求逐幀 hash 完全相同，只是換了等價運算順序的改動也會被錯殺",
+      "location": "under H2「兩層驗證，才敢說數字」",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "Marking 「一個合理的解讀是：」 present at the head of the sentence. The source states the two tiers but never explains why they are split, so this is legitimately the author's marked reasoning.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c28",
+      "claim_text": "把 diffusion transformer 的 residual stream 降到 bf16，實測更快但輸出跌出第二層誤差帶，最後被打回",
+      "location": "under H2「兩層驗證，才敢說數字」",
+      "type": "attribution",
+      "load": "high",
+      "note_ids": [
+        "n19"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "One candidate moved the diffusion transformers' residual stream down to bf16 and measured faster end to end, but its output fell below the band.",
+      "note": "Every element matched verbatim; the rejection is the direct consequence the source's \"but\" clause establishes.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c29",
+      "claim_text": "這篇文章公開於 2026 年 8 月 13 日",
+      "location": "under H2「兩層驗證，才敢說數字」",
+      "type": "date-version",
+      "load": "medium",
+      "note_ids": [
+        "n22"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "AUG. 13, 2026",
+      "note": "Datestamp confirmed on re-fetch; one day before the post date, so all volatile-timeliness claims are fresh.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c30",
+      "claim_text": "由 HeyGen 團隊、Google Cloud AI 團隊、Google Cloud Field 與 Customer Engineering 團隊三方具名合寫，加起來十二位工程師掛名",
+      "location": "under H2「兩層驗證，才敢說數字」",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n23",
+        "n22"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "HeyGen Team: 5 named; Google Cloud AI Team: 5 named; Google Cloud Field & Customer Engineering Teams: 2 named (Travis Martin, Jennifer Liang)",
+      "note": "Round 1 判 unverifiable：署名誤計為「兩邊…十位」，實際頁面另有第三個掛名團隊。Round 2 由 checker 獨立重數（未被告知既有數字），得三個團隊、5+5+2=12 人，與修正後的 prose 相符；n23 引文已更新涵蓋三個署名區塊。",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c31",
+      "claim_text": "Avatar IV 在八晶片 Trillium（v6e）host 上，比團隊自己第一個能跑起來的版本快 1.86 倍",
+      "location": "closing section",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n14"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "we brought Avatar IV to an eight-chip Trillium (v6e) host and made it 1.86× faster than our first working version.",
+      "note": "1.86×, the eight-chip v6e host, and the self-referential baseline all matched verbatim; the post's caveat that this is a self-comparison is a correct reading.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c32",
+      "claim_text": "串流效能跟自家 8×H100 產線打平，但每分鐘生成影片的成本最多可以低 25%",
+      "location": "closing section",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n15"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The result is a pipeline that streams at performance comparable to what we see from our 8×H100 production setup while being up to 25% more cost efficient per minute of generated video.",
+      "note": "The \"up to\" hedge is preserved as 「最多可以」 and the comparison target (HeyGen's own 8×H100 production setup) is kept. No inflation.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c33",
+      "claim_text": "合理的推測是，單獨拿掉任何一層，乘出來的數字都會小很多",
+      "location": "closing section",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "Marking 「合理的推測是，」 opens the clause. The source never publishes a per-layer ablation, so the multiplicative-contribution reasoning is correctly fenced as the author's own.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "r01",
+      "claim_text": "中間那個「接近四分之三」的數字，代表的是光靠對齊邊界、還沒動 kernel 本體時所推進到的位置",
+      "location": "under H2「把 block 縮到 16」",
+      "type": "causal",
+      "load": "low",
+      "note_ids": [
+        "n09"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The alignment round lifted the kernel from about half of the ceiling this attention shape can reach on the hardware to nearly three-quarters of it, and the rebuilt body closed to about 86%.",
+      "note": "Round 2 迴歸掃描發現：c18 修正時新寫的句子把「接近四分之三」說成「能拿到的上限」，等於額外斷言僅靠對齊無法再往上，而來源只說對齊那一輪把 kernel 推到接近四分之三。Parent 已將「能拿到的上限」改為「所推進到的位置」，數字不變、去掉未獲支持的上限含意。",
+      "action": "hedge",
+      "resolution": "hedged"
+    }
+  ],
+  "checked_at": "2026-08-14",
+  "checker_rounds": 2,
+  "coverage": {
+    "candidate_claims": 40,
+    "checked": 34,
+    "dropped_low_load": 6,
+    "note": "Round 1 檢查 33 項（27 clean / 6 actionable）；Round 2 針對 6 項修正重查全數通過，並以迴歸掃描新增 r01（低載重，已 hedge）。"
+  }
+}
