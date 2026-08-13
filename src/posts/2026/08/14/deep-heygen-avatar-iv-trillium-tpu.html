@@ -1,0 +1,358 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">有一個改動，實測端對端跑得比原本快，HeyGen 還是把它擋下來，不讓它上線。</p>
+  <h1 class="vg-post-title">{{ title }}</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p><span class="vg-dropcap">一</span>張照片配一段音訊，生出一個會說話、會動的人——這是 Avatar IV 要做的事。輸出是 720p 或 1080p、每秒 25 幀的影片，而且是每算完一個 chunk 就往外串流，不必等整支影片跑完才看到畫面。把這套 pipeline 搬上自家的 Trillium TPU 機隊，HeyGen 團隊最先撞見的不是模型設計問題，而是一道裝不裝得下的算術題。</p>
+
+  <h2>一個 chunk，三個模型</h2>
+
+  <p>每個 chunk 依序過三個模型：先是一個依音訊把動作算出來的 diffusion transformer，接著一個把畫面放大、補細節的 super-resolution transformer，最後是把 latent 轉成像素的 VAE decoder。Avatar IV 整體超過 18B 參數；其中 diffusion transformer 跟 super-resolution transformer 這兩個 transformer 加起來，合計超過 36 GB 的 bf16 權重。</p>
+
+  <p>「依音訊算動作」說的是 diffusion transformer 把輸入的音訊當成條件，生成跟聲音對得上的臉部與身體動作，決定的是嘴型、表情、肢體動作跟聲音搭不搭；super-resolution transformer 接手的是畫質，VAE decoder 接手的是把 latent 轉成看得到的像素。三個模型依序跑完才算完成一個 chunk，而輸出是逐 chunk 往外串流的——這代表整條 pipeline 每個 chunk 的耗時穩不穩定，會直接反映在畫面串流的節奏上。720p 或 1080p、25fps 這個輸出規格，決定了每個 chunk 要在多短的時間內把三個模型都跑完，才跟得上串流的節奏；晶片記憶體不夠、collective 卡在關鍵路徑、kernel 利用率上不去，這些問題只要有一個沒解，最直接的後果就是串流跟不上該有的節奏。</p>
+
+  <p>問題出在硬體那一側。HeyGen 選用的 Trillium（v6e）host 有八顆晶片，但每顆晶片只有 32 GB HBM。36 對 32，連權重本身都放不進單一晶片，更別提留給 activation、KV cache 的空間。這不是效能調校的起點，是「能不能跑起來」的起點——後面每一項優化，都是在回答同一道題目：怎麼在這道算術不利的條件下，還能把 pipeline 跑得又快又便宜。36 GB 這個數字只算 diffusion transformer 跟 super-resolution transformer 兩個 transformer 的權重，不含 VAE decoder；後面幾層優化，鎖定的也正是這兩個 transformer。</p>
+
+  <p>Avatar IV 不是實驗室原型——它是 HeyGen 已經透過 Web 與 API 對外開放的產品，這也是為什麼記憶體算術與 kernel 效率這種底層細節，值得攤開來寫成一篇完整的技術文章：它們直接決定了正式環境的吞吐量與成本，不是紙上談兵的效能數字。</p>
+
+  <h2>同一個 mesh，兩種切法</h2>
+
+  <p>標準做法是 FSDP（Fully Sharded Data Parallel）：把 36 GB 權重切成幾份，分別放進不同晶片，各自只常駐自己那一份，真正要用到別人手上的參數時再去 gather。HeyGen 把權重跨八顆晶片做 FSDP 切分，正是因為 36 GB 大於單顆 32 GB 的容量——這件事沒有選擇空間，是被記憶體算術逼出來的。</p>
+
+  <p>但光切權重還不夠。影片本身要連續串流輸出，序列長度也是壓力來源，於是團隊另外疊上 Ulysses sequence parallelism，把影片序列本身切開分給不同晶片。關鍵在於這兩種切法「共用同一個 mesh」，不是分開建兩組獨立機群：一個切的維度是「權重」，一個切的維度是「序列」，兩者疊在同一組八晶片群組上運作。</p>
+
+  <p>如果分別建兩組獨立 mesh 會怎樣？文章沒有給答案，這裡只能推想：兩種切法各自建一組獨立晶片群組，等於同一顆晶片要同時應付兩套通訊協調邏輯，通訊路徑會更複雜；共用同一個 mesh，兩種切法用的是同一批晶片、同一套通訊拓樸，協調邏輯不必疊兩層。</p>
+
+  <p>FSDP 解決的是「權重本身放不下」這件事，但晶片上要留的不只權重——算 attention 跟兩個 transformer 中間產生的 activation，也要佔記憶體，而且會隨著序列長度變長而變大。如果只做 FSDP、不把序列也切開，長序列一樣可能把單顆晶片的記憶體撐爆，這正是 Ulysses 要頂住的那一塊。下面這個小工具把這道算術攤開——把晶片數當成可調參數，看每顆晶片要背多少權重、離 32 GB 的天花板還有多少餘裕。真正部署固定用八顆，其餘晶片數只是拿來看清楚這道算術的形狀。</p>
+
+  <figure class="vg-w-param-mesh-heygen-tpu" data-mobile="static" data-svg-scroll="720">
+    <style>
+      .vg-w-param-mesh-heygen-tpu { display: grid; grid-template-rows: auto auto 1fr; gap: var(--s-2); margin: var(--s-4) 0; }
+      .vg-w-param-mesh-heygen-tpu .vg-w-affordance { display: flex; align-items: center; gap: 6px; font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; margin: 0; }
+      .vg-w-param-mesh-heygen-tpu .vg-w-affordance svg { flex: none; width: 14px; height: 14px; }
+      .vg-w-param-mesh-heygen-tpu .controls { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); flex-wrap: wrap; }
+      .vg-w-param-mesh-heygen-tpu .controls input[type="range"] { flex: 1; min-width: 140px; height: 36px; accent-color: var(--accent); touch-action: none; }
+      .vg-w-param-mesh-heygen-tpu .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 4ch; text-align: right; }
+      .vg-w-param-mesh-heygen-tpu svg.vg-w-param-mesh-heygen-tpu-main { width: 100%; height: auto; }
+      .vg-w-param-mesh-heygen-tpu .stats { display: flex; gap: var(--s-3); flex-wrap: wrap; font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+      .vg-w-param-mesh-heygen-tpu .stats strong { font-variant-numeric: tabular-nums; color: var(--ink); }
+      .vg-w-param-mesh-heygen-tpu figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+      @media (max-width: 720px) {
+        .vg-w-param-mesh-heygen-tpu .stats { gap: var(--s-2); }
+      }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h3"/><path d="M16 3h3a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-3"/><path d="M12 8v8"/><path d="m9 11 3-3 3 3"/><path d="m9 13 3 3 3-3"/></svg>
+      <span>拖動 mesh 晶片數，看每顆晶片的權重份額與 32 GB 餘裕 · 1 個滑桿</span>
+    </p>
+
+    <div class="controls" data-vg-controls>
+      <label for="vg-w-param-mesh-heygen-tpu-n">mesh 晶片數 N =</label>
+      <input id="vg-w-param-mesh-heygen-tpu-n" type="range" min="1" max="8" step="1" value="8" />
+      <span class="readout" id="vg-w-param-mesh-heygen-tpu-n-readout">8</span>
+    </div>
+
+    <svg class="vg-w-param-mesh-heygen-tpu-main" viewBox="0 0 720 300" role="img" aria-label="每顆晶片權重份額隨 mesh 晶片數變化，對照 32 GB HBM 上限">
+      <line x1="80" y1="44" x2="640" y2="44" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="3,3" />
+      <text x="650" y="48" font-family="Manrope, sans-serif" font-size="12" fill="var(--muted)">36 GB 總權重（不切分）</text>
+
+      <line x1="80" y1="68" x2="640" y2="68" stroke="var(--accent)" stroke-width="1.5" stroke-dasharray="5,3" />
+      <text x="650" y="72" font-family="Manrope, sans-serif" font-size="12" fill="var(--accent-text)">32 GB HBM 上限</text>
+
+      <line x1="80" y1="260" x2="640" y2="260" stroke="var(--muted-2)" stroke-width="1" />
+      <text x="80" y="280" font-family="EB Garamond, serif" font-size="13" fill="var(--muted)">0 GB</text>
+
+      <rect id="vg-w-param-mesh-heygen-tpu-bar" x="300" width="120" fill="var(--sage-deep)" y="233" height="27" />
+      <text id="vg-w-param-mesh-heygen-tpu-bar-label" x="360" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)" y="223">4.50 GB／顆</text>
+
+      <text x="360" y="20" text-anchor="middle" font-family="EB Garamond, serif" font-size="16" fill="var(--ink)">每顆晶片的權重份額 vs. 32 GB 上限</text>
+
+      <text id="vg-w-param-mesh-heygen-tpu-verdict" x="360" y="296" text-anchor="middle" font-family="Manrope, sans-serif" font-size="14" fill="var(--sage-deep)">還有 27.50 GB 餘裕給 activation／SparseCore 之外的用途</text>
+    </svg>
+
+    <div class="stats">
+      <span>權重份額：<strong id="vg-w-param-mesh-heygen-tpu-shard">4.50</strong> GB／顆</span>
+      <span>相對 32 GB 的餘裕：<strong id="vg-w-param-mesh-heygen-tpu-headroom">27.50</strong> GB</span>
+    </div>
+
+    <figcaption>實際部署固定在 N=8；把 N 當成滑桿只是為了看清楚 36 GB 權重除以晶片數這道算術，何時會撞上 32 GB 的天花板（N=1 時整份權重都要塞進一顆晶片，明顯裝不下）。</figcaption>
+
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        const root = document.querySelector('.vg-w-param-mesh-heygen-tpu');
+        if (!root) return;
+        const input = root.querySelector('#vg-w-param-mesh-heygen-tpu-n');
+        const readout = root.querySelector('#vg-w-param-mesh-heygen-tpu-n-readout');
+        const bar = root.querySelector('#vg-w-param-mesh-heygen-tpu-bar');
+        const barLabel = root.querySelector('#vg-w-param-mesh-heygen-tpu-bar-label');
+        const verdict = root.querySelector('#vg-w-param-mesh-heygen-tpu-verdict');
+        const shardOut = root.querySelector('#vg-w-param-mesh-heygen-tpu-shard');
+        const headroomOut = root.querySelector('#vg-w-param-mesh-heygen-tpu-headroom');
+
+        const TOTAL_GB = 36;
+        const CAP_GB = 32;
+        const SCALE = 6; // px per GB
+        const Y0 = 260;  // baseline y
+
+        function update() {
+          const n = Number(input.value);
+          readout.textContent = String(n);
+          const shard = TOTAL_GB / n;
+          const headroom = CAP_GB - shard;
+          const barHeight = shard * SCALE;
+          const barTop = Y0 - barHeight;
+          bar.setAttribute('y', barTop.toFixed(1));
+          bar.setAttribute('height', barHeight.toFixed(1));
+          barLabel.setAttribute('y', (barTop - 10).toFixed(1));
+          barLabel.textContent = shard.toFixed(2) + ' GB／顆';
+          shardOut.textContent = shard.toFixed(2);
+          headroomOut.textContent = headroom.toFixed(2);
+          if (headroom < 0) {
+            bar.setAttribute('fill', 'var(--accent-text)');
+            verdict.setAttribute('fill', 'var(--accent-text)');
+            verdict.textContent = '超出 32 GB 上限 ' + Math.abs(headroom).toFixed(2) + ' GB，單顆裝不下';
+          } else {
+            bar.setAttribute('fill', 'var(--sage-deep)');
+            verdict.setAttribute('fill', 'var(--sage-deep)');
+            verdict.textContent = '還有 ' + headroom.toFixed(2) + ' GB 餘裕給 activation／SparseCore 之外的用途';
+          }
+        }
+
+        input.addEventListener('input', update);
+        update();
+      })();
+    </script>
+  </figure>
+
+  <p>真正讓這套切分「不用付出代價」的，是 Trillium 的 SparseCore——一個跟主核心並行運作的協處理器，專門非同步搬運每一層的權重 gather。權重搬運這件事丟給 SparseCore 之後，負責矩陣運算的 matrix unit 完全不用等資料就位；原本因為記憶體算術被迫做的切分，幾乎不佔用關鍵路徑上的時間。換句話說，FSDP 決定「要不要切」是被 36 對 32 這個數字逼出來的，SparseCore 決定的是「切了之後要不要付代價」——答案是不用。</p>
+
+  <p>FSDP 的代價通常藏在 all-gather 那一步：要用到某一層的完整權重時，得先跟其他晶片要回自己手上沒有的那幾份，拼成完整的一份才能算。這一步如果排在計算前面等，就是純粹的閒置時間。HeyGen 把這一步整個交給 SparseCore，讓它在背景非同步跑，主核心的 matrix unit 只管算、不管等。</p>
+
+  <h2>讓 all-to-all 別擋路</h2>
+
+  <p>Ulysses 把序列切開分給八顆晶片後，attention 運算需要重新把資料按「head」而不是按「序列片段」排列，這一步要靠 all-to-all collective 在晶片之間搬資料。這類 collective 一般需要所有參與的晶片都到齊才算完成，套在這裡就是任何一顆晶片慢半拍，運算單元都得等在原地——這段機制描述文章沒有寫，是通用通訊模型帶出的背景知識，不是原文的說法。HeyGen 的解法是把 attention 的 head 拆成幾個互相獨立的群組，各自跑自己的 all-to-all、attention、all-to-all 這個順序；每個群組的搬資料動作，現在都有另一個群組的 attention 運算可以躲在後面重疊，XLA 因此把這些搬資料動作換成非同步的 start/done pair，不必所有 head 綁在一起等同一個 collective 收尾。</p>
+
+  <p>從實際 trace 量到的結果是：collective 佔用 compute stream 的時間窗大約收窄了 5 倍，而 attention 本身的運算耗時沒有變。省下來的不是「attention 算得更快」，是「等 collective 搬完資料」這段空等時間變短了。前四個優化（FSDP、Ulysses、SparseCore、head 分組）合起來解決的是同一類問題：怎麼把切分和搬資料這些「非計算」的開銷，從關鍵路徑上擠出去。</p>
+
+  <h2>把 block 縮到 16</h2>
+
+  <p>另一條瓶頸在 sparse attention kernel 本身。這套 kernel 原本要求 block 大小必須是 128 的倍數，團隊把這個限制放寬到 16 的倍數——16 已經是這顆硬體在序列維度上支援的最細 bf16 tiling 粒度。放寬的效果不只是「切得更細」這麼簡單：block 邊界跟真實資料邊界對得更齊之後，原本為了處理「半滿」block 而存在的 mask predicate、多跑一次的掃描、還有拿來湊滿一個 block 用的 padding，三樣東西可以一次全部拿掉。</p>
+
+  <p>在 128 的倍數這個限制下，只要真實資料長度不是剛好的整數倍，尾端那個「半滿」block 就得靠額外邏輯撐住：先判斷這個位置算不算數的 mask predicate、為了不出界而多跑一次的掃描、還有硬湊出一整個 block 的 padding，三者疊在一起本身就要花執行時間。block 邊界改成貼齊真實資料之後，這整組「善後」邏輯直接沒有存在的必要。</p>
+
+  <figure class="vg-w-morph-block-size-heygen-tpu" data-mobile="static" data-svg-scroll="720">
+    <style>
+      .vg-w-morph-block-size-heygen-tpu { display: grid; grid-template-rows: auto auto auto; gap: var(--s-2); margin: var(--s-4) 0; }
+      .vg-w-morph-block-size-heygen-tpu .vg-w-affordance { display: flex; align-items: center; gap: 6px; font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; margin: 0; }
+      .vg-w-morph-block-size-heygen-tpu .vg-w-affordance svg { flex: none; width: 14px; height: 14px; }
+      .vg-w-morph-block-size-heygen-tpu svg.vg-w-morph-block-size-heygen-tpu-main { width: 100%; height: auto; }
+      .vg-w-morph-block-size-heygen-tpu .toggle-row { display: flex; align-items: center; gap: var(--s-2); }
+      .vg-w-morph-block-size-heygen-tpu button { font-family: var(--sans); font-size: var(--fs-sm); min-height: 44px; padding: var(--s-1) var(--s-3); border-radius: 4px; border: 1px solid var(--line); background: var(--bg-soft); color: var(--ink); cursor: pointer; }
+      .vg-w-morph-block-size-heygen-tpu button:hover { border-color: var(--accent); color: var(--accent-text); }
+      .vg-w-morph-block-size-heygen-tpu .state-label { font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); font-variant-numeric: tabular-nums; }
+      .vg-w-morph-block-size-heygen-tpu figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-6.219-8.56"/><path d="M12 7v5l3 3"/></svg>
+      <span>切換 block 大小限制，看 padding 浪費的區塊怎麼縮小 · 1 個按鈕</span>
+    </p>
+
+    <svg class="vg-w-morph-block-size-heygen-tpu-main" viewBox="0 0 720 220" role="img" aria-label="block 大小限制從 128 的倍數放寬到 16 的倍數，padding 區塊隨之縮小">
+      <text x="360" y="24" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">真實資料邊界之後，block 邊界要湊到哪裡才停</text>
+
+      <line x1="80" y1="60" x2="460" y2="60" stroke="var(--sage-deep)" stroke-width="14" />
+      <text x="80" y="48" font-family="Manrope, sans-serif" font-size="12" fill="var(--muted)">真實資料範圍</text>
+      <line x1="460" y1="60" x2="460" y2="60" stroke="none" />
+
+      <g id="vg-w-morph-block-size-heygen-tpu-ticks-coarse">
+        <line x1="80" y1="46" x2="80" y2="74" stroke="var(--muted-2)" stroke-width="1.5" />
+        <line x1="200" y1="46" x2="200" y2="74" stroke="var(--muted-2)" stroke-width="1.5" />
+        <line x1="320" y1="46" x2="320" y2="74" stroke="var(--muted-2)" stroke-width="1.5" />
+        <line x1="440" y1="46" x2="440" y2="74" stroke="var(--muted-2)" stroke-width="1.5" />
+        <line x1="560" y1="46" x2="560" y2="74" stroke="var(--muted-2)" stroke-width="1.5" />
+      </g>
+      <g id="vg-w-morph-block-size-heygen-tpu-ticks-fine" style="display:none">
+        <line x1="80" y1="46" x2="80" y2="74" stroke="var(--muted-2)" stroke-width="1" />
+        <line x1="140" y1="46" x2="140" y2="74" stroke="var(--muted-2)" stroke-width="1" />
+        <line x1="200" y1="46" x2="200" y2="74" stroke="var(--muted-2)" stroke-width="1" />
+        <line x1="260" y1="46" x2="260" y2="74" stroke="var(--muted-2)" stroke-width="1" />
+        <line x1="320" y1="46" x2="320" y2="74" stroke="var(--muted-2)" stroke-width="1" />
+        <line x1="380" y1="46" x2="380" y2="74" stroke="var(--muted-2)" stroke-width="1" />
+        <line x1="440" y1="46" x2="440" y2="74" stroke="var(--muted-2)" stroke-width="1" />
+        <line x1="480" y1="46" x2="480" y2="74" stroke="var(--muted-2)" stroke-width="1" />
+      </g>
+
+      <path id="vg-w-morph-block-size-heygen-tpu-pad" d="M 460 46 L 560 46 L 560 74 L 460 74 Z" fill="var(--accent)" fill-opacity="0.28" stroke="var(--accent)" stroke-width="1" />
+
+      <text x="510" y="100" text-anchor="middle" font-family="Manrope, sans-serif" font-size="12" fill="var(--accent-text)" id="vg-w-morph-block-size-heygen-tpu-pad-label">128 的倍數：最多湊到下一個 128 邊界，浪費區塊較大</text>
+
+      <text x="360" y="140" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--muted)">邊界對齊之後，mask predicate、第二次掃描、padding 三樣一起消失</text>
+
+      <g id="vg-w-morph-block-size-heygen-tpu-state" font-family="Manrope, sans-serif" font-size="13" fill="var(--muted)">
+        <text x="360" y="170" text-anchor="middle">目前：block 限制為 <tspan id="vg-w-morph-block-size-heygen-tpu-state-text" fill="var(--ink)">128</tspan> 的倍數</text>
+      </g>
+    </svg>
+
+    <div class="toggle-row" data-vg-controls>
+      <button type="button" id="vg-w-morph-block-size-heygen-tpu-toggle">切到 16 的倍數</button>
+      <span class="state-label" id="vg-w-morph-block-size-heygen-tpu-side-label">目前顯示：128 的倍數</span>
+    </div>
+
+    <figcaption>示意圖：block 越粗，資料邊界之後要湊到下一個整數倍才能停，浪費的 padding 區塊也越大；16 是這顆硬體支援的最細粒度，浪費區塊隨之縮到最小。實際浪費比例依真實序列長度而定，文章沒有給出具體百分比。</figcaption>
+
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        const root = document.querySelector('.vg-w-morph-block-size-heygen-tpu');
+        if (!root) return;
+        const btn = root.querySelector('#vg-w-morph-block-size-heygen-tpu-toggle');
+        const pad = root.querySelector('#vg-w-morph-block-size-heygen-tpu-pad');
+        const padLabel = root.querySelector('#vg-w-morph-block-size-heygen-tpu-pad-label');
+        const ticksCoarse = root.querySelector('#vg-w-morph-block-size-heygen-tpu-ticks-coarse');
+        const ticksFine = root.querySelector('#vg-w-morph-block-size-heygen-tpu-ticks-fine');
+        const stateText = root.querySelector('#vg-w-morph-block-size-heygen-tpu-state-text');
+        const sideLabel = root.querySelector('#vg-w-morph-block-size-heygen-tpu-side-label');
+
+        const COARSE = 'M 460 46 L 560 46 L 560 74 L 460 74 Z';
+        const FINE = 'M 460 46 L 480 46 L 480 74 L 460 74 Z';
+        let fine = false;
+
+        btn.addEventListener('click', () => {
+          const from = fine ? FINE : COARSE;
+          const to = fine ? COARSE : FINE;
+          pad.animate(
+            [{ d: `path('${from}')` }, { d: `path('${to}')` }],
+            { duration: 500, easing: 'ease-in-out', fill: 'forwards' }
+          );
+          fine = !fine;
+          ticksCoarse.style.display = fine ? 'none' : '';
+          ticksFine.style.display = fine ? '' : 'none';
+          stateText.textContent = fine ? '16' : '128';
+          sideLabel.textContent = '目前顯示：' + (fine ? '16' : '128') + ' 的倍數';
+          padLabel.textContent = fine
+            ? '16 的倍數：最多湊到下一個 16 邊界，浪費區塊縮到最小'
+            : '128 的倍數：最多湊到下一個 128 邊界，浪費區塊較大';
+          btn.textContent = fine ? '切回 128 的倍數' : '切到 16 的倍數';
+        });
+      })();
+    </script>
+  </figure>
+
+  <p>利用率的進展分兩步走：先是 block 邊界對齊帶來的改動，把 kernel 從這種 attention 形狀在這顆硬體上能達到的理論上限的一半左右，推到接近四分之三；接著重寫 kernel 主體之後，再收斂到大約 86%。</p>
+
+  <p>這兩次躍進不是同一批改動：第一次是把 block 邊界對齊到真實資料邊界，這個改動本身帶來的效果；第二次是團隊另外重寫了 kernel 主體之後才拿到的。中間那個「接近四分之三」的數字，代表的是光靠對齊邊界、還沒動 kernel 本體時所推進到的位置。</p>
+
+  <h2>拿掉 softmax 的序列相依</h2>
+
+  <p>標準的 flash-style attention 在算 softmax 時，每個 query row 要維護一個逐步更新的「目前最大值」：每進來一個新的 key block 把最大值推高，就要重新縮放已經累加的結果。這個維護動作，是整條 pipeline 裡最熱的內迴圈裡的一條序列相依鏈——前一個 block 的最大值沒確定，後一個 block 的縮放就沒法算，天生沒法平行展開。</p>
+
+  <p>HeyGen 換了一個算法：用 Cauchy-Schwarz 不等式算出一個上界。一個 query 向量能算出的最大 logit，有一個現成的上界——它自己的 norm，乘上這個 key block 裡最大的 key norm。一小組預先算好的 norm，透過 scalar prefetch 餵進 kernel，讓每一個 row 一開始就能算出自己的上界，不必等看過整個 block 才知道真正的最大值。最大值一旦固定，原本那條 rescaling 的序列相依鏈，就整條從內迴圈消失。這個上界不是對每個 head 都夠緊——在 HeyGen 自己的生產資料上量測，98% 到 99% 的 head 符合套用條件。符合資格與否是逐 head 檢查的，上界不夠緊的那些 head，會在同一個 kernel 裡退回標準的 online softmax 路徑，不是被晾在一邊沒人處理。</p>
+
+  <p>這個上界為什麼成立不難想：兩個向量的內積，最多就是兩者長度（norm）相乘那麼大，方向完全對齊時才會頂到這個上限，方向不對齊只會更小。不必真的做完內積運算才知道會不會超過某個值，光看兩邊的 norm，就能先估出一個絕對安全的上限。</p>
+
+  <h2>兩層驗證，才敢說數字</h2>
+
+  <p>前面每一項改動，能不能真的上線，得先過兩層驗證。第一層針對「不改變運算順序」的改動：輸出影片必須跟基準版本逐幀 hash 完全相等，沒有模糊地帶。第二層針對「會改變編譯後 reduction order」的改動，容許的誤差就是 bf16 重結合（reassociation）本身天生會產生的那個窄誤差帶，不是團隊自己另外放寬的門檻。</p>
+
+  <p>「reduction order」講的是浮點數加總的先後順序——bf16 精度有限，同樣一組數字用不同順序累加，結果會有微小差異，這不是 bug，是浮點運算本身的性質。第二層驗證抓的就是這種必然存在的誤差，劃出一條「這是重結合本身造成的正常誤差」跟「這是改動本身讓輸出跑偏」之間的界線。</p>
+
+  <p>如果所有改動都要求逐幀 hash 完全相同，那些會改變編譯後 reduction order、本質上只是換了個等價運算順序的改動，很可能也會被錯殺（這是本文的推論，原文沒有這樣寫）——bf16 重結合本身就會產生極小的數值差異，跟 hash 比對是零容忍的。分成兩層之後，順序沒變的改動守最嚴的標準，順序有變的改動守合理的標準，兩種情況不會用同一把尺去量。</p>
+
+  <p>這道關卡真的擋下過東西：有一個候選改動，把 diffusion transformer 的 residual stream 降到 bf16，實測端對端確實更快，但輸出跌出了第二層的誤差帶，最後被打回，沒有上線。跑分變快不等於能上線，是這套流程守住的底線。</p>
+
+  <p>這篇文章公開於 2026 年 8 月 13 日，由 HeyGen 團隊、Google Cloud AI 團隊、Google Cloud Field 與 Customer Engineering 團隊三方具名合寫，加起來十二位工程師掛名——比較像雙方工程團隊的聯合技術紀錄，不是單向的客戶案例宣傳。</p>
+
+  <figure class="vg-w-tabs-verification-heygen-tpu" data-mobile="static" data-svg-scroll="560">
+    <style>
+      .vg-w-tabs-verification-heygen-tpu { display: grid; gap: var(--s-2); margin: var(--s-4) 0; }
+      .vg-w-tabs-verification-heygen-tpu input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-tabs-verification-heygen-tpu .vg-w-affordance { display: flex; align-items: center; gap: 6px; font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; margin: 0 0 var(--s-1) 0; }
+      .vg-w-tabs-verification-heygen-tpu .vg-w-affordance svg { flex: none; width: 14px; height: 14px; }
+      .vg-w-tabs-verification-heygen-tpu .tabs { display: flex; gap: var(--s-2); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+      .vg-w-tabs-verification-heygen-tpu .tab { font-family: var(--sans); font-size: var(--fs-sm); padding: var(--s-1) var(--s-2); min-height: 44px; display: flex; align-items: center; cursor: pointer; color: var(--muted); }
+      .vg-w-tabs-verification-heygen-tpu .panel { display: none; padding: var(--s-2) 0; }
+      .vg-w-tabs-verification-heygen-tpu .panel h3 { margin: 0 0 var(--s-1) 0; font-family: var(--display); font-size: var(--fs-md); color: var(--accent-text); }
+      .vg-w-tabs-verification-heygen-tpu .panel p { margin: 0; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-tabs-verification-heygen-tpu:has(#vg-w-tabs-verification-heygen-tpu-t1:checked) .panel-1 { display: block; }
+      .vg-w-tabs-verification-heygen-tpu:has(#vg-w-tabs-verification-heygen-tpu-t1:checked) [for="vg-w-tabs-verification-heygen-tpu-t1"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-verification-heygen-tpu:has(#vg-w-tabs-verification-heygen-tpu-t2:checked) .panel-2 { display: block; }
+      .vg-w-tabs-verification-heygen-tpu:has(#vg-w-tabs-verification-heygen-tpu-t2:checked) [for="vg-w-tabs-verification-heygen-tpu-t2"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-verification-heygen-tpu:has(#vg-w-tabs-verification-heygen-tpu-t3:checked) .panel-3 { display: block; }
+      .vg-w-tabs-verification-heygen-tpu:has(#vg-w-tabs-verification-heygen-tpu-t3:checked) [for="vg-w-tabs-verification-heygen-tpu-t3"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 3v18h18"/><path d="m19 9-5 5-4-4-3 3"/></svg>
+      <span>切換看兩層驗證各自守住什麼，以及一個被打回的候選 · 3 個分頁</span>
+    </p>
+
+    <input type="radio" id="vg-w-tabs-verification-heygen-tpu-t1" name="vg-w-tabs-verification-heygen-tpu-sel" checked />
+    <input type="radio" id="vg-w-tabs-verification-heygen-tpu-t2" name="vg-w-tabs-verification-heygen-tpu-sel" />
+    <input type="radio" id="vg-w-tabs-verification-heygen-tpu-t3" name="vg-w-tabs-verification-heygen-tpu-sel" />
+
+    <div class="tabs" data-vg-controls>
+      <label class="tab" for="vg-w-tabs-verification-heygen-tpu-t1">Tier 1 · 保序改動</label>
+      <label class="tab" for="vg-w-tabs-verification-heygen-tpu-t2">Tier 2 · 改變 reduction order</label>
+      <label class="tab" for="vg-w-tabs-verification-heygen-tpu-t3">被打回的候選</label>
+    </div>
+
+    <div>
+      <div class="panel panel-1">
+        <h3>Tier 1 · byte-identical</h3>
+        <p>套用在不改變運算順序的改動上：輸出影片必須跟基準版本逐幀 hash 完全相等，沒有模糊地帶——差一個 bit 就是沒過。</p>
+      </div>
+      <div class="panel panel-2">
+        <h3>Tier 2 · bf16 重結合誤差帶</h3>
+        <p>套用在會改變編譯後 reduction order 的改動上：容許誤差就是 bf16 重結合（reassociation）本身天生會產生的那條窄誤差帶，不是團隊自己另外放寬的門檻。</p>
+      </div>
+      <div class="panel panel-3">
+        <h3>residual stream 降到 bf16</h3>
+        <p>有一個候選改動把 diffusion transformer 的 residual stream 降到 bf16，端對端實測確實更快，但輸出跌出了 Tier 2 的誤差帶，最後被打回，沒有上線。</p>
+      </div>
+    </div>
+  </figure>
+
+  <p>疊加所有通過驗證的改動之後，Avatar IV 在八晶片 Trillium（v6e）host 上，比團隊自己第一個能跑起來的版本快 1.86 倍。串流效能跟自家 8×H100 產線打平，但每分鐘生成影片的成本，最多可以比 8×H100 低 25%。</p>
+
+  <p>文章沒有細說「第一個可運作版本」具體是什麼樣子，只講清楚它是團隊自己拿來當基準的最早跑得動的版本——1.86 倍是跟自己比，不是跟其他 TPU 方案或其他公司的實作比，這一點在讀這個數字時值得放在心上。下面把貫穿全文的幾個數字並排放在一起看。</p>
+
+  <figure class="vg-w-table-optimization-stack-heygen-tpu" data-mobile="keep">
+    <style>
+      .vg-w-table-optimization-stack-heygen-tpu { overflow-x: auto; margin: var(--s-4) 0; }
+      .vg-w-table-optimization-stack-heygen-tpu table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-optimization-stack-heygen-tpu thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); }
+      .vg-w-table-optimization-stack-heygen-tpu tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); }
+      .vg-w-table-optimization-stack-heygen-tpu td.num { font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; color: var(--accent-text); font-family: var(--mono); }
+    </style>
+    <table>
+      <thead>
+        <tr>
+          <th>機制</th>
+          <th class="num">量測結果</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>head 分組後，all-to-all collective 佔用 compute stream 的時間窗</td><td class="num">縮小約 5×</td></tr>
+        <tr><td>sparse attention block 大小限制</td><td class="num">128 的倍數 → 16 的倍數</td></tr>
+        <tr><td>kernel 利用率（對理論上限）</td><td class="num">約一半 → 近四分之三 → 約 86%</td></tr>
+        <tr><td>符合 Cauchy-Schwarz 上界套用條件的 head 比例</td><td class="num">98 至 99%</td></tr>
+        <tr><td>整體速度 vs. 第一個可運作版本</td><td class="num">1.86×</td></tr>
+        <tr><td>每分鐘生成影片成本 vs. 自家 8×H100</td><td class="num">最多低 25%</td></tr>
+      </tbody>
+    </table>
+  </figure>
+
+  <p>這六層優化不是全部處理同一種瓶頸——FSDP、Ulysses、SparseCore 三層先解決「切分要不要占關鍵路徑」，head 分組跟 block 放寬到 16 兩層再處理 kernel 本身的執行效率，Cauchy-Schwarz 上界拿掉的是 softmax 那條序列相依鏈。三組人馬對付的是三種不同性質的瓶頸，疊起來才會有 1.86 倍這種量級的差距。這裡是本文的推算，不是原文寫的：單獨拿掉任何一層，乘出來的數字應該都會小很多。</p>
+
+  <p>1.86 倍跟最多 25% 的成本差，不是單一一個聰明點子換來的，是六層各自獨立的改動疊加，而且每一層在上線前都先過了兩層驗證篩選——包含一個測出更快、卻因為跌出誤差帶而被打回的候選。36 GB 對 32 GB 這道最初看起來會讓 pipeline 直接跑不起來的算術題，最後變成一條效能追平 8×H100、成本卻更低的生產線。</p>
+
+  <p>這套順序對想把大模型塞進固定記憶體上限的人有參考價值：先算清楚是權重本身裝不下、還是 activation 在跑起來後才爆記憶體，這決定要不要做 FSDP；序列長度如果也是壓力來源，才需要疊上序列並行；等這兩層切分定案之後，才輪到把切分逼出來的搬資料開銷，丟給非同步機制去藏，而不是急著去動 kernel 本身的計算邏輯。</p>
+
+  <p>回到最開頭那道算術：36 GB 的權重跟 32 GB 的晶片，乍看是一道打不贏的題目。六層優化沒有讓 32 GB 變大，也沒有讓 36 GB 變小，改變的是這兩個數字之間，原本要花在切分、搬資料、等待上的那些時間——那些時間，才是真正被壓縮掉的東西。</p>
+
+  <p class="vg-deep-closer"><strong>這套疊加解鎖了什麼</strong>：權重比單顆晶片記憶體大這件事，原本足以讓一條 pipeline 直接跑不起來；疊上 FSDP、Ulysses、SparseCore、head 分組、block 放寬到 16、Cauchy-Schwarz 上界六層改動，再通過兩層驗證篩掉不合格的候選之後，同一套算術題變成一條在自家 TPU 機隊上、效能追平 8×H100、成本卻最多省 25% 的生產線。</p>
+</div>
