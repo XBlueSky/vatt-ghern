@@ -1,0 +1,947 @@
+{
+  "output_path": "src/posts/2026/08/16/deep-mcp-traffic-detection.html",
+  "spine": [
+    "1. Cloudflare Gateway 過去用 hostname 與路徑關鍵字（含 mcp、/mcp、/sse）猜測流量是不是 MCP，這個方法既會漏掉不符合命名慣例的合法 MCP endpoint，也可能誤判無關流量。",
+    "2. 讓 wire-level 辨識成為可能的前提不是偵測技術進步，而是 MCP 規格自己先變了：2025-11-25 版要求 client 在 initialize 完成後的每個 request 帶 MCP-Protocol-Version 標頭，2026-07-28 版把 initialize handshake 整個拿掉，改成每個 POST 都各自宣告版本、session 機制一併移除。",
+    "3. 協定版本從「連線建立時協商一次」變成「每個請求都必須攜帶的欄位」，才讓 Gateway 有機會不靠猜測、直接讀一個標頭字串分類 MCP 流量。",
+    "4. Gateway 把這個訊號包成 policy 端可用的 experimental.is_mcp 布林 selector，只在 TLS 解密過的請求上有效；再用 mcp_portal Traffic Source 標籤區分經 Portal 代理與直連上游的流量，並有預設規則封鎖未經 Portal 的已偵測 MCP 流量。",
+    "5. Shadow MCP（組織未核准、員工自己找到並連上的伺服器）與 Portal bypass（已核准、但員工繞過 Portal 直連上游 URL）是兩個不同的威脅面，一個是未知伺服器，一個是已知伺服器的未受控路徑——兩者在 mcp_portal 標籤上可能長得一樣。",
+    "6. 三個控制層各自的覆蓋範圍不同：client hook 能在 request 序列化前攔截，但要在每個 client 重建同一套規則；network proxy 視角最廣、涵蓋所有走過 managed path 且 TLS 解密過的流量，但看不到 stdio 呼叫與離網流量；server middleware 執行 context 最豐富、是工具執行前最後一關，但只在自己收到請求那一刻才生效。",
+    "7. 來源沒有公開 heuristic 判斷的內部細節、誤判率、也沒有揭露 TLS 解密加標頭檢查對延遲的實際影響，這些空白要老實承認，不能用推測填滿。"
+  ],
+  "sources": [
+    {
+      "url": "https://blog.cloudflare.com/mcp-security-updates/",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": "2026-08",
+      "perspective": {
+        "mechanism": "Gateway 把 MCP 流量辨識從 URL/hostname 字串匹配換成讀取 MCP-Protocol-Version 標頭，在 TLS 解密之後對每個 request 檢查該標頭是否存在，存在即回傳 experimental.is_mcp = true 供 policy 引用；另用 mcp_portal Traffic Source 標籤區分流量是否經過 MCP Portal 代理。",
+        "tradeoff": "wire-level 標頭辨識比 URL 猜測精準，但仍完全依賴 TLS 解密——沒解密、走 stdio、離網、或屬於 Do Not Inspect 名單的流量,Gateway 一律看不到；shadow MCP 與 Portal bypass 用同一個「沒有 Portal 標籤」的訊號表示，policy 無法單靠這個訊號分辨兩者。",
+        "reader_use": "在導入 Zero Trust Gateway 的團隊裡，工程師可以用 is_mcp 布林寫細粒度的 Allow/Block policy,但要清楚這個 selector 的前提是 TLS 解密開著、而且不能涵蓋 stdio 或未受檢流量——部署前得先盤點哪些路徑根本不會流經 Gateway。"
+      }
+    },
+    {
+      "url": "https://modelcontextprotocol.io/specification/2025-11-25/basic/transports",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": "2025-11-25",
+      "perspective": {
+        "mechanism": "2025-11-25 版规定：一旦 initialize 交换完成，client 必须在之后所有 HTTP request 上带 MCP-Protocol-Version 标头；这个阶段仍保留 session 概念（MCP-Session-Id）与 initialize handshake，标头只是「协商结果」的镜射,不是唯一真相来源。",
+        "tradeoff": "标头存在与否取决于 initialize 是否先发生过——第一个 initialize 请求本身按规定不带这个标头，纯 wire-level 中间人在会话最开始那一刻仍然看不到协定版本。",
+        "reader_use": "工程师若要在这个版本的 MCP 上做流量分类，必须理解 initialize 请求是盲区,只有初始化之后的请求才带有效标头,单纯的标头检测在会话开头会失灵。"
+      }
+    },
+    {
+      "url": "https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": "2026-07-28",
+      "perspective": {
+        "mechanism": "2026-07-28 版移除了 GET stream endpoint 与 protocol-level session（MCP-Session-Id 不再使用),改成每个 POST 都必须带 MCP-Protocol-Version 标头,且该值必须与 request body 里 _meta 栏位的版本一致，不一致会被 400 HeaderMismatch 拒绝。",
+        "tradeoff": "拿掉 session 换来的是「每个请求自我完备」——中间人不需要追踪跨请求的会话状态就能判定协定版本，但也意味着旧版 client（预期 initialize handshake）与新版 server 完全不相容,需要靠错误 body 内容做 era 侦测。",
+        "reader_use": "写 client 或中间层代码的工程师要意识到，从这个版本开始「协定版本」是逐请求栏位而非连线属性——任何缓存版本判定结果跨请求复用的旧逻辑都要重写。"
+      }
+    },
+    {
+      "url": "https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": "2026-07-28",
+      "perspective": {
+        "mechanism": "versioning 页面把两个时代命名清楚：modern（2026-07-28 起,逐请求 metadata 携带版本/身份/能力）与 legacy（2025-11-25 及以前,靠 initialize handshake 建立会话）。没有协商 handshake，每个请求独立被接受或拒绝。",
+        "tradeoff": "modern 与 legacy 之间没有自动升级路径——legacy client 打 modern server 会直接失败，因为 legacy client 不知道要送 per-request metadata；这个断裂是刻意设计,不是过渡期疏漏。",
+        "reader_use": "决定要不要跟进新版协定的工程师，可以用这页的相容性矩阵判断自己的 client/server 组合会不会在升级后互相打不通。"
+      }
+    },
+    {
+      "url": "https://modelcontextprotocol.io/specification/2026-07-28/basic/transports",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": "2026-07-28",
+      "perspective": {
+        "mechanism": "transports 总览页说明 Streamable HTTP 是唯一的现行 HTTP 绑定，且明确将「connection-scoped session 与 initialize handshake」归类为「earlier protocol revisions」的特征，与 2026-07-28 的逐请求模型对照。",
+        "tradeoff": "把协定语意与 transport 绑定分开描述，代价是读者要同时理解两层规则才能推出「协定版本从连线属性变成请求栏位」这个结论——规格文件本身没有直接下这句结论。",
+        "reader_use": "工程师读这页可以确认 stdio 与 Streamable HTTP 共享同一套核心讯息语意，只有 transport 层的 metadata 携带方式不同,写跨 transport 的 client 时不用重复实作协定逻辑。"
+      }
+    }
+  ],
+  "notes": [
+    {
+      "id": "n01",
+      "url": "https://blog.cloudflare.com/mcp-security-updates/",
+      "quote": "hostnames containing `mcp` and common paths like `/mcp` or `/sse`",
+      "hedge": "asserted",
+      "interpretation": "Gateway 早期版本用這幾種字串/路徑組合當作 MCP 流量的判斷依據,屬於純粹的 URL 命名慣例猜測法。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n02",
+      "url": "https://blog.cloudflare.com/mcp-security-updates/",
+      "quote": "Those signals are still useful for finding traffic from older clients and providing historical visibility, but they're very basic. They miss an MCP server at an ordinary URL like https://tools.example.com/api, which is not uncommon. And they can match an unrelated service that happens to use `mcp` in a hostname or path (unlikely, but we have seen it).",
+      "hedge": "asserted",
+      "interpretation": "舊方法（hostname/路徑字串比對）的兩個具體缺陷：會漏掉不符合命名慣例的合法 MCP endpoint（如這個範例 URL，且並不罕見），也可能誤判含 mcp 字串但實際無關的服務——但源文本身把後者標為「unlikely, but we have seen it」，是罕見情況，不是這個方法系統性容易誤判。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n03",
+      "url": "https://modelcontextprotocol.io/specification/2025-11-25/basic/transports",
+      "quote": "If using HTTP, the client **MUST** include the `MCP-Protocol-Version: <protocol-version>` HTTP header on all subsequent requests to the MCP server, allowing the MCP server to respond based on the MCP protocol version.",
+      "hedge": "asserted",
+      "interpretation": "2025-11-25 版規定 initialize 完成後的所有請求都要帶版本標頭，但 initialize 本身這一次請求不受此規則約束。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n04",
+      "url": "https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http",
+      "quote": "Every POST request to the MCP endpoint **MUST** include an `MCP-Protocol-Version` header.",
+      "hedge": "asserted",
+      "interpretation": "2026-07-28 版把範圍從「initialize 之後的請求」擴大成「每一個 POST」，不再有豁免的第一個請求。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n05",
+      "url": "https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http",
+      "quote": "Revision 2026-07-28 changed the behavior of Streamable HTTP. Clients must ensure they handle backwards compatibility correctly. Changes included: * Removal of the GET stream endpoint. * Removal of protocol-level sessions.",
+      "hedge": "asserted",
+      "interpretation": "2026-07-28 版連 session 機制本身都拿掉了,不只是標頭規則變嚴——這代表 MCP-Session-Id 這類跨請求識別手段不存在,協定完全靠逐請求 metadata 運作。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n06",
+      "url": "https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning",
+      "quote": "There is no negotiation handshake. Every request carries its protocol version, and the server accepts or rejects each request independently",
+      "hedge": "asserted",
+      "interpretation": "這是對「協定版本從連線層變成請求層」最直接的規格陳述——每個請求獨立被接受或拒絕，伺服器不需要記得之前協商過什麼。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n07",
+      "url": "https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning",
+      "quote": "**Modern**: protocol versions that convey version, identity, and capabilities as per-request metadata (revision `2026-07-28` and later). * **Legacy**: protocol versions that establish a session with an `initialize` handshake (`2025-11-25` and earlier).",
+      "hedge": "asserted",
+      "interpretation": "規格自己把 2026-07-28 前後劃成兩個時代,分界點正是 initialize handshake 存不存在。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n08",
+      "url": "https://modelcontextprotocol.io/specification/2026-07-28/basic/transports",
+      "quote": "Streamable HTTP was introduced in protocol version 2025-03-26 as a replacement for the HTTP+SSE transport from protocol version 2024-11-05.",
+      "hedge": "asserted",
+      "interpretation": "Streamable HTTP 這個 transport 本身在 2025-03-26 就存在了，早於版本標頭被定義；標頭是後來加進這個既有 transport 的規則。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n09",
+      "url": "https://blog.cloudflare.com/mcp-security-updates/",
+      "quote": "The initial request from a legacy client may not contain it, protocol versions earlier than 2025-06-18 did not define it, and local `stdio`, custom transport, or nonconforming traffic may never carry it.",
+      "hedge": "hedged",
+      "interpretation": "Cloudflare 自己列出標頭偵測法的已知限制：2025-06-18 之前的協定版本根本沒有這個標頭、legacy client 的第一個請求可能沒帶、stdio 與自訂 transport 可能永遠不會有這個標頭。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n10",
+      "url": "https://blog.cloudflare.com/mcp-security-updates/",
+      "quote": "Gateway inspects that header on every TLS-inspected request and classifies the traffic accordingly, using detection built from patterns we observe across the millions of requests that traverse the Cloudflare network every day.",
+      "hedge": "asserted",
+      "interpretation": "Gateway 的分類機制建立在「觀察到的流量模式」上，但具體是什麼模式、怎麼判斷、誤判率多少，這句話完全沒有交代——這是來源留白的地方。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n11",
+      "url": "https://blog.cloudflare.com/mcp-security-updates/",
+      "quote": "If Gateway detects the `MCP-Protocol-Version` header on a TLS-inspected request, the value is `true`, and an administrator can use it in an Allow or Block policy.",
+      "hedge": "asserted",
+      "interpretation": "is_mcp 這個 selector 明確只在「TLS 已解密」的前提下才有效，且只在偵測到標頭時才給 true——沒提到標頭不存在時的明確回傳值，屬於合理補完而非直接引述。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n12",
+      "url": "https://blog.cloudflare.com/mcp-security-updates/",
+      "quote": "Any detected MCP traffic that did not arrive through a Portal gets blocked; traffic that came through the Portal is unaffected.",
+      "hedge": "asserted",
+      "interpretation": "這是一條預設 enforcement 規則,把 is_mcp 判定跟 mcp_portal 標籤組合成 Allow/Block 動作，用於封鎖已被偵測到、但沒走 Portal 的 MCP 流量。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n13",
+      "url": "https://blog.cloudflare.com/mcp-security-updates/",
+      "quote": "A connection to a server the organization has not approved. An employee finds the server in a repository, a product guide, or a message from a colleague.",
+      "hedge": "asserted",
+      "interpretation": "shadow MCP 的定義——重點在「組織未核准」，伺服器本身從未進入受管理的清單。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n14",
+      "url": "https://blog.cloudflare.com/mcp-security-updates/",
+      "quote": "An approved server that the organization has placed in an MCP Portal, but an employee connects to its upstream URL directly and skips the Portal's Access policy.",
+      "hedge": "asserted",
+      "interpretation": "Portal bypass 的定義——伺服器本身是核准過的,問題出在連線路徑繞過了 Portal 的存取政策。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n15",
+      "url": "https://blog.cloudflare.com/mcp-security-updates/",
+      "quote": "A client hook can run after the model selects a tool but before the client serializes the request.",
+      "hedge": "asserted",
+      "interpretation": "client hook 這個控制點的時機是「工具已選定、但請求還沒序列化送出前」，屬於三層控制點裡最早能介入的一層。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n16",
+      "url": "https://blog.cloudflare.com/mcp-security-updates/",
+      "quote": "they would need to reproduce their controls across every client",
+      "hedge": "hedged",
+      "interpretation": "client hook 的盲點是規則不會自動跨 client 生效——每換一個 client 實作,安全團隊都得重新把同一套規則刻一遍。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n17",
+      "url": "https://blog.cloudflare.com/mcp-security-updates/",
+      "quote": "The network layer has the widest lens to detect remote MCP traffic on managed paths.",
+      "hedge": "asserted",
+      "interpretation": "network proxy（如 Gateway）的優勢是視角最廣，但這裡的「widest lens」有限定詞「on managed paths」——不是無條件的全面覆蓋。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n18",
+      "url": "https://blog.cloudflare.com/mcp-security-updates/",
+      "quote": "The server has the richest execution context... this is the last point where the request can be denied before the tool runs.",
+      "hedge": "asserted",
+      "interpretation": "server middleware 的優勢是掌握最豐富的執行 context,而且是工具真正執行前的最後把關點。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n19",
+      "url": "https://blog.cloudflare.com/mcp-security-updates/",
+      "quote": "Proxies cannot see local `stdio` calls or off-network traffic.",
+      "hedge": "asserted",
+      "interpretation": "network proxy 這層的明確盲點：本機 stdio 呼叫與離網流量完全在視野之外。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n20",
+      "url": "https://blog.cloudflare.com/mcp-security-updates/",
+      "quote": "Direct encrypted traffic must pass through TLS decryption before Gateway can inspect these headers, and local `stdio` servers, off-network connections, Do Not Inspect traffic, and requests that never traverse Gateway remain outside this view.",
+      "hedge": "asserted",
+      "interpretation": "把 Gateway 這層方法的完整限制條件講清楚：只要沒過 TLS 解密、走 stdio、離網、屬於 Do Not Inspect 名單、或根本沒流經 Gateway,這套偵測法一律看不到。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n21",
+      "url": "https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning",
+      "quote": "A server that supports only modern versions SHOULD name the protocol versions it supports in any error it returns to an initialize request, on any transport: legacy clients have no fall-forward mechanism, and this message may be the only diagnostic they can surface to users.",
+      "hedge": "asserted",
+      "interpretation": "規格明確標示 modern-only server 對 legacy client 是硬性失敗，legacy client 沒有自動降級路徑，只能靠錯誤訊息裡的診斷資訊人工排查。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n22",
+      "url": "https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http",
+      "quote": "The header value MUST match the io.modelcontextprotocol/protocolVersion field carried in the request body's _meta. If the values do not match, the server MUST reject the request with 400 Bad Request and a HeaderMismatch JSON-RPC error",
+      "hedge": "asserted",
+      "interpretation": "協定本身要求標頭與 body 版本欄位一致，不一致就拒絕；這代表 Gateway 這類只讀標頭的中間層可以合理信任標頭值，因為協定已經把偽造/不一致的情況擋在伺服器端。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n23",
+      "url": "https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning",
+      "quote": "Clients MAY call it before sending any other requests to learn the server's supported versions up front, but are not required to: a client is free to invoke any RPC inline and handle UnsupportedProtocolVersionError if its preferred version is not supported.",
+      "hedge": "asserted",
+      "interpretation": "server/discover 是選用的前置探測手段，不是強制步驟；即使不用它，client 仍可直接送請求、靠錯誤回應重試，版本協商整體維持逐請求、錯誤驅動的模式。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n24",
+      "url": "https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http",
+      "quote": "Server-to-client interactions (sampling, elicitation, roots) are embedded in results as input requests per Multi Round-Trip Requests (MRTR) (SEP-2322).",
+      "hedge": "asserted",
+      "interpretation": "2026-07-28 版拿掉獨立 SSE 推播管道後，伺服器需要 client 提供更多資訊時改用 InputRequiredResult 包在回應裡，client 帶著答案重送原始請求，而不是伺服器另開連線主動發話。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n25",
+      "url": "https://blog.cloudflare.com/mcp-security-updates/",
+      "quote": "When MCP Portal traffic routes through Gateway it carries an `mcp_portal` Traffic Source, which lets policy distinguish Portal-proxied requests from direct employee connections.",
+      "hedge": "asserted",
+      "interpretation": "mcp_portal 是 Gateway 用的一個 Traffic Source 標籤，專門標示一段流量是否經過 MCP Portal 代理，讓 policy 可以把 Portal-proxied 的請求跟員工直連的請求分開處理——這是 is_mcp 之外的第二個獨立訊號。",
+      "timeliness": "durable"
+    }
+  ],
+  "claims": [
+    {
+      "id": "c01",
+      "claim_text": "（修正前）Gateway 舊版的判斷邏輯很直接：檢查 hostname 或路徑裡有沒有出現「hostnames containing mcp and common paths like /mcp or /sse」這種字串組合，符合就當作 MCP 流量處理。",
+      "location": "H2「舊方法：URL pattern 的猜測遊戲」",
+      "type": "attribution",
+      "load": "high",
+      "note_ids": [
+        "n01"
+      ],
+      "independence": "single-source",
+      "verdict": "unverifiable",
+      "hedge_delta": "none",
+      "evidence": "Our first approach to finding MCP traffic used the GraphQL Analytics API to search Gateway HTTP logs for hostnames containing `mcp` and common paths like `/mcp` or `/sse`. Our MCP traffic detection tutorial includes the query.",
+      "note": "嵌入的英文片段是逐字的，但周圍的歸屬不是。來源描述的是 Cloudflare 自己跑的事後 log 搜尋（GraphQL Analytics API 查 Gateway HTTP logs）用來「找出」MCP 流量，不是 Gateway 對流量套用的即時分類規則。post 把一個探索用查詢升級成 Gateway 自己的 policy 邏輯。",
+      "action": "correct",
+      "resolution": "corrected",
+      "fix_applied": "改寫為 Cloudflare 用 GraphQL Analytics API 對 Gateway HTTP logs 做的事後搜尋，並補上來源另一句隱含的事實（管理者過去得自己維護 MCP-looking domains 清單），不再宣稱那是 Gateway 內建的分類規則。",
+      "recheck_round": 2
+    },
+    {
+      "id": "c02",
+      "claim_text": "（修正前）Cloudflare 自己承認「this misses ordinary URLs like https://tools.example.com/api and risks false positives」",
+      "location": "H2「舊方法：URL pattern 的猜測遊戲」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n02"
+      ],
+      "independence": "single-source",
+      "verdict": "unverifiable",
+      "hedge_delta": "inflated",
+      "evidence": "Those signals are still useful for finding traffic from older clients and providing historical visibility, but they're very basic. They miss an MCP server at an ordinary URL like https://tools.example.com/api, which is not uncommon. And they can match an unrelated service that happens to use `mcp` in a hostname or path (unlikely, but we have seen it).",
+      "note": "引文捏造。該英文字串在原文中完全不存在，是 WebFetch 摘要器把兩個分開的來源句焊在一起並改寫而成。被捏造的措辭（risks false positives）同時抹掉了來源自己的 hedge（unlikely, but we have seen it），因此 hedge_delta 判為 inflated。",
+      "action": "correct",
+      "resolution": "corrected",
+      "fix_applied": "post 改為引用兩句真實原文並保留來源的 hedge；ledger note n02 的 quote 欄位也從捏造字串換成上述逐字原文（這是唯一允許修改既有 note quote 的情況，因為原值本來就不是逐字來源文字）。修正前作者已重新抓取原文逐字核對。",
+      "recheck_round": 2
+    },
+    {
+      "id": "c03",
+      "claim_text": "（修正前，三處未標推斷）真正讓 Gateway 不用再猜的，不是偵測技術進步，而是 MCP 規格自己先把 initialize handshake 整個拿掉。",
+      "location": "hero opener、dropcap 導言、MCP-Protocol-Version 段末",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "這是全篇的立論，屬作者綜合，不是任何來源的發現。重新抓取 Cloudflare 原文專門尋找把 2026-07-28 規格變更與 Gateway 新偵測能力連起來的句子：不存在。原文把規格變更與 Gateway 讀標頭當成兩件分開的事陳述，從未主張因果；規格頁面更完全沒提到 Gateway。post 在別處已用「推測起來」「看得出來的是」正確標示同一個想法，但這三處是平述。",
+      "action": "mark-inferred",
+      "resolution": "corrected",
+      "fix_applied": "三處都補上「推測起來，」的推斷標記（opener 保持精簡）。論點本身保留，只是不再以來源的發現呈現。",
+      "recheck_round": 2
+    },
+    {
+      "id": "c04",
+      "claim_text": "（修正前）如果團隊想涵蓋更多可能的 MCP endpoint，唯一的辦法是把符合條件的關鍵字表越列越長，清單越長，誤判的表面積也跟著變大。",
+      "location": "H2「舊方法：URL pattern 的猜測遊戲」",
+      "type": "superlative",
+      "load": "medium",
+      "note_ids": [],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": "an administrator can use it in an Allow or Block policy without maintaining their own list of MCP-looking domains",
+      "note": "未標示的絕對化主張（唯一的辦法）。來源只支持較弱的事實：管理者過去得自己維護 MCP-looking domains 清單；沒有說加長關鍵字表是唯一選項，也沒有說誤判表面積會隨清單長度成長。",
+      "action": "mark-inferred",
+      "resolution": "corrected",
+      "fix_applied": "改為「比較合理的推測是，……得靠把符合條件的關鍵字表越列越長——清單一長，誤判的表面積很可能也跟著變大」，加上推斷標記與機率性措辭。",
+      "recheck_round": 2
+    },
+    {
+      "id": "c05",
+      "claim_text": "推測起來，Cloudflare 沒有選擇繼續加大 URL pattern 的比對範圍，卡住的原因在協定本身沒把訊號做出來。",
+      "location": "H2「舊方法：URL pattern 的猜測遊戲」",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "推斷標記「推測起來」確認存在於句首並統攝整段。合法的已標示綜合。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c06",
+      "claim_text": "「Streamable HTTP was introduced in protocol version 2025-03-26 as a replacement for the HTTP+SSE transport from protocol version 2024-11-05」",
+      "location": "H2「MCP-Protocol-Version」",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n08"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Streamable HTTP was introduced in protocol version 2025-03-26 as a replacement for the [HTTP+SSE transport][http-sse] from protocol version 2024-11-05.",
+      "note": "逐字（僅去掉 markdown 連結語法）。Ledger 衛生：n08 把這句記在 .../basic/transports，但該總覽頁沒有這句，實際出自 .../basic/transports/streamable-http；主張成立，建議修正 n08 的 url 欄位。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c07",
+      "claim_text": "2025-06-18 才第一次定義 MCP-Protocol-Version",
+      "location": "H2「MCP-Protocol-Version」",
+      "type": "date-version",
+      "load": "medium",
+      "note_ids": [
+        "n09"
+      ],
+      "independence": "corroborated",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "protocol versions earlier than 2025-06-18 did not define it（Cloudflare）／ A server that supports clients implementing protocol versions earlier than `2025-06-18` (which did not define the `MCP-Protocol-Version` header)...（2026-07-28 spec）",
+      "note": "由兩個真正獨立的出處佐證——Cloudflare 工程部落格與 modelcontextprotocol.io 規範文件，兩者對 2025-06-18 這個分界一致。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c08",
+      "claim_text": "「client MUST include the MCP-Protocol-Version HTTP header on all subsequent requests to the MCP server」",
+      "location": "H2「MCP-Protocol-Version」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n03"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "If using HTTP, the client **MUST** include the `MCP-Protocol-Version: <protocol-version>` HTTP header on all subsequent requests to the MCP server, allowing the MCP server to respond based on the MCP protocol version.",
+      "note": "逐字核對 2025-11-25 版 Protocol Version Header 段落。post 引用子字串，略去開頭條件子句與值佔位符，屬 trivial elision。post 對 subsequent 的註解與同頁 session 流程一致。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c09",
+      "claim_text": "「Every POST request to the MCP endpoint MUST include an MCP-Protocol-Version header」",
+      "location": "H2「MCP-Protocol-Version」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n04"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Every POST request to the MCP endpoint **MUST** include an `MCP-Protocol-Version` header.",
+      "note": "逐字核對 2026-07-28 版 Request Metadata → Protocol Version Header 段落。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c10",
+      "claim_text": "「Removal of the GET stream endpoint」與「Removal of protocol-level sessions」，MCP-Session-Id 不再使用",
+      "location": "H2「MCP-Protocol-Version」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n05"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Changes included: * Removal of the GET stream endpoint. * Removal of protocol-level sessions. ... An `Mcp-Session-Id` header on a request: ignore it, and do not mint or echo session IDs.",
+      "note": "兩個 changelog 條目逐字。額外斷言「MCP-Session-Id 不再使用」由同頁 Earlier Streamable HTTP Revisions 段落獨立確認。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c11",
+      "claim_text": "「There is no negotiation handshake. Every request carries its protocol version, and the server accepts or rejects each request independently」",
+      "location": "H2「MCP-Protocol-Version」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n06"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "There is no negotiation handshake. Every request carries its protocol version, and the server accepts or rejects each request independently:",
+      "note": "逐字（僅去掉句末冒號，該冒號引出一張 mermaid 圖）。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c12",
+      "claim_text": "把 2026-07-28 之後稱為 modern、2025-11-25 之前稱為 legacy",
+      "location": "H2「MCP-Protocol-Version」",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n07"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "* **Modern**: protocol versions that convey version, identity, and capabilities as per-request metadata (revision `2026-07-28` and later). * **Legacy**: protocol versions that establish a session with an `initialize` handshake (`2025-11-25` and earlier).",
+      "note": "逐字出自 versioning 頁 Terminology 段；中文轉述同時保留 metadata 三元組與 handshake 判準。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c13",
+      "claim_text": "legacy client 打上 modern-only server 會直接失敗……唯一能兩邊都討好的是 dual-era 實作",
+      "location": "H2「MCP-Protocol-Version」",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n07",
+        "n21"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "| Legacy | Modern | Fails. ... Legacy clients have no fall-forward mechanism. | ... * **Dual-era**: an implementation that supports both modern and legacy versions. ... attempt a modern request and inspect the body of a `400 Bad Request` before falling back.",
+      "note": "相容性矩陣確認 Legacy→Modern 為 Fails、Dual-era 兩側皆 Works，故「唯一能兩邊都討好」在矩陣的 client-era 軸上成立。僅部分追溯：沒有 note 承載矩陣列或 Dual-era 條目，值得補 note，但重抓來源支持該句的強度。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c14",
+      "claim_text": "「A server that supports only modern versions SHOULD name the protocol versions it supports in any error it returns to an initialize request...」",
+      "location": "H2「MCP-Protocol-Version」",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n21"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "A server that supports only [modern](#terminology) versions **SHOULD** name the protocol versions it supports in any error it returns to an `initialize` request, on any transport: legacy clients have no fall-forward mechanism, and this message may be the only diagnostic they can surface to users.",
+      "note": "逐字（僅去除連結與 code-span 標記）。post 的框架語未把 SHOULD 升級成 MUST。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c15",
+      "claim_text": "標頭值必須與 request body 的 _meta 版本一致，不一致要用 400 Bad Request 搭配 HeaderMismatch 拒絕",
+      "location": "H2「MCP-Protocol-Version」",
+      "type": "attribution",
+      "load": "high",
+      "note_ids": [
+        "n22"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The header value **MUST** match the `io.modelcontextprotocol/protocolVersion` field carried in the request body's `_meta`. If the values do not match, the server **MUST** reject the request with `400 Bad Request` and a `HeaderMismatch` JSON-RPC error",
+      "note": "逐字，兩個 MUST 都保留。HeaderMismatch 的錯誤碼 -32020 在同頁 Server Validation 表中確認。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c16",
+      "claim_text": "這個設計是衝著中間層而來的——如果標頭跟 body 可以各說各話，任何只在標頭層做判斷的裝置都可能被偽造的標頭誤導",
+      "location": "H2「MCP-Protocol-Version」",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [
+        "n22"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "This prevents potential security vulnerabilities when different components in the network rely on different sources of truth (e.g., a load balancer routing on the header value while the MCP server executes based on the body value).",
+      "note": "規格自己就給出這個理由，並點名網路中介裝置（load balancer）為確切案例，故 post 的因果解讀是來源自己的，不是作者外推。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c17",
+      "claim_text": "server/discover 讓 client 可以先問支援哪些版本，但這一步是 MAY 不是 MUST",
+      "location": "H2「MCP-Protocol-Version」",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n23"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Servers **MUST** implement [`server/discover`]... Clients **MAY** call it before sending any other requests to learn the server's supported versions up front, but are not required to: a client is free to invoke any RPC inline and handle `UnsupportedProtocolVersionError` if its preferred version is not supported.",
+      "note": "逐字，且 MAY/MUST 的範圍正確：post 的「這一步是 MAY」指的是 client 呼叫。對抗性檢查：緊鄰的 Servers MUST implement 有被誤讀成強制探索的風險，post 沒有犯這個錯。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c18",
+      "claim_text": "GET stream endpoint 被拿掉，伺服器改把需求包進回應、由 client 帶著答案重送",
+      "location": "H2「MCP-Protocol-Version」",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [
+        "n05",
+        "n24"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "clients could open a standalone SSE stream with HTTP GET to receive server-initiated messages ... None of these mechanisms are part of this revision. ／ It returns an `InputRequiredResult` containing `inputRequests`, and the client retries the original request with the matching `inputResponses`.",
+      "note": "兩半都在重抓的 2026-07-28 streamable-http 頁確認，2025-11-25 頁亦獨立確認被移除的行為。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c19",
+      "claim_text": "「The initial request from a legacy client may not contain it, protocol versions earlier than 2025-06-18 did not define it, and local stdio, custom transport, or nonconforming traffic may never carry it」",
+      "location": "H2「MCP-Protocol-Version」",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n09"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The initial request from a legacy client may not contain it, protocol versions earlier than 2025-06-18 did not define it, and local `stdio`, custom transport, or nonconforming traffic may never carry it.",
+      "note": "逐字到句末句點，用中性 prompt 重抓確認（先前一次抓取曾在句中截斷）。note 記為 hedged，post 的轉述保留 may，無膨脹。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c20",
+      "claim_text": "看得出來的是，只有當協定版本變成每個請求都必須自帶的欄位，Gateway 這種無狀態裝置才有辦法單靠讀一個 request 完成分類",
+      "location": "H2「MCP-Protocol-Version」（時間軸 widget 之後）",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [
+        "n06"
+      ],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "推斷標記「看得出來的是」確認存在於句首。其立論前提（逐請求無狀態）本身有出處，關於 Gateway 的結論是作者的，已正確標示。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c21",
+      "claim_text": "「If Gateway detects the MCP-Protocol-Version header on a TLS-inspected request, the value is true, and an administrator can use it in an Allow or Block policy」",
+      "location": "H2「is_mcp 與 mcp_portal」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n11"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "If Gateway detects the `MCP-Protocol-Version` header on a TLS-inspected request, the value is `true`, and an administrator can use it in an Allow or Block policy without maintaining their own list of MCP-looking domains.",
+      "note": "逐字子字串，用中性 prompt 重抓確認。post 在 domains 清單之前截斷，損失資訊但未扭曲。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c22",
+      "claim_text": "Gateway 另外用一個叫 mcp_portal 的 Traffic Source 標籤區分流量有沒有經過 MCP Portal 代理",
+      "location": "H2「is_mcp 與 mcp_portal」（並見 H2 標題、closer、表格與 widget）",
+      "type": "attribution",
+      "load": "high",
+      "note_ids": [
+        "n25"
+      ],
+      "independence": "single-source",
+      "verdict": "unverifiable",
+      "hedge_delta": "none",
+      "evidence": "When MCP Portal traffic routes through Gateway it carries an `mcp_portal` Traffic Source, which lets policy distinguish Portal-proxied requests from direct employee connections.",
+      "note": "追溯失敗：mcp_portal 是全篇兩個主打 selector 之一，出現在 H2、closer、表格與 widget，但原 notes 沒有任何一條提到它（n12 只涵蓋 Portal 封鎖規則，不含 Traffic Source 標籤）。事實本身完全成立，故採最便宜的修法：補 note 綁定逐字句。",
+      "action": "correct",
+      "resolution": "corrected",
+      "fix_applied": "新增 note n25 承載上述逐字句並綁定此 claim；prose 未改。",
+      "recheck_round": 2
+    },
+    {
+      "id": "c23",
+      "claim_text": "「Any detected MCP traffic that did not arrive through a Portal gets blocked; traffic that came through the Portal is unaffected」",
+      "location": "H2「is_mcp 與 mcp_portal」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n12"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Any detected MCP traffic that did not arrive through a Portal gets blocked; traffic that came through the Portal is unaffected.",
+      "note": "逐字含分號，用中性 prompt 重抓確認。post 後續對 unaffected 比 allowed 弱一截的細讀，忠於來源用字。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c24",
+      "claim_text": "（修正前）並且預設就有一條 enforcement 規則",
+      "location": "H2「is_mcp 與 mcp_portal」（並見 toggle widget 文案）",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n12"
+      ],
+      "independence": "single-source",
+      "verdict": "unverifiable",
+      "hedge_delta": "inflated",
+      "evidence": "We are adding Traffic Source selectors to Gateway Network and HTTP policies to give administrators the fidelity to write rules... A baseline enforcement rule looks like this:",
+      "note": "來源用「A baseline enforcement rule looks like this:」引入——那是管理者用新 selector 自己寫的規則範例，不是 Gateway 出廠就啟用的規則。「預設就有」宣稱了一個來源沒有主張的出廠預設，這會實質改變讀者啟用功能後的預期。",
+      "action": "correct",
+      "resolution": "corrected",
+      "fix_applied": "prose 改為「Cloudflare 給的 baseline 規則範例是：」，toggle widget 的對應文案同步改為「Cloudflare 給的 baseline 規則範例會直接封鎖」。post 後續的「這條 baseline 規則」用法本來就沒問題，未動。",
+      "recheck_round": 2
+    },
+    {
+      "id": "c25",
+      "claim_text": "這裡可以合理延伸一步：is_mcp 與 mcp_portal 合起來也可以拿來做流量盤點",
+      "location": "H2「is_mcp 與 mcp_portal」",
+      "type": "causal",
+      "load": "low",
+      "note_ids": [],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "標記「這裡可以合理延伸一步」確認存在，且該段結尾另有明示揭露「這一層用途來源沒有明講，是順著兩個 selector 的定義往下推的延伸」。示範級的推斷標示。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c26",
+      "claim_text": "合理的推論是，Gateway 光靠這個標籤沒辦法區分「從未被核准」跟「核准過但繞過 Portal」",
+      "location": "H2「兩種不同的繞過」",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [
+        "n12",
+        "n13",
+        "n14"
+      ],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "標記「合理的推論是」確認存在。來源分別定義兩種情境，從未說 mcp_portal 訊號會把兩者混同，故判為作者綜合是正確的；其推理依據的定義本身有出處。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c27",
+      "claim_text": "Shadow MCP 的定義是「A connection to a server the organization has not approved. An employee finds the server in a repository, a product guide, or a message from a colleague」",
+      "location": "H2「兩種不同的繞過」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n13"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "A connection to a server the organization has not approved. An employee finds the server in a repository, a product guide, or a message from a colleague and adds it directly to their MCP client.",
+      "note": "逐字子字串。post 的引文在 colleague 處截斷，屬截斷非扭曲，且中文轉述實際上把被截掉的子句語意補了回來。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c28",
+      "claim_text": "「An approved server that the organization has placed in an MCP Portal, but an employee connects to its upstream URL directly and skips the Portal's Access policy」",
+      "location": "H2「兩種不同的繞過」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n14"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Portal bypass is different: it starts with an approved server that the organization has placed in an MCP Portal, but an employee connects to its upstream URL directly and skips the Portal's Access policy, curated tool catalog, data loss prevention, and tool-level audit trail.",
+      "note": "逐字（僅去掉開頭引語並將 an 大寫）。引文截斷了來源的列舉，因此 post 只說跳過 Access policy，而來源說還跳過 curated tool catalog、DLP 與 tool-level audit trail——這是低估而非高估，不算錯誤。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c29",
+      "claim_text": "比較可能的情況是，這兩種繞過在實務上會混在一起發生",
+      "location": "H2「兩種不同的繞過」",
+      "type": "causal",
+      "load": "low",
+      "note_ids": [],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "標記「比較可能的情況是」確認存在，且該段對 Cloudflare 動機的推測另有「這可能是…的原因」二次 hedge。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c30",
+      "claim_text": "Cloudflare 把整條路徑上的介入時機分成三層：client hook、network proxy、server middleware",
+      "location": "H2「三層控制點」",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n15",
+        "n17",
+        "n18"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Security teams can intervene at three locations: Inside the MCP client ... At the network boundary ... Before the server invokes the tool.",
+      "note": "三層結構是文章自己的框架，每層的特徵句皆逐字出自對應小節。post 使用的三個標籤也是文章自己在那些小節裡用的詞。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c31",
+      "claim_text": "「A client hook can run after the model selects a tool but before the client serializes the request」",
+      "location": "H2「三層控制點」（stack widget detail-1）",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n15"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "A client hook can run after the model selects a tool but before the client serializes the request.",
+      "note": "逐字，用未提供措辭的中性 prompt 重抓確認。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c32",
+      "claim_text": "規則不會自動跨 client 生效，安全團隊得在每一個 client 實作裡各自重建同一套邏輯",
+      "location": "H2「三層控制點」（stack widget detail-1）",
+      "type": "attribution",
+      "load": "low",
+      "note_ids": [
+        "n16"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "deflated",
+      "evidence": "In order for a security team to benefit from this, they would need to reproduce their controls across every client that their employees use.",
+      "note": "n16 的 quote 是逐字子字串。n16 記為 hedged 偏保守（來源該句是條件式要求），post 若有偏差也是更弱的方向。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c33",
+      "claim_text": "「The network layer has the widest lens to detect remote MCP traffic on managed paths」——但這個最廣有限定詞",
+      "location": "H2「三層控制點」（stack widget detail-2）",
+      "type": "superlative",
+      "load": "medium",
+      "note_ids": [
+        "n17"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "deflated",
+      "evidence": "The network layer has the widest lens to detect remote MCP traffic on managed paths.",
+      "note": "逐字。對抗性檢查最高級用語：post 沒有剝掉 on managed paths 限定詞，反而明確凸顯它並加上 n20 的 TLS 解密條件，屬收窄而非膨脹。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c34",
+      "claim_text": "「Proxies cannot see local stdio calls or off-network traffic」",
+      "location": "H2「三層控制點」（stack widget detail-2）",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n19"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Proxies cannot see local `stdio` calls or off-network traffic.",
+      "note": "逐字，用中性 prompt 重抓確認。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c35",
+      "claim_text": "「The server has the richest execution context... this is the last point where the request can be denied before the tool runs」",
+      "location": "H2「三層控制點」（stack widget detail-3）",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n18"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The server has the richest execution context. It has authenticated the caller, parsed the MCP message, resolved `get_weather` to a handler, and validated the supplied arguments against the tool's input schema. This is the last point where the request can be denied before the tool runs.",
+      "note": "兩半逐字；刪節號合法地略去一句列舉，This 因應刪節改為小寫。無語意變動。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c36",
+      "claim_text": "比較合理的看法是，這一層只在請求真的送到這台伺服器時才生效",
+      "location": "H2「三層控制點」（stack widget detail-3）",
+      "type": "causal",
+      "load": "low",
+      "note_ids": [],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "標記「比較合理的看法是」確認存在。誠實，因為來源自己對這層限制的措辭沒有被任何 note 承載。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c37",
+      "claim_text": "站得住腳的猜測是，這三層要疊加起來才划算，不是彼此替代的選項",
+      "location": "H2「三層控制點」",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "標記「站得住腳的猜測是」確認存在，且該段以明示揭露收尾：「這篇文章引用的來源完全沒有提到三層同時部署之後，縫隙實際縮小了多少」。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c38",
+      "claim_text": "「Direct encrypted traffic must pass through TLS decryption before Gateway can inspect these headers, and local stdio servers, off-network connections, Do Not Inspect traffic, and requests that never traverse Gateway remain outside this view」",
+      "location": "H2「三層控制點」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n20"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Direct encrypted traffic must pass through TLS decryption before Gateway can inspect these headers, and local `stdio` servers, off-network connections, Do Not Inspect traffic, and requests that never traverse Gateway remain outside this view.",
+      "note": "逐字到句末句點，用中性 prompt 重抓確認（先前一次抓取曾在 these headers 處截斷）。post 列舉的四類盲點與來源順序一致。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c39",
+      "claim_text": "Gateway 的分類機制被形容成「detection built from patterns we observe across the millions of requests that traverse the Cloudflare network every day」，這句話沒有交代 heuristic 邏輯、閾值、誤判率",
+      "location": "H2「三層控制點」收尾前的留白段",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n10"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Gateway inspects that header on every TLS-inspected request and classifies the traffic accordingly, using detection built from patterns we observe across the millions of requests that traverse the Cloudflare network every day.",
+      "note": "逐字子字串，用中性 prompt 重抓確認。否定性主張同樣正確：跨多次抓取都找不到 heuristic 細節、閾值、誤判率或延遲數字。把這些標為未知而不是填滿，是正確處理。",
+      "action": "none",
+      "resolution": "none-needed"
+    }
+  ],
+  "checked_at": "2026-08-16",
+  "checker_rounds": 2,
+  "coverage": {
+    "candidate_claims": 46,
+    "checked": 39,
+    "dropped_low_load": 7
+  }
+}

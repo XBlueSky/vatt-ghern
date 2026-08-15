@@ -1,0 +1,460 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">GC 讀 MySQL，看到這個 blob 的引用數是零，判定可以刪；幾乎在同一時間，client 把同樣的 bytes 重新寫回 S3、在 MySQL commit 了一筆新引用——兩邊各自的判斷都沒有錯，資料還是不見了。</p>
+  <h1 class="vg-post-title">{{ title }}</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p><span class="vg-dropcap">這</span>是 Depot Registry 的故事，而且是一種特別讓人不安的丟資料方式——不是硬碟壞掉，也不是誰手滑打錯指令，是兩段各自看起來完全正確的程式碼，湊在一起的時候把資料弄丟了。Depot Registry 用 content-addressable 的方式存 blob，路徑是 <code>blobs/sha256/&lt;digest&gt;</code>，digest 就是內容本身的雜湊值。同樣的 bytes 理論上永遠寫到同一個 key，重複上傳照理是最安全的操作之一。Depot 工程團隊把整套三層 garbage collector 的行為寫成 TLA+ spec，丟給 model checker TLC 檢查，結果找到一個「測試和 code review 都漏掉的 bug」：一個熱門的 base image「cycle 出去又 cycle 回來」的時候，GC 判定要刪的 blob，可能剛好是 client 前一刻才重新寫回去的那份資料。</p>
+
+  <p>原文開場點出的命題，正好是這整起事故的縮影：「最難找到的分散式系統 bug，不會出現在單一操作裡；是兩個流程各自做對了自己的事，只是順序沒人想過，資料就這樣不見了。」</p>
+
+  <h2>兩層帳本，各自都沒說謊</h2>
+
+  <p>Depot Registry 把「誰還在用這個 blob」跟「這個 blob 實際的 bytes」拆成兩套系統管：引用關係存在 MySQL，內容本身存在 S3。GC 的流程照原文說法是「標記一個零引用的 blob，等過 grace period，再驗證一次，才刪除」——先讀 MySQL 判斷沒人用了，記下來，等一段時間，再確認一次，最後才真的對 S3 送出刪除指令。除了 GC 之外，另外還有一套機制在管引用計數本身：Depot 用一個輕量的 saga 模式減少熱門 blob 上的鎖競爭——「先把引用計數加一，做完工作，如果失敗再用減一補償」；如果補償因為當機而沒能跑完，一個叫 reconciler 的角色會負責修回正確的計數。</p>
+
+  <p>把這兩層放在一起看，故事的謎題就出現了：MySQL 那邊讀到零引用的那一刻是真的零引用；S3 那邊寫入新版本、MySQL 那邊 commit 新引用的那一刻也是真的成功寫入。兩個讀寫動作單獨拿出來看都沒有問題，可是 GC 最後執行的刪除，砍掉的卻是剛剛才被重新引用的那份資料。要理解這是怎麼發生的，得先把「誰的責任是什麼、誰對另一邊一無所知」攤開來看。</p>
+
+  <p>content-addressable 只保證「同樣的 bytes 只會佔一份儲存空間」，不保證「同樣的 bytes 不會被重新上傳」——client 端不知道、也不需要知道 GC 現在對這個 blob 的判斷是什麼，它只是照常把 image 推上去；於是上傳跟刪除這兩件事，變成兩個完全不知道對方存在的動作。</p>
+
+  <figure class="vg-w-annotated-gc-two-store" data-mobile="static" data-svg-scroll="720">
+    <style>
+      .vg-w-annotated-gc-two-store { display: grid; grid-template-columns: 1fr; gap: var(--s-3); align-items: start; margin: var(--s-4) 0; }
+      .vg-w-annotated-gc-two-store svg { width: 100%; height: auto; }
+      .vg-w-annotated-gc-two-store .vg-w-affordance { display: flex; align-items: center; gap: 6px; font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; grid-column: 1 / -1; margin: 0; }
+      .vg-w-annotated-gc-two-store .vg-w-affordance svg { flex: none; width: 14px; height: 14px; }
+      .vg-w-annotated-gc-two-store .component { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; transition: fill 200ms, stroke 200ms; }
+      .vg-w-annotated-gc-two-store .component:hover { stroke: var(--accent); }
+      .vg-w-annotated-gc-two-store .component:focus { outline: none; }
+      .vg-w-annotated-gc-two-store .component:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+      .vg-w-annotated-gc-two-store .component-text { pointer-events: none; }
+      .vg-w-annotated-gc-two-store .flow-label { pointer-events: none; }
+      .vg-w-annotated-gc-two-store .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+      .vg-w-annotated-gc-two-store .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-annotated-gc-two-store .detail p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-annotated-gc-two-store .radios { position: absolute; width: 0; height: 0; overflow: hidden; }
+      .vg-w-annotated-gc-two-store:has(#vg-w-annotated-gc-two-store-r1:checked) .component-1 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-annotated-gc-two-store:has(#vg-w-annotated-gc-two-store-r2:checked) .component-2 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-annotated-gc-two-store:has(#vg-w-annotated-gc-two-store-r3:checked) .component-3 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-annotated-gc-two-store:has(#vg-w-annotated-gc-two-store-r4:checked) .component-4 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-annotated-gc-two-store:has(#vg-w-annotated-gc-two-store-r1:checked) .detail-1 { display: block; }
+      .vg-w-annotated-gc-two-store:has(#vg-w-annotated-gc-two-store-r2:checked) .detail-2 { display: block; }
+      .vg-w-annotated-gc-two-store:has(#vg-w-annotated-gc-two-store-r3:checked) .detail-3 { display: block; }
+      .vg-w-annotated-gc-two-store:has(#vg-w-annotated-gc-two-store-r4:checked) .detail-4 { display: block; }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 9 5 12 1.8-5.2L21 14Z"/><path d="M7.2 2.2 8 5.1"/><path d="m5.1 8-2.9-.8"/><path d="M14 4.1 12 6"/><path d="m6 12-1.9 2"/></svg>
+      <span>點任一元件看它的職責與盲區 · 4 個元件</span>
+    </p>
+
+    <div class="radios" data-vg-controls>
+      <input type="radio" id="vg-w-annotated-gc-two-store-r1" name="vg-w-annotated-gc-two-store-sel" checked />
+      <input type="radio" id="vg-w-annotated-gc-two-store-r2" name="vg-w-annotated-gc-two-store-sel" />
+      <input type="radio" id="vg-w-annotated-gc-two-store-r3" name="vg-w-annotated-gc-two-store-sel" />
+      <input type="radio" id="vg-w-annotated-gc-two-store-r4" name="vg-w-annotated-gc-two-store-sel" />
+    </div>
+
+    <svg class="vg-w-annotated-gc-two-store-main" viewBox="0 0 720 340" role="img" aria-label="MySQL 引用表、S3 bytes 儲存、GC worker、並行 pusher 四個元件，點選查看各自職責與盲區">
+      <defs>
+        <marker id="vg-w-annotated-gc-two-store-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+        </marker>
+      </defs>
+
+      <rect class="component component-1" data-target="vg-w-annotated-gc-two-store-r1" role="button" tabindex="0" aria-label="選取 MySQL 引用表" x="40" y="30" width="200" height="90" />
+      <text class="component-text" x="140" y="68" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">MySQL</text>
+      <text class="component-text" x="140" y="90" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">引用表</text>
+
+      <rect class="component component-2" data-target="vg-w-annotated-gc-two-store-r2" role="button" tabindex="0" aria-label="選取 S3 bytes 儲存" x="480" y="30" width="200" height="90" />
+      <text class="component-text" x="580" y="68" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">S3</text>
+      <text class="component-text" x="580" y="90" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">bytes 儲存</text>
+
+      <rect class="component component-3" data-target="vg-w-annotated-gc-two-store-r3" role="button" tabindex="0" aria-label="選取 GC worker" x="40" y="210" width="200" height="90" />
+      <text class="component-text" x="140" y="248" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">GC worker</text>
+      <text class="component-text" x="140" y="270" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">mark → grace → delete</text>
+
+      <rect class="component component-4" data-target="vg-w-annotated-gc-two-store-r4" role="button" tabindex="0" aria-label="選取並行 pusher" x="480" y="210" width="200" height="90" />
+      <text class="component-text" x="580" y="248" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">pusher</text>
+      <text class="component-text" x="580" y="270" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">並行推送 client</text>
+
+      <line x1="140" y1="210" x2="140" y2="120" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-annotated-gc-two-store-arrow)" />
+      <text class="flow-label" x="150" y="168" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">讀引用</text>
+
+      <line x1="580" y1="210" x2="580" y2="120" stroke="currentColor" stroke-width="1.5" marker-end="url(#vg-w-annotated-gc-two-store-arrow)" />
+      <text class="flow-label" x="590" y="168" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">寫 bytes</text>
+
+      <line x1="240" y1="220" x2="480" y2="112" stroke="var(--accent)" stroke-width="1.5" marker-end="url(#vg-w-annotated-gc-two-store-arrow)" />
+      <text class="flow-label" x="300" y="150" font-family="Manrope, sans-serif" font-size="11" fill="var(--accent-text)">送出刪除（對 key）</text>
+
+      <line x1="480" y1="220" x2="240" y2="112" stroke="var(--sage-deep)" stroke-width="1.5" marker-end="url(#vg-w-annotated-gc-two-store-arrow)" />
+      <text class="flow-label" x="330" y="205" font-family="Manrope, sans-serif" font-size="11" fill="var(--sage-deep)">commit 新引用</text>
+    </svg>
+
+    <div>
+      <div class="detail detail-1">
+        <h3>MySQL · 引用表</h3>
+        <p>存每個 manifest 對應的 blob 引用狀態；GC 判斷「零引用、可以刪」靠的就是這張表在某個時間點的讀值。</p>
+        <p><strong>不知道</strong>：S3 那把 key 現在實際有幾個 version、哪一個 version 才是 GC 當初看到的那份 bytes。</p>
+      </div>
+      <div class="detail detail-2">
+        <h3>S3 · bytes 儲存</h3>
+        <p>用 content-addressable key（<code>blobs/sha256/&lt;digest&gt;</code>）存實際內容；若開了 bucket versioning，同一把 key 再寫一次會疊出一個新版本，不會覆寫舊的。</p>
+        <p><strong>不知道</strong>：MySQL 那邊這把 key 目前是不是還有人引用著。</p>
+      </div>
+      <div class="detail detail-3">
+        <h3>GC worker · mark → grace period → re-verify → delete</h3>
+        <p>讀 MySQL 判斷零引用後標記、等過 grace period、re-verify 一次，才真的對 S3 送出刪除。</p>
+        <p><strong>不知道（修法前）</strong>：它送出的刪除，對到的是不是自己當初看到的那份 bytes——沒有 delete fence 之前，它問 S3 的是「這把 key」，不是「那個版本」。</p>
+      </div>
+      <div class="detail detail-4">
+        <h3>並行的 pusher · 重新推 image</h3>
+        <p>算出 blob digest、把 bytes 寫進 S3、在 MySQL commit 一筆新的引用——三個動作，跟 GC 的動作完全獨立執行。</p>
+        <p><strong>不知道</strong>：GC 是不是已經把這把 key 標成要刪、現在是不是正好在它的 grace period 裡。</p>
+      </div>
+    </div>
+
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        const root = document.querySelector('.vg-w-annotated-gc-two-store');
+        if (!root) return;
+        root.querySelectorAll('.component').forEach((rect) => {
+          rect.addEventListener('click', () => {
+            const targetId = rect.getAttribute('data-target');
+            const radio = root.querySelector('#' + targetId);
+            if (radio) radio.checked = true;
+          });
+          rect.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              rect.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            }
+          });
+        });
+      })();
+    </script>
+  </figure>
+
+  <p>四個元件各自把自己的那一步做對，湊在一起卻可能把資料弄丟——這正是接下來要拆解的地方：如果不是任何一步算錯，問題會出在哪裡？</p>
+
+  <h2>先懷疑：是不是引用計數算錯了</h2>
+
+  <p>Depot 的系統裡本來就有一整套機制在防「引用計數算錯」：saga 模式的 compensate-on-failure、專門修正計數的 reconciler，還有 TLA+ 模型裡特地加的一個 drift 注入流程——原文形容它「用跟失敗補償、跟歷史上計數失準相同的方向去改動計數」，讓 TLC 能故意去戳計數算錯的各種情境。既然系統本身就承認計數會出錯、而且已經為此準備了修補機制，第一個合理的懷疑自然是：這次弄丟資料，是不是因為某個 blob 的引用計數被算成了零，但其實還有人在用它？這套 drift 模擬的用意很清楚：既然現實裡的補償會失敗、計數會因為歷史原因跑掉，TLC 就該連這些髒狀態一起檢查，而不是只驗證乾淨情境下的行為。</p>
+
+  <p>模型裡確實有一條 invariant 專門守著這件事：<code>ManifestCountNeverUndercounts</code>，寫成邏輯是「blob 處於 active 狀態時，<code>blobManifestCount</code> 必須大於等於 <code>TrueGlobalManifestCount</code>」——白話講就是只要一個 blob 還 active，MySQL 算出來的引用數就不准低於真正的全域引用數，寧可多算，不能少算。但這條懷疑在這起事故裡站不住腳。真正弄丟資料的那個時間點，GC 讀到零引用的那一刻，MySQL 裡的計數是準的；client 重新寫入之後，MySQL 裡的計數也是準的。兩次讀都沒有算錯。問題不出在「數字錯了」，而是「數字對的時候，剛好夾在中間的一段時間裡發生了另一件事」——這就得回到 MySQL 跟 S3 之間那道真正的縫隙。</p>
+
+  <p>這條 invariant 只往一個方向設防，合理的推測是：兩種算錯的後果並不對稱——引用數被多算，最壞的結果是該刪的 blob 暫時沒被刪，浪費一點儲存空間；引用數被少算，後果卻是一個還在用的 blob 被判定可以刪，資料真的會不見。安全的代價分佈不對稱，防線也該跟著不對稱。</p>
+
+  <h2>真正的縫隙：MySQL 和 S3 之間沒有交易</h2>
+
+  <p>原文把根因講得很直白：「引用存在 MySQL，bytes 存在 S3，沒有一個 transaction 能同時橫跨這兩個系統。」GC 判定要刪一個 blob，靠的是讀 MySQL；真正刪掉資料，靠的是對 S3 下指令。這兩個動作之間，隔著整套 grace period、re-verify 的流程，時間夠長，長到一次完整的並行推送——寫 S3、commit MySQL——可以完整地塞進這段窗口。</p>
+
+  <p>完整的序列是這樣的：「GC 驗證這個 blob 的引用數是零，決定要刪除它。與此同時，一個 client 推送了一個包含那個 blob 的 image——同樣的 digest，同樣的 key。這次上傳把資料寫進 S3，並且 commit 了一筆新的引用。GC 的刪除落地，砍掉了一個剛剛提交的 manifest 現在指向的物件。」兩邊各自的每一步都是對的：GC 讀到零引用的當下沒有算錯；client 寫入 S3、commit MySQL 也都成功了。錯的是順序——GC 手上那把「要刪除」的判斷，是在 client 重新寫入之前做出的，可是它真正執行刪除的時候，晚了。</p>
+
+  <p>grace period 與 re-verify 這兩道防線，原本是為了拉大反應時間、多一次機會重新讀 MySQL 確認引用數沒有變。但把前面兩句話拼起來看，這兩道防線守住的是「MySQL 內部的數字有沒有變」，不是「S3 那把 key 現在到底是不是我當初檢查過的那份 bytes」。只要 client 的寫入與 commit，能在 GC 最後一次檢查之後、真正送出刪除之前完成，這道防線就守不到——問題從來不是檢查次數不夠多，是檢查的對象，一直都只有 MySQL 這一邊。</p>
+
+  <figure class="vg-w-scrub-gc-race-window" data-mobile="static" data-svg-scroll="720">
+    <style>
+      .vg-w-scrub-gc-race-window { display: grid; gap: var(--s-2); margin: var(--s-4) 0; }
+      .vg-w-scrub-gc-race-window svg { width: 100%; height: auto; }
+      .vg-w-scrub-gc-race-window .vg-w-affordance { display: flex; align-items: center; gap: 6px; font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; margin: 0; }
+      .vg-w-scrub-gc-race-window .vg-w-affordance svg { flex: none; width: 14px; height: 14px; }
+      .vg-w-scrub-gc-race-window .state { font-family: var(--serif); font-size: var(--fs-sm); padding: var(--s-2); background: var(--bg-soft); border-left: 2px solid var(--accent); }
+      .vg-w-scrub-gc-race-window .handle { cursor: grab; touch-action: none; }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 8L22 12L18 16"/><path d="M6 8L2 12L6 16"/><path d="M14.5 4L9.5 20"/></svg>
+      <span>拖動或用方向鍵掃過時間軸 · GC 與 pusher 兩條並行動作 · 6 個事件</span>
+    </p>
+
+    <svg class="vg-w-scrub-gc-race-window-main" viewBox="0 0 720 150" role="img" aria-label="GC 與 pusher 並行動作的時間軸，從 GC mark 到刪除落地">
+      <line x1="50" y1="70" x2="670" y2="70" stroke="var(--muted-2)" stroke-width="1.5" />
+
+      <circle cx="50" cy="70" r="5" fill="var(--accent)" />
+      <text x="50" y="50" text-anchor="middle" font-family="Manrope, sans-serif" font-size="10" fill="var(--accent-text)">GC</text>
+      <text x="50" y="95" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--ink)">mark：讀 MySQL</text>
+
+      <circle cx="174" cy="70" r="5" fill="var(--accent)" />
+      <text x="174" y="50" text-anchor="middle" font-family="Manrope, sans-serif" font-size="10" fill="var(--accent-text)">GC</text>
+      <text x="174" y="95" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--ink)">grace period</text>
+
+      <circle cx="360" cy="70" r="5" fill="var(--sage-deep)" />
+      <text x="360" y="50" text-anchor="middle" font-family="Manrope, sans-serif" font-size="10" fill="var(--sage-deep)">pusher</text>
+      <text x="360" y="95" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--ink)">重推 image</text>
+
+      <circle cx="484" cy="70" r="5" fill="var(--sage-deep)" />
+      <text x="484" y="50" text-anchor="middle" font-family="Manrope, sans-serif" font-size="10" fill="var(--sage-deep)">pusher</text>
+      <text x="484" y="95" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--ink)">寫入 S3</text>
+
+      <circle cx="577" cy="70" r="5" fill="var(--sage-deep)" />
+      <text x="577" y="50" text-anchor="middle" font-family="Manrope, sans-serif" font-size="10" fill="var(--sage-deep)">pusher</text>
+      <text x="577" y="95" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--ink)">commit 引用</text>
+
+      <circle cx="670" cy="70" r="5" fill="var(--accent)" />
+      <text x="670" y="50" text-anchor="middle" font-family="Manrope, sans-serif" font-size="10" fill="var(--accent-text)">GC</text>
+      <text x="670" y="95" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--ink)">送出刪除</text>
+
+      <line id="vg-w-scrub-gc-race-window-line" class="handle" x1="670" y1="50" x2="670" y2="90" stroke="var(--accent)" stroke-width="2" />
+      <circle id="vg-w-scrub-gc-race-window-handle" class="handle" cx="670" cy="70" r="9" fill="var(--accent)" role="slider" tabindex="0" aria-label="拖動掃過時間軸事件" aria-valuemin="0" aria-valuemax="5" aria-valuenow="5" />
+    </svg>
+
+    <div class="state" id="vg-w-scrub-gc-race-window-state">grace period 結束，GC 對 S3 送出刪除——沒有 delete fence 時，刪的是「這把 key」，不是 mark 當下記下的那個版本；剛提交的 manifest，現在指向一個已經被刪除的物件。</div>
+
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        const root = document.querySelector('.vg-w-scrub-gc-race-window');
+        if (!root) return;
+        const svg = root.querySelector('svg.vg-w-scrub-gc-race-window-main');
+        const handle = root.querySelector('#vg-w-scrub-gc-race-window-handle');
+        const handleLine = root.querySelector('#vg-w-scrub-gc-race-window-line');
+        const stateDiv = root.querySelector('#vg-w-scrub-gc-race-window-state');
+
+        const events = [
+          [50, 'GC 讀到零引用，記下當時看到的 S3 版本，標記這個 blob 待刪。'],
+          [174, 'GC 進入 grace period，等待，還沒有任何寫入動作。'],
+          [360, '同一個 base image 被重新拉入，client 算出跟舊 blob 相同的 digest。'],
+          [484, 'bytes 寫進 S3——同一把 key，疊出一個新版本。'],
+          [577, 'client 在 MySQL commit 一筆新的引用，剛推送的 manifest 生效。'],
+          [670, 'grace period 結束，GC 對 S3 送出刪除——沒有 delete fence 時，刪的是「這把 key」，不是 mark 當下記下的那個版本；剛提交的 manifest，現在指向一個已經被刪除的物件。'],
+        ];
+        const X_MIN = 50, X_MAX = 670;
+
+        function nearestIndex(x) {
+          let best = 0, bestDist = Infinity;
+          events.forEach((e, i) => {
+            const d = Math.abs(e[0] - x);
+            if (d < bestDist) { bestDist = d; best = i; }
+          });
+          return best;
+        }
+        function setIndex(i) {
+          const [x, desc] = events[i];
+          handle.setAttribute('cx', x);
+          handleLine.setAttribute('x1', x); handleLine.setAttribute('x2', x);
+          handle.setAttribute('aria-valuenow', String(i));
+          stateDiv.textContent = desc;
+        }
+
+        function clientToSvgX(clientX) {
+          const pt = svg.createSVGPoint();
+          pt.x = clientX; pt.y = 0;
+          const svgPt = pt.matrixTransform(svg.getScreenCTM().inverse());
+          return Math.max(X_MIN, Math.min(X_MAX, svgPt.x));
+        }
+
+        let dragging = false;
+        let currentIndex = 5;
+        handle.addEventListener('pointerdown', (e) => {
+          dragging = true;
+          handle.setPointerCapture(e.pointerId);
+        });
+        handle.addEventListener('pointermove', (e) => {
+          if (!dragging) return;
+          const x = clientToSvgX(e.clientX);
+          currentIndex = nearestIndex(x);
+          setIndex(currentIndex);
+        });
+        handle.addEventListener('pointerup', () => { dragging = false; });
+        handle.addEventListener('keydown', (e) => {
+          if (e.key === 'ArrowLeft' && currentIndex > 0) {
+            currentIndex -= 1; setIndex(currentIndex); e.preventDefault();
+          } else if (e.key === 'ArrowRight' && currentIndex < events.length - 1) {
+            currentIndex += 1; setIndex(currentIndex); e.preventDefault();
+          }
+        });
+      })();
+    </script>
+  </figure>
+
+  <p>把上面這條時間軸掃過一遍會發現，GC 跟 pusher 的動作完全沒有互相等待——標記、等待、重推、寫入、commit、刪除，六個步驟像兩條各走各的軌道，只有終點撞在一起。真正該問的不是「哪一步算錯了」，而是「GC 手上那份判斷，是什麼時候拍下的快照」。</p>
+
+  <h2>TLC 探索了一千四百多萬種交錯</h2>
+
+  <p>Depot 把這整套行為寫成 TLA+ spec：「模型涵蓋 registry 三層 garbage collector，模擬並行的 pusher、兩個 GC domain、一個計數 reconciler，以及人工注入的計數 drift，全部交錯在一起。」原文沒有進一步解釋這兩個 GC domain 具體分別對應什麼，但丟給 model checker TLC 之後，「TLC 在大約 21 分鐘內探索了 14,290,224 個不同的狀態，驗證了 10 個 safety invariant 和 2 個 liveness property」。這個數字之所以有意義，是因為交錯的組合是指數成長的：模型裡有並行的 pusher、兩個 GC domain、reconciler、drift 注入，四種角色的動作只要能任意交錯，光是排列組合就足以讓人手動想不完。原文用的動詞是 proves，不是「試過幾個劇本沒出事」——這 14,290,224 個相異狀態不是工程師事先猜測的那幾條路徑。</p>
+
+  <p>十個 safety invariant 裡，原文點名了幾條，各自守住不同的東西。最重要的一條擺在第一位：「已經 commit 的 manifest 永遠不會失去它的 blob 資料」——這條就是整起事故的病灶所在，也是修法真正要守住的底線，對應的公式是「任何一個有 manifest 存在的 pusher，它的 S3 版本集合都不可以是空的」。<code>ManifestCountNeverUndercounts</code> 守的是前面提過的「寧可多算，不能少算」；<code>S3HeadOK</code> 則是純粹的內部自洽檢查——S3 目前指到的版本，得跟它自己記錄的版本集合裡最新的那個吻合。三條各自守住一層，湊在一起才撐得住「刪除可以放心跟寫入賽跑」這句話。</p>
+
+  <p>safety 與 liveness 是兩種不同性質的保證：一個 safety property 禁止的是「執行過程中不該發生的壞事」，一個 liveness property 要求的是「某件好事最終一定要發生」。這起事故踩到的三條都是 safety——防止資料被錯誤刪除，屬於前者；文章沒有點名那兩條 liveness property 具體要求什麼，但它們守的通常是「GC 最終真的會把沒人用的 blob 清掉」這一類、跟安全性無關但同樣重要的另一半承諾。</p>
+
+  <figure class="vg-w-table-gc-invariants" data-mobile="keep">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="9" y1="9" x2="9" y2="21"/></svg>
+      <span>3 個具名 invariant + 1 列總計 · 各自守住什麼</span>
+    </p>
+    <style>
+      .vg-w-table-gc-invariants { overflow-x: auto; margin: var(--s-4) 0; }
+      .vg-w-table-gc-invariants table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-gc-invariants thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); }
+      .vg-w-table-gc-invariants tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+      .vg-w-table-gc-invariants td.name { font-family: var(--mono); font-size: var(--fs-xs); white-space: nowrap; color: var(--accent-text); }
+      .vg-w-table-gc-invariants td.kind { white-space: nowrap; color: var(--muted); }
+    </style>
+    <table>
+      <thead>
+        <tr>
+          <th>名稱</th>
+          <th>型別</th>
+          <th>守住什麼</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="name">ManifestNeedsData</td>
+          <td class="kind">safety</td>
+          <td>對每一個有已提交 manifest 的 pusher，它的 S3 版本集合都不可以是空的——最重要的一條，直接對應「已提交的 manifest 不會失去 blob 資料」。</td>
+        </tr>
+        <tr>
+          <td class="name">ManifestCountNeverUndercounts</td>
+          <td class="kind">safety</td>
+          <td>blob 處於 active 狀態時，MySQL 算出的 manifest count 不可以低於真正的全域 manifest count——寧可多算，不能少算。</td>
+        </tr>
+        <tr>
+          <td class="name">S3HeadOK</td>
+          <td class="kind">safety</td>
+          <td>S3 目前指到的版本，必須跟它自己記錄的版本集合裡最新的那一個一致——純粹的內部自洽檢查。</td>
+        </tr>
+        <tr>
+          <td class="name">（其餘 7 + 2）</td>
+          <td class="kind">safety／liveness</td>
+          <td>TLC 這次總共驗證了 10 個 safety invariant、2 個 liveness property，原文只點名上面三條，其餘未逐條列出定義。</td>
+        </tr>
+      </tbody>
+    </table>
+  </figure>
+
+  <p>手動寫測試案例，靠的是工程師想得到、覺得可能出事的那幾種交錯；TLC 窮舉的，是這套 spec 能描述出來的所有交錯——差別不在誰更聰明，在窮舉的範圍。這起事故被找到，靠的正是後者：14,290,224 個狀態裡，藏著一種沒人特地寫成測試案例、也沒在 code review 裡被點出來的順序。</p>
+
+  <h2>delete fence：把「刪這把 key」換成「刪我當時看到的版本」</h2>
+
+  <p>修法不是想辦法讓 MySQL 跟 S3 憑空多出一個橫跨兩邊的 transaction——這做不到。真正的修法換了一個問題：GC 不再問「請刪掉這把 key」，而是問「請刪掉我當初看到的那份 bytes」。方法是打開 S3 bucket 的 versioning：「GC 標記一個 blob 的時候，記下它當時看到的那個 S3 version ID。真正刪除的時候，只刪那個版本。」原文把這個機制講得很直接：「我們把它當成一個 delete fence：它把『刪掉這把 key』變成『刪掉我當時檢查過的那份精確的 bytes』，這讓一次刪除能安全地跟一次寫入賽跑。」這個修法能成立，靠的是 S3 versioning 本身的語意——AWS 官方文件寫得很明確：「如果你覆寫一個物件，結果是 bucket 裡多出一個新的物件版本，你永遠可以還原前一個版本」；而「要永久刪除一個已版本化的物件，你必須使用指定 version ID 的 DELETE」，一般不指定版本的 DELETE 只會插入一個 delete marker，不會真的抹掉任何一個版本。GC 拿到的，正是這個「指定版本才會真的刪」的保證。</p>
+
+  <p>同一個 race 現在重新跑一次：GC mark 的時候記下 v1；client 重新推送，S3 那把 key 疊出一個新版本 v2，MySQL commit 新引用；grace period 結束，GC 送出刪除——但它刪的是 v1，不是「這把 key 目前指到的版本」。v2 完好無缺，剛 commit 的 manifest 找得到它的 bytes。窗口本身沒有被關掉，GC 跟 client 還是可以在同一段時間裡各自動作，但刪除的目標從一個會被時間改變的東西（這把 key 現在指向誰），變成一個永遠不會變的東西（mark 那一刻拍下的版本 ID）。</p>
+
+  <p>有人可能會問，為什麼不讓 GC 在真正刪除前，再多讀一次 S3 確認版本沒變就好——這其實正是 re-verify 想做的事，只是它 re-verify 的對象一直是 MySQL，不是 S3。delete fence 的關鍵不是「多檢查一次」，而是把檢查的對象換成不會因為新寫入而被覆蓋掉意義的東西：一個具體的 version ID，而不是一把會隨時間變化指向的 key。</p>
+
+  <p>這個機制不是沒有代價。AWS 官方文件提醒：「每一個版本都照一般 S3 費率計費——一個物件的每個版本都是完整的物件，不是相對於前一版的差異，所以如果你存了三個版本，就是照三個物件收費。」delete fence 能運作的前提，是舊版本被保留到 GC 真正動手清理為止；如果沒有搭配 lifecycle 規則去清掉真正不再需要的舊版本，版本數會一直往上疊，儲存成本也會跟著疊上去。</p>
+
+  <figure class="vg-w-drag-gc-version-fence" data-mobile="static" data-svg-scroll="640">
+    <style>
+      .vg-w-drag-gc-version-fence { display: grid; gap: var(--s-2); margin: var(--s-4) 0; }
+      .vg-w-drag-gc-version-fence svg { width: 100%; height: auto; }
+      .vg-w-drag-gc-version-fence .vg-w-affordance { display: flex; align-items: center; gap: 6px; font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; margin: 0; }
+      .vg-w-drag-gc-version-fence .vg-w-affordance svg { flex: none; width: 14px; height: 14px; }
+      .vg-w-drag-gc-version-fence .state { font-family: var(--serif); font-size: var(--fs-sm); padding: var(--s-2); background: var(--bg-soft); border-left: 2px solid var(--accent); }
+      .vg-w-drag-gc-version-fence .handle { cursor: grab; touch-action: none; }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 8L22 12L18 16"/><path d="M6 8L2 12L6 16"/><path d="M14.5 4L9.5 20"/></svg>
+      <span>拖動或用方向鍵改變「之後又被覆寫幾次」· 5 個版本</span>
+    </p>
+
+    <svg class="vg-w-drag-gc-version-fence-main" viewBox="0 0 640 220" role="img" aria-label="S3 同一把 key 的版本歷史，delete fence 永遠釘住 mark 當下的版本">
+      <text x="100" y="26" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--accent-text)">GC 記下：永遠釘住這裡</text>
+      <line x1="100" y1="32" x2="100" y2="55" stroke="var(--accent)" stroke-width="1.5" marker-end="url(#vg-w-drag-gc-version-fence-pin)" />
+      <defs>
+        <marker id="vg-w-drag-gc-version-fence-pin" viewBox="0 0 10 10" refX="5" refY="9" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M 0 0 L 10 0 L 5 10 z" fill="var(--accent)" />
+        </marker>
+      </defs>
+
+      <rect id="vg-w-drag-gc-version-fence-b0" x="60" y="60" width="80" height="50" rx="4" fill="var(--accent)" fill-opacity="0.18" stroke="var(--accent)" stroke-width="1.5" />
+      <text x="100" y="90" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--accent-text)">v1</text>
+
+      <rect id="vg-w-drag-gc-version-fence-b1" x="170" y="60" width="80" height="50" rx="4" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.2" />
+      <text x="210" y="90" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">v2</text>
+
+      <rect id="vg-w-drag-gc-version-fence-b2" x="280" y="60" width="80" height="50" rx="4" fill="var(--ink-deep)" fill-opacity="0.16" stroke="var(--ink-deep)" stroke-width="1.5" />
+      <text x="320" y="90" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--ink-deep)">v3</text>
+
+      <rect id="vg-w-drag-gc-version-fence-b3" x="390" y="60" width="80" height="50" rx="4" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.2" />
+      <text x="430" y="90" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">v4</text>
+
+      <rect id="vg-w-drag-gc-version-fence-b4" x="500" y="60" width="80" height="50" rx="4" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.2" />
+      <text x="540" y="90" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">v5</text>
+
+      <text x="320" y="145" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--ink-deep)">↑ S3 目前最新版本</text>
+      <line id="vg-w-drag-gc-version-fence-line" class="handle" x1="320" y1="115" x2="320" y2="135" stroke="var(--ink-deep)" stroke-width="2" />
+      <circle id="vg-w-drag-gc-version-fence-handle" class="handle" cx="320" cy="125" r="9" fill="var(--ink-deep)" role="slider" tabindex="0" aria-label="拖動改變 S3 目前最新版本" aria-valuemin="0" aria-valuemax="4" aria-valuenow="2" />
+    </svg>
+
+    <div class="state" id="vg-w-drag-gc-version-fence-state">S3 目前最新版本：v3　·　delete fence 鎖定：v1　·　這次會被刪的版本：v1（就算 key 已經被覆寫了 2 次，GC 手上鎖定的版本沒有變）</div>
+
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        const root = document.querySelector('.vg-w-drag-gc-version-fence');
+        if (!root) return;
+        const svg = root.querySelector('svg.vg-w-drag-gc-version-fence-main');
+        const handle = root.querySelector('#vg-w-drag-gc-version-fence-handle');
+        const handleLine = root.querySelector('#vg-w-drag-gc-version-fence-line');
+        const stateDiv = root.querySelector('#vg-w-drag-gc-version-fence-state');
+        const boxes = [0, 1, 2, 3, 4].map((i) => root.querySelector('#vg-w-drag-gc-version-fence-b' + i));
+        const xs = [100, 210, 320, 430, 540];
+
+        function render(i) {
+          handle.setAttribute('cx', xs[i]);
+          handleLine.setAttribute('x1', xs[i]); handleLine.setAttribute('x2', xs[i]);
+          handle.setAttribute('aria-valuenow', String(i));
+          boxes.forEach((b, j) => {
+            if (j === 0) return;
+            if (j === i) {
+              b.setAttribute('fill', 'var(--ink-deep)');
+              b.setAttribute('fill-opacity', '0.16');
+              b.setAttribute('stroke', 'var(--ink-deep)');
+              b.setAttribute('stroke-width', '1.5');
+            } else {
+              b.setAttribute('fill', 'var(--bg-soft)');
+              b.setAttribute('fill-opacity', '1');
+              b.setAttribute('stroke', 'var(--muted-2)');
+              b.setAttribute('stroke-width', '1.2');
+            }
+          });
+          const overwrites = i;
+          const suffix = overwrites === 0 ? '（mark 之後 S3 還沒被覆寫過）' : '（就算 key 已經被覆寫了 ' + overwrites + ' 次，GC 手上鎖定的版本沒有變）';
+          stateDiv.textContent = 'S3 目前最新版本：v' + (i + 1) + '　·　delete fence 鎖定：v1　·　這次會被刪的版本：v1' + suffix;
+        }
+
+        function clientToSvgX(clientX) {
+          const pt = svg.createSVGPoint();
+          pt.x = clientX; pt.y = 0;
+          const svgPt = pt.matrixTransform(svg.getScreenCTM().inverse());
+          return svgPt.x;
+        }
+        function nearestIndex(x) {
+          let best = 0, bestDist = Infinity;
+          xs.forEach((bx, i) => { const d = Math.abs(bx - x); if (d < bestDist) { bestDist = d; best = i; } });
+          return best;
+        }
+
+        let dragging = false;
+        let currentIndex = 2;
+        handle.addEventListener('pointerdown', (e) => { dragging = true; handle.setPointerCapture(e.pointerId); });
+        handle.addEventListener('pointermove', (e) => {
+          if (!dragging) return;
+          currentIndex = nearestIndex(clientToSvgX(e.clientX));
+          render(currentIndex);
+        });
+        handle.addEventListener('pointerup', () => { dragging = false; });
+        handle.addEventListener('keydown', (e) => {
+          if (e.key === 'ArrowLeft' && currentIndex > 0) { currentIndex -= 1; render(currentIndex); e.preventDefault(); }
+          else if (e.key === 'ArrowRight' && currentIndex < xs.length - 1) { currentIndex += 1; render(currentIndex); e.preventDefault(); }
+        });
+      })();
+    </script>
+  </figure>
+
+  <h2>模型是多一顆信任的骰子，不是正確性證明</h2>
+
+  <p>這份 spec 不是工程師逐行手寫出來的——Depot 的 staff engineer Wito Delnat 在文章裡寫得很清楚：「我們現在不再手寫模型了。一個 agent 讀實作——Go 的 transaction、SQL、S3 呼叫——把它翻譯成一份 spec。」人的工作變成審查：invariant 是不是真的講出了工程師想要的意思，一輪一輪修。原文也劃了範圍：「不要把 TLA+ 丟去對付每一件事」——CRUD 端點不值得為它建模，這套工具是留給真正有並行、有跨系統邊界的地方。文章開頭還用了一個更簡單的「玩具範例」暖身，再進入 Depot Registry 這個生產環境的真實案例。審查的重點不是語法對不對，是語意對不對——一個寫得出來、跑得動的 invariant，不代表它真的講出了工程師心裡那句「這件事絕對不能發生」。</p>
+
+  <p>這篇文章發表於 2026 年 7 月 20 日，作者是 Depot 的 staff engineer Wito Delnat——把這次修 bug 的過程寫成一篇方法論文章，而不只是一則變更紀錄，本身也是一種選擇：比起單純說「我們修好了」，作者選擇把找到 bug 的推理過程、模型檢查的具體數字，都攤開給讀者看。</p>
+
+  <p>作者對模型檢查本身也沒有誇大：「一個 model checker 只是多一顆信任的骰子，不是正確性證明。」他甚至建議不用等看懂 spec 的每一行才動手：「不要等到你看懂一份生成出來的 spec 的每一行才動作。跑跑看，看看會掉出什麼。最壞的情況是浪費一個下午；最好的情況是你抓到了一條值得追下去的線索。」被 TLC 抓出來的 violated invariant，原文的說法是「當成線索，不是判決：模型可能跟現實不符，所以一個被違反的 invariant 是一個起點，一條值得順著拉下去的線」——這句話本身就帶著保留語氣，不是斷言模型永遠正確。</p>
+
+  <p>這起事故是這整套說法的示範：測試沒抓到、code review 沒抓到，model checker 抓到了；而 model checker 抓到的東西，最後還是得靠工程師去判斷它是不是真的、該怎麼修——查清楚根因是 MySQL 跟 S3 之間沒有 transaction，再挑出 S3 versioning 這個現成機制當 delete fence，這兩步都是人做的判斷，TLC 只負責把那個沒人想過的交錯順序找出來，攤在桌上。原文收尾的說法也呼應這一點：「測試檢查你想得到的交錯；TLA+ 探索你想不到的交錯。」這也是為什麼原文特別強調「測試和 code review 都漏掉」這句話——不是說 Depot 的工程團隊不夠仔細，而是這種橫跨兩個系統、只在特定順序下才會出現的窗口，本來就不是靠讀程式碼、靠寫幾個測試案例就能可靠抓到的東西。</p>
+
+  <p class="vg-deep-closer"><strong>下次遇到跨系統邊界時</strong>：只要一個判斷靠讀系統 A、一個動作靠寫系統 B，中間沒有辦法用一個 transaction 把兩邊鎖在一起，這道縫隙就值得用 model checker 窮舉一次交錯順序——不是因為程式碼寫錯了，而是因為「兩邊都對」本來就可能在時間上對不起來。</p>
+</div>
