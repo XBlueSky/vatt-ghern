@@ -1,0 +1,913 @@
+{
+  "output_path": "src/posts/2026/08/16/deep-tla-registry-gc-race.html",
+  "spine": [
+    "1. Depot Registry 的 GC 分成 mark（讀 MySQL 判斷零引用、記下當時看到的 S3 version ID）、grace period、re-verify、delete 四步；另有一套 saga 模式（增量引用計數、做工作、失敗時減量補償）與負責修復計數的 reconciler。",
+    "2. 症狀：一個熱門 base image「cycle 出去又 cycle 回來」時，client 用同 digest、同 S3 key 重新推送，剛好跟 GC 判定該 blob 零引用、要刪除的時間點交錯，GC 的刪除最後砍掉的是剛提交的 manifest 指向的物件。",
+    "3. 排除的懷疑：這不是引用計數算錯——GC mark 時讀到的零引用是準的，client 重新寫入之後 MySQL 的計數也是準的；模型裡的 ManifestCountNeverUndercounts invariant 守的是計數不對稱，但這起事故裡兩次讀數都沒有錯。",
+    "4. 真正的根因：引用存在 MySQL、bytes 存在 S3，沒有一個 transaction 能橫跨兩個系統；GC 的 grace period 與 re-verify 只能確認 MySQL 內部的數字沒有變，守不住『S3 那把 key 現在是不是我當初檢查過的那份 bytes』這件事。",
+    "5. 驗證方式：把三層 GC（並行 pusher、兩個 GC domain、計數 reconciler、人工注入的計數 drift）寫成 TLA+ spec，TLC 在約 21 分鐘內探索 14,290,224 個不同狀態，驗證 10 個 safety invariant 與 2 個 liveness property，最重要的一條是『已提交的 manifest 永遠不會失去它的 blob 資料』（ManifestNeedsData）。",
+    "6. 修法：打開 S3 bucket versioning，GC mark 時記下當時看到的 S3 version ID，sweep 時只刪那個版本——把『刪這把 key』換成『刪我當時檢查過的那份 bytes』，S3 官方語意保證覆寫會產生新版本、指定 version ID 的 DELETE 才會永久刪除該版本，因此新版本不會被誤刪。",
+    "7. 方法論：spec 現在由 agent 讀實作（Go transaction、SQL、S3 呼叫）翻譯生成、人審查 invariant；作者強調 model checker 是『多一顆信任的骰子，不是正確性證明』，建議不用等看懂每一行才動手，把 violated invariant 當線索而非判決——這起事故正是測試與 code review 都漏掉、model checker 抓到的案例。"
+  ],
+  "sources": [
+    {
+      "url": "https://depot.dev/blog/tla-verification",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": "2026-07-20",
+      "perspective": {
+        "mechanism": "GC 讀 MySQL 判斷零引用後 mark、等 grace period、re-verify 才 delete；但引用（MySQL）與 bytes（S3）分屬兩個系統，沒有橫跨兩者的 transaction，client 在 mark 之後、delete 之前用同 digest/key 重新寫入並 commit，會讓 GC 的刪除砍掉剛提交的資料。把整套行為（並行 pusher、兩個 GC domain、計數 reconciler、注入的計數 drift）寫成 TLA+ spec，TLC 探索 14,290,224 個狀態、驗證 10 個 safety invariant 與 2 個 liveness property 找到這個交錯。",
+        "tradeoff": "修法用 S3 bucket versioning 當 delete fence（mark 時記版本 ID、delete 時只刪那個版本），不去強求一個跨 MySQL／S3 的 transaction——換來的是『刪除可以安全地跟寫入賽跑』，代價是必須開啟並依賴 S3 versioning 這個額外機制；同時作者強調 model checker 只是多一顆信任的骰子，不是正確性證明，violated invariant 是線索不是判決。",
+        "reader_use": "任何系統把『誰還在引用』跟『資料本體』拆在兩個沒有共同 transaction 的系統裡（例如 metadata DB／物件儲存），都該檢查刪除路徑是不是用『對 key 動作』而非『對當時看到的那份資料動作』；有 S3-like 版本化儲存時，delete fence（記版本、只刪那個版本）是一個現成、低成本的關窗手法。"
+      }
+    },
+    {
+      "url": "https://docs.aws.amazon.com/AmazonS3/latest/userguide/Versioning.html",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": null,
+      "perspective": {
+        "mechanism": "S3 versioning 開啟後，對同一個 key 的覆寫會產生一個新的物件版本而不是抹掉舊版本；一般（不指定 version ID）的 DELETE 也不會真的刪除物件，只會插入一個 delete marker 作為新的當前版本。",
+        "tradeoff": "versioning 讓誤刪／覆寫可以復原，但每個版本都要另外計費、另外儲存——這正是 Depot 拿它當 delete fence 能成立的前提：舊版本不會因為新的寫入而消失，GC 才能安全地鎖定一個舊版本來刪。",
+        "reader_use": "設計任何『刪除要跟並行寫入賽跑』的機制時，先確認底層儲存是否有版本化語意；如果有，把刪除目標從『這把 key』改成『這個 version ID』，通常比自己發明鎖或跨系統協調更便宜。"
+      }
+    },
+    {
+      "url": "https://docs.aws.amazon.com/AmazonS3/latest/userguide/DeletingObjectVersions.html",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": null,
+      "perspective": {
+        "mechanism": "要永久刪除一個已版本化物件，必須在 DELETE 請求裡指定 version ID；指定版本的 DELETE 會永久移除那一個特定版本，其他版本不受影響——這是 delete fence 機制能保證『只刪 GC 當初看到的那份 bytes』的直接語意依據。",
+        "tradeoff": "指定版本刪除是不可逆的（一旦永久刪除就無法復原），跟一般 DELETE 插入 delete marker、可復原的行為完全不同——用 delete fence 的系統等於把『不可逆刪除』的判斷完全交給 GC 當初記下的那個 version ID 是否正確。",
+        "reader_use": "在程式碼裡看到 DELETE 帶著 version ID 的呼叫時，可以直接判斷這是一次不可逆、鎖定特定版本的刪除，而不是一般會留下 delete marker、可以復原的刪除——review 這類程式碼時，version ID 的來源與時效就是重點。"
+      }
+    },
+    {
+      "url": "https://en.wikipedia.org/wiki/Safety_and_liveness_properties",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": null,
+      "perspective": {
+        "mechanism": "safety property 禁止執行過程中發生特定的壞事；liveness property 要求某件好事最終一定要在執行過程中發生——這是區分 TLC 驗證的 10 個 safety invariant 與 2 個 liveness property 的標準定義依據。",
+        "tradeoff": "只驗證 safety 不夠——一個永遠不做任何事的系統可以滿足所有 safety property（因為壞事永遠不會發生），liveness 才能保證系統真的會往前推進；兩種性質要分開陳述、分開驗證。",
+        "reader_use": "讀任何 TLA+ / model checking 報告時，先分清楚一條 invariant 屬於 safety 還是 liveness，能幫助判斷它到底在防什麼——防止壞事發生，還是保證好事最終發生。"
+      }
+    }
+  ],
+  "notes": [
+    {
+      "id": "n01",
+      "url": "https://depot.dev/blog/tla-verification",
+      "quote": "GC verifies the blob has zero references and decides to delete it. Concurrently, a client pushes an image containing that exact blob. Same digest, same key. The upload writes to S3 and commits a new reference. GC's delete lands and removes the object that a just-committed manifest now points to.",
+      "hedge": "asserted",
+      "interpretation": "race 的完整序列：GC 決定刪除、client 並行推送同 digest/key 的 image、S3 寫入＋MySQL commit 新引用、GC 的刪除命中剛提交的物件。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n02",
+      "url": "https://depot.dev/blog/tla-verification",
+      "quote": "But the references live in MySQL and the bytes live in S3, and there is no transaction that spans both systems.",
+      "hedge": "asserted",
+      "interpretation": "根因陳述：引用與 bytes 分屬兩個系統，沒有橫跨兩者的 transaction。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n03",
+      "url": "https://depot.dev/blog/tla-verification",
+      "quote": "When GC marks a blob, it records the specific S3 version ID it saw. When it deletes, it deletes only that version.",
+      "hedge": "asserted",
+      "interpretation": "修法的具體機制：mark 時記下當時看到的 S3 version ID，刪除時只刪那個版本。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n04",
+      "url": "https://depot.dev/blog/tla-verification",
+      "quote": "We use it as a delete fence: it turns 'delete this key' into 'delete exactly the bytes I inspected,' which makes a delete safe to race against a write.",
+      "hedge": "asserted",
+      "interpretation": "delete fence 概念的框架描述：把刪除語意從『刪 key』改成『刪我檢查過的那份 bytes』，讓刪除能安全地跟寫入賽跑。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n05",
+      "url": "https://depot.dev/blog/tla-verification",
+      "quote": "TLC explores 14,290,224 distinct states in about 21 minutes and proves 10 safety invariants and 2 liveness properties.",
+      "hedge": "asserted",
+      "interpretation": "模型檢查的具體規模：狀態數、耗時、驗證的 invariant／property 數量。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n06",
+      "url": "https://depot.dev/blog/tla-verification",
+      "quote": "The most important invariant is the first one: a committed manifest never loses its blob data.",
+      "hedge": "asserted",
+      "interpretation": "最重要的 invariant：已提交的 manifest 不會失去 blob 資料。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n07",
+      "url": "https://depot.dev/blog/tla-verification",
+      "quote": "A model checker is one more trust dial, not a correctness proof.",
+      "hedge": "asserted",
+      "interpretation": "作者對 model checker 角色的定位：多一顆信任的骰子，不是正確性證明。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n08",
+      "url": "https://depot.dev/blog/tla-verification",
+      "quote": "So don't wait until you understand every line of a generated spec. Run it and see what falls out.",
+      "hedge": "asserted",
+      "interpretation": "建議不用等看懂每一行 spec 才動手，先跑跑看，看看會掉出什麼。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n09",
+      "url": "https://depot.dev/blog/tla-verification",
+      "quote": "Treat findings as leads, not verdicts: The model might not match reality, so a violated invariant is a starting point, a thread to keep pulling.",
+      "hedge": "hedged",
+      "interpretation": "把 violated invariant 當線索而非判決，因為模型可能跟現實不符——句子本身帶著保留語氣。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n10",
+      "url": "https://depot.dev/blog/tla-verification",
+      "quote": "The GC worker marks a blob with zero references, waits out a grace period, re-verifies, and deletes.",
+      "hedge": "asserted",
+      "interpretation": "GC 的四步驟流程：mark、grace period、re-verify、delete。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n11",
+      "url": "https://depot.dev/blog/tla-verification",
+      "quote": "ManifestNeedsData == \\A p \\in PusherIDs: manifestExists[p] => s3Versions /= {}",
+      "hedge": "asserted",
+      "interpretation": "invariant 公式：任何有 manifest 存在的 pusher，其 s3Versions 集合不可為空。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n12",
+      "url": "https://depot.dev/blog/tla-verification",
+      "quote": "ManifestCountNeverUndercounts == blobActive => blobManifestCount >= TrueGlobalManifestCount",
+      "hedge": "asserted",
+      "interpretation": "invariant 公式：blob active 時，MySQL 算出的 manifest count 不可低於真正全域數。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n13",
+      "url": "https://depot.dev/blog/tla-verification",
+      "quote": "S3HeadOK == /\\ (s3Versions = {}) <=> (s3Current = 0)",
+      "hedge": "asserted",
+      "interpretation": "invariant 公式：S3 目前版本指標與版本集合是否為空要邏輯一致，內部自洽檢查。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n14",
+      "url": "https://depot.dev/blog/tla-verification",
+      "quote": "To reduce contention on hot blobs, we use a lightweight saga: increment a reference counter, do the work, and compensate with a decrement on failure.",
+      "hedge": "asserted",
+      "interpretation": "saga 模式：先加引用計數、做工作、失敗則減量補償。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n15",
+      "url": "https://depot.dev/blog/tla-verification",
+      "quote": "A reconciler repairs counters when a crash prevents that compensation from completing.",
+      "hedge": "asserted",
+      "interpretation": "reconciler 負責在補償因當機而未完成時修正計數。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n16",
+      "url": "https://depot.dev/blog/tla-verification",
+      "quote": "An agent reads the implementation, the Go transactions and SQL and S3 calls, and translates it into a spec.",
+      "hedge": "asserted",
+      "interpretation": "spec 產生流程：agent 讀 Go/SQL/S3 呼叫並翻譯成 TLA+ spec。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n17",
+      "url": "https://depot.dev/blog/tla-verification",
+      "quote": "Don't throw TLA+ at everything.",
+      "hedge": "asserted",
+      "interpretation": "範圍限制建議：不要把 TLA+ 用在所有地方。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n18",
+      "url": "https://depot.dev/blog/tla-verification",
+      "quote": "We added a dedicated drift process that changes them in the same directions as failed compensations.",
+      "hedge": "asserted",
+      "interpretation": "drift 注入流程：用跟失敗補償相同的方向去改動計數。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n19",
+      "url": "https://depot.dev/blog/tla-verification",
+      "quote": "Within Depot Registry, blobs live at `blobs/sha256/<digest>`, and the digest is the hash of the content.",
+      "hedge": "asserted",
+      "interpretation": "blob 存放路徑格式與 content-addressing 定義。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n20",
+      "url": "https://depot.dev/blog/tla-verification",
+      "quote": "It's what happens when a popular base image cycles out of use and back in.",
+      "hedge": "asserted",
+      "interpretation": "觸發情境：熱門 base image「cycle 出去又回來」引發這個 race。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n21",
+      "url": "https://depot.dev/blog/tla-verification",
+      "quote": "The hardest distributed systems bugs to find aren't in any single operation. Two processes each do the right thing, but in an order nobody thought of, and data disappears.",
+      "hedge": "asserted",
+      "interpretation": "文章開場的核心命題：最難找的分散式系統 bug 不在單一操作裡，而是兩個各自正確的流程湊在一起、順序沒人想過。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n22",
+      "url": "https://depot.dev/blog/tla-verification",
+      "quote": "You now have another tool in your toolbox: tests check the interleavings you thought of; TLA+ explores the ones you didn't.",
+      "hedge": "asserted",
+      "interpretation": "收尾方法論主張：測試檢查想得到的交錯，TLA+ 探索想不到的交錯。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n23",
+      "url": "https://depot.dev/blog/tla-verification",
+      "quote": "The model checker found a real bug that our tests and reviews had missed.",
+      "hedge": "asserted",
+      "interpretation": "測試與 code review 都沒抓到這個 bug，是 model checker 找到的。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n24",
+      "url": "https://depot.dev/blog/tla-verification",
+      "quote": "Written by Wito Delnat, Published on 20 July 2026",
+      "hedge": "asserted",
+      "interpretation": "作者為 Depot 的 staff engineer Wito Delnat，文章發布於 2026 年 7 月 20 日。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n25",
+      "url": "https://depot.dev/blog/tla-verification",
+      "quote": "The wallet is a toy example.",
+      "hedge": "asserted",
+      "interpretation": "文章用一個簡化的 wallet 範例暖身，再進入 Depot Registry 這個生產環境的真實案例；本 note 僅確認其作為暖身範例存在，不涉及其內部機制細節（未取得逐字描述）。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n26",
+      "url": "https://depot.dev/blog/tla-verification",
+      "quote": "The result is a spec of the registry's three-tier garbage collector that models concurrent pushers, two GC domains, a counter reconciler, and injected counter drift, all interleaved.",
+      "hedge": "asserted",
+      "interpretation": "模型涵蓋範圍的完整敘述：三層 GC、並行 pusher、兩個 GC domain、計數 reconciler、注入的計數 drift，全部交錯；文章未進一步定義兩個 GC domain 具體對應什麼。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n27",
+      "url": "https://docs.aws.amazon.com/AmazonS3/latest/userguide/Versioning.html",
+      "quote": "If you overwrite an object, it results in a new object version in the bucket. You can always restore the previous version.",
+      "hedge": "asserted",
+      "interpretation": "bucket versioning 開啟後，覆寫同一個 key 會產生新版本，不會抹掉舊版本。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n28",
+      "url": "https://docs.aws.amazon.com/AmazonS3/latest/userguide/Versioning.html",
+      "quote": "if you delete an object, Amazon S3 inserts a delete marker instead of removing the object permanently",
+      "hedge": "asserted",
+      "interpretation": "一般（不指定 version）的 DELETE 不會真的刪除物件，只是插入一個 delete marker。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n29",
+      "url": "https://docs.aws.amazon.com/AmazonS3/latest/userguide/DeletingObjectVersions.html",
+      "quote": "To delete versioned objects permanently, you must use `DELETE Object versionId`.",
+      "hedge": "asserted",
+      "interpretation": "指定 version ID 的 DELETE，才會真的永久刪除那個版本；delete fence 機制依賴的正是這個 S3 語意。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n30",
+      "url": "https://docs.aws.amazon.com/AmazonS3/latest/userguide/DeletingObjectVersions.html",
+      "quote": "deleting a specified object version permanently removes that object",
+      "hedge": "asserted",
+      "interpretation": "指定版本的刪除，永久移除的是那一個特定版本，未提及是否影響同 key 的其他版本，需與同頁『DELETE Object versionId』的用途說明合看。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n31",
+      "url": "https://docs.aws.amazon.com/AmazonS3/latest/userguide/Versioning.html",
+      "quote": "Normal Amazon S3 rates apply for every version of an object stored and transferred. Each version of an object is the entire object; it is not just a diff from the previous version. Thus, if you have three versions of an object stored, you are charged for three objects.",
+      "hedge": "asserted",
+      "interpretation": "版本化儲存的成本語意：每個版本都以完整物件計費，不是差異儲存；delete fence 若沒有搭配後續清理，版本會持續累積成本。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n32",
+      "url": "https://en.wikipedia.org/wiki/Safety_and_liveness_properties",
+      "quote": "A safety property proscribes discrete bad things from occurring during an execution.",
+      "hedge": "asserted",
+      "interpretation": "safety property 的標準定義：禁止執行過程中發生特定的壞事。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n33",
+      "url": "https://en.wikipedia.org/wiki/Safety_and_liveness_properties",
+      "quote": "A liveness property prescribes good things for every execution or, equivalently, describes something that must happen during an execution.",
+      "hedge": "asserted",
+      "interpretation": "liveness property 的標準定義：要求某件好事最終一定要在執行過程中發生。",
+      "timeliness": "durable"
+    }
+  ],
+  "claims": [
+    {
+      "id": "c01",
+      "claim_text": "「最難找到的分散式系統 bug，不會出現在單一操作裡；是兩個流程各自做對了自己的事，只是順序沒人想過，資料就這樣不見了。」",
+      "location": "開場第二段",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n21"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The hardest distributed systems bugs to find aren't in any single operation. Two processes each do the right thing, but in an order nobody thought of, and data disappears.",
+      "note": "逐字對應原文開場兩句，中譯未增減語意強度。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c02",
+      "claim_text": "路徑是 blobs/sha256/<digest>，digest 就是內容本身的雜湊值",
+      "location": "開場第一段",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n19"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Within Depot Registry, blobs live at `blobs/sha256/<digest>`, and the digest is the hash of the content.",
+      "note": "路徑字串與 content-addressing 定義皆逐字可查。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c03",
+      "claim_text": "結果找到一個「測試和 code review 都漏掉的 bug」",
+      "location": "開場第一段（並於結尾段重述）",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n23"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The model checker found a real bug that our tests and reviews had missed.",
+      "note": "原文用 reviews，post 譯為 code review，屬合理具體化，未改變主張強度。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c04",
+      "claim_text": "一個熱門的 base image「cycle 出去又 cycle 回來」的時候",
+      "location": "開場第一段",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n20"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "And 'a client re-pushes a blob right as it becomes garbage' is not exotic: it's what happens when a popular base image cycles out of use and back in.",
+      "note": "n20 記的是後半句，重新抓取後確認完整句子存在且語意一致。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c05",
+      "claim_text": "GC 的流程照原文說法是「標記一個零引用的 blob，等過 grace period，再驗證一次，才刪除」",
+      "location": "H2「兩層帳本，各自都沒說謊」第 1 段",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n10"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The GC worker marks a blob with zero references, waits out a grace period, re-verifies, and deletes.",
+      "note": "四步驟順序與原文一致，句中已用「照原文說法」做可見出處標示。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c06",
+      "claim_text": "Depot 用一個輕量的 saga 模式減少熱門 blob 上的鎖競爭——「先把引用計數加一，做完工作，如果失敗再用減一補償」",
+      "location": "H2「兩層帳本，各自都沒說謊」第 1 段",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n14"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "To reduce contention on hot blobs, we use a lightweight saga: increment a reference counter, do the work, and compensate with a decrement on failure.",
+      "note": "引號內三動作逐字對應。唯一偏差：原文只說 contention，post 譯為「鎖競爭」，多加了「鎖」這個實作細節。屬低幅度具體化，未動搖主張。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c07",
+      "claim_text": "如果補償因為當機而沒能跑完，一個叫 reconciler 的角色會負責修回正確的計數",
+      "location": "H2「兩層帳本，各自都沒說謊」第 1 段",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n15"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "A reconciler repairs counters when a crash prevents that compensation from completing.",
+      "note": "當機導致補償未完成、reconciler 修正計數，兩個條件皆在原文句內。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c08",
+      "claim_text": "原文形容它「用跟失敗補償、跟歷史上計數失準相同的方向去改動計數」",
+      "location": "H2「先懷疑：是不是引用計數算錯了」第 1 段",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n18"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "We added a dedicated drift process that changes them in the same directions as failed compensations and historical desynchronization",
+      "note": "post 的引文比 n18 記錄的多出「跟歷史上計數失準」一節；重新抓取確認原文確有 and historical desynchronization。建議作者把 n18 的 quote 補齊到完整句。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c09",
+      "claim_text": "ManifestCountNeverUndercounts，寫成邏輯是「blob 處於 active 狀態時，blobManifestCount 必須大於等於 TrueGlobalManifestCount」",
+      "location": "H2「先懷疑：是不是引用計數算錯了」第 2 段（並見 invariant 表格）",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n12"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "ManifestCountNeverUndercounts ==\n    blobActive => blobManifestCount >= TrueGlobalManifestCount",
+      "note": "公式逐項對應：blobActive 為前提、>= 方向正確、變數名稱與原文一致。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c10",
+      "claim_text": "原文把根因講得很直白：「引用存在 MySQL，bytes 存在 S3，沒有一個 transaction 能同時橫跨這兩個系統。」",
+      "location": "H2「真正的縫隙：MySQL 和 S3 之間沒有交易」第 1 段",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n02"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "But the references live in MySQL and the bytes live in S3, and there is no transaction that spans both systems.",
+      "note": "全文根因句，逐字對應且句中已標示「原文」。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c11",
+      "claim_text": "「GC 驗證這個 blob 的引用數是零，決定要刪除它。與此同時，一個 client 推送了一個包含那個 blob 的 image——同樣的 digest，同樣的 key。這次上傳把資料寫進 S3，並且 commit 了一筆新的引用。GC 的刪除落地，砍掉了一個剛剛提交的 manifest 現在指向的物件。」",
+      "location": "H2「真正的縫隙：MySQL 和 S3 之間沒有交易」第 2 段",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n01"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "GC verifies the blob has zero references and decides to delete it. Concurrently, a client pushes an image containing that exact blob. Same digest, same key. The upload writes to S3 and commits a new reference. GC's delete lands and removes the object that a just-committed manifest now points to.",
+      "note": "五句逐句對應，順序、主詞、動作皆未變動；全文最核心的敘事引用，重新抓取後完整存在。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c12",
+      "claim_text": "「模型涵蓋 registry 三層 garbage collector，模擬並行的 pusher、兩個 GC domain、一個計數 reconciler，以及人工注入的計數 drift，全部交錯在一起。」",
+      "location": "H2「TLC 探索了一千四百多萬種交錯」第 1 段",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n26"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The result is a spec of the registry's three-tier garbage collector that models concurrent pushers, two GC domains, a counter reconciler, and injected counter drift, all interleaved.",
+      "note": "五個模型元素與 all interleaved 全部逐項對應。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c13",
+      "claim_text": "「TLC 在大約 21 分鐘內探索了 14,290,224 個不同的狀態，驗證了 10 個 safety invariant 和 2 個 liveness property」",
+      "location": "H2「TLC 探索了一千四百多萬種交錯」第 1 段（數字並於表格末列重述）",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n05"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "TLC explores 14,290,224 distinct states in about 21 minutes and proves 10 safety invariants and 2 liveness properties.",
+      "note": "四個數字逐一比對：14,290,224 狀態、about 21 minutes、10 safety、2 liveness，全部相符。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c14",
+      "claim_text": "（修正前）這不是抽樣測試，是把這些並行動作能排列出的交錯順序，窮舉到 TLC 願意花的那 21 分鐘為止。……TLC 探索的 14,290,224 個狀態，正是這四種角色的動作在給定時間點上所有能出現的組合結果",
+      "location": "H2「TLC 探索了一千四百多萬種交錯」第 1 段",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [
+        "n05"
+      ],
+      "independence": "single-source",
+      "verdict": "unverifiable",
+      "hedge_delta": "none",
+      "evidence": "TLC explores 14,290,224 distinct states in about 21 minutes and proves 10 safety invariants and 2 liveness properties.",
+      "note": "原文說 TLC proves，蘊含狀態空間已被完整走完，21 分鐘是完成所需的時間，不是探索被切斷的預算。post 的「窮舉到 TLC 願意花的那 21 分鐘為止」反過來暗示探索是被時間截斷的，與 proves 相牴觸；同段把狀態數等同於四種角色動作的組合數，也不在原文。",
+      "action": "correct",
+      "resolution": "corrected",
+      "fix_applied": "刪去「窮舉到 TLC 願意花的那 21 分鐘為止」與把狀態數解釋成角色動作組合數的整句，改寫為「原文用的動詞是 proves，不是『試過幾個劇本沒出事』——這 14,290,224 個相異狀態不是工程師事先猜測的那幾條路徑。」修正只用 n05 已有的內容，未引入新事實。",
+      "recheck_round": 2
+    },
+    {
+      "id": "c15",
+      "claim_text": "最重要的一條擺在第一位：「已經 commit 的 manifest 永遠不會失去它的 blob 資料」——對應的公式是「任何一個有 manifest 存在的 pusher，它的 S3 版本集合都不可以是空的」",
+      "location": "H2「TLC 探索了一千四百多萬種交錯」第 2 段",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n06",
+        "n11"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The most important invariant is the first one: a committed manifest never loses its blob data. / ManifestNeedsData ==\n    \\A p \\in PusherIDs: manifestExists[p] => s3Versions /= {}",
+      "note": "「最重要」「擺在第一位」皆出自原文，非作者自封。唯一措辭偏差：s3Versions 是全域變數、不隨 p 索引，post 寫成「它的 S3 版本集合」屬翻譯所有格誤置，不影響該 invariant 的保證內容。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c16",
+      "claim_text": "S3HeadOK 則是純粹的內部自洽檢查——S3 目前指到的版本，得跟它自己記錄的版本集合裡最新的那個吻合",
+      "location": "H2「TLC 探索了一千四百多萬種交錯」第 2 段",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n13"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "S3HeadOK ==\n    /\\ (s3Versions = {}) <=> (s3Current = 0)\n    /\\ (s3Versions /= {}) =>\n        /\\ s3Current \\in s3Versions\n        /\\ s3Current = MaxVersion(s3Versions)",
+      "note": "n13 的 quote 只截到第一個 conjunct，不足以支撐 post 的說法；重新抓取取得完整公式後，第二個 conjunct 的 s3Current = MaxVersion(s3Versions) 正是 post 所述內容，主張成立。建議補齊 n13 的 quote 至完整公式。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c17",
+      "claim_text": "一個 safety property 禁止的是「執行過程中不該發生的壞事」，一個 liveness property 要求的是「某件好事最終一定要發生」",
+      "location": "H2「TLC 探索了一千四百多萬種交錯」第 3 段",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n32",
+        "n33"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "A safety property proscribes discrete bad things from occurring during an execution. / A liveness property prescribes good things for every execution or, equivalently, describes something that must happen during an execution.",
+      "note": "兩條定義逐字對應 Wikipedia。此處僅作背景定義，未被拿來佐證 Depot 文章的任何具體發現。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c18",
+      "claim_text": "文章沒有點名那兩條 liveness property 具體要求什麼，但它們守的通常是「GC 最終真的會把沒人用的 blob 清掉」這一類承諾",
+      "location": "H2「TLC 探索了一千四百多萬種交錯」第 3 段",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "無 note 支撐，但文中已自行揭露「文章沒有點名」並以「通常是」限定，屬明示的作者推斷。前半經重新抓取確認為真：原文只給出 10/2 的計數，未逐條列出。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c19",
+      "claim_text": "「GC 標記一個 blob 的時候，記下它當時看到的那個 S3 version ID。真正刪除的時候，只刪那個版本。」",
+      "location": "H2「delete fence」第 1 段",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n03"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "When GC marks a blob, it records the specific S3 version ID it saw. When it deletes, it deletes only that version.",
+      "note": "修法機制的兩句逐字對應，only that version 的排他性也保留在譯文。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c20",
+      "claim_text": "「我們把它當成一個 delete fence：它把『刪掉這把 key』變成『刪掉我當時檢查過的那份精確的 bytes』，這讓一次刪除能安全地跟一次寫入賽跑。」",
+      "location": "H2「delete fence」第 1 段",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n04"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "We use it as a delete fence: it turns 'delete this key' into 'delete exactly the bytes I inspected,' which makes a delete safe to race against a write.",
+      "note": "含尾句在內，全句經第二輪重新抓取逐字確認存在。原文為斷言語氣，post 亦為斷言。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c21",
+      "claim_text": "AWS 官方文件寫得很明確：「如果你覆寫一個物件，結果是 bucket 裡多出一個新的物件版本，你永遠可以還原前一個版本」……一般不指定版本的 DELETE 只會插入一個 delete marker",
+      "location": "H2「delete fence」第 1 段",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n27",
+        "n28"
+      ],
+      "independence": "echo",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "If you overwrite an object, it results in a new object version in the bucket. You can always restore the previous version. / For example, if you delete an object, Amazon S3 inserts a delete marker instead of removing the object permanently.",
+      "note": "兩句皆逐字存在。兩個 AWS 頁面同屬官方文件、同一出處，判為 echo 而非互相佐證；post 用單數「AWS 官方文件」陳述，未宣稱多方證實。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c22",
+      "claim_text": "「要永久刪除一個已版本化的物件，你必須使用指定 version ID 的 DELETE」……GC 拿到的，正是這個「指定版本才會真的刪」的保證",
+      "location": "H2「delete fence」第 1 段",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n29",
+        "n30"
+      ],
+      "independence": "echo",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "To delete versioned objects permanently, you must use `DELETE Object versionId`. / The following figure shows that deleting a specified object version permanently removes that object.",
+      "note": "must use 的強制語氣在譯文保留，無 hedge 落差。與 c21 同屬 AWS 文件，判為 echo。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c23",
+      "claim_text": "「每一個版本都照一般 S3 費率計費……所以如果你存了三個版本，就是照三個物件收費。」",
+      "location": "H2「delete fence」第 4 段",
+      "type": "number",
+      "load": "medium",
+      "note_ids": [
+        "n31"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Normal Amazon S3 rates apply for every version of an object stored and transferred. Each version of an object is the entire object; it is not just a diff from the previous version. Thus, if you have three versions of an object stored, you are charged for three objects.",
+      "note": "三句逐字對應，含「三個版本＝三個物件」的具體數字例。譯文未加入原文沒有的費率數字。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c24",
+      "claim_text": "如果沒有搭配 lifecycle 規則去清掉真正不再需要的舊版本，版本數會一直往上疊，儲存成本也會跟著疊上去",
+      "location": "H2「delete fence」第 4 段",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [
+        "n31"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The noncurrent expiration lifecycle configuration manages the deletes of the noncurrent object versions in the versioning-enabled bucket. / Normal Amazon S3 rates apply for every version of an object stored and transferred.",
+      "note": "成本累積由 n31 直接支撐。lifecycle 機制本身沒有 note 記錄，屬追溯缺口；重新抓取 Versioning.html 後同頁確有 noncurrent expiration lifecycle configuration 的敘述，主張成立。建議作者補一條相關 note。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c25",
+      "claim_text": "這篇文章發表於 2026 年 7 月 20 日，作者是 Depot 的 staff engineer Wito Delnat",
+      "location": "H2「模型是多一顆信任的骰子」第 2 段",
+      "type": "date-version",
+      "load": "high",
+      "note_ids": [
+        "n24"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Written by Wito Delnat / Published on 20 July 2026 / Staff Engineer at Depot",
+      "note": "byline 三項全中。n24 的 quote 未含職稱，但職稱確實出現在同一 byline 區塊；建議把 n24 補上職稱一行。文章發布距本文日期不到一個月，無時效疑慮。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c26",
+      "claim_text": "「我們現在不再手寫模型了。一個 agent 讀實作——Go 的 transaction、SQL、S3 呼叫——把它翻譯成一份 spec。」",
+      "location": "H2「模型是多一顆信任的骰子」第 1 段",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n16"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "What changed is that we don't write the model by hand anymore. / An agent reads the implementation, the Go transactions and SQL and S3 calls, and translates it into a spec.",
+      "note": "第二句由 n16 逐字支撐。第一句沒有 note 記錄，屬追溯缺口——重新抓取後在原文找到對應句，引文整體成立。建議補一條 note。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c27",
+      "claim_text": "原文也劃了範圍：「不要把 TLA+ 丟去對付每一件事」——CRUD 端點不值得為它建模",
+      "location": "H2「模型是多一顆信任的骰子」第 1 段",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n17"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Don't throw TLA+ at everything.",
+      "note": "引號內的祈使句逐字對應。其後的展開說明未以引號呈現，屬合理延伸。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c28",
+      "claim_text": "文章開頭還用了一個更簡單的「玩具範例」暖身，再進入 Depot Registry 這個生產環境的真實案例",
+      "location": "H2「模型是多一顆信任的骰子」第 1 段",
+      "type": "attribution",
+      "load": "low",
+      "note_ids": [
+        "n25"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The wallet is a toy example. / Here's a trivial model: two clients withdrawing from a shared wallet, each doing a read-then-write without locking.",
+      "note": "「玩具範例」直譯自 toy example，且該範例確實置於 Depot Registry 案例之前。post 未描述其內部細節，未逾越 n25 的記錄範圍。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c29",
+      "claim_text": "「一個 model checker 只是多一顆信任的骰子，不是正確性證明。」",
+      "location": "H2「模型是多一顆信任的骰子」第 3 段（並用作 H2 標題）",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n07"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "A model checker is one more trust dial, not a correctness proof.",
+      "note": "逐字對應。post 以「作者對模型檢查本身也沒有誇大」引入，與原文的自我限縮語境一致。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c30",
+      "claim_text": "「不要等到你看懂一份生成出來的 spec 的每一行才動作。跑跑看，看看會掉出什麼。最壞的情況是浪費一個下午；最好的情況是你抓到了一條值得追下去的線索。」",
+      "location": "H2「模型是多一顆信任的骰子」第 3 段",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n08"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "So don't wait until you understand every line of a generated spec. Run it and see what falls out. Worst case you lose an afternoon; best case you've found a thread to pull.",
+      "note": "n08 只記到前兩句，post 的引文多出第三句。重新抓取確認第三句確實存在且緊接其後；建議把 n08 的 quote 延伸到第三句。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c31",
+      "claim_text": "原文的說法是「當成線索，不是判決：模型可能跟現實不符……」——這句話本身就帶著保留語氣",
+      "location": "H2「模型是多一顆信任的骰子」第 3 段",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n09"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Treat findings as leads, not verdicts: The model might not match reality, so a violated invariant is a starting point, a thread to keep pulling.",
+      "note": "n09 記為 hedged。post 不但沒有把保留語氣拉高成斷言，還明文指出「這句話本身就帶著保留語氣」，強度與原文一致甚至更保守。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c32",
+      "claim_text": "原文收尾的說法也呼應這一點：「測試檢查你想得到的交錯；TLA+ 探索你想不到的交錯。」",
+      "location": "H2「模型是多一顆信任的骰子」第 4 段",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n22"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "You now have another tool in your toolbox: tests check the interleavings you thought of; TLA+ explores the ones you didn't.",
+      "note": "引號內對應原文冒號之後的兩個分句，逐字相符；「收尾」的位置描述亦與原文相符。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c33",
+      "claim_text": "原文沒有進一步解釋這兩個 GC domain 具體分別對應什麼",
+      "location": "H2「TLC 探索了一千四百多萬種交錯」第 1 段",
+      "type": "attribution",
+      "load": "low",
+      "note_ids": [
+        "n26"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The result is a spec of the registry's three-tier garbage collector that models concurrent pushers, two GC domains, a counter reconciler, and injected counter drift, all interleaved.",
+      "note": "這是一個否定式主張。重新抓取全文確認 two GC domains 僅在此句出現一次，全文未再定義或展開，故該否定成立。作者明示知識邊界而非自行補完，是正確處理。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c34",
+      "claim_text": "這條 invariant 只往一個方向設防，合理的推測是：兩種算錯的後果並不對稱……",
+      "location": "H2「先懷疑：是不是引用計數算錯了」第 3 段",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "原文沒有解釋 ManifestCountNeverUndercounts 為何只設單向下界。post 以「合理的推測是」明文標示為作者推斷。其立論前提（該 invariant 只有 >= 這一個方向）由 n12 的公式支撐。",
+      "action": "none",
+      "resolution": "none-needed"
+    }
+  ],
+  "checked_at": "2026-08-16",
+  "checker_rounds": 2,
+  "coverage": {
+    "candidate_claims": 42,
+    "checked": 34,
+    "dropped_low_load": 8
+  }
+}
