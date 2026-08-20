@@ -1,0 +1,409 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">40 行的 Rust 程式,開著 debug 資訊編到 WebAssembly 要 50 秒,關掉只要 1.5 秒。問題出在 LLVM 一個叫 Register Stackify 的 pass——它會為了替變數的除錯位置搬家,一次次把整份指令列表從頭掃到尾,而且掃不到的地方永遠掃不到;rustc 本身沒有錯,「debug 資訊本來就貴」這種說法也解釋不了這麼誇張的落差。</p>
+  <h1 class="vg-post-title">{{ title }}</h1>
+</header>
+
+<div class="vg-post-prose vg-post-body">
+  <p><span class="vg-dropcap">帶</span>著 debug 資訊編譯 Rust 到 WebAssembly,建置時間可以慢到不成比例。Frank Denis 在 8 月 19 日的文章裡,用一個 40 行的 reproducer 把問題壓縮到最小：開 debug=2 要 50 秒,關掉只要 1.5 秒。他沒有停在「慢」這個結論上,而是往下追,一路追到 LLVM 為 wasm 產生機器碼的 Register Stackify pass 裡,一段結構性寫壞的往前掃描邏輯。這種慢法不是「多等幾秒」的等級——對一個習慣改一行程式碼就跑一次 build 看結果的人來說,50 秒已經足夠打斷思路,而真實 crate 上這個數字還能再放大好幾十倍。</p>
+
+  <p>這也不是一篇「debug info 拖慢建置」的老生常談。debug info 在原生 target 上通常只多花一點時間跟磁碟空間;會被放大到分鐘等級的,是 wasm 這個特定 backend 裡一段可以指名道姓、可以重現、也已經有具體修法的演算法瑕疵。接下來的每一個數字,都是同一份 crate 只切換 debug=2 開關或套用 patch 前後量出來的對照組。</p>
+
+  <h2>DBG_VALUE 與被炸開的 MIR</h2>
+
+  <p>LLVM 中段用一種叫 DBG_VALUE 的 record 追蹤「這個原始碼變數,現在存放在機器碼的哪個位置」。它本身不產生任何機器碼,純粹是給除錯器看的路標——但代價是,每一個會搬動指令的 pass,都得順手把跟著這段指令的 DBG_VALUE 一起搬,或更新它指向的位置。debug=2 要求完整的 DWARF 資訊,跟重度 inlining 疊在一起特別致命：一個函式被 inlining 進來的呼叫愈多層,綁在每一層局部變數上的 DBG_VALUE 就跟著愈多層疊上去,單一函式因此可以產生數十萬條這種 record。這件事在原生 target 上不太會被注意到,因為原生後端的暫存器分配、指令排程對這類 metadata 的搬移沒那麼敏感;wasm 的差別要往下兩節才看得出來。</p>
+
+  <p>Denis 的 reproducer 只有 40 行,但等 Register Stackify 跑完的時候,裡面已經有大約 9 萬條真正的指令、26.7 萬條 DBG_VALUE record、35.5 萬行 MIR——debug metadata 的行數是實際指令數的將近三倍。這個比例本身就是一個警訊：一份原始碼被展開之後,大部分需要被讀、被搬、被掃描的東西,是純粹為了除錯器存在的路標,真正能跑起來的程式邏輯只占其中一小部分。</p>
+
+  <figure class="vg-w-cq-repro-scale" data-mobile="keep">
+    <style>
+      .vg-w-cq-repro-scale { container-type: inline-size; container-name: vgwcq; margin: var(--s-4) 0; }
+      .vg-w-cq-repro-scale .grid { display: grid; grid-template-columns: 1fr; gap: var(--s-2); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); padding: var(--s-3) 0; }
+      @container vgwcq (min-width: 560px) {
+        .vg-w-cq-repro-scale .grid { grid-template-columns: repeat(3, 1fr); }
+      }
+      .vg-w-cq-repro-scale .tile { display: flex; flex-direction: column; gap: 4px; padding: 0 var(--s-2); }
+      @container vgwcq (min-width: 560px) {
+        .vg-w-cq-repro-scale .tile + .tile { border-left: 1px solid var(--line); }
+      }
+      .vg-w-cq-repro-scale .num { font-family: var(--display); font-size: 2.2rem; color: var(--ink); line-height: 1; font-variant-numeric: tabular-nums; }
+      .vg-w-cq-repro-scale .num .unit { font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-left: 0.4ch; }
+      .vg-w-cq-repro-scale .lbl { font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink-soft); }
+      .vg-w-cq-repro-scale figcaption { font-family: var(--scribed); font-size: var(--fs-xs); color: var(--muted); margin-top: var(--s-2); }
+    </style>
+    <div class="grid">
+      <div class="tile"><div class="num">9<span class="unit">萬</span></div><div class="lbl">真正的指令</div></div>
+      <div class="tile"><div class="num">26.7<span class="unit">萬</span></div><div class="lbl">DBG_VALUE record</div></div>
+      <div class="tile"><div class="num">35.5<span class="unit">萬</span></div><div class="lbl">行 MIR</div></div>
+    </div>
+    <figcaption>同一個 40 行 reproducer,跑到 Register Stackify 結束時的規模——debug metadata 是真正指令數的將近三倍。</figcaption>
+  </figure>
+
+  <p>三個數字放在一起看更清楚：9 萬條真正的指令,對比 26.7 萬條 DBG_VALUE record,意味著 Register Stackify 每處理一條「有意義」的指令,同時要應付將近三條純粹是路標的 record。這不是一次性的建置開銷——每一次 dev build、每一次只改一行程式碼重新編譯,都要重新付一次同樣比例的稅。</p>
+
+  <p>這份清單為什麼一路往上疊,而不是隨 pass 跑完慢慢清空?一個是重度 inlining 本身就會逐層堆疊變數的 DBG_VALUE;另一個是 pass 在「sink」一個定義(把它搬到更靠近使用點的地方)時,會把舊位置的 debug record 留在指令列表裡,只把它的位置資訊清空,而不是刪掉——「it leaves the old debug records in the instruction list with their locations blanked out instead of deleting them」;還有像常數這種算起來很便宜的值,pass 不會把它搬運共用,而是在每一個使用它的地方重新算一次——等於每次使用都多長出一段可以被掃描到的指令。三個原因疊起來,指令列表只增不減。</p>
+
+  <figure class="vg-w-diag-dbgvalue-growth" data-mobile="keep" data-svg-scroll="640">
+    <style>
+      .vg-w-diag-dbgvalue-growth { margin: var(--s-4) 0; }
+      .vg-w-diag-dbgvalue-growth svg { width: 100%; height: auto; }
+      .vg-w-diag-dbgvalue-growth figcaption { font-family: var(--scribed); font-size: var(--fs-xs); color: var(--muted); margin-top: var(--s-2); }
+      .vg-w-diag-dbgvalue-growth text { font-family: EB Garamond, serif; }
+      .vg-w-diag-dbgvalue-growth .head { font-family: IM Fell English, serif; font-style: italic; font-size: 13px; }
+      .vg-w-diag-dbgvalue-growth .box-h { font-family: var(--sans); font-size: 12px; letter-spacing: 0.01em; }
+      .vg-w-diag-dbgvalue-growth .box-b { font-size: 12px; fill: var(--ink-soft); }
+    </style>
+    <svg viewBox="0 0 720 240" role="img" aria-label="DBG_VALUE 列表持續膨脹的三個成因——重度 inlining、sink 定義時只清空不刪除、廉價值重複計算">
+      <text x="360" y="24" text-anchor="middle" fill="var(--ink)" class="head">為什麼 DBG_VALUE 列表只增不減</text>
+
+      <rect x="20" y="46" width="220" height="120" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1"/>
+      <text x="36" y="72" fill="var(--accent-text)" class="box-h">重度 inlining</text>
+      <text x="36" y="96" class="box-b">每多 inline 一層呼叫,</text>
+      <text x="36" y="114" class="box-b">綁在局部變數上的</text>
+      <text x="36" y="132" class="box-b">DBG_VALUE 就多疊一層</text>
+
+      <rect x="250" y="46" width="220" height="120" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1"/>
+      <text x="266" y="72" fill="var(--accent-text)" class="box-h">sink 定義不刪除</text>
+      <text x="266" y="96" class="box-b">搬動定義時把舊 record</text>
+      <text x="266" y="114" class="box-b">位置清空(blanked out)</text>
+      <text x="266" y="132" class="box-b">而不是真的刪掉</text>
+
+      <rect x="480" y="46" width="220" height="120" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1"/>
+      <text x="496" y="72" fill="var(--accent-text)" class="box-h">廉價值重複計算</text>
+      <text x="496" y="96" class="box-b">常數之類的值不搬運</text>
+      <text x="496" y="114" class="box-b">共用,而是在每個使用點</text>
+      <text x="496" y="132" class="box-b">重新算一次</text>
+
+      <line x1="20" y1="188" x2="700" y2="188" stroke="var(--muted-2)" stroke-width="1"/>
+      <text x="360" y="214" text-anchor="middle" fill="var(--muted)" class="box-b">三段疊加——指令列表只增不減,愈掃愈久</text>
+    </svg>
+    <figcaption>三個獨立的膨脹來源,疊加在同一份指令列表上。</figcaption>
+  </figure>
+
+  <p>這三個原因沒有一個是懶惰的實作——每一個都是 pass 在忠實做自己份內的最佳化工作：把定義搬到離使用點更近的地方可以省掉額外的搬運,常數不特地保留、算便宜就重算,可以省下暫存器或 local 槽位。合理的推測是,這些各自看起來划算的決定疊在一起,產生的副作用是一份只增不減的 debug record 清單——而清單愈長,下一節要講的 Register Stackify pass 就要付出愈高的代價。</p>
+
+  <h2>Register Stackify 為什麼吃掉八成五的時間</h2>
+
+  <p>WebAssembly 是堆疊機器,沒有通用暫存器——LLVM 在產生 wasm 位元碼之前,要跑一個叫 Register Stackify 的 pass,把原本用虛擬暫存器表示的值盡量搬到 wasm 的運算堆疊上,省掉來回讀寫 local 的開銷。這個 pass 是 wasm 這種堆疊機器特有的後端工作,跟 x86、ARM 這類暫存器機器的程式碼產生路徑不是同一套邏輯,這也是為什麼同樣的 debug=2 設定在原生後端上不太會被人注意到。編這個 reproducer 時,debug=2 底下 LLVM 全部 pass 加起來花了 50.85 秒,其中 Register Stackify 一個 pass 就吃掉 43.51 秒,占 85.6%;第二名的 Explicit Locals 也才 6.31 秒,占 12.4%。兩個 pass 加起來吃掉九成八的時間,其餘所有 pass 合計不到 2%——時間幾乎全部灌進這兩個 pass,尤其是 Register Stackify 一個。這也是為什麼多數人「感覺」wasm build 特別慢,卻很難具體說出慢在哪一步：一般的建置耗時觀察通常只會看到 rustc 這個階段花了不成比例的時間,不會直接看到 Register Stackify 這個藏在 LLVM 內部的 pass 名字,除非像這篇文章一樣特地把 LLVM pass 計時打開來看。</p>
+
+  <p>問題出在 Register Stackify 判斷一個值能不能安全留在堆疊上的方式——它要往前掃描指令列表,數一數這個值後面還有幾個 use,count 歸零就代表可以安全搬到堆疊上,不用再存回 local。這種用一個遞減計數器判斷「這個定義後面還有沒有人用」的寫法,在編譯器裡不是新鮮事,平常在沒有大量 debug metadata 干擾的情況下,既簡單又夠快——這個想法本身沒問題,只是從來沒有被驗證過：在 debug record 又多、位置又會被 pass 自己重新排列的世界裡,這個計數器還碰不碰得到它該碰到的每一筆紀錄。這個 reproducer 裡碰不到,因為 pass 在搬動或複製指令的過程中,會把某些 DBG_VALUE record 留在原本定義點的「前面」。往前掃描的邏輯結構性地碰不到這些留在後方的 record：「A forward scan can never reach them, so its count never reaches zero and it always reads to the end」——count 永遠不會歸零,掃描永遠得讀到整個 block 結尾才停。</p>
+
+  <figure class="vg-w-diag-mir-scan" data-mobile="keep" data-svg-scroll="720">
+    <style>
+      .vg-w-diag-mir-scan { margin: var(--s-4) 0; }
+      .vg-w-diag-mir-scan svg { width: 100%; height: auto; }
+      .vg-w-diag-mir-scan figcaption { font-family: var(--scribed); font-size: var(--fs-xs); color: var(--muted); margin-top: var(--s-2); }
+      .vg-w-diag-mir-scan .head { font-family: IM Fell English, serif; font-style: italic; font-size: 14px; }
+      .vg-w-diag-mir-scan .box-t { font-family: var(--sans); font-size: 11px; }
+      .vg-w-diag-mir-scan .box-s { font-family: EB Garamond, serif; font-size: 10px; fill: var(--muted); }
+      .vg-w-diag-mir-scan .note { font-family: EB Garamond, serif; font-size: 12px; fill: var(--muted); }
+    </style>
+    <svg viewBox="0 0 720 260" role="img" aria-label="舊邏輯往前掃描碰不到定義點之前的 DBG_VALUE;修法改成雙向掃描">
+      <defs>
+        <marker id="vg-w-diag-mir-scan-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/>
+        </marker>
+      </defs>
+
+      <text x="360" y="20" text-anchor="middle" fill="var(--ink)" class="head">往前掃描——舊邏輯</text>
+      <rect x="30" y="34" width="76" height="34" fill="var(--bg-soft)" stroke="var(--muted-2)"/>
+      <text x="68" y="49" text-anchor="middle" class="box-t" fill="var(--ink)">DBG_VALUE</text>
+      <text x="68" y="61" text-anchor="middle" class="box-s">def 之前</text>
+      <rect x="114" y="34" width="76" height="34" fill="var(--bg-soft)" stroke="var(--muted-2)"/>
+      <text x="152" y="55" text-anchor="middle" class="box-t" fill="var(--muted)">instr</text>
+      <rect x="198" y="34" width="76" height="34" fill="var(--accent)" fill-opacity="0.28" stroke="var(--accent)"/>
+      <text x="236" y="55" text-anchor="middle" class="box-t" fill="var(--accent-text)">DEF v</text>
+      <rect x="282" y="34" width="76" height="34" fill="var(--bg-soft)" stroke="var(--muted-2)"/>
+      <text x="320" y="55" text-anchor="middle" class="box-t" fill="var(--muted)">instr</text>
+      <rect x="366" y="34" width="76" height="34" fill="var(--sage)" fill-opacity="0.35" stroke="var(--sage-deep)"/>
+      <text x="404" y="49" text-anchor="middle" class="box-t" fill="var(--sage-deep)">DBG_VALUE</text>
+      <text x="404" y="61" text-anchor="middle" class="box-s">def 之後</text>
+      <rect x="450" y="34" width="76" height="34" fill="var(--bg-soft)" stroke="var(--muted-2)"/>
+      <text x="488" y="55" text-anchor="middle" class="box-t" fill="var(--muted)">instr</text>
+      <rect x="534" y="34" width="76" height="34" fill="var(--muted-2)" fill-opacity="0.22" stroke="var(--muted-2)"/>
+      <text x="572" y="55" text-anchor="middle" class="box-t" fill="var(--muted)">block 結尾</text>
+
+      <text x="68" y="88" text-anchor="middle" class="note">scan 從 def 往前,</text>
+      <text x="68" y="102" text-anchor="middle" class="note">碰不到這裡</text>
+
+      <line x1="238" y1="118" x2="530" y2="118" stroke="var(--accent)" stroke-width="1.6" marker-end="url(#vg-w-diag-mir-scan-arrow)"/>
+      <text x="360" y="140" text-anchor="middle" class="note">掃到 block 結尾,count 還是沒有歸零</text>
+
+      <text x="360" y="168" text-anchor="middle" fill="var(--ink)" class="head">雙向掃描——修法之一</text>
+      <rect x="30" y="182" width="76" height="34" fill="var(--sage)" fill-opacity="0.3" stroke="var(--sage-deep)"/>
+      <text x="68" y="197" text-anchor="middle" class="box-t" fill="var(--sage-deep)">DBG_VALUE</text>
+      <text x="68" y="209" text-anchor="middle" class="box-s">✓ 現在算得到</text>
+      <rect x="114" y="182" width="76" height="34" fill="var(--bg-soft)" stroke="var(--muted-2)"/>
+      <text x="152" y="203" text-anchor="middle" class="box-t" fill="var(--muted)">instr</text>
+      <rect x="198" y="182" width="76" height="34" fill="var(--accent)" fill-opacity="0.28" stroke="var(--accent)"/>
+      <text x="236" y="203" text-anchor="middle" class="box-t" fill="var(--accent-text)">DEF v</text>
+      <rect x="282" y="182" width="76" height="34" fill="var(--bg-soft)" stroke="var(--muted-2)"/>
+      <text x="320" y="203" text-anchor="middle" class="box-t" fill="var(--muted)">instr</text>
+      <rect x="366" y="182" width="76" height="34" fill="var(--sage)" fill-opacity="0.35" stroke="var(--sage-deep)"/>
+      <text x="404" y="203" text-anchor="middle" class="box-t" fill="var(--sage-deep)">DBG_VALUE</text>
+      <rect x="450" y="182" width="76" height="34" fill="var(--bg-soft)" stroke="var(--muted-2)"/>
+      <text x="488" y="203" text-anchor="middle" class="box-t" fill="var(--muted)">instr</text>
+      <rect x="534" y="182" width="76" height="34" fill="var(--muted-2)" fill-opacity="0.22" stroke="var(--muted-2)"/>
+      <text x="572" y="203" text-anchor="middle" class="box-t" fill="var(--muted)">block 結尾</text>
+
+      <line x1="196" y1="230" x2="108" y2="230" stroke="var(--sage-deep)" stroke-width="1.6" marker-end="url(#vg-w-diag-mir-scan-arrow)"/>
+      <line x1="238" y1="230" x2="530" y2="230" stroke="var(--accent)" stroke-width="1.6" marker-end="url(#vg-w-diag-mir-scan-arrow)"/>
+      <text x="360" y="248" text-anchor="middle" class="note">往上數清楚 def 之前的 record,兩段一起算</text>
+    </svg>
+    <figcaption>舊邏輯的往前掃描結構性地碰不到定義點之前的 DBG_VALUE;修法之一是同時往上掃。</figcaption>
+  </figure>
+
+  <p>把上面這張圖攤開成邏輯,大概是這樣：</p>
+
+  <pre data-kind="pseudocode"><code>// 舊邏輯——只往前掃
+scan_forward(def):
+  count = uses_after(def)
+  for instr in block[def.pos : end]:
+    if instr is DBG_VALUE and refers(def):
+      count -= 1
+    if count == 0:
+      return SAFE_TO_STACKIFY
+  return NOT_SAFE                <em>// 掃到 block 結尾,count 還是沒歸零</em>
+
+<em>// 問題:pass 搬移/複製指令時,
+// 部分 DBG_VALUE 被留在 def 位置「之前」
+// → 這段迴圈結構性地碰不到它們</em>
+
+// 修法之一——雙向掃
+scan_both_ways(def):
+  count = uses_after(def)
+  count -= scan_backward(def)     <em>// 先數清楚留在前面的 DBG_VALUE</em>
+  for instr in block[def.pos : end]:
+    if instr is DBG_VALUE and refers(def):
+      count -= 1
+    if count == 0:
+      return SAFE_TO_STACKIFY
+  return NOT_SAFE</code></pre>
+
+  <p>往前掃只認得 def 之後的 DBG_VALUE,往上掃負責把 def 之前的那些先扣掉——兩個改動看起來很小,拿掉的卻正是整段迴圈裡最貴的部分：一次不必要地讀到 block 結尾。而且這不是一次性的固定成本,record 愈多,每次往前掃描要跑的距離也愈長,兩者疊加之後,「twice as many records can mean four times as much scanning」,record 數量翻倍,掃描量可以變成四倍。合理的推測是,這也解釋了為什麼像 ed25519-compact 這種吃了大量 inlining 的 crate,建置時間會斷崖式暴增——record 數量變多,跟每條 record 的掃描成本同時變貴,兩件事疊在一起,效果遠比單純等比例拉長劇烈。</p>
+
+  <h2>三個小改動,刪掉多餘的工作</h2>
+
+  <p>回到三個改動本身,它們共同的性格看起來是「只拿掉多餘的工作,不改變任何輸出結果」——原本能被安全搬到堆疊上的值,修法之後一樣會被搬;原本不能的,一樣不會。差別只在於 pass 判斷這件事要花多少功夫。這種「行為不變、只把浪費的步驟拿掉」的修法,通常也是最容易被上游接受的一種,因為 review 的人不用擔心它悄悄改變了任何程式的執行結果,只需要驗證計時數字。</p>
+
+  <p>LLVM 官方其實已經注意到這個問題。issue #168326 在 2026 年 3 月 27 日被一個 commit 關閉,加了一個 use-count 機制——那個 issue 最早是從 clang 加 <code>-g</code> 編 wasm 的情境被回報的,作者自己的講法是它「doesn't help Rust (TBH it does, but very little)」。Rust 靠重度 inlining 產生的 DBG_VALUE 密度,跟 clang 的情境不是同一個量級,官方修法幫不上什麼忙——它解決的是「查找次數太多」的那一小塊,沒有碰到「往前掃結構性碰不到某些 record」這個更根本的問題。</p>
+
+  <p>真正解決問題的修法沒有重寫這個 pass,也沒有動 Register Stackify 判斷一個值該不該進堆疊的核心邏輯——三個改動動的都是「明明不需要做的工作」,而且每一個都直接對應前面講的根因。找出「為什麼這一步在做用不到的工作」,比重寫或砍掉重練精準得多——這正是三個改動能又小又有效的原因。</p>
+
+  <figure class="vg-w-tabs-regstackify-fix" data-mobile="static" data-svg-scroll="560">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="3" y="4" width="18" height="16" rx="1"/><path d="M3 9h18"/><path d="M9 4v16"/>
+      </svg>
+      <span>切換分頁比較 3 個修法步驟 · 3 個分頁</span>
+    </p>
+    <style>
+      .vg-w-tabs-regstackify-fix { display: grid; gap: var(--s-2); margin: var(--s-4) 0; }
+      .vg-w-tabs-regstackify-fix input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-tabs-regstackify-fix .tabs { display: flex; flex-wrap: wrap; gap: var(--s-2); border-bottom: 1px solid var(--line); }
+      .vg-w-tabs-regstackify-fix .tab { font-family: var(--sans); font-size: var(--fs-sm); padding: var(--s-1) var(--s-2); cursor: pointer; color: var(--muted); border-bottom: 2px solid transparent; }
+      .vg-w-tabs-regstackify-fix .panel { display: none; padding: var(--s-2) 0; font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink-soft); line-height: 1.75; }
+      .vg-w-tabs-regstackify-fix .panel strong { color: var(--ink); font-weight: 600; }
+      .vg-w-tabs-regstackify-fix:has(#vg-w-tabs-regstackify-fix-t1:checked) .panel-1 { display: block; }
+      .vg-w-tabs-regstackify-fix:has(#vg-w-tabs-regstackify-fix-t1:checked) [for="vg-w-tabs-regstackify-fix-t1"] { color: var(--accent-text); border-bottom-color: var(--accent); }
+      .vg-w-tabs-regstackify-fix:has(#vg-w-tabs-regstackify-fix-t2:checked) .panel-2 { display: block; }
+      .vg-w-tabs-regstackify-fix:has(#vg-w-tabs-regstackify-fix-t2:checked) [for="vg-w-tabs-regstackify-fix-t2"] { color: var(--accent-text); border-bottom-color: var(--accent); }
+      .vg-w-tabs-regstackify-fix:has(#vg-w-tabs-regstackify-fix-t3:checked) .panel-3 { display: block; }
+      .vg-w-tabs-regstackify-fix:has(#vg-w-tabs-regstackify-fix-t3:checked) [for="vg-w-tabs-regstackify-fix-t3"] { color: var(--accent-text); border-bottom-color: var(--accent); }
+      @media (max-width: 720px) { .vg-w-tabs-regstackify-fix .tab { min-height: 44px; display: flex; align-items: center; } }
+    </style>
+    <div class="tabs" data-vg-controls>
+      <input type="radio" id="vg-w-tabs-regstackify-fix-t1" name="vg-w-tabs-regstackify-fix-sel" checked />
+      <input type="radio" id="vg-w-tabs-regstackify-fix-t2" name="vg-w-tabs-regstackify-fix-sel" />
+      <input type="radio" id="vg-w-tabs-regstackify-fix-t3" name="vg-w-tabs-regstackify-fix-sel" />
+      <label class="tab" for="vg-w-tabs-regstackify-fix-t1">① 雙向掃描</label>
+      <label class="tab" for="vg-w-tabs-regstackify-fix-t2">② 跳過用不到的查找</label>
+      <label class="tab" for="vg-w-tabs-regstackify-fix-t3">③ 用位置編號比大小</label>
+    </div>
+    <div class="panel panel-1"><strong>往前掃改成雙向掃。</strong>原本只往前掃到 block 結尾;修法讓它同時往上走——往上那一段負責數清楚留在定義點之前的 record,往前那一段維持原本的順序,一樣在碰到下一個定義時停下來。不用等掃到底才死心,留在前面的 record 也算得到。</div>
+    <div class="panel panel-2"><strong>debug record 沒有位置編號,別再查了。</strong>LLVM 給真正的指令一個位置編號,比較順序時不用真的走一遍指令列表;但 debug record 從來不會拿到位置編號,舊邏輯還是先把它丟進這個通用查找函式,查完才發現查不到。修法直接跳過這些注定白費的查找。</div>
+    <div class="panel panel-3"><strong>判斷順序時,別再從頭掃一遍。</strong>「這條指令是不是一定跑在另一條前面」這個問題,原本每次都靠通用輔助函式從 block 開頭重新走一遍才能回答。指令本來就有位置編號,修法直接比較兩個數字大小,得到一樣的答案。</div>
+  </figure>
+
+  <p>三個改動加起來,對已經編譯好的 bitcode 直接跑 <code>llc -O3</code>——排除 rustc 前端的干擾,單獨量化 LLVM 這一段——reproducer 的 Register Stackify 從 45.9 秒降到 1.19 秒,約 38.6 倍;Explicit Locals 從 6.5 秒降到 0.013 秒,約 500 倍;整個 codegen pass 時間從 53.3 秒降到 2.17 秒,約 24.5 倍。Explicit Locals 的 500 倍格外誇張——這個 pass 本身沒有被改過,合理的推測是它接手的指令列表因為 Register Stackify 已經把該清的 debug record 清掉而大幅縮水,連帶也跟著變快,等於一個 pass 的修法把下游 pass 的成本一起帶走。</p>
+
+  <h2>真實世界的落差</h2>
+
+  <p>這類問題最難的部分,通常在於先把一個牽動幾萬個符號的真實專案,壓縮成一個 40 行、任何人都能在自己機器上重現的最小案例——找到修法反而是相對容易的後半段——reproducer 存在的意義,是讓「這是 LLVM 的問題,不是某個特定 crate 寫法奇怪」這件事變得可驗證。reproducer 是刻意做小的案例,但真實 crate 上的數字更誇張,也更不均勻。sha2 只是眾多加密函式庫之一,大小普通、沒有特別炫技,修法之前,它整段 wasm 程式碼產生時間裡就有 88% 花在 Register Stackify 這一個 pass 上。換句話說,即使不是 ed25519-compact 那種被 inlining 炸開的病態案例,這個瓶頸依然主宰整個建置時間,遠遠壓過其他所有開銷加總。</p>
+
+  <figure class="vg-w-chart-wasm-regstackify" data-mobile="static" data-svg-scroll="720">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m9 9 5 12 1.8-5.2L21 14Z"/><path d="M7.2 2.2 8 5.1"/><path d="m5.1 8-2.9-.8"/><path d="M14 4.1 12 6"/><path d="m6 12-1.9 2"/>
+      </svg>
+      <span>點擊任一列查看細節 · 5 組資料</span>
+    </p>
+    <style>
+      .vg-w-chart-wasm-regstackify { display: grid; gap: var(--s-2); margin: var(--s-4) 0; }
+      .vg-w-chart-wasm-regstackify svg { width: 100%; height: auto; }
+      .vg-w-chart-wasm-regstackify input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-chart-wasm-regstackify .row { cursor: pointer; }
+      .vg-w-chart-wasm-regstackify .hit { fill: transparent; }
+      .vg-w-chart-wasm-regstackify .hit:hover ~ .before { r: 6.5; }
+      .vg-w-chart-wasm-regstackify .readout { padding: var(--s-2) var(--s-3); background: var(--bg-soft); border-left: 2px solid var(--accent); font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink-soft); line-height: 1.7; min-height: 3.4em; }
+      .vg-w-chart-wasm-regstackify figcaption { font-family: var(--scribed); font-size: var(--fs-xs); color: var(--muted); }
+      .vg-w-chart-wasm-regstackify text { font-family: EB Garamond, serif; }
+      .vg-w-chart-wasm-regstackify .cat { font-family: var(--sans); font-size: 12px; }
+      .vg-w-chart-wasm-regstackify .sub { font-family: JetBrains Mono, monospace; font-size: 10px; fill: var(--muted); }
+      .vg-w-chart-wasm-regstackify .mult { font-family: JetBrains Mono, monospace; font-size: 12px; fill: var(--accent-text); }
+      .vg-w-chart-wasm-regstackify .tick { font-family: JetBrains Mono, monospace; font-size: 10px; fill: var(--muted); }
+    </style>
+
+    <div data-vg-controls>
+      <input type="radio" id="vg-w-chart-wasm-regstackify-r1" name="vg-w-chart-wasm-regstackify-sel" checked />
+      <input type="radio" id="vg-w-chart-wasm-regstackify-r2" name="vg-w-chart-wasm-regstackify-sel" />
+      <input type="radio" id="vg-w-chart-wasm-regstackify-r3" name="vg-w-chart-wasm-regstackify-sel" />
+      <input type="radio" id="vg-w-chart-wasm-regstackify-r4" name="vg-w-chart-wasm-regstackify-sel" />
+      <input type="radio" id="vg-w-chart-wasm-regstackify-r5" name="vg-w-chart-wasm-regstackify-sel" />
+    </div>
+
+    <svg viewBox="0 0 720 320" role="img" aria-label="五組案例的 Register Stackify 修法前後時間(秒,對數軸)——ed25519-compact、reproducer、k256、sha2、blake2">
+      <line x1="160" y1="298" x2="600" y2="298" stroke="var(--muted-2)" stroke-width="1"/>
+      <text x="248" y="312" text-anchor="middle" class="tick">1s</text>
+      <text x="355" y="312" text-anchor="middle" class="tick">10s</text>
+      <text x="461" y="312" text-anchor="middle" class="tick">100s</text>
+      <text x="568" y="312" text-anchor="middle" class="tick">1,000s</text>
+
+      <g class="row">
+        <rect class="hit" data-target="vg-w-chart-wasm-regstackify-r1" x="10" y="30" width="640" height="40" role="button" tabindex="0" aria-label="ed25519-compact 細節"/>
+        <text x="10" y="44" class="cat" fill="var(--ink)">ed25519-compact</text>
+        <line x1="394" y1="50" x2="592" y2="50" stroke="var(--muted-2)" stroke-width="2"/>
+        <circle class="before" cx="592" cy="50" r="5" fill="var(--accent)"/>
+        <circle cx="394" cy="50" r="5" fill="var(--sage-deep)"/>
+        <text x="602" y="54" class="mult">72.6×</text>
+        <text x="10" y="66" class="sub">1683.4s → 23.2s</text>
+      </g>
+
+      <g class="row">
+        <rect class="hit" data-target="vg-w-chart-wasm-regstackify-r2" x="10" y="84" width="640" height="40" role="button" tabindex="0" aria-label="reproducer(llc)細節"/>
+        <text x="10" y="98" class="cat" fill="var(--ink)">reproducer(llc)</text>
+        <line x1="256" y1="104" x2="425" y2="104" stroke="var(--muted-2)" stroke-width="2"/>
+        <circle class="before" cx="425" cy="104" r="5" fill="var(--accent)"/>
+        <circle cx="256" cy="104" r="5" fill="var(--sage-deep)"/>
+        <text x="435" y="108" class="mult">38.6×</text>
+        <text x="10" y="120" class="sub">45.9s → 1.19s</text>
+      </g>
+
+      <g class="row">
+        <rect class="hit" data-target="vg-w-chart-wasm-regstackify-r3" x="10" y="138" width="640" height="40" role="button" tabindex="0" aria-label="k256 細節"/>
+        <text x="10" y="152" class="cat" fill="var(--ink)">k256</text>
+        <line x1="176" y1="158" x2="323" y2="158" stroke="var(--muted-2)" stroke-width="2"/>
+        <circle class="before" cx="323" cy="158" r="5" fill="var(--accent)"/>
+        <circle cx="176" cy="158" r="5" fill="var(--sage-deep)"/>
+        <text x="333" y="162" class="mult">24.1×</text>
+        <text x="10" y="174" class="sub">5.06s → 0.21s</text>
+      </g>
+
+      <g class="row">
+        <rect class="hit" data-target="vg-w-chart-wasm-regstackify-r4" x="10" y="192" width="640" height="40" role="button" tabindex="0" aria-label="sha2 細節"/>
+        <text x="10" y="206" class="cat" fill="var(--ink)">sha2</text>
+        <line x1="239" y1="212" x2="299" y2="212" stroke="var(--muted-2)" stroke-width="2"/>
+        <circle class="before" cx="299" cy="212" r="5" fill="var(--accent)"/>
+        <circle cx="239" cy="212" r="5" fill="var(--sage-deep)"/>
+        <text x="309" y="216" class="mult">3.6×</text>
+        <text x="10" y="228" class="sub">3.01s → 0.83s</text>
+      </g>
+
+      <g class="row">
+        <rect class="hit" data-target="vg-w-chart-wasm-regstackify-r5" x="10" y="246" width="640" height="40" role="button" tabindex="0" aria-label="blake2 細節"/>
+        <text x="10" y="260" class="cat" fill="var(--ink)">blake2</text>
+        <line x1="176" y1="266" x2="264" y2="266" stroke="var(--muted-2)" stroke-width="2"/>
+        <circle class="before" cx="264" cy="266" r="5" fill="var(--accent)"/>
+        <circle cx="176" cy="266" r="5" fill="var(--sage-deep)"/>
+        <text x="274" y="270" class="mult">6.8×</text>
+        <text x="10" y="282" class="sub">1.43s → 0.21s</text>
+      </g>
+    </svg>
+
+    <div class="readout" data-readout>ed25519-compact 2.4.0——Register Stackify 從 1683.4 秒降到 23.2 秒(72.6 倍),整個 crate 的程式碼產生時間從 1884.9 秒(31 分鐘)降到 48.2 秒。</div>
+    <figcaption>橘點：修法前;綠點：修法後。對數軸,五個案例橫跨超過三個數量級。</figcaption>
+
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        var root = document.querySelector('.vg-w-chart-wasm-regstackify');
+        var readout = root.querySelector('[data-readout]');
+        var details = {
+          'vg-w-chart-wasm-regstackify-r1': 'ed25519-compact 2.4.0——Register Stackify 從 1683.4 秒降到 23.2 秒(72.6 倍),整個 crate 的程式碼產生時間從 1884.9 秒(31 分鐘)降到 48.2 秒。',
+          'vg-w-chart-wasm-regstackify-r2': '40 行 reproducer 直接對已編譯好的 bitcode 跑 llc -O3——Register Stackify 從 45.9 秒降到 1.19 秒(38.6 倍),排除了 rustc 前端,單獨量化 LLVM 這段的改善。',
+          'vg-w-chart-wasm-regstackify-r3': 'k256——Register Stackify 從 5.06 秒降到 0.21 秒(24.1 倍)。',
+          'vg-w-chart-wasm-regstackify-r4': 'sha2——Register Stackify 從 3.01 秒降到 0.83 秒(3.6 倍);修法之前,Register Stackify 占掉這個 crate 整段 wasm 程式碼產生時間的 88%。',
+          'vg-w-chart-wasm-regstackify-r5': 'blake2——Register Stackify 從 1.43 秒降到 0.21 秒(6.8 倍),是五個案例裡改善倍數偏低的一個。'
+        };
+        root.querySelectorAll('.hit').forEach(function (rect) {
+          function activate() {
+            var id = rect.getAttribute('data-target');
+            var radio = root.querySelector('#' + id);
+            if (radio) radio.checked = true;
+            readout.textContent = details[id] || readout.textContent;
+          }
+          rect.addEventListener('click', activate);
+          rect.addEventListener('keydown', function (e) {
+            if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); activate(); }
+          });
+        });
+      })();
+    </script>
+  </figure>
+
+  <p>把五個案例放在同一條對數軸上看,倍數差距本身就是資訊：ed25519-compact 被修法救回 72.6 倍,blake2 只有 6.8 倍——合理的推測是,差別來自這個 crate 原本被重度 inlining 炸得多慘,炸得愈慘,這次修法能拿回的時間就愈多。把幾個加密函式庫共 134 個模組全部加總,Register Stackify 總時間從 1702.7 秒降到 26.2 秒,整體 wasm 程式碼產生時間從 1922.2 秒降到 67.4 秒。對一個 CI pipeline 來說,這個差距大到足以決定要不要把 wasm target 排進每次 push 都跑的 workflow 裡。這個加總數字對只用單一 crate 的人可能感覺遙遠,但真實專案很少只依賴一個 crate——一個用到 ed25519、k256 這類簽章與橢圓曲線函式庫的 wasm 專案,通常同時牽動好幾個依賴,每一個都各自吃掉自己那份 Register Stackify 時間。不過 134 個模組整體 codegen 時間的約 28.5 倍,跟單一 crate 只看 Register Stackify 階段的 72.6 倍,量的其實不是同一件事——前者含整段程式碼產生時間,後者只算那一個 pass,兩個數字並排容易看成同一種東西。要放在同一把尺上比才有意義：ed25519-compact 自己的整段 codegen 時間是從 1884.9 秒降到 48.2 秒,約 39 倍;而 134 個模組的 Register Stackify 那一段,則是約 65 倍。不管挑哪一組同類數字,方向都一致——規模化到上百個模組之後,效益並沒有被稀釋掉多少。</p>
+
+  <p>回頭比較一下 LLVM 官方那個已經合併的 issue #168326 修法,到底解決了多少?文章特地對同一個 reproducer 跟 sha2 各自跑了三個版本——原始版本、只套用官方修法、套用這篇文章的完整修法。</p>
+
+  <figure class="vg-w-chart-partial-fix" data-mobile="keep" data-svg-scroll="720">
+    <style>
+      .vg-w-chart-partial-fix { margin: var(--s-4) 0; }
+      .vg-w-chart-partial-fix svg { width: 100%; height: auto; }
+      .vg-w-chart-partial-fix figcaption { font-family: var(--scribed); font-size: var(--fs-xs); color: var(--muted); margin-top: var(--s-2); }
+      .vg-w-chart-partial-fix text { font-family: EB Garamond, serif; }
+      .vg-w-chart-partial-fix .cat { font-family: var(--sans); font-size: 11px; fill: var(--ink-soft); }
+      .vg-w-chart-partial-fix .val { font-family: JetBrains Mono, monospace; font-size: 11px; fill: var(--ink); }
+      .vg-w-chart-partial-fix .grp { font-family: IM Fell English, serif; font-style: italic; font-size: 13px; fill: var(--ink); }
+      .vg-w-chart-partial-fix .tick { font-family: JetBrains Mono, monospace; font-size: 10px; fill: var(--muted); }
+    </style>
+    <svg viewBox="0 0 720 240" role="img" aria-label="LLVM 官方修法 vs 完整修法——reproducer 與 sha2 的 Register Stackify 時間(秒,對數軸)">
+      <text x="20" y="20" class="grp">reproducer——Register Stackify</text>
+      <text x="10" y="53" class="cat">原始</text>
+      <rect x="150" y="40" width="528" height="18" fill="var(--accent)" fill-opacity="0.85"/>
+      <text x="684" y="53" class="val">45.37s</text>
+      <text x="10" y="77" class="cat">官方修法</text>
+      <rect x="150" y="64" width="297" height="18" fill="var(--accent)" fill-opacity="0.45"/>
+      <text x="453" y="77" class="val">6.32s</text>
+      <text x="10" y="101" class="cat">完整修法</text>
+      <rect x="150" y="88" width="100" height="18" fill="var(--sage-deep)"/>
+      <text x="256" y="101" class="val">1.17s</text>
+
+      <text x="20" y="130" class="grp">sha2——Register Stackify</text>
+      <text x="10" y="163" class="cat">原始</text>
+      <rect x="150" y="150" width="212" height="18" fill="var(--accent)" fill-opacity="0.85"/>
+      <text x="368" y="163" class="val">3.04s</text>
+      <text x="10" y="187" class="cat">官方修法</text>
+      <rect x="150" y="174" width="181" height="18" fill="var(--accent)" fill-opacity="0.45"/>
+      <text x="337" y="187" class="val">2.35s</text>
+      <text x="10" y="211" class="cat">完整修法</text>
+      <rect x="150" y="198" width="59" height="18" fill="var(--sage-deep)"/>
+      <text x="215" y="211" class="val">0.83s</text>
+
+      <line x1="150" y1="222" x2="690" y2="222" stroke="var(--muted-2)" stroke-width="1"/>
+      <text x="231" y="234" text-anchor="middle" class="tick">1s</text>
+      <text x="501" y="234" text-anchor="middle" class="tick">10s</text>
+    </svg>
+    <figcaption>橘色深：原始;橘色淺：只套用 LLVM 官方既有修法(issue #168326);綠色：這篇文章的完整修法。</figcaption>
+  </figure>
+
+  <p>官方修法把 reproducer 的 Register Stackify 從 45.37 秒降到 6.32 秒,不是沒用;但完整修法能再降到 1.17 秒。sha2 上的落差感覺更明顯：官方修法只把 3.04 秒降到 2.35 秒,降幅兩成三,完整修法則降到 0.83 秒。同一組對照換算成整段 codegen 時間(不只 Register Stackify)也是一樣的形狀——reproducer 從 52.58 秒的原始版本,官方修法降到 7.12 秒,完整修法降到 1.99 秒;sha2 則是 3.46 秒到 2.75 秒再到 1.21 秒。用量規模愈小、DBG_VALUE 密度沒那麼誇張的 crate,官方那個 use-count 機制幫上的忙愈有限——這也印證了作者自己的判斷,官方修法對 Rust「幫得上忙,但很少」。</p>
+
+  <h2>今天能做的事</h2>
+
+  <p>回頭看整個過程,想出三個改動其實不難,每一個單獨看都不複雜;真正耗時的是找到「為什麼往前掃描的邏輯結構性地碰不到部分 DBG_VALUE record」這個根因本身——需要真的把 40 行的 reproducer 跑到底、把 MIR 印出來一行一行對照,才看得出九萬條指令跟二十六萬條 DBG_VALUE 之間的落差不是巧合。這也是這種效能問題常見的形狀：表面上看到的是「pass 太慢」,實際的根因往往藏在一個「這個資料結構理論上該歸零,但在某些情況下永遠歸不了零」的邊界條件裡。</p>
+
+  <p>debug=2 不是什麼冷門設定——它是 Rust <code>dev</code> profile 的預設值,意味著大部分開發者在本機跑 wasm target 的一般 build 時,根本不用刻意打開任何 flag 就已經踩進這條慢路徑。問題也不是 Rust 專屬：C 跟 C++ 使用者用 clang 加 <code>-g</code> 編到 wasm 一樣會踩到,issue #168326 本來就是從這個情境被回報的——換句話說,缺陷出在 wasm 後端這條路徑本身,任何語言只要走同一條 codegen 路線都會撞上,rustc 和 LLVM 的 Rust 前端並沒有做錯什麼。</p>
+
+  <p>在完整修法合併進 LLVM 主線之前,能做的事很有限——多切幾個 codegen unit,或者乾脆關掉 debug info,兩者都能繞過問題,但作者自己也講得很直白：「that's not ideal」。多切 codegen unit 通常會犧牲一部分跨模組最佳化的空間,這是分割 codegen unit 常見的副作用,不是這篇文章特別量化的數字;關掉 debug info 犧牲的則更直接——放棄在瀏覽器 devtools 或 wasm debugger 裡對照原始碼行號、看變數當下的值,對正在追一個難重現的 bug 的人來說,這個代價可能比多等幾分鐘建置更痛。哪個代價比較能接受,取決於你現在是在追一個 bug,還是只是想讓 CI 早點跑完;不管選哪一條,都只是繞開 Register Stackify 這個瓶頸,不會讓它變快。對還在評估要不要把 wasm 當成 Rust 專案 build target 之一的團隊,這其實給了一個時間表：現在就要導入,debug=2 底下的建置時間得算進 CI 預算;能等的話,修法一旦進了 LLVM 主線,同一份 pipeline 不用改任何設定就會直接變快。這個修法思路本身也不只對 Rust 有效——同樣的 LLVM 缺陷,任何重度依賴 inlining、又需要完整 debug 資訊的語言或工具鏈理論上都會踩到,套用同一套邏輯理論上也都能受益。</p>
+
+  <p class="vg-deep-closer"><strong>還沒解決的事</strong>：三個改動加起來,把 wasm 後端這段隨 debug record 數量近乎二次方成長的重複掃描拿掉——但完整修法目前還沒進 LLVM 主線,合併之前,debug=2 底下的 wasm build 依然要付出這個代價。</p>
+</div>
