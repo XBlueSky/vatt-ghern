@@ -1,0 +1,533 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">星期二凌晨兩點，值班工程師的 pager 響了——兩千個 shard 裡的一個出了問題。過去這代表 15 分鐘人工排序、最長 3 小時逐步觸發與監看；Stripe 後來做的事，是把「下一步該做什麼」這個問題，直接變成一張圖上的最短路徑搜尋。</p>
+  <h1 class="vg-post-title">把兩千個資料庫節點的修復，變成一道最短路徑問題</h1>
+</header>
+
+<div class="vg-post-prose vg-post-body">
+  <p><span class="vg-dropcap">星</span>期二凌晨兩點的這聲 pager，背後接的是一個不小的機群：Stripe 用來扛支付流量的 MongoDB，一共兩千個 shard，2025 年合計處理了 1.9 兆美元的金流，橫跨 40 多種不同的佈局，從成本優化到高可用性各有取捨。這種規模下，任何一個 shard 掉進不健康的狀態都不是小事——沒有自動化的話，值班工程師得先花 15 分鐘小心排出操作順序，再花最長 3 小時一項一項觸發、盯著結果。Stripe 這篇文章講的不是又一次「我們寫了個自動化腳本」的故事，而是把整個修復問題的骨架換掉：從一堆針對個別故障寫死的判斷邏輯，換成一張狀態圖與一個真正的最短路徑演算法。</p>
+
+  <p>把兩種做法擺在同一條時間軸上，落差看得很清楚。</p>
+
+  <figure class="vg-w-timeline-manual-vs-auto" data-mobile="keep" data-svg-scroll="720">
+    <style>
+      .vg-w-timeline-manual-vs-auto { margin: var(--s-4) 0; }
+      .vg-w-timeline-manual-vs-auto svg { width: 100%; height: auto; }
+      .vg-w-timeline-manual-vs-auto .note { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-2); }
+    </style>
+    <svg viewBox="0 0 720 210" role="img" aria-label="人工修復與自動化修復的時間對比">
+      <text x="20" y="28" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">人工修復</text>
+      <rect x="140" y="14" width="150" height="34" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.5"/>
+      <text x="215" y="32" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--ink)">診斷＋排序</text>
+      <text x="215" y="60" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--accent-text)">15 分鐘</text>
+      <rect x="300" y="14" width="380" height="34" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.5"/>
+      <text x="490" y="32" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--ink)">逐一觸發並監看每個操作</text>
+      <text x="490" y="60" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--accent-text)">最長 3 小時</text>
+
+      <line x1="20" y1="90" x2="700" y2="90" stroke="var(--line)" stroke-dasharray="2 4"/>
+
+      <text x="20" y="128" font-family="EB Garamond, serif" font-size="15" fill="var(--ink)">自動化</text>
+      <rect x="140" y="114" width="60" height="34" fill="var(--sage)" fill-opacity="0.35" stroke="var(--sage-deep)" stroke-width="1.5"/>
+      <text x="170" y="132" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--ink)">模擬</text>
+      <text x="170" y="160" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--sage-deep)">毫秒級</text>
+      <rect x="210" y="114" width="470" height="34" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.5"/>
+      <text x="445" y="132" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--ink)">Temporal 執行，中斷可從原地恢復</text>
+      <text x="445" y="160" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--accent-text)">視操作而定，可能仍需數小時</text>
+    </svg>
+    <p class="note">自動化省下的是人工診斷、排序、緊盯每一步的時間，不是讓 node rebuild 這類操作本身瞬間完成——兩段圖示的比例尺不同，重點是標出哪一段被壓縮掉了。</p>
+  </figure>
+
+  <p>但「自動化」這三個字，在 V1 的年代其實只做到一半。確實有系統會嘗試修復，可是修復的判斷邏輯是逐案累積出來的：新故障組合出現，就再加一條規則、再排一次優先權，長期下來規則彼此打架的機率只會越疊越高。</p>
+
+  <h2>V1 為什麼撐不住</h2>
+
+  <p>Stripe 原本的自動修復系統（文章稱為 V1）是一堆各自獨立的規則 plugin：每個 plugin 負責偵測並修復一種特定的誤設定，彼此之間再用優先權排出執行順序。問題是，優先權跟前提條件是兩件事，沒人保證它們互相相容。文章舉的例子很直接：「fix votes」跟「fix priorities」這兩個 plugin 的優先權都比「node down」高，但它們的前提是『沒有節點下線』，偏偏此刻正好有節點下線。三個 plugin 排在那裡，誰都動不了：該先處理的 node down 因為優先權低被排在後面，優先權高的兩個又因為前提不成立跑不起來。</p>
+
+  <p>這種失效模式不是 Stripe 獨有的巧合。任何用「優先權排序＋前提條件」組合出來的規則系統都有同樣的風險：優先權只回答「誰先跑」，前提條件回答「能不能跑」，兩者分屬不同的作者、不同的時間點寫下，沒有人天生會去檢查兩者是否互相打架。規則越多，這種組合爆炸的機率就越高，這也是為什麼後來的解法不是「再加一條規則去處理這個特例」，而是把整個判斷邏輯換成一個不會有「前提」跟「優先權」分裂問題的模型。</p>
+
+  <p>還有另一種失效模式跟優先權無關：workflow 被取消。人工介入、部署更新、逾時，都可能讓一個正在跑的修復 workflow 被取消，而 V1 沒有為「取消到一半」設計任何收尾邏輯，shard 就這樣卡在一個系統從沒設想過的中間狀態。把這些問題疊加起來，六個月的觀察窗裡，control plane 因為誤設定觸發了 124 次 pager，另外 32 次是含有複合狀況的單節點故障；每次誤觸發卡住 index build 之類的關鍵維運操作，平均要等一小時才能繼續。拆開來看，124 次裡的誤設定代表系統判斷錯了，本來不需要人介入；32 次的複合單節點故障，才是真正需要人力排查的案例。兩種加起來，就是值班輪班裡最容易累積疲勞的那一塊。</p>
+
+  <figure class="vg-w-diagram-v1-priority-conflict" data-mobile="keep" data-svg-scroll="720">
+    <style>
+      .vg-w-diagram-v1-priority-conflict { margin: var(--s-4) 0; }
+      .vg-w-diagram-v1-priority-conflict svg { width: 100%; height: auto; }
+    </style>
+    <svg viewBox="0 0 720 340" role="img" aria-label="V1 規則 plugin 優先權衝突示意圖">
+      <text x="20" y="24" font-family="EB Garamond, serif" font-size="14" fill="var(--muted)" font-style="italic">V1：規則 plugin 各自為政</text>
+
+      <rect x="20" y="40" width="210" height="66" rx="4" fill="var(--bg-soft)" stroke="var(--accent)" stroke-width="1.5"/>
+      <text x="125" y="66" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">fix votes</text>
+      <text x="125" y="86" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--accent-text)">優先權：高</text>
+
+      <rect x="255" y="40" width="210" height="66" rx="4" fill="var(--bg-soft)" stroke="var(--accent)" stroke-width="1.5"/>
+      <text x="360" y="66" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">fix priorities</text>
+      <text x="360" y="86" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--accent-text)">優先權：高</text>
+
+      <rect x="490" y="40" width="210" height="66" rx="4" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.5"/>
+      <text x="595" y="66" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">node down</text>
+      <text x="595" y="86" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">優先權：低</text>
+
+      <rect x="255" y="150" width="210" height="56" rx="4" fill="none" stroke="var(--ink)" stroke-width="1.5" stroke-dasharray="4 3"/>
+      <text x="360" y="174" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">現況：一個節點下線</text>
+      <text x="360" y="194" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)" font-style="italic">正是這兩個 plugin 的前提</text>
+
+      <line x1="125" y1="106" x2="330" y2="150" stroke="var(--accent)" stroke-width="1.5"/>
+      <line x1="360" y1="106" x2="360" y2="150" stroke="var(--accent)" stroke-width="1.5"/>
+      <text x="220" y="128" font-family="EB Garamond, serif" font-size="11" fill="var(--accent-text)">前提不成立，跑不了</text>
+
+      <line x1="490" y1="73" x2="465" y2="73" stroke="var(--muted-2)" stroke-width="1.5" stroke-dasharray="3 3"/>
+      <text x="475" y="112" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">該先跑，卻排在後面</text>
+
+      <text x="360" y="232" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--accent-text)" font-style="italic">三個 plugin，沒有一個真的動得了</text>
+
+      <rect x="20" y="260" width="220" height="56" rx="4" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.5"/>
+      <text x="130" y="284" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">workflow 被取消</text>
+      <text x="130" y="302" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">部署／逾時／人工介入</text>
+
+      <line x1="240" y1="288" x2="290" y2="288" stroke="var(--muted-2)" stroke-width="1.5" marker-end="url(#vg-w-diagram-v1-priority-conflict-arrow)"/>
+
+      <rect x="295" y="260" width="405" height="56" rx="4" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.5"/>
+      <text x="497" y="284" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">shard 卡在沒設想過的中間狀態</text>
+      <text x="497" y="302" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">V1 沒有為「取消到一半」設計收尾邏輯</text>
+
+      <defs>
+        <marker id="vg-w-diagram-v1-priority-conflict-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="var(--muted-2)"/></marker>
+      </defs>
+    </svg>
+  </figure>
+
+  <h2>佈局越多，維運成本越貴</h2>
+
+  <p>V1 真正撐不住規模的地方，是佈局耦合。Stripe 的機群橫跨 40 多種佈局，而每個規則 plugin 裡都寫死了針對特定佈局的安全檢查——文章的說法是「layout coupling was everywhere」。這代表每新增一種新佈局，得把所有 plugin、所有 workflow 的邏輯重新稽核一遍，確認沒有哪條規則因為換了拓樸而失效，這個過程大約要花一週。佈局種類線性成長，人工稽核的工作量就跟著線性成長，而且每個新佈局都要重新算一次帳，不會因為稽核過類似的佈局而變快。</p>
+
+  <figure class="vg-w-range-layout-coupling" data-mobile="static" data-svg-scroll="720">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M18 8L22 12L18 16"/><path d="M6 8L2 12L6 16"/><path d="M2 12H22"/>
+      </svg>
+      <span>拖曳滑桿看佈局數量如何影響兩種架構的維運成本 · 1 至 45 種佈局</span>
+    </p>
+    <style>
+      .vg-w-range-layout-coupling { display: grid; gap: var(--s-2); }
+      .vg-w-range-layout-coupling .controls { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); flex-wrap: wrap; }
+      .vg-w-range-layout-coupling input[type="range"] { flex: 1; min-width: 140px; height: 36px; accent-color: var(--accent); touch-action: none; }
+      .vg-w-range-layout-coupling .readout-val { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 4ch; text-align: right; }
+      .vg-w-range-layout-coupling svg.vg-w-range-layout-coupling-main { width: 100%; height: auto; }
+      .vg-w-range-layout-coupling .stats { font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink); padding: var(--s-2); background: var(--bg-soft); border-left: 2px solid var(--accent); }
+      .vg-w-range-layout-coupling .note { font-family: var(--scribed); font-size: var(--fs-xs); color: var(--muted); line-height: 1.6; }
+    </style>
+    <div class="controls" data-vg-controls>
+      <label for="vg-w-range-layout-coupling-n">佈局種類數 N =</label>
+      <input id="vg-w-range-layout-coupling-n" type="range" min="1" max="45" step="1" value="41"/>
+      <span class="readout-val" id="vg-w-range-layout-coupling-n-val">41</span>
+    </div>
+    <svg class="vg-w-range-layout-coupling-main" viewBox="0 0 720 260" role="img" aria-label="佈局數量對維運成本的影響">
+      <line x1="60" y1="220" x2="680" y2="220" stroke="var(--muted-2)" stroke-width="1"/>
+      <line x1="60" y1="20" x2="60" y2="220" stroke="var(--muted-2)" stroke-width="1"/>
+      <text x="370" y="245" text-anchor="middle" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">佈局種類數 N</text>
+      <rect id="vg-w-range-layout-coupling-bar-v1" x="200" y="47" width="60" height="173" fill="var(--accent)" fill-opacity="0.35" stroke="var(--accent)" stroke-width="1.5"/>
+      <text id="vg-w-range-layout-coupling-bar-v1-label" x="230" y="41" text-anchor="middle" font-family="Manrope, sans-serif" font-size="12" fill="var(--accent-text)">41 週</text>
+      <text x="230" y="238" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">V1 人工稽核</text>
+      <rect x="400" y="218" width="60" height="2" fill="var(--sage-deep)"/>
+      <text x="430" y="212" text-anchor="middle" font-family="Manrope, sans-serif" font-size="12" fill="var(--sage-deep)">0 行程式碼</text>
+      <text x="430" y="238" text-anchor="middle" font-family="EB Garamond, serif" font-size="11" fill="var(--muted)">新架構</text>
+    </svg>
+    <p class="stats" id="vg-w-range-layout-coupling-stats">N = 41 時：V1 大約要花 41 週人工稽核所有 plugin；新架構不用改任何程式碼。</p>
+    <p class="note">把「每種佈局約一週」線性外推到 N 種，是本圖的簡化演算法，不是 Stripe 公佈的加總數字；新架構「零程式碼」則是文章裡實際 onboard 一種新佈局時驗證過的結果，不是外推。</p>
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        var root = document.querySelector('.vg-w-range-layout-coupling');
+        var input = root.querySelector('input');
+        var val = root.querySelector('#vg-w-range-layout-coupling-n-val');
+        var bar = root.querySelector('#vg-w-range-layout-coupling-bar-v1');
+        var barLabel = root.querySelector('#vg-w-range-layout-coupling-bar-v1-label');
+        var stats = root.querySelector('#vg-w-range-layout-coupling-stats');
+        var Y0 = 220, MAXH = 190, MAXN = 45;
+        function update() {
+          var n = Number(input.value);
+          val.textContent = String(n);
+          var h = (n / MAXN) * MAXH;
+          bar.setAttribute('y', Y0 - h);
+          bar.setAttribute('height', h);
+          barLabel.setAttribute('y', Y0 - h - 6);
+          barLabel.textContent = n + ' 週';
+          stats.textContent = 'N = ' + n + ' 時：V1 大約要花 ' + n + ' 週人工稽核所有 plugin；新架構不用改任何程式碼。';
+        }
+        input.addEventListener('input', update);
+        update();
+      })();
+    </script>
+  </figure>
+
+  <h2>把修復問題重新定義成一張圖</h2>
+
+  <p>新架構的做法，是把「這個 shard 該怎麼修」重新定義成圖搜尋問題。每一種可能的 shard 設定——哪些節點在投票、優先權怎麼分配、有沒有節點被隱藏、oplog 開多大——都是圖上的一個節點；每一個可以執行的維運操作，調整投票或優先權、調整 oplog 大小、重建節點，都是一條邊，把系統從一個狀態帶往另一個狀態。有些狀態直接被劃為不合法：文章列出的例子包括投票數是偶數、健康的投票節點不到半數（這會讓寫入可用性有風險），或者一個節點的設定本身就矛盾，比如 priority=1 卻 vote=0。合理的解讀是，這裡的問題在於兩個欄位的語意衝突：priority 通常代表一個節點在選主時的權重，數字越高越容易被選為 primary；vote=0 則代表這個節點沒有投票權，不該參與選主。一個沒有投票權的節點卻被設定成有選主權重，這種組合本身就是設定寫錯的訊號，不需要等到真的選主出錯，圖搜尋在建圖的當下就能把這種狀態直接標成不合法，連路徑都不用算。</p>
+
+  <p>判斷一個狀態有多糟，靠的是一組可以疊加的規則，各自針對一類問題——節點下線、投票不match、優先權不match、oplog 大小、隱藏狀態、可用區不平衡——分別打分，加總起來就是這個狀態的 misconfiguration 分數。文章沒有進一步展開每條規則怎麼打分，隱藏狀態、可用區不平衡這兩項也沒有多做解釋；照 MongoDB replica set 本身的常見定義，hidden 通常代表節點被設成不可被讀取，可用區不平衡則是副本集中在同一個可用區，一次機房事故就可能波及過多節點——這是這套機制常見的一般定義，不是文章本身的說明。文章給的一個真實範例路徑是「Current State → [Rebuild backup] → [Fix vote+priority] → [Rebuild data node] → Healthy」，同一個 shard 可能得先重建備份、修正投票與優先權，最後才重建資料節點，四個操作串成一條路徑；跟下面 widget 示範用的簡化模型比起來，真實案例往往更長、涉及更多種操作交錯。</p>
+
+  <p>下面這個 widget 用一張簡化的示意圖，把三種真實故障場景放在同一張圖上：選一個起點，再選 BFS 或 Dijkstra，看演算法實際選出哪一條修復路徑。</p>
+
+  <figure class="vg-w-graph-shard-remediation" data-mobile="static" data-svg-scroll="800">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M13 13l6 6"/>
+        <path d="M4 4l3.5 12L10 12l4 -1.5L4 4Z"/>
+      </svg>
+      <span>切換故障場景與演算法 · 3 種場景 × 2 種演算法</span>
+    </p>
+    <style>
+      .vg-w-graph-shard-remediation { display: grid; gap: var(--s-3); }
+      .vg-w-graph-shard-remediation .controls { display: grid; gap: var(--s-2); }
+      .vg-w-graph-shard-remediation .btn-row { display: flex; flex-wrap: wrap; gap: var(--s-2); }
+      .vg-w-graph-shard-remediation button { font-family: var(--sans); font-size: var(--fs-sm); padding: var(--s-1) var(--s-2); min-height: 44px; border: 1px solid var(--line); background: var(--bg-soft); color: var(--ink-soft); cursor: pointer; border-radius: 2px; }
+      .vg-w-graph-shard-remediation button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent-text); background: color-mix(in srgb, var(--accent) 10%, transparent); }
+      .vg-w-graph-shard-remediation svg.vg-w-graph-shard-remediation-main { width: 100%; height: auto; }
+      .vg-w-graph-shard-remediation .node-box { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; transition: fill 150ms, stroke 150ms; }
+      .vg-w-graph-shard-remediation .node-box.active { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); stroke-width: 2; }
+      .vg-w-graph-shard-remediation .edge { stroke: var(--muted-2); stroke-width: 1.5; fill: none; transition: stroke 150ms, stroke-width 150ms; }
+      .vg-w-graph-shard-remediation .edge.active { stroke: var(--accent); stroke-width: 3; }
+      .vg-w-graph-shard-remediation .readout { padding: var(--s-3); background: var(--bg-soft); border-left: 2px solid var(--accent); display: grid; gap: var(--s-1); }
+      .vg-w-graph-shard-remediation .readout .path-line { font-family: JetBrains Mono, monospace; font-size: var(--fs-sm); color: var(--ink); }
+      .vg-w-graph-shard-remediation .readout .stat-line { font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+      .vg-w-graph-shard-remediation .readout .stat-line strong { color: var(--ink); font-variant-numeric: tabular-nums; }
+      .vg-w-graph-shard-remediation .readout .verdict { font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink-soft); line-height: 1.7; }
+      .vg-w-graph-shard-remediation .legend { font-family: var(--scribed); font-size: var(--fs-xs); color: var(--muted); line-height: 1.6; }
+    </style>
+
+    <div class="controls" data-vg-controls>
+      <div class="btn-row" role="group" aria-label="選擇故障場景">
+        <button type="button" class="scenario-btn" data-scenario="A" aria-pressed="false">單節點下線</button>
+        <button type="button" class="scenario-btn" data-scenario="B" aria-pressed="true">兩節點下線＋投票設定錯誤</button>
+        <button type="button" class="scenario-btn" data-scenario="C" aria-pressed="false">ephemeral 節點失聯＋缺票</button>
+      </div>
+      <div class="btn-row" role="group" aria-label="選擇演算法">
+        <button type="button" class="algo-btn" data-algo="bfs" aria-pressed="false">BFS · 只算步數</button>
+        <button type="button" class="algo-btn" data-algo="dijkstra" aria-pressed="true">Dijkstra · 算真實成本</button>
+      </div>
+    </div>
+
+    <svg class="vg-w-graph-shard-remediation-main" viewBox="0 0 800 380" role="img" aria-label="shard 修復狀態圖：場景、狀態與操作">
+      <defs>
+        <marker id="vg-w-graph-shard-remediation-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M0,0 L10,5 L0,10 Z" fill="var(--muted-2)"/>
+        </marker>
+        <marker id="vg-w-graph-shard-remediation-arrow-active" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M0,0 L10,5 L0,10 Z" fill="var(--accent)"/>
+        </marker>
+      </defs>
+
+      <path id="vg-w-graph-shard-remediation-edge-A-V" class="edge" d="M170,48 L230,113" marker-end="url(#vg-w-graph-shard-remediation-arrow)"/>
+      <text x="182" y="72" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">3</text>
+
+      <path id="vg-w-graph-shard-remediation-edge-B-V" class="edge active" d="M170,178 L230,141" marker-end="url(#vg-w-graph-shard-remediation-arrow-active)"/>
+      <text x="182" y="172" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">3</text>
+
+      <path id="vg-w-graph-shard-remediation-edge-B-G" class="edge" d="M170,190 C 420,320 560,300 650,165" marker-end="url(#vg-w-graph-shard-remediation-arrow)"/>
+      <text x="400" y="318" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">101</text>
+
+      <path id="vg-w-graph-shard-remediation-edge-V-G" class="edge" d="M380,113 L650,140" marker-end="url(#vg-w-graph-shard-remediation-arrow)"/>
+      <text x="390" y="95" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">101</text>
+
+      <path id="vg-w-graph-shard-remediation-edge-V-O" class="edge active" d="M380,120 L440,120" marker-end="url(#vg-w-graph-shard-remediation-arrow-active)"/>
+      <text x="400" y="108" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">19</text>
+
+      <path id="vg-w-graph-shard-remediation-edge-O-G" class="edge active" d="M590,113 L650,148" marker-end="url(#vg-w-graph-shard-remediation-arrow-active)"/>
+      <text x="600" y="118" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">3</text>
+
+      <path id="vg-w-graph-shard-remediation-edge-C-P" class="edge" d="M170,308 L230,308" marker-end="url(#vg-w-graph-shard-remediation-arrow)"/>
+      <text x="182" y="300" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">3</text>
+
+      <rect id="vg-w-graph-shard-remediation-node-A" class="node-box" x="20" y="20" width="150" height="56" rx="4"/>
+      <text x="95" y="53" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">單節點下線</text>
+
+      <rect id="vg-w-graph-shard-remediation-node-B" class="node-box active" x="20" y="150" width="150" height="56" rx="4"/>
+      <text x="95" y="183" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">兩節點＋錯票</text>
+
+      <rect id="vg-w-graph-shard-remediation-node-C" class="node-box" x="20" y="280" width="150" height="56" rx="4"/>
+      <text x="95" y="313" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">ephemeral 失聯</text>
+
+      <rect id="vg-w-graph-shard-remediation-node-V" class="node-box active" x="230" y="85" width="150" height="56" rx="4"/>
+      <text x="305" y="118" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">投票已修正</text>
+
+      <rect id="vg-w-graph-shard-remediation-node-P" class="node-box" x="230" y="280" width="150" height="56" rx="4"/>
+      <text x="305" y="313" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">人工待辦</text>
+
+      <rect id="vg-w-graph-shard-remediation-node-O" class="node-box active" x="440" y="85" width="150" height="56" rx="4"/>
+      <text x="515" y="118" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">oplog 已調整</text>
+
+      <rect id="vg-w-graph-shard-remediation-node-G" class="node-box active" x="650" y="110" width="110" height="100" rx="4"/>
+      <text x="705" y="158" text-anchor="middle" font-family="EB Garamond, serif" font-size="14" fill="var(--ink)">健康狀態</text>
+      <text x="705" y="176" text-anchor="middle" font-family="Manrope, sans-serif" font-size="10" fill="var(--muted)">goal</text>
+    </svg>
+
+    <div class="readout">
+      <p class="path-line" id="vg-w-graph-shard-remediation-path">兩節點＋錯票 → 投票已修正 → oplog 已調整 → 健康狀態</p>
+      <p class="stat-line">步數 <strong id="vg-w-graph-shard-remediation-hops">3</strong> · 總成本 <strong id="vg-w-graph-shard-remediation-weight">25</strong></p>
+      <p class="verdict" id="vg-w-graph-shard-remediation-verdict">Dijkstra 依真實操作時間選路徑，這條 3 步路徑的總成本是 25，比直接一步到位的 node rebuild（成本 101）省得多。</p>
+    </div>
+    <p class="legend">邊上的數字是操作成本：3 = vote/priority 修正、19 = oplog resize、101 = node rebuild，數字直接取自 Stripe 程式碼裡的常數。這是依真實成本重建的簡化示意圖，節點與邊的具體拓樸是本文示範用的簡化模型，不是 Stripe 內部實際的狀態圖。</p>
+
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        var root = document.querySelector('.vg-w-graph-shard-remediation');
+        var PREFIX = 'vg-w-graph-shard-remediation';
+
+        var GRAPH = {
+          A: [{ to: 'V', w: 3 }],
+          B: [{ to: 'V', w: 3 }, { to: 'G', w: 101 }],
+          C: [{ to: 'P', w: 3 }],
+          V: [{ to: 'G', w: 101 }, { to: 'O', w: 19 }],
+          O: [{ to: 'G', w: 3 }],
+          P: [],
+          G: []
+        };
+        var MISCONFIG = { A: 2, B: 3, C: 3, V: 1, O: 1, P: 1, G: 0 };
+        var LABELS = { A: '單節點下線', B: '兩節點＋錯票', C: 'ephemeral 失聯', V: '投票已修正', O: 'oplog 已調整', P: '人工待辦', G: '健康狀態' };
+
+        function bfsPath(start) {
+          var queue = [[start]];
+          var seen = {};
+          seen[start] = true;
+          while (queue.length) {
+            var path = queue.shift();
+            var node = path[path.length - 1];
+            if (node === 'G') return path;
+            var edges = GRAPH[node] || [];
+            for (var i = 0; i < edges.length; i++) {
+              var to = edges[i].to;
+              if (!seen[to]) { seen[to] = true; queue.push(path.concat([to])); }
+            }
+          }
+          return null;
+        }
+
+        function dijkstraPath(start) {
+          var dist = {}; dist[start] = 0;
+          var prev = {};
+          var visited = {};
+          var pq = [[0, start]];
+          var goalPath = null;
+          while (pq.length) {
+            pq.sort(function (a, b) { return a[0] - b[0]; });
+            var top = pq.shift();
+            var d = top[0], node = top[1];
+            if (visited[node]) continue;
+            visited[node] = true;
+            if (node === 'G') {
+              var path = []; var cur = 'G';
+              while (cur !== undefined) { path.unshift(cur); cur = prev[cur]; }
+              goalPath = { path: path, weight: d, partial: false };
+              break;
+            }
+            var edges = GRAPH[node] || [];
+            for (var i = 0; i < edges.length; i++) {
+              var to = edges[i].to, w = edges[i].w;
+              var nd = d + w;
+              if (dist[to] === undefined || nd < dist[to]) { dist[to] = nd; prev[to] = node; pq.push([nd, to]); }
+            }
+          }
+          if (goalPath) return goalPath;
+          var reachable = Object.keys(dist).filter(function (n) { return n !== start; });
+          if (reachable.length === 0) return null;
+          var best = reachable[0];
+          for (var j = 0; j < reachable.length; j++) { if (MISCONFIG[reachable[j]] < MISCONFIG[best]) best = reachable[j]; }
+          var p2 = []; var c2 = best;
+          while (c2 !== undefined) { p2.unshift(c2); c2 = prev[c2]; }
+          return { path: p2, weight: dist[best], partial: true };
+        }
+
+        function pathWeight(path) {
+          var w = 0;
+          for (var i = 0; i < path.length - 1; i++) {
+            var edges = GRAPH[path[i]] || [];
+            for (var j = 0; j < edges.length; j++) {
+              if (edges[j].to === path[i + 1]) { w += edges[j].w; break; }
+            }
+          }
+          return w;
+        }
+
+        var scenario = 'B', algo = 'dijkstra';
+        var scenarioBtns = root.querySelectorAll('.scenario-btn');
+        var algoBtns = root.querySelectorAll('.algo-btn');
+        var pathEl = root.querySelector('#' + PREFIX + '-path');
+        var hopsEl = root.querySelector('#' + PREFIX + '-hops');
+        var weightEl = root.querySelector('#' + PREFIX + '-weight');
+        var verdictEl = root.querySelector('#' + PREFIX + '-verdict');
+
+        function render() {
+          var result;
+          if (algo === 'bfs') {
+            var p = bfsPath(scenario);
+            result = p ? { path: p, weight: pathWeight(p), partial: false, found: true } : { path: [scenario], weight: 0, partial: false, found: false };
+          } else {
+            var d = dijkstraPath(scenario);
+            result = d ? { path: d.path, weight: d.weight, partial: d.partial, found: true } : { path: [scenario], weight: 0, partial: false, found: false };
+          }
+
+          root.querySelectorAll('.edge').forEach(function (el) { el.classList.remove('active'); el.setAttribute('marker-end', 'url(#' + PREFIX + '-arrow)'); });
+          root.querySelectorAll('.node-box').forEach(function (el) { el.classList.remove('active'); });
+
+          for (var i = 0; i < result.path.length; i++) {
+            var n = result.path[i];
+            var nodeEl = root.querySelector('#' + PREFIX + '-node-' + n);
+            if (nodeEl) nodeEl.classList.add('active');
+            if (i < result.path.length - 1) {
+              var edgeEl = root.querySelector('#' + PREFIX + '-edge-' + n + '-' + result.path[i + 1]);
+              if (edgeEl) { edgeEl.classList.add('active'); edgeEl.setAttribute('marker-end', 'url(#' + PREFIX + '-arrow-active)'); }
+            }
+          }
+
+          if (!result.found) {
+            pathEl.textContent = LABELS[scenario] + '（無解）';
+            hopsEl.textContent = '–';
+            weightEl.textContent = '–';
+            verdictEl.textContent = 'BFS 沒有備案：目標「健康狀態」不可達，演算法直接回報失敗，沒有任何路徑可用。';
+          } else {
+            pathEl.textContent = result.path.map(function (n) { return LABELS[n]; }).join(' → ');
+            hopsEl.textContent = String(result.path.length - 1);
+            weightEl.textContent = String(result.weight);
+            if (result.partial) {
+              verdictEl.textContent = 'Dijkstra 找不到通往「健康狀態」的路徑，改為回傳目前可達、misconfiguration 分數最低的狀態，其餘留給人工處理。';
+            } else if (algo === 'bfs') {
+              verdictEl.textContent = 'BFS 只數步數，選出這條 ' + (result.path.length - 1) + ' 步路徑，換算真實成本其實是 ' + result.weight + '。';
+            } else {
+              verdictEl.textContent = 'Dijkstra 依真實操作時間選路徑，這條 ' + (result.path.length - 1) + ' 步路徑的總成本是 ' + result.weight + '。';
+            }
+          }
+        }
+
+        scenarioBtns.forEach(function (b) {
+          b.addEventListener('click', function () {
+            scenario = b.dataset.scenario;
+            scenarioBtns.forEach(function (x) { x.setAttribute('aria-pressed', x === b ? 'true' : 'false'); });
+            render();
+          });
+        });
+        algoBtns.forEach(function (b) {
+          b.addEventListener('click', function () {
+            algo = b.dataset.algo;
+            algoBtns.forEach(function (x) { x.setAttribute('aria-pressed', x === b ? 'true' : 'false'); });
+            render();
+          });
+        });
+      })();
+    </script>
+  </figure>
+
+  <h2>BFS 先上，撞到牆</h2>
+
+  <p>最早的版本用 BFS 在這張圖上找路：從目前的狀態出發，找到通往完全健康狀態、步驟最少的一條路徑。BFS 的優點是簡單、保證找到最少步驟的解，前提是「一條通往完全健康的路徑」真的存在。文章直接點出這個版本的限制：「BFS finds the optimal path to a fully healthy state, but it fails entirely if no complete path exists」，找不到完整路徑，演算法就直接宣告失敗，沒有退路。</p>
+
+  <p>後來換成 Dijkstra，關鍵不只是「能不能找到路」，還有「步驟少不等於實際修得快」。每條邊的權重不是固定的 1，而是這條公式：edgeWeight(state, operation) = misconfiguration(state) × estimatedTime(operation)。operation 的耗時直接寫在程式碼裡，是三個常數：OPTIME_NODE_UPDATE_MONGO_CONFIG = 3、OPTIME_SHARD_UPDATE_OPLOG = 19、OPTIME_NODE_REBUILD = 101，換算下來，重建一個節點比單純改一次設定慢了大約 33 倍。這三個數字本身沒有標注實際單位，文章沒有進一步說明是秒、分鐘還是其他相對刻度，但比例才是重點：只要 node rebuild 比改設定慢 33 倍這件事成立，用「步驟少」決定路徑就有系統性風險。</p>
+
+  <p>用乘法而不是相加組合這兩個數字，是為了讓演算法在該省的地方省、該花的地方才花。文章的說法是「Using the product of these two for edge weight means the algorithm minimizes time spent in misconfigured states, prioritizing quick fixes that reduce exposure before committing to longer operations」，先把便宜能做的修正做掉，讓 shard 儘快離開嚴重誤設定的狀態，再決定要不要花大成本做 node rebuild 這種操作。</p>
+
+  <p>用 Dijkstra 而不是暴力列舉所有路徑，可以合理推想還有一個現實考量：機群裡的狀態組合不算少，暴力窮舉的成本可能隨節點數爆炸；Dijkstra 在邊權重非負的前提下能找到全域最優解，不需要真的走過每一條路徑——這也是為什麼從 BFS 換到 Dijkstra 不需要換掉整個圖搜尋的骨架，只是把邊上原本固定的「1」，換成一個算出來的數字。</p>
+
+  <figure class="vg-w-chart-operation-weights" data-mobile="keep" data-svg-scroll="800">
+    <style>
+      .vg-w-chart-operation-weights { margin: var(--s-4) 0; }
+      .vg-w-chart-operation-weights svg { width: 100%; height: auto; }
+    </style>
+    <svg viewBox="0 0 720 260" role="img" aria-label="三種維運操作的真實耗時常數">
+      <line x1="220" y1="30" x2="220" y2="200" stroke="var(--muted-2)" stroke-width="1"/>
+      <text x="220" y="18" font-family="EB Garamond, serif" font-size="12" fill="var(--muted)">相對耗時（程式碼常數，數字越大越慢）</text>
+
+      <text x="200" y="60" text-anchor="end" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">vote/priority 修正</text>
+      <rect x="220" y="44" width="14" height="24" fill="var(--sage)" stroke="var(--sage-deep)" stroke-width="1"/>
+      <text x="242" y="61" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--ink)">3</text>
+      <text x="242" y="76" font-family="JetBrains Mono, monospace" font-size="10" fill="var(--muted)">OPTIME_NODE_UPDATE_MONGO_CONFIG</text>
+
+      <text x="200" y="120" text-anchor="end" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">oplog resize</text>
+      <rect x="220" y="104" width="79" height="24" fill="var(--ink-deep)" fill-opacity="0.5" stroke="var(--ink-deep)" stroke-width="1"/>
+      <text x="307" y="121" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--ink)">19</text>
+      <text x="307" y="136" font-family="JetBrains Mono, monospace" font-size="10" fill="var(--muted)">OPTIME_SHARD_UPDATE_OPLOG</text>
+
+      <text x="200" y="180" text-anchor="end" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)">node rebuild</text>
+      <rect x="220" y="164" width="420" height="24" fill="var(--accent)" fill-opacity="0.5" stroke="var(--accent)" stroke-width="1"/>
+      <text x="648" y="181" font-family="JetBrains Mono, monospace" font-size="12" fill="var(--ink)">101</text>
+      <text x="648" y="196" font-family="JetBrains Mono, monospace" font-size="10" fill="var(--muted)">OPTIME_NODE_REBUILD</text>
+
+      <text x="220" y="230" font-family="EB Garamond, serif" font-size="13" fill="var(--ink)" font-style="italic">node rebuild 比 vote/priority 修正慢了大約 33 倍。</text>
+    </svg>
+  </figure>
+
+  <p>這正是上面那個 widget 裡場景 B（兩節點下線＋投票設定錯誤）想呈現的落差：直接一步 node rebuild 能修好一切，成本是 101；先修投票、再調 oplog、最後補一個小操作，走三步，成本卻只要 25。BFS 只看步數，會挑中前者；Dijkstra 看真實時間成本，會挑中後者。步驟少不等於修得快，這句話換成三個具體數字，就是「101」跟「25」的差距。</p>
+
+  <p>找不到完全健康的路徑時，Dijkstra 版本不會像 BFS 一樣直接放棄。文章的說法是「When no complete path exists, the algorithm returns the path to the least misconfigured state」，找不到通往完全健康的路，就退而求其次，回傳目前可達、misconfiguration 分數最低的狀態，把剩下修不了的部分留給人工處理。上面 widget 裡選第三種場景（ephemeral 節點失聯＋缺票）就是這種情況：自動化沒辦法把失聯的 ephemeral 節點修好，但至少能先把票數修正，把問題縮小到人工只需要處理那一小塊，而不是整個 shard 都等人來看。</p>
+
+  <h2>模擬即所執行</h2>
+
+  <p>圖跟權重算對還不夠，修復邏輯終究要真的執行在生產環境的 shard 上，而且像 node rebuild 這種操作可能要跑好幾個小時，中途遇到部署、當機、逾時都得扛得住。Stripe 用 Temporal 承接這段：文章形容它是「a durable execution framework that guarantees a workflow interrupted by a deploy, crash, or timeout can resume exactly where it left off」，中斷之後能從原地接著跑，不用整套重來，這對可能耗時數小時的 node rebuild 來說是必要條件。</p>
+
+  <p>真正把「規劃」跟「執行」黏在一起的，是一個叫 CommonContext 的介面。文章的說法是「The interface wraps Temporal's core primitives so that remediation logic can call them without knowing whether it's running inside a real workflow or a local simulation」，同一套修復邏輯，可以在不知情的狀況下，跑在真正的 Temporal workflow 上，也可以跑在一個純記憶體的模擬器上。這帶來的好處，文章講得很直接：「what you simulate is what you execute. There's no separate planning codebase that could diverge from the execution codebase」，模擬出來的修復計畫可以高信心地直接拿去執行，因為根本沒有兩套邏輯，不存在規劃碼跟執行碼慢慢長歪這種問題。模擬本身也快得多，把原本 I/O bound、以分鐘計的操作壓縮成「milliseconds of CPU-bound computation」，讓演算法可以在很短時間內把大量候選修復路徑都算一遍，再挑出最划算的那條。</p>
+
+  <p>這句話背後的工程意義，是很多自動化系統踩過的坑：規劃用的是一套簡化過的模型，執行用的是完整的正式邏輯，兩邊各自演進，久了就會出現「模擬說沒問題，真的執行卻爆炸」的落差。CommonContext 把這條分界線直接拿掉，規劃模型跟執行邏輯是同一份程式碼，差別只在背後接的是記憶體裡的假狀態，還是真正的 MongoDB API。</p>
+
+  <h2>三個數字</h2>
+
+  <p>上線之後，三個數字撐起了這次重構的成績單。pager 量降低 30%，換算下來一年少約 200 次呼叫；shard 卡在不健康狀態的時間，一年少了 12 天；佈局種類的擴充成本從「每種約一週人工稽核」變成零。文章提到的一個實例是，onboard 一種新的 planned-failover 佈局時，自動修復「worked with zero code changes」，不是理論上可以，是真的驗證過。三成 pager 少了，不代表值班變輕鬆三成——文章沒有拆解這 30% 的組成，但合理猜測少掉的多半是那種誤觸發、查半天發現沒事的假警報；12 天的機群健康時間，文章也沒說明計算口徑，猜想是兩千個 shard 分攤下來的總和。</p>
+
+  <figure class="vg-w-stats-results" data-mobile="keep">
+    <style>
+      .vg-w-stats-results { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--s-3); margin: var(--s-4) 0; }
+      @media (max-width: 720px) { .vg-w-stats-results { grid-template-columns: 1fr; } }
+      .vg-w-stats-results .cell { padding: var(--s-3); background: var(--bg-soft); border-left: 2px solid var(--accent); }
+      .vg-w-stats-results .num { font-family: var(--display); font-size: 2rem; color: var(--accent-text); display: block; line-height: 1.1; }
+      .vg-w-stats-results .label { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin-top: var(--s-1); display: block; }
+      .vg-w-stats-results .sub { font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink-soft); margin-top: var(--s-1); line-height: 1.6; }
+    </style>
+    <div class="cell">
+      <span class="num">30%</span>
+      <span class="label">pager 量下降</span>
+      <p class="sub">一年少約 200 次呼叫。</p>
+    </div>
+    <div class="cell">
+      <span class="num">12 天</span>
+      <span class="label">找回的機群健康時間</span>
+      <p class="sub">shard 卡在不健康狀態的時間，一年少了 12 天。</p>
+    </div>
+    <div class="cell">
+      <span class="num">0 行</span>
+      <span class="label">新增佈局要改的程式碼</span>
+      <p class="sub">40 多種佈局，onboard 新佈局時已驗證零程式碼改動。</p>
+    </div>
+  </figure>
+
+  <h2>接下來還要做的事</h2>
+
+  <p>團隊接下來想把同一套框架用在修復以外的地方。第一個方向是佈局遷移：與其寫死一套遷移腳本，不如把目標佈局設成 goal state，讓演算法自己找出安全的遷移順序，文章的說法是「Instead, we can set the goal state and let the algorithm discover a safe migration sequence the same way it discovers a recovery sequence」，跟修復用的是同一套邏輯，只是終點從健康狀態換成目標佈局。第二個方向是 blue-green 遷移，這需要演算法本身能感知拓樸：「The pathfinder must be topology-aware, understanding which color is active and what 'healthy' means at each phase of the migration」，因為遷移過程中，哪個顏色是現役、什麼叫健康會隨階段改變。第三個方向是把多個維運操作合併執行，文章舉的例子是「Right now, we execute one operation at a time on a single node across the entire shard, but when a node is already offline for a version upgrade, we could batch an oplog resize or index build into the same window」，既然一個節點已經因為版本升級離線，不如把 oplog resize 或 index build 一起做掉，省下重複下線同一個節點的成本。</p>
+
+  <p>這三個方向有一個共同點：目標從「健康狀態」換成別的東西，目標佈局、遷移中的某個階段、批次維護窗口，但「把目標寫成 goal state、讓演算法自己找路徑」這件事本身不用重寫。這也是圖搜尋這個框架比逐案寫規則更耐用的地方——規則系統每多一種新情境就要多寫一條規則，圖搜尋只要新增節點跟邊，goal state 換了，找路徑的邏輯還是同一套。</p>
+
+  <p>圖跟權重公式解決了「怎麼修」，CommonContext 跟 Temporal 解決了「修的計畫敢不敢真的拿去執行」。下面把文章裡幾個關鍵詞收在一起，方便回頭查。</p>
+
+  <figure class="vg-w-glossary-graph-terms" data-mobile="keep">
+    <style>
+      .vg-w-glossary-graph-terms { display: grid; gap: var(--s-1); margin: var(--s-4) 0; }
+      .vg-w-glossary-graph-terms details { border: 1px solid var(--line); padding: var(--s-2); border-radius: 2px; }
+      .vg-w-glossary-graph-terms summary { font-family: var(--sans); font-size: var(--fs-sm); color: var(--accent-text); cursor: pointer; min-height: 32px; display: flex; align-items: center; }
+      .vg-w-glossary-graph-terms p { font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink-soft); margin: var(--s-1) 0 0 0; line-height: 1.75; }
+    </style>
+    <details>
+      <summary>invalid state（不合法狀態）</summary>
+      <p>違反安全不變量的狀態，直接被排除在圖搜尋範圍之外。文章列的例子包括投票數是偶數、健康投票節點不到半數，或者一個節點的設定本身矛盾，像 priority=1 卻 vote=0。</p>
+    </details>
+    <details>
+      <summary>misconfiguration 分數</summary>
+      <p>由一組可疊加的規則算出來，每條規則對應一類具體問題：節點下線、投票不match、優先權不match、oplog 大小、隱藏狀態、可用區不平衡。分數越高，狀態越糟，也是 Dijkstra 邊權重公式裡的其中一項。</p>
+    </details>
+    <details>
+      <summary>CommonContext</summary>
+      <p>包住 Temporal 核心原語的介面，讓修復邏輯在不知情的狀況下，既可以跑在真正的 workflow 裡，也可以跑在純記憶體模擬器上，是「模擬即所執行」成立的關鍵。</p>
+    </details>
+    <details>
+      <summary>Temporal durable execution</summary>
+      <p>保證一個被部署、當機或逾時打斷的 workflow，能從中斷的地方繼續跑，不用整套重來，這對可能耗時數小時的 node rebuild 是必要條件。</p>
+    </details>
+  </figure>
+
+  <p class="vg-deep-closer"><strong>這個框架能搬去哪裡</strong>：把「狀態」攤開成圖上的節點、把「操作」攤開成帶權重的邊、用同一套邏輯同時餵模擬與執行，這不是 MongoDB shard 專屬的技巧。任何一個異質、多拓樸、需要自動修復的分散式系統，都可以照著這個骨架重新設計，不用再為每一種故障組合手寫一條規則。</p>
+</div>
