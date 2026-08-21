@@ -1,0 +1,415 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">兩個 batch 用同一個時間戳分別想把餘額寫成 (100, 1900) 與 (1800, 200)，Cassandra 逐個 cell 比大小、留下數值較大的一邊，最後寫進資料庫的是誰都沒打算寫的 (1800, 1900)。</p>
+  <h1 class="vg-post-title">從無交易到跨分區 ACID，Cassandra 6 走了 13 年</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p><span class="vg-dropcap">C</span>assandra 一開始是一套完全沒有交易的 eventually-consistent 系統，介面是 Thrift、schema 也是空的——vendor-neutral、內建 sharding 與複寫這個組合，是 Apple、eBay、Bloomberg、Netflix 這些大型使用者會選它的原因，但一致性從來不是賣點。The Consensus 的 Phil Eaton 用一個最直白的銀行轉帳情境測了這件事：兩個帳戶各起始 1000，兩個寫入者互轉、模擬併發轉帳，第三個執行緒不停讀、斷言兩帳戶總和永遠是 2000——這個不變量，貫穿了接下來每一種模式的每一次測試。用最原始的 UPDATE 語句跑這個情境，1500 次併發讀取斷言裡有 939 次總和不對，六成以上讀到一個不可能的數字。Cassandra 過去 13 年一路疊加 BATCH、LWT、Accord 三層機制，要解決的正是這個問題——而且到了 Accord，答案依然沒有乾淨到毫無破綻。</p>
+
+  <p>問題之所以現實，跟 Cassandra 的資料模型有關：沒有 join，自動 sharding 加上有限的 secondary index 能力，逼得你依查詢模式設計資料表——同一筆邏輯上的更新，常常得拆成好幾次寫入，分別落在不同的表。單一 partition 內的原子性從來不夠用，這正是「跨 partition 交易」在 Cassandra 上特別現實的理由，也是這篇文章想弄清楚的：BATCH、LWT、Accord 三層機制，各自把這道邊界推到哪裡。</p>
+
+  <p>Cassandra 能被這種規模的公司選中，靠的是一個少見的組合：vendor-neutral、open source，同時提供 SQL-like 的查詢語言，還內建 sharding 與複寫——市場上同時具備這幾項的資料庫並不多。正是這個組合把「交易能力補齊」變成一件很多人在意的事：應用程式已經被迫用 SQL-like 語法思考、又因為沒有 join 被迫把寫入拆成多筆，缺乏跨 partition 的一致性保護，風險就特別具體。光是最原始的 UPDATE，Cassandra 就撐不住一間銀行——這也是 BATCH、LWT、Accord 三層機制存在的理由。</p>
+
+  <p>測試設計本身有三個軸：一個是模式（plain、BATCH、LWT、Accord）；一個是要不要跨 partition——帳戶表用 customer 欄位分區，跨分區版本讓兩個帳戶落在不同 customer 底下；第三個是要不要先讀再寫，盲寫版本直接算好新值就送出，read-modify-write 版本要先讀當下餘額、算出差值，再寫回去。支援條件寫入的 LWT 與 Accord 用了額外的 op 欄位當 idempotency key；plain 與一般 BATCH 沒有用到，不是為了討巧，是它們的語法本來就沒有條件寫入，用不上這個欄位。</p>
+
+  <figure class="vg-w-scrub-cassandra-history" data-mobile="static" data-svg-scroll="720">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m8 18-6-6 6-6"/><path d="M2 12h20"/><path d="m16 6 6 6-6 6"/>
+      </svg>
+      <span>拖曳時間軸看每一次升級解決了什麼、留下什麼 · 4 個里程碑</span>
+    </p>
+    <style>
+      .vg-w-scrub-cassandra-history { display: grid; gap: var(--s-2); }
+      .vg-w-scrub-cassandra-history svg.vg-w-scrub-cassandra-history-main { width: 100%; height: auto; min-width: 720px; }
+      .vg-w-scrub-cassandra-history .marker-title { font-family: var(--sans); font-size: 12px; fill: var(--ink); }
+      .vg-w-scrub-cassandra-history .marker-sub { font-family: var(--scribed); font-size: 11px; fill: var(--muted); }
+      .vg-w-scrub-cassandra-history .state { font-family: var(--serif); font-size: var(--fs-sm); padding: var(--s-2); background: var(--bg-soft); border-left: 2px solid var(--accent); }
+    </style>
+
+    <svg class="vg-w-scrub-cassandra-history-main" viewBox="0 0 720 280" role="img" aria-label="Cassandra 交易能力時間軸：起點、2013 年 1 月 BATCH、2013 年 9 月 LWT、2026 年（未發布）Accord">
+      <line x1="60" y1="140" x2="660" y2="140" stroke="var(--muted-2)" stroke-width="1.5" />
+
+      <circle cx="60" cy="140" r="6" fill="var(--muted)" />
+      <text class="marker-title" x="60" y="110" text-anchor="middle">最初的 Cassandra</text>
+      <text class="marker-sub" x="60" y="126" text-anchor="middle">Thrift、schemaless</text>
+      <text class="marker-sub" x="60" y="140" text-anchor="middle" dy="-2">完全沒有交易</text>
+
+      <circle cx="240" cy="140" r="6" fill="var(--accent)" />
+      <text class="marker-title" x="240" y="172" text-anchor="middle">2013 年 1 月 · BATCH</text>
+      <text class="marker-sub" x="240" y="188" text-anchor="middle">同分區原子＋隔離</text>
+      <text class="marker-sub" x="240" y="202" text-anchor="middle">跨分區只剩最終原子性</text>
+
+      <circle cx="330" cy="140" r="6" fill="var(--ink-deep)" />
+      <text class="marker-title" x="330" y="110" text-anchor="middle">2013 年 9 月 · LWT</text>
+      <text class="marker-sub" x="330" y="126" text-anchor="middle">Paxos-based CAS</text>
+      <text class="marker-sub" x="330" y="140" text-anchor="middle" dy="-2">完全跨不了 partition</text>
+
+      <circle id="vg-w-scrub-cassandra-history-handle" cx="660" cy="140" r="9" fill="var(--sage-deep)" cursor="grab" role="button" tabindex="0" aria-label="拖曳查看時間軸各里程碑" />
+      <text class="marker-title" x="660" y="172" text-anchor="middle">2026（未發布）· Accord</text>
+      <text class="marker-sub" x="660" y="188" text-anchor="middle">EPaxos 共識、跨分區 ACID</text>
+      <text class="marker-sub" x="660" y="202" text-anchor="middle">仍非互動式</text>
+    </svg>
+
+    <div class="state" id="vg-w-scrub-cassandra-history-state">cassandra-6.0 分支：EPaxos 啟發的無 leader 共識協定，讓標記 transactional_mode='full' 的資料表所有讀寫都走 Accord，終於做到跨分區的 ACID 交易——但仍是非互動式。</div>
+
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        const root = document.querySelector('.vg-w-scrub-cassandra-history');
+        const svg = root.querySelector('svg.vg-w-scrub-cassandra-history-main');
+        const handle = root.querySelector('#vg-w-scrub-cassandra-history-handle');
+        const stateDiv = root.querySelector('#vg-w-scrub-cassandra-history-state');
+        const X_MIN = 60, X_MAX = 660;
+        const stops = [
+          { x: 60, text: '最初的 Cassandra：介面是 Thrift、schema 也是空的，是一套完全沒有交易的 eventually-consistent 系統。' },
+          { x: 240, text: 'Cassandra 1.2（2013 年 1 月）：BATCH 讓同一個 partition 內的多語句原子且隔離；一旦跨 partition，只剩「最終都會套用」，不含隔離。' },
+          { x: 330, text: 'Cassandra 2.0（2013 年 9 月）：LWT 用 Paxos 產生唯一時間戳，做到同分區的原子 compare-and-swap，但文法上完全無法跨越 partition 邊界。' },
+          { x: 660, text: "cassandra-6.0 分支：EPaxos 啟發的無 leader 共識協定，讓標記 transactional_mode='full' 的資料表所有讀寫都走 Accord，終於做到跨分區的 ACID 交易——但仍是非互動式。" }
+        ];
+        function clamp(x) { return Math.max(X_MIN, Math.min(X_MAX, x)); }
+        function nearest(x) {
+          let best = stops[0], bestD = Infinity;
+          for (const s of stops) { const d = Math.abs(s.x - x); if (d < bestD) { bestD = d; best = s; } }
+          return best;
+        }
+        function clientToSvgX(clientX) {
+          const pt = svg.createSVGPoint();
+          pt.x = clientX; pt.y = 0;
+          const svgPt = pt.matrixTransform(svg.getScreenCTM().inverse());
+          return clamp(svgPt.x);
+        }
+        function update(x) {
+          const snap = nearest(x);
+          handle.setAttribute('cx', snap.x);
+          stateDiv.textContent = snap.text;
+        }
+        let dragging = false;
+        handle.addEventListener('pointerdown', (e) => { dragging = true; handle.setPointerCapture(e.pointerId); handle.setAttribute('cursor', 'grabbing'); });
+        handle.addEventListener('pointermove', (e) => { if (!dragging) return; update(clientToSvgX(e.clientX)); });
+        handle.addEventListener('pointerup', () => { dragging = false; handle.setAttribute('cursor', 'grab'); });
+        handle.addEventListener('keydown', (e) => {
+          const cx = Number(handle.getAttribute('cx'));
+          if (e.key === 'ArrowLeft') { e.preventDefault(); update(clamp(cx - 40)); }
+          else if (e.key === 'ArrowRight') { e.preventDefault(); update(clamp(cx + 40)); }
+        });
+      })();
+    </script>
+  </figure>
+
+  <h2>BATCH：同分區原子，時間戳打平就拆夥</h2>
+
+  <p>BATCH 是這條路的第一站，Cassandra 1.2（2013 年 1 月）定型至今。它把多個語句包成一個 mutation：落在同一個 partition 內，套用是原子且隔離的；如果 batch 跨越 partition，保證降級成「最終都會套用」，不含隔離。同一個 batch 裡所有語句共用一個時間戳，其他情況下每個語句有自己的時間戳；衝突用時間戳決勝，而且是逐個 cell 決勝，不是逐 row。正常情況下不同 batch 的時間戳不會一樣，較晚的 batch 整批贏過較早的 batch，同一個 batch 寫入的欄位不會被拆散。但時間戳是用戶端自己產生的，兩個用戶端是有機會打平的——打平時 Cassandra 逐個 cell 保留數值較大的一方，兩個打平的 batch 因此可能各贏一部分欄位。這個「最終」保證本身仍然有用：就算某個 replica 當下故障，batch 裡的每一句最後都會被套用，不會遇到「一半語句永遠遺失」的情況，只是併發讀取這段期間看到的畫面可能是錯的。</p>
+
+  <figure class="vg-w-pop-batch-tie" data-mobile="keep">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M9 9a3 3 0 1 1 5.12 2.12L12 13.24"/><path d="M12 17h.01"/><circle cx="12" cy="12" r="10"/>
+      </svg>
+      <span>點按或聚焦底線詞看衝突解決機制 · 1 個名詞解釋</span>
+    </p>
+    <style>
+      .vg-w-pop-batch-tie { display: grid; gap: var(--s-2); }
+      .vg-w-pop-batch-tie .tie-boxes { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s-2); }
+      .vg-w-pop-batch-tie .tie-box { padding: var(--s-2); border: 1px solid var(--line); background: var(--bg-soft); }
+      .vg-w-pop-batch-tie .tie-box.tie-result { border-color: var(--accent); background: transparent; border-width: 1.5px; }
+      .vg-w-pop-batch-tie .tie-label { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin: 0 0 var(--s-1) 0; }
+      .vg-w-pop-batch-tie .tie-val { font-family: JetBrains Mono, monospace; font-size: var(--fs-sm); color: var(--ink); margin: 0; font-variant-numeric: tabular-nums; }
+      .vg-w-pop-batch-tie .tie-mid { position: relative; font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink-soft); text-align: center; margin: 0; }
+      .vg-w-pop-batch-tie .term { anchor-name: --vgw-pop-batch-tie-anchor; text-decoration: underline dotted var(--muted); cursor: help; color: var(--accent-text); }
+      .vg-w-pop-batch-tie .pop {
+        position-anchor: --vgw-pop-batch-tie-anchor;
+        position: absolute; top: anchor(bottom); left: anchor(center); translate: -50% var(--s-1);
+        padding: var(--s-2); background: var(--bg-soft); border: 1px solid var(--line);
+        font-family: var(--scribed); font-size: var(--fs-xs); max-width: 34ch; text-align: left;
+        opacity: 0; transition: opacity 100ms; pointer-events: none; z-index: 2;
+      }
+      .vg-w-pop-batch-tie .term:hover .pop, .vg-w-pop-batch-tie .term:focus .pop { opacity: 1; }
+      @supports not (anchor-name: --x) {
+        .vg-w-pop-batch-tie .pop { position: static; opacity: 1; pointer-events: auto; display: inline-block; margin-top: var(--s-1); }
+      }
+    </style>
+    <div class="tie-boxes">
+      <div class="tie-box">
+        <p class="tie-label">writer 1 想寫的 batch</p>
+        <p class="tie-val">customer=1 → 100</p>
+        <p class="tie-val">customer=2 → 1900</p>
+      </div>
+      <div class="tie-box">
+        <p class="tie-label">writer 2 想寫的 batch</p>
+        <p class="tie-val">customer=1 → 1800</p>
+        <p class="tie-val">customer=2 → 200</p>
+      </div>
+    </div>
+    <p class="tie-mid">兩個 batch 用同一個時間戳送達，Cassandra 用<span class="term" tabindex="0">cell 層級 last-write-wins<span class="pop">衝突不是整批比大小，是逐一個欄位（cell）比大小——時間戳打平時，每個 cell 各自保留數值較大的一邊，勝負可能兩邊各贏一半。</span></span>逐一決勝。</p>
+    <div class="tie-box tie-result">
+      <p class="tie-label">實際寫入結果</p>
+      <p class="tie-val">customer=1 → 1800</p>
+      <p class="tie-val">customer=2 → 1900</p>
+    </div>
+    <figcaption>兩邊都沒打算寫出 (1800, 1900)——這組數字是逐 cell 各自比大小的副產品，兩個 batch 的寫入時間戳固定為同一個值：1755400000000000。日常測試裡兩個用戶端各自產生的時間戳不常剛好相等，但轉帳這種高頻寫入同一組欄位的情境，撞上的機率並不算低，這正是前面同分區盲寫測試裡偶爾出現的那 6 次失敗的來源。</figcaption>
+  </figure>
+
+  <p>實測結果印證了這一點。同分區內的盲寫轉帳測試，多數執行完全乾淨，但作者說得很直接：每跑幾輪就會撞到一次糟糕的結果——其中一輪 1500 次讀取斷言裡有 6 次失敗，兩個帳戶的餘額同時衝到 1897 與 1893，加總遠超過 2000。換成跨分區轉帳，BATCH 保住了原子性——每個 batch 的寫入最終都會一起生效——但完全不隔離，1500 次讀取斷言裡有 231 次總和不對。更糟的是 read-modify-write：CQL 的文法根本不允許把 SELECT 放進 BATCH 裡，讀取這一步從一開始就不算在「交易」範圍內。同分區內先讀餘額、算出新值、再包成 batch 寫回去，1000 次讀取斷言裡 831 次錯，連測試結束後兩個帳戶該收斂到的 600 與 1400，最後也沒收斂到。作者特別補了一句：不論是時間戳打平還是跨分區失去隔離，都是 Cassandra 文件已經寫明的預期行為，不是意外撞見的 bug——這一點在讀到後面 Accord 那段時值得記住，兩者的性質並不一樣。</p>
+
+  <p>測試環境本身也有一個限制值得記住：叢集複寫係數是 3、節點數也是 3，等於每個節點都握有全部資料，這次測試其實沒有真的做到 sharding——要是加進更多節點、複寫係數維持 3，sharding 才會真正發生。跨分區的 BATCH 測試裡，測試結束後的最終檢查是過的，但作者也提醒這不是保證：如果最後兩個 batch 剛好也打平了時間戳，連最終持久化的結果都可能被打亂，不只是併發讀取瞬間看到的錯。</p>
+
+  <h2>LWT：Paxos 解決了打平，過不了 partition 邊界</h2>
+
+  <p>Lightweight Transaction（LWT）在同一年 9 月的 Cassandra 2.0 上市，用 Paxos 換來原子的 compare-and-swap——不能原子地先 SELECT 再 UPDATE，但至少可以原子地「條件成立才 UPDATE」。LWT 的時間戳來自 Paxos、同一個 partition 內唯一，BATCH 那種用戶端時間戳打平的問題在這裡不會發生。LWT 還有一個限制：條件不成立時你知道失敗了，但逾時時完全不知道寫入到底成不成功。所以測試裡得靠一個額外的 op 欄位撐住：每個寫入者有自己的 op 欄位，每次重複迴圈送出一個遞增的 op 值，逾時就重試同一個 LWT，直到讀回自己剛剛送出的那個 op 值為止——用重試迴圈把「逾時等於失敗還是成功」這個模糊地帶蓋掉。讀取這一側也不是預設受保護的：LWT 的 SELECT 預設不會走 Paxos，得由用戶端顯式送出 CONSISTENCY SERIAL 才會讓讀取一起經過 Paxos——這類讀取一樣可能因逾時失敗，所以測試把讀取斷言放寬成「總和是 2000，或者讀取本身報錯」兩種都算過關。加上這層保護之後，同分區的 read-modify-write 與盲寫兩種轉帳測試都是零失敗——1000 次與 1500 次讀取斷言全過。盲寫這一版甚至不需要真正的條件：兩個 UPDATE 用 IF EXISTS 這個最寬鬆的判斷式包進帶條件的 BATCH，純粹是為了讓寫入照樣走 Paxos、共用 LWT 的保護。問題出在跨 partition：LWT 一旦跨分區，Cassandra 連寫都不讓你寫，直接回一句「Batch with conditions cannot span multiple partitions」。兩個寫入者各嘗試 400 次，800 次全部被拒——不是資料算錯，是操作根本沒發生。</p>
+
+  <h2>Accord：無 leader 共識，終於跨過那道邊界</h2>
+
+  <p>跨 partition 這個缺口，是 Apple 與密西根大學的工程師做 Accord 的理由。Accord 是 EPaxos 啟發、無 leader 的共識協定，讓標記 transactional_mode='full' 的資料表所有讀寫都走 Accord 共識——Cassandra 終於有了真正的 ACID 交易，只是仍非互動式。跟 LWT 比，關鍵差異在「讀」跟「條件判斷」是不是同一步：LWT 先讀再比較，讀到的值常常已經過期，失敗了只能整個重來；Accord 把條件判斷跟讀取放在同一時刻評估，讀到的值不會過期，會失敗的原因基本只剩用戶端逾時或節點故障。這個能力要等 Cassandra 6 正式發布才會出現在穩定版——作者測試當下用的是 cassandra-6.0 這條尚未發布的分支，發布時間點連作者自己都只能說「也許是今年稍晚」。</p>
+
+  <p>語法上，Accord 也帶來 BATCH 與 LWT 都沒有的寫法：BEGIN TRANSACTION 開出一個區塊，LET 把一次 SELECT 的結果綁定成變數，IF...THEN...END IF 決定要不要真的寫入，COMMIT TRANSACTION 收尾。這段區塊要嘛整包成功、要嘛整包不生效，而且必須一次送完——中途不能像應用程式那樣等一個網路來回、再根據結果決定下一步該做什麼，這正是作者說 Accord 交易「非互動式」的意思：能一次表達的邏輯變複雜了，但仍然是一次送出、一次判定。作者也點出這次測試的邊界：Accord 幾乎不會因為逾時或節點故障而失敗，是因為整個叢集只是本機三個 process，沒有真正的網路延遲，是一個「happy localhost environment」；op 欄位這種 idempotency key 在正式環境仍然有用，只是在這個實驗室設定裡被拿掉了。</p>
+
+  <p>同分區的測試結果沒有懸念，Accord 跟 LWT 一樣乾淨：read-modify-write 轉帳測試 1000 次讀取斷言全過。真正的分水嶺在跨分區——同樣是先讀餘額、算新值、再寫回去，這次橫跨兩個不同的 customer partition，1000 次讀取斷言依然全過。這是 Cassandra 6 之前完全不存在的組合：BATCH 能跨分區但不隔離，LWT 隔離但跨不了分區，只有 Accord 兩件事同時做到。底下每個百分比都是用「併發讀取斷言」當分母算出來的，不是用測試結束後的最終檢查——同一輪測試，最終持久化的結果很可能是乾淨的，過程中的併發讀取卻已經記錄下上百次違反不變量的瞬間。把四種模式攤開來看，四個情境各自的失敗率長這樣：</p>
+
+  <figure class="vg-w-param-consistency-cassandra" data-mobile="static" data-svg-scroll="720">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M3 9h18"/><path d="M3 15h18"/><rect x="3" y="4" width="18" height="16" rx="2"/>
+      </svg>
+      <span>切換情境比較四種模式的失敗率 · 4 種情境 × 4 種模式</span>
+    </p>
+    <style>
+      .vg-w-param-consistency-cassandra { display: grid; gap: var(--s-3); }
+      .vg-w-param-consistency-cassandra input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-param-consistency-cassandra .scenario-switch { display: grid; grid-template-columns: repeat(2, 1fr); gap: var(--s-2); }
+      @media (min-width: 720px) { .vg-w-param-consistency-cassandra .scenario-switch { grid-template-columns: repeat(4, 1fr); } }
+      .vg-w-param-consistency-cassandra .scenario-btn { display: flex; align-items: center; justify-content: center; text-align: center; min-height: 44px; padding: var(--s-1) var(--s-2); border: 1px solid var(--line); font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.03em; color: var(--muted); cursor: pointer; user-select: none; transition: border-color 150ms, color 150ms; }
+      .vg-w-param-consistency-cassandra .scenario-btn:has(input:checked) { border-color: var(--accent); color: var(--accent-text); background: var(--bg-soft); }
+      .vg-w-param-consistency-cassandra svg.vg-w-param-consistency-cassandra-main { width: 100%; height: auto; min-width: 720px; }
+      .vg-w-param-consistency-cassandra .row-label { font-family: var(--serif); font-size: 14px; fill: var(--ink); }
+      .vg-w-param-consistency-cassandra .tick-label { font-family: JetBrains Mono, monospace; font-size: 10px; fill: var(--muted); }
+      .vg-w-param-consistency-cassandra .val-pct { font-family: JetBrains Mono, monospace; font-size: 13px; fill: var(--ink); font-variant-numeric: tabular-nums; }
+      .vg-w-param-consistency-cassandra .val-frac { font-family: var(--scribed); font-size: 10.5px; fill: var(--muted); }
+      .vg-w-param-consistency-cassandra .na-label { font-family: var(--scribed); font-style: italic; font-size: 11px; fill: var(--muted); }
+      .vg-w-param-consistency-cassandra .scenario-group { display: none; }
+      .vg-w-param-consistency-cassandra:has(#vg-w-param-consistency-cassandra-r-same-blind:checked) .scenario-same-blind { display: block; }
+      .vg-w-param-consistency-cassandra:has(#vg-w-param-consistency-cassandra-r-cross-blind:checked) .scenario-cross-blind { display: block; }
+      .vg-w-param-consistency-cassandra:has(#vg-w-param-consistency-cassandra-r-same-rmw:checked) .scenario-same-rmw { display: block; }
+      .vg-w-param-consistency-cassandra:has(#vg-w-param-consistency-cassandra-r-cross-rmw:checked) .scenario-cross-rmw { display: block; }
+      .vg-w-param-consistency-cassandra .scenario-note { display: none; font-family: var(--scribed); font-size: var(--fs-sm); color: var(--ink-soft); margin: 0; }
+      .vg-w-param-consistency-cassandra:has(#vg-w-param-consistency-cassandra-r-same-blind:checked) .note-same-blind { display: block; }
+      .vg-w-param-consistency-cassandra:has(#vg-w-param-consistency-cassandra-r-cross-blind:checked) .note-cross-blind { display: block; }
+      .vg-w-param-consistency-cassandra:has(#vg-w-param-consistency-cassandra-r-same-rmw:checked) .note-same-rmw { display: block; }
+      .vg-w-param-consistency-cassandra:has(#vg-w-param-consistency-cassandra-r-cross-rmw:checked) .note-cross-rmw { display: block; }
+      .vg-w-param-consistency-cassandra .legend { font-family: var(--sans); font-size: var(--fs-xs); color: var(--muted); }
+    </style>
+
+    <div class="scenario-switch" data-vg-controls role="radiogroup" aria-label="選擇測試情境">
+      <label class="scenario-btn">
+        <input type="radio" id="vg-w-param-consistency-cassandra-r-same-blind" name="vg-w-param-consistency-cassandra-scenario" checked />
+        <span>同分區・盲寫</span>
+      </label>
+      <label class="scenario-btn">
+        <input type="radio" id="vg-w-param-consistency-cassandra-r-cross-blind" name="vg-w-param-consistency-cassandra-scenario" />
+        <span>跨分區・盲寫</span>
+      </label>
+      <label class="scenario-btn">
+        <input type="radio" id="vg-w-param-consistency-cassandra-r-same-rmw" name="vg-w-param-consistency-cassandra-scenario" />
+        <span>同分區・讀後寫</span>
+      </label>
+      <label class="scenario-btn">
+        <input type="radio" id="vg-w-param-consistency-cassandra-r-cross-rmw" name="vg-w-param-consistency-cassandra-scenario" />
+        <span>跨分區・讀後寫</span>
+      </label>
+    </div>
+
+    <svg class="vg-w-param-consistency-cassandra-main" viewBox="0 0 720 400" role="img" aria-label="四種模式在四種測試情境下的併發讀取失敗率長條圖">
+      <text x="360" y="26" text-anchor="middle" class="row-label" font-size="15">四種模式・併發讀取的失敗率</text>
+
+      <line x1="190" y1="50" x2="190" y2="360" stroke="var(--muted-2)" stroke-width="1" />
+      <line x1="282" y1="50" x2="282" y2="360" stroke="var(--muted-2)" stroke-width="0.6" stroke-dasharray="2,3" />
+      <line x1="375" y1="50" x2="375" y2="360" stroke="var(--muted-2)" stroke-width="0.6" stroke-dasharray="2,3" />
+      <line x1="468" y1="50" x2="468" y2="360" stroke="var(--muted-2)" stroke-width="0.6" stroke-dasharray="2,3" />
+      <line x1="560" y1="50" x2="560" y2="360" stroke="var(--muted-2)" stroke-width="1" />
+      <text class="tick-label" x="190" y="42" text-anchor="middle">0%</text>
+      <text class="tick-label" x="375" y="42" text-anchor="middle">50%</text>
+      <text class="tick-label" x="560" y="42" text-anchor="middle">100%</text>
+
+      <text class="row-label" x="20" y="94">plain</text>
+      <text class="row-label" x="20" y="174">BATCH</text>
+      <text class="row-label" x="20" y="254">LWT</text>
+      <text class="row-label" x="20" y="334">Accord</text>
+
+      <g class="scenario-group scenario-same-blind">
+        <rect x="190" y="76" width="232" height="28" fill="var(--muted)" opacity="0.55" />
+        <text class="val-pct" x="575" y="94">62.6%</text>
+        <text class="val-frac" x="575" y="108">939 / 1500</text>
+
+        <rect x="190" y="156" width="4" height="28" fill="var(--accent)" />
+        <text class="val-pct" x="575" y="174">0.4%</text>
+        <text class="val-frac" x="575" y="188">6/1500（偶發打平）</text>
+
+        <line x1="190" y1="236" x2="190" y2="264" stroke="var(--ink-deep)" stroke-width="2" />
+        <text class="val-pct" x="575" y="254">0%</text>
+        <text class="val-frac" x="575" y="268">0 / 1500</text>
+
+        <rect x="190" y="316" width="4" height="28" fill="var(--sage-deep)" />
+        <text class="val-pct" x="575" y="334">0.07%</text>
+        <text class="val-frac" x="575" y="348">1/1500（已確認 bug）</text>
+      </g>
+
+      <g class="scenario-group scenario-cross-blind">
+        <rect x="190" y="76" width="60" height="28" fill="none" stroke="var(--muted-2)" stroke-dasharray="4,3" />
+        <text class="na-label" x="575" y="94">未測試</text>
+
+        <rect x="190" y="156" width="57" height="28" fill="var(--accent)" />
+        <text class="val-pct" x="575" y="174">15.4%</text>
+        <text class="val-frac" x="575" y="188">231 / 1500</text>
+
+        <rect x="190" y="236" width="370" height="28" fill="var(--ink-deep)" />
+        <text class="val-pct" x="575" y="254">100%</text>
+        <text class="val-frac" x="575" y="268">800/800（遭拒）</text>
+
+        <rect x="190" y="316" width="60" height="28" fill="none" stroke="var(--muted-2)" stroke-dasharray="4,3" />
+        <text class="na-label" x="575" y="334">未測試</text>
+      </g>
+
+      <g class="scenario-group scenario-same-rmw">
+        <rect x="190" y="76" width="60" height="28" fill="none" stroke="var(--muted-2)" stroke-dasharray="4,3" />
+        <text class="na-label" x="575" y="94">未測試</text>
+
+        <rect x="190" y="156" width="308" height="28" fill="var(--accent)" />
+        <text class="val-pct" x="575" y="174">83.1%</text>
+        <text class="val-frac" x="575" y="188">831 / 1000</text>
+
+        <line x1="190" y1="236" x2="190" y2="264" stroke="var(--ink-deep)" stroke-width="2" />
+        <text class="val-pct" x="575" y="254">0%</text>
+        <text class="val-frac" x="575" y="268">0 / 1000</text>
+
+        <line x1="190" y1="316" x2="190" y2="344" stroke="var(--sage-deep)" stroke-width="2" />
+        <text class="val-pct" x="575" y="334">0%</text>
+        <text class="val-frac" x="575" y="348">0 / 1000</text>
+      </g>
+
+      <g class="scenario-group scenario-cross-rmw">
+        <rect x="190" y="76" width="60" height="28" fill="none" stroke="var(--muted-2)" stroke-dasharray="4,3" />
+        <text class="na-label" x="575" y="94">未測試</text>
+
+        <rect x="190" y="156" width="60" height="28" fill="none" stroke="var(--muted-2)" stroke-dasharray="4,3" />
+        <text class="na-label" x="575" y="174">未測試</text>
+
+        <rect x="190" y="236" width="60" height="28" fill="none" stroke="var(--muted-2)" stroke-dasharray="4,3" />
+        <text class="na-label" x="575" y="254">結構性不支援</text>
+
+        <line x1="190" y1="316" x2="190" y2="344" stroke="var(--sage-deep)" stroke-width="2" />
+        <text class="val-pct" x="575" y="334">0%</text>
+        <text class="val-frac" x="575" y="348">0/1000（全新能力）</text>
+      </g>
+    </svg>
+
+    <p class="scenario-note note-same-blind">同分區、只做盲寫：plain 六成多的讀取撞到錯的總和，完全沒有隔離；BATCH 多數情況乾淨，但時間戳打平時會偶發出錯；LWT 全過；Accord 幾乎全過，只有一次觀察到瞬間讀到錯的總和，細節留到下一節談。</p>
+    <p class="scenario-note note-cross-blind">跨分區、只做盲寫：plain 與 Accord 都沒有在這個情境下被測試；BATCH 有原子性、沒有隔離，231 次讀到錯的總和；LWT 直接被 Cassandra 拒絕寫入——不是資料算錯，是整批操作根本沒發生。</p>
+    <p class="scenario-note note-same-rmw">同分區、要先讀再寫：plain 沒被測試；BATCH 的文法根本不允許把 SELECT 放進 batch，831 次讀到錯的總和，連測試結束後的最終餘額都不是預期的 600 與 1400；LWT 與 Accord 都乾淨過關。</p>
+    <p class="scenario-note note-cross-rmw">跨分區、要先讀再寫：只有 Accord 撐得住，1000 次讀取斷言 0 次失敗；plain、BATCH 未在這個情境測試；LWT 因為文法限制，只要跨分區就會被拒絕，測這個組合沒有意義。</p>
+
+    <p class="legend">實線長條＝實測百分比；虛線框＝該情境未測試；LWT 的滿格代表寫入遭拒，不是資料算錯。</p>
+  </figure>
+
+  <p>四種模式的能力邊界，攤成一張表：</p>
+
+  <figure class="vg-w-table-mode-capability" data-mobile="keep">
+    <style>
+      .vg-w-table-mode-capability { overflow-x: auto; }
+      .vg-w-table-mode-capability table { width: 100%; min-width: 600px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-mode-capability thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); }
+      .vg-w-table-mode-capability tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+      .vg-w-table-mode-capability td.mode { font-family: var(--sans); font-weight: 600; color: var(--accent-text); white-space: nowrap; }
+      .vg-w-table-mode-capability caption { text-align: left; caption-side: top; font-family: var(--scribed); font-style: italic; color: var(--muted); font-size: var(--fs-sm); padding: var(--s-1) 0; }
+    </style>
+    <table>
+      <caption>四種模式在同一份帳戶 schema 上的能力邊界，數字與行為全部來自本文的測試結果；「未測試」代表原文沒有針對該格跑這個組合，不代表結果是零失敗。</caption>
+      <thead>
+        <tr>
+          <th>模式</th>
+          <th>同分區隔離</th>
+          <th>跨分區原子性</th>
+          <th>跨分區隔離</th>
+          <th>Read-modify-write</th>
+          <th>底層機制</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td class="mode">plain</td><td>無</td><td>未測試</td><td>未測試</td><td>未測試</td><td>無交易語意，逐語句各自的時間戳</td></tr>
+        <tr><td class="mode">BATCH</td><td>有（時間戳打平會壞）</td><td>有（最終套用）</td><td>無</td><td>不支援（SELECT 不能放進 batch）</td><td>用戶端時間戳，cell 層級 last-write-wins，打平時各自為政</td></tr>
+        <tr><td class="mode">LWT</td><td>有（Paxos CAS）</td><td>不支援（直接遭拒）</td><td>不支援</td><td>支援（限同分區）</td><td>Paxos 產生的唯一時間戳，條件式 UPDATE；讀取需顯式送 CONSISTENCY SERIAL</td></tr>
+        <tr><td class="mode">Accord</td><td>有</td><td>有</td><td>有</td><td>支援（含跨分區）</td><td>EPaxos 啟發、無 leader 共識，transactional_mode='full'；讀取與條件判斷同一時刻評估，不會讀到過期值</td></tr>
+      </tbody>
+    </table>
+  </figure>
+
+  <h2>找 bug 的方法，跟 bug 本身一樣重要</h2>
+
+  <p>整篇文章的測試工具是作者自己寫的開源併發測試器 Monastery，概念很直接：腳本裡宣告幾個具名的 client——兩個寫入者 w1、w2 各自重複執行一段轉帳語句，一個讀取者 r1 不停讀、不停斷言——Monastery 就照著腳本把這些 client 同時打到叢集上，每個語句後面用註解宣告「這句話跑完該符合什麼條件」。叢集是三節點的本機部署，複寫係數 3、每節點 4GB heap，cassandra.yaml 裡明確打開 accord.enabled。真正抓出問題的不是測試跑完後最終持久化的資料，是「併發讀者不斷讀、不斷斷言總和是 2000」這個持續施壓的第三個角色——如果只檢查最終狀態，plain 與 BATCH 那些隔離漏洞、以及底下這個 Accord 的瞬間異常，全都會被完全蓋過去，必須有人在寫入進行中不斷讀，才能把這種問題逼出來。整個情境的正確性依據是雙重的：過程中兩個帳戶加總永遠是 2000 這個不變量，加上 read-modify-write 版本有明確的收斂目標——兩個寫入者各跑 200 次一加一減，理論上該收斂到 600 與 1400。這個雙重標準讓測試除了抓「有沒有算錯」，也能抓「算錯了之後會不會自己修正回來」。</p>
+
+  <p>用同一套方法測 Accord 的同分區盲寫轉帳時，作者偶爾看到併發讀者讀到不等於 2000 的總和，只發生在同分區的情境。一次具體觀察到的讀數是 1851 與 1853，加總 3704，跟前面 plain、BATCH 那些「加總對不上」的失敗長得很像，差別是 Accord 理論上應該完全不會有這種情況。每次測試結束後，持久化的資料永遠是對的——問題只出現在寫入進行到一半的那個瞬間。作者當時的說法很保守：也許是 Cassandra 的 bug，也許是自己測試腳本寫錯，要等 ASF JIRA 上的社群意見。隔天的編輯附註給出了答案：Apple 的工程師 C. Scott Andreas 確認，這是一個真的 bug。作者自己對嚴重程度的校準很清楚：就算真的是 bug，也不算特別致命——分散式系統本來就會有 bug，何況 Cassandra 6 都還沒正式發布。作者在文末也坦言，這是他第一次真正接觸 Cassandra，整體印象正面：內建複寫、內建 sharding、加上 Accord 這個新穎的共識協定與 strictly serializable 保證，都讓他覺得這套系統這些年的演進值得關注。</p>
+
+  <p>把 BATCH 跟 Accord 的兩種「壞」放在一起看，性質完全不同：BATCH 的隔離缺口是文件寫明的已知行為，讀懂文件、避開跨分區與時間戳打平就能繞過；Accord 的這個瞬間異常，是連作者自己都要等社群驗證才敢確認的未知數，截至發文，Cassandra 6 也還沒有正式發布。這是評估要不要現在就依賴 Accord 時，兩種完全不同等級的風險——一種是讀文件就能避開的已知限制，另一種是連原作者都得等上游社群確認的未知數。</p>
+
+  <figure class="vg-w-drag-accord-bug-window" data-mobile="static" data-svg-scroll="640">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M18 8L22 12L18 16"/><path d="M6 8L2 12L6 16"/><path d="M2 12H22"/>
+      </svg>
+      <span>拖曳看併發讀者在不同瞬間讀到什麼 · 1 個真實觀測到的異常瞬間</span>
+    </p>
+    <style>
+      .vg-w-drag-accord-bug-window { display: grid; gap: var(--s-2); }
+      .vg-w-drag-accord-bug-window svg.vg-w-drag-accord-bug-window-main { width: 100%; height: auto; min-width: 640px; }
+      .vg-w-drag-accord-bug-window .readout { font-family: var(--serif); font-size: var(--fs-sm); padding: var(--s-2); border-left: 2px solid var(--accent); background: var(--bg-soft); }
+      .vg-w-drag-accord-bug-window .readout strong { color: var(--accent-text); font-family: JetBrains Mono, monospace; font-variant-numeric: tabular-nums; }
+    </style>
+
+    <svg class="vg-w-drag-accord-bug-window-main" viewBox="0 0 640 240" role="img" aria-label="Accord 同分區盲寫測試的時間軸，拖曳查看不同瞬間的併發讀取結果">
+      <text x="320" y="26" text-anchor="middle" font-family="var(--sans)" font-size="13" fill="var(--muted)">blind-accord-same · 併發讀者在測試進行中不斷讀取</text>
+      <line x1="60" y1="120" x2="580" y2="120" stroke="var(--muted-2)" stroke-width="1.5" />
+      <text x="60" y="106" font-family="var(--scribed)" font-size="11" fill="var(--muted)">寫入開始</text>
+      <text x="580" y="106" text-anchor="end" font-family="var(--scribed)" font-size="11" fill="var(--muted)">寫入結束</text>
+
+      <circle id="vg-w-drag-accord-bug-window-handle" cx="340" cy="120" r="10" fill="var(--accent)" cursor="grab" role="button" tabindex="0" aria-label="拖曳查看不同瞬間的讀取結果" />
+    </svg>
+
+    <div class="readout">
+      <p id="vg-w-drag-accord-bug-window-text">此刻併發讀者讀到 customer=1 → <strong>1851</strong>、customer=2 → <strong>1853</strong>，總和 <strong>3704</strong>，不等於 2000——這是作者實際觀測到的異常瞬間，已由 Apple 工程師 C. Scott Andreas 在 ASF JIRA 上確認是真的 bug。每次測試結束後，持久化的資料仍然永遠正確；問題只出現在寫入進行到一半的這個瞬間。</p>
+    </div>
+
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        const root = document.querySelector('.vg-w-drag-accord-bug-window');
+        const svg = root.querySelector('svg.vg-w-drag-accord-bug-window-main');
+        const handle = root.querySelector('#vg-w-drag-accord-bug-window-handle');
+        const text = root.querySelector('#vg-w-drag-accord-bug-window-text');
+        const X_MIN = 60, X_MAX = 580, BUG_X = 340, THRESHOLD = 26;
+        const BUG_TEXT = "此刻併發讀者讀到 customer=1 → <strong>1851</strong>、customer=2 → <strong>1853</strong>，總和 <strong>3704</strong>，不等於 2000——這是作者實際觀測到的異常瞬間，已由 Apple 工程師 C. Scott Andreas 在 ASF JIRA 上確認是真的 bug。每次測試結束後，持久化的資料仍然永遠正確；問題只出現在寫入進行到一半的這個瞬間。";
+        const NORMAL_TEXT = "此刻併發讀者讀到的總和是 <strong>2000</strong>，符合不變量——整個測試過程裡，這種正常瞬間佔絕大多數，作者只在同分區的盲寫測試中偶爾撞到上面那個瞬間。";
+        function clamp(x) { return Math.max(X_MIN, Math.min(X_MAX, x)); }
+        function clientToSvgX(clientX) {
+          const pt = svg.createSVGPoint();
+          pt.x = clientX; pt.y = 0;
+          const svgPt = pt.matrixTransform(svg.getScreenCTM().inverse());
+          return clamp(svgPt.x);
+        }
+        function update(x) {
+          handle.setAttribute('cx', x);
+          text.innerHTML = Math.abs(x - BUG_X) <= THRESHOLD ? BUG_TEXT : NORMAL_TEXT;
+        }
+        let dragging = false;
+        handle.addEventListener('pointerdown', (e) => { dragging = true; handle.setPointerCapture(e.pointerId); handle.setAttribute('cursor', 'grabbing'); });
+        handle.addEventListener('pointermove', (e) => { if (!dragging) return; update(clientToSvgX(e.clientX)); });
+        handle.addEventListener('pointerup', () => { dragging = false; handle.setAttribute('cursor', 'grab'); });
+        handle.addEventListener('keydown', (e) => {
+          const cx = Number(handle.getAttribute('cx'));
+          if (e.key === 'ArrowLeft') { e.preventDefault(); update(clamp(cx - 30)); }
+          else if (e.key === 'ArrowRight') { e.preventDefault(); update(clamp(cx + 30)); }
+        });
+      })();
+    </script>
+  </figure>
+
+  <p class="vg-deep-closer"><strong>這次解鎖的能力</strong>：跨分區、讀取後再寫入的 ACID 交易，是 Cassandra 十三年來第一次真正做到；但 Accord 距離完美還有距離——一個已被 Apple 工程師證實存在、仍待修的併發隔離 bug，正等在 ASF JIRA 上。</p>
+</div>
