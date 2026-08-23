@@ -4,13 +4,15 @@
 </header>
 
 <div class="vg-post-prose">
-  <p><span class="vg-dropcap">D</span>enseMap 是 LLVM 內部用量最大的雜湊表容器，散布在編譯器幾乎每一層的資料結構裡。2026 年這一輪重寫把它的探測策略從 quadratic probing 換成 linear probing，刪除演算法也從 tombstone 延遲刪除換成 Knuth 的 Algorithm R，理由不是抽象的漸進分析，而是先把真實編譯工作負載的操作分布量出來，再照著量出來的數字挑策略。</p>
+  <p><span class="vg-dropcap">D</span>enseMap 是 LLVM 內部用量最大的雜湊表容器，散布在編譯器幾乎每一層的資料結構裡，扮演的多半是各種對照表的角色：把一個識別子、一個型別、一個中介表示裡的節點對應到某個結果，呼叫次數常常是整個程式裡數一數二密集的，選錯策略的代價會被反覆放大。2026 年這一輪重寫把它的探測策略從 quadratic probing 換成 linear probing，刪除演算法也從 tombstone 延遲刪除換成 Knuth 的 Algorithm R，理由不是抽象的漸進分析，而是先把真實編譯工作負載的操作分布量出來，再照著量出來的數字挑策略。這類抉擇其實不限於編譯器：任何自己維護容器庫、或者在效能敏感路徑上手刻雜湊表的團隊，遲早會撞上同一個問題——業界近年公認「更先進」的探測策略，換到自己的 workload 上是不是真的划算，還是只是把別人的 worst-case 保護，錯裝進一個根本用不到那種 worst-case 的系統裡。</p>
 
   <h2>工作負載長什麼樣子——實測 186M 次操作</h2>
 
-  <p>要決定選哪種雜湊表策略，得先知道這個雜湊表實際上被怎麼用。LLVM 團隊插樁了一份 clang，在編譯 <code>llvm/lib/Analysis/ScalarEvolution.cpp</code> 的過程中記錄每一次 <code>(KeyT, ValueT)</code> 操作，涵蓋 597 種不同的 <code>DenseMap</code>／<code>DenseSet</code> 型別，總共量到約 186M 次操作。拆開來看：find-hit 65.2M 次，平均探測 1.55 次；find-miss 65.7M 次，平均探測 1.28 次；insert 47.8M 次，平均探測 1.71 次；erase 只有 7.0M 次。</p>
+  <p>要決定選哪種雜湊表策略，不能單靠演算法課本上的漸進分析，得先弄清楚這個雜湊表在真實世界裡到底被怎麼操作、操作的比例又是如何分布。LLVM 團隊為此插樁了一份 clang，在編譯 <code>llvm/lib/Analysis/ScalarEvolution.cpp</code> 的過程中記錄每一次 <code>(KeyT, ValueT)</code> 操作，涵蓋 597 種不同的 <code>DenseMap</code>／<code>DenseSet</code> 型別，總共量到約 186M 次操作。拆開來看：find-hit 65.2M 次，平均探測 1.55 次；find-miss 65.7M 次，平均探測 1.28 次；insert 47.8M 次，平均探測 1.71 次；erase 只有 7.0M 次。</p>
 
-  <p>查找（find-hit 加 find-miss）合計約 130.9M 次，占了整個操作量的大多數；insert 排第二；erase 敬陪末座，是四種操作裡最少的一種。更關鍵的是探測深度：不管哪種操作，平均探測次數全部卡在 1.28 到 1.71 之間，沒有一個逼近理論上會讓 open addressing 惡化的高 load factor 情境。這組數字才是後面每一個取捨判斷的起點——不是先挑一種「理論上更好」的策略，而是先看真實 workload 撐不撐得住最簡單的策略。</p>
+  <p>查找（find-hit 加 find-miss）合計約 130.9M 次，占了整個操作量的大多數；insert 排第二；erase 敬陪末座，是四種操作裡最少的一種。更關鍵的是探測深度：不管哪種操作，平均探測次數全部卡在 1.28 到 1.71 之間，沒有一個逼近理論上會讓 open addressing 惡化的高填滿率情境。這組數字才是後面每一個取捨判斷的起點——不是先挑一種「理論上更好」的策略，而是先看真實 workload 撐不撐得住最簡單的策略。</p>
+
+  <p>這裡所謂「理論上的高填滿率」，指的是 open addressing 課本分析裡常討論的情境：當 bucket 陣列被填到七、八成滿以上，探測序列的期望長度會隨著填滿程度逼近上限而急遽拉長，資料越多，每一次查找要跳過的已佔用格子也越多——這正是 Robin Hood、Swiss Table 這類策略當初設計時想解決的痛點，它們用額外的 metadata 或搬移規則，換取在高填滿率下仍然平坦的探測次數。可是插樁量出來的平均探測次數只落在 1.3 到 1.7 之間，離那個會讓探測序列爆炸的區間還很遠。合理的推測是，LLVM 的 DenseMap 在實務上大多運作在遠低於臨界填滿率的範圍，那把理論上的保護傘在這裡幾乎沒有用武之地，花力氣撐開它反而是浪費。</p>
 
   <figure class="vg-w-chart-llvm-workload" data-mobile="static" data-svg-scroll="720">
     <style>
@@ -95,11 +97,15 @@
 
   <h2>linear probing vs Robin Hood：worst-case 保證要花多少錢</h2>
 
-  <p>Robin Hood hashing 的賣點是縮小探測次數的變異：插入時讓「離家更遠」的 entry 優先霸佔位置，查找時因此可以提早結束。但按原文的說法，Robin Hood 主要改善的是高 load factor 下的 find-miss，對 find-hit 跟 insert 反而是一筆小小的負擔——而 find-hit 跟 insert 剛好是編譯器 workload 裡份量最重的兩種操作。</p>
+  <p>這幾年 Robin Hood hashing、Swiss Table、以及像 Verstable 這樣的新設計，會被拿來當成雜湊表的標準答案，靠的多半是它們在合成 benchmark 或通用場景下亮眼的 worst-case 數字：查找變異小、SIMD 友善、記憶體局部性佳。這些特性放進一個鍵值分布未知、操作比例也未知的通用容器庫裡，是合理的預設；但放進一個操作分布已經量出來的具體 workload 裡，「通用場景下比較好」跟「這個場景下比較好」是兩個不同的問題。</p>
 
-  <p>問題出在 find-miss 提早結束探測這件事本身要付的成本。它得靠知道每個 resident 的 displacement，才能判斷「查到這裡還沒找到，這個 key 一定不存在」；不存 displacement 的話，就得在探測路徑上重新雜湊每一個 resident，比省下的探測還貴；存了 displacement 又多背一條 metadata cache line。不管走哪條路，insert 時的 swap-carry 都是內建成本——量出來比 Algorithm R 慢 10 到 20%。對一個 insert 占了 47.8M 次、erase 只有 7.0M 次的 workload，用這個代價去換幾乎用不到的高 load factor find-miss 保證，不划算。</p>
+  <p>Robin Hood hashing 的賣點是縮小探測次數的變異：插入時讓「離家更遠」的 entry 優先霸佔位置，查找時因此可以提早結束。但按原文的說法，Robin Hood 主要改善的是高填滿率下的 find-miss，對 find-hit 跟 insert 反而是一筆小小的負擔——而 find-hit 跟 insert 剛好是編譯器 workload 裡份量最重的兩種操作。</p>
+
+  <p>問題出在 find-miss 提早結束探測這件事本身要付的成本。它得靠知道每個 resident 的 displacement，才能判斷「查到這裡還沒找到，這個 key 一定不存在」；不存 displacement 的話，就得在探測路徑上重新雜湊每一個 resident，比省下的探測還貴；存了 displacement 又多背一條 metadata cache line。不管走哪條路，insert 時的 swap-carry 都是內建成本——量出來比 Algorithm R 慢 10 到 20%。對一個 insert 占了 47.8M 次、erase 只有 7.0M 次的 workload，用這個代價去換幾乎用不到的高填滿率 find-miss 保證，不划算。</p>
 
   <p>Swiss Table 家族被拒絕的理由更直接：它在小 key 上表現差，原文直接寫「若刪除效能不重要，就不需要它的重型實作」——LLVM 的 key 大量是指標大小，erase 又只占整體操作量的 4%，Swiss Table 為了讓刪除變快背的那套 metadata／SIMD 機制，正好是這個場景用不到的重量。Verstable（metadata 加 home-rooted chain）在查找與疊代上反而有優勢，卻在 clang 自舉這個真實測試裡，因為 metadata 與 chain 邏輯被 inline 進每一個呼叫點，讓執行檔大了 4 到 10%，同樣被否決。</p>
+
+  <p>這幾個策略被否決的共同點，不是效能全面輸——Robin Hood 在特定情境下真的能壓低查找次數的變異，Verstable 在查找與疊代上也確實比較快——而是它們把成本前置在 insert 或程式碼體積上，剛好命中編譯器 workload 裡份量最重的兩塊。換一種操作分布完全不同的 workload，例如刪除頻繁的快取層，同一張比較表的結論很可能整個反過來，這也是為什麼要先把操作分布量清楚，而不是直接套用一份業界公認比較先進的清單。</p>
 
   <figure class="vg-w-pop-llvm-strategies" data-mobile="static">
     <style>
@@ -136,22 +142,22 @@
     </p>
     <div class="row adopted">
       <span class="name">linear probing + Algorithm R（採用）</span>
-      <span class="verdict">沒有 metadata 稅，insert 走最短路徑</span>
+      <span class="verdict">沒有 metadata 稅，insert 走最短路徑，代價是拿掉了刪除的懶惰空間</span>
     </div>
     <div class="row">
       <span class="name term term-1" tabindex="0">Robin Hood hashing</span>
       <span class="verdict">find-miss 早退，insert 慢 10～20%</span>
-      <span class="pop pop-1">早退判斷得靠每個 resident 的 displacement；不存這個資訊就要在探測路徑上重新雜湊每個 resident，存了又多一條 cache line，insert 的 swap-carry 兩條路都跑不掉。</span>
+      <span class="pop pop-1">早退判斷得靠每個 resident 的 displacement；不存這個資訊就要在探測路徑上重新雜湊每個 resident，存了又多一條 cache line，insert 的 swap-carry 兩條路都跑不掉，換來的早退只在高填滿率的 find-miss 才用得到。</span>
     </div>
     <div class="row">
       <span class="name term term-2" tabindex="0">Swiss Table 家族</span>
       <span class="verdict">小 key 表現差，刪除不重要就不必要</span>
-      <span class="pop pop-2">為了讓刪除變快背了一整套 metadata／SIMD 機制，這套重型實作在小 key、刪除罕見的場景裡是用不到的重量。</span>
+      <span class="pop pop-2">為了讓刪除變快背了一整套 metadata／SIMD 機制，這套重型實作在小 key、刪除罕見的場景裡是用不到的重量，指標大小的鍵值恰好是它最不擅長的情況。</span>
     </div>
     <div class="row">
       <span class="name term term-3" tabindex="0">Verstable</span>
       <span class="verdict">查找快，但執行檔胖 4～10%</span>
-      <span class="pop pop-3">metadata 加 home-rooted chain 邏輯被 inline 進每一個呼叫點，clang 自舉這個真實測試裡把執行檔撐大了。</span>
+      <span class="pop pop-3">metadata 加 home-rooted chain 邏輯被 inline 進每一個呼叫點，clang 自舉這個真實測試裡把執行檔撐大了，查找與疊代的優勢換不回這筆體積成本。</span>
     </div>
   </figure>
 
@@ -159,7 +165,7 @@
 
   <p>LLVM 原本的做法是 quadratic probing 搭配 in-band 的 sentinel key（empty、tombstone），刪除一筆資料就把它標成 tombstone，查找時照樣得跳過這些標記過的死格子。近年的工作把它換成 linear probing，並且拿掉 tombstone key，取而代之的是 Knuth《The Art of Computer Programming》卷三 §6.4 的 Algorithm R——一個專門用來避開 lazy deletion 的演算法。</p>
 
-  <p>跟 tombstone 被動標記不同，Algorithm R 在刪除時主動搬東西：從空出來的位置往前走，把 home bucket 落在這個空位之前的 entry 往後搬回填坑，一路搬到探測鏈上不再有這種 entry 為止。代價是既有 entry 的指標可能因此失效——這跟 <code>std::unordered_map</code> 的保證不一樣，換句話說 LLVM 內部程式碼刪除之後不能再持有舊指標。</p>
+  <p>跟 tombstone 被動標記不同，Algorithm R 在刪除時主動搬東西：從空出來的位置往前走，把 home bucket 落在這個空位之前的 entry 往後搬回填坑，一路搬到探測鏈上不再有這種 entry 為止。代價是既有 entry 的指標可能因此失效——這跟 <code>std::unordered_map</code> 的保證不一樣，換句話說 LLVM 內部程式碼刪除之後不能再持有舊指標。合理的推測是，這種取捨在編譯器這種內部程式碼裡比較容易被接受：DenseMap 幾乎都是實作細節，呼叫端通常在同一段邏輯裡查完就用掉結果，很少會跨過一次刪除操作還繼續持有先前拿到的指標；換成一個對外公開、生命週期完全交給使用者掌控的容器，同樣的行為差異就會變成文件裡要用大寫警告的破壞性變更。</p>
 
   <p>同一波重寫也順手修掉兩個舊問題。整數鍵的 DenseMap（<code>int</code>、<code>unsigned</code>、<code>size_t</code>）過去把 -1 跟 -2 保留給 empty 跟 tombstone 用，等於這兩個值永遠不能當合法鍵，原文形容這是一個「一直都在的 footgun」，現在補上了。指標鍵的雜湊公式 <code>(p&gt;&gt;4)^(p&gt;&gt;9)</code> 則是另一個問題：它只移位互斥或位址的低位，從不觸碰高位，而同一個配置器配出來的指標常常共用同一段高位址，結果這些指標的雜湊值全部擠進同一段窄範圍的 bucket，違反雜湊表希望鍵值分布均勻的前提。</p>
 
@@ -244,6 +250,8 @@
 
   <p>這個位元陣列的效益不是平均分布的：find-miss、疊代、大 bucket 的 insert 受惠，因為位元陣列能直接終止探測、跳過空 bucket，完全不必讀 bucket 本身的 key；find-hit 本來就要把命中的 bucket 讀進來，所以沒省到什麼，小 bucket 的 insert 反而要多寫一個字。原文特別提醒，用 <code>instructions:u</code>（指令數）當成本模型在這裡會失真——省下來的是「沒發出的 bucket 記憶體讀取」，指令計數器只看得到多出來的位元測試指令，看不到少發的那一次記憶體存取。曾經考慮過保留 in-band sentinel、不額外配這個位元陣列的指標鍵變體，但在 AMD Zen 4 與 Apple M4 上實測後排除：即使多用記憶體，帶位元陣列的版本還是比較快。</p>
 
+  <p>換算回工作負載的數字，find-miss 一項就有 65.7M 次，加上疊代與大 bucket 的 insert，是這個位元陣列真正在幫忙的操作；find-hit 的 65.2M 次跟小 bucket 的 insert 則是它讓步的地方，兩邊份量其實相當接近。這也呼應前面提到的指標雜湊問題：編譯器內部大量仰賴 arena／bump allocator 一次批次配置記憶體，這類配置器配出來的指標，位址的高位本來就容易重複，同一個配置器配出來的物件常常擠在同一段位址空間裡。雜湊函式要不要處理高位、探測策略要不要為極端填滿率買保險，說到底是同一種態度的兩種表現：設計要不要對照真實的記憶體配置模式，而不是只對照理論上均勻分布的假設鍵值。</p>
+
   <figure class="vg-w-3d-llvm-used-bit" data-mobile="keep">
     <style>
       .vg-w-3d-llvm-used-bit { display: grid; gap: var(--s-2); }
@@ -269,7 +277,7 @@
 
   <p>把每個 patch 的量測結果攤開來看，改善不是全面一致的。linear probing + Algorithm R 單獨拿出來測，stage1-O3 指令數 -1.34%，十個 CTMark benchmark 全部落在 -0.85% 到 -1.61% 之間，沒有一個變差，clang wall time 是 -1.54%。used-bit array 這個 patch 則有取捨：stage1-O3 指令數 -0.99%、wall time -1.37%，但 stage2-O3 反而 +0.13%，檔案大小多了 0.87%——wall time 的改善幅度比指令數改善幅度更大，剛好印證上一節「指令計數看不到省下的記憶體讀取」這個說法。</p>
 
-  <p>把這一整輪雜湊表相關改動全部疊加起來，clang 自舉在 stage1-O3 的總指令數變化是 -0.38%；如果只看四個最熱、大量使用 DenseMap／DenseSet 的 container header，指令開銷從 2488M 降到 2272M，降了 8.7%。</p>
+  <p>把這一整輪雜湊表相關改動全部疊加起來，clang 自舉在 stage1-O3 的總指令數變化是 -0.38%；如果只看四個最熱、大量使用 DenseMap／DenseSet 的 container header，指令開銷從 2488M 降到 2272M，降了 8.7%。這個總數字比任何一個單一 patch 的改善幅度都小，原因不難理解：改動疊加之後彼此之間也會有取捨，used-bit array 在 stage2-O3 的輕微倒退就是其中一筆；但把鏡頭拉近到真正大量用到這些容器的四個 container header，改善幅度反而放大到 8.7%，這說明整體數字被其他不那麼依賴雜湊表的程式碼稀釋了，越靠近雜湊表本身的熱點，效益越明顯。</p>
 
   <figure class="vg-w-table-llvm-bench" data-mobile="keep">
     <style>
@@ -294,7 +302,7 @@
           <td>linear probing + Algorithm R</td>
           <td class="num">-1.34%</td>
           <td class="num">-1.54%</td>
-          <td>十個 CTMark benchmark 全部落在 -0.85%～-1.61% 之間</td>
+          <td>十個 CTMark benchmark 全部落在 -0.85%～-1.61% 之間，沒有一個變差</td>
         </tr>
         <tr>
           <td>used-bit array</td>
@@ -312,6 +320,12 @@
     </table>
     <figcaption>三組量測分別對應：單一 patch（linear probing + Algorithm R）、單一 patch（used-bit array）、整個系列疊加後的總效果。</figcaption>
   </figure>
+
+  <h2>先量測再選型，不是先選型再量測</h2>
+
+  <p>這篇文章從頭到尾沒有一處是先預設「線性探測比較優雅」再回頭找數據撐腰，順序完全反過來：先插樁量出 597 種 DenseMap／DenseSet 型別，在一個真實編譯單元裡跑出的操作分布，看到查找加起來占了將近七成、insert 兩成六出頭、erase 不到半成，探測深度全部落在 1.3 到 1.7 之間，才拿這組數字回頭檢驗每一種候選策略在這個範圍裡到底划不划算。Robin Hood、Swiss Table、Verstable 沒有一個是因為「理論分析比較弱」被刷掉，它們是因為量出來的成本結構跟這組操作分布對不上——保護的是這裡幾乎用不到的情境，付出的卻是這裡最常發生的操作。</p>
+
+  <p>合理的推測是，同一套方法論可以搬到任何一個 insert 頻繁、刪除罕見、對 cache 局部性敏感的資料結構上——直譯器的 symbol table、任何仰賴 arena 配置的內部容器，形狀都很類似。先把操作分布跟探測深度量出來，再決定要不要為理論上的最壞情況付 metadata、cache line 或程式碼體積的代價，而不是預設抄一份業界正在流行的資料結構清單。</p>
 
   <p class="vg-deep-closer"><strong>這場重寫留下的教訓</strong>：Robin Hood、Swiss Table 這類為 worst-case 買保險的雜湊表策略，保費是實實在在的——metadata cache line、程式碼體積、insert 的 swap-carry；先把真實 workload 的操作分布跟探測深度量出來，再決定要不要付這筆保費，比預設抄業界正紅的資料結構更划算。</p>
 </div>
