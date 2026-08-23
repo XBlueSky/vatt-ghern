@@ -1,0 +1,175 @@
+{
+  "output_path": "src/posts/2026/08/24/deep-llvm-hash-table-linear-probing.html",
+  "spine": [
+    "1. LLVM 的 DenseMap/DenseSet 從 quadratic probing + tombstone 延遲刪除，換成 linear probing + Knuth Algorithm R 的主動搬移刪除，依據是實測編譯器真實 workload 的操作分布，不是理論分析。",
+    "2. 對 ScalarEvolution.cpp 的實測（597 種 DenseMap/DenseSet、約 186M 次操作）顯示：find-hit 65.2M（平均 1.55 次探測）、find-miss 65.7M（1.28 次）、insert 47.8M（1.71 次）、erase 只有 7.0M；探測深度全部落在 1.28～1.71 之間。",
+    "3. Robin Hood 的 find-miss early-out 得靠每個 resident 的 displacement 資訊：不存 metadata 就要在探測路徑上重新雜湊每個 resident，比省下的探測還貴；存 metadata 又多一條 cache line，insert 的 swap-carry 是內建成本，比 Algorithm R 慢 10–20%。",
+    "4. Swiss Table 家族在小 key 上表現差，若刪除效能不重要就不需要它的重型實作；Verstable 的 metadata + chain 邏輯 inline 進每個呼叫點，讓 clang 自舉的執行檔大了 4–10%——兩者都在為 LLVM 用不到的情境（刪除頻繁、高 load factor 下的 find-miss）付成本。",
+    "5. Algorithm R（Knuth TAOCP 卷三 §6.4）刪除時從空位往前走，把 home bucket 落在空位之前的 entry 往後搬回填補，entry 指標可能因此失效；這套機制原本用在 quadratic probing 加 in-band sentinel key 上，後續工作改成 linear probing 加移除 tombstone key。",
+    "6. LLVM 同時修掉舊 pointer key 雜湊公式 (p>>4)^(p>>9) 從不混合位址高位、導致同一個 allocator 配出的指標擠進同一段 bucket 的問題，並拿掉整數 key 的 -1/-2 保留 sentinel（一個一直存在的 footgun），改用獨立的 1-bit-per-bucket used array（跟 bucket 陣列共用同一塊配置）取代 in-band sentinel。",
+    "7. 量測結果：linear probing + Algorithm R 單獨帶來 stage1-O3 指令數 -1.34%（十個 CTMark benchmark 全部落在 -0.85%～-1.61%）、clang wall time -1.54%；used-bit array 再帶來 stage1-O3 -0.99%、wall time -1.37%（但 stage2-O3 反而 +0.13%、檔案大小 +0.87%）；整個系列合計 stage1-O3 -0.38%，四個最熱的 container header 指令開銷從 2488M 降到 2272M（-8.7%）。"
+  ],
+  "sources": [
+    {
+      "url": "https://maskray.me/blog/2026-06-07-recent-llvm-hash-table-improvements",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": "2026-06-07",
+      "perspective": {
+        "mechanism": "LLVM 重寫了 DenseMap/DenseSet 的探測策略與刪除演算法：從 quadratic probing + tombstone 延遲刪除，改成 linear probing + Knuth Algorithm R 的主動搬移刪除，並用一個獨立的 1-bit-per-bucket used array 取代掉 in-band sentinel key，同時修掉舊 pointer hash 公式不混合高位址的 bug。",
+        "tradeoff": "Robin Hood、Swiss Table、Verstable 這類在通用場景下理論較優的雜湊表策略，都在為 find-miss 或刪除的 worst-case 多付 metadata、cache line、程式碼體積或 insert 成本；LLVM 用真實編譯器 workload 的操作分布與探測深度證明這些 worst-case 保護在這個場景基本用不到，寧可用更簡單的策略換更低的平均成本，即使這代表用 instructions:u 這個成本模型量不出全部的效益（省下的是 cache load，不是指令數）。",
+        "reader_use": "如果在維護一個 insert 頻繁、刪除罕見、對 cache 局部性極敏感的資料結構（編譯器、直譯器、任何 arena-heavy 系統），可以照同樣的方法論走：先量測真實 workload 的操作分布與探測深度，再決定要不要為理論最壞情況的保證買單，而不是預設抄業界正紅的資料結構。"
+      }
+    }
+  ],
+  "notes": [
+    {
+      "id": "n01",
+      "url": "https://maskray.me/blog/2026-06-07-recent-llvm-hash-table-improvements",
+      "quote": "Robin Hood Hashing primarily improves find-miss on high-load factors but imposes a small cost on find-hit and inserts.",
+      "hedge": "asserted",
+      "interpretation": "Robin Hood 的真正好處很窄——只在高 load factor 下的 find-miss 才有感——但代價卻落在 find-hit 與 insert 這兩個編譯器 workload 裡佔比最高的操作上。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n02",
+      "url": "https://maskray.me/blog/2026-06-07-recent-llvm-hash-table-improvements",
+      "quote": "Knuth TAOCP Vol. 3 §6.4 Algorithm R describes an algorithm that avoids lazy deletion.",
+      "hedge": "asserted",
+      "interpretation": "LLVM 用的刪除演算法不是自己發明的巧思，而是直接對應到 Knuth 教科書裡一個有名有姓的演算法。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n03",
+      "url": "https://maskray.me/blog/2026-06-07-recent-llvm-hash-table-improvements",
+      "quote": "Erase walks forward from the hole and pulls back any entry whose home bucket lies behind the hole, so entry pointers may be invalidated",
+      "hedge": "asserted",
+      "interpretation": "這是 Algorithm R 刪除的機械定義：主動把後面探測鏈上、home bucket 落在空位之前的 entry 搬回填坑，跟 tombstone 從不移動既有資料的做法完全相反；副作用是刪除會讓既有 entry 指標失效，跟 std::unordered_map 的保證不同。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n04",
+      "url": "https://maskray.me/blog/2026-06-07-recent-llvm-hash-table-improvements",
+      "quote": "An instrumented clang counts every `(KeyT, ValueT)` operation while compiling `llvm/lib/Analysis/ScalarEvolution.cpp`. 597 distinct `DenseMap`/`DenseSet` types, ~186M user ops:",
+      "hedge": "asserted",
+      "interpretation": "workload 剖面來自對一個真實編譯單元（ScalarEvolution.cpp）的插樁量測，涵蓋 597 種不同的 DenseMap/DenseSet 型別，不是合成 benchmark；這是後面所有取捨判斷的材料來源。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n05",
+      "url": "https://maskray.me/blog/2026-06-07-recent-llvm-hash-table-improvements",
+      "quote": "find-hit: 65.2M (1.55), find-miss: 65.7M (1.28), insert: 47.8M (1.71), erase: 7.0M",
+      "hedge": "asserted",
+      "interpretation": "查找（find-hit + find-miss）合計約 130.9M，占約 186M 次操作裡的大多數；insert 47.8M 是第二大類；erase 只有 7.0M，明顯是少數。平均探測次數全部落在 1.28～1.71 之間，代表探測鏈在實務上很短。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n06",
+      "url": "https://maskray.me/blog/2026-06-07-recent-llvm-hash-table-improvements",
+      "quote": "On stage1-O3 the change is -1.34% instructions and all ten CTMark benchmarks improve between -0.85% and -1.61%. Clang wall is -1.54%",
+      "hedge": "asserted",
+      "interpretation": "linear probing + Algorithm R 這個改動單獨拿出來看，在十個 CTMark benchmark 上全部往同一個方向改善（沒有例外），而且換算成真實建置時間也有感。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n07",
+      "url": "https://maskray.me/blog/2026-06-07-recent-llvm-hash-table-improvements",
+      "quote": "There is a 1-bit-per-bucket `uint32` array sharing one allocation with the buckets.",
+      "hedge": "asserted",
+      "interpretation": "used-bit array 是一個獨立的、每個 bucket 一個位元的佔用標記陣列，跟 bucket 陣列共用同一塊記憶體配置（也就是彼此相鄰），這是後面 cache locality 論證的物理基礎。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n08",
+      "url": "https://maskray.me/blog/2026-06-07-recent-llvm-hash-table-improvements",
+      "quote": "Swiss Table family implementations are poor at small keys. If deletion performance does not matter, you don't need its heavy implementation.",
+      "hedge": "asserted",
+      "interpretation": "Swiss Table 被拒絕的理由很直接：它為了讓刪除變快而背的那套 metadata/SIMD 機制是重量級實作，換來的效益在小 key（LLVM 大量是指標大小的 key）與刪除罕見的場景裡用不到。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n09",
+      "url": "https://maskray.me/blog/2026-06-07-recent-llvm-hash-table-improvements",
+      "quote": "Wins negative-probe and iteration; loses `clang` self-build — metadata + chain logic inlines into every call site for +4-10% binary.",
+      "hedge": "asserted",
+      "interpretation": "Verstable（metadata + home-rooted chain 的做法）在 clang 自舉這個真實測試裡被拒絕的原因不是變慢，而是它的 metadata 與 chain 邏輯會被 inline 進編譯器裡每一個呼叫 DenseMap 的地方，讓執行檔大了 4～10%。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n10",
+      "url": "https://maskray.me/blog/2026-06-07-recent-llvm-hash-table-improvements",
+      "quote": "DenseMap with integer keys (`int`/`unsigned`/`size_t`) had `-1`/`-2` reserved — a footgun, now fixed.",
+      "hedge": "asserted",
+      "interpretation": "舊版 DenseMap 對整數 key 保留 -1/-2 當作 empty/tombstone 的 in-band sentinel，等於整數鍵的值域裡永遠有兩個值不能用；這是這輪重寫順手修掉的正確性隱患，跟探測策略的改動同一波發生。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n11",
+      "url": "https://maskray.me/blog/2026-06-07-recent-llvm-hash-table-improvements",
+      "quote": "The old `DenseMapInfo<T*>::getHashValue` (`(p>>4)^(p>>9)`) never mixes the high bits of the address.",
+      "hedge": "asserted",
+      "interpretation": "舊的指標雜湊公式只用位址的低位做移位互斥或，從不觸碰高位；同一個配置器配出來的指標往往共用同一段高位址，所以這些指標的雜湊值會擠進同一段窄範圍的 bucket，違反雜湊表希望鍵值分布均勻的前提。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n12",
+      "url": "https://maskray.me/blog/2026-06-07-recent-llvm-hash-table-improvements",
+      "quote": "The find-miss early-out depends on knowing each resident's displacement; without stored metadata it requires re-hashing every resident on the probe walk, which costs more than the saved probes. Storing the displacement recovers the early-out but adds a metadata cache line, and the swap-carry on insert is intrinsic — +10-20% insert vs Algorithm R",
+      "hedge": "asserted",
+      "interpretation": "這是 Robin Hood 成本結構的核心：find-miss 提早結束探測需要知道每個 resident 的 displacement，不存這個資訊就得在探測路徑上重新雜湊每個 resident（比省下的探測還貴），存了又多一條 cache line；不管哪條路，insert 時的 swap-carry 都是內建成本，量出來比 Algorithm R 慢 10～20%。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n13",
+      "url": "https://maskray.me/blog/2026-06-07-recent-llvm-hash-table-improvements",
+      "quote": "stage1-O3 -0.38%",
+      "hedge": "asserted",
+      "interpretation": "這是把這一整輪雜湊表相關改動（不只 linear probing + Algorithm R，也包含 used-bit array 等後續 patch）全部疊加後，clang 自舉在 stage1-O3 的總指令數變化。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n14",
+      "url": "https://maskray.me/blog/2026-06-07-recent-llvm-hash-table-improvements",
+      "quote": "LLVM has several hash tables. They used quadratic probing with in-band sentinel keys (empty, tombstone); recent work has been replacing that with linear probing with tombstone key removed.",
+      "hedge": "asserted",
+      "interpretation": "這句話交代了改動前後的探測策略對照：舊版是 quadratic probing 搭配 in-band 的 empty/tombstone sentinel key，新工作把它換成 linear probing 並拿掉 tombstone key。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n15",
+      "url": "https://maskray.me/blog/2026-06-07-recent-llvm-hash-table-improvements",
+      "quote": "`instructions:u` is the wrong cost model when the savings are cache loads: the counter sees the new bit-test sequence; it does not see the bucket load you didn't issue.",
+      "hedge": "asserted",
+      "interpretation": "作者自己提醒：用「指令數」這個常見的效能代理指標去衡量 used-bit array 的效益會失真，因為省下來的是「沒發出的 bucket 記憶體讀取」，指令計數器根本看不到這件事，只看得到多出來的位元測試指令。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n16",
+      "url": "https://maskray.me/blog/2026-06-07-recent-llvm-hash-table-improvements",
+      "quote": "Measurements on AMD Zen 4 and Apple M4 ruled it out: the used-bit version is faster despite the extra memory.",
+      "hedge": "asserted",
+      "interpretation": "曾經考慮過保留 in-band sentinel（不額外配 used-bit array）的指標鍵變體以省記憶體，但在 AMD Zen 4 與 Apple M4 兩種硬體上實測後被排除——即使 used-bit 版本多用記憶體，速度還是比較快。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n17",
+      "url": "https://maskray.me/blog/2026-06-07-recent-llvm-hash-table-improvements",
+      "quote": "Stage1-O3 instructions are -0.99%, but stage2-O3 is +0.13% and stage2-O0-g is +0.34%\" and \"Clang wall time is -1.37% while instructions are only -0.49%, and `size-file` is +0.87%",
+      "hedge": "asserted",
+      "interpretation": "used-bit array 這個 patch 的量測結果不是全面正向：stage1-O3 指令數改善，但 stage2-O3 與 stage2-O0-g 反而輕微變差；wall time 的改善幅度比指令數改善幅度更大（呼應 n15 的論點），檔案大小則多了 0.87%。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n18",
+      "url": "https://maskray.me/blog/2026-06-07-recent-llvm-hash-table-improvements",
+      "quote": "Find-miss, iteration, and large-bucket inserts win: the bit array terminates the probe walk and skips the empty buckets without ever loading the bucket key. Find-hit and small-bucket inserts lose: a hit loads the matched bucket anyway, and a small-bucket insert pays one extra word write.",
+      "hedge": "asserted",
+      "interpretation": "used-bit array 的效益分佈不均：find-miss、疊代、大 bucket 的 insert 受惠，因為位元陣列能直接終止探測、跳過空 bucket 而不必讀 bucket 本身的 key；find-hit 本來就要讀中的 bucket 所以沒省到，小 bucket 的 insert 反而多寫一個字。",
+      "timeliness": "durable"
+    }
+  ],
+  "claims": [],
+  "checked_at": "2026-08-24",
+  "checker_rounds": 0,
+  "coverage": { "candidate_claims": 0, "checked": 0, "dropped_low_load": 0 }
+}
