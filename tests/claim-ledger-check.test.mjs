@@ -524,6 +524,34 @@ test("CLI: rollup dir skips the gate entirely", () => {
   assert.ok(output.includes("rollup"));
 });
 
+test("CLI: mixed weekly-rollup + daily dir checks the daily post and skips the rollup", () => {
+  // Regression: a rollup can land in the same YYYY/MM/DD directory as
+  // that day's daily roundup (e.g. Monday). The whole-directory
+  // isRollupDir check used to require every slug to be a rollup archetype
+  // before skipping Step 7.6, so a mixed directory demanded a
+  // weekly.ledger.json that the skill never produces — failing every
+  // such day even when the daily post's own ledger was complete.
+  const postsDir = makePostsDir();
+  writeFileSync(
+    join(postsDir, "weekly.11tydata.json"),
+    JSON.stringify({ archetype: "weekly-rollup" })
+  );
+  writeFileSync(join(postsDir, "weekly.html"), "<p>rollup</p>");
+  writeFileSync(
+    join(postsDir, "deep-foo.11tydata.json"),
+    JSON.stringify({ archetype: "daily-deep-story" })
+  );
+  writeFileSync(join(postsDir, "deep-foo.html"), "<p>內文</p>");
+  const ledger = makeDeepLedger({
+    output_path: "src/posts/2026/06/12/deep-foo.html",
+  });
+  writeFileSync(join(postsDir, "deep-foo.ledger.json"), JSON.stringify(ledger));
+  const { status, output } = runCli([postsDir]);
+  assert.equal(status, 0);
+  assert.ok(output.includes("OK"));
+  assert.ok(output.includes("weekly"));
+});
+
 test("CLI: missing arg / bad dir / undateable path exit 2", () => {
   assert.equal(runCli([]).status, 2);
   assert.equal(runCli(["/nonexistent/posts-dir"]).status, 2);

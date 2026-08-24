@@ -78,10 +78,15 @@ if (slugs.length === 0) {
   process.exit(1);
 }
 
-// Detect whether every post in this dir is a rollup archetype.
-// Weekly/monthly rollups don't produce deep stories or dual-reviewer passes
-// (the fallback workflow for those skips Steps 2-7; only 8, 8.5, 9 run).
-const isRollupDir = slugs.every((slug) => {
+// Detect which posts in this dir are rollup archetype vs. checkable
+// (daily-roundup / daily-deep-story). A day can legitimately mix a
+// weekly/monthly rollup with same-day daily posts (e.g. Monday's weekly
+// rollup sharing YYYY/MM/DD/ with that day's roundup + deep stories) —
+// exemption from Step 7.5/7.6 must be per-slug, not all-or-nothing for
+// the whole directory. See check-claim-ledger.mjs for the same fix,
+// applied there first after this exact bug broke Monday-directory
+// validation for already-merged content.
+const isRollupSlug = (slug) => {
   try {
     const data = JSON.parse(
       readFileSync(join(targetDir, `${slug}.11tydata.json`), "utf8")
@@ -90,7 +95,10 @@ const isRollupDir = slugs.every((slug) => {
   } catch {
     return false;
   }
-});
+};
+const rollupSlugs = slugs.filter(isRollupSlug);
+const checkableSlugs = slugs.filter((slug) => !isRollupSlug(slug));
+const isRollupDir = checkableSlugs.length === 0;
 
 const violations = [];
 
@@ -107,7 +115,7 @@ if (!isRollupDir && !existsSync(qualityDir)) {
       `skip clause exists".`
   );
 } else if (!isRollupDir) {
-  for (const slug of slugs) {
+  for (const slug of checkableSlugs) {
     const a = join(qualityDir, `${slug}-reviewer-A.json`);
     const b = join(qualityDir, `${slug}-reviewer-B.json`);
     if (!existsSync(a))
@@ -121,7 +129,7 @@ if (!isRollupDir && !existsSync(qualityDir)) {
 // Rollup posts synthesize from already-published roundups (no new claims),
 // so Step 7.6 does not run for them — same guard as Step 7.5.
 if (!isRollupDir) {
-  for (const slug of slugs) {
+  for (const slug of checkableSlugs) {
     const p = join(norm, `${slug}.ledger.json`);
     if (!existsSync(p))
       violations.push(
