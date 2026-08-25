@@ -303,8 +303,12 @@ function main() {
   }
 
   // Weekly/monthly rollups synthesize from already-published roundups —
-  // no new claims enter the site, so Step 7.6 does not run for them.
-  const isRollupDir = slugs.every((slug) => {
+  // no new claims enter the site, so Step 7.6 does not run for them. A
+  // rollup can land in the same YYYY/MM/DD directory as that day's daily
+  // roundup/deep-stories (e.g. Monday), so this is a per-slug exemption,
+  // not a whole-directory one — a mixed directory still fact-checks its
+  // non-rollup posts normally.
+  const isRollupSlug = (slug) => {
     try {
       const data = JSON.parse(
         readFileSync(join(targetDir, `${slug}.11tydata.json`), "utf8")
@@ -313,8 +317,10 @@ function main() {
     } catch {
       return false;
     }
-  });
-  if (isRollupDir) {
+  };
+  const rollupSlugs = slugs.filter(isRollupSlug);
+  const checkableSlugs = slugs.filter((slug) => !isRollupSlug(slug));
+  if (checkableSlugs.length === 0) {
     process.stdout.write(
       `OK: rollup dir — Step 7.6 fact-check not required for ${targetDir}\n`
     );
@@ -323,8 +329,13 @@ function main() {
 
   const allViolations = [];
   const allWarnings = [];
+  if (rollupSlugs.length > 0) {
+    allWarnings.push(
+      `skipped rollup post(s) sharing this directory (Step 7.6 not required): ${rollupSlugs.join(", ")}`
+    );
+  }
 
-  for (const slug of slugs) {
+  for (const slug of checkableSlugs) {
     const p = join(norm, `${slug}.ledger.json`);
     if (!existsSync(p)) {
       allViolations.push(
@@ -378,7 +389,7 @@ function main() {
     process.exit(1);
   }
   process.stdout.write(
-    `OK: reading ledgers complete and resolved for ${slugs.length} post(s) in ${targetDir}\n`
+    `OK: reading ledgers complete and resolved for ${checkableSlugs.length} post(s) in ${targetDir}\n`
   );
 }
 
