@@ -1,0 +1,449 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">一個 warp 裡 32 個 thread 各自要 4 bytes，這條最基本的讀取指令要先經過 coalescer、L1、TLB、crossbar、36 個 L2 slice 之一、記憶體控制器，最壞的情況才會碰到 DRAM——命中的樓層不同，代價差了將近 17 倍。</p>
+  <h1 class="vg-post-title">GPU 讀一次記憶體，經過幾層硬體</h1>
+</header>
+
+<div class="vg-post-prose">
+
+<p><span class="vg-dropcap">讀</span>完這篇，你會知道一件事：GPU 的「讀一個 float」不是一步到位，是一串會分別命中或落空的硬體站點——coalescer、L1、TLB、crossbar、某個 L2 slice、記憶體控制器，最壞情況才輪到 DRAM。文章從一行你已經看過的陣列加法開始，沿著 Doubleword 創辦人暨技術成員 Fergus Finn 在一張鎖定 2.6 GHz 核心時脈的 RTX 4090 上實測到的每一站延遲，一路走到 DRAM 的 activate 與 column read，最後回到「這對你調 kernel 有什麼用」這個問題。</p>
+
+<h2>從 c[i] = a[i] + b[i] 到一條 LDG.E</h2>
+
+<p>上一篇文章追的是一個最簡單的 kernel：<code>c[i] = a[i] + b[i]</code>，一個 thread 對一個 float，從 <code>nvcc</code> 編譯一路追到 warp 怎麼被排上 SM。那篇文章自己承認漏掉了一大塊——kernel 裡真正在做事的那條指令，也就是把 <code>a[i]</code> 這個 float 從記憶體搬進暫存器的「全域讀取」，究竟怎麼被硬體服務。這一篇補上那一塊。</p>
+
+<pre data-kind="pseudocode"><code>c[i] = a[i] + b[i];   <em>// 一個 thread 對一個 float</em>
+
+LDG.E                 <em>// 編譯後真正去搬資料的那條指令</em>
+                      <em>// 32 個 lane 各要 4 bytes，合計 128 bytes</em>
+                      <em>// 服務它要動用：</em>
+                      <em>//   四個 32-byte sector</em>
+                      <em>//   一條 cache line</em>
+                      <em>//   一次位址轉換</em>
+                      <em>//   一次 crossbar 穿越</em>
+                      <em>//   三十六個 L2 slice 其中一個</em>
+                      <em>//   miss 的話，才輪到 DRAM</em></code></pre>
+
+<p>追蹤的對象很具體：一條 <code>LDG.E</code> 指令，warp 裡 32 個 lane 各自要 4 bytes，合計要 128 bytes。原文自己給了一句路徑摘要：服務這條指令，要經過四個 32-byte sector、一條 cache line、一次位址轉換、一次 crossbar 交叉、36 個 L2 slice 裡的其中一個，如果兩層快取都沒中，還要加一次 activate 與四次 column read。這句摘要，也是接下來整篇文章要拆開來講的內容。</p>
+
+<p>這條路徑值得停下來看的原因很簡單：「讀一個 float」聽起來像是一步就到位的事，實際上是一連串會分別成功或落空的硬體查詢，每一次落空都把成本推高一個量級。</p>
+
+<p>先說清楚這篇文章追蹤的範圍：作者量的是單一 warp 的單一 load。原文沒有自己聲明過這個範圍限制，但從它只架一個 one-warp kernel 來量這件事看，合理的推測是：多個 warp 同時發出請求時，記憶體控制器要怎麼排隊、同一個 bank 被連續打中會不會衝突這類「多請求交錯」的次序問題，並不在這一篇的涵蓋範圍裡。換句話說，接下來每一個數字，回答的都是「這一條路徑本身要付多少代價」，不是「一整個 kernel 實際跑起來會有多快」——後者還要疊上 occupancy、排程這些變數。這個範圍限定，也是接下來讀每一個數字時要記住的前提。</p>
+
+<h2>「L1、L2、DRAM 三層」這句話沒告訴你的事</h2>
+
+<p>多數人對 GPU 記憶體的印象停在一張三格圖：L1、L2、DRAM，一層比一層慢。這張圖沒有畫錯，但它把好幾個工程師真正要面對的細節都省略掉了。</p>
+
+<p>L1 的「你問一次」跟「它抓多少」其實是兩件事——合併粒度是 32-byte 的 sector，但實際儲存組織卻是 128-byte 的 line（一條 line 裝四個 sector），而且是 4-way set-associative，用的是虛擬位址。從虛擬位址走到實體位址，中間插了一層 TLB：SM 上只留最近 16 筆轉換、所有 warp 共用，任何位址第一次用到必定 miss，miss 要多花約 4.4 ns。</p>
+
+<p>sector、line、set-associative 這三個詞常常被當同義詞混用，但它們回答的是三個不同的問題：sector 決定「一次要抓多少 byte」，line 決定「抓進來的東西以什麼單位存放」，set-associative 的路數決定「同一個位置能不能同時放好幾份、不必立刻互相踢掉」。L1 用 32-byte sector 定址、卻用 128-byte line 存放，等於每次 miss 都會順帶多帶三個 sector 進來；4-way 代表同一個 set 最多同時留 4 條 line，超過就要踢掉一條。L2 的路數是 16-way——同一個 set 能同時留住的 line 數是 L1 的四倍。原文只給出兩層各自的組織、沒有做這個跨層比較，但照這個數字推算，合理的推測是：一些在 L1 裡會互相踢掉的資料，換到 L2 的同一個 set 裡就還有位置可以並存。</p>
+
+<p>L2 也不是「一塊」。它是 36 個各自獨立、各 2 MiB 的 slice，請求要先經過 crossbar，依位址的一個「頗複雜」的函式被送到其中一個 slice——每個 slice 內部又是 1024 個 set、16-way，換成實體位址定址。從虛擬位址的 L1 走到實體位址的 L2，中間那次 TLB 轉換不只是換一個數字：它是整條路徑上位址空間真正切換的那一刻，也是為什麼「同一個位址第一次用到必定 miss」這句話單獨成立——沒有轉換過，L2、crossbar 都無從知道要把請求送去哪裡。DRAM 更不是平坦的空間：GDDR6X 用 2 條 channel、每條 16 個 bank、每個 bank 65,536 個 row 排成二維陣列，一次只能開一個 row（這一步原文自己形容成「貴」），開了之後才能對這個 row 讀 32-byte 的 column。</p>
+
+<p>三格圖沒告訴你的是，每一格裡面都還有自己的組織方式——而那個組織方式，決定了你的存取模式會不會撞到代價最高的那條路。下面這張表把四層的組織方式攤開，捲進頁面時會慢慢顯出來。</p>
+
+<figure class="vg-w-specsheet-gpumem" data-mobile="keep">
+  <style>
+    .vg-w-specsheet-gpumem { display: grid; grid-template-columns: repeat(2, 1fr); gap: var(--s-2); }
+    .vg-w-specsheet-gpumem .card { border: 1px solid var(--line); padding: var(--s-2); opacity: 1; transform: none; }
+    .vg-w-specsheet-gpumem.js-reveal .card { opacity: 0; transform: translateY(8px); transition: opacity .4s ease, transform .4s ease; }
+    .vg-w-specsheet-gpumem.js-reveal .card.on { opacity: 1; transform: none; }
+    .vg-w-specsheet-gpumem h3 { font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: .05em; color: var(--accent-text); margin: 0 0 var(--s-1); }
+    .vg-w-specsheet-gpumem p { font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink-soft); margin: 0; }
+    .vg-w-specsheet-gpumem figcaption { grid-column: 1 / -1; font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-1); }
+    @media (max-width: 720px) { .vg-w-specsheet-gpumem { grid-template-columns: 1fr; } }
+  </style>
+  <div class="card"><h3>L1</h3><p>32-byte sector 定址・128-byte line（4 sector/line）・4-way・虛擬位址</p></div>
+  <div class="card"><h3>TLB</h3><p>16 筆最近轉換・warp 共用・miss 多花約 4.4 ns</p></div>
+  <div class="card"><h3>L2</h3><p>36 個 2 MiB slice・每 slice 1024 set・16-way・實體位址</p></div>
+  <div class="card"><h3>DRAM（GDDR6X）</h3><p>2 channel × 16 bank × 65,536 row・一次開一個 row，讀 32-byte column</p></div>
+  <figcaption>四層各自的組織方式——這是「三層快取」那張簡圖沒畫出來的部分。</figcaption>
+  <script>
+    (function () {
+      if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+      var root = document.querySelector('.vg-w-specsheet-gpumem');
+      root.classList.add('js-reveal');
+      var cards = root.querySelectorAll('.card');
+      var io = new IntersectionObserver(function (entries) {
+        entries.forEach(function (e) {
+          if (e.isIntersecting) { e.target.classList.add('on'); io.unobserve(e.target); }
+        });
+      }, { rootMargin: '-15% 0px -15% 0px', threshold: 0 });
+      cards.forEach(function (c) { io.observe(c); });
+    })();
+  </script>
+</figure>
+
+<p>表格裡「DRAM（GDDR6X）」那一列，其實還可以再往上拉一層看。這張 RTX 4090 總共有十二個記憶體控制器，合起來組成一條 384-bit 的匯流排——原文寫得很白：十二個控制器，每個負責 32-bit。每個控制器只做一件事：對著一顆 GDDR6X 晶片說話，一個控制器配一顆晶片，彼此不共用。也就是說，表格裡「2 channel × 16 bank × 65,536 row」描述的，其實是單一一顆 GDDR6X 晶片內部的組織；卡上有十二顆這樣的晶片，各自掛在自己的控制器後面，平行運作、互不干擾。</p>
+
+<p>這一層平行，是「三格圖」漏掉的另一半：一次全域讀取的位址，最終會落在十二個控制器裡的哪一個，決定了它是不是要跟其他 warp 的請求排隊等同一個控制器、同一顆晶片。下面這張圖把十二個控制器攤開——每一個各自面對一顆晶片、各自的 channel 與 bank，彼此不共用線路。</p>
+
+<figure class="vg-w-controllers-gpumem" data-mobile="keep" data-svg-scroll="720">
+  <style>
+    .vg-w-controllers-gpumem { display: grid; gap: var(--s-2); }
+    .vg-w-controllers-gpumem svg { width: 100%; height: auto; }
+    .vg-w-controllers-gpumem figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+  </style>
+  <svg viewBox="0 0 880 170" preserveAspectRatio="xMidYMid meet" role="img" aria-label="十二個記憶體控制器組成 384-bit 匯流排">
+    <line x1="60" y1="30" x2="820" y2="30" stroke="var(--muted-2)" stroke-width="1.5" />
+    <line x1="60" y1="24" x2="60" y2="36" stroke="var(--muted-2)" stroke-width="1.5" />
+    <line x1="820" y1="24" x2="820" y2="36" stroke="var(--muted-2)" stroke-width="1.5" />
+    <text x="440" y="18" text-anchor="middle" font-family="Manrope, sans-serif" font-size="14" fill="var(--muted)">384-bit 匯流排（12 × 32-bit）</text>
+    <g>
+      <rect x="65" y="50" width="45" height="60" fill="var(--accent)" opacity="0.18" />
+      <rect x="134" y="50" width="45" height="60" fill="var(--sage)" opacity="0.2" />
+      <rect x="203" y="50" width="45" height="60" fill="var(--accent)" opacity="0.18" />
+      <rect x="272" y="50" width="45" height="60" fill="var(--sage)" opacity="0.2" />
+      <rect x="341" y="50" width="45" height="60" fill="var(--accent)" opacity="0.18" />
+      <rect x="410" y="50" width="45" height="60" fill="var(--sage)" opacity="0.2" />
+      <rect x="479" y="50" width="45" height="60" fill="var(--accent)" opacity="0.18" />
+      <rect x="548" y="50" width="45" height="60" fill="var(--sage)" opacity="0.2" />
+      <rect x="617" y="50" width="45" height="60" fill="var(--accent)" opacity="0.18" />
+      <rect x="686" y="50" width="45" height="60" fill="var(--sage)" opacity="0.2" />
+      <rect x="755" y="50" width="45" height="60" fill="var(--accent)" opacity="0.18" />
+      <rect x="810" y="50" width="10" height="60" fill="var(--sage)" opacity="0.2" />
+    </g>
+    <text x="440" y="132" text-anchor="middle" font-family="Manrope, sans-serif" font-size="14" fill="var(--ink)">十二個獨立控制器</text>
+    <line x1="87" y1="110" x2="87" y2="150" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="2 3" />
+    <text x="87" y="163" text-anchor="middle" font-family="Manrope, sans-serif" font-size="14" fill="var(--muted)">→ 各自一顆 GDDR6X 晶片</text>
+  </svg>
+  <figcaption>十二個控制器合組成 384-bit 匯流排，每個控制器只對一顆 GDDR6X 晶片說話——表格裡「2 channel × 16 bank × 65,536 row」，說的就是這其中一顆晶片內部的組織，卡上有十二顆這樣的晶片並行運作。</figcaption>
+</figure>
+
+<h2>coalescer 先決定你要問幾次</h2>
+
+<p>在故事真正進到 L1 之前，還有一步決定了後面所有代價：coalescer。</p>
+
+<p>coalescer 的工作，原文寫得很白：figure out the minimal number of L1 sectors it needs to retrieve to service our 4-byte requests——用最少的 sector 數量，服務 warp 裡每個 lane 各自的 4-byte 請求。追蹤的這個例子裡，32 個 lane 要的是連續的 128 bytes，coalescer 剛好合併成 4 個連續的 32-byte sector 請求，128 bytes 需求對上 128 bytes 抓取，一滴不浪費。</p>
+
+<p>這句話反過來讀才是重點：如果 32 個 lane 的位址不連續——每個 lane 跳著讀，中間夾了 stride——coalescer 沒辦法把它們塞進同樣少的 sector 裡，同一個 128 bytes 的邏輯需求就要拆成更多次 sector 請求，每一次沒被用滿的 sector，都是抓進來又丟掉的頻寬。下面這個工具把這條規則攤開：拖動 stride，看 32 個 lane 各自的 4 bytes 落進哪些 32-byte sector，連續讀取跟跳著讀取之間，實際要抓的 sector 數量差了多少。</p>
+
+<figure class="vg-w-coalesce-gpumem" data-mobile="static" data-svg-scroll="720">
+  <style>
+    .vg-w-coalesce-gpumem { display: grid; gap: var(--s-2); }
+    .vg-w-coalesce-gpumem .controls { display: flex; align-items: center; gap: var(--s-2); flex-wrap: wrap; font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+    .vg-w-coalesce-gpumem .controls input { flex: 1; min-width: 8rem; height: 36px; accent-color: var(--accent); touch-action: none; }
+    .vg-w-coalesce-gpumem .readout { font-variant-numeric: tabular-nums; color: var(--ink); }
+    .vg-w-coalesce-gpumem svg { width: 100%; height: auto; }
+    .vg-w-coalesce-gpumem figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+  </style>
+
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+    <span>拖動 stride，看 32 個 lane 落進幾個 sector · stride 1–8</span>
+  </p>
+
+  <div class="controls" data-vg-controls>
+    <label for="vg-w-coalesce-gpumem-x">stride =</label>
+    <input id="vg-w-coalesce-gpumem-x" type="range" min="1" max="8" step="1" value="1" />
+    <span class="readout" id="vg-w-coalesce-gpumem-readout">1 ・ 4 個 sector ・ 128 bytes ・ 效率 100%</span>
+  </div>
+
+  <svg class="vg-w-coalesce-gpumem-main" viewBox="0 0 880 110" preserveAspectRatio="xMidYMid meet" role="img" aria-label="warp coalescing 示意圖">
+    <g id="vg-w-coalesce-gpumem-bands">
+      <rect x="40" y="40" width="208" height="40" fill="var(--accent)" opacity="0.16" />
+      <text x="144" y="64" text-anchor="middle" font-family="Manrope, sans-serif" font-size="14" fill="var(--ink)">8</text>
+      <rect x="248" y="40" width="208" height="40" fill="var(--sage)" opacity="0.18" />
+      <text x="352" y="64" text-anchor="middle" font-family="Manrope, sans-serif" font-size="14" fill="var(--ink)">8</text>
+      <rect x="456" y="40" width="208" height="40" fill="var(--accent)" opacity="0.16" />
+      <text x="560" y="64" text-anchor="middle" font-family="Manrope, sans-serif" font-size="14" fill="var(--ink)">8</text>
+      <rect x="664" y="40" width="208" height="40" fill="var(--sage)" opacity="0.18" />
+      <text x="768" y="64" text-anchor="middle" font-family="Manrope, sans-serif" font-size="14" fill="var(--ink)">8</text>
+    </g>
+    <text x="40" y="98" font-family="Manrope, sans-serif" font-size="14" fill="var(--muted)">lane 0</text>
+    <text x="872" y="98" text-anchor="end" font-family="Manrope, sans-serif" font-size="14" fill="var(--muted)">lane 31</text>
+  </svg>
+
+  <script>
+    (function () {
+      if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+      var root = document.querySelector('.vg-w-coalesce-gpumem');
+      var input = root.querySelector('input');
+      var readout = root.querySelector('#vg-w-coalesce-gpumem-readout');
+      var bandsG = root.querySelector('#vg-w-coalesce-gpumem-bands');
+      var X0 = 40, PITCH = 26;
+
+      function computeRuns(stride) {
+        function sectorOf(i) { return Math.floor((i * stride) / 8); }
+        var runs = [], start = 0, cur = sectorOf(0);
+        for (var i = 1; i < 32; i++) {
+          var s = sectorOf(i);
+          if (s !== cur) { runs.push({ start: start, end: i - 1 }); start = i; cur = s; }
+        }
+        runs.push({ start: start, end: 31 });
+        return runs;
+      }
+
+      function render(stride) {
+        var runs = computeRuns(stride);
+        while (bandsG.firstChild) bandsG.removeChild(bandsG.firstChild);
+        runs.forEach(function (r, idx) {
+          var x = X0 + r.start * PITCH;
+          var w = (r.end - r.start + 1) * PITCH;
+          var rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+          rect.setAttribute('x', x); rect.setAttribute('y', 40);
+          rect.setAttribute('width', w); rect.setAttribute('height', 40);
+          rect.setAttribute('fill', idx % 2 === 0 ? 'var(--accent)' : 'var(--sage)');
+          rect.setAttribute('opacity', idx % 2 === 0 ? '0.16' : '0.18');
+          bandsG.appendChild(rect);
+          if (runs.length <= 8) {
+            var t = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+            t.setAttribute('x', x + w / 2); t.setAttribute('y', 64);
+            t.setAttribute('text-anchor', 'middle');
+            t.setAttribute('font-family', 'Manrope, sans-serif'); t.setAttribute('font-size', '14');
+            t.setAttribute('fill', 'var(--ink)');
+            t.textContent = String(r.end - r.start + 1);
+            bandsG.appendChild(t);
+          }
+        });
+        var sectors = runs.length, bytes = sectors * 32, eff = Math.round((128 / bytes) * 100);
+        readout.textContent = stride + ' ・ ' + sectors + ' 個 sector ・ ' + bytes + ' bytes ・ 效率 ' + eff + '%';
+      }
+
+      input.addEventListener('input', function () { render(Number(input.value)); });
+      render(1);
+    })();
+  </script>
+  <figcaption>stride = 1 對應原文給的例子：32 個 lane 位址連續，coalescer 剛好合併成 4 個 32-byte sector，128 bytes 需求對上 128 bytes 抓取。stride 變大之後的 sector 數，是同一條「最少化」規則算出來的結果，不是另一組實測數字。</figcaption>
+</figure>
+
+<p>這件事值得講得更白一點：coalescer 省下來的，不只是這一次 L1 查詢的次數。任何一個沒被用滿的 sector，都是要一路揹到底的重量——它要先在 L1 miss，再翻 TLB、跨 crossbar、找 L2 slice，運氣不好還要在 L2 也 miss，一路揹到 DRAM 去換一次 activate 加 column read。換句話說，stride 一拉大，浪費的不是「多讀了幾個 byte」這麼小的事，而是把原本一次 15.4 ns 就能結束的請求，多出來的那幾個 sector 各自都有機會被推去啃 127 ns 甚至 255 ns 那個量級的代價。coalescer 站在整條路徑最前面，做的其實是「幫你決定要不要把後面幾層的代價都乘上去」這件事。</p>
+
+<h2>追一次真正的 LDG.E：從暫存器到 DRAM 再折返</h2>
+
+<p>把前兩節的規則收斂成一條時間軸，原文給的答案很乾脆：命中的樓層不同，代價差了一個量級。</p>
+
+<p>如果資料已經在 L1，這條 <code>LDG.E</code> 大約 15.4 ns（40 cycles）就能返回。如果 L1 沒中，要往下問 TLB、crossbar、某個 L2 slice——只要 L2 有，總成本大約 127 ns（330 cycles）。如果兩層都沒中，原文自己把完整路徑寫了出來：L1、TLB、crossbar、L2、controller，再折返，總成本大約 255 ns（660 cycles）——大約是 L1 命中的 17 倍。</p>
+
+<pre data-kind="pseudocode"><code>LDG.E R4, [R2]        <em>// 每個 lane 各要 4 bytes，warp 共 32 個 lane</em></code></pre>
+
+<p>255 ns 對 15.4 ns，約 17 倍——這個倍數值得多停留一下。它不是「DRAM 比 L1 慢一點」這種模糊印象，而是同一條 <code>LDG.E</code> 指令，光是「在哪一層被找到」這一件事，就能把總延遲乘上一個量級。而三種情境走的其實是同一條路徑，差別只在於在哪一站提早結束：L1 命中，走了三站；L2 命中，走了六站；DRAM 往返，走完全部八站再折返。多出來的每一站，都是前面那張表裡各自有自己組織方式的硬體——不是抽象的「慢一點」，是 TLB 要多花 4.4 ns、crossbar 要多繞一趟、L2 slice 要多查一次、記憶體控制器要多送一次 activate。</p>
+
+<p>這三個數字都不是規格書上的公稱值，是作者自己在一張鎖定 2.6 GHz 核心時脈的 RTX 4090（<code>sm_89</code>）上，用「指標在特定 eviction set 裡連續跳轉兩萬次」量出平均延遲，再搭配硬體計數器比例與 alias mapping 反推出快取的組織方式。下面這個工具讓你切三種命中情境，看代價怎麼疊上去。</p>
+
+<figure class="vg-w-hitpath-gpumem" data-mobile="static" data-svg-scroll="720">
+  <style>
+    .vg-w-hitpath-gpumem { display: grid; gap: var(--s-2); }
+    .vg-w-hitpath-gpumem .controls { display: flex; flex-wrap: wrap; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+    .vg-w-hitpath-gpumem input[type="radio"] { position: absolute; opacity: 0; }
+    .vg-w-hitpath-gpumem .pill { padding: 0 var(--s-2); min-height: 36px; display: inline-flex; align-items: center; border: 1px solid var(--line); cursor: pointer; color: var(--ink-soft); }
+    .vg-w-hitpath-gpumem .pill:has(input:checked) { border-color: var(--accent); color: var(--accent-text); }
+    .vg-w-hitpath-gpumem svg { width: 100%; height: auto; }
+    .vg-w-hitpath-gpumem .on { fill: var(--accent); stroke: var(--accent); stroke-width: 1.5; }
+    .vg-w-hitpath-gpumem .off { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; }
+    .vg-w-hitpath-gpumem figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    @media (max-width: 720px) { .vg-w-hitpath-gpumem .pill { min-height: 44px; } }
+  </style>
+
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+    <span>切三種命中情境，看代價從哪一站開始疊加 · 3 個情境</span>
+  </p>
+
+  <div class="controls" data-vg-controls>
+    <label class="pill"><input type="radio" name="vg-w-hitpath-gpumem-s" value="l1" checked /><span>L1 命中</span></label>
+    <label class="pill"><input type="radio" name="vg-w-hitpath-gpumem-s" value="l2" /><span>L2 命中</span></label>
+    <label class="pill"><input type="radio" name="vg-w-hitpath-gpumem-s" value="dram" /><span>DRAM 往返</span></label>
+  </div>
+
+  <svg class="vg-w-hitpath-gpumem-main" viewBox="0 0 880 220" preserveAspectRatio="xMidYMid meet" role="img" aria-label="GPU 記憶體讀取命中路徑">
+    <line x1="60" y1="90" x2="820" y2="90" stroke="var(--muted-2)" stroke-width="1.5" />
+    <path id="vg-w-hitpath-gpumem-hl" d="M60 90 L169 90 L277 90" stroke="var(--accent)" stroke-width="3" fill="none" />
+    <g id="vg-w-hitpath-gpumem-stops">
+      <circle id="vg-w-hitpath-gpumem-p0" class="on" cx="60" cy="90" r="8" />
+      <circle id="vg-w-hitpath-gpumem-p1" class="on" cx="169" cy="90" r="8" />
+      <circle id="vg-w-hitpath-gpumem-p2" class="on" cx="277" cy="90" r="8" />
+      <circle id="vg-w-hitpath-gpumem-p3" class="off" cx="386" cy="90" r="8" />
+      <circle id="vg-w-hitpath-gpumem-p4" class="off" cx="494" cy="90" r="8" />
+      <circle id="vg-w-hitpath-gpumem-p5" class="off" cx="603" cy="90" r="8" />
+      <circle id="vg-w-hitpath-gpumem-p6" class="off" cx="711" cy="90" r="8" />
+      <circle id="vg-w-hitpath-gpumem-p7" class="off" cx="820" cy="90" r="8" />
+    </g>
+    <g font-family="Manrope, sans-serif" font-size="14" fill="var(--muted)" text-anchor="middle">
+      <text x="60" y="122">暫存器</text>
+      <text x="169" y="122">coalescer</text>
+      <text x="277" y="122">L1</text>
+      <text x="386" y="122">TLB</text>
+      <text x="494" y="122">crossbar</text>
+      <text x="603" y="122">L2</text>
+      <text x="711" y="122">控制器</text>
+      <text x="820" y="122">DRAM</text>
+    </g>
+    <text id="vg-w-hitpath-gpumem-total" x="440" y="180" text-anchor="middle" font-family="EB Garamond, serif" font-size="26" fill="var(--ink)">15.4 ns（40 cycles）</text>
+    <text id="vg-w-hitpath-gpumem-desc" x="440" y="205" text-anchor="middle" font-family="Manrope, sans-serif" font-size="14" fill="var(--muted)">資料已經在 L1，不必往下問。</text>
+  </svg>
+
+  <script>
+    (function () {
+      if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+      var root = document.querySelector('.vg-w-hitpath-gpumem');
+      var radios = root.querySelectorAll('input[type=radio]');
+      var hl = root.querySelector('#vg-w-hitpath-gpumem-hl');
+      var total = root.querySelector('#vg-w-hitpath-gpumem-total');
+      var desc = root.querySelector('#vg-w-hitpath-gpumem-desc');
+      var pts = [60, 169, 277, 386, 494, 603, 711, 820];
+      var scenarios = {
+        l1: { upto: 2, ns: '15.4 ns（40 cycles）', desc: '資料已經在 L1，不必往下問。' },
+        l2: { upto: 5, ns: '127 ns（330 cycles）', desc: 'L1 沒中，一路查到某個 L2 slice 才找到。' },
+        dram: { upto: 7, ns: '255 ns（660 cycles）', desc: 'L1、L2 都沒中，一路查到 DRAM 再折返。' }
+      };
+      function apply(key) {
+        var sc = scenarios[key];
+        var d = 'M' + pts[0] + ' 90';
+        for (var i = 1; i <= sc.upto; i++) d += ' L' + pts[i] + ' 90';
+        hl.setAttribute('d', d);
+        for (var j = 0; j < 8; j++) {
+          root.querySelector('#vg-w-hitpath-gpumem-p' + j).setAttribute('class', j <= sc.upto ? 'on' : 'off');
+        }
+        total.textContent = sc.ns;
+        desc.textContent = sc.desc;
+      }
+      radios.forEach(function (r) { r.addEventListener('change', function () { apply(r.value); }); });
+    })();
+  </script>
+  <figcaption>三個數字都是作者在鎖定 2.6 GHz 核心時脈的 RTX 4090 上實測的平均延遲，不是規格書公稱值；命中的樓層每往下一層，代價跳一個量級。</figcaption>
+</figure>
+
+<p>命中在哪一層決定了總成本，但真正付出代價的是沿路每一站各自的工作。拖著下面這個把手，沿著這條路徑走一遍——從暫存器出發，經過 coalescer 把 32 個請求收成 4 個 sector，進 L1，沒中就查 TLB，拿到實體位址後跨過 crossbar，落進 36 個 L2 slice 裡的其中一個，如果還是沒中，最後才輪到記憶體控制器對 GDDR6X 送出 activate 與 column read。</p>
+
+<figure class="vg-w-hopdrag-gpumem" data-mobile="static" data-svg-scroll="720">
+  <style>
+    .vg-w-hopdrag-gpumem { display: grid; gap: var(--s-2); }
+    .vg-w-hopdrag-gpumem svg { width: 100%; height: auto; }
+    .vg-w-hopdrag-gpumem .panel { border-left: 2px solid var(--accent); padding-left: var(--s-2); font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink-soft); min-height: 3.6em; }
+    .vg-w-hopdrag-gpumem .panel strong { font-family: var(--sans); font-size: var(--fs-xs); color: var(--ink); text-transform: uppercase; letter-spacing: .05em; display: block; margin-bottom: 2px; }
+    .vg-w-hopdrag-gpumem figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    .vg-w-hopdrag-gpumem-handle { cursor: grab; touch-action: none; }
+  </style>
+
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 9l-3 3 3 3M19 9l3 3-3 3M2 12h20"/></svg>
+    <span>拖著把手沿路徑走一遍，或用左右鍵切換 · 8 站</span>
+  </p>
+
+  <svg class="vg-w-hopdrag-gpumem-main" viewBox="0 0 880 150" preserveAspectRatio="xMidYMid meet" role="img" aria-label="LDG.E 請求的硬體路徑">
+    <line x1="60" y1="70" x2="820" y2="70" stroke="var(--muted-2)" stroke-width="1.5" />
+    <g fill="var(--muted-2)">
+      <circle cx="60" cy="70" r="4" /><circle cx="169" cy="70" r="4" /><circle cx="277" cy="70" r="4" />
+      <circle cx="386" cy="70" r="4" /><circle cx="494" cy="70" r="4" /><circle cx="603" cy="70" r="4" />
+      <circle cx="711" cy="70" r="4" /><circle cx="820" cy="70" r="4" />
+    </g>
+    <g font-family="Manrope, sans-serif" font-size="14" fill="var(--muted)" text-anchor="middle">
+      <text x="60" y="102">暫存器</text>
+      <text x="169" y="102">coalescer</text>
+      <text x="277" y="102">L1</text>
+      <text x="386" y="102">TLB</text>
+      <text x="494" y="102">crossbar</text>
+      <text x="603" y="102">L2</text>
+      <text x="711" y="102">控制器</text>
+      <text x="820" y="102">DRAM</text>
+    </g>
+    <circle id="vg-w-hopdrag-gpumem-handle" class="vg-w-hopdrag-gpumem-handle" cx="277" cy="70" r="11" fill="var(--accent)" stroke="var(--bg)" stroke-width="2" role="slider" tabindex="0" aria-label="沿路徑選一站" aria-valuemin="0" aria-valuemax="7" aria-valuenow="2" />
+  </svg>
+
+  <div class="panel" id="vg-w-hopdrag-gpumem-panel">
+    <strong>L1</strong>32-byte sector 定址、128-byte line（4-way）、虛擬位址。命中的話到這裡就結束：約 15.4 ns（40 cycles）。
+  </div>
+
+  <script>
+    (function () {
+      if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+      var root = document.querySelector('.vg-w-hopdrag-gpumem');
+      var svg = root.querySelector('svg.vg-w-hopdrag-gpumem-main');
+      var handle = root.querySelector('#vg-w-hopdrag-gpumem-handle');
+      var panel = root.querySelector('#vg-w-hopdrag-gpumem-panel');
+      var pts = [60, 169, 277, 386, 494, 603, 711, 820];
+      var stages = [
+        { name: '暫存器', text: 'R4 這個目的暫存器，warp 裡 32 個 lane 各自一份，等著被寫入。' },
+        { name: 'COALESCER', text: '把 32 個 lane 各自要的 4 bytes，合併成最少數量的 32-byte sector 請求——這個例子合併成連續 4 個 sector。' },
+        { name: 'L1', text: '32-byte sector 定址、128-byte line（4-way）、虛擬位址。命中的話到這裡就結束：約 15.4 ns（40 cycles）。' },
+        { name: 'TLB', text: 'SM 上最近 16 筆位址轉換，warp 共用。沒中的話多花約 4.4 ns（11 cycles）才能拿到實體位址。' },
+        { name: 'CROSSBAR', text: '拿到實體位址後，依位址的一個「頗複雜」的函式，被送往 36 個 L2 slice 之一。' },
+        { name: 'L2', text: '1024 set、16-way、實體位址。L1 沒中但這裡命中的話，總成本約 127 ns（330 cycles）。' },
+        { name: '控制器', text: 'L2 也沒中，記憶體控制器要對其中一顆 GDDR6X chip 送出 DRAM 指令。' },
+        { name: 'DRAM', text: '先送一個 activate 打開目標 row（原文形容這一步「貴」），再送 4 個 column read。走到這裡再折返，總成本約 255 ns（660 cycles）。' }
+      ];
+      function render(i) {
+        handle.setAttribute('cx', pts[i]);
+        handle.setAttribute('aria-valuenow', String(i));
+        panel.innerHTML = '<strong>' + stages[i].name + '</strong>' + stages[i].text;
+      }
+      function nearest(x) {
+        var best = 0, bd = Infinity;
+        for (var i = 0; i < pts.length; i++) { var d = Math.abs(pts[i] - x); if (d < bd) { bd = d; best = i; } }
+        return best;
+      }
+      var dragging = false;
+      function clientToX(clientX) {
+        var pt = svg.createSVGPoint();
+        pt.x = clientX; pt.y = 0;
+        var p = pt.matrixTransform(svg.getScreenCTM().inverse());
+        return Math.max(60, Math.min(820, p.x));
+      }
+      handle.addEventListener('pointerdown', function (e) { dragging = true; handle.setPointerCapture(e.pointerId); handle.style.cursor = 'grabbing'; });
+      handle.addEventListener('pointermove', function (e) { if (dragging) render(nearest(clientToX(e.clientX))); });
+      handle.addEventListener('pointerup', function () { dragging = false; handle.style.cursor = 'grab'; });
+      handle.addEventListener('keydown', function (e) {
+        var cur = Number(handle.getAttribute('aria-valuenow'));
+        if (e.key === 'ArrowRight') { render(Math.min(7, cur + 1)); e.preventDefault(); }
+        else if (e.key === 'ArrowLeft') { render(Math.max(0, cur - 1)); e.preventDefault(); }
+        else if (e.key === 'Home') { render(0); e.preventDefault(); }
+        else if (e.key === 'End') { render(7); e.preventDefault(); }
+      });
+    })();
+  </script>
+  <figcaption>把手預設停在 L1——大多數請求走到這裡就結束了；拖到 DRAM 才是最壞情況。</figcaption>
+</figure>
+
+<h2>怎麼在 profiler 上看到這幾層</h2>
+
+<p>前面幾節講的 sector、TLB、crossbar、L2 slice，都不是憑空畫出來的抽象分層——作者在原文裡直接把每一站對應到 Nsight Compute（ncu）底下可以讀到的硬體計數器，讓這條路徑不只是「重建出來的架構圖」，而是可以在自己的 kernel 上重新量一次的東西。</p>
+
+<p>最直接的一個實驗，呼應前面那個拖 stride 的工具：架一個只有一個 warp、每個 lane 讀 4 bytes、stride 固定的合成 kernel，丟進 ncu 裡跑，計數器 <code>l1tex__average_t_sectors_per_request_pipe_lsu_mem_global_op_ld.ratio</code> 會直接報出「這次 load 平均用了幾個 sector」。stride 為 1 時，32 個 lane 覆蓋連續的 128 bytes，計數器讀到 4——跟前面 coalescer 合併出來的 4 個連續 sector 完全對上。stride 拉大之後，這個數字就等於 32 個 lane 各自位址落進了幾個不同的 32-byte 區間，而且原文說得很清楚：不會多讀，沒有多餘的 sector 被要求。這代表拖 stride 那個工具算出來的「sector 數」，不是憑空模擬的示意，而是這顆計數器實際會讀到的值。</p>
+
+<p>再往下一站，crossbar 本身也不是無限頻寬：每個 SM 每個 cycle 最多能把兩個 line-request 丟給 crossbar，三十六個 slice 各自獨立服務，不互相卡住。對應的出口計數器是 <code>l1tex__m_l1tex2xbar_req_cycles_active</code>——這一站忙不忙、是不是變成瓶頸，同樣有名字可以查，不必只靠猜。</p>
+
+<p>到了 L2 入口，原文也給出對應的一組計數器：<code>lts__t_requests_srcunit_tex_op_read</code> 與它的 <code>t_sectors</code> 對應版本，分別讀出「crossbar 送過來的請求，在 L2 這端變成幾次 request、幾個 sector」。作者也提醒了量測本身的眉角：要把 ncu 的讀數當成迭代次數的斜率去取，把 kernel launch 這類固定開銷從讀數裡消掉，量到的才是這條路徑本身的成本，不是量測雜訊。</p>
+
+<figure class="vg-w-proftable-gpumem" data-mobile="keep">
+  <style>
+    .vg-w-proftable-gpumem { display: block; }
+    .vg-w-proftable-gpumem table { width: 100%; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+    .vg-w-proftable-gpumem th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: .05em; color: var(--accent-text); text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); }
+    .vg-w-proftable-gpumem td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); color: var(--ink-soft); vertical-align: top; }
+    .vg-w-proftable-gpumem code { font-size: 0.9em; }
+    .vg-w-proftable-gpumem figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-1); }
+  </style>
+  <table>
+    <thead>
+      <tr><th>想確認什麼</th><th>在哪一站查</th><th>計數器</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>32 個 lane 合併成幾個 sector</td><td>coalescer／L1 出口</td><td><code>l1tex__average_t_sectors_per_request_pipe_lsu_mem_global_op_ld.ratio</code></td></tr>
+      <tr><td>crossbar 這一跳是不是被塞爆</td><td>L1 到 L2 的交叉口</td><td><code>l1tex__m_l1tex2xbar_req_cycles_active</code></td></tr>
+      <tr><td>L2 端實際收到幾次 request、幾個 sector</td><td>L2 入口</td><td><code>lts__t_requests_srcunit_tex_op_read</code>／<code>t_sectors</code></td></tr>
+    </tbody>
+  </table>
+  <figcaption>三個計數器分別卡在路徑上不同的站——coalescer 出口、crossbar 出口、L2 入口，讀數要取多次迭代的斜率，把固定開銷濾掉。</figcaption>
+</figure>
+
+<p>換句話說，coalescer 是不是把 32 個 lane 收斂成最少 sector、crossbar 是不是被塞爆、L2 端實際處理了多少 request——這三個問題，分別對應三個可以直接讀出來的數字，不必只憑架構圖猜測自己的 kernel 落在代價曲線的哪一段。</p>
+
+<p>這三個計數器合在一起看，其實是把前面整條路徑翻譯成一個可以反覆迭代的迴圈：改一次存取模式，重新跑一次 ncu，看 sector-per-request 有沒有往 4 靠近、crossbar 出口計數器有沒有下降——不用先猜對，量出來的數字會直接告訴你這次改動是不是真的把請求收斂得更緊。這也是為什麼作者要先把每一站的計數器名字寫出來：架構圖能解釋「為什麼慢」，但只有這幾個數字能回答「這次改動有沒有用」。</p>
+
+<h2>這對你調 kernel 有什麼用</h2>
+
+<p>原文本身沒有另外寫一段「給工程師的建議」——它是一篇拆解硬體路徑的文章，不是效能調校指南。但前面四節攤開的機制，已經足夠讓人自己推出幾個合理的方向。</p>
+
+<p>合理的推測是：coalescing 之所以是每一份 CUDA 教材都反覆強調的第一課，是因為它決定了你落在哪一條代價曲線上——連續存取讓 32 個 lane 剛好湊滿 4 個 sector，一滴不浪費；跳著存取則會讓同樣的邏輯需求拆成更多次沒被用滿的 sector 請求，而每一次多出來的 sector 請求，都有可能把你從「L1 命中的 15.4 ns」推向「L2 命中的 127 ns」，甚至「DRAM 往返的 255 ns」。合理的推測是：working set 大小之所以重要，也是同一個原因的另一面——只要反覆存取的資料塞得進 L1 或某個 L2 slice，就一直吃 15.4 ns 或 127 ns 這個量級；一旦溢出，每一次落空都要多繞 TLB、crossbar，甚至 DRAM 的 activate。</p>
+
+<p>DRAM 這一段還有一個原文明講的細節值得單獨拉出來看：打開一個 row（activate）跟從已經打開的 row 讀一個 column，是兩個不同重量的操作——原文自己用「expensive」形容 activate。追蹤的這次請求，送出的是一次 activate 加四次 read，四個 32-byte column 正好湊滿原本要的 128 bytes。這也是為什麼「同一塊資料要不要盡量放在一起用」在 GPU 上不只是快取問題，還牽涉到 DRAM 那顆晶片願不願意讓同一個 row 多開一會兒。</p>
+
+<p>如果要把這幾節收斂成一件具體能做的事，合理的推測是：比起憑印象猜「這段存取應該有 coalesce 到吧」，直接去讀 <code>l1tex__average_t_sectors_per_request_pipe_lsu_mem_global_op_ld.ratio</code> 這個數字——它跟 stride 為 1 時的理論值 4 差多少，就是這次讀取實際多揹了多少 sector；如果 crossbar 的出口計數器持續偏高，合理的推測是問題已經不在單一 kernel 的存取模式，而是同時有太多 warp 把請求往同一批 L2 slice 送，跟十二個控制器各自對一顆晶片、彼此不共用的結構疊在一起看，位址落在哪個控制器，也決定了它是不是要排隊。這些都是原文親自標出對應計數器與硬體結構的環節，不是額外延伸出來的猜測。</p>
+
+<p>這篇文章沒有給出一份「怎麼優化」的清單，也沒有替 coalescing、working set、tiling 這些常見建議背書或反駁——它做的是把「為什麼」攤開：15.4 ns、127 ns、255 ns 這三個數字之間隔著的不是抽象的「層級」，是 sector、TLB、crossbar、slice、row 這些各自有自己組織方式的真實硬體，而作者是在一張鎖定時脈的卡上，一個一個把它們量出來的。</p>
+
+<p>把這篇文章跟上一篇追 kernel launch 的文章擺在一起看，兩者其實在做同一件事：把「軟體工程師習慣略過的一步」攤開成可以逐站檢查的硬體。上一篇拆的是「這個 kernel 怎麼被排上 SM」，這一篇拆的是「排上去之後，一條 load 指令怎麼被服務」——兩篇合起來，一個 warp 從 launch 到讀到第一個 float，中間經過的每一站，現在都有名字，也有可以直接量測的計數器可以對照。</p>
+
+<p class="vg-deep-closer"><strong>心智模型</strong>：GPU 讀一個 float，不是一步到位，是一連串會分別命中或落空的站點——coalescer 決定你問幾次，每一次命中的樓層決定你付多少代價，15.4 ns、127 ns、255 ns 之間隔著的是 sector、TLB、crossbar、slice、row 這些各自有組織方式的真實硬體，不是一張三格圖能講完的東西。</p>
+
+</div>

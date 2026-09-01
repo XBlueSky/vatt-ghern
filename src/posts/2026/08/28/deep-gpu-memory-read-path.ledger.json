@@ -1,0 +1,620 @@
+{
+  "output_path": "src/posts/2026/08/28/deep-gpu-memory-read-path.html",
+  "spine": [
+    "1. 一次全域讀取（LDG.E）最終要付出的代價，由「在哪一層被找到」決定：L1 命中約 15.4 ns，L1 沒中但 L2 命中約 127 ns，兩層都沒中、一路查到 DRAM 再折返約 255 ns。",
+    "2. 在碰到 L1 之前，一個 warp 裡 32 個 lane、各自要 4 bytes 的請求，會先被 coalescer 合併——位址連續時，剛好合併成 4 個連續的 32-byte sector 請求，湊滿 128 bytes，完全不浪費。",
+    "3. L1 本身以虛擬位址定址、128-byte line 為單位組織（一條 line 裝 4 個 32-byte sector），4-way set-associative；沒中就要先查 TLB 才能拿到實體位址。",
+    "4. TLB 只留 SM 上最近 16 筆位址轉換、warp 共用；第一次用到的位址必定 miss，miss 要多花約 4.4 ns。",
+    "5. 拿到實體位址後，請求跨過 crossbar，被送到 36 個獨立 2 MiB L2 slice 之一（依位址的一個「頗複雜」的函式決定），每個 slice 是 1024 set、16-way、實體定址。",
+    "6. L2 也沒中就要問 DRAM（GDDR6X）：DRAM 以 2 條 channel、每 channel 16 個 bank、每 bank 65,536 個 row 組織，一次只能開一個 row（activate，作者形容它「貴」），再從打開的 row 讀 32-byte column；這次追蹤的請求送了 1 個 activate 加 4 個 read。",
+    "7. 全部數字不是官方規格書，是作者自己在鎖定 2.6 GHz 核心時脈的 RTX 4090（sm_89）上，用 latency-chase 指標鏈、硬體計數器比例、alias mapping 量出來的。"
+  ],
+  "sources": [
+    {
+      "url": "https://blog.doubleword.ai/what-happens-when-a-gpu-reads-memory",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": "2026-08-13",
+      "perspective": {
+        "mechanism": "追一個具體的 SASS 指令（LDG.E，一次全域讀取）從暫存器出發，依序經過 coalescer、L1（虛擬定址、32-byte sector／128-byte line）、TLB（16 entries）、crossbar、36 個 L2 slice 之一（實體定址、1024 set×16-way）、記憶體控制器，最後在需要時才碰到 DRAM（GDDR6X：2 channel×16 bank×65536 row，row 用 activate 打開、column 用 32-byte 讀），呈現的是「請求實際穿過哪些硬體層級」這條路徑，而不是一張抽象的『三層快取』教科書圖。",
+        "tradeoff": "每往下一層，命中的代價就跳一個量級（L1 命中 15.4 ns → L2 命中 127 ns → DRAM 往返 255 ns，約 17 倍），而每一層能不能命中，又取決於上一層更早的動作——coalescing 有沒有把 32 個 lane 的請求收斂成最少的 sector、TLB 裡有沒有這筆位址轉換、目標 DRAM row 是不是已經開著。作者測的是單一 warp 的單一 load，沒有涵蓋多 warp 併發、記憶體控制器排隊、bank 衝突等『真實 kernel 下的次序』，所以文章本身是路徑構造，不是完整的效能模型。",
+        "reader_use": "調 inference／training kernel 的工程師可以把這條路徑當作『為什麼要 coalesce』『為什麼 working set 塞不進 L2 就會很痛』的具體依據：位址連續與否直接決定 sector 請求數，sector 數直接決定要不要多繞 L2/DRAM 這幾跳，而每一跳的代價差了一個數量級。這篇沒有給『怎麼優化』的清單，但給了為什麼那些常見建議（coalesce access、控制 working set、注意 tile 大小）在硬體層級上真的有代價依據。"
+      }
+    }
+  ],
+  "notes": [
+    {
+      "id": "n01",
+      "url": "https://blog.doubleword.ai/what-happens-when-a-gpu-reads-memory",
+      "quote": "Our previous post followed a vector-add kernel — c[i] = a[i] + b[i], one thread per float — from nvcc down to the warps. We went into a lot of detail on how the kernel was launched, but we also left a lot out. This time, we're going to address our omissions, and follow the path the critical SASS instruction (a global load) takes through the hardware...",
+      "hedge": "asserted",
+      "interpretation": "文章接續前一篇 vector-add kernel 的分析，這次專門追蹤一條全域讀取（load）SASS 指令在硬體裡實際走的路徑，範圍限定在單一 load 指令，不是整個 kernel 的效能分析。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n02",
+      "url": "https://blog.doubleword.ai/what-happens-when-a-gpu-reads-memory",
+      "quote": "An L1 hit returns in about 15.4 ns — 40 cycles.",
+      "hedge": "hedged",
+      "interpretation": "資料已經在 L1 時的成本基準值。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n03",
+      "url": "https://blog.doubleword.ai/what-happens-when-a-gpu-reads-memory",
+      "quote": "Misses cost about 4.4 ns — eleven cycles.",
+      "hedge": "hedged",
+      "interpretation": "SM 上 16-entry TLB 沒有命中所需位址轉換時，額外多花的時間。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n04",
+      "url": "https://blog.doubleword.ai/what-happens-when-a-gpu-reads-memory",
+      "quote": "An L2 hit costs about 127 ns — some 330 cycles.",
+      "hedge": "hedged",
+      "interpretation": "L1 沒中、但 L2 有命中時的總成本，高於單純 L1 命中、低於一路查到 DRAM 的往返成本。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n05",
+      "url": "https://blog.doubleword.ai/what-happens-when-a-gpu-reads-memory",
+      "quote": "The round trip — L1, TLB, crossbar, L2, controller, and back — costs about 255 ns, some 660 cycles.",
+      "hedge": "hedged",
+      "interpretation": "L1、L2 都沒中，一路查到 DRAM 再折返的最壞情況總成本；這句同時列出完整路徑的站點順序。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n06",
+      "url": "https://blog.doubleword.ai/what-happens-when-a-gpu-reads-memory",
+      "quote": "the L1 cache, is addressed in 32 byte sectors ... The L1 cache's unit of organization is still less granular: 128 byte lines ... A set on this card holds four slots, and each carries a tag identifying the line in it.",
+      "hedge": "asserted",
+      "interpretation": "L1 的合併粒度是 32-byte sector，但實際儲存組織單位是 128-byte line（等於 4 個 sector），且是 4-way set-associative（一個 set 有 4 個 slot）。（Step 7.6c 更正：本則引文第三段原先誤轉錄為「a line on this card holds four slots」，已改回原文字句「A set on this card holds four slots」；set 與 line 在此意義不同。）",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n07",
+      "url": "https://blog.doubleword.ai/what-happens-when-a-gpu-reads-memory",
+      "quote": "The coalescer's job is to figure out the minimal number of L1 sectors it needs to retrieve to service our 4-byte requests. The coalescer figures out that it ought to emit 4 contiguous sector requests, for the 128 bytes the warp has asked for.",
+      "hedge": "asserted",
+      "interpretation": "當 32 個 lane 各要連續的 4 bytes 時，coalescer 把它們收斂成剛好 4 個連續 sector 請求，128 bytes 需求對上 128 bytes 抓取，沒有浪費。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n08",
+      "url": "https://blog.doubleword.ai/what-happens-when-a-gpu-reads-memory",
+      "quote": "One LDG.E asks for four bytes in each of 32 lanes. Serving it takes four 32-byte sectors, one cache line, one address translation, a crossbar crossing, one of thirty-six L2 slices, and, when it misses everywhere, an activate and four column reads at a DRAM chip.",
+      "hedge": "asserted",
+      "interpretation": "全文追蹤的具體案例：一個 warp（32 lane）、每 lane 4 bytes 的全域讀取，完整路徑摘要——4 個 sector、1 條 line、1 次位址轉換、1 次 crossbar、36 個 L2 slice 之一、最壞情況下 1 個 activate 加 4 個 column read。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n09",
+      "url": "https://blog.doubleword.ai/what-happens-when-a-gpu-reads-memory",
+      "quote": "The SM keeps its sixteen most recent translations in a TLB, shared across warps. ... The very first load will miss in this TLB.",
+      "hedge": "asserted",
+      "interpretation": "TLB 容量是 16 筆、SM 上所有 warp 共用；一個位址第一次被用到時必定 miss。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n10",
+      "url": "https://blog.doubleword.ai/what-happens-when-a-gpu-reads-memory",
+      "quote": "The request runs across the crossbar to one of 36 2 MiB L2 slices, picked by a somewhat complex function of its physical address.",
+      "hedge": "hedged",
+      "interpretation": "位址轉換完成後，請求經 crossbar 被路由到 36 個獨立 2 MiB L2 slice 之一；分配函式本身作者只形容「頗複雜」，沒有公開完整定義，所以不寫死實際雜湊公式。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n11",
+      "url": "https://blog.doubleword.ai/what-happens-when-a-gpu-reads-memory",
+      "quote": "Each slice holds 1024 sets. The set to which a line belongs is picked by a hash of the line's physical address. Each set now contains 16 slots: the slices are individually 16 way set-associative.",
+      "hedge": "asserted",
+      "interpretation": "每個 L2 slice 內部是 1024 set × 16-way，以實體位址定址（跟 L1 的虛擬定址不同）。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n12",
+      "url": "https://blog.doubleword.ai/what-happens-when-a-gpu-reads-memory",
+      "quote": "The DRAM is divided into two separate buses the controller drives independently, called channels. On each channel sit 16 banks: two-dimensional arrays of memory cells. A bank consists of 65,536 rows. The hardware can open one row at a time (an activate, expensive), and then return any 32-byte columns from that row",
+      "hedge": "asserted",
+      "interpretation": "DRAM 組織：2 channel、每 channel 16 bank、每 bank 65,536 row；一次只能開一個 row，開 row（activate）這一步作者自己形容為「貴」，開了之後才能對這個 row 讀 32-byte 的 column。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n13",
+      "url": "https://blog.doubleword.ai/what-happens-when-a-gpu-reads-memory",
+      "quote": "So, to serve our load, the memory controller must first send one activate, and then four reads.",
+      "hedge": "asserted",
+      "interpretation": "文章追蹤的這次具體請求，實際送出的 DRAM 指令序列是 1 個 activate 加 4 個 read（4×32 bytes＝128 bytes，對上原始請求量）。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n14",
+      "url": "https://blog.doubleword.ai/what-happens-when-a-gpu-reads-memory",
+      "quote": "The card has twelve controllers (a 384-bit bus, 12 × 32-bit).",
+      "hedge": "asserted",
+      "interpretation": "RTX 4090 有 12 個記憶體控制器，組成 384-bit 的總線寬度。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n15",
+      "url": "https://blog.doubleword.ai/what-happens-when-a-gpu-reads-memory",
+      "quote": "Each memory controller's job is to speak to a single GDDR6X DRAM chip.",
+      "hedge": "asserted",
+      "interpretation": "確認記憶體型態是 GDDR6X，每個控制器對應一顆 DRAM chip。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n16",
+      "url": "https://blog.doubleword.ai/what-happens-when-a-gpu-reads-memory",
+      "quote": "We do this kind of reverse engineering for performance reasons...so we'll determine it by running timing experiments on the hardware itself. ... A latency chase. To get a latency measurement...we run a pointer cycle through a chosen set of lines, hopped 20,000 times...",
+      "hedge": "asserted",
+      "interpretation": "文中所有延遲與結構數字，都是作者自己在真實硬體上用 latency-chase（指標在特定 eviction set 裡連續跳轉上萬次量時間）、硬體計數器比例、alias mapping 等技術量出來的，不是官方文件公布的規格。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n17",
+      "url": "https://blog.doubleword.ai/what-happens-when-a-gpu-reads-memory",
+      "quote": "All measurements are on one RTX 4090 (sm_89), with the core clock locked at 2.6 GHz.",
+      "hedge": "asserted",
+      "interpretation": "所有數字的測量環境：單張 RTX 4090（sm_89 架構代號），核心時脈鎖定 2.6 GHz，用來把量到的 cycle 數換算成 ns。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n18",
+      "url": "https://blog.doubleword.ai/what-happens-when-a-gpu-reads-memory",
+      "quote": "Interested in helping us make inference 100x more efficient? We're hiring—reach us at careers@doubleword.ai.",
+      "hedge": "asserted",
+      "interpretation": "文章結尾是徵才呼籲，不是技術結論；正文本身沒有再另外寫一段『給工程師的建議』收尾段落，優化意涵是本篇作者的推論，不是原文提供的結論句。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n19",
+      "url": "https://blog.doubleword.ai/what-happens-when-a-gpu-reads-memory",
+      "quote": "We set up a one-warp kernel that loads 4 bytes per lane with a fixed stride. If you run it under ncu, it reports 'sectors per load' as l1tex__average_t_sectors_per_request_pipe_lsu_mem_global_op_ld.ratio. At stride 1 the 32 lanes cover 128 contiguous bytes and the counter reads four sectors. At every wider stride the count equals the number of distinct 32-byte spans the lane addresses touch, with no extra sectors requested.",
+      "hedge": "asserted",
+      "interpretation": "作者用一個單一 warp、固定 stride 的合成 kernel，在 ncu 下讀出 l1tex__average_t_sectors_per_request_pipe_lsu_mem_global_op_ld.ratio 這個計數器，直接量出「這次 load 用了幾個 sector」；stride 1 時讀到 4，跟前面 coalescer 合併出的 4 個連續 sector 對上，證明計數器測的就是同一件事，且更寬的 stride 不會多讀多餘的 sector。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n20",
+      "url": "https://blog.doubleword.ai/what-happens-when-a-gpu-reads-memory",
+      "quote": "Each SM can hand the crossbar up to two line-requests per cycle, and the 36 slices serve independently. The exit-port counter is l1tex__m_l1tex2xbar_req_cycles_active.",
+      "hedge": "asserted",
+      "interpretation": "crossbar 這一跳本身也有頻寬上限（每個 SM 每 cycle 最多丟兩個 line-request），36 個 slice 各自獨立服務；作者給出對應的出口計數器名稱，讓這個環節忙不忙可以直接從 profiler 讀出來。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n21",
+      "url": "https://blog.doubleword.ai/what-happens-when-a-gpu-reads-memory",
+      "quote": "The counters are lts__t_requests_srcunit_tex_op_read and its t_sectors counterpart.",
+      "hedge": "asserted",
+      "interpretation": "到了 L2 這端，作者同樣給出對應的計數器（request 數與 sector 數兩個版本），讓「crossbar 送過來的請求，在 L2 入口實際變成幾次 request、幾個 sector」也可以被量出來。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n22",
+      "url": "https://blog.doubleword.ai/what-happens-when-a-gpu-reads-memory",
+      "quote": "To read ncu's counters reliably you have to take them as slopes over iteration count so fixed overhead cancels.",
+      "hedge": "asserted",
+      "interpretation": "作者提醒這些計數器有自己的量測方法論——要跑多次迭代取斜率，把固定開銷（如 kernel launch）從讀數裡消掉，量到的才是這條路徑本身的成本，不是量測噪音。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n23",
+      "url": "https://blog.doubleword.ai/what-happens-when-a-gpu-reads-memory",
+      "quote": "Fergus Finn, Founder & Member of Technical Staff, Doubleword",
+      "hedge": "asserted",
+      "interpretation": "原文署名行：作者是 Fergus Finn，頭銜為 Founder & Member of Technical Staff，機構為 Doubleword——是創辦人兼技術成員，署名行本身沒有「engineer／工程師」這個字。Step 7.6c 補記，用於支撐首段的人身歸屬（c16）。",
+      "timeliness": "durable"
+    }
+  ],
+  "claims": [
+    {
+      "id": "c01",
+      "claim_text": "服務這條指令，要經過四個 32-byte sector、一條 cache line、一次位址轉換、一次 crossbar 交叉、36 個 L2 slice 裡的其中一個，如果兩層快取都沒中，還要加一次 activate 與四次 column read。",
+      "location": "H2「從 c[i] = a[i] + b[i] 到一條 LDG.E」下的段落，以及其上的 pseudocode 區塊（「四個 32-byte sector／一條 cache line／一次位址轉換／一次 crossbar 穿越／三十六個 L2 slice 其中一個」）",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n08"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "One `LDG.E` asks for four bytes in each of 32 lanes. Serving it takes four 32-byte sectors, one cache line, one address translation, a crossbar crossing, one of thirty-six L2 slices, and, when it misses everywhere, an activate and four column reads at a DRAM chip.",
+      "note": "逐項比對：four 32-byte sectors／one cache line／one address translation／a crossbar crossing／one of thirty-six L2 slices／an activate and four column reads——全部逐字對上，包含 pseudocode 區塊裡的「三十六個 L2 slice 其中一個」。原文用 asserted 語氣，post 亦然。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c02",
+      "claim_text": "L1 用 32-byte sector 定址、卻用 128-byte line 存放…而且是 4-way set-associative，用的是虛擬位址。",
+      "location": "H2「「L1、L2、DRAM 三層」這句話沒告訴你的事」下的兩段，以及 specsheet 小工具的 L1 卡片",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n06"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The L1 cache, is addressed in 32 byte sectors. / The L1 cache's unit of organization is still less granular: 128 byte lines. / A set on this card holds four slots, and each carries a tag identifying the line in it. / The address it uses is the virtual address used in the program.",
+      "note": "四個子主張（32-byte sector 定址／128-byte line／4-way／虛擬位址）在重新抓取的原文裡都找得到，post 沒有超出來源強度。但 n06 的引文第三段不是逐字：ledger 寫「a line on this card holds four slots」，原文實為「A set on this card holds four slots」——line 與 set 在此處意義不同，是證據層的轉錄錯誤。post 本身寫的是 4-way set-associative，與原文一致，因此判 verified；建議把 n06 的引文更正為原文字句（不影響 post 內文）。第 2 輪已完成該更正，n06 引文現為「A set on this card holds four slots, and each carries a tag identifying the line in it.」。「一條 line 裝四個 sector」是 128÷32 的算術，兩個操作數都已核實。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c03",
+      "claim_text": "SM 上只留最近 16 筆轉換、所有 warp 共用，任何位址第一次用到必定 miss，miss 要多花約 4.4 ns。",
+      "location": "H2「「L1、L2、DRAM 三層」這句話沒告訴你的事」下的段落；specsheet 的 TLB 卡片；hopdrag 小工具的 TLB 站",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n09",
+        "n03"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The SM keeps its sixteen most recent translations in a TLB, shared across warps. The very first load will miss in this TLB. / Misses cost about 4.4 ns — eleven cycles.",
+      "note": "16 筆、warp 共用、miss 約 4.4 ns（11 cycles）逐字對上；post 保留了原文的「about／約」。唯一的擴張：原文說的是「The very first load will miss in this TLB」（第一次 load），post 兩處寫成「任何位址第一次用到必定 miss」，把單一事例推廣成通則。語意方向相同、強度未升級（原文本身即 asserted），故仍判 verified，但這句廣義化不是原文字面說法，改稿時可收斂成「第一次 load 必定 miss」。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c04",
+      "claim_text": "如果資料已經在 L1，這條 LDG.E 大約 15.4 ns（40 cycles）就能返回。",
+      "location": "H2「追一次真正的 LDG.E：從暫存器到 DRAM 再折返」下的段落；hitpath 小工具的 L1 情境",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n02"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "An L1 hit returns in about 15.4 ns — 40 cycles.",
+      "note": "數字與 cycle 數逐字對上。n02 記為 hedged（原文的 about），post 內文用「大約」保留了同一層 hedge；小工具讀數面板顯示為裸值「15.4 ns（40 cycles）」，但同一 figure 的 figcaption 已標明是「實測的平均延遲，不是規格書公稱值」，未構成強度升級。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c05",
+      "claim_text": "只要 L2 有，總成本大約 127 ns（330 cycles）。",
+      "location": "H2「追一次真正的 LDG.E：從暫存器到 DRAM 再折返」下的段落；hitpath 小工具的 L2 情境",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n04"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "An L2 hit costs about 127 ns — some 330 cycles.",
+      "note": "127 ns／330 cycles 逐字對上；post 的「大約」對應原文的 about、「330 cycles」對應 some 330 cycles。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c06",
+      "claim_text": "原文自己把完整路徑寫了出來：L1、TLB、crossbar、L2、controller，再折返，總成本大約 255 ns（660 cycles）。",
+      "location": "H2「追一次真正的 LDG.E：從暫存器到 DRAM 再折返」下的段落；hitpath 小工具的 DRAM 情境",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n05"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The round trip — L1, TLB, crossbar, L2, controller, and back — costs about 255 ns, some 660 cycles.",
+      "note": "站點順序（L1, TLB, crossbar, L2, controller, and back）與 255 ns／660 cycles 都逐字對上，post 說「原文自己把完整路徑寫了出來」屬實。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c07",
+      "claim_text": "255 ns 對 15.4 ns，約 17 倍",
+      "location": "hero opener（「代價差了將近 17 倍」）、H2「追一次真正的 LDG.E」下段落、sidecar summary",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n02",
+        "n05"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "An L1 hit returns in about 15.4 ns — 40 cycles. / The round trip — L1, TLB, crossbar, L2, controller, and back — costs about 255 ns, some 660 cycles.",
+      "note": "原文全篇沒有寫出任何倍數（重新抓取後確認沒有 17x／order-of-magnitude 這類比值句）。「17 倍」是 post 對兩個已核實數字做的除法：255 ÷ 15.4 = 16.56。post 三處都用「約／將近」表述，未把 16.56 說成整數 17，也未宣稱這個倍數出自原文，故判 verified；若要更嚴謹，可在文中寫明「兩個數字相除約 16.6 倍」。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c08",
+      "claim_text": "它是 36 個各自獨立、各 2 MiB 的 slice，請求要先經過 crossbar，依位址的一個「頗複雜」的函式被送到其中一個 slice",
+      "location": "H2「「L1、L2、DRAM 三層」這句話沒告訴你的事」下的段落；specsheet 的 L2 卡片；hopdrag 的 CROSSBAR 站",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n10"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The request runs across the crossbar to one of 36 2 MiB L2 slices, picked by a somewhat complex function of its physical address.",
+      "note": "36 個 slice、每個 2 MiB、經 crossbar 路由、「somewhat complex function of its physical address」全部對上。post 用引號的「頗複雜」精準對應 somewhat complex，沒有把作者的模糊描述寫成具體雜湊公式——這正是 n10 記為 hedged 的部分，post 未升級。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c09",
+      "claim_text": "每個 slice 內部又是 1024 個 set、16-way，換成實體位址定址",
+      "location": "H2「「L1、L2、DRAM 三層」這句話沒告訴你的事」下的段落；specsheet 的 L2 卡片；hopdrag 的 L2 站",
+      "type": "number",
+      "load": "medium",
+      "note_ids": [
+        "n11"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Each slice holds 1024 sets. The set to which a line belongs is picked by a hash of the line's physical address. Each set now contains 16 slots: the slices are individually 16 way set-associative.",
+      "note": "1024 set、16-way、實體位址三項逐字對上。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c10",
+      "claim_text": "GDDR6X 用 2 條 channel、每條 16 個 bank、每個 bank 65,536 個 row 排成二維陣列，一次只能開一個 row（這一步原文自己形容成「貴」），開了之後才能對這個 row 讀 32-byte 的 column。",
+      "location": "H2「「L1、L2、DRAM 三層」這句話沒告訴你的事」下的段落；specsheet 的 DRAM 卡片；H2「這對你調 kernel 有什麼用」下引用「expensive」處",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n12"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The DRAM is divided into two separate buses the controller drives independently, called channels. On each channel sit 16 banks: two-dimensional arrays of memory cells. A bank consists of 65,536 rows. The hardware can open one row at a time (an activate, expensive), and then return any 32-byte columns from that row (a read, cheap while the row is open).",
+      "note": "2 channel、16 bank／channel、65,536 row／bank、二維陣列、一次開一個 row、activate 被形容為 expensive、32-byte column——全部對上。post 引用的英文詞「expensive」逐字存在。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c11",
+      "claim_text": "這張 RTX 4090 總共有十二個記憶體控制器，合起來組成一條 384-bit 的匯流排——原文寫得很白：十二個控制器，每個負責 32-bit。",
+      "location": "specsheet 之後的段落；controllers 小工具的 SVG 標籤「384-bit 匯流排（12 × 32-bit）」",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n14",
+        "n17"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The card has twelve controllers (a 384-bit bus, 12 × 32-bit). / All measurements are on one RTX 4090 (`sm_89`), with the core clock locked at 2.6 GHz.",
+      "note": "十二個控制器、384-bit、12 × 32-bit 逐字對上；原文寫的是「The card」，而該卡由 n17 明確界定為 RTX 4090，故 post 把主詞寫成「這張 RTX 4090」成立。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c12",
+      "claim_text": "每個控制器只做一件事：對著一顆 GDDR6X 晶片說話，一個控制器配一顆晶片，彼此不共用……卡上有十二顆這樣的晶片，各自掛在自己的控制器後面，平行運作、互不干擾。",
+      "location": "controllers 小工具前後的段落與 figcaption",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [
+        "n15",
+        "n14"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Each memory controller's job is to speak to a single GDDR6X DRAM chip. / The card has twelve controllers (a 384-bit bus, 12 × 32-bit).",
+      "note": "「一個控制器對一顆 GDDR6X 晶片」逐字對上；「卡上十二顆晶片」是 12 controllers × 1 chip 的直接算術，兩個操作數皆已核實。「彼此不共用／平行運作」對應原文 the controller drives them independently 的語意，未超出來源。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c13",
+      "claim_text": "追蹤的這次請求，送出的是一次 activate 加四次 read，四個 32-byte column 正好湊滿原本要的 128 bytes。",
+      "location": "H2「這對你調 kernel 有什麼用」下的 DRAM 段落；hopdrag 的 DRAM 站",
+      "type": "number",
+      "load": "medium",
+      "note_ids": [
+        "n13",
+        "n12"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "So, to serve our load, the memory controller must first send one activate, and then four reads.",
+      "note": "1 activate + 4 reads 逐字對上；「四個 32-byte column 湊滿 128 bytes」是 4×32 的算術，column 大小由 n12（32-byte columns）核實、128 bytes 由 n08 核實。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c14",
+      "claim_text": "coalescer 的工作，原文寫得很白：figure out the minimal number of L1 sectors it needs to retrieve to service our 4-byte requests……coalescer 剛好合併成 4 個連續的 32-byte sector 請求",
+      "location": "H2「coalescer 先決定你要問幾次」下的段落；coalesce 小工具的 figcaption",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n07"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The coalescer's job is to figure out the minimal number of L1 sectors it needs to retrieve to service our 4-byte requests. / The coalescer figures out that it ought to emit 4 contiguous sector requests, for the 128 bytes the warp has asked for.",
+      "note": "post 直接引用的英文片語逐字存在於原文（含 minimal number of L1 sectors、4-byte requests）；「4 個連續 sector／128 bytes」亦逐字對上。小工具 figcaption 已自行聲明 stride>1 的 sector 數是規則推算、非另一組實測數字，這個自我限定與 n19 的「count equals the number of distinct 32-byte spans」一致。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c15",
+      "claim_text": "這三個數字都不是規格書上的公稱值，是作者自己在一張鎖定 2.6 GHz 核心時脈的 RTX 4090（sm_89）上，用「指標在特定 eviction set 裡連續跳轉兩萬次」量出平均延遲，再搭配硬體計數器比例與 alias mapping 反推出快取的組織方式。",
+      "location": "hitpath 小工具前的段落與其 figcaption；opener 段落（「鎖定 2.6 GHz 核心時脈的 RTX 4090」）",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n16",
+        "n17"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "All measurements are on one RTX 4090 (`sm_89`), with the core clock locked at 2.6 GHz. / Little of the detail of this path is documented by NVIDIA, at least not to the level that we'd like, so we'll determine it by running timing experiments on the hardware itself. / we run a pointer cycle through a chosen set of lines, hopped 20,000 times, and then measure the mean ns per hop.",
+      "note": "2.6 GHz 鎖頻、RTX 4090、sm_89、兩萬次跳轉、量 mean ns per hop、非 NVIDIA 文件公布——全部對上。alias mapping 亦在原文腳註中作為量測手法出現（把同一塊實體配置映射到兩個虛擬位址來判定索引用的是虛擬或實體位元）。post 寫的「特定 eviction set」對應原文 a chosen set of lines，屬同義改寫、未升級強度。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c16",
+      "claim_text": "沿著 Doubleword 創辦人暨技術成員 Fergus Finn 在一張鎖定 2.6 GHz 核心時脈的 RTX 4090 上實測到的每一站延遲",
+      "location": "首段 dropcap 段落",
+      "type": "attribution",
+      "load": "high",
+      "note_ids": [
+        "n23",
+        "n17"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Fergus Finn, Founder & Member of Technical Staff, Doubleword",
+      "note": "第 1 輪：追溯失敗＋頭銜誤植。ledger 當時 22 則 note 沒有一則記錄作者身分，post 又把頭銜寫成「Doubleword 工程師」，而原文署名行是「Fergus Finn, Founder & Member of Technical Staff, Doubleword」——是創辦人，不是單純的工程師；這是全篇唯一的人身歸屬且位於開場定調句，故第 1 輪判 unverifiable／action: correct。第 2 輪：已把頭銜改成原文字面的「創辦人暨技術成員」，並補上 n23 逐字記錄署名行，追溯與字面皆對上，改判 verified。 ／ 修正：頭銜由「Doubleword 工程師」改為原文署名的「Doubleword 創辦人暨技術成員」，並新增 n23 逐字保存署名行以完成追溯（改判 verified）",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c17",
+      "claim_text": "計數器 l1tex__average_t_sectors_per_request_pipe_lsu_mem_global_op_ld.ratio 會直接報出「這次 load 平均用了幾個 sector」。stride 為 1 時，32 個 lane 覆蓋連續的 128 bytes，計數器讀到 4……不會多讀，沒有多餘的 sector 被要求。",
+      "location": "H2「怎麼在 profiler 上看到這幾層」下的第二段；proftable 小工具第一列；結尾「這對你調 kernel 有什麼用」再次引用同一計數器",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n19"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "We set up a one-warp kernel that loads 4 bytes per lane with a fixed stride. If you run it under `ncu`, it reports 'sectors per load' as `l1tex__average_t_sectors_per_request_pipe_lsu_mem_global_op_ld.ratio`. At stride 1 the 32 lanes cover 128 contiguous bytes and the counter reads four sectors. At every wider stride the count equals the number of distinct 32-byte spans the lane addresses touch, with no extra sectors requested.",
+      "note": "計數器名稱逐字比對通過，含尾綴 .ratio 與整串 pipe_lsu_mem_global_op_ld 段落，post 內文與表格兩處拼寫一致、無錯字。單一 warp／每 lane 4 bytes／固定 stride 的合成 kernel、stride 1 讀到 4、更寬 stride 不多要 sector，全部對上。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c18",
+      "claim_text": "每個 SM 每個 cycle 最多能把兩個 line-request 丟給 crossbar，三十六個 slice 各自獨立服務，不互相卡住。對應的出口計數器是 l1tex__m_l1tex2xbar_req_cycles_active",
+      "location": "H2「怎麼在 profiler 上看到這幾層」下的第三段；proftable 小工具第二列",
+      "type": "number",
+      "load": "medium",
+      "note_ids": [
+        "n20"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Each SM can hand the crossbar up to two line-requests per cycle, and the 36 slices serve independently. The exit-port counter is `l1tex__m_l1tex2xbar_req_cycles_active`.",
+      "note": "計數器名稱逐字對上（l1tex__m_l1tex2xbar_req_cycles_active）；每 cycle 兩個 line-request 的上限、36 slice 獨立服務亦對上。post 的「不互相卡住」對應 serve independently。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c19",
+      "claim_text": "到了 L2 入口，原文也給出對應的一組計數器：lts__t_requests_srcunit_tex_op_read 與它的 t_sectors 對應版本",
+      "location": "H2「怎麼在 profiler 上看到這幾層」下的第四段；proftable 小工具第三列",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n21"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The counters are `lts__t_requests_srcunit_tex_op_read` and its `t_sectors` counterpart.",
+      "note": "計數器名稱逐字對上，含「its t_sectors counterpart」的對應版本說法；post 把它描述成「L2 入口」的計數器與原文所在段落一致。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c20",
+      "claim_text": "要把 ncu 的讀數當成迭代次數的斜率去取，把 kernel launch 這類固定開銷從讀數裡消掉",
+      "location": "H2「怎麼在 profiler 上看到這幾層」下的第四段末；proftable figcaption",
+      "type": "attribution",
+      "load": "low",
+      "note_ids": [
+        "n22"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "To read `ncu`'s counters reliably you have to take them as slopes over iteration count so fixed overhead cancels.",
+      "note": "「取迭代次數的斜率、讓固定開銷相消」逐字對上；post 補的例子「kernel launch 這類固定開銷」是對 fixed overhead 的舉例，屬低風險具體化。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c21",
+      "claim_text": "作者量的是單一 warp 的單一 load。原文沒有自己聲明過這個範圍限制，但從它只架一個 one-warp kernel 來量這件事看，合理的推測是：多個 warp 同時發出請求時，記憶體控制器要怎麼排隊、同一個 bank 被連續打中會不會衝突這類「多請求交錯」的次序問題，並不在這一篇的涵蓋範圍裡。",
+      "location": "H2「從 c[i] = a[i] + b[i] 到一條 LDG.E」下的第四段（範圍限定段）",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n01",
+        "n19"
+      ],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": "We set up a one-warp kernel that loads 4 bytes per lane with a fixed stride. / This time, we're going to address our omissions, and follow the path the critical SASS instruction (a global load) takes through the hardware",
+      "note": "前半（單一 warp、單一 load）由 n01、n19 支撐。後半是「原文沒有涵蓋 X」的缺席主張：重新抓取後確認原文確實沒有討論控制器排隊、bank 衝突或多 warp 併發，但原文也從未自己聲明這個範圍限制（原文另有一句提到 the rest of the chip wasn't idle）。也就是說，這個範圍限定是本篇作者的歸納，不是原文的自陳，而 post 用「先說清楚這篇文章追蹤的範圍」的口吻呈現，讀起來像是原文的自我聲明。依 出處四態，未標記的作者綜合判 inferred。修法：加上推斷標記（例如「原文沒有明說，但從它只架一個 one-warp kernel 看，……」），或刪去缺席主張那一句。第 2 輪：已改寫為「原文沒有自己聲明過這個範圍限制，但從它只架一個 one-warp kernel 來量這件事看，合理的推測是：……」，缺席主張明確歸給本篇作者，推理依據（one-warp kernel）出自 n19 原文字句，未引入新事實。 ／ 修正：加入「原文沒有自己聲明過這個範圍限制，但從它只架一個 one-warp kernel 來量這件事看，合理的推測是：」的推斷標記，把範圍限定改為本篇作者的觀察而非原文自陳",
+      "action": "mark-inferred",
+      "resolution": "marked-inferred"
+    },
+    {
+      "id": "c22",
+      "claim_text": "L2 的路數是 16-way——同一個 set 能同時留住的 line 數是 L1 的四倍。原文只給出兩層各自的組織、沒有做這個跨層比較，但照這個數字推算，合理的推測是：一些在 L1 裡會互相踢掉的資料，換到 L2 的同一個 set 裡就還有位置可以並存。",
+      "location": "H2「「L1、L2、DRAM 三層」這句話沒告訴你的事」下第三段",
+      "type": "causal",
+      "load": "low",
+      "note_ids": [
+        "n06",
+        "n11"
+      ],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": "A set on this card holds four slots, and each carries a tag identifying the line in it. / Each set now contains 16 slots: the slices are individually 16 way set-associative.",
+      "note": "「16-way 是 4-way 的四倍」是已核實數字的算術，成立。但後半的因果結論（在 L1 互相驅逐的資料換到 L2 就不會衝突）原文並未提出——原文只給出兩層各自的組織，沒有做這個跨層推論，也沒有討論 conflict-miss 的實例。屬未標記的作者推論，判 inferred，load 低（只是說明段的一句補述）。修法：加推斷標記，或改寫成純結構描述（16 個 slot 對 4 個 slot）而不下因果結論。第 2 輪：已改寫為「原文只給出兩層各自的組織、沒有做這個跨層比較，但照這個數字推算，合理的推測是：……就還有位置可以並存」，同時標明原文未做此跨層推論、把結論降為推測，並把「反而不會衝突」的絕對因果收斂成「還有位置可以並存」。 ／ 修正：明說原文沒有做這個跨層比較，改以「照這個數字推算，合理的推測是」標記為本篇推斷，並把「換到 L2 反而不會衝突」收斂為「換到 L2 的同一個 set 裡就還有位置可以並存」",
+      "action": "mark-inferred",
+      "resolution": "marked-inferred"
+    },
+    {
+      "id": "c23",
+      "claim_text": "原文本身沒有另外寫一段「給工程師的建議」——它是一篇拆解硬體路徑的文章，不是效能調校指南。",
+      "location": "H2「這對你調 kernel 有什麼用」下的第一段",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n18"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Interested in helping us make inference 100x more efficient? We're hiring—reach us at careers@doubleword.ai.",
+      "note": "重新抓取確認原文收尾是徵才呼籲，正文沒有獨立的優化建議段落，post 的這句自我限定屬實；而且它接的下一段全部以「合理的推測是」開頭，把後續的調校意涵明確標成本篇作者的推斷，符合 出處四態 對 inferred 的標記要求。",
+      "action": "none",
+      "resolution": "none-needed"
+    }
+  ],
+  "checked_at": "2026-08-31",
+  "checker_rounds": 2,
+  "coverage": {
+    "candidate_claims": 31,
+    "checked": 23,
+    "dropped_low_load": 8
+  }
+}
