@@ -1,0 +1,394 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">把讀流量切到 replica 之後，最先壞掉的通常不是效能，是使用者剛送出的那筆資料——commit 在主庫上已經算數，跳轉後的畫面卻讀不到它。</p>
+  <h1 class="vg-post-title">讀自己剛寫的資料，不必回主庫</h1>
+</header>
+
+<div class="vg-post-prose">
+
+<p><span class="vg-dropcap">讀</span>完這篇你會知道：commit 在主庫上算數的那一刻，跟這筆資料在 replica 上可以被讀到的那一刻，中間隔的不是一個「lag 數字」，而是三段可以分開量測、分開修的等待——以及 PostgreSQL 19 怎麼把其中一段直接變成一個 client 可以自己問的問題，而不是猜。這篇不重講 replication 的基本概念，直接進到那三段等待各自卡在哪、還有「WAIT FOR」這句話實際上等的是什麼。</p>
+
+<h2>你剛送出的表單，畫面卻看不到它</h2>
+
+<p>前端把讀流量切到 replica 之後，最先壞掉的通常不是延遲，是這件事：使用者送出表單、頁面立刻導去下一步、下一步的畫面卻讀不到剛剛那筆資料。commit 在主庫上已經算數，對正在讀 replica 的那個請求來說卻像什麼都沒發生過。應用層通常用猜的辦法補：等一下、設個 flag、或者乾脆全部回主庫——boringsql 這篇把問題定義得很窄：application 該做的是把讀路由對，而不是拿 timeout 或一顆 Redis flag 賭運氣。這幾種猜法各有各的壞法：固定睡一下，快的時候是浪費，慢的時候還是猜錯；設一顆旗標，等於把一致性保證外包給另一個系統的可用性，那個系統一掛保證也跟著消失；乾脆全部回主庫，最穩，但等於把 replica 分流這件事整個放棄。</p>
+
+<p>協作型產品會把這件事放大。boringsql 舉的例子是即時協作文件：「every change sent over a websocket invalidates state on every teammate's open tab and device, and all of them go back to the same endpoints on the same replicas.」——一個人按下儲存，所有開著同一份文件的分頁在同一瞬間去問同一批 replica 要不要重新讀，而那批 replica 這時候可能都還沒追上剛剛那筆 commit。前端愈快，這個縫愈容易被踩到：樂觀更新、立刻重新驗證、SSR 之後馬上打一次 API，全部都在把「使用者能讀到自己剛寫的東西」當成理所當然，直到某一次它不成立。</p>
+
+<p>boringsql 把這整件事定義成一個角色問題：「Your application has to act like a traffic conductor. It guesses the replication lag using timeouts and Redis flags. The replica already knows exactly where it stands; your code just has no way to ask.」——replica 自己明明知道走到哪了，你的程式碼卻沒有管道去問，只能靠 timeout 或一顆 flag 賭。接下來先把「它到底走到哪了」拆開講清楚，再看 PostgreSQL 19 怎麼把「問」這件事變成一句可以直接發出去的敘述。</p>
+
+<h2>replica lag 不是一個數字，是三段不同的等待</h2>
+
+<p>「replica lag」聽起來像一個單一數字，實際上是三段可以分開量測的等待疊出來的——多數團隊在儀表板上看到的通常是一個彙總後的數字，不會自動告訴你這次卡在哪一段。</p>
+
+<div class="vg-w-pop-lag-glossary">
+  <style>
+    .vg-w-pop-lag-glossary { position: relative; margin: var(--s-3) 0; }
+    .vg-w-pop-lag-glossary p { margin: 0; font-family: var(--serif); }
+    .vg-w-pop-lag-glossary .term { anchor-name: --vgw-lag-anchor; text-decoration: underline dotted var(--muted); cursor: help; }
+    .vg-w-pop-lag-glossary .term2 { anchor-name: --vgw-lag-anchor2; text-decoration: underline dotted var(--muted); cursor: help; }
+    .vg-w-pop-lag-glossary .pop {
+      position-anchor: --vgw-lag-anchor;
+      position: absolute;
+      top: anchor(bottom);
+      left: anchor(center);
+      translate: -50% var(--s-1);
+      padding: var(--s-1) var(--s-2);
+      background: var(--bg-soft);
+      border: 1px solid var(--line);
+      font-family: var(--scribed);
+      font-size: var(--fs-sm);
+      max-width: 34ch;
+      opacity: 0;
+      transition: opacity 100ms;
+      pointer-events: none;
+      z-index: 2;
+    }
+    .vg-w-pop-lag-glossary .pop2 {
+      position-anchor: --vgw-lag-anchor2;
+      position: absolute;
+      top: anchor(bottom);
+      left: anchor(center);
+      translate: -50% var(--s-1);
+      padding: var(--s-1) var(--s-2);
+      background: var(--bg-soft);
+      border: 1px solid var(--line);
+      font-family: var(--scribed);
+      font-size: var(--fs-sm);
+      max-width: 34ch;
+      opacity: 0;
+      transition: opacity 100ms;
+      pointer-events: none;
+      z-index: 2;
+    }
+    .vg-w-pop-lag-glossary .term:hover + .pop,
+    .vg-w-pop-lag-glossary .term:focus + .pop { opacity: 1; }
+    .vg-w-pop-lag-glossary .term2:hover + .pop2,
+    .vg-w-pop-lag-glossary .term2:focus + .pop2 { opacity: 1; }
+    @supports not (anchor-name: --x) {
+      .vg-w-pop-lag-glossary .pop, .vg-w-pop-lag-glossary .pop2 { position: static; opacity: 1; pointer-events: auto; display: block; margin-top: var(--s-1); }
+    }
+  </style>
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <circle cx="12" cy="12" r="9" /><line x1="12" y1="8" x2="12" y2="13" /><circle cx="12" cy="16" r="0.5" fill="currentColor" />
+    </svg>
+    <span>點兩個底線詞看定義 · 2 個名詞</span>
+  </p>
+  <p>
+    把 replica lag 拆開看是三段：<span class="term" tabindex="0">write_lag 跟 flush_lag</span><span class="pop">「write_lag and flush_lag are the mechanics of the network and the disk on the standby.」——WAL 段落在網路上跑、落到磁碟，這兩段是機械時間。</span>
+    是網路跟磁碟的機械時間；真正卡住你的通常是 <span class="term2" tabindex="0">replay_lag</span><span class="pop2">「replay_lag is the problem. Shipping WAL is usually simple; applying it is the part that makes your change visible to queries.」——送到不難，套用回去讓資料能被查詢到，才是問題所在。</span>
+    ——WAL 送到不難，難的是被套用回去，讓資料真的能被查詢到。
+  </p>
+</div>
+
+<p>replay 為什麼會是瓶頸，原文講得很具體：recovery is a single startup process replaying records one at a time，即使有 prefetch 幫忙把 I/O 先熱起來，實際套用一次還是只能套一筆。如果 replica 上剛好有長時間查詢卡住某筆 WAL 的套用，PostgreSQL 也不是無限等——<code>max_standby_streaming_delay</code> 官方文件寫的預設是 30 秒，超過就取消那個擋路的 standby 查詢，讓 replay 繼續往下走。而讀流量本身又會讓這件事更糟，boringsql 的原話是「the more successfully you offload reads to the replica, the more lag you introduce there」——你越想靠 replica 分流，replica 自己要處理的查詢就越多，能分給 replay 的時間就越少。他們量到的數字很誇張：同一台機器上、走 loopback 的 replica，對剛寫入的資料做 naive 的讀，還是有 99.2% 的機率讀不到——這還是本機測試，真實世界跨機房、跨可用區的網路只會更慢，合理的推測是這個數字換到生產環境不會變好看。</p>
+
+<figure class="vg-w-3d-replay-pipeline" data-mobile="keep">
+  <style>
+    .vg-w-3d-replay-pipeline .stage { perspective: 1100px; height: 260px; display: flex; align-items: center; justify-content: center; }
+    .vg-w-3d-replay-pipeline .stack {
+      transform-style: preserve-3d;
+      transform: rotateX(-18deg) rotateY(-26deg);
+      width: 260px; height: 220px;
+      position: relative;
+    }
+    .vg-w-3d-replay-pipeline .layer {
+      position: absolute; width: 260px; height: 36px;
+      border: 1.5px solid var(--ink);
+      background: var(--bg-soft);
+      font-family: var(--sans); font-size: var(--fs-xs);
+      display: flex; align-items: center; justify-content: center; text-align: center;
+      color: var(--ink); padding: 0 var(--s-1);
+    }
+    .vg-w-3d-replay-pipeline .l1 { transform: translateZ(0px); }
+    .vg-w-3d-replay-pipeline .l2 { transform: translateZ(-50px); }
+    .vg-w-3d-replay-pipeline .l3 { transform: translateZ(-100px); background: color-mix(in srgb, var(--accent) 14%, var(--bg-soft)); border-color: var(--accent-text); }
+    .vg-w-3d-replay-pipeline .l4 { transform: translateZ(-150px); }
+    .vg-w-3d-replay-pipeline figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-2); }
+    @media (max-width: 480px) { .vg-w-3d-replay-pipeline .stack { transform: none; } .vg-w-3d-replay-pipeline .layer { position: static; margin-bottom: var(--s-1); width: 100%; } .vg-w-3d-replay-pipeline .stage { height: auto; display: block; } }
+  </style>
+  <div class="stage">
+    <div class="stack">
+      <div class="layer l1">L1 · 主庫 commit，WAL 產生 / flush</div>
+      <div class="layer l2">L2 · 網路傳輸（write_lag / flush_lag）</div>
+      <div class="layer l3">L3 · replica replay（單一 process，逐筆套用）</div>
+      <div class="layer l4">L4 · 對查詢可見</div>
+    </div>
+  </div>
+  <figcaption>一筆 commit 要疊過這四層才變成 replica 上讀得到的東西；瓶頸幾乎都在 L3——單一 process、逐筆套用，卡住就是整批卡住，長查詢還可能被 max_standby_streaming_delay（預設 30 秒）強制打斷才能繼續。</figcaption>
+</figure>
+
+<p>這四層排下來，工程上真正能動的手段其實不多。L1、L2 是網路跟磁碟的機械時間，砸頻寬、換更快的磁碟能壓縮一些，但壓不到零；L3 是單一 process 逐筆套用，橫向加機器對這一段幫不上忙——replica 數量再多，每一台自己的 replay 還是各自單執行緒往下推。這也是為什麼「多開幾台 replica 分攤讀流量」這個直覺解法有時候反而讓事情變糟：讀流量增加，replay process 要跟這些查詢搶 CPU 跟 I/O，L3 這段反而被拉長，符合前面那句「the more successfully you offload reads to the replica, the more lag you introduce there」的邏輯。順著這個邏輯往下走，一個合理的做法是把「需要低延遲追趕」的讀跟「會拖慢 replay 的長查詢、報表」分流到不同的 replica——不是因為官方文件這樣建議，而是因為 L3 這段的容量沒辦法用加機器換來，只能用少搶資源換來。</p>
+
+<h2>讓 client 帶著自己的 LSN 去問「你追上了嗎」</h2>
+
+<p>這個保證在分散式系統文獻裡有名字，叫 read-your-writes（也寫成 read your own writes）。Jepsen 的定義是：「if a process performs a write w, and that same process performs a subsequent read r, then r must observe w's effects」——同一個 process 寫的東西，自己接下來讀，必須看得到。範圍也劃得很窄：「read your writes does not apply to operations performed by different processes」，別人寫的東西你看不看得到是另一個問題，這個保證完全不管。PostgreSQL 19 要處理的，正是這個窄範圍內的保證，不多也不少。要在 PostgreSQL 上兌現它，缺的從來不是理論，是一個「問」的管道——client 要有辦法拿到自己那次寫入的位置，也要有辦法問 replica 是不是已經追到那個位置。</p>
+
+<p>PostgreSQL 本來就有辦法回答「replica 追到哪了」：<code>pg_current_wal_lsn()</code> 回主庫目前的 WAL write 位置，<code>pg_current_wal_flush_lsn()</code> 回目前已經 flush 到磁碟的位置，<code>pg_last_wal_replay_lsn()</code> 回 standby 目前已經套用到哪——官方文件對這顆函式的描述是：如果 recovery 還在跑，這個值會單調遞增；recovery 跑完就停在最後一筆套用的位置；伺服器不是從 recovery 啟動的話直接回 NULL。不少團隊本來就會拿這幾個函式自己拼一套「輪詢比對」：寫入時記下 LSN，讀之前去 replica 問一次 <code>pg_last_wal_replay_lsn()</code>，自己比大小。能動，但每次讀都要多一趟輪詢，還得處理兩條連線之間的競態：你在 A 連線讀到的 LSN，跟 B 連線問到的 replay 進度，中間永遠夾著一段沒被鎖住的時間差。</p>
+
+<p>PostgreSQL 19 把這段輪詢直接變成一句可以等待的敘述，原文的說法是：PostgreSQL 19 adds a way to ask——在 standby 上直接發：</p>
+
+<pre><code class="language-sql">WAIT FOR LSN '0/554D1B78';
+
+-- 帶完整選項：
+WAIT FOR LSN '0/554D1B78' WITH (
+  MODE 'standby_replay',
+  TIMEOUT '500ms',
+  NO_THROW
+);</code></pre>
+
+<p><code>MODE</code> 決定 standby 要對這筆 WAL 做到什麼程度：「MODE says what the standby has to have done with the WAL. standby_replay is the default and the only one that helps here: it waits until the record has been replayed and is visible to queries.」——等到記錄真的被套用、對查詢可見為止，不是等到收到而已。原文只點名了 <code>standby_replay</code> 這一個值，其他 MODE 選項沒有進一步展開，這篇也不多猜。把等待這件事丟給伺服器端還有一個好處：client 不用自己寫迴圈重試，也不用擔心兩條連線各自看到不同時間點的答案——問一次，伺服器擋著不回應，直到答案確定為止，前面那段「輪詢比對」的競態問題直接不存在。</p>
+
+<p>捕捉 LSN 的時機也有講究：要在 commit 之後抓 <code>pg_current_wal_flush_lsn()</code>，不是在交易進行中抓。原文的區分很直白：等 in-transaction 的位置，等的是「這筆資料存不存在」；等 post-commit 的位置，等的是「這筆資料算不算數」。抓到之後，這個字串（例如 <code>0/554D1B78</code>）就跟著這次請求往下走——常見的做法是把這個字串塞進一個自訂 response header，跟著這次請求的回應一起送回瀏覽器，下一個請求再原封不動帶回來；如果是伺服器端渲染或背景工作，就直接放進要處理的 job payload 或 session。管線不同，做法都一樣：這個字串跟著「這次寫入」本身走。到了要讀的地方，先對 replica 發一次 <code>WAIT FOR LSN</code>，等成功了才真的把讀送過去。這就是 boringsql 說的「replica has to earn the read」：replica 沒等到，就沒有資格接這次讀。比較 LSN 的時候也有個容易踩的坑：不要拿它們當字串比，要轉成 <code>::pg_lsn</code> 讓 PostgreSQL 自己做順序判斷。語法裡還有一個 <code>NO_THROW</code> 選項，作用可以從應用層那段 <code>Replayed</code> 的註解反推：不管是逾時、replica 被 promote 還是掛掉，回來的都是一個可以檢查的失敗結果，不是一個中斷連線的例外——沒有這個選項，等待失敗大概會直接丟一個 error，應用層就得多包一層錯誤處理，而不是像現在這樣接一個布林值就繼續往下走。</p>
+
+<figure class="vg-w-drag-lsn-catchup" data-mobile="static" data-svg-scroll="720">
+  <style>
+    .vg-w-drag-lsn-catchup { display: grid; gap: var(--s-2); }
+    .vg-w-drag-lsn-catchup svg { width: 100%; height: auto; touch-action: none; }
+    .vg-w-drag-lsn-catchup figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+  </style>
+  <p class="vg-w-affordance">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/><path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+    </svg>
+    <span>拖動圓點 · 模擬 replica 的 replay LSN 位置</span>
+  </p>
+  <svg class="vg-w-drag-lsn-catchup-main" viewBox="0 0 720 170" preserveAspectRatio="xMidYMid meet" role="img" aria-label="LSN 追趕比較">
+    <line x1="60" y1="90" x2="660" y2="90" stroke="var(--muted-2)" stroke-width="1.5" />
+    <line id="vg-w-drag-lsn-catchup-target-line" x1="500" y1="60" x2="500" y2="120" stroke="var(--ink-deep)" stroke-width="2" />
+    <text x="500" y="46" text-anchor="middle" font-family="Manrope, sans-serif" font-size="12" fill="var(--ink-deep)">你剛寫的 LSN：0/554D1B78</text>
+    <circle id="vg-w-drag-lsn-catchup-h" cx="300" cy="90" r="11" fill="var(--accent)" cursor="grab" />
+    <text id="vg-w-drag-lsn-catchup-label" x="300" y="140" text-anchor="middle" font-family="Manrope, sans-serif" font-size="13" fill="var(--ink)">replica replay LSN</text>
+    <text id="vg-w-drag-lsn-catchup-verdict" x="360" y="160" text-anchor="middle" font-family="EB Garamond, serif" font-size="15" font-style="italic" fill="var(--accent-text)">還沒到，讀了就是舊資料</text>
+  </svg>
+  <figcaption>圓點是 replica 目前的 <code>pg_last_wal_replay_lsn()</code>；深色直線是你這次寫入 commit 後拿到的 LSN。圓點追過直線，WAIT FOR LSN 才會判定成功——比較用轉型後的 <code>::pg_lsn</code>，不是字串順序。</figcaption>
+  <script>
+    (function () {
+      if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+      const root = document.querySelector('.vg-w-drag-lsn-catchup');
+      const svg = root.querySelector('svg.vg-w-drag-lsn-catchup-main');
+      const handle = root.querySelector('#vg-w-drag-lsn-catchup-h');
+      const verdict = root.querySelector('#vg-w-drag-lsn-catchup-verdict');
+      const TARGET_X = 500;
+      const X_MIN = 60, X_MAX = 660;
+
+      let dragging = false;
+      function clientToSvgX(clientX) {
+        const pt = svg.createSVGPoint();
+        pt.x = clientX; pt.y = 0;
+        const svgPt = pt.matrixTransform(svg.getScreenCTM().inverse());
+        return Math.max(X_MIN, Math.min(X_MAX, svgPt.x));
+      }
+      function update(x) {
+        handle.setAttribute('cx', x);
+        if (x >= TARGET_X) {
+          verdict.textContent = '追上了，WAIT FOR LSN 判定成功，可以讀';
+          verdict.setAttribute('fill', 'var(--sage-deep)');
+          handle.setAttribute('fill', 'var(--sage-deep)');
+        } else {
+          verdict.textContent = '還沒到，讀了就是舊資料';
+          verdict.setAttribute('fill', 'var(--accent-text)');
+          handle.setAttribute('fill', 'var(--accent)');
+        }
+      }
+      handle.addEventListener('pointerdown', (e) => {
+        dragging = true;
+        handle.setPointerCapture(e.pointerId);
+        handle.setAttribute('cursor', 'grabbing');
+      });
+      handle.addEventListener('pointermove', (e) => {
+        if (!dragging) return;
+        update(clientToSvgX(e.clientX));
+      });
+      handle.addEventListener('pointerup', () => {
+        dragging = false;
+        handle.setAttribute('cursor', 'grab');
+      });
+      update(300);
+    })();
+  </script>
+</figure>
+
+<h2>TIMEOUT 不是正確性開關，是排程決定</h2>
+
+<p>TIMEOUT 這個參數決定的不是資料新不新鮮——它決定的是這次讀落在哪個節點。boringsql 用固定 50 毫秒的 replica lag 量了兩組數字：TIMEOUT 設 500 毫秒，0/400 次讀到舊資料，全部由 replica 服務，p50 53.4 毫秒；TIMEOUT 設 20 毫秒，一樣 0/400 次讀到舊資料，但全部退回主庫，p50 24.0 毫秒。兩組結果的「新不新鮮」完全一樣，差別只在誰接住這次讀、要多付幾毫秒。拖動下面的 TIMEOUT，看這個決定怎麼在 50ms 這條線兩側切換——線以下的每一格都是同一個結果：退回主庫；線以上的每一格也是同一個結果：交給 replica。</p>
+
+<figure class="vg-w-param-demo-timeout-budget" data-mobile="static" data-svg-scroll="720">
+  <style>
+    .vg-w-param-demo-timeout-budget { display: grid; grid-template-rows: auto auto 1fr auto; gap: var(--s-2); }
+    .vg-w-param-demo-timeout-budget .controls { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+    .vg-w-param-demo-timeout-budget .controls input { flex: 1; height: 36px; accent-color: var(--accent); touch-action: none; }
+    .vg-w-param-demo-timeout-budget .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 9ch; text-align: right; }
+    .vg-w-param-demo-timeout-budget .result-row { display: flex; gap: var(--s-3); font-family: var(--sans); font-size: var(--fs-sm); flex-wrap: wrap; }
+    .vg-w-param-demo-timeout-budget .result-row b { color: var(--ink); font-variant-numeric: tabular-nums; }
+    .vg-w-param-demo-timeout-budget svg { width: 100%; height: auto; }
+    .vg-w-param-demo-timeout-budget figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+  </style>
+
+  <div class="controls" data-vg-controls>
+    <label for="vg-w-param-demo-timeout-budget-x">TIMEOUT =</label>
+    <input id="vg-w-param-demo-timeout-budget-x" type="range" min="0" max="500" step="10" value="250" />
+    <span class="readout" id="vg-w-param-demo-timeout-budget-readout">250 ms</span>
+  </div>
+
+  <div class="result-row">
+    <span>stale reads：<b id="vg-w-param-demo-timeout-budget-stale">0 / 400</b></span>
+    <span>服務節點：<b id="vg-w-param-demo-timeout-budget-server">replica</b></span>
+    <span>p50：<b id="vg-w-param-demo-timeout-budget-p50">53.4 ms</b></span>
+  </div>
+
+  <svg viewBox="0 0 720 160" preserveAspectRatio="xMidYMid meet" role="img" aria-label="TIMEOUT 與 replica 追趕時間軸">
+    <line x1="60" y1="110" x2="700" y2="110" stroke="var(--muted-2)" stroke-width="1" />
+    <text x="60" y="130" font-family="Manrope, sans-serif" font-size="11" fill="var(--muted)">commit（t=0）</text>
+    <line id="vg-w-param-demo-timeout-budget-lag-line" x1="120" y1="70" x2="120" y2="150" stroke="var(--ink-deep)" stroke-width="1.5" stroke-dasharray="3 3" />
+    <text x="120" y="60" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--ink-deep)">replica 追上（lag 50ms）</text>
+    <rect id="vg-w-param-demo-timeout-budget-bar" x="60" y="95" width="60" height="18" fill="var(--accent)" opacity="0.45" />
+    <circle id="vg-w-param-demo-timeout-budget-dot" cx="120" cy="104" r="7" fill="var(--sage-deep)" stroke="var(--ink)" stroke-width="1" />
+    <text id="vg-w-param-demo-timeout-budget-dot-label" x="120" y="160" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" font-style="italic" fill="var(--ink)">此刻判定：等到了，交給 replica</text>
+  </svg>
+
+  <figcaption>lag 固定在 50ms（boringsql 該組實驗的設定）；20ms 與 500ms 是原文實際量到的兩個 TIMEOUT，兩者中間畫成一個在 50ms 切換的階梯，不是內插出來的假數字——低於 lag 一律退回主庫、p50 24.0ms，等於或高於 lag 一律由 replica 服務、p50 53.4ms，stale reads 兩邊都是 0。</figcaption>
+
+  <script>
+    (function () {
+      if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+      const root = document.querySelector('.vg-w-param-demo-timeout-budget');
+      const input = root.querySelector('input');
+      const readout = root.querySelector('.readout');
+      const bar = root.querySelector('#vg-w-param-demo-timeout-budget-bar');
+      const dot = root.querySelector('#vg-w-param-demo-timeout-budget-dot');
+      const dotLabel = root.querySelector('#vg-w-param-demo-timeout-budget-dot-label');
+      const server = root.querySelector('#vg-w-param-demo-timeout-budget-server');
+      const p50 = root.querySelector('#vg-w-param-demo-timeout-budget-p50');
+
+      const X0 = 60, X1 = 700, T_MAX = 500;
+      const LAG = 50;
+      function xOf(t) { return X0 + (t / T_MAX) * (X1 - X0); }
+
+      function update() {
+        const t = Number(input.value);
+        readout.textContent = `${t} ms`;
+        bar.setAttribute('width', Math.max(0, xOf(t) - X0));
+        const served = t >= LAG;
+        const dotX = xOf(Math.min(t, LAG));
+        dot.setAttribute('cx', dotX);
+        dot.setAttribute('fill', served ? 'var(--sage-deep)' : 'var(--accent-text)');
+        dotLabel.setAttribute('x', dotX);
+        dotLabel.textContent = served ? '此刻判定：等到了，交給 replica' : '此刻判定：逾時，退回主庫';
+        server.textContent = served ? 'replica' : 'primary';
+        p50.textContent = served ? '53.4 ms' : '24.0 ms';
+      }
+      input.addEventListener('input', update);
+      update();
+    })();
+  </script>
+</figure>
+
+<p>挑 TIMEOUT 之前，至少要先弄清楚兩個數字：這台 replica 平常的 replay_lag 落在哪個範圍，還有連線池能撐幾條同時卡住的等待——前者決定 TIMEOUT 該設多大才划算，後者決定它最多能設多大而不會反過來拖垮系統。</p>
+
+<p>這個機制在應用層要串成三個動作：commit 後在主庫拿 LSN、去 replica 問一次有沒有追上、根據答案決定這次連線走哪個 pool。作者自己的實作把第一步寫成一個完整的函式：</p>
+
+<pre><code class="language-go">// CaptureLSN runs on the PRIMARY, after the commit. Before it, or on
+// any other connection, and you get a position that says nothing
+// about your write.
+func CaptureLSN(ctx context.Context, primary *pgxpool.Pool) (string, error) {
+    var lsn string
+    err := primary.QueryRow(ctx,
+        "SELECT pg_current_wal_flush_lsn()::text").Scan(&lsn)
+    return lsn, err
+}</code></pre>
+
+<p>另外兩個函式的角色寫在註解裡，沒有另外展開實作。負責等待的 <code>Replayed</code>：「asks one replica whether it has caught up to lsn, within budget. Any answer other than success (timeout, promotion, a dead replica) means "read the primary", so every failure path returns false rather than an error.」——逾時、replica 被 promote、replica 掛了，全部歸類成「沒追上」，不丟例外。負責路由的 <code>PoolFor</code>：「is the whole routing decision: the replica has to earn the read.」整條路徑上沒有一步是用猜的，只有「問到了」跟「沒問到」兩種結果，落到哪個連線池全看這個布林值。</p>
+
+<p>把這個邏輯跟最省事的做法「固定睡 50 毫秒」擺在同一條時間軸上看，差別更直接：</p>
+
+<figure class="vg-w-timeline-sleep-vs-wait" data-mobile="keep" data-svg-scroll="720">
+  <style>
+    .vg-w-timeline-sleep-vs-wait svg { width: 100%; height: auto; }
+    .vg-w-timeline-sleep-vs-wait figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-2); }
+  </style>
+  <svg viewBox="0 0 720 210" preserveAspectRatio="xMidYMid meet" role="img" aria-label="固定睡眠與 WAIT FOR 的時間軸比較">
+    <text x="60" y="24" font-family="Manrope, sans-serif" font-size="12" fill="var(--muted)">睡 50ms（固定）</text>
+    <line x1="60" y1="44" x2="660" y2="44" stroke="var(--muted-2)" stroke-width="1" />
+    <rect x="60" y="34" width="600" height="20" fill="var(--muted-2)" opacity="0.4" />
+    <text x="360" y="48" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--ink)">每次都付滿 50ms，不管 replica 那次追上了沒</text>
+
+    <text x="60" y="94" font-family="Manrope, sans-serif" font-size="12" fill="var(--muted)">WAIT FOR（replica 這次 10ms 就追上）</text>
+    <line x1="60" y1="114" x2="660" y2="114" stroke="var(--muted-2)" stroke-width="1" />
+    <rect x="60" y="104" width="120" height="20" fill="var(--sage-deep)" opacity="0.55" />
+    <text x="120" y="118" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--ink)">10ms</text>
+
+    <text x="60" y="164" font-family="Manrope, sans-serif" font-size="12" fill="var(--muted)">WAIT FOR（replica 這次 45ms 才追上）</text>
+    <line x1="60" y1="184" x2="660" y2="184" stroke="var(--muted-2)" stroke-width="1" />
+    <rect x="60" y="174" width="540" height="20" fill="var(--sage-deep)" opacity="0.55" />
+    <text x="330" y="188" text-anchor="middle" font-family="Manrope, sans-serif" font-size="11" fill="var(--ink)">45ms</text>
+  </svg>
+  <figcaption>睡眠視窗量的是「最壞情況該等多久」，然後每次都照付；WAIT FOR 量的是「這一次實際等多久」，replica 早追上就早結束。兩者的上限可以設得一樣，付出的中位數不一樣。</figcaption>
+</figure>
+
+<p>這個保證本身有代價，而且代價集中在一個容易忽略的地方。TIMEOUT 選太短，退回主庫沒問題；但 boringsql 提醒的是另一種情境：「a cluster-wide lag event times out every waiter at roughly the same moment. The system then does the opposite of what you built it for and stampedes the primary with the traffic it was supposed to be shielded from.」——replica 整體卡住的那一刻，所有等待中的 reader 幾乎同時判定逾時，一起轉頭回打主庫，正好是原本想避免的那種流量尖峰。另一個容易漏掉的成本是連線本身：「a waiting reader holds a connection for the whole duration of the timeout」——等待期間那條連線是被占著的，TIMEOUT 得跟連線池大小一起算，不是憑感覺挑一個數字。往下推一步：如果連線池的餘裕只留給「正常速度」的查詢，一批讀同時卡在 WAIT FOR 上等到逾時，這批等待的讀就可能把連線池占滿，連其他原本無關的查詢都排不進來——TIMEOUT 選太大時真正的代價，不是等待本身拖慢了誰，是等待期間連線被鎖住的機會成本。測試時要人工重現「replica 明顯落後」這種情境，boringsql 用的是 <code>recovery_min_apply_delay</code>：這顆設定本來的用途就是刻意延後 replay，正好拿來造出可重複的落後場景。這整套語法目前測試環境是 <code>postgres:19beta3</code>——PostgreSQL 19 還在 beta，正式版釋出前介面仍可能微調，現在能確認的是這套機制本身，不是最終語法一定長這樣。</p>
+
+<h2>跟兩個懶辦法、一個重辦法比起來</h2>
+
+<p>把幾種做法擺在同一張表上看最清楚。boringsql 在沒有額外人工延遲的環境（同機房 replica）量了四種讀法：</p>
+
+<figure class="vg-w-table-baseline-strategies" data-mobile="keep">
+  <style>
+    .vg-w-table-baseline-strategies { overflow-x: auto; }
+    .vg-w-table-baseline-strategies table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+    .vg-w-table-baseline-strategies thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); }
+    .vg-w-table-baseline-strategies tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); }
+    .vg-w-table-baseline-strategies td.num { font-variant-numeric: tabular-nums; text-align: right; }
+    .vg-w-table-baseline-strategies figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-2); }
+  </style>
+  <table>
+    <thead>
+      <tr>
+        <th>讀法</th>
+        <th class="num">stale reads</th>
+        <th class="num">replica 服務比例</th>
+        <th class="num">p50</th>
+        <th class="num">p95</th>
+        <th class="num">p99</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td>全讀主庫</td><td class="num">0 / 1000</td><td class="num">0%</td><td class="num">1.9 ms</td><td class="num">3.1 ms</td><td class="num">4.3 ms</td></tr>
+      <tr><td>直接讀 replica（naive）</td><td class="num">992 / 1000</td><td class="num">100%</td><td class="num">1.8 ms</td><td class="num">2.5 ms</td><td class="num">9.2 ms</td></tr>
+      <tr><td>先睡 50ms 再讀 replica</td><td class="num">0 / 1000</td><td class="num">100%</td><td class="num">53.9 ms</td><td class="num">57.5 ms</td><td class="num">62.0 ms</td></tr>
+      <tr><td>WAIT FOR，再讀 replica</td><td class="num">0 / 1000</td><td class="num">100%</td><td class="num">2.8 ms</td><td class="num">4.2 ms</td><td class="num">6.4 ms</td></tr>
+    </tbody>
+  </table>
+  <figcaption>全讀主庫最穩但完全放棄分流；直接讀 replica 最快也最危險，992/1000 次讀到舊資料；睡 50ms 把新鮮度找回來了，但每一次讀都固定多付 50ms，不管那次 replica 到底追上了沒；WAIT FOR 拿到接近全讀主庫的正確性，p50 只比全讀主庫多 1 到 2 毫秒。</figcaption>
+</figure>
+
+<p>換一個角度看，這幾種做法真正不同的地方是把等待的成本轉嫁給誰。這裡有兩顆設定要先分工清楚：<code>synchronous_standby_names</code> 決定哪些 standby 有資格參與同步，<code>synchronous_commit</code> 決定要等到哪個階段才算 commit 完成——把後者設成 <code>remote_apply</code>，才是讓每一個寫入都背上 replay 等待的那個開關。官方文件的說法是：commits will wait until replies from the current synchronous standby(s) indicate they have received the commit record of the transaction and applied it, so that it has become visible to queries on the standby(s)……this will cause much larger commit delays than previous settings since it waits for WAL replay——換句話說，這顆設定讓「每一個」寫入都背上 replay 等待，不管那筆資料之後有沒有人會急著讀。boringsql 自己的實驗也印證了方向：只是把 standby 加進 <code>synchronous_standby_names</code>，新鮮度問題從 593/600 壓到「somewhere between 3 and 17，depending on the run」，逼近但沒有真正關掉。WAIT FOR 的做法相反：它把成本精準轉嫁給「這一次剛好需要這筆資料」的 reader，其他讀寫完全不受影響。</p>
+
+<div class="vg-w-cq-cost-shift">
+  <style>
+    .vg-w-cq-cost-shift { container-type: inline-size; container-name: vgwcost; margin: var(--s-3) 0; }
+    .vg-w-cq-cost-shift .grid { display: grid; grid-template-columns: 1fr; gap: var(--s-2); }
+    @container vgwcost (min-width: 480px) { .vg-w-cq-cost-shift .grid { grid-template-columns: 1fr 1fr; } }
+    @container vgwcost (min-width: 720px) { .vg-w-cq-cost-shift .grid { grid-template-columns: repeat(4, 1fr); } }
+    .vg-w-cq-cost-shift .card { border: 1px solid var(--line); background: var(--bg-soft); padding: var(--s-2); display: flex; flex-direction: column; gap: var(--s-1); }
+    .vg-w-cq-cost-shift .card h4 { margin: 0; font-family: var(--sans); font-size: var(--fs-sm); color: var(--accent-text); text-transform: uppercase; letter-spacing: 0.04em; }
+    .vg-w-cq-cost-shift .card p { margin: 0; font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink-soft); }
+  </style>
+  <div class="grid">
+    <div class="card"><h4>讀主庫</h4><p>主庫獨自扛下所有讀流量，等於沒有分流。</p></div>
+    <div class="card"><h4>睡眠視窗</h4><p>每次讀都固定多付一段等待，不管 replica 那次到底追上了沒。</p></div>
+    <div class="card"><h4>remote_apply</h4><p>每一個寫入都要等 replay，不只是需要立刻讀回的那個 reader。</p></div>
+    <div class="card"><h4>WAIT FOR LSN</h4><p>只有剛好需要那筆資料的 reader 付等待，且有 TIMEOUT 上限。</p></div>
+  </div>
+</div>
+
+<p>這四張卡片跟前面那張表其實是同一組實驗換了角度看：p50 53.9ms 的「睡 50ms」對應卡片二付出的固定成本；p50 2.8ms 的「WAIT FOR」對應卡片四那句「只有需要的 reader 付」。數字沒有變，變的是由誰付、什麼時候付。</p>
+
+<p>這個機制的適用範圍也不是無限大。WAIT FOR 不能在 function、procedure 或 DO block 裡跑，也不能在 isolation level 高於 READ COMMITTED 的交易裡呼叫——原文寫得很直接：cannot be executed within a transaction with an isolation level higher than READ COMMITTED。standby 上如果剛好有交易持有舊快照，也可能反過來卡住它正在等的那次 replay：「a snapshot held on a standby can block the replay that the wait is waiting for, at which point neither side moves」。這兩條限制其實是同一件事的兩面：隔離層級一旦允許持有比較舊的快照，那個快照本身就可能卡住它正在等的 replay，變成雙方互相等對方，誰都動不了；把限制卡在 READ COMMITTED 以下，等於先把這種自己卡自己的情況擋掉。連線層也有陷阱，作者對這件事的定位是：「The pooler is the one component that already knows where each query is going, so it would be the natural place for this.」——pooler 天生知道每個查詢要往哪送，理論上是收斂這整套邏輯最自然的位置；但現實是「the wait and the read still have to reach the same node, so a pooler sitting in front of a load-balanced multi-replica endpoint breaks the pattern」——PgBouncer 的 transaction pooling 模式沒問題，但如果前面是把讀流量分散到多台 replica 的 load balancer，等的是一個 replica，讀的卻可能是另一個，整套機制形同虛設。Rails 的 Active Record 也踩到類似的坑：它靠比對語句開頭關鍵字判斷是不是寫入，WAIT FOR 不在允許清單上，於是被當成寫入擋下來，得繞到底層的 raw connection 才能發出這個呼叫。</p>
+
+<p>boringsql 自己也劃了界線：「This is not a general fix for stale replicas. WAIT FOR covers the writes whose LSNs you are holding and nothing else.」——這解決的是「我剛寫的這筆，我自己要讀到」，不是「這台 replica 現在到底新不新鮮」這種更大的問題。合理的推測是：一個從沒自己寫過資料、只是打開頁面看別人異動的讀者，LSN 這條路徑幫不上忙——這類讀者要新鮮，還是得回到讀主庫或 <code>remote_apply</code> 這類更貴、涵蓋範圍更廣的保證。LSN 本身也不是什麼需要藏起來的東西，它就是一個字串，像 <code>0/3F8A120</code>，可以放進 response header、job payload 的欄位、或者直接交給下一個服務，跟著請求一路往下傳。</p>
+
+<p>把這些拼起來看，導入這套機制的代價不只是在讀路徑上加一段 WAIT FOR。LSN 得從主庫一路帶到發起讀的那個連線——經過應用層、可能經過 pooler、可能跨服務；ORM 跟 pooler 原本的假設得重新檢查一遍，Active Record 的 write-detection 攔截跟 load-balanced pooler endpoint 是兩個已知會踩到的地方；TIMEOUT 的數字要跟連線池大小一起挑，不是拍腦袋定一個看起來安全的毫秒數。這些都是這套保證換來「比全讀主庫多 1 到 2 毫秒」的實際成本。回到標題那句話：不必回主庫，說的不是永遠不去，是不用再把回主庫當成唯一的安全牌——多數時候 replica 已經追上了，只是程式碼原本沒有辦法確認這件事。</p>
+
+<p class="vg-deep-closer"><strong>Take-away</strong>：TIMEOUT 決定的從來不是資料新不新鮮——LSN 已經把這題解掉了；TIMEOUT 只決定這次讀由誰接、多晚接住。</p>
+
+</div>
