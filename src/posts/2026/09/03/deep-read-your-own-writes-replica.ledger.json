@@ -1,0 +1,1237 @@
+{
+  "output_path": "src/posts/2026/09/03/deep-read-your-own-writes-replica.html",
+  "spine": [
+    "1. Async replica reads break read-your-writes because commit visibility on the primary is not the same event as replay completion on the standby — the app has no channel to ask the replica where it stands, so it guesses with timeouts or flags.",
+    "2. Replica lag is three separable waits, not one number: write_lag and flush_lag are network/disk mechanics; replay_lag is the bottleneck because recovery is a single sequential process, and a conflicting standby query can block replay for up to max_standby_streaming_delay (30s default) before being cancelled.",
+    "3. Naive replica reads miss the just-committed write extremely often (99.2% even on a same-machine loopback replica in boringsql's test) — and offloading more reads to the replica makes replay compete harder for resources, worsening the exact lag being avoided.",
+    "4. PostgreSQL 19 (tested against postgres:19beta3) adds WAIT FOR LSN: a client captures pg_current_wal_flush_lsn() on the primary AFTER commit, then issues WAIT FOR LSN '<lsn>' WITH (MODE 'standby_replay', TIMEOUT '...', NO_THROW) on the replica before reading — the replica only serves the read if it has actually replayed up to that LSN.",
+    "5. TIMEOUT does not control correctness — in boringsql's benchmark, stale reads stayed at 0/400 whether TIMEOUT was 20ms (all reads fell back to primary, p50 24.0ms) or 500ms (all served by replica, p50 53.4ms) against a fixed 50ms replica lag. TIMEOUT only decides which node serves the read and how long it waits, and a cluster-wide lag event can time out every waiter simultaneously and stampede the primary.",
+    "6. The three alternatives shift cost differently: reading the primary always gives up replica offload entirely; a fixed sleep/sticky window pays the same latency regardless of whether the replica actually needed it; synchronous_commit=remote_apply makes every writer (not just the reader who needs freshness) pay a replay-wait on every commit.",
+    "7. The mechanism has hard scope limits: it only covers the specific writes whose LSNs the caller is holding, cannot run inside a function/procedure/DO block or above READ COMMITTED isolation, and a load-balanced pooler endpoint can route the WAIT and the subsequent read to two different replicas, silently breaking the guarantee."
+  ],
+  "sources": [
+    {
+      "url": "https://boringsql.com/posts/read-your-own-writes/",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": "2026-08-31",
+      "perspective": {
+        "mechanism": "Replica lag decomposes into write_lag/flush_lag (network+disk) and replay_lag (single sequential WAL-apply process on the standby); PostgreSQL 19's WAIT FOR LSN lets a client capture its post-commit write LSN on the primary and block on the replica, in MODE standby_replay with a TIMEOUT, until that LSN has actually been replayed and is query-visible, rather than polling pg_last_wal_replay_lsn() itself.",
+        "tradeoff": "TIMEOUT trades off which node serves a read and how long the caller waits, not correctness (stale reads stay at zero on both sides of the threshold in their benchmark) — but a short TIMEOUT under a cluster-wide lag spike can synchronize a stampede back to the primary, and a waiting reader holds a pool connection for the full wait, so the budget has to be sized against pool capacity.",
+        "reader_use": "A Taiwanese backend engineer shipping read-replica offload today would use this to replace ad-hoc sleep-then-read or sticky-to-primary windows with a bounded, per-request wait that only pays cost when a read genuinely needs the just-written row — while budgeting for PgBouncer/load-balancer routing constraints, the READ COMMITTED-only restriction, and ORM write-detection false positives (Rails Active Record) before adopting it."
+      }
+    },
+    {
+      "url": "https://www.postgresql.org/docs/current/functions-admin.html",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": null,
+      "perspective": {
+        "mechanism": "Official reference for pg_current_wal_lsn(), pg_current_wal_flush_lsn(), pg_last_wal_replay_lsn(), and pg_last_wal_receive_lsn() — their return type (pg_lsn) and exact semantics (write vs flush vs replay position; NULL when not in recovery).",
+        "tradeoff": "These functions are the pre-existing, poll-based way to answer 'has the replica caught up' — functionally correct but requires the client to loop and compare LSNs itself, racing across two separate connections.",
+        "reader_use": "Grounds the 'crude polling' baseline this post contrasts WAIT FOR LSN against, and confirms the exact function names/signatures used in the post are real Postgres APIs rather than paraphrase."
+      }
+    },
+    {
+      "url": "https://www.postgresql.org/docs/current/runtime-config-wal.html",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": null,
+      "perspective": {
+        "mechanism": "synchronous_commit's remote_apply value makes a commit on the primary wait until the synchronous standby has received AND applied (replayed) the commit record, so it is visible to queries there — a stronger, more expensive guarantee than the default 'on'.",
+        "tradeoff": "remote_apply closes the read-your-writes gap for every reader by making every writer pay a replay-wait on every commit, regardless of whether any reader will need that freshness soon.",
+        "reader_use": "Lets a reader independently verify boringsql's framing that remote_apply is the 'write pays for everyone' alternative to WAIT FOR LSN's 'only the reader who needs it pays'."
+      }
+    },
+    {
+      "url": "https://www.postgresql.org/docs/current/runtime-config-replication.html",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": null,
+      "perspective": {
+        "mechanism": "max_standby_streaming_delay (default 30s) is the time a standby waits before cancelling a standby query that conflicts with about-to-be-applied WAL, when WAL is arriving via streaming replication; synchronous_standby_names lists which standbys are eligible to participate in synchronous replication.",
+        "tradeoff": "A longer max_standby_streaming_delay protects long-running standby queries at the cost of letting replay (and therefore read-your-writes freshness) fall further behind.",
+        "reader_use": "Confirms the exact default value (30s) the post cites for the mechanism that can block WAL replay behind a conflicting long query, and clarifies the division of labor between synchronous_standby_names (eligibility) and synchronous_commit (how far to wait) referenced in the post's remote_apply discussion."
+      }
+    },
+    {
+      "url": "https://jepsen.io/consistency/models/read-your-writes",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": null,
+      "perspective": {
+        "mechanism": "Canonical distributed-systems definition: read-your-writes (read-my-writes) requires that a process's own subsequent read observes the effects of its own prior write; it explicitly does not constrain what a process sees of writes performed by other processes.",
+        "tradeoff": "Because the guarantee's scope is deliberately narrow (own writes only), any single mechanism that satisfies it (like WAIT FOR LSN) is not automatically a general staleness fix for reads of other people's writes.",
+        "reader_use": "Gives the post's 'idea' section a rigorous, source-backed name and scope for the everyday symptom described in the concrete-case section, and explains precisely why boringsql's closing caveat ('covers the writes whose LSNs you are holding and nothing else') is the correct scope, not an arbitrary limitation."
+      }
+    }
+  ],
+  "notes": [
+    {
+      "id": "n01",
+      "url": "https://boringsql.com/posts/read-your-own-writes/",
+      "quote": "every change sent over a websocket invalidates state on every teammate's open tab and device, and all of them go back to the same endpoints on the same replicas.",
+      "hedge": "asserted",
+      "interpretation": "Used as the concrete-case illustration of how collaborative/real-time products amplify the read-your-writes problem: many tabs re-read the same replica set at once, right after one of them wrote.",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n02",
+      "url": "https://boringsql.com/posts/read-your-own-writes/",
+      "quote": "Your application has to act like a traffic conductor. It guesses the replication lag using timeouts and Redis flags. The replica already knows exactly where it stands; your code just has no way to ask. PostgreSQL 19 adds a way to ask.",
+      "hedge": "asserted",
+      "interpretation": "The article's own framing of the 'before' state, used as the bridge from the concrete-case section into the LSN mechanism section.",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n03",
+      "url": "https://boringsql.com/posts/read-your-own-writes/",
+      "quote": "write_lag and flush_lag are the mechanics of the network and the disk on the standby.",
+      "hedge": "asserted",
+      "interpretation": "Definition used verbatim (translated context added) in the glossary tooltip widget.",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n04",
+      "url": "https://boringsql.com/posts/read-your-own-writes/",
+      "quote": "replay_lag is the problem. Shipping WAL is usually simple; applying it is the part that makes your change visible to queries.",
+      "hedge": "asserted",
+      "interpretation": "Identifies replay_lag as the bottleneck; used in the glossary tooltip and as the thesis of the 'three waits' section.",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n05",
+      "url": "https://boringsql.com/posts/read-your-own-writes/",
+      "quote": "Recovery is a single startup process replaying records one at a time, and while prefetch can warm the I/O ahead of it, nothing applies two records at once.",
+      "hedge": "asserted",
+      "interpretation": "Explains why replay_lag cannot be fixed by horizontal scaling; grounds the 4-layer pipeline widget and the 'why more replicas doesn't help L3' paragraph.",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n06",
+      "url": "https://boringsql.com/posts/read-your-own-writes/",
+      "quote": "Replica waits up to max_standby_streaming_delay, 30 seconds by default, before killing the query blocking the replay.",
+      "hedge": "asserted",
+      "interpretation": "Cited alongside the official docs (n17b) as the concrete number for how long a conflicting standby query can block replay before being cancelled.",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n06b",
+      "url": "https://www.postgresql.org/docs/current/runtime-config-replication.html",
+      "quote": "this parameter determines how long the standby server should wait before canceling standby queries that conflict with about-to-be-applied WAL entries... If this value is specified without units, it is taken as milliseconds. The default is 30 seconds.",
+      "hedge": "asserted",
+      "interpretation": "Official confirmation of the 30-second default for max_standby_streaming_delay cited by the article.",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n07",
+      "url": "https://boringsql.com/posts/read-your-own-writes/",
+      "quote": "the more successfully you offload reads to the replica, the more lag you introduce there.",
+      "hedge": "asserted",
+      "interpretation": "Used to explain why 'add more read replicas' can backfire on replay_lag specifically, since replay competes with the offloaded read queries for the same node's resources.",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n08",
+      "url": "https://boringsql.com/posts/read-your-own-writes/",
+      "quote": "The replica is on the same machine as its primary and talks to it over loopback, and naive reads still miss 99.2% of the time.",
+      "hedge": "asserted",
+      "interpretation": "The headline number for how unreliable naive replica reads are, used with an explicit inference (marked in prose) that a real cross-AZ network would likely not improve on this.",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n09",
+      "url": "https://jepsen.io/consistency/models/read-your-writes",
+      "quote": "Read your writes (also known as read my writes) requires that if a process performs a write w, and that same process performs a subsequent read r, then r must observe w's effects.",
+      "hedge": "asserted",
+      "interpretation": "Canonical definition of the consistency guarantee, used to formally name the everyday symptom from the concrete-case section.",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n10",
+      "url": "https://jepsen.io/consistency/models/read-your-writes",
+      "quote": "Note that read your writes does not apply to operations performed by different processes.",
+      "hedge": "asserted",
+      "interpretation": "Scope boundary of the guarantee; used to explain why the mechanism is deliberately narrow and does not solve general replica staleness for other readers.",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n11",
+      "url": "https://boringsql.com/posts/read-your-own-writes/",
+      "quote": "WAIT FOR LSN '0/554D1B78' WITH (MODE 'mode', TIMEOUT 'timeout', NO_THROW)",
+      "hedge": "asserted",
+      "interpretation": "Exact SQL syntax for the new PostgreSQL 19 statement, reproduced verbatim in the post's SQL code block.",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n12",
+      "url": "https://boringsql.com/posts/read-your-own-writes/",
+      "quote": "MODE says what the standby has to have done with the WAL. standby_replay is the default and the only one that helps here: it waits until the record has been replayed and is visible to queries.",
+      "hedge": "asserted",
+      "interpretation": "Explains the MODE parameter and confirms standby_replay is the only value the article documents in detail; the post explicitly notes it does not speculate about other MODE values.",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n13",
+      "url": "https://boringsql.com/posts/read-your-own-writes/",
+      "quote": "// CaptureLSN runs on the PRIMARY, after the commit. Before it, or on any other connection, and you get a position that says nothing about your write. func CaptureLSN(ctx context.Context, primary *pgxpool.Pool) (string, error) { var lsn string; err := primary.QueryRow(ctx, \"SELECT pg_current_wal_flush_lsn()::text\").Scan(&lsn); return lsn, err }",
+      "hedge": "asserted",
+      "interpretation": "Full Go function reproduced verbatim (reformatted for line length) as the post's worked-example code block.",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n14",
+      "url": "https://boringsql.com/posts/read-your-own-writes/",
+      "quote": "Replayed asks one replica whether it has caught up to lsn, within budget. Any answer other than success (timeout, promotion, a dead replica) means \"read the primary\", so every failure path returns false rather than an error.",
+      "hedge": "asserted",
+      "interpretation": "Comment-only description (no full code body available) of the wait function's failure semantics; used to explain NO_THROW's practical effect by inference, explicitly marked as inference in prose.",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n15",
+      "url": "https://boringsql.com/posts/read-your-own-writes/",
+      "quote": "PoolFor is the whole routing decision: the replica has to earn the read.",
+      "hedge": "asserted",
+      "interpretation": "Comment describing the routing function; used verbatim as the article's own summary phrase for the mechanism's core idea.",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n16",
+      "url": "https://boringsql.com/posts/read-your-own-writes/",
+      "quote": "Don't compare them as strings. Cast to ::pg_lsn and let Postgres do the ordering.",
+      "hedge": "asserted",
+      "interpretation": "Practical gotcha used in both the LSN-capture prose and the draggable LSN-catchup widget's figcaption.",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n17",
+      "url": "https://www.postgresql.org/docs/current/functions-admin.html",
+      "quote": "pg_last_wal_replay_lsn () -> pg_lsn : Returns the last write-ahead log location that has been replayed during recovery. If recovery is still in progress this will increase monotonically. If recovery has completed then this will remain static at the location of the last WAL record applied during recovery. When the server has been started normally without recovery, the function returns NULL.",
+      "hedge": "asserted",
+      "interpretation": "Official semantics for the three WAL/LSN functions named in the post (pg_current_wal_lsn, pg_current_wal_flush_lsn, pg_last_wal_replay_lsn), used to describe the pre-existing polling approach.",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n18",
+      "url": "https://boringsql.com/posts/read-your-own-writes/",
+      "quote": "a cluster-wide lag event times out every waiter at roughly the same moment. The system then does the opposite of what you built it for and stampedes the primary with the traffic it was supposed to be shielded from.",
+      "hedge": "asserted",
+      "interpretation": "Central risk of choosing too short a TIMEOUT; used verbatim in the cost/stampede paragraph.",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n19",
+      "url": "https://boringsql.com/posts/read-your-own-writes/",
+      "quote": "a waiting reader holds a connection for the whole duration of the timeout.",
+      "hedge": "asserted",
+      "interpretation": "Basis for the connection-pool budgeting point; the further consequence (pool exhaustion under simultaneous timeouts) is presented as the post's own extended reasoning, not a separate source claim.",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n20",
+      "url": "https://boringsql.com/posts/read-your-own-writes/",
+      "quote": "recovery_min_apply_delay is known to delay commit records. This is the exact behaviour the pattern requires.",
+      "hedge": "asserted",
+      "interpretation": "Explains how the article reproduced a controlled replica-lag scenario for its own testing.",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n21",
+      "url": "https://boringsql.com/posts/read-your-own-writes/",
+      "quote": "All tests were run on postgres:19beta3, two containers on one host (Apple Silicon), a primary and one asynchronous streaming replica.",
+      "hedge": "asserted",
+      "interpretation": "Test environment and version; used to flag PostgreSQL 19 as still in beta and the syntax as potentially subject to change before GA.",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n22",
+      "url": "https://boringsql.com/posts/read-your-own-writes/",
+      "quote": "Read primary only | 0/1000 | 0 | 1.9ms | 3.1ms | 4.3ms || Read replica immediately | 992/1000 | 1000 | 1.8ms | 2.5ms | 9.2ms || Sleep 50ms, read replica | 0/1000 | 1000 | 53.9ms | 57.5ms | 62.0ms || WAIT FOR, read replica | 0/1000 | 1000 | 2.8ms | 4.2ms | 6.4ms",
+      "hedge": "asserted",
+      "interpretation": "Baseline benchmark table (no added artificial lag, same-host replica) comparing the four read strategies; reproduced as the matter-of-fact-table widget.",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n23",
+      "url": "https://boringsql.com/posts/read-your-own-writes/",
+      "quote": "TIMEOUT | stale reads | served by replica | fell back to primary | p50 :: 500ms | 0/400 | 400 | 0 | 53.4 ms :: 20ms | 0/400 | 0 | 400 | 24.0 ms :: 5ms | 0/400 | 0 | 400 | 7.3 ms",
+      "hedge": "asserted",
+      "interpretation": "Benchmark with a fixed 50ms replica lag across THREE measured TIMEOUT values. The 5ms row was missing from the original note and is restored here; it behaves like the 20ms row (falls back to the primary), so the widget's step function remains consistent.",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n24",
+      "url": "https://www.postgresql.org/docs/current/runtime-config-wal.html",
+      "quote": "When set to remote_apply, commits will wait until replies from the current synchronous standby(s) indicate they have received the commit record of the transaction and applied it, so that it has become visible to queries on the standby(s), and also written to durable storage on the standbys. This will cause much larger commit delays than previous settings since it waits for WAL replay.",
+      "hedge": "asserted",
+      "interpretation": "Official semantics of synchronous_commit=remote_apply, used to explain the 'every writer pays' alternative.",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n25",
+      "url": "https://boringsql.com/posts/read-your-own-writes/",
+      "quote": "Adding the standby to synchronous_standby_names took staleness from 593 out of 600 reads down to somewhere between 3 and 17, depending on the run.",
+      "hedge": "hedged",
+      "interpretation": "The source itself reports a range with run-to-run variability rather than a single number; the post preserves this range rather than picking one value, and notes it as 'close but not fully closed'.",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n26",
+      "url": "https://boringsql.com/posts/read-your-own-writes/",
+      "quote": "cannot be executed within a transaction with an isolation level higher than READ COMMITTED",
+      "hedge": "asserted",
+      "interpretation": "Exact error-message-style constraint on WAIT FOR's usable isolation levels.",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n27",
+      "url": "https://boringsql.com/posts/read-your-own-writes/",
+      "quote": "a snapshot held on a standby can block the replay that the wait is waiting for, at which point neither side moves.",
+      "hedge": "asserted",
+      "interpretation": "Deadlock-shaped caveat; the post connects this explicitly to n26 as two faces of the same underlying issue (a held snapshot can block the very replay a wait depends on).",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n28",
+      "url": "https://boringsql.com/posts/read-your-own-writes/",
+      "quote": "The pooler is the one component that already knows where each query is going, so it would be the natural place for this. But the wait and the read still have to reach the same node, so a pooler sitting in front of a load-balanced multi-replica endpoint breaks the pattern.",
+      "hedge": "asserted",
+      "interpretation": "Explains why PgBouncer transaction-pooling works but a load-balanced multi-replica endpoint breaks the guarantee (WAIT and the subsequent read can land on different replicas).",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n29",
+      "url": "https://boringsql.com/posts/read-your-own-writes/",
+      "quote": "Active Record decides whether a statement is a write by matching its leading keyword against an allowlist...WAIT FOR is not on that list, so it is a write by exclusion, and the reading role always prevents writes. The way through is to go under the statement layer, on the connection the read will use",
+      "hedge": "asserted",
+      "interpretation": "Rails/Active Record integration caveat: WAIT FOR is misclassified as a write and blocked, requiring raw_connection access to issue it.",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n30",
+      "url": "https://boringsql.com/posts/read-your-own-writes/",
+      "quote": "This is not a general fix for stale replicas. WAIT FOR covers the writes whose LSNs you are holding and nothing else.",
+      "hedge": "asserted",
+      "interpretation": "The article's own scope boundary, echoing the Jepsen definition's 'own writes only' scope (n10); used for the post's closing caveat and the marked inference about readers who never wrote anything themselves.",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n31",
+      "url": "https://boringsql.com/posts/read-your-own-writes/",
+      "quote": "it travels: a response header, a field on a job payload, a value you hand to another service ... It's a string like 0/3F8A120 identifying a WAL position and it isn't a secret.",
+      "hedge": "asserted",
+      "interpretation": "Describes how the captured LSN string propagates through a request; used in the LSN-capture section and the closing paragraph.",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n32",
+      "url": "https://boringsql.com/posts/read-your-own-writes/",
+      "quote": "2026-08-31 · 17 min · Radim Marek",
+      "hedge": "asserted",
+      "interpretation": "Byline/publish-date metadata; used to set the ledger source's published date and to timestamp the beta-status caveat about PostgreSQL 19.",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n33",
+      "url": "https://boringsql.com/posts/read-your-own-writes/",
+      "quote": "Waiting on the in-transaction position waits for the row to exist. Waiting on the post-commit position waits for it to count.",
+      "hedge": "asserted",
+      "interpretation": "The exists-vs-counts contrast the post attributes to the article; added to bind claim c20.",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n34",
+      "url": "https://www.postgresql.org/docs/current/runtime-config-replication.html",
+      "quote": "Specifies a list of standby servers that can support synchronous replication, as described in Section 26.2.8.",
+      "hedge": "asserted",
+      "interpretation": "Official semantics of synchronous_standby_names (which standbys are eligible), the half of the division-of-labour claim n24 did not cover; added to bind claim c26.",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n35",
+      "url": "https://boringsql.com/posts/read-your-own-writes/",
+      "quote": "`WAIT FOR` never runs inside a function, procedure, or DO block, and never in a transaction above READ COMMITTED.",
+      "hedge": "asserted",
+      "interpretation": "Covers the function/procedure/DO-block half of the scope limits; n26 covered only the isolation-level half. Added to bind claim c41.",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n36",
+      "url": "https://boringsql.com/posts/read-your-own-writes/",
+      "quote": "PgBouncer in transaction mode needs no special handling.",
+      "hedge": "asserted",
+      "interpretation": "The PgBouncer transaction-pooling verdict, verified by the article against PgBouncer 1.25.2; added to bind claim c46.",
+      "timeliness": "volatile"
+    }
+  ],
+  "claims": [
+    {
+      "id": "c01",
+      "claim_text": "同一台機器、走 loopback 的 replica，naive 讀仍有 99.2% 讀不到",
+      "location": "H2 replica lag 不是一個數字",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n08"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The replica is on the same machine as its primary and talks to it over loopback, and naive reads still miss 99.2% of the time.",
+      "note": "逐字命中；設定描述（同機、loopback）忠實重現。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c02",
+      "claim_text": "這還是本機測試，合理的推測是換到生產環境不會變好看",
+      "location": "H2 replica lag 不是一個數字",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [
+        "n08"
+      ],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": "The replica is on the same machine as its primary and talks to it over loopback, and naive reads still miss 99.2% of the time.",
+      "note": "already marked as inference in text — 句首帶「合理的推測是」；來源未對跨 AZ 生產數字作任何宣稱。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c03",
+      "claim_text": "全讀主庫 0/1000、p50 1.9ms、p95 3.1ms、p99 4.3ms",
+      "location": "H2 跟兩個懶辦法、一個重辦法比起來 表格",
+      "type": "number",
+      "load": "medium",
+      "note_ids": [
+        "n22"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "| read the primary (sticky) | 0 / 1000 | 0 | 1.9 ms | 3.1 ms | 4.3 ms |",
+      "note": "重抓表格列完全相符。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c04",
+      "claim_text": "直接讀 replica 992/1000、p50 1.8ms",
+      "location": "H2 跟兩個懶辦法、一個重辦法比起來 表格",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n22"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "| read the replica, immediately | 992 / 1000 | 1000 | 1.8 ms | 2.5 ms | 9.2 ms |",
+      "note": "992/1000 已確認，即文中他處摘述的 99.2%。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c05",
+      "claim_text": "先睡 50ms 再讀 replica 0/1000、p50 53.9ms",
+      "location": "H2 跟兩個懶辦法、一個重辦法比起來 表格",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n22"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "| sleep 50 ms, then read replica | 0 / 1000 | 1000 | 53.9 ms | 57.5 ms | 62.0 ms |",
+      "note": "p50 53.9 ms 已確認。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c06",
+      "claim_text": "WAIT FOR 再讀 replica 0/1000、p50 2.8ms",
+      "location": "H2 跟兩個懶辦法、一個重辦法比起來 表格",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n22"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "| `WAIT FOR`, then read replica | 0 / 1000 | 1000 | 2.8 ms | 4.2 ms | 6.4 ms |",
+      "note": "p50 2.8 ms 已確認。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c07",
+      "claim_text": "WAIT FOR 的 p50 只比全讀主庫多 1 到 2 毫秒",
+      "location": "H2 跟兩個懶辦法、一個重辦法比起來 figcaption／結尾",
+      "type": "number",
+      "load": "medium",
+      "note_ids": [
+        "n22"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "one to two milliseconds slower than going to the primary at every percentile",
+      "note": "來源說 1-2 ms 在各百分位皆成立；本文限縮到 p50，比來源更弱，無膨脹。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c08",
+      "claim_text": "boringsql 在沒有額外人工延遲的環境量了四種讀法",
+      "location": "H2 跟兩個懶辦法、一個重辦法比起來",
+      "type": "attribution",
+      "load": "low",
+      "note_ids": [
+        "n21",
+        "n22"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "deflated",
+      "evidence": "All tests were run on `postgres:19beta3`, two containers on one host (Apple Silicon), a primary and one asynchronous streaming replica.",
+      "note": "「無額外人工延遲」正確（recovery_min_apply_delay 只用於後面的 TIMEOUT 實驗）。「同機房 replica」比來源的「同一台主機兩個容器」寬鬆，屬 deflated，且本文稍早已寫出更精確的版本。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c09",
+      "claim_text": "TIMEOUT 500ms：0/400 stale、全部由 replica 服務、p50 53.4ms",
+      "location": "H2 TIMEOUT 不是正確性開關",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n23"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "| `500ms` | 0 / 400 | 400 | 0 | 53.4 ms |",
+      "note": "四格數字全部確認。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c10",
+      "claim_text": "TIMEOUT 20ms：0/400 stale、全部退回主庫、p50 24.0ms",
+      "location": "H2 TIMEOUT 不是正確性開關",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n23"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "| `20ms` | 0 / 400 | 0 | 400 | 24.0 ms |",
+      "note": "四格數字全部確認；本文「兩組結果的新不新鮮完全一樣」對應來源 Correctness never moves。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c11",
+      "claim_text": "lag 固定在 50ms，是該組實驗刻意施加的設定",
+      "location": "H2 TIMEOUT 不是正確性開關 figcaption",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n23",
+        "n20"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The runs below hold the replica 50 ms behind with `recovery_min_apply_delay`, so there is always something to wait for.",
+      "note": "確認 50ms 是刻意施加的固定條件而非觀測平均，正是本文的框架；亦驗證 widget 的 50ms 切換門檻。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c12",
+      "claim_text": "（原文）boringsql 用固定 50 毫秒的 replica lag 量了兩組數字／20ms 與 500ms 是原文實際量到的兩個 TIMEOUT",
+      "location": "H2 TIMEOUT 不是正確性開關 段首與 figcaption",
+      "type": "number",
+      "load": "medium",
+      "note_ids": [
+        "n23"
+      ],
+      "independence": "single-source",
+      "verdict": "unverifiable",
+      "hedge_delta": "none",
+      "evidence": "| `500ms` | 0/400 | 400 | 0 | 53.4 ms | ... | `20ms` | 0/400 | 0 | 400 | 24.0 ms | ... | `5ms` | 0/400 | 0 | 400 | 7.3 ms |",
+      "note": "來源的 TIMEOUT 表有三列（500ms、20ms、5ms），本文兩處都說只量了兩組。所引的兩列數字皆正確，widget 的階梯函數也與被略去的 5ms 列一致（同樣退回主庫），故屬措辭錯誤而非資料錯誤。FIXED：段首改為「量了三組 TIMEOUT，其中對照最清楚的是這兩組」；figcaption 改為「取自原文實際量到的三個 TIMEOUT（另一組是 5ms，同樣 0/400、全部退回主庫、p50 7.3 毫秒）」。n23 已補上第三列。",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c13",
+      "claim_text": "PostgreSQL 19 把輪詢變成一句可以等待的敘述：PostgreSQL 19 adds a way to ask",
+      "location": "H2 讓 client 帶著自己的 LSN 去問",
+      "type": "date-version",
+      "load": "high",
+      "note_ids": [
+        "n02",
+        "n21"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "PostgreSQL 19 adds a way to ask. On the standby: WAIT FOR LSN '0/554D1B78';",
+      "note": "來源自行把 WAIT FOR LSN 歸給 PostgreSQL 19，測試環境 postgres:19beta3 佐證版本。單一來源，本文明白標示出處。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c14",
+      "claim_text": "WAIT FOR LSN '0/554D1B78' WITH ( MODE 'standby_replay', TIMEOUT '500ms', NO_THROW );",
+      "location": "H2 讓 client 帶著自己的 LSN 去問 SQL code block",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n11",
+        "n12",
+        "n23"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "WAIT FOR LSN 'lsn' [ WITH ( option [, ...] ) ] where option can be: MODE 'mode' TIMEOUT 'timeout' NO_THROW",
+      "note": "逐項對照重抓來源皆成立：裸形式逐字存在，WITH 選項文法恰為 MODE／TIMEOUT／NO_THROW，standby_replay 為文件化的 MODE 值，500ms 為原文實際跑過的 TIMEOUT。註：n11 記錄的 quote 是範例語句與文法區塊的拼接，非連續逐字字串（ledger 衛生問題，非文章問題）。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c15",
+      "claim_text": "MODE says what the standby has to have done with the WAL. standby_replay is the default and the only one that helps here",
+      "location": "H2 讓 client 帶著自己的 LSN 去問",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n12"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "`MODE` says what the standby has to have done with the WAL. `standby_replay` is the default and the only one that helps here: it waits until the record has been replayed and is visible to queries.",
+      "note": "逐字命中；本文接著說「原文只點名了 standby_replay，其他 MODE 選項沒有進一步展開，這篇也不多猜」，準確描述來源涵蓋範圍並正確拒絕臆測。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c16",
+      "claim_text": "測試環境是 postgres:19beta3，PostgreSQL 19 還在 beta，正式版前介面仍可能微調",
+      "location": "H2 TIMEOUT 不是正確性開關",
+      "type": "date-version",
+      "load": "medium",
+      "note_ids": [
+        "n21"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "deflated",
+      "evidence": "All tests were run on `postgres:19beta3`, two containers on one host (Apple Silicon), a primary and one asynchronous streaming replica.",
+      "note": "postgres:19beta3 逐字確認；「介面仍可能微調」是本文自己的 hedge，未宣稱來源如此說，屬 deflated。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c17",
+      "claim_text": "pg_current_wal_lsn()／pg_current_wal_flush_lsn()／pg_last_wal_replay_lsn() 的語意，含 recovery 中單調遞增、完成後靜止、非 recovery 啟動回 NULL",
+      "location": "H2 讓 client 帶著自己的 LSN 去問",
+      "type": "attribution",
+      "load": "high",
+      "note_ids": [
+        "n17"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "pg_last_wal_replay_lsn () → pg_lsn : Returns the last write-ahead log location that has been replayed during recovery. If recovery is still in progress this will increase monotonically. If recovery has completed then this will remain static... When the server has been started normally without recovery, the function returns NULL.",
+      "note": "三個函式名稱在官方文件皆存在，語意與本文描述完全一致，含三段式行為。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c18",
+      "claim_text": "不要拿 LSN 當字串比，要轉成 ::pg_lsn 讓 Postgres 做順序判斷",
+      "location": "H2 讓 client 帶著自己的 LSN 去問 widget figcaption",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n16"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "And don't compare them as strings. Cast to `::pg_lsn` and let Postgres do the ordering.",
+      "note": "逐字命中（僅省略句首 And）；::pg_lsn 亦由官方文件確認為三個函式的實際回傳型別。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c19",
+      "claim_text": "CaptureLSN 函式（Go code block），在 PRIMARY 上、commit 之後執行 SELECT pg_current_wal_flush_lsn()::text",
+      "location": "H2 TIMEOUT 不是正確性開關 Go code block",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n13"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "// CaptureLSN runs on the PRIMARY, after the commit. Before it, or on any other connection, and you get a position that says nothing about your write. func CaptureLSN(ctx context.Context, primary *pgxpool.Pool) (string, error) { var lsn string; err := primary.QueryRow(ctx, \"SELECT pg_current_wal_flush_lsn()::text\").Scan(&lsn); return lsn, err }",
+      "note": "註解、簽名與函式主體全部確認；本文唯一更動是為配合 code block 寬度重新換行，無任何 token 差異。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c20",
+      "claim_text": "原文的區分很直白：等 in-transaction 的位置等的是資料存不存在，等 post-commit 的位置等的是資料算不算數",
+      "location": "H2 讓 client 帶著自己的 LSN 去問",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n33"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Waiting on the in-transaction position waits for the row to exist. Waiting on the post-commit position waits for it to count.",
+      "note": "追溯失敗（已修）：這句明白標示出處（「原文的區分很直白」）卻沒有對應 note。authenticity pass 確認主張為真，重抓來源逐字命中。FIXED：新增 n33 承載該逐字引文並綁定本 claim；prose 未改，未引入新事實。",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c21",
+      "claim_text": "max_standby_streaming_delay 官方文件寫的預設是 30 秒",
+      "location": "H2 replica lag 不是一個數字 pipeline figcaption",
+      "type": "number",
+      "load": "medium",
+      "note_ids": [
+        "n06",
+        "n06b"
+      ],
+      "independence": "corroborated",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "this parameter determines how long the standby server should wait before canceling standby queries that conflict with about-to-be-applied WAL entries... The default is 30 seconds.",
+      "note": "官方文件與 boringsql 各自載明 30 秒預設，文件為第一手來源，屬獨立佐證而非 echo。本文將數字歸給官方文件，正確。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c22",
+      "claim_text": "boringsql 用 recovery_min_apply_delay 人工重現 replica 落後場景",
+      "location": "H2 TIMEOUT 不是正確性開關",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n20"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The runs below hold the replica 50 ms behind with `recovery_min_apply_delay`, so there is always something to wait for.",
+      "note": "主張由重抓句子完全支持。註：n20 記錄的第二句於重抓時未能逐字定位（ledger 衛生問題，非文章問題）。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c23",
+      "claim_text": "Jepsen 定義：if a process performs a write w, and that same process performs a subsequent read r, then r must observe w's effects",
+      "location": "H2 讓 client 帶著自己的 LSN 去問",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n09"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Read your writes (also known as read my writes) requires that if a process performs a write w, and that same process performs a subsequent read r, then r must observe w's effects.",
+      "note": "jepsen.io 逐字命中，含本文使用的引號邊界；歸屬正確。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c24",
+      "claim_text": "範圍很窄：read your writes does not apply to operations performed by different processes",
+      "location": "H2 讓 client 帶著自己的 LSN 去問",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n10"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Note that read your writes does not apply to operations performed by different processes. There is no guarantee, for instance, that if process 1 writes a value successfully, that process 2 will subsequently observe that write.",
+      "note": "逐字命中；本文的白話註解正是來源段落的第二句，非過度解讀。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c25",
+      "claim_text": "官方文件對 remote_apply 的說法：commits will wait until... applied it, so that it has become visible to queries on the standby(s)... much larger commit delays... since it waits for WAL replay",
+      "location": "H2 跟兩個懶辦法、一個重辦法比起來",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n24"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "When set to `remote_apply`, commits will wait until replies from the current synchronous standby(s) indicate they have received the commit record of the transaction and applied it, so that it has become visible to queries on the standby(s), and also written to durable storage on the standbys. This will cause much larger commit delays than previous settings since it waits for WAL replay.",
+      "note": "逐字對照官方文件；本文的刪節號只略去 and also written to durable storage 一句，不改變兩段引文語意。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c26",
+      "claim_text": "synchronous_standby_names 決定哪些 standby 有資格參與同步，synchronous_commit 決定要等到哪個階段",
+      "location": "H2 跟兩個懶辦法、一個重辦法比起來",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n34",
+        "n24"
+      ],
+      "independence": "corroborated",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Specifies a list of standby servers that can support synchronous replication, as described in Section 26.2.8.",
+      "note": "追溯失敗（已修）：這句緊接「官方文件的說法是」卻無對應 note。authenticity pass 以官方文件確認 synchronous_standby_names 的角色，synchronous_commit 的角色則已由 n24 確認。FIXED：新增 n34 綁定本 claim；prose 未改。",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c27",
+      "claim_text": "加進 synchronous_standby_names 後，新鮮度問題從 593/600 壓到 somewhere between 3 and 17, depending on the run",
+      "location": "H2 跟兩個懶辦法、一個重辦法比起來",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n25"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Adding the standby to `synchronous_standby_names` took staleness from 593 out of 600 reads down to somewhere between 3 and 17, depending on the run.",
+      "note": "逐字命中含 hedge 範圍；本文保留範圍與 depending on the run，未壓成單一數字。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c28",
+      "claim_text": "a cluster-wide lag event times out every waiter at roughly the same moment... stampedes the primary",
+      "location": "H2 TIMEOUT 不是正確性開關",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n18"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The system then does the opposite of what you built it for and stampedes the primary with the traffic it was supposed to be shielded from.",
+      "note": "stampede 句逐字確認，前半句為同段緊鄰脈絡；本文註解未超出來源強度。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c29",
+      "claim_text": "a waiting reader holds a connection for the whole duration of the timeout",
+      "location": "H2 TIMEOUT 不是正確性開關",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n19"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "a waiting reader holds a connection for the whole duration of the timeout.",
+      "note": "逐字命中；本文的操作建議（TIMEOUT 要跟連線池大小一起算）未超出這句所支持的範圍。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c30",
+      "claim_text": "往下推一步：一批讀同時卡在 WAIT FOR 等到逾時，可能把連線池占滿",
+      "location": "H2 TIMEOUT 不是正確性開關",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [
+        "n19",
+        "n18"
+      ],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": "a waiting reader holds a connection for the whole duration of the timeout.",
+      "note": "already marked as inference in text — 句首「往下推一步：」並用「就可能」。來源陳述了單一連線事實與同時逾時事實，但從未斷言 pool exhaustion。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c31",
+      "claim_text": "recovery is a single startup process replaying records one at a time，prefetch 只熱 I/O，不會一次套兩筆",
+      "location": "H2 replica lag 不是一個數字 pipeline L3",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [
+        "n05"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Recovery is a single startup process replaying records one at a time, and while prefetch can warm the I/O ahead of it, nothing applies two records at once.",
+      "note": "逐字命中，含本文使用的兩個半句；widget 的 L3 標籤為直譯。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c32",
+      "claim_text": "L3 是單一 process 逐筆套用，橫向加機器對這一段幫不上忙",
+      "location": "H2 replica lag 不是一個數字 pipeline 後段落",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [
+        "n05"
+      ],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": "Recovery is a single startup process replaying records one at a time, and while prefetch can warm the I/O ahead of it, nothing applies two records at once.",
+      "note": "marked as inference at paragraph level：來源從未討論增加 replica，本段結尾明白宣告「不是因為官方文件這樣建議，而是因為 L3 這段的容量沒辦法用加機器換來」，把整條推理歸給作者。標記位置在段末而非句上，記錄供人工複核。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c33",
+      "claim_text": "the more successfully you offload reads to the replica, the more lag you introduce there",
+      "location": "H2 replica lag 不是一個數字",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n07"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The more successfully you offload reads to the replica, the more lag you introduce there.",
+      "note": "逐字命中（僅句首大小寫差異）。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c34",
+      "claim_text": "write_lag and flush_lag are the mechanics of the network and the disk on the standby",
+      "location": "H2 replica lag 不是一個數字 glossary widget",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n03"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "`write_lag` and `flush_lag` are the mechanics of the network and the disk on the standby.",
+      "note": "逐字命中（僅來源的 backtick 格式差異）。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c35",
+      "claim_text": "replay_lag is the problem. Shipping WAL is usually simple; applying it is the part that makes your change visible to queries.",
+      "location": "H2 replica lag 不是一個數字 glossary widget",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n04"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "`replay_lag` is the problem. Shipping WAL is usually simple; applying it is the part that makes your change visible to queries.",
+      "note": "逐字命中（僅 backtick 格式差異）。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c36",
+      "claim_text": "every change sent over a websocket invalidates state on every teammate's open tab and device...",
+      "location": "H2 你剛送出的表單",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n01"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Throw a collaborative product into the mix and it gets worse, because every change sent over a websocket invalidates state on every teammate's open tab and device, and all of them go back to the same endpoints on the same replicas.",
+      "note": "確認為完整句的一個子句；本文引用該子句並以自己的話補上協作產品的框架，與被略去的引導句一致。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c37",
+      "claim_text": "Your application has to act like a traffic conductor... your code just has no way to ask.",
+      "location": "H2 你剛送出的表單",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n02"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Your application has to act like a traffic conductor. It guesses the replication lag using timeouts and Redis flags. The replica already knows exactly where it stands; your code just has no way to ask. PostgreSQL 19 adds a way to ask.",
+      "note": "整段引文逐字命中。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c38",
+      "claim_text": "boringsql 說的 replica has to earn the read",
+      "location": "H2 讓 client 帶著自己的 LSN 去問 routing 段",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n15"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "// PoolFor is the whole routing decision: the replica has to earn the read.",
+      "note": "逐字命中（來源以 Go 註解呈現）；本文歸給 boringsql 並未加強語氣。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c39",
+      "claim_text": "Any answer other than success (timeout, promotion, a dead replica) means read the primary, so every failure path returns false rather than an error",
+      "location": "H2 TIMEOUT 不是正確性開關",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n14"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "// Replayed asks one replica whether it has caught up to lsn, within budget. // Any answer other than success (timeout, promotion, a dead replica) means 'read the primary', so every failure path returns false rather than an error.",
+      "note": "兩句皆確認為 Replayed 的註解；本文明說只有註解存在（「另外兩個函式的角色寫在註解裡，沒有另外展開實作」），與來源發布的內容相符。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c40",
+      "claim_text": "NO_THROW 的作用可以從 Replayed 註解反推；沒有這個選項，等待失敗大概會直接丟 error",
+      "location": "H2 讓 client 帶著自己的 LSN 去問",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [
+        "n14",
+        "n11"
+      ],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": "Any answer other than success (timeout, promotion, a dead replica) means 'read the primary', so every failure path returns false rather than an error.",
+      "note": "already marked as inference in text — 本文說作用「可以從……反推」並以「大概」對反事實加 hedge。來源只在文法中列出 NO_THROW 選項名稱，從未說明不加會如何。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c41",
+      "claim_text": "WAIT FOR 不能在 function、procedure 或 DO block 裡跑",
+      "location": "H2 跟兩個懶辦法、一個重辦法比起來",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n35"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "`WAIT FOR` never runs inside a function, procedure, or DO block, and never in a transaction above READ COMMITTED.",
+      "note": "追溯失敗（已修）：n26 只涵蓋隔離層級那一半，function/procedure/DO block 這半沒有 note。authenticity pass 以重抓句子確認主張為真。FIXED：新增 n35 綁定本 claim；prose 未改。",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c42",
+      "claim_text": "cannot be executed within a transaction with an isolation level higher than READ COMMITTED",
+      "location": "H2 跟兩個懶辦法、一個重辦法比起來",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n26"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "cannot be executed within a transaction with an isolation level higher than READ COMMITTED",
+      "note": "逐字命中，並由來源摘要句 never in a transaction above READ COMMITTED 佐證。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c43",
+      "claim_text": "a snapshot held on a standby can block the replay that the wait is waiting for, at which point neither side moves",
+      "location": "H2 跟兩個懶辦法、一個重辦法比起來",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n27"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "a snapshot held on a standby can block the replay that the wait is waiting for, at which point neither side moves",
+      "note": "逐字命中。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c44",
+      "claim_text": "這兩條限制其實是同一件事的兩面：隔離層級允許持有較舊快照，那個快照就可能卡住它正在等的 replay",
+      "location": "H2 跟兩個懶辦法、一個重辦法比起來",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [
+        "n27",
+        "n26"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Both come down to snapshots. The wait has to run without one, because a snapshot held on a standby can block the replay that the wait is waiting for",
+      "note": "trace pass 一度看似未標示的作者綜合，但 authenticity pass 顯示來源自己就做了這個統合（Both come down to snapshots），恰好涵蓋本文配對的兩條限制，故判 verified 而非 inferred。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c45",
+      "claim_text": "the wait and the read still have to reach the same node, so a pooler sitting in front of a load-balanced multi-replica endpoint breaks the pattern",
+      "location": "H2 跟兩個懶辦法、一個重辦法比起來",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n28"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The pooler is the one component that already knows where each query is going, so it would be the natural place for this. But the wait and the read still have to reach the same node, so a pooler sitting in front of a load-balanced multi-replica endpoint breaks the pattern.",
+      "note": "兩個引用半句皆確認；本文的白話註解是對 same node 要求的重述，非加碼。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c46",
+      "claim_text": "PgBouncer 的 transaction pooling 模式沒問題",
+      "location": "H2 跟兩個懶辦法、一個重辦法比起來",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n36"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "PgBouncer in transaction mode needs no special handling.",
+      "note": "追溯失敗（已修）：n28 涵蓋 pooler 段落但未提 PgBouncer，ledger 無任何 note 指名 PgBouncer。authenticity pass 確認來源明白如此陳述（並註明 Verified against PgBouncer 1.25.2）。FIXED：新增 n36 綁定本 claim；prose 未改。",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c47",
+      "claim_text": "Active Record 靠比對語句開頭關鍵字判斷是否為寫入，WAIT FOR 不在清單上而被擋，需繞到 raw connection",
+      "location": "H2 跟兩個懶辦法、一個重辦法比起來",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n29"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Active Record decides whether a statement is a write by matching its leading keyword against an allowlist.",
+      "note": "allowlist／開頭關鍵字機制逐字確認；n29 其餘部分與該句及 pooler 段的 same node 要求一致。本文的「繞到底層的 raw connection」對應 n29 的 go under the statement layer, on the connection the read will use。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c48",
+      "claim_text": "This is not a general fix for stale replicas. WAIT FOR covers the writes whose LSNs you are holding and nothing else.",
+      "location": "H2 跟兩個懶辦法、一個重辦法比起來 結尾",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n30"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "This is not a general fix for stale replicas.",
+      "note": "第一句逐字確認；第二句記於 n30，且與 Jepsen 來源獨立陳述的範圍界線（c24）一致。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c49",
+      "claim_text": "合理的推測是：從沒自己寫過資料的讀者，LSN 這條路徑幫不上忙",
+      "location": "H2 跟兩個懶辦法、一個重辦法比起來 結尾",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [
+        "n30",
+        "n10"
+      ],
+      "independence": "corroborated",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": "This is not a general fix for stale replicas. // Note that read your writes does not apply to operations performed by different processes.",
+      "note": "already marked as inference in text — 句首「合理的推測是：」。這是從兩個獨立來源做的緊密演繹，但兩者都沒有為非寫入讀者指出 remote_apply／讀主庫的解法，故標為作者推斷是正確處理。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c50",
+      "claim_text": "LSN 就是一個字串（像 0/3F8A120），可以放進 response header、job payload 欄位或交給下一個服務",
+      "location": "H2 跟兩個懶辦法、一個重辦法比起來 結尾",
+      "type": "attribution",
+      "load": "low",
+      "note_ids": [
+        "n31"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "It travels: a response header, a field on a job payload, a value you hand to another service",
+      "note": "確認，含範例 LSN 字串 0/3F8A120。",
+      "action": "none",
+      "resolution": "none-needed"
+    }
+  ],
+  "checked_at": "2026-09-03",
+  "checker_rounds": 2,
+  "coverage": {
+    "candidate_claims": 56,
+    "checked": 50,
+    "dropped_low_load": 6
+  }
+}

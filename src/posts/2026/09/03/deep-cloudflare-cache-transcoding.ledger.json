@@ -1,0 +1,1029 @@
+{
+  "output_path": "src/posts/2026/09/03/deep-cloudflare-cache-transcoding.html",
+  "spine": [
+    "1. Cloudflare 在 Pingora 裡對已經落地的 cache object 做 zstd 轉碼：cache miss 時把 body 編碼成 zstd 才寫盤，cache hit 時把儲存的 zstd 物件讀出解碼，回給 client 的內容不受影響。",
+    "2. 轉碼只挑「200 OK、Content-Encoding 未設、Content-Type 是可壓縮文字、Content-Length 已知且至少 4 KiB」的物件；slice subrequest、已由上游主動壓縮的回應、range request、已預先壓縮的回應、長度未知的 body、二進位內容一律跳過不轉碼。",
+    "3. 4 KiB 門檻卡掉大量小物件的請求數，卻只放棄了約 1% 原本符合資格的 bytes——用捨棄請求數換 byte 覆蓋率。",
+    "4. 流量組成決定了轉碼值不值得：media（圖片、影片、字型）佔 21.4% 請求卻是 63.3% bytes、且多半早已壓縮過；compressible text（HTML/JSON/CSS/JS）佔 67.3% 請求只佔 22.3% bytes，其中約 71% 是完全沒壓縮的裸文字——這才是轉碼真正的目標。",
+    "5. 用 zstd level 3（早期瀏覽器壓縮測試裡比 Brotli 快 42%、檔案大小幾乎相同，比 gzip 在相近速度下小 11.3%）換來一次超過百萬請求規模的測試裡約 2.8 倍（2.834x）的壓縮比；encode 成本 4.31 ns/byte（約 232 MB/s，只在填 cache 那一刻付一次），decode 成本 1.56 ns/byte（約 641 MB/s，每次命中都要付）。",
+    "6. 在 Tiered Cache 架構下，壓縮過的物件以壓縮形式在上下層之間搬運，只有在最後 client-facing 的那一跳才解碼——省的不只是磁碟，還有跨資料中心的頻寬。",
+    "7. Cloudflare 把 4 KiB 門檻與 zstd level 3 明講成「參數而非永久限制」：下一步打算測更高的 zstd level、更廣的內容類型與物件大小、調整不同參數，並研究 range request 與已預先壓縮的 origin 回應這兩塊目前還沒碰的範圍。"
+  ],
+  "sources": [
+    {
+      "url": "https://blog.cloudflare.com/cache-transcoding/",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": "2026-09-01",
+      "perspective": {
+        "mechanism": "在 Pingora 的 cache fill/serve 路徑上插入一層 zstd transcoding：miss 時編碼落盤、hit 時解碼回應，Tiered Cache 上下層之間搬運維持壓縮形式，只在 client-facing 那一跳解碼。資格判斷（Content-Encoding/Content-Type/Content-Length）與例外清單（range、slice、precompressed、unknown length、binary）保證轉碼不改變對外的 cache 語意。",
+        "tradeoff": "拿 CPU（encode 4.31 ns/byte、decode 1.56 ns/byte，level 3 下模型估計額外成本只有幾個百分點）換儲存與跨機房頻寬（測試語料庫裡約 2.8 倍壓縮比、petabytes 級別的等效容量）。門檻設在 4 KiB 是另一組 trade-off：捨棄大量小物件的請求數換取幾乎不損失 byte 覆蓋率（只丟約 1%）。",
+        "reader_use": "對維運自家 CDN／反向代理快取層的工程師，這是一個「對已落地資料做二次轉碼以換取儲存」的具體案例研究：資格判斷放在寫入路徑而非讀取路徑、用真實流量分布（bytes vs 請求數的落差）決定值不值得轉碼、以及把壓縮 level 與大小門檻當成可調參數而非寫死常數，都是可以搬到自己系統上的設計原則。"
+      }
+    },
+    {
+      "url": "https://datatracker.ietf.org/doc/html/rfc8878",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": "2021-02-01",
+      "perspective": {
+        "mechanism": "RFC 8878 定義 Zstandard 壓縮格式本身，並把 zstd 註冊進 IANA 的 HTTP Content Coding Registry，讓 Content-Encoding: zstd 成為合法的 HTTP 語意——Cloudflare 的轉碼設計建立在這個註冊之上。",
+        "tradeoff": "RFC 只定義格式與語意，不涉及實作端的壓縮/CPU 取捨；取捨的部分完全是 Cloudflare 這篇文章自己做的工程決定。",
+        "reader_use": "確認 zstd 作為 HTTP Content-Encoding 是有標準依據的，不是 Cloudflare 自創的私有格式——對任何要在自己代理層支援 zstd 協商的工程師，這是查 wire format 與 registry 條目的第一手來源。"
+      }
+    }
+  ],
+  "notes": [
+    {
+      "id": "n01",
+      "url": "https://blog.cloudflare.com/cache-transcoding/",
+      "quote": "On a cache miss, our Pingora-based proxy encodes the body using zstd before writing it to disk.",
+      "hedge": "asserted",
+      "interpretation": "轉碼的插入點是 cache miss 的寫入路徑：從 origin 拿到的 body 在寫盤前先被編碼成 zstd，而不是先寫原始格式再另外跑一輪背景轉碼。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n02",
+      "url": "https://blog.cloudflare.com/cache-transcoding/",
+      "quote": "the body is decoded back to its original identity representation",
+      "hedge": "asserted",
+      "interpretation": "同一次 miss 裡，回給當下這個請求的 client 之前，body 會被解回原本的 identity representation——也就是說轉碼只影響磁碟上存的東西，不影響這一次 response 本身收到的內容。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n03",
+      "url": "https://blog.cloudflare.com/cache-transcoding/",
+      "quote": "the stored zstd object is read from disk and decoded",
+      "hedge": "asserted",
+      "interpretation": "後續 cache hit 時，磁碟上的 zstd 物件被讀出後解碼，這是「decode 每次命中都要付」的成本來源。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n04",
+      "url": "https://blog.cloudflare.com/cache-transcoding/",
+      "quote": "With Tiered Cache, the compressed representation is transferred from the upper tier to the lower tier in the compressed form. Decoding only happens on the client-facing hop.",
+      "hedge": "asserted",
+      "interpretation": "在多層快取架構下，壓縮的形式一路保持到最後一跳才解碼——這代表省下的不只是磁碟空間，跨層／跨資料中心搬運的那段頻寬也一起省了。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n05",
+      "url": "https://blog.cloudflare.com/cache-transcoding/",
+      "quote": "The prototype only transcodes a `200 OK` response when `Content-Encoding` is unset, the `Content-Type` is compressible text, and the response has a known `Content-Length` of at least 4 KiB.",
+      "hedge": "asserted",
+      "interpretation": "資格判斷是三個條件的交集，而且明確標成「prototype」目前的行為，不是永久規格。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n06",
+      "url": "https://blog.cloudflare.com/cache-transcoding/",
+      "quote": "Slice subrequests, responses using active upstream compression, range requests, precompressed responses, unknown length bodies, and binary content remain unchanged.",
+      "hedge": "asserted",
+      "interpretation": "六類物件明確被排除在轉碼之外；文章沒有針對每一類分別給出個別理由，只列出清單本身。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n07",
+      "url": "https://blog.cloudflare.com/cache-transcoding/",
+      "quote": "A cache layer receiving an object from another tier can see that it is already stored using zstd, and preserve it in that form",
+      "hedge": "asserted",
+      "interpretation": "儲存層會標記編碼狀態，避免同一物件在不同快取層之間被重複編碼。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n08",
+      "url": "https://blog.cloudflare.com/cache-transcoding/",
+      "quote": "In our controlled test corpus, the eligible assets compressed by roughly 2.8 times.",
+      "hedge": "hedged",
+      "interpretation": "這是「符合資格的內容」在特定測試語料庫上的平均壓縮倍率，用「roughly」與「controlled test corpus」限定範圍，不是宣稱全站流量都有這個倍率。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n09",
+      "url": "https://blog.cloudflare.com/cache-transcoding/",
+      "quote": "Compression ratio | 2.834x",
+      "hedge": "asserted",
+      "interpretation": "文章表格裡給出的具體壓縮比數字，對應 n08、n10 描述的同一次測試。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n10",
+      "url": "https://blog.cloudflare.com/cache-transcoding/",
+      "quote": "One performance campaign sent more than a million requests across 10 cache servers. The two assets were approximately 195 KiB and 272 KiB, and both compressed by roughly 2.8 times.",
+      "hedge": "hedged",
+      "interpretation": "測試方法：一次上百萬請求規模的壓力測試、10 台 cache server、只用兩個具體大小的測試物件（195 KiB、272 KiB）。樣本是兩個特定物件的重複請求量，不是隨機抽樣的多樣化內容集合。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n11",
+      "url": "https://blog.cloudflare.com/cache-transcoding/",
+      "quote": "At zstd level 3 (often the default balance of speed and compression size output), our model kept the extra CPU cost to a few percent under the traffic and reuse assumptions we tested.",
+      "hedge": "hedged",
+      "interpretation": "「幾個百分點」是模型化推算出來的額外 CPU 成本，並且明確綁定在「我們測試的流量與重用假設」這個前提下，不是不限條件的通用結論。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n12",
+      "url": "https://blog.cloudflare.com/cache-transcoding/",
+      "quote": "4.31 ns per byte, approximately 232 MB/s",
+      "hedge": "asserted",
+      "interpretation": "encode 端的單位成本與對應吞吐量，這是「填一次 cache 付一次」的那段成本。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n13",
+      "url": "https://blog.cloudflare.com/cache-transcoding/",
+      "quote": "1.56 ns per byte, approximately 641 MB/s",
+      "hedge": "asserted",
+      "interpretation": "decode 端的單位成本與對應吞吐量，比 encode 快，但因為每次 cache hit 都要付一次，累積次數遠多於 encode。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n14",
+      "url": "https://blog.cloudflare.com/cache-transcoding/",
+      "quote": "Images, video, and fonts are usually compressed already. In our traffic sample, this media slice represented 21.4% of requests but 63.3% of bytes.",
+      "hedge": "asserted",
+      "interpretation": "media 類型雖然只佔兩成請求，卻佔了六成以上的 bytes；文章的判斷是這塊多半已經壓縮過，轉碼收益低。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n15",
+      "url": "https://blog.cloudflare.com/cache-transcoding/",
+      "quote": "HTML, JSON, CSS, and JavaScript represented 67.3% of requests and 22.3% of bytes.",
+      "hedge": "asserted",
+      "interpretation": "compressible text 類別的具體內容型別，佔多數請求但只佔一小部分 bytes——這正是轉碼鎖定的目標流量。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n16",
+      "url": "https://blog.cloudflare.com/cache-transcoding/",
+      "quote": "Within that text slice, approximately 71% arrived uncompressed with `Content-Encoding` unset.",
+      "hedge": "hedged",
+      "interpretation": "在 compressible text 這個子集裡，約七成請求本身完全沒帶壓縮——這是轉碼最直接能吃到的那一塊，用「approximately」限定。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n17",
+      "url": "https://blog.cloudflare.com/cache-transcoding/",
+      "quote": "The 4 KiB threshold removed a large number of tiny requests while leaving out only about 1% of the otherwise eligible bytes.",
+      "hedge": "hedged",
+      "interpretation": "門檻設計的算術：犧牲請求數（把大量小物件排除在外）換來幾乎不損失 byte 覆蓋率，用「about 1%」限定精確度。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n18",
+      "url": "https://blog.cloudflare.com/cache-transcoding/",
+      "quote": "Zstandard, or zstd, is a lossless compression algorithm developed by Yann Collet at Facebook and open sourced in 2016.",
+      "hedge": "asserted",
+      "interpretation": "zstd 的起源背景：作者、公司、開源年份。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n19",
+      "url": "https://blog.cloudflare.com/cache-transcoding/",
+      "quote": "In our earlier browser compression testing, it compressed data 42% faster than Brotli while producing nearly the same file size",
+      "hedge": "hedged",
+      "interpretation": "這個比較數字明確標明來源是 Cloudflare「更早的瀏覽器壓縮測試」，不是這次 cache transcoding 專案本身重新測的，屬於引用既有內部數據。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n20",
+      "url": "https://blog.cloudflare.com/cache-transcoding/",
+      "quote": "and produced files 11.3% smaller than gzip at a comparable speed.",
+      "hedge": "hedged",
+      "interpretation": "同一段既有測試的另一半比較：對 gzip 是體積優勢而非速度優勢，速度大致持平。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n21",
+      "url": "https://blog.cloudflare.com/cache-transcoding/",
+      "quote": "The prototype uses zstd level 3, giving us most of the compression benefit without turning cache fills into a CPU bottleneck.",
+      "hedge": "asserted",
+      "interpretation": "選 level 3 的理由：邊際壓縮收益遞減，level 3 是「大部分收益、CPU 還沒吃緊」的落點。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n22",
+      "url": "https://blog.cloudflare.com/cache-transcoding/",
+      "quote": "For next steps, we plan to evaluate higher zstd levels, test a broader range of content types and object sizes, tune different parameters",
+      "hedge": "hedged",
+      "interpretation": "明講門檻與 level 是未來會調整的參數，這句是路線圖式的表態，不是已完成的工作。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n23",
+      "url": "https://blog.cloudflare.com/cache-transcoding/",
+      "quote": "Future work can also examine range requests, pre-compressed origin responses",
+      "hedge": "hedged",
+      "interpretation": "目前被排除在轉碼之外的 range request 與已預先壓縮的 origin 回應，被明講成「未來可能研究」的範圍，不代表短期會支援。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n24",
+      "url": "https://blog.cloudflare.com/cache-transcoding/",
+      "quote": "A small increase in CPU gives Cloudflare petabytes of effective cache capacity and reduces the data transferred between our data centers.",
+      "hedge": "hedged",
+      "interpretation": "「petabytes」是定性描述，文章沒有給出精確的 PB 數字，只是把量級講成 petabytes 等級的等效容量。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n25",
+      "url": "https://blog.cloudflare.com/cache-transcoding/",
+      "quote": "I built during my internship at Cloudflare as part of the 1.1.1.1 Intern Program",
+      "hedge": "asserted",
+      "interpretation": "作者身份：這是 1.1.1.1 Intern Program 的一份實習專案產出，不是正式 GA 功能的官方公告。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n26",
+      "url": "https://datatracker.ietf.org/doc/html/rfc8878",
+      "quote": "Zstandard, or \"zstd\" (pronounced \"zee standard\"), is a lossless data compression mechanism.",
+      "hedge": "asserted",
+      "interpretation": "RFC 8878 對 zstd 的正式定義，佐證 zstd 不是 Cloudflare 自創格式而是有 IETF RFC 規範的標準壓縮機制。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n27",
+      "url": "https://datatracker.ietf.org/doc/html/rfc8878",
+      "quote": "February 2021 — Y. Collet, M. Kucherawy",
+      "hedge": "asserted",
+      "interpretation": "RFC 8878 的發布時間與作者（Yann Collet 本人與 Murray Kucherawy），確認 zstd 標準化與其開發者的直接關聯。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n28",
+      "url": "https://datatracker.ietf.org/doc/html/rfc8878",
+      "quote": "IANA has added the following entry to the \"HTTP Content Coding Registry\" within the \"Hypertext Transfer Protocol (HTTP) Parameters\" registry: Name: zstd",
+      "hedge": "asserted",
+      "interpretation": "zstd 作為 HTTP Content-Encoding 的正式 IANA 註冊，是「client 可以透過 Accept-Encoding: zstd 協商」這件事的標準依據，即便 Cloudflare 這篇文章本身沒有細談協商細節。",
+      "timeliness": "durable"
+    }
+  ],
+  "claims": [
+    {
+      "id": "c01",
+      "claim_text": "流量樣本裡佔六成多 bytes 的是圖片與影片；佔近七成請求、只佔兩成多 bytes 的是 HTML、JSON、CSS 與 JavaScript",
+      "location": "vg-deep-opener",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n14",
+        "n15"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "In our traffic sample, this media slice represented 21.4% of requests but 63.3% of bytes. / HTML, JSON, CSS, and JavaScript represented 67.3% of requests and 22.3% of bytes.",
+      "note": "「六成多」對應 63.3%、「將近七成請求」對應 67.3%、「兩成多 bytes」對應 22.3%，全部落在來源數字範圍內。hero 略去字型屬省略而非誤述，後段有補上。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c02",
+      "claim_text": "（原文）把它從 gzip、Brotli 或完全沒壓縮的原始格式，重新編碼成 zstd",
+      "location": "第一段（dropcap 段）與 range widget verdict",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [
+        "n05",
+        "n06"
+      ],
+      "independence": "single-source",
+      "verdict": "unverifiable",
+      "hedge_delta": "none",
+      "evidence": "The prototype only transcodes a `200 OK` response when `Content-Encoding` is unset ... Slice subrequests, responses using active upstream compression, range requests, precompressed responses, unknown length bodies, and binary content remain unchanged.",
+      "note": "來源明講資格條件之一是 Content-Encoding 未設，且 precompressed／active upstream compression 一律 remain unchanged——已經是 gzip／Brotli 的物件不會被轉碼。原句與來源相反，也與本文後段自己寫的「只處理『完全沒壓縮』的乾淨案例」矛盾。FIXED：改為「把它從完全沒壓縮的原始格式重新編碼成 zstd——已經帶著 gzip 或 Brotli 的物件不在轉碼範圍內」，並一併修正 range widget 的 verdict 文案（移除「還是 gzip」）。",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c03",
+      "claim_text": "這是作者在 Cloudflare 1.1.1.1 Intern Program 實習期間做的原型，文章用 prototype 稱呼，不是全量上線的正式功能",
+      "location": "第一段",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n25",
+        "n05"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "I built during my internship at Cloudflare as part of the 1.1.1.1 Intern Program / The prototype only transcodes a `200 OK` response…",
+      "note": "原文多處以 prototype 稱呼；實習專案身份與非 GA 判斷皆有直接依據。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c04",
+      "claim_text": "Cache miss 時 Pingora-based proxy「把 body 用 zstd 編碼之後才寫盤」",
+      "location": "H2 轉碼發生在寫盤那一刻 第一段",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n01"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "On a cache miss, our Pingora-based proxy encodes the body using zstd before writing it to disk.",
+      "note": "引號內為忠實翻譯，來源為平述句，譯文亦為平述。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c05",
+      "claim_text": "同一次 miss 回給 client 之前，body 會「解回原本的 identity representation」",
+      "location": "H2 轉碼發生在寫盤那一刻 第一段",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n02"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "the body is decoded back to its original identity representation",
+      "note": "引文逐字存在於重抓的原文，強度一致。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c06",
+      "claim_text": "「儲存的 zstd 物件被從磁碟讀出、解碼」是 decode 成本累積的地方",
+      "location": "H2 轉碼發生在寫盤那一刻 第一段",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n03",
+        "n13"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "the stored zstd object is read from disk and decoded",
+      "note": "「每次命中都要付」有來源效能表格 paid on every serve 佐證。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c07",
+      "claim_text": "encode 只需付一次、decode 要付很多次；一個物件填一次可能被讀成千上萬次",
+      "location": "H2 轉碼發生在寫盤那一刻 第一段／CPU 段",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [
+        "n12",
+        "n13"
+      ],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": "4.31 ns per byte (paid once per fill) / 1.56 ns per byte (paid on every serve)",
+      "note": "不對稱本身有來源表格支撐；「成千上萬次」是數量級舉例，以「可能」標成假設性描述。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c08",
+      "claim_text": "壓縮內容「以壓縮形式從上層搬到下層，只有在最後 client-facing 那一跳才解碼」",
+      "location": "H2 轉碼發生在寫盤那一刻 第二段",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n04"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "With Tiered Cache, the compressed representation is transferred from the upper tier to the lower tier in the compressed form. Decoding only happens on the client-facing hop.",
+      "note": "兩句逐字存在，且為平述句；跨資料中心省頻寬與 n24 一致。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c09",
+      "claim_text": "「收到別層物件的快取層，能看出它已經是用 zstd 存的，並且維持這個形式」",
+      "location": "H2 轉碼發生在寫盤那一刻 第二段",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n07"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "A cache layer receiving an object from another tier can see that it is already stored using zstd, and preserve it in that form",
+      "note": "逐字對應，強度一致。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c10",
+      "claim_text": "若沒有標記機制，物件在多層之間可能被重複編碼，幾個百分點的 CPU 估計很可能不再成立",
+      "location": "H2 轉碼發生在寫盤那一刻 第三段",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [
+        "n07",
+        "n11"
+      ],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": "A cache layer receiving an object from another tier can see that it is already stored using zstd, and preserve it in that form",
+      "note": "來源只描述機制存在，未分析拿掉會怎樣。本文用「可能」「很可能」雙重 hedge 標成反事實推論。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c11",
+      "claim_text": "把轉碼放在寫入路徑而非背景工作是沒明講的設計選擇；合理的推測是背景轉碼要多維護排程與掃描邏輯",
+      "location": "H2 轉碼發生在寫盤那一刻 第三段",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [
+        "n01"
+      ],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "重抓確認原文完全沒有討論此選擇。本文以「沒有明講但看得出來」＋「合理的推測是」雙重標記為推斷。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c12",
+      "claim_text": "資格三條件：Content-Encoding 未設定、Content-Type 是可壓縮文字、已知 Content-Length 至少 4 KiB 的 200 OK",
+      "location": "H2 資格判斷 第一段／popover widget",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n05"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The prototype only transcodes a `200 OK` response when `Content-Encoding` is unset, the `Content-Type` is compressible text, and the response has a known `Content-Length` of at least 4 KiB.",
+      "note": "三條件逐項對應，順序調整但語意不變。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c13",
+      "claim_text": "六項排除：slice subrequest、上游主動壓縮的回應、range request、預先壓縮好的回應、長度未知的 body、二進位內容",
+      "location": "H2 資格判斷 第一段",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n06"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Slice subrequests, responses using active upstream compression, range requests, precompressed responses, unknown length bodies, and binary content remain unchanged.",
+      "note": "六項逐一對應且順序相同，重抓確認確為六項。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c14",
+      "claim_text": "文章本身沒有針對每一類逐一說明理由，只列出清單",
+      "location": "H2 資格判斷 第一段",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n06"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Slice subrequests, responses using active upstream compression, range requests, precompressed responses, unknown length bodies, and binary content remain unchanged.",
+      "note": "重抓確認原文只列清單、未逐項給理由。這句同時是後續作者理由的推斷標記。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c15",
+      "claim_text": "「已知 Content-Length」順帶排除 chunked；上游已壓縮被排除是類似邏輯",
+      "location": "H2 資格判斷 第一段後半",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [
+        "n05",
+        "n06"
+      ],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": "…the response has a known `Content-Length` of at least 4 KiB. / …unknown length bodies… remain unchanged.",
+      "note": "被排除的事實有來源；兩個理由是作者推論。緊接在前的「文章本身沒有針對每一類逐一說明理由」已對讀者標示後續為作者自述。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c16",
+      "claim_text": "IANA 在 HTTP Content Coding Registry 登記 zstd；RFC 8878 由 Yann Collet 與 Murray Kucherawy 於 2021 年 2 月發布",
+      "location": "H2 資格判斷 第二段／zstd 段",
+      "type": "date-version",
+      "load": "high",
+      "note_ids": [
+        "n26",
+        "n27",
+        "n28"
+      ],
+      "independence": "corroborated",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "RFC 8878, Y. Collet, M. Kucherawy, February 2021. / IANA has added the following entry to the \"HTTP Content Coding Registry\": Name: zstd",
+      "note": "重抓 datatracker 確認作者、日期與 IANA 條目均存在。Collet 為 zstd 原作者由 Cloudflare 文章獨立佐證。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c17",
+      "claim_text": "文章通篇沒有提到 Accept-Encoding 協商、client 支援判斷或 Vary 標頭",
+      "location": "H2 資格判斷 第二段",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n28"
+      ],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": "",
+      "note": "否定式陳述：主張的是來源「沒有」討論 Accept-Encoding 協商、client 支援判斷或 Vary 標頭，本質上無法用逐字正面引文佐證，故記為 inferred 而非 verified。重抓 Cloudflare 原文確認全文未出現這些討論，n28 的 interpretation 亦記錄同一觀察。本文在文面上以「文章通篇沒有提到這條路」明白標示這是對來源涵蓋範圍的觀察。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c18",
+      "claim_text": "「4 KiB 門檻卡掉了大量小物件的請求，卻只放棄了原本符合資格裡大約 1% 的 bytes」",
+      "location": "H2 資格判斷 第三段",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n17"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The 4 KiB threshold removed a large number of tiny requests while leaving out only about 1% of the otherwise eligible bytes.",
+      "note": "來源以 about 限定，本文用「大約」保留同等 hedge。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c19",
+      "claim_text": "（原文）這是拿捨棄一小部分請求（門檻以下的小物件占多數）去換來幾乎完整的 byte 覆蓋率",
+      "location": "H2 資格判斷 第三段",
+      "type": "number",
+      "load": "medium",
+      "note_ids": [
+        "n17"
+      ],
+      "independence": "single-source",
+      "verdict": "unverifiable",
+      "hedge_delta": "none",
+      "evidence": "The 4 KiB threshold removed a large number of tiny requests while leaving out only about 1% of the otherwise eligible bytes.",
+      "note": "來源說擋掉的是 a large number of tiny requests，原句改述成「一小部分請求」方向相反，也與本文前一句自己引用的「卡掉了大量小物件的請求」矛盾。FIXED：改為「這是拿捨棄大量小物件請求去換來幾乎完整的 byte 覆蓋率」。",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c20",
+      "claim_text": "4 KiB 是這個 prototype 目前唯一直接量化過的門檻決策",
+      "location": "H2 資格判斷 第三段",
+      "type": "superlative",
+      "load": "medium",
+      "note_ids": [
+        "n17",
+        "n21"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The prototype uses zstd level 3, giving us most of the compression benefit without turning cache fills into a CPU bottleneck.",
+      "note": "重抓確認 4 KiB 是原文唯一附上量化理由的門檻決策；level 3 只有定性理由、無數字。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c21",
+      "claim_text": "以 2.834x 估算 48 KiB 約壓到 16.9 KiB，省約 31.1 KiB（示意計算）",
+      "location": "range-input widget",
+      "type": "number",
+      "load": "medium",
+      "note_ids": [
+        "n09",
+        "n08"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "deflated",
+      "evidence": "Compression ratio | 2.834x / In our controlled test corpus, the eligible assets compressed by roughly 2.8 times.",
+      "note": "2.834 為來源表格數字；48 ÷ 2.834 = 16.94、差 31.06，算術正確。widget 自標為示意計算，比來源更保守。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c22",
+      "claim_text": "media 佔 21.4% 請求、63.3% bytes，且「多半早就壓縮過了」",
+      "location": "H2 流量的形狀 第一段／chart widget",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n14"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Images, video, and fonts are usually compressed already. In our traffic sample, this media slice represented 21.4% of requests but 63.3% of bytes.",
+      "note": "數字與內容型別逐項對應；「多半」對應 usually，hedge 強度一致。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c23",
+      "claim_text": "compressible text 佔 22.3% bytes、67.3% 請求，其中「約 71% 是完全沒帶壓縮標頭的裸文字」",
+      "location": "H2 流量的形狀 第一段",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n15",
+        "n16"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "HTML, JSON, CSS, and JavaScript represented 67.3% of requests and 22.3% of bytes. / Within that text slice, approximately 71% arrived uncompressed with `Content-Encoding` unset.",
+      "note": "來源以 approximately 限定 71%，本文用「約」保留。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c24",
+      "claim_text": "chart 裡 text 內部的 29%／71% 是由「約 71% 未壓縮」換算出的請求數佔比，不是 bytes 佔比",
+      "location": "data-driven-chart figcaption",
+      "type": "number",
+      "load": "low",
+      "note_ids": [
+        "n16"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Within that text slice, approximately 71% arrived uncompressed with `Content-Encoding` unset.",
+      "note": "29% 是 100−71 的顯性換算，figcaption 已揭露為換算。圖表已標注基準，讀者不會被誤導。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c25",
+      "claim_text": "百分比來自 Cloudflare 自己的流量樣本，文章沒交代時間窗、地區或客戶涵蓋範圍",
+      "location": "H2 流量的形狀 第二段",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n14",
+        "n15"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "In our traffic sample, this media slice represented 21.4% of requests but 63.3% of bytes.",
+      "note": "in our traffic sample 確為來源用語；重抓確認原文未交代樣本範圍。本文把數字定位成「這次觀察到的樣子」，屬正確的降強度處理。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c26",
+      "claim_text": "Zstandard「由 Yann Collet 在 Facebook 開發、2016 年開源」",
+      "location": "H2 zstd level 3 的算術 第一段",
+      "type": "date-version",
+      "load": "medium",
+      "note_ids": [
+        "n18"
+      ],
+      "independence": "corroborated",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Zstandard, or zstd, is a lossless compression algorithm developed by Yann Collet at Facebook and open sourced in 2016.",
+      "note": "Cloudflare 原文逐字支持；Collet 作者身份另由 RFC 8878 作者欄獨立佐證。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c27",
+      "claim_text": "zstd「比 Brotli 快 42%，檔案大小幾乎一樣」，且明講是早期瀏覽器壓縮測試而非本次專案重測",
+      "location": "H2 zstd level 3 的算術 第一段／table caption",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n19"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "In our earlier browser compression testing, it compressed data 42% faster than Brotli while producing nearly the same file size",
+      "note": "重抓確認 42% 明確歸屬於 earlier browser compression testing；本文兩處都正確標明這層歸屬。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c28",
+      "claim_text": "「跟 gzip 相比，在速度相近的情況下檔案小 11.3%」",
+      "location": "H2 zstd level 3 的算術 第一段／table widget",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n20"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "and produced files 11.3% smaller than gzip at a comparable speed.",
+      "note": "「速度相近」精確對應 at a comparable speed。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c29",
+      "claim_text": "（原文）壓縮率跟 Brotli 打平、比 gzip 更小、速度比兩者都快",
+      "location": "H2 zstd level 3 的算術 第一段",
+      "type": "number",
+      "load": "medium",
+      "note_ids": [
+        "n19",
+        "n20"
+      ],
+      "independence": "single-source",
+      "verdict": "unverifiable",
+      "hedge_delta": "inflated",
+      "evidence": "and produced files 11.3% smaller than gzip at a comparable speed.",
+      "note": "來源只說比 Brotli 快 42%，對 gzip 是 at a comparable speed 而非更快。原句把「速度相近」升級成「速度比兩者都快」，與同段自己引用的「在速度相近的情況下」直接衝突。FIXED：改為「速度比 Brotli 快、跟 gzip 相近」。",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c30",
+      "claim_text": "「這給了我們大部分的壓縮效益，同時沒有把 cache fill 變成 CPU 瓶頸」",
+      "location": "H2 zstd level 3 的算術 第二段",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n21"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The prototype uses zstd level 3, giving us most of the compression benefit without turning cache fills into a CPU bottleneck.",
+      "note": "逐字對應，平述強度一致。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c31",
+      "claim_text": "超過百萬請求規模、橫跨 10 台 cache server、兩個物件（195 KiB 與 272 KiB）都壓縮約 2.8 倍",
+      "location": "H2 zstd level 3 的算術 第二段",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n10"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "One performance campaign sent more than a million requests across 10 cache servers. The two assets were approximately 195 KiB and 272 KiB, and both compressed by roughly 2.8 times.",
+      "note": "重抓確認是 more than a million，本文「超過百萬請求規模」正確。註：ledger spine 第 5 點原寫成「上千萬請求規模」與來源不符，已由 parent 依此更正為「超過百萬請求規模」。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c32",
+      "claim_text": "表格裡給的精確數字是 2.834x",
+      "location": "H2 zstd level 3 的算術 第二段／morph widget",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n09"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Compression ratio | 2.834x",
+      "note": "重抓確認表格數字確為 2.834x，且本文正確歸屬為「表格裡」的精確值，與 roughly 2.8 的敘述句分開處理。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c33",
+      "claim_text": "轉碼後縮成大約三分之一；widget 標示轉碼後約 35.3%（1 ÷ 2.834）",
+      "location": "H2 zstd level 3 的算術 第二段／morph widget",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n08",
+        "n09"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "In our initial testing, this encoding shrunk eligible assets to ⅓ of their original on-disk size on average.",
+      "note": "來源在導言即直接陳述三分之一；widget 的 35.3% 是顯性換算並標明是平均值而非個別物件保證。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c34",
+      "claim_text": "「模型估計額外的 CPU 成本，在我們測試的流量與重用假設下只有幾個百分點」，並明說是模型推算不是量產實測",
+      "location": "H2 zstd level 3 的算術 第三段",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n11"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "At zstd level 3 (often the default balance of speed and compression size output), our model kept the extra CPU cost to a few percent under the traffic and reuse assumptions we tested.",
+      "note": "高負載檢查點：本文完整保留兩層限定，還額外明講是模型推算。無 hedge 膨脹，屬正確的降強度說明。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c35",
+      "claim_text": "encode 4.31 奈秒（約 232 MB/s）只在填 cache 付一次；decode 1.56 奈秒（約 641 MB/s）每次 cache hit 都要付",
+      "location": "H2 zstd level 3 的算術 第三段",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n12",
+        "n13"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "4.31 ns per byte, approximately 232 MB/s, paid once per fill / 1.56 ns per byte, approximately 641 MB/s, paid on every serve",
+      "note": "四個數字全部逐字對應；付費時機對應表格兩欄，非作者推導。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c36",
+      "claim_text": "「CPU 只增加一點點，換來 petabytes 等級的等效快取容量」，且沒有精確 PB 數字",
+      "location": "H2 zstd level 3 的算術 第三段",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n24"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "A small increase in CPU gives Cloudflare petabytes of effective cache capacity and reduces the data transferred between our data centers.",
+      "note": "引文逐字對應；重抓確認原文未給任何精確 PB 數值，本文主動標示這一點。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c37",
+      "claim_text": "641 ÷ 232 約 2.76 倍，跟 2.834x 壓縮比數值接近但量的是不同東西，文章沒有把它們連在一起",
+      "location": "H2 zstd level 3 的算術 第三段（parent 已修正段落）",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n12",
+        "n13",
+        "n09"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "4.31 ns per byte, approximately 232 MB/s / 1.56 ns per byte, approximately 641 MB/s / Compression ratio | 2.834x",
+      "note": "已查核磁碟上現行文字。641 ÷ 232 = 2.763 算術正確；重抓確認原文完全沒有把吞吐比與壓縮比建立關聯，現行寫法與來源一致，先前的「不是巧合」機制敘述已不存在。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c38",
+      "claim_text": "把流量佔比乘上壓縮比推到 petabytes 量級，是定性推算，文章沒有把兩組數字直接相乘",
+      "location": "H2 zstd level 3 的算術 第三段末",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [
+        "n15",
+        "n16",
+        "n09",
+        "n24"
+      ],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": "A small increase in CPU gives Cloudflare petabytes of effective cache capacity and reduces the data transferred between our data centers.",
+      "note": "本文以「有機會」「定性推算」「文章本身沒有把這兩組數字直接相乘」三重標記為推斷。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c39",
+      "claim_text": "「接下來我們打算評估更高的 zstd level、測試更廣泛的內容類型與物件大小、調整不同的參數」",
+      "location": "H2 門檻與版本都只是參數 第一段",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n22"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "For next steps, we plan to evaluate higher zstd levels, test a broader range of content types and object sizes, tune different parameters",
+      "note": "逐字對應；plan to 以「打算」保留同等強度，未寫成已完成。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c40",
+      "claim_text": "「未來的工作也可以研究 range request、預先壓縮過的 origin 回應」",
+      "location": "H2 門檻與版本都只是參數 第一段",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n23",
+        "n06"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Future work can also examine range requests, pre-compressed origin responses",
+      "note": "引文逐字對應，can also examine 的可能性語氣以「也可以研究」保留。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c41",
+      "claim_text": "4 KiB 與 level 3 都不是寫死的常數，文章沒承諾這些數字長期不變",
+      "location": "H2 門檻與版本都只是參數 第一段",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n22",
+        "n05",
+        "n21"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "For next steps, we plan to evaluate higher zstd levels, test a broader range of content types and object sizes, tune different parameters",
+      "note": "來源自列待調整項目直接支持；並以 prototype 稱呼現行行為，未作長期承諾。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c42",
+      "claim_text": "測試物件大小只到一般網頁資源範圍，超大型或幾乎不重複讀取的內容是否適用同一套算術，文章沒給答案",
+      "location": "H2 門檻與版本都只是參數 第一段",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n10",
+        "n22"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The two assets were approximately 195 KiB and 272 KiB / test a broader range of content types and object sizes",
+      "note": "測試物件僅 195 KiB 與 272 KiB；來源自列「更廣的內容類型與物件大小」為待測項，支持「文章沒有給答案」。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c43",
+      "claim_text": "很多 origin 本來就不見得設定壓縮；轉碼是 CDN 自己補一次，不需 origin 配合也不改變 origin 看到的請求與回應",
+      "location": "第二段",
+      "type": "causal",
+      "load": "low",
+      "note_ids": [
+        "n16",
+        "n01",
+        "n02"
+      ],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": "Within that text slice, approximately 71% arrived uncompressed with `Content-Encoding` unset.",
+      "note": "「origin 不見得會設定壓縮」由 n16 的 71% 佐證；成因以「可能」標成猜測；「不改變 origin 看到的請求跟回應」是 n01/n02 機制的定義性延伸。",
+      "action": "none",
+      "resolution": "none-needed"
+    }
+  ],
+  "checked_at": "2026-09-03",
+  "checker_rounds": 2,
+  "coverage": {
+    "candidate_claims": 51,
+    "checked": 43,
+    "dropped_low_load": 8
+  }
+}
