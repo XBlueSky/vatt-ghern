@@ -1,0 +1,441 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">Debian Code Search 打開 profile-guided optimization 那次，編譯器為了不讓分支跨過一個 32-byte 邊界而插入的 NOP，把預期中的效能提升，直接換成了 13% 的全面倒退。</p>
+  <h1 class="vg-post-title">最後一個 cgo 相依，用 Go SIMD 換掉了</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p><span class="vg-dropcap">D</span>ebian Code Search 靠一份反向索引，把整個 Debian 套件庫的原始碼字串對應到出現的檔案，索引能不能塞進磁碟、多快讀出來，七年來都仰賴 C 函式庫 powturbo/TurboPFor，透過 cgo 做整數壓縮與解壓縮。今年八月，作者把這條路徑重寫成純 Go，倚仗的是 Go 1.26 在今年二月引入的一個實驗性套件 <code>simd/archsimd</code>，第一次讓 AVX2、AVX512 這類指令可以直接寫進 Go 程式碼，不必再靠組合語言或 cgo 繞路。</p>
+
+  <p>TurboPFor 這類格式把資料切成固定大小的區塊，每個區塊各自決定一個 bit width，讓區塊內的值都能用這個寬度打包。少數幾個大到超出這個寬度的值，不會反過來拉高整個區塊的 bit width，而是被標記成例外，另外用一個獨立的 bit width 存起來，這樣多數值可以留在窄的寬度裡，不必為了少數離群值集體多付位元。<code>scan()</code> 只出現在 encoder 端，decoder 端不需要，因為解碼的時候 bit width 已經是區塊標頭裡寫死的資訊，直接照著這個位寬把值倒出來就好；真正貴的是編碼的時候要決定這個區塊該用哪個 bit width，而這個決定得先掃過所有候選寬度、算出每個寬度下有幾個例外，才能挑出總成本最低的一個。因為 bit width 是逐區塊決定的，同一個檔案裡，不同區塊可以各自用不同的寬度，取決於那一段資料的值分布；比起整個檔案套用同一個寬度，這樣才不會被少數幾個區塊的離群值拖累到全部。</p>
+
+  <h2>PGO 先撞上的是 SKX102 對齊陷阱</h2>
+
+  <p>作者想拆 cgo 是出於專案純度的偏好。他自己講得很直接：「I would prefer it if I did not have any C code in the project.」（我寧願專案裡完全沒有 C 程式碼）。真正促成重寫的，是 Go 終於有了不必繞道組合語言就能碰到 SIMD 的辦法。</p>
+
+  <p>第一步照例是打開 profile-guided optimization。理論上編譯器看過熱路徑的側寫資料，應該更敢做積極的 inline，效能只會往上走。結果 DCS 的 benchmark 反而全面倒退了 13%。追下去，原因出在一個和效能優化本身毫不相干的角落：Go 編譯器為了修一個叫 SKX102 的 Intel 勘誤（Go issue #35881），規定融合分支序列不能跨過或落在 32-byte 邊界上，遇到會踩線的情況就塞一條 NOP 進去對齊。這條規則疊在一個更早的機制上：2017 年的 mid-stack inlining 提案（proposal #19348）讓 Go 有時得放進 NOP 指令，好讓 inliner 能在上面附掛標記，方便之後的側寫工具定位。PGO 一打開，指令排列跟著變了，某些熱路徑就這樣撞進了對齊陷阱。後續幾個 commit 剛好改動了程式碼，這個倒楣的情境在接下來的優化系列裡就這樣被避開了——純粹是巧合。</p>
+
+  <p>這類問題有意思的地方在於，它不是演算法寫錯，也不是哪個迴圈沒寫好，而是編譯器為了相容特定世代 CPU 而做的底層調整，跟另一個最佳化（PGO 改變的指令排列）疊在一起才會現形，單獨看兩邊都沒問題。原文沒有解釋 32-byte 邊界為什麼會卡到效能，以下是照常理推想的機制：CPU 前端一次抓指令是照固定大小的視窗抓的；如果一組融合分支剛好跨在視窗邊界上，在有 SKX102 這個勘誤的處理器世代就可能不穩定，Go 編譯器的作法是預先算好每個分支的位置，只要會跨到邊界就墊一顆 NOP，讓它整個往後挪、不再跨界。PGO 打開之後，因為某些函式被更積極地 inline，程式碼在記憶體裡的位元組位置全部跟著變動。一個原本安全、離邊界還有餘裕的分支，可能因為前面多塞了幾行程式碼，就剛好撞上新的邊界，於是需要新的 NOP 墊上去。這個變動剛好卡進某條熱路徑，才會讓整體 benchmark 退步。</p>
+
+  <h2>把配置搬出熱路徑</h2>
+
+  <p>PGO 站穩之後，下一個要清的是配置熱點。decoder 原本在熱路徑裡用 <code>make()</code> 動態配置暫存陣列，每呼叫一次就要跟 allocator 打一次交道，這種成本平常不顯眼，量大了就是全面的拖累。作者把這個暫存陣列改成寫進 <code>StreamDecoder</code> 型別裡的固定欄位，一個 <code>vals [256]uint32</code>，搭配重新設計過的 API，讓呼叫端能重複使用同一個 decoder 實例，不必每次重新配置。這個改動把 debian-mix 這個混合真實工作負載的解碼速度，從 773 Mval/s 拉到 858 Mval/s，多了將近一成一。這一步完全沒碰 SIMD，也沒有動到任何演算法本身，純粹是把配置成本從迴圈內部搬出去，提升幅度遠不如後面幾輪，但也不必動到指令集。</p>
+
+  <p>這個 API 改動假設呼叫端會長時間跑在伺服器裡、重複處理大量查詢——建立一次 decoder、之後重複呼叫，是 DCS 這種常駐服務的常態用法。</p>
+
+  <h2>用 generics 把 bit width 釘死成編譯期常數</h2>
+
+  <p>TurboPFor 這類整數壓縮格式的核心是 bitpacking，把一組整數用剛好夠用的 bit 數打包，不多浪費一個位元。bit width 理論上可以是 1 到 32 之間任何一個數字，問題是，如果這個寬度只在執行期才確定，編譯器就沒辦法把移位量、遮罩這些運算寫死成常數，每一次都要多繞一層判斷。作者用 Go 的 generics 把 bit width 變成型別參數，對 1 到 32 每一個寬度各自生成一份特化程式碼。原文的說法是：「Because the bitWidth is now known at compile time, the Go compiler can generate close to the optimal machine code for each bit width」（因為 bitWidth 現在是編譯期常數，Go 編譯器可以為每個 bit width 生成接近最佳的機器碼）——迴圈能不能展開、分支能不能消掉，全看這個寬度是不是常數。</p>
+
+  <p>這個改動對「餘數區塊」最有感，也就是一個 block 裡塞不滿整個向量化寬度、留下來的那截尾巴。原文寫的是「Encoding remainder blocks is quite a bit faster (full blocks use the vertical layout anyway)」，完整區塊本來就走向量化的 vertical layout，能再省的空間有限，真正吃到特化紅利的是這些邊角料。</p>
+
+  <p>「vertical layout」實際上怎麼把多個值塞進一個 SIMD 暫存器，原文沒有進一步展開，但合理的推測是，它假設區塊裡的值數量剛好湊滿一整個向量寬度；一旦剩下不足一個向量寬度的尾巴，就沒有整份資料可以一次處理，只能退回逐值的 remainder 路徑，這也解釋了為什麼 generics 特化幾乎只對 remainder 有感。</p>
+
+  <figure class="vg-w-table-bitwidth" data-mobile="keep">
+    <style>
+      .vg-w-table-bitwidth { overflow-x: auto; }
+      .vg-w-table-bitwidth table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-bitwidth thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); }
+      .vg-w-table-bitwidth tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); }
+      .vg-w-table-bitwidth td.num { font-variant-numeric: tabular-nums; text-align: right; }
+      .vg-w-table-bitwidth td.up { color: var(--accent-text); }
+    </style>
+    <table>
+      <thead>
+        <tr>
+          <th>benchmark</th>
+          <th class="num">特化前（Mval/s）</th>
+          <th class="num">特化後（Mval/s）</th>
+          <th class="num">提升</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>bitpacking-bw1</td><td class="num">751.2</td><td class="num">1120.5</td><td class="num up">+49.15%</td></tr>
+        <tr><td>bitpacking-bw2</td><td class="num">716.8</td><td class="num">1176.0</td><td class="num up">+64.07%</td></tr>
+        <tr><td>bitpacking-bw7</td><td class="num">700.0</td><td class="num">1078.5</td><td class="num up">+54.08%</td></tr>
+        <tr><td>bitpacking-bw1-exc</td><td class="num">524.8</td><td class="num">736.8</td><td class="num up">+40.40%</td></tr>
+        <tr><td>bitpacking-bw7-exc</td><td class="num">566.7</td><td class="num">787.7</td><td class="num up">+38.99%</td></tr>
+        <tr><td>debian-mix</td><td class="num">559.5</td><td class="num">783.8</td><td class="num up">+40.09%</td></tr>
+      </tbody>
+    </table>
+    <figcaption>generics 對 remainder block 做 bit width 特化前後的吞吐量（Mval/s），數字取自作者釋出的 benchmark；exc 代表帶 exceptions 的路徑。</figcaption>
+  </figure>
+
+  <p>上面表格裡的 exc，指的是後面會細講的帶 exceptions 路徑，先記得它也吃到特化的紅利就好。從表格可以看到，remainder block 的特化收益普遍落在 39% 到 64% 之間，純打包和帶 exceptions 的路徑都吃得到，不是只有某個特定 bit width 才特別有感。</p>
+
+  <figure class="vg-w-range-bitwidth" data-mobile="static" data-svg-scroll="720">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m18 8 4 4-4 4"/><path d="M2 12h20"/><path d="m6 8-4 4 4 4"/></svg>
+      <span>拖曳調整 bit width，看 32 bit 能塞進幾個完整值 · 1 至 32 bit</span>
+    </p>
+    <style>
+      .vg-w-range-bitwidth { display: flex; flex-direction: column; gap: var(--s-2); }
+      .vg-w-range-bitwidth .ctl { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); }
+      .vg-w-range-bitwidth input[type="range"] { flex: 1; height: 36px; accent-color: var(--accent); }
+      .vg-w-range-bitwidth .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 5ch; text-align: right; }
+      .vg-w-range-bitwidth svg.vg-w-range-bitwidth-main { width: 100%; height: auto; display: block; }
+      .vg-w-range-bitwidth .summary { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--ink-soft); }
+      @media (hover: none) and (pointer: coarse) {
+        .vg-w-range-bitwidth .ctl { display: none; }
+      }
+    </style>
+    <div class="ctl" data-vg-controls>
+      <label for="vg-w-range-bitwidth-k">bit width =</label>
+      <input id="vg-w-range-bitwidth-k" type="range" min="1" max="32" step="1" value="5" />
+      <span class="readout">5</span>
+    </div>
+    <svg class="vg-w-range-bitwidth-main" viewBox="0 0 720 100">
+      <rect x="0" y="30" width="720" height="40" fill="none" stroke="var(--line)" stroke-width="1"/>
+      <g class="segs"></g>
+    </svg>
+    <p class="summary">32 bit 的區塊，用 5 bit 打包，可以塞進 6 個完整值，剩下 2 bit 進 remainder 路徑，得靠 generics 特化的餘數程式碼另外處理。</p>
+    <script>
+    (function () {
+      var isTouch = window.matchMedia('(hover: none) and (pointer: coarse)').matches;
+      var root = document.querySelector('.vg-w-range-bitwidth');
+      if (!root) return;
+      var input = root.querySelector('input');
+      var readout = root.querySelector('.readout');
+      var svgNS = 'http://www.w3.org/2000/svg';
+      var segsG = root.querySelector('.segs');
+      var summary = root.querySelector('.summary');
+      var WORD = 32;
+      var BAR_W = 720, Y = 30, H = 40;
+
+      function render() {
+        var k = Number(input.value);
+        readout.textContent = String(k);
+        var full = Math.floor(WORD / k);
+        var rem = WORD - full * k;
+        while (segsG.firstChild) segsG.removeChild(segsG.firstChild);
+        var unitW = BAR_W / WORD;
+        var x = 0;
+        for (var i = 0; i < full; i++) {
+          var w = k * unitW;
+          var rect = document.createElementNS(svgNS, 'rect');
+          rect.setAttribute('x', x);
+          rect.setAttribute('y', Y);
+          rect.setAttribute('width', Math.max(w - 1, 0));
+          rect.setAttribute('height', H);
+          rect.setAttribute('fill', i % 2 === 0 ? 'var(--accent)' : 'var(--ink-deep)');
+          segsG.appendChild(rect);
+          x += w;
+        }
+        if (rem > 0) {
+          var rrect = document.createElementNS(svgNS, 'rect');
+          rrect.setAttribute('x', x);
+          rrect.setAttribute('y', Y);
+          rrect.setAttribute('width', Math.max(rem * unitW - 1, 0));
+          rrect.setAttribute('height', H);
+          rrect.setAttribute('fill', 'var(--sage)');
+          segsG.appendChild(rrect);
+        }
+        summary.textContent = '32 bit 的區塊，用 ' + k + ' bit 打包，可以塞進 ' + full + ' 個完整值' + (rem > 0 ? '，剩下 ' + rem + ' bit 進 remainder 路徑，得靠 generics 特化的餘數程式碼另外處理。' : '，剛好整除，沒有餘數要處理。');
+      }
+      if (!isTouch) input.addEventListener('input', render);
+      render();
+    })();
+    </script>
+  </figure>
+
+  <p>這個對應是離散的——bit width 只有 32 種可能，每一種都對應一組固定的位移量與遮罩，也就對應一份可以窮舉生成的特化程式碼。generics 在這裡等於把 32 種可能都個別編譯一次，執行期只要照 bit width 分派到對應的那一份。</p>
+
+  <h2>AVX2 bitunpack 用兩個 256-bit 暫存器換掉一個迴圈</h2>
+
+  <p>generics 特化能做的事有邊界，它讓編譯器少繞一層判斷，但運算本身還是一次處理一個值。真正的加速要等 Go 1.26 的 <code>simd/archsimd</code> 上場。這個實驗性套件要在建置時設定環境變數 <code>GOEXPERIMENT=simd</code> 才會啟用，搭配既有的 <code>GOAMD64</code>（決定編譯目標的微架構等級，分 v1 到 v4 四級），再用 <code>archsimd.X86.AVX2()</code> 在執行期偵測這台機器實際支援哪些指令集，偵測不到就退回純量版本。<code>GOAMD64</code> 這個環境變數本來就存在於 Go 工具鏈裡，用來決定編譯目標假設的最低微架構等級；archsimd 在這之上再加一層執行期偵測，兩者疊起來的效果，是同一份二進位檔案可以在新舊 CPU 上都跑，只是新 CPU 才吃得到 SIMD 的紅利。</p>
+
+  <p>GOAMD64 每往上一級，假設的最低微架構能力就更新一批，編譯器可以直接生成假設這些能力存在的機器碼，不必在每個呼叫點都插入相容性檢查。原文沒有說明在不滿足那個等級的舊機器上實際會發生什麼；比較保守的猜測是：程式碼用到的指令根本不存在於那顆 CPU 上，執行到時應該會觸發非法指令、讓程式中止，而不只是變慢。</p>
+
+  <p>拿 bitunpack（解包）來說，純量版本用一個逐一跑 8 次的 <code>for range</code> 迴圈處理 8 個值，位移、遮罩、邊界檢查全部逐值跑一輪；SIMD 版本一樣是處理 8 個值一批，卻完全不需要那個迴圈，用兩個 256-bit 暫存器同時扛住整批資料的位移與遮罩運算，8 個值的活一次做完。實測下來，SIMD 版本比純量版本快了大約 3 倍。這一段走的正是前面提到的向量化路徑，處理的是塞滿一整個 SIMD 寬度的完整區塊，不需要 generics 特化的 remainder 邏輯介入。</p>
+
+  <h2>positional popcount：把逐值掃描改寫成逐欄計數</h2>
+
+  <p>bitunpack 加速之後，瓶頸換了個位置。TurboPFor 這種帶 exceptions 的格式，encoder 端要先跑一輪 <code>scan()</code>，對每一個候選 bit width，數出有多少個值會變成例外，也就是超出這個寬度、得另外存起來的值。原文對這種區塊類型的定義是它會同時定出兩個 bit width——「one for values, the other bit width for encoding exceptions」（一個給正常值，一個給例外編碼用）。<code>scan()</code> 就是在替這兩個寬度找答案，而這是一個逐值、逐 bit width 的計數問題，即使套用了前面幾輪優化，「快」的版本平均每個值還是要花掉大約 12 條指令。SIMD 化了 bitunpack，卻繞不過這道逐值掃描。</p>
+
+  <p>作者的解法是把問題整個倒過來想。與其對每一個值逐一去問「你在這個 bit width 底下算不算例外」，不如把所有值攤開成一個 bit 矩陣，直接對每一欄，也就是每一個候選 bit width 的邊界，做一次橫向計數，這叫 positional population count，原文的講法是「Counting columns is called Positional Population Count」。第一步要先把每個輸入值變成它的 smear mask，原文形容是「imagine taking the first 1 bit and smearing it across the remaining positions」，把最低的那個 1 往其餘位置塗開；接著重新排列資料，讓同一批值裡同一個位置的內容集中到一起，方便逐欄計數。smear 之後，只要檢查某個 bit 位置是不是 1，就能知道這個值在那個 bit width 底下算不算例外，不必再對每一種 bit width 分別判斷一次。整套流程走完，原本要 12 條指令才能算完一個值的工作，壓到只剩 1.5 條，快了 8 倍。</p>
+
+  <p>原文沒有逐步拆解 <code>GF2P8AFFINEQB</code> 這一步的位元排列細節，但從整條 pipeline 的輸入輸出可以合理還原它要解決的問題：一批值攤開之後，每個值的第 k 個 bit 分散在不同的 byte、不同的偏移量上，硬要直接數所有值的第 k 個 bit 裡有幾個 1，得對每個值分別做位移跟遮罩，等於繞了一圈又回到逐值處理。<code>VPERMB</code> 先把同一個 byte 位置的內容集中到同一個 lane，<code>GF2P8AFFINEQB</code> 接著把位元位置本身重新排列，讓來自不同值、同一個 bit 位置的位元最後能落在同一個 byte 裡；排好之後，<code>VPOPCNTB</code> 才有辦法一次數完 64 個 byte，因為每個 byte 現在裝的是同一個位置、來自不同值的位元組合——這和轉置前一個 byte 只裝一個值的 8 個 bit，剛好相反。整套轉置換來的效果，是把「每個值各自的一排 bit」，重新切成「每個 bit 位置各自的一排值」——橫著數哪個位置有幾個 1，就直接等於數哪個 bit width 底下有幾個例外。這也是為什麼一次轉置能同時處理多個候選 bit width 的計數——byte 的數量早就對應著候選寬度的上限，<code>VPOPCNTB</code> 一次把整批位置都數完，不用再對每個寬度分別跑一次迴圈。</p>
+
+  <figure class="vg-w-canvas-popcount" data-mobile="swap" data-mobile-summary="把每個值轉成 smear mask 後依位置重排、再做一次轉置，之後只要橫向數過去，掃描例外值就從每個值 12 條指令降到 1.5 條，快了 8 倍。">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 9V4.5a1.5 1.5 0 0 1 3 0V9"/><path d="M12 9V4.5a1.5 1.5 0 0 1 3 0V9"/><path d="M15 9v-1.5a1.5 1.5 0 0 1 3 0V13"/><path d="M18 13a4 4 0 0 1-4 4h-1.5"/><path d="M8 9.5V6.5a1.5 1.5 0 0 0-3 0v9c0 3.5 2 6 6.5 6h2c3 0 4.5-2 5-4l1.5-3.5c.5-1-1-2-2-1l-1.5 2"/></svg>
+      <span>播放看四個階段如何把逐值掃描變成一次橫向計數 · 4 個階段</span>
+    </p>
+    <style>
+      .vg-w-canvas-popcount { display: grid; grid-template-rows: auto 1fr auto; gap: var(--s-2); }
+      .vg-w-canvas-popcount .toolbar { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); flex-wrap: wrap; }
+      .vg-w-canvas-popcount button { font-family: var(--sans); font-size: var(--fs-sm); padding: 6px 14px; min-height: 44px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); cursor: pointer; }
+      .vg-w-canvas-popcount button:hover { border-color: var(--accent); color: var(--accent-text); }
+      .vg-w-canvas-popcount canvas { width: 100%; height: auto; aspect-ratio: 16 / 9; display: block; }
+      .vg-w-canvas-popcount .stage-label { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--ink-soft); margin-left: auto; }
+      .vg-w-canvas-popcount figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+      @media (max-width: 720px) {
+        .vg-w-canvas-popcount canvas { aspect-ratio: 4 / 3; }
+      }
+    </style>
+
+    <div class="toolbar" data-vg-controls>
+      <button class="vg-w-canvas-popcount-toggle" type="button">▷ 播放</button>
+      <button class="vg-w-canvas-popcount-step" type="button">下一階段</button>
+      <button class="vg-w-canvas-popcount-reset" type="button">↺ 重來</button>
+      <span class="stage-label"></span>
+    </div>
+
+    <canvas class="vg-w-canvas-popcount-main"></canvas>
+
+    <figcaption>8 個示範值的低 8 位元；顏色只用來標示欄位，不代表真實資料。</figcaption>
+
+    <script>
+    (function () {
+      if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+      var root = document.querySelector('.vg-w-canvas-popcount');
+      if (!root) return;
+      var canvas = root.querySelector('canvas.vg-w-canvas-popcount-main');
+      var toggle = root.querySelector('.vg-w-canvas-popcount-toggle');
+      var stepBtn = root.querySelector('.vg-w-canvas-popcount-step');
+      var reset = root.querySelector('.vg-w-canvas-popcount-reset');
+      var label = root.querySelector('.stage-label');
+      var ctx = canvas.getContext('2d');
+
+      function cssVar(name) { return getComputedStyle(root).getPropertyValue(name).trim() || '#888'; }
+
+      function resize() {
+        var dpr = window.devicePixelRatio || 1;
+        var rect = canvas.getBoundingClientRect();
+        canvas.width = rect.width * dpr;
+        canvas.height = rect.height * dpr;
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      }
+      window.addEventListener('resize', resize);
+      resize();
+
+      var VALUES = [0x2D, 0x91, 0x47, 0x0C, 0xB3, 0x58, 0xE0, 0x1A];
+      var N = 8;
+      var stages = ['原始值（逐值檢視）', 'smear mask（把最低的 1 往外塗開）', '重排（依位置分欄）', '橫向計數（VPOPCNTB）'];
+      var stageIdx = 0;
+      var running = false;
+      var lastTick = 0;
+      var AUTO_MS = 1800;
+
+      function bits(v) {
+        var arr = [];
+        for (var i = 7; i >= 0; i--) arr.push((v >> i) & 1);
+        return arr;
+      }
+      function smear(v) {
+        for (var i = 0; i < 8; i++) {
+          if ((v & (1 << i)) !== 0) { return (0xFF >> (7 - i)); }
+        }
+        return 0;
+      }
+
+      var rawRows = VALUES.map(bits);
+      var smearRows = VALUES.map(function (v) { return bits(smear(v)); });
+
+      function transposed(rows) {
+        var out = [];
+        for (var c = 0; c < 8; c++) {
+          var col = [];
+          for (var r = 0; r < N; r++) col.push(rows[r][c]);
+          out.push(col);
+        }
+        return out;
+      }
+      var colsOfSmear = transposed(smearRows);
+      var colCounts = colsOfSmear.map(function (col) { return col.reduce(function (a, b) { return a + b; }, 0); });
+
+      function draw() {
+        var W = canvas.getBoundingClientRect().width;
+        var H = canvas.getBoundingClientRect().height;
+        ctx.clearRect(0, 0, W, H);
+        ctx.font = '13px "EB Garamond", serif';
+        var accent = cssVar('--accent');
+        var ink = cssVar('--ink');
+        var muted = cssVar('--muted');
+        var sage = cssVar('--sage');
+
+        var padL = 46, padT = 28;
+        var cell = Math.min((W - padL - 20) / 8, (H - padT - 40) / N);
+
+        if (stageIdx <= 1) {
+          var rows = stageIdx === 0 ? rawRows : smearRows;
+          ctx.fillStyle = muted;
+          ctx.fillText(stageIdx === 0 ? '每一列 = 一個值' : '每一列 = 一個 smear mask', padL, 16);
+          for (var r = 0; r < N; r++) {
+            for (var c = 0; c < 8; c++) {
+              ctx.strokeStyle = muted;
+              ctx.lineWidth = 1;
+              var x = padL + c * cell, y = padT + r * cell;
+              ctx.strokeRect(x, y, cell - 2, cell - 2);
+              if (rows[r][c]) { ctx.fillStyle = accent; ctx.fillRect(x, y, cell - 2, cell - 2); }
+            }
+          }
+        } else if (stageIdx === 2) {
+          ctx.fillStyle = muted;
+          ctx.fillText('每一欄 = 同一個 bit 位置，來自全部 8 個值', padL, 16);
+          for (var cc = 0; cc < 8; cc++) {
+            for (var rr = 0; rr < N; rr++) {
+              ctx.strokeStyle = muted;
+              ctx.lineWidth = 1;
+              var x2 = padL + cc * cell, y2 = padT + rr * cell;
+              ctx.strokeRect(x2, y2, cell - 2, cell - 2);
+              if (colsOfSmear[cc][rr]) { ctx.fillStyle = sage; ctx.fillRect(x2, y2, cell - 2, cell - 2); }
+            }
+          }
+        } else {
+          ctx.fillStyle = muted;
+          ctx.fillText('VPOPCNTB：每一欄直接數出 1 的個數', padL, 16);
+          for (var c3 = 0; c3 < 8; c3++) {
+            var barH = (colCounts[c3] / N) * (H - padT - 40);
+            var x3 = padL + c3 * cell;
+            ctx.fillStyle = ink;
+            ctx.fillRect(x3, padT + (H - padT - 40) - barH, cell - 4, barH);
+            ctx.fillStyle = muted;
+            ctx.fillText(String(colCounts[c3]), x3, H - 8);
+          }
+        }
+        label.textContent = stages[stageIdx];
+      }
+
+      function frame(now) {
+        if (running && now - lastTick > AUTO_MS) {
+          stageIdx = (stageIdx + 1) % stages.length;
+          lastTick = now;
+          draw();
+        }
+        requestAnimationFrame(frame);
+      }
+      requestAnimationFrame(frame);
+      draw();
+
+      toggle.addEventListener('click', function () {
+        running = !running;
+        toggle.textContent = running ? '⏸ 暫停' : '▷ 播放';
+        lastTick = performance.now();
+      });
+      stepBtn.addEventListener('click', function () {
+        stageIdx = (stageIdx + 1) % stages.length;
+        draw();
+      });
+      reset.addEventListener('click', function () {
+        running = false;
+        toggle.textContent = '▷ 播放';
+        stageIdx = 0;
+        draw();
+      });
+    })();
+    </script>
+  </figure>
+
+  <p>encoder 端最貴的一段掃描，因此從一個逐值迴圈，換成前面這套轉置加橫向計數的做法。這套轉置動用了三個實際的 x86 指令，各自負責哪一段可以點開下面看。</p>
+
+  <figure class="vg-w-pop-simdterms" data-mobile="keep">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 2-3 4"/><path d="M12 17h.01"/></svg>
+      <span>點開三個指令名稱看各自負責的段落 · 3 個名詞</span>
+    </p>
+    <style>
+      .vg-w-pop-simdterms { position: relative; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-pop-simdterms ul { list-style: none; padding: 0; margin: 0; display: grid; gap: var(--s-2); }
+      .vg-w-pop-simdterms .term { anchor-name: --vgw-pop-anchor; text-decoration: underline dotted var(--muted); cursor: help; }
+      .vg-w-pop-simdterms .pop {
+        position-anchor: --vgw-pop-anchor;
+        position: absolute;
+        top: anchor(bottom);
+        left: anchor(center);
+        translate: -50% var(--s-1);
+        padding: var(--s-1) var(--s-2);
+        background: var(--bg-soft);
+        border: 1px solid var(--line);
+        font-family: var(--scribed);
+        font-size: var(--fs-xs);
+        max-width: 32ch;
+        opacity: 0;
+        transition: opacity 100ms;
+        pointer-events: none;
+        z-index: 2;
+      }
+      .vg-w-pop-simdterms .term:hover + .pop,
+      .vg-w-pop-simdterms .term:focus + .pop { opacity: 1; }
+      @supports not (anchor-name: --x) {
+        .vg-w-pop-simdterms .pop { position: static; opacity: 1; pointer-events: auto; display: block; margin: 2px 0 var(--s-2) var(--s-2); }
+      }
+    </style>
+    <ul>
+      <li>
+        <span class="term" tabindex="0"><code>VPERMB</code></span>
+        <span class="pop">依 byte 重排資料，讓同一批值裡同一個 byte 位置的內容集中到同一個 lane，是轉置流程的第一步。</span>
+        <span>——負責重排 byte。</span>
+      </li>
+      <li>
+        <span class="term" tabindex="0"><code>GF2P8AFFINEQB</code></span>
+        <span class="pop">原文形容它聽起來很嚇人，其實在位元操作上相當靈活，這裡用來把資料整理成方便逐欄計數的形狀。</span>
+        <span>——負責位元層級整理。</span>
+      </li>
+      <li>
+        <span class="term" tabindex="0"><code>VPOPCNTB</code></span>
+        <span class="pop">一次數完 64 個 byte 裡所有的 1，取代逐值迴圈裡個別計算的開銷。</span>
+        <span>——負責一次橫向計數。</span>
+      </li>
+    </ul>
+  </figure>
+
+  <p>把這五輪優化攤開來看，量級差得很明顯：</p>
+
+  <figure class="vg-w-tabs-stages" data-mobile="static" data-svg-scroll="560">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+      <span>切換看五輪優化各自的實測數字 · 5 個階段</span>
+    </p>
+    <style>
+      .vg-w-tabs-stages { display: grid; gap: var(--s-2); }
+      .vg-w-tabs-stages input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-tabs-stages .tabs { display: flex; flex-wrap: wrap; gap: var(--s-1); border-bottom: 1px solid var(--line); }
+      .vg-w-tabs-stages .tab { font-family: var(--sans); font-size: var(--fs-xs); padding: var(--s-1) var(--s-2); cursor: pointer; color: var(--muted); }
+      .vg-w-tabs-stages .panel { display: none; padding: var(--s-2) 0; }
+      .vg-w-tabs-stages .stat { font-family: var(--display); font-size: 2rem; color: var(--accent-text); }
+      .vg-w-tabs-stages .cap { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--ink-soft); }
+      .vg-w-tabs-stages:has(#vg-w-tabs-stages-t1:checked) .panel-1 { display: block; }
+      .vg-w-tabs-stages:has(#vg-w-tabs-stages-t1:checked) [for="vg-w-tabs-stages-t1"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-stages:has(#vg-w-tabs-stages-t2:checked) .panel-2 { display: block; }
+      .vg-w-tabs-stages:has(#vg-w-tabs-stages-t2:checked) [for="vg-w-tabs-stages-t2"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-stages:has(#vg-w-tabs-stages-t3:checked) .panel-3 { display: block; }
+      .vg-w-tabs-stages:has(#vg-w-tabs-stages-t3:checked) [for="vg-w-tabs-stages-t3"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-stages:has(#vg-w-tabs-stages-t4:checked) .panel-4 { display: block; }
+      .vg-w-tabs-stages:has(#vg-w-tabs-stages-t4:checked) [for="vg-w-tabs-stages-t4"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      .vg-w-tabs-stages:has(#vg-w-tabs-stages-t5:checked) .panel-5 { display: block; }
+      .vg-w-tabs-stages:has(#vg-w-tabs-stages-t5:checked) [for="vg-w-tabs-stages-t5"] { color: var(--accent-text); border-bottom: 2px solid var(--accent); }
+      @media (hover: none) and (pointer: coarse) {
+        .vg-w-tabs-stages .tabs { display: none; }
+      }
+    </style>
+    <input type="radio" id="vg-w-tabs-stages-t1" name="vg-w-tabs-stages-sel" checked />
+    <input type="radio" id="vg-w-tabs-stages-t2" name="vg-w-tabs-stages-sel" />
+    <input type="radio" id="vg-w-tabs-stages-t3" name="vg-w-tabs-stages-sel" />
+    <input type="radio" id="vg-w-tabs-stages-t4" name="vg-w-tabs-stages-sel" />
+    <input type="radio" id="vg-w-tabs-stages-t5" name="vg-w-tabs-stages-sel" />
+    <div class="tabs" data-vg-controls>
+      <label class="tab" for="vg-w-tabs-stages-t1">PGO</label>
+      <label class="tab" for="vg-w-tabs-stages-t2">配置</label>
+      <label class="tab" for="vg-w-tabs-stages-t3">generics</label>
+      <label class="tab" for="vg-w-tabs-stages-t4">AVX2</label>
+      <label class="tab" for="vg-w-tabs-stages-t5">popcount</label>
+    </div>
+    <div class="panel panel-1"><div class="stat">-13%</div><div class="cap">打開 PGO 反而全面倒退，兇手是 Intel SKX102 勘誤造成的迴圈對齊 NOP。</div></div>
+    <div class="panel panel-2"><div class="stat">773 到 858</div><div class="cap">Mval/s，debian-mix 工作負載；把 make() 換成 struct 內建的 scratch buffer。</div></div>
+    <div class="panel panel-3"><div class="stat">+38% 至 64%</div><div class="cap">依 bit width（1 至 32）特化後，remainder block 各項 benchmark 的漲幅範圍。</div></div>
+    <div class="panel panel-4"><div class="stat">約 3 倍</div><div class="cap">AVX2 向量化 bitunpack 對比純量版本，8 個值一次處理完，不再逐值跑迴圈。</div></div>
+    <div class="panel panel-5"><div class="stat">12 到 1.5</div><div class="cap">每個值的平均指令數；positional popcount 把逐值掃描改成逐欄計數，快了 8 倍。</div></div>
+  </figure>
+
+  <h2>搬回 C 之後，Go 還是慢了 1.4 倍</h2>
+
+  <p>故事如果在這裡打住，很容易寫成「Go 打敗了 C」的勝利敘事，但作者沒有這樣收尾。純量版本一開始的成績是 C 的 76%，原文寫的是「Go is at 76% of C」——沒有 SIMD 就只慢 24%。後面的優化甚至一度超車：原文說 SIMD 與 bit width 特化兩三個 commit 就足以「Beating C TurboPFor」，positional popcount 再拿下另一個 2 倍。等到把同一套 AVX512 kernel 和 positional popcount 技巧反向移植回 C TurboPFor，做真正對等的比較，作者測出來的結果是「Go benchmarks a little slower at ≈1.4x C.」，Go 版本還是慢了大約 1.4 倍。</p>
+
+  <p>差距不是玄學，三個原因都講得清楚。Go 強制邊界檢查，作者的態度很明確：「While it costs performance, bounds checking is great for safety, so I will not turn off bounds checking.」——這是主動的取捨。mid-stack inlining 留下的 NOP 標記，在指令吞吐量已經很吃緊的函式裡確實會拖慢執行，原文寫的是「For dispatch-bound functions, these extra NOPs can measurable slow down execution.」。再加上，Go 編譯器在每一次 <code>POPCNT</code> 前面都塞一條 <code>XORL CX,CX</code>，為的是修 Intel Sandy Bridge、Skylake 世代的一個假輸出依賴，這條指令在 AMD Zen 上其實用不到，但作者猜測，Go 是刻意不提供這種細緻的客製化，<code>GOAMD64</code> 只分 v1 到 v4 四個等級，粒度就是這麼粗。這個細節說明了架構泛用的實際代價：每次執行都多付一點點、在某些硬體上完全用不到的成本。</p>
+
+  <p>作者最後把話收得很收斂：「a powerful part of modern CPUs which allows speeding up the kind of computation that TurboPFor needs by an order of magnitude」（有能力把 TurboPFor 需要的這類運算加速一個數量級），重點是不用繞道 cgo 或組合語言就拿得到這種能力。純量版本的原生 Go encoder，作者說從動筆到寫完只花了幾天。優化到後段，解碼器的效能計數器顯示每個 cycle 能發出 7 條指令，在這台機器 8 IPC 的理論上限裡，已經算是把大部分等待都榨乾了。</p>
+
+  <p>如果只看結論，DCS 這條路徑給準備在自己專案裡用 Go SIMD 的人，還是留下幾個要先想清楚的代價：<code>archsimd</code> 目前是 experimental，API 隨時可能在後續版本改動；要吃到 SIMD 的紅利，實際上等於把部署目標釘在支援 AVX2 甚至 AVX512 的機器上，舊硬體只能走純量 fallback；就算全部條件都符合，跟針對同一批技巧手工調校過的 C 相比，仍有大約 1.4 倍的差距要接受。值得用在哪裡要先想清楚：對 DCS 這種吃索引解碼吞吐量的系統，不用 cgo 換來的維護單純，划算過那 1.4 倍。</p>
+
+  <p class="vg-deep-closer"><strong>算總帳</strong>：PGO 對齊陷阱、配置搬遷、generics 特化、AVX2 向量化、positional popcount，五輪優化疊起來，讓一個原本鎖在 C 函式庫裡的效能關鍵路徑，第一次能完全用 Go 寫、用 Go 測、用 Go 除錯，不必為了追平速度回頭寫組合語言或維護一份 cgo 綁定。</p>
+</div>
