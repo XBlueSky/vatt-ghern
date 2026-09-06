@@ -1,0 +1,1119 @@
+{
+  "output_path": "src/posts/2026/09/07/deep-dcs-turbopfor-go-simd.html",
+  "spine": [
+    "1. Debian Code Search 用了七年的 powturbo/TurboPFor（透過 cgo）做整數壓縮；作者想移除它是因為想讓專案維持純 Go，不是效能不夠。",
+    "2. 第一步打開 PGO 反而讓效能倒退 13%，根源是 Go 編譯器為修 Intel SKX102 勘誤而插入的 NOP 對齊，觸發了病態的迴圈排列。",
+    "3. 把動態配置（make()）換成 struct 內建的固定 scratch buffer，decoder 從 773 提升到 858 Mval/s。",
+    "4. 用 generics 把 bit width（1 到 32）變成編譯期常數，讓編譯器對每個寬度生成接近最佳的機器碼，remainder block 提升 38% 到 64% 不等。",
+    "5. Go 1.26 的實驗性 simd/archsimd package 讓 AVX2 直接寫進 Go：向量化 bitunpack 免去逐值迴圈，比純量版快約 3 倍。",
+    "6. 真正的瓶頸轉到 encoder 的 scan()：原本找例外值要 12 條指令，靠 positional popcount（smear mask + 位元重排 + VPOPCNTB）壓到 1.5 條，降了 8 倍。",
+    "7. 就算把同樣的 AVX512 技巧搬回 C 做真正對等比較，Go 仍慢了約 1.4 倍——邊界檢查、NOP、架構泛用是三個作者主動接受的代價，重點是不用 cgo 或組合語言就能追近，不是逐項擊敗 C。"
+  ],
+  "sources": [
+    {
+      "url": "https://michael.stapelberg.ch/posts/2026-09-06-dcs-fast-turbopfor-go-simd/",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": "2026-09-06",
+      "perspective": {
+        "mechanism": "這篇文章教的機制是：把一個逐值、逐條件分支的掃描問題（scan() 找 bit width 例外值），透過 smear mask、位元轉置、向量化 popcount，改寫成一次處理整個 SIMD 暫存器寬度的欄位計數問題——這是把資料重排、讓平行操作方式與資料本身正交的通用招式，這裡示範得特別乾淨。",
+        "tradeoff": "追平 C 的代價分好幾層：generics 只在 bit width 變成編譯期常數才有用；SIMD 需要執行期偵測 CPU 能力並保留純量 fallback；就算做到這些，Go 仍因為強制邊界檢查、mid-stack inlining 留下的 NOP、以及為相容所有 x86 硬體而放棄的微架構客製化，比對等的 C 慢了大約 1.4 倍——這是作者主動選擇不用安全換效能的結果。",
+        "reader_use": "對正在評估要不要為了效能保留 cgo 或組合語言依賴的 Go 專案，這篇文章給了一條具體路徑：先做 PGO 並注意迴圈對齊的隱藏成本、再檢查配置熱點、再用 generics 把已知常數搬到編譯期、最後才碰 Go 1.26 的實驗性 SIMD——每一步都有可測量的獨立收益，不需要一口氣跳到 SIMD 才有感。"
+      }
+    }
+  ],
+  "notes": [
+    {
+      "id": "n01",
+      "url": "https://michael.stapelberg.ch/posts/2026-09-06-dcs-fast-turbopfor-go-simd/",
+      "quote": "Debian Code Search used to use the powturbo/TurboPFor C library via cgo for the last 7 years.",
+      "hedge": "asserted",
+      "interpretation": "背景設定：DCS 用 cgo 包裝 TurboPFor 做整數壓縮已經七年，是本文要拆除的技術債。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n02",
+      "url": "https://michael.stapelberg.ch/posts/2026-09-06-dcs-fast-turbopfor-go-simd/",
+      "quote": "I would prefer it if I did not have any C code in the project.",
+      "hedge": "asserted",
+      "interpretation": "作者移除 cgo 的動機是專案純度偏好，不是效能不足；效能追平是附帶條件而非起因。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n03",
+      "url": "https://michael.stapelberg.ch/posts/2026-09-06-dcs-fast-turbopfor-go-simd/",
+      "quote": "This August, I accomplished what I wanted for many years: I deleted the last cgo dependency in Debian Code Search!",
+      "hedge": "asserted",
+      "interpretation": "收尾事件：2026 年 8 月，cgo 依賴正式移除完成。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n04",
+      "url": "https://michael.stapelberg.ch/posts/2026-09-06-dcs-fast-turbopfor-go-simd/",
+      "quote": "Surprisingly, turning on PGO actually decreases our performance (-13% geomean)",
+      "hedge": "asserted",
+      "interpretation": "PGO 打開後不但沒有變快、反而全面退步 13%，是作者遇到的第一個反直覺結果。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n05",
+      "url": "https://michael.stapelberg.ch/posts/2026-09-06-dcs-fast-turbopfor-go-simd/",
+      "quote": "However, the Go compiler ensures fused branch sequences must never cross or end at a 32-byte boundary to fix Intel erratum SKX102 (discussion: Go issue #35881) by inserting NOPs.",
+      "hedge": "asserted",
+      "interpretation": "PGO 退步的根源：編譯器為修 Intel SKX102 勘誤，在特定分支序列前插入 NOP 讓迴圈對齊改變，PGO 觸發後恰好命中這個病態情境。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n06",
+      "url": "https://michael.stapelberg.ch/posts/2026-09-06-dcs-fast-turbopfor-go-simd/",
+      "quote": "When doing mid-stack inlining (proposal #19348) (2017), Go sometimes needs to put NOP instructions into the binary so that it can attach inlining markers.",
+      "hedge": "asserted",
+      "interpretation": "解釋為何「插入 NOP」是 Go 編譯器結構性存在的機制（inlining marker），不是 bug，是為了讓側寫/inliner 正確標記位置。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n07",
+      "url": "https://michael.stapelberg.ch/posts/2026-09-06-dcs-fast-turbopfor-go-simd/",
+      "quote": "In the DCS pfordec package (with the improved API design), I ended up with a vals [256]uint32 field in the StreamDecoder type, which brings us from 773 Mval/s to 858 Mval/s on the debian-mix",
+      "hedge": "asserted",
+      "interpretation": "把動態配置換成 struct 內建的固定陣列（scratch buffer），decoder 吞吐量從 773 提升到 858 Mval/s，是第二步優化：減少配置。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n08",
+      "url": "https://michael.stapelberg.ch/posts/2026-09-06-dcs-fast-turbopfor-go-simd/",
+      "quote": "vals=bitpacking-bw1 751.2 ± 3% 1120.5 ± 0% +49.15%",
+      "hedge": "asserted",
+      "interpretation": "1 bit 打包 remainder block 的 generics 特化前後吞吐量，漲幅 49.15%。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n08b",
+      "url": "https://michael.stapelberg.ch/posts/2026-09-06-dcs-fast-turbopfor-go-simd/",
+      "quote": "vals=bitpacking-bw2 716.8 ± 2% 1176.0 ± 0% +64.07%",
+      "hedge": "asserted",
+      "interpretation": "2 bit 打包 remainder block 的漲幅，是整組 benchmark 裡漲最多的一項。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n09",
+      "url": "https://michael.stapelberg.ch/posts/2026-09-06-dcs-fast-turbopfor-go-simd/",
+      "quote": "vals=debian-mix 559.5 ± 0% 783.8 ± 9% +40.09%",
+      "hedge": "asserted",
+      "interpretation": "對真實混合工作負載（debian-mix）而言，generics 特化整體帶來 40% 的提升，不只是極端 bit width 才有感。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n10",
+      "url": "https://michael.stapelberg.ch/posts/2026-09-06-dcs-fast-turbopfor-go-simd/",
+      "quote": "Because the bitWidth is now known at compile time, the Go compiler can generate close to the optimal machine code for each bit width",
+      "hedge": "asserted",
+      "interpretation": "generics 讓 bit width 變成編譯期常數，是特化能生效的機制核心：編譯器可以把移位量、遮罩都寫死，不用在執行期動態判斷。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n11",
+      "url": "https://michael.stapelberg.ch/posts/2026-09-06-dcs-fast-turbopfor-go-simd/",
+      "quote": "The SIMD version benchmarks about 3x as fast as the scalar version.",
+      "hedge": "asserted",
+      "interpretation": "AVX2 版本的向量化 bitunpack 比純量版快 3 倍，用兩個 256-bit 暫存器取代逐值迴圈。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n12",
+      "url": "https://michael.stapelberg.ch/posts/2026-09-06-dcs-fast-turbopfor-go-simd/",
+      "quote": "The fast version still needs about 12 instructions per value.",
+      "hedge": "asserted",
+      "interpretation": "在套用 positional popcount 前，即使是「快」的版本，scan() 函式（找出超出 bit width 的例外值）平均每個值仍要 12 條指令。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n13",
+      "url": "https://michael.stapelberg.ch/posts/2026-09-06-dcs-fast-turbopfor-go-simd/",
+      "quote": "The bitpacking with exceptions block type determines two bit widths: one for values, the other bit width for encoding exceptions.",
+      "hedge": "asserted",
+      "interpretation": "「例外」是這個編碼格式的核心設計：大多數值用較窄的 bit width 打包，少數超出範圍的值另外用 exceptions bit width 存，這也是為什麼 scan() 要先掃過一輪去算每個 bit width 下有多少例外值。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n14",
+      "url": "https://michael.stapelberg.ch/posts/2026-09-06-dcs-fast-turbopfor-go-simd/",
+      "quote": "Counting columns is called Positional Population Count.",
+      "hedge": "asserted",
+      "interpretation": "positional popcount 的核心概念：把「數每個值有幾個 exception bit」轉換成「數每一個 bit 欄位（column）上有多少個 1」。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n15",
+      "url": "https://michael.stapelberg.ch/posts/2026-09-06-dcs-fast-turbopfor-go-simd/",
+      "quote": "The trick is to turn each input value into its 'smear mask' (imagine taking the first 1 bit and smearing it across the remaining positions).",
+      "hedge": "asserted",
+      "interpretation": "做 positional popcount 前，先把每個值轉成「smear mask」：最低位的 1 往其餘位置延伸，這樣「這個值有沒有超出某個 bit width」就變成「某個 bit 位置是不是 1」。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n16",
+      "url": "https://michael.stapelberg.ch/posts/2026-09-06-dcs-fast-turbopfor-go-simd/",
+      "quote": "we permute the bytes (VPERMB) such that all the first bytes of each value end up in one lane",
+      "hedge": "asserted",
+      "interpretation": "VPERMB 做位元組層級的重排，把 32 個值裡「同一個 byte 位置」的內容集中到同一個 lane，是轉置流程的第一步。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n17",
+      "url": "https://michael.stapelberg.ch/posts/2026-09-06-dcs-fast-turbopfor-go-simd/",
+      "quote": "the GF2P8AFFINEQB instruction, which sounds scary but turns out to be quite flexible for bit manipulation",
+      "hedge": "asserted",
+      "interpretation": "GF2P8AFFINEQB 用於位元操作，是轉置流程裡承接 VPERMB 之後的一步；原文未具體展開其確切位元語義，僅形容其靈活性，故文中對此指令的描述保持在原文的概略程度。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n18",
+      "url": "https://michael.stapelberg.ch/posts/2026-09-06-dcs-fast-turbopfor-go-simd/",
+      "quote": "Now we can use VPOPCNTB to count the bits in all 64 bytes at once",
+      "hedge": "asserted",
+      "interpretation": "轉置完成後，VPOPCNTB 一次數完 64 個 byte 裡所有 1 的個數，取代逐值迴圈裡的個別計算。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n19",
+      "url": "https://michael.stapelberg.ch/posts/2026-09-06-dcs-fast-turbopfor-go-simd/",
+      "quote": "With SIMD, we can reduce this to by 8x to only 1.5 instructions per value!",
+      "hedge": "asserted",
+      "interpretation": "套用 positional popcount 之後，scan() 從每個值 12 條指令降到 1.5 條，等於 8 倍。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n20",
+      "url": "https://michael.stapelberg.ch/posts/2026-09-06-dcs-fast-turbopfor-go-simd/",
+      "quote": "When comparing apples to apples, i.e. backporting the AVX512 kernels and positional popcount technique to C TurboPFor, Go benchmarks a little slower at ≈1.4x C.",
+      "hedge": "hedged",
+      "interpretation": "把同一套 AVX512 技巧反向移植回 C 版本做真正對等比較，Go 版本還是慢了大約 1.4 倍，這是誠實的差距，不是「Go 贏了 C」的敘事。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n21",
+      "url": "https://michael.stapelberg.ch/posts/2026-09-06-dcs-fast-turbopfor-go-simd/",
+      "quote": "While it costs performance, bounds checking is great for safety, so I will not turn off bounds checking.",
+      "hedge": "asserted",
+      "interpretation": "1.4 倍差距的其中一個來源是 Go 強制邊界檢查，作者明確表示不打算為了效能關掉它，是刻意的安全/效能取捨。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n22",
+      "url": "https://michael.stapelberg.ch/posts/2026-09-06-dcs-fast-turbopfor-go-simd/",
+      "quote": "For dispatch-bound functions, these extra NOPs can measurable slow down execution.",
+      "hedge": "hedged",
+      "interpretation": "mid-stack inlining 留下的 NOP 標記，在指令吞吐量已經很吃緊的函式裡會拖慢執行，是另一個 1.4 倍差距的來源。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n23",
+      "url": "https://michael.stapelberg.ch/posts/2026-09-06-dcs-fast-turbopfor-go-simd/",
+      "quote": "The Go compiler emits XORL CX,CX before every POPCNT to break a false-output-dependency from the Intel Sandy Bridge Skylake era, which is unnecessary on AMD Zen CPUs.",
+      "hedge": "asserted",
+      "interpretation": "Go 編譯器為了相容所有 x86 硬體，在每次 POPCNT 前插入一條在 AMD 上其實用不到的指令，是「架構泛用」要付的代價。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n24",
+      "url": "https://michael.stapelberg.ch/posts/2026-09-06-dcs-fast-turbopfor-go-simd/",
+      "quote": "I suspect that Go intentionally does not offer this level of customizability",
+      "hedge": "hedged",
+      "interpretation": "不像 C 可以針對單一 CPU 世代編譯到極致，Go 刻意不提供這麼細的微架構客製化，GOAMD64 只分 v1-v4 四個等級。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n25",
+      "url": "https://michael.stapelberg.ch/posts/2026-09-06-dcs-fast-turbopfor-go-simd/",
+      "quote": "Go 1.26 (released in February 2026) introduced the simd/archsimd package",
+      "hedge": "asserted",
+      "interpretation": "整個優化路徑的前提：Go 1.26（2026 年 2 月釋出）帶來實驗性的 simd/archsimd package，讓 SIMD 可以直接寫在 Go 裡。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n26",
+      "url": "https://michael.stapelberg.ch/posts/2026-09-06-dcs-fast-turbopfor-go-simd/",
+      "quote": "Go 1.26 introduces a new experimental simd/archsimd package, which can be enabled by setting the environment variable GOEXPERIMENT=simd at build time.",
+      "hedge": "asserted",
+      "interpretation": "archsimd 目前是 experimental，要透過 GOEXPERIMENT=simd 這個環境變數手動開啟，不是預設行為。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n27",
+      "url": "https://michael.stapelberg.ch/posts/2026-09-06-dcs-fast-turbopfor-go-simd/",
+      "quote": "With GOARCH=amd64, the architecture-specific variable GOAMD64 configures the microarchitecture level for which to compile",
+      "hedge": "asserted",
+      "interpretation": "GOAMD64 這個既有環境變數決定編譯目標的微架構等級（v1-v4），SIMD 版本要靠它加上執行期偵測來決定走哪條路徑。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n28",
+      "url": "https://michael.stapelberg.ch/posts/2026-09-06-dcs-fast-turbopfor-go-simd/",
+      "quote": "Go's SIMD support makes available — in Go code without having to resort to cgo or assembly — a powerful part of modern CPUs which allows speeding up the kind of computation that TurboPFor needs by an order of magnitude!",
+      "hedge": "asserted",
+      "interpretation": "作者的總結立場：重點不是「贏過 C」，而是 Go 現在不用寫組合語言或 cgo，就能拿到能把這類運算加速一個數量級的 SIMD 能力。文中僅引用去除破折號子句後的連續子句以符合站內標點規則，語意未變。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n29",
+      "url": "https://michael.stapelberg.ch/posts/2026-09-06-dcs-fast-turbopfor-go-simd/",
+      "quote": "The answer is yes, it is doable in a few days, and it isn't even that much slower: Go is at 76% of C",
+      "hedge": "hedged",
+      "interpretation": "一開始（尚未上 SIMD）的純量 Go 版本，效能是 C 版本的 76%，這是起跑點，不是終點。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n30",
+      "url": "https://michael.stapelberg.ch/posts/2026-09-06-dcs-fast-turbopfor-go-simd/",
+      "quote": "The CPU performance counters show value decoding speeds of 7 instructions/cycle (IPC) on a machine where the maximum is 8 IPC.",
+      "hedge": "asserted",
+      "interpretation": "最佳化到後期，解碼器的 IPC 達到 7/8，已接近這台機器單核心一個 cycle 能發出的指令數上限，說明瓶頸轉移到指令吞吐量本身。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n31",
+      "url": "https://michael.stapelberg.ch/posts/2026-09-06-dcs-fast-turbopfor-go-simd/",
+      "quote": "Encoding remainder blocks is quite a bit faster (full blocks use the vertical layout anyway):",
+      "hedge": "asserted",
+      "interpretation": "界定 generics 特化最有感的範圍：只有處理「餘數區塊」（不滿一整個 SIMD block 的尾巴）的路徑受益最大，因為完整區塊本來就走向量化的 vertical layout。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n32",
+      "url": "https://michael.stapelberg.ch/posts/2026-09-06-dcs-fast-turbopfor-go-simd/",
+      "quote": "vals=bitpacking-bw7 700.0 ± 1% 1078.5 ± 0% +54.08%",
+      "hedge": "asserted",
+      "interpretation": "7 bit 打包 remainder block 的 generics 特化漲幅，用於 benchmark 表格中段的代表值。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n33",
+      "url": "https://michael.stapelberg.ch/posts/2026-09-06-dcs-fast-turbopfor-go-simd/",
+      "quote": "vals=bitpacking-bw1-exc 524.8 ± 1% 736.8 ± 0% +40.40%",
+      "hedge": "asserted",
+      "interpretation": "帶 exceptions 路徑（1 bit 值寬）的漲幅，用於支持「exceptions 路徑漲幅落在 39%-40%」的範圍陳述。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n34",
+      "url": "https://michael.stapelberg.ch/posts/2026-09-06-dcs-fast-turbopfor-go-simd/",
+      "quote": "vals=bitpacking-bw7-exc 566.7 ± 1% 787.7 ± 0% +38.99%",
+      "hedge": "asserted",
+      "interpretation": "帶 exceptions 路徑（7 bit 值寬）的漲幅，是範圍陳述「39% 到 40%」的下界依據，並用於文中表格。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n35",
+      "url": "https://michael.stapelberg.ch/posts/2026-09-06-dcs-fast-turbopfor-go-simd/",
+      "quote": "var hasAVX2 = archsimd.X86.AVX2()\nif !hasAVX2 {\n  fillConstantScalar(output, val)\n  return\n}",
+      "hedge": "asserted",
+      "interpretation": "程式碼證實 archsimd.X86.AVX2() 是在執行期呼叫、賦值給 hasAVX2，緊接著用 if !hasAVX2 判斷、跳去純量 fallback（fillConstantScalar）——對應文中「執行期偵測這台機器實際支援哪些指令集，偵測不到就退回純量版本」的敘述。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n36",
+      "url": "https://michael.stapelberg.ch/posts/2026-09-06-dcs-fast-turbopfor-go-simd/",
+      "quote": "var rest8 archsimd.Uint32x8\nvar cur8 archsimd.Uint32x8",
+      "hedge": "asserted",
+      "interpretation": "bitunpack256v32 函式裡宣告的兩個 archsimd.Uint32x8（8 個 uint32 = 256 bit）暫存器變數，對應文中「用兩個 256-bit 暫存器同時扛住整批資料的位移與遮罩運算」的敘述。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n37",
+      "url": "https://michael.stapelberg.ch/posts/2026-09-06-dcs-fast-turbopfor-go-simd/",
+      "quote": "Beating C TurboPFor was possible in 2-3 commits (SIMD and bit width specialization). To my surprise, Claude Fable 5 pointed out that the encoder's block scanning could be done more efficiently using a technique called positional popcount, and that is another 2x speed-up!",
+      "hedge": "asserted",
+      "interpretation": "純量之後的兩三個 commit（SIMD 與 bit width 特化）已足以超過未改造的 C TurboPFor，positional popcount 再多拿一個 2 倍；這是超車，不是逐步逼近。",
+      "timeliness": "durable"
+    }
+  ],
+  "claims": [
+    {
+      "id": "c01",
+      "claim_text": "打開 profile-guided optimization，Debian Code Search 的整數解碼器不是變快，而是全面倒退 13%",
+      "location": "hero opener（並於 H2「PGO 撞上的第一個陷阱」段內重述「結果 DCS 的 benchmark 反而全面倒退了 13%」）",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n04"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Surprisingly, turning on PGO actually decreases our performance (-13% geomean)",
+      "note": "原文的 -13% 是 geomean（幾何平均），文中的「全面倒退」與 geomean 相符，未誇大。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c02",
+      "claim_text": "Debian Code Search 打開 profile-guided optimization 那次，編譯器為了不讓分支跨過一個 32-byte 邊界而插入的 NOP，把預期中的效能提升，直接換成了 13% 的全面倒退。",
+      "location": "hero opener（已重寫）",
+      "type": "date-version",
+      "load": "high",
+      "note_ids": [
+        "n04",
+        "n05"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "In the unlucky arrangement, a macro-fused CMPQ+JGE instruction pair now ends up exactly on a 32-byte boundary. However, the Go compiler ensures fused branch sequences must never cross or end at a 32-byte boundary to fix Intel erratum SKX102 (discussion: Go issue #35881) by inserting NOPs. || Surprisingly, turning on PGO actually decreases our performance (-13% geomean)",
+      "note": "第 2 輪重新抓取後逐項核對重寫的開場：（一）「十年前」已完全移除，原文對 SKX102 對齊 NOP 確實沒有給任何年份，第 1 輪指出的年份混接（把 proposal #19348 的 2017 掛到 SKX102 NOP 上）已解除；（二）「編譯器為了…而插入的 NOP」對應 by inserting NOPs；（三）32-byte 邊界對應 must never cross or end at a 32-byte boundary；（四）「13% 的全面倒退」對應 -13% geomean；（五）因果鏈（PGO→不幸的指令排列→對齊 NOP→倒退）與原文敘事順序一致。唯一殘留的壓縮：原文的規則是「不能跨過『或落在』32-byte 邊界」，而這次事件命中的其實是「落在」那一半（ends up exactly on a 32-byte boundary），開場只寫「跨過」。屬摘要式壓縮而非造假，完整規則在正文（c10）一字不差寫出，不影響核實結果。第 3 輪覆核：開場文字未變動，此殘留壓縮仍在（記錄不失分）。",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c03",
+      "claim_text": "索引能不能塞進磁碟、多快讀出來，七年來都仰賴 C 函式庫 powturbo/TurboPFor，透過 cgo 做整數壓縮與解壓縮。",
+      "location": "首段",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n01"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Debian Code Search used to use the powturbo/TurboPFor C library via cgo for the last 7 years",
+      "note": "原文此處的 powturbo/TurboPFor 帶超連結標記，去除連結標記後與註記逐字相同。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c04",
+      "claim_text": "今年八月，作者把這條路徑重寫成純 Go",
+      "location": "首段",
+      "type": "date-version",
+      "load": "medium",
+      "note_ids": [
+        "n03"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "This August, I accomplished what I wanted for many years: I deleted the last cgo dependency in Debian Code Search!",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c05",
+      "claim_text": "倚仗的是 Go 1.26 在今年二月引入的一個實驗性套件 simd/archsimd",
+      "location": "首段",
+      "type": "date-version",
+      "load": "high",
+      "note_ids": [
+        "n25",
+        "n26"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Go 1.26 (released in February 2026) introduced the simd/archsimd package",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c06",
+      "claim_text": "第一次讓 AVX2、AVX512 這類指令可以直接寫進 Go 程式碼，不必再靠組合語言或 cgo 繞路。",
+      "location": "首段",
+      "type": "superlative",
+      "load": "medium",
+      "note_ids": [
+        "n25",
+        "n28"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Go's SIMD support makes available — in Go code without having to resort to cgo or assembly — a powerful part of modern CPUs",
+      "note": "「第一次」是對原文「introduces a new experimental simd/archsimd package」＋「without having to resort to cgo or assembly」的壓縮；原文未使用 first-ever 字樣，但語意方向一致，未上修強度。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c07",
+      "claim_text": "scan() 只出現在 encoder 端，decoder 端不需要，因為解碼的時候 bit width 已經是區塊標頭裡寫死的資訊，直接照著這個位寬把值倒出來就好",
+      "location": "第二段（TurboPFor 格式說明）",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "重新抓取確認：原文只把掃描描述為編碼側的瓶頸（\"the preceding step of scanning the input values to decide which block type to use becomes the bottleneck\"），從未說明 decoder 由區塊標頭讀取 bit width、因此不需要 scan。這段因果是作者自行補的機制說明，文中沒有任何推斷標記。",
+      "action": "mark-inferred",
+      "resolution": "marked-inferred"
+    },
+    {
+      "id": "c08",
+      "claim_text": "少數幾個大到超出這個寬度的值，不會反過來拉高整個區塊的 bit width，而是被標記成例外，另外用一個獨立的 bit width 存起來",
+      "location": "第二段",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n13"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The bitpacking with exceptions block type determines two bit widths: one for values, the other bit width for encoding exceptions.",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c09",
+      "claim_text": "他自己講得很直接：「I would prefer it if I did not have any C code in the project.」",
+      "location": "H2「PGO 先撞上的是 SKX102 對齊陷阱」首段",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n02"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "I would prefer it if I did not have any C code in the project.",
+      "note": "逐字相符，含句點。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c10",
+      "claim_text": "Go 編譯器為了修一個叫 SKX102 的 Intel 勘誤（Go issue #35881），規定融合分支序列不能跨過或落在 32-byte 邊界上，遇到會踩線的情況就塞一條 NOP 進去對齊。",
+      "location": "H2「PGO 先撞上的是 SKX102 對齊陷阱」",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [
+        "n05"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "However, the Go compiler ensures fused branch sequences must never cross or end at a 32-byte boundary to fix Intel erratum SKX102 (discussion: Go issue #35881) by inserting NOPs.",
+      "note": "逐項核對：SKX102、Go issue #35881、32-byte 邊界、插入 NOP 四個要素全在原文同一句內，且掛在同一個因果上。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c11",
+      "claim_text": "2017 年的 mid-stack inlining 提案（proposal #19348）讓 Go 有時得放進 NOP 指令，好讓 inliner 能在上面附掛標記",
+      "location": "H2「PGO 先撞上的是 SKX102 對齊陷阱」",
+      "type": "date-version",
+      "load": "high",
+      "note_ids": [
+        "n06"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "When doing mid-stack inlining (proposal #19348) (2017), Go sometimes needs to put NOP instructions into the binary so that it can attach inlining markers.",
+      "note": "提案編號與 2017 年份皆逐字相符。文中補的「方便之後的側寫工具定位」為作者對 inlining markers 用途的補述，原文只寫 attach inlining markers；屬低度延伸，未改變事實方向。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c12",
+      "claim_text": "後續幾個 commit 剛好改動了程式碼，這個倒楣的情境在接下來的優化系列裡就這樣被避開了——純粹是巧合。",
+      "location": "H2「PGO 先撞上的是 SKX102 對齊陷阱」段末（已重寫）",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [
+        "n04"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Because the commits after the PGO enabling commit change the code, this unlucky situation is avoided for the rest of the optimization series (by chance).",
+      "note": "第 2 輪逐項核對重寫後的句子：（一）「後續幾個 commit 剛好改動了程式碼」＝ Because the commits after the PGO enabling commit change the code；（二）「這個倒楣的情境在接下來的優化系列裡就這樣被避開了」＝ this unlucky situation is avoided for the rest of the optimization series；（三）「純粹是巧合」＝ (by chance)，偶然性已還原。第 1 輪指出的三個問題（把偶然寫成作者主動調整結構、憑空補上 PGO 正收益、憑空補上後續可疊更多 inline）全部消失；本輪重抓再次確認原文從未回報 PGO 產生正收益，也沒有任何 inline 疊加的說法。殘留：本句的支撐句「Because the commits after…」目前沒有對應的獨立註記（n04 只記錄 -13% geomean），追溯層偏薄，建議作者補一則含此逐字引文的註記。第 3 輪覆核：notes[] 未變動，此追溯薄弱點仍在（記錄不失分，句子本身有逐字來源支撐）。",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c13",
+      "claim_text": "原文沒有解釋 32-byte 邊界為什麼會卡到效能，以下是照常理推想的機制：CPU 前端一次抓指令是照固定大小的視窗抓的；如果一組融合分支剛好跨在視窗邊界上，在有 SKX102 這個勘誤的處理器世代就可能不穩定，Go 編譯器的作法是預先算好每個分支的位置，只要會跨到邊界就墊一顆 NOP，讓它整個往後挪、不再跨界。",
+      "location": "H2「PGO 先撞上的是 SKX102 對齊陷阱」第三段（已加推斷標記）",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "第 2 輪確認：重新抓取後原文仍完全沒有解釋 32-byte 邊界為何影響效能，也沒有 CPU 前端固定大小取指視窗的說法——所以新加的前提「原文沒有解釋…」本身準確。標記「原文沒有解釋 32-byte 邊界為什麼會卡到效能，以下是照常理推想的機制：」置於句首、以冒號把後面整段收進推斷範圍，涵蓋同段後續「PGO 打開之後…就剛好撞上新的邊界」那幾句，強度與文中另兩處推斷標記（vertical layout、GF2P8AFFINEQB）一致，符合出處四態的「推斷」用法。",
+      "action": "mark-inferred",
+      "resolution": "marked-inferred"
+    },
+    {
+      "id": "c14",
+      "claim_text": "這個改動把 debian-mix 這個混合真實工作負載的解碼速度，從 773 Mval/s 拉到 858 Mval/s，多了將近一成一。",
+      "location": "H2「把配置搬出熱路徑」",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n07"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "In the DCS pfordec package (with the improved API design), I ended up with a vals [256]uint32 field in the StreamDecoder type, which brings us from 773 Mval/s to 858 Mval/s on the debian-mix",
+      "note": "773→858 為 +10.996%，「將近一成一」的表述與計算相符，未上修。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c15",
+      "claim_text": "作者把這個暫存陣列改成寫進 StreamDecoder 型別裡的固定欄位，一個 vals [256]uint32，搭配重新設計過的 API",
+      "location": "H2「把配置搬出熱路徑」",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n07"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "I ended up with a vals [256]uint32 field in the StreamDecoder type",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c16",
+      "claim_text": "原文的說法是：「Because the bitWidth is now known at compile time, the Go compiler can generate close to the optimal machine code for each bit width」",
+      "location": "H2「用 generics 把 bit width 釘死成編譯期常數」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n10"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Because the bitWidth is now known at compile time, the Go compiler can generate close to the optimal machine code for each bit width",
+      "note": "逐字相符。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c17",
+      "claim_text": "作者用 Go 的 generics 把 bit width 變成型別參數，對 1 到 32 每一個寬度各自生成一份特化程式碼。",
+      "location": "H2「用 generics 把 bit width 釘死成編譯期常數」",
+      "type": "number",
+      "load": "medium",
+      "note_ids": [
+        "n10"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Because the bitWidth is now known at compile time, the Go compiler can generate close to the optimal machine code for each bit width",
+      "note": "1 到 32 的範圍在原文以 dispatch 用的 switch（case 1 至 case 32）呈現，並非散文中的宣告句；文中的敘述與該程式碼一致。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c18",
+      "claim_text": "原文寫的是「Encoding remainder blocks is quite a bit faster (full blocks use the vertical layout anyway)」",
+      "location": "H2「用 generics 把 bit width 釘死成編譯期常數」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n31"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Encoding remainder blocks is quite a bit faster (full blocks use the vertical layout anyway):",
+      "note": "原文句末為冒號（引出 benchmark 表），文中引用時省略冒號，語意未變。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c19",
+      "claim_text": "bitpacking-bw1 751.2 / 1120.5 / +49.15%；bitpacking-bw2 716.8 / 1176.0 / +64.07%；bitpacking-bw7 700.0 / 1078.5 / +54.08%；bitpacking-bw1-exc 524.8 / 736.8 / +40.40%；bitpacking-bw7-exc 566.7 / 787.7 / +38.99%；debian-mix 559.5 / 783.8 / +40.09%",
+      "location": "benchmark 表格（figure.vg-w-table-bitwidth）",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n08",
+        "n08b",
+        "n32",
+        "n33",
+        "n34",
+        "n09"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "vals=bitpacking-bw1 751.2 ± 3% 1120.5 ± 0% +49.15% / vals=bitpacking-bw2 716.8 ± 2% 1176.0 ± 0% +64.07% / vals=bitpacking-bw7 700.0 ± 1% 1078.5 ± 0% +54.08% / vals=bitpacking-bw1-exc 524.8 ± 1% 736.8 ± 0% +40.40% / vals=bitpacking-bw7-exc 566.7 ± 1% 787.7 ± 0% +38.99% / vals=debian-mix 559.5 ± 0% 783.8 ± 9% +40.09%",
+      "note": "六列全部逐位元核對相符，單位 Mval/s 也與原文欄位標題相符。原文表格另有 bitpacking-bw2-exc、bitpacking-vb-exc、sparse-exc、sparse-vb-exc 四列未收入；文中未宣稱表格完整，屬合法取樣。原文的 ± 誤差區間在文中省略，屬減弱而非上修。第 2 輪重抓完整表格（含未收入的四列：bw2-exc +39.46%、vb-exc +39.29%、sparse-exc +47.97%、sparse-vb-exc +46.20%）再次核對，六列數字全部維持相符。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c20",
+      "claim_text": "generics 對 remainder block 做 bit width 特化前後的吞吐量（Mval/s），數字取自作者釋出的 benchmark",
+      "location": "benchmark 表格 figcaption",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n08",
+        "n09",
+        "n31"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Encoding remainder blocks is quite a bit faster (full blocks use the vertical layout anyway):",
+      "note": "原文這組數字為作者自行以 benchstat 跑出並貼在文中的結果，figcaption 的歸屬（作者釋出的 benchmark）與來源一致；表格緊接在 remainder block 那句之後，「對 remainder block 特化」的框定也正確。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c21",
+      "claim_text": "從表格可以看到，remainder block 的特化收益普遍落在 39% 到 64% 之間，純打包和帶 exceptions 的路徑都吃得到，不是只有某個特定 bit width 才特別有感。",
+      "location": "benchmark 表格後一段（已重寫）",
+      "type": "number",
+      "load": "medium",
+      "note_ids": [
+        "n08",
+        "n08b",
+        "n32",
+        "n33",
+        "n34",
+        "n09"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "vals=bitpacking-bw1 … +49.15% / vals=bitpacking-bw2 … +64.07% / vals=bitpacking-bw7 … +54.08% / vals=bitpacking-bw1-exc … +40.40% / vals=bitpacking-bw2-exc … +39.46% / vals=bitpacking-bw7-exc … +38.99% / vals=bitpacking-vb-exc … +39.29% / vals=sparse-exc … +47.97% / vals=sparse-vb-exc … +46.20% / vals=debian-mix … +40.09%",
+      "note": "第 2 輪核對：（一）第 1 輪指出的「越窄的 bit width 越吃這套特化」那句跨寬度排序推論已完全消失，重抓再次確認原文從未比較不同 bit width 之間的特化幅度；（二）新的範圍陳述可用文中六列直接驗算——最低 +38.99%（bw7-exc）、最高 +64.07%（bw2），與「39% 到 64%」在四捨五入層級相符，且「普遍」保留模糊餘地；（三）重抓完整表格（十列）後區間仍是 38.99%–64.07%，範圍陳述對整張原表也成立，不是只在取樣的六列成立；（四）「純打包和帶 exceptions 的路徑都吃得到」由 bw1/bw2/bw7 與三個 -exc 列同時支撐；（五）第 1 輪指出的「與自家表格互相矛盾」已不存在（新句不再對 bw1 與 bw2 做高低排序）。唯一可挑剔處：下界 38.99% 嚴格說略低於 39%，屬四捨五入層級，且文中 tab widget 另一處寫的是更保守的「+38% 至 64%」。第 3 輪覆核：本段與 tab widget（panel-3「+38% 至 64%」）文字均未變動，此四捨五入邊界仍在（記錄不失分）。",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c22",
+      "claim_text": "「vertical layout」實際上怎麼把多個值塞進一個 SIMD 暫存器，原文沒有進一步展開，但合理的推測是，它假設區塊裡的值數量剛好湊滿一整個向量寬度",
+      "location": "H2「用 generics 把 bit width 釘死成編譯期常數」後段",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "deflated",
+      "evidence": null,
+      "note": "文中已明寫「原文沒有進一步展開，但合理的推測是」，推斷標記完整，符合出處四態的「推斷」用法。附帶一提：原文對 vertical layout 其實有一句概略描述（SIMD bitpacking 同時處理 8 個 uint32 little-endian 值）與一張示意圖，所以「原文沒有進一步展開」略為保守，但保守方向不構成錯誤。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c23",
+      "claim_text": "這個實驗性套件要在建置時設定環境變數 GOEXPERIMENT=simd 才會啟用",
+      "location": "H2「AVX2 bitunpack 用兩個 256-bit 暫存器換掉一個迴圈」",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n26"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Go 1.26 introduces a new experimental simd/archsimd package, which can be enabled by setting the environment variable GOEXPERIMENT=simd at build time.",
+      "note": "第 3 輪重抓再次逐字核對相符。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c24",
+      "claim_text": "搭配既有的 GOAMD64（決定編譯目標的微架構等級，分 v1 到 v4 四級）",
+      "location": "H2「AVX2 bitunpack 用兩個 256-bit 暫存器換掉一個迴圈」",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n27"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "With GOARCH=amd64, the architecture-specific variable GOAMD64 configures the microarchitecture level for which to compile",
+      "note": "第 2 輪重抓再次確認原文逐條列出 GOAMD64=v1（default）／v2／v3／v4 四個等級與各自的指令集，「分 v1 到 v4 四級」與原文相符。第 3 輪再次重抓四級清單逐字核對（v1 baseline／v2 加 POPCNT、SSE 系列／v3 加 AVX、AVX2 等／v4 加 AVX512F、AVX512BW、AVX512CD、AVX512DQ、AVX512VL），四級無誤。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c25",
+      "claim_text": "再用 archsimd.X86.AVX2() 在執行期偵測這台機器實際支援哪些指令集，偵測不到就退回純量版本",
+      "location": "H2「AVX2 bitunpack 用兩個 256-bit 暫存器換掉一個迴圈」（第 3 輪前已由 parent 修正）",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n26",
+        "n35"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "var hasAVX2 = archsimd.X86.AVX2()\n\nfunc fillConstant(output []uint32, val uint32) {\n  if !hasAVX2 {\n    fillConstantScalar(output, val)\n    return\n  }",
+      "note": "第 3 輪定案。修正已落地：文中原本並列的「archsimd.X86.AVX512()」已刪除，現行句只留 archsimd.X86.AVX2() 一支。本輪以逐字搜尋重新追查整篇原文（含所有程式碼區塊）確認：字串 archsimd.X86. 全文只出現一次，即 var hasAVX2 = archsimd.X86.AVX2()；沒有 archsimd.X86.AVX512()，也沒有 hasAVX512 變數——第 2 輪指認的捏造 API 識別字確實已從文中消失，且來源側的否定結論在本輪重抓後維持不變。整句其餘要素逐項覆核皆有據：（一）GOEXPERIMENT=simd 於建置時啟用＝原文 which can be enabled by setting the environment variable GOEXPERIMENT=simd at build time（同 c23）；（二）GOAMD64 決定編譯目標微架構等級、分 v1 到 v4 四級＝原文 GOAMD64 configures the microarchitecture level for which to compile 加上逐條列出的 v1/v2/v3/v4（同 c24）；（三）執行期偵測＋純量 fallback＝ var hasAVX2 = archsimd.X86.AVX2() 後接 if !hasAVX2 { fillConstantScalar(output, val); return }，偵測與退回兩個動作都在同一段程式碼裡。殘留可挑剔處（不失分）：句中「偵測這台機器實際支援哪些指令集」用了複數的「哪些」，但原文實際示範的執行期偵測呼叫只有 AVX2 一支；此為對 archsimd 特性偵測 API 的一般性描述，未再指名任何不存在的識別字，不構成 fabricated texture。",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c26",
+      "claim_text": "原文沒有說明在不滿足那個等級的舊機器上實際會發生什麼；比較保守的猜測是：程式碼用到的指令根本不存在於那顆 CPU 上，執行到時應該會觸發非法指令、讓程式中止，而不只是變慢。",
+      "location": "H2「AVX2 bitunpack 用兩個 256-bit 暫存器換掉一個迴圈」GOAMD64 段（已加推斷標記）",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "第 2 輪確認：重新抓取後專門追問「原文是否說明過為較高 GOAMD64 等級編譯的執行檔跑在舊 CPU 上會發生什麼（非法指令／崩潰／SIGILL）」，答案明確是沒有——文中新增的前提「原文沒有說明…」準確。第 1 輪的肯定句（「會直接觸發非法指令、整個程式中止執行」）已改寫成帶雙重標記的推斷（「比較保守的猜測是」＋「應該會」），符合出處四態的「推斷」用法。",
+      "action": "mark-inferred",
+      "resolution": "marked-inferred"
+    },
+    {
+      "id": "c27",
+      "claim_text": "純量版本用一個逐一跑 8 次的 for range 迴圈處理 8 個值…SIMD 版本一樣是處理 8 個值一批，卻完全不需要那個迴圈，用兩個 256-bit 暫存器同時扛住整批資料的位移與遮罩運算",
+      "location": "H2「AVX2 bitunpack 用兩個 256-bit 暫存器換掉一個迴圈」",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n11",
+        "n36"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The SIMD version also processes 8 values, but without a `for i := range 8` loop! || var rest8 archsimd.Uint32x8\nvar cur8 archsimd.Uint32x8",
+      "note": "第 2 輪加驗：追溯層已補齊——作者新增 n36，本輪重抓逐字核對相符（原文確有 var rest8 archsimd.Uint32x8 與 var cur8 archsimd.Uint32x8 兩行，且確實位於 bitunpack256v32 函式內，與 n36 的 interpretation 一致）。另重抓確認原文的 The SIMD version also processes 8 values, but without a `for i := range 8` loop!，以及純量側的 for i := range 8 迴圈程式碼，文中「純量版本用一個逐一跑 8 次的 for range 迴圈」「SIMD 版本…完全不需要那個迴圈」兩句均有據。8×uint32 = 256 bit 的換算為算術，非新增事實。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c28",
+      "claim_text": "實測下來，SIMD 版本比純量版本快了大約 3 倍。",
+      "location": "H2「AVX2 bitunpack 用兩個 256-bit 暫存器換掉一個迴圈」",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n11"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The SIMD version benchmarks about 3x as fast as the scalar version.",
+      "note": "原文的 about 與文中的「大約」對應，強度一致。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c29",
+      "claim_text": "原文對這種區塊類型的定義是它會同時定出兩個 bit width——「one for values, the other bit width for encoding exceptions」",
+      "location": "H2「positional popcount：把逐值掃描改寫成逐欄計數」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n13"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The bitpacking with exceptions block type determines two bit widths: one for values, the other bit width for encoding exceptions.",
+      "note": "引用片段逐字相符。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c30",
+      "claim_text": "即使套用了前面幾輪優化，「快」的版本平均每個值還是要花掉大約 12 條指令。",
+      "location": "H2「positional popcount：把逐值掃描改寫成逐欄計數」",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n12"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The fast version still needs about 12 instructions per value.",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c31",
+      "claim_text": "這叫 positional population count，原文的講法是「Counting columns is called Positional Population Count」",
+      "location": "H2「positional popcount：把逐值掃描改寫成逐欄計數」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n14"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Counting columns is called Positional Population Count.",
+      "note": "逐字相符（文中省略句末句點）。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c32",
+      "claim_text": "原文形容是「imagine taking the first 1 bit and smearing it across the remaining positions」",
+      "location": "H2「positional popcount：把逐值掃描改寫成逐欄計數」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n15"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The trick is to turn each input value into its 'smear mask' (imagine taking the first 1 bit and smearing it across the remaining positions).",
+      "note": "括號內片段逐字相符。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c33",
+      "claim_text": "原本要 12 條指令才能算完一個值的工作，壓到只剩 1.5 條，快了 8 倍。",
+      "location": "H2「positional popcount：把逐值掃描改寫成逐欄計數」（並於 tab widget panel-5 重述）",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n12",
+        "n19"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "With SIMD, we can reduce this to by 8x to only 1.5 instructions per value!",
+      "note": "12→1.5 與 8 倍兩個數字都出自原文（12 來自 n12 的 about 12 instructions per value），倍數關係與原文自述的 8x 一致。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c34",
+      "claim_text": "原文沒有逐步拆解 GF2P8AFFINEQB 這一步的位元排列細節，但從整條 pipeline 的輸入輸出可以合理還原它要解決的問題",
+      "location": "H2「positional popcount：把逐值掃描改寫成逐欄計數」轉置段",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [
+        "n16",
+        "n17",
+        "n18"
+      ],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "推斷標記存在且明確。再抓取確認原文對這一步只給到「transpose the bits using the GF2P8AFFINEQB instruction」加一張 90 度旋轉示意圖，未指明個別位元的去向——文中「原文沒有逐步拆解…位元排列細節」的描述準確。段內引用的 VPERMB／VPOPCNTB 角色本身有 n16／n18 支撐。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c35",
+      "claim_text": "純量版本一開始的成績是 C 的 76%，原文寫的是「Go is at 76% of C」",
+      "location": "H2「搬回 C 之後，Go 還是慢了 1.4 倍」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n29"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "I explored whether I could also implement a native Go encoder so that I could get rid of the C TurboPFor dependency entirely. The answer is yes, it is doable in a few days, and it isn't even that much slower: Go is at 76% of C",
+      "note": "第 2 輪抓到完整前後文：這句回答的問題是「能不能也寫一個原生 Go encoder，好完全甩掉 C TurboPFor 依賴」，76% 指的正是尚未上 SIMD 的純量 Go encoder，文中的框定正確。（同段後半的軌跡敘述另立為 c45，見該筆。）第 3 輪重抓再次確認引文逐字相符。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c36",
+      "claim_text": "等到把同一套 AVX512 kernel 和 positional popcount 技巧反向移植回 C TurboPFor，做真正對等的比較，作者測出來的結果是「Go benchmarks a little slower at ≈1.4x C.」",
+      "location": "H2「搬回 C 之後，Go 還是慢了 1.4 倍」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n20"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "When comparing apples to apples, i.e. backporting the AVX512 kernels and positional popcount technique to C TurboPFor, Go benchmarks a little slower at ≈1.4x C.",
+      "note": "特別核對文中對 1.4 倍的框定：原文自己就把這個數字限定在「把 AVX512 kernels 與 positional popcount 技巧反向移植回 C TurboPFor 之後的對等比較」，文中的條件敘述與原文一字不差地對應，沒有把 1.4 倍擴大成一般性結論。引號內片段逐字相符（含 ≈ 與句點）。第 3 輪重抓再次確認：本句在段落改寫後位置未變、條件（反向移植回 C）仍完整保留在句首，未因前面新增的超車敘述而被剝離。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c37",
+      "claim_text": "Go 強制邊界檢查，作者的態度很明確：「While it costs performance, bounds checking is great for safety, so I will not turn off bounds checking.」",
+      "location": "H2「搬回 C 之後，Go 還是慢了 1.4 倍」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n21"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "While it costs performance, bounds checking is great for safety, so I will not turn off bounds checking.",
+      "note": "逐字相符。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c38",
+      "claim_text": "原文寫的是「For dispatch-bound functions, these extra NOPs can measurable slow down execution.」",
+      "location": "H2「搬回 C 之後，Go 還是慢了 1.4 倍」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n22"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "deflated",
+      "evidence": "For dispatch-bound functions, these extra NOPs can measurable slow down execution.",
+      "note": "逐字相符，包含原文自己的文法瑕疵 measurable（而非 measurably），文中原樣重現未擅自修正。文中緊接的敘述用「確實會拖慢執行」，原文為 can …，屬輕度上修；但因引文緊接在後、讀者看得到原始強度，判為可接受，不另開修正。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c39",
+      "claim_text": "Go 編譯器在每一次 POPCNT 前面都塞一條 XORL CX,CX，為的是修 Intel Sandy Bridge、Skylake 世代的一個假輸出依賴，這條指令在 AMD Zen 上其實用不到",
+      "location": "H2「搬回 C 之後，Go 還是慢了 1.4 倍」",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [
+        "n23"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The Go compiler emits XORL CX,CX before every POPCNT to break a false-output-dependency from the Intel Sandy Bridge Skylake era, which is unnecessary on AMD Zen CPUs.",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c40",
+      "claim_text": "但作者猜測，Go 是刻意不提供這種細緻的客製化，GOAMD64 只分 v1 到 v4 四個等級，粒度就是這麼粗。",
+      "location": "H2「搬回 C 之後，Go 還是慢了 1.4 倍」（已重寫）",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n24",
+        "n27"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The Go compiler currently allows specifying the architecture (GOARCH=amd64) and microarchitecture (GOAMD64=v3), but not a specific CPU architecture (like AMD Zen 4). I suspect that Go intentionally does not offer this level of customizability.",
+      "note": "第 2 輪核對：（一）文中已補上「但作者猜測」，與原文句首的 I suspect that 對應，把原本升格成既成事實的意圖歸因降回作者本人的推測，強度一致，hedge_delta 由 inflated 回到 none；（二）「不像 C 那樣針對單一 CPU 世代做客製化」的比較有原文支撐（but not a specific CPU architecture (like AMD Zen 4)）；（三）GOAMD64 四級由 n27／c24 支撐。ledger 端也已修好：n24 的 quote 補回被漏掉的 I suspect that，且 hedge 欄位已由 asserted 改為 hedged，本輪重抓逐字核對相符，這條註記不再有被誤當成斷言引用的風險。",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c41",
+      "claim_text": "作者最後把話收得很收斂：「a powerful part of modern CPUs which allows speeding up the kind of computation that TurboPFor needs by an order of magnitude」",
+      "location": "H2「搬回 C 之後，Go 還是慢了 1.4 倍」結尾段",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n28"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Go's SIMD support makes available — in Go code without having to resort to cgo or assembly — a powerful part of modern CPUs which allows speeding up the kind of computation that TurboPFor needs by an order of magnitude!",
+      "note": "引用的是原文破折號子句之後的連續片段，逐字相符；文中同段也照原文補上「不用繞道 cgo 或組合語言」的條件，未斷章。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c42",
+      "claim_text": "純量版本的原生 Go encoder，作者說從動筆到寫完只花了幾天。",
+      "location": "H2「搬回 C 之後，Go 還是慢了 1.4 倍」結尾段（已重寫）",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n29"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "I explored whether I could also implement a native Go encoder so that I could get rid of the C TurboPFor dependency entirely. The answer is yes, it is doable in a few days, and it isn't even that much slower: Go is at 76% of C",
+      "note": "第 2 輪核對：文中已把「幾天」的適用範圍收回到「純量版本的原生 Go encoder」，與原文 in a few days 所回答的問題（能不能實作一個原生 Go encoder 以完全甩掉 C TurboPFor 依賴）一致；第 1 輪指出的橫跨 AVX512／positional popcount 的延伸已消失。重抓再次確認後段另有不同計量方式（\"Beating C TurboPFor was possible in 2-3 commits (SIMD and bit width specialization).\"），是 commit 數不是天數，文中沒有再把它併進「幾天」。附註：交辦說明引用的新句是「從動筆到追到 C 的 76%」，但文中實際寫的是「從動筆到寫完」——實際文字比交辦版本更保守（不再把 76% 綁進同一句），核實結論不受影響；「從動筆到寫完只花了幾天」對應 it is doable in a few days，屬同強度轉述且帶「作者說」的可見歸屬。第 3 輪覆核：c45 的重寫把「2-3 commits」明確標成 commit 數而非天數，與本筆的「幾天」不再有混淆風險。",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c43",
+      "claim_text": "解碼器的效能計數器顯示每個 cycle 能發出 7 條指令，在這台機器 8 IPC 的理論上限裡",
+      "location": "H2「搬回 C 之後，Go 還是慢了 1.4 倍」結尾段",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n30"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The CPU performance counters show value decoding speeds of 7 instructions/cycle (IPC) on a machine where the maximum is 8 IPC.",
+      "note": "7 IPC 與 8 IPC 上限皆逐字相符，且原文同樣把 8 限定在「這台機器」而非通則，文中框定一致。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c44",
+      "claim_text": "archsimd 目前是 experimental，API 隨時可能在後續版本改動",
+      "location": "結尾「幾個要先想清楚的代價」段",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n26"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The API is not yet considered stable.",
+      "note": "原文除 experimental 的形容外，另引 Go 1.26 release notes 明說 API 尚未穩定，與文中敘述強度相當。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c45",
+      "claim_text": "沒有 SIMD 就只慢 24%。後面的優化甚至一度超車：原文說 SIMD 與 bit width 特化兩三個 commit 就足以「Beating C TurboPFor」，positional popcount 再拿下另一個 2 倍。",
+      "location": "H2「搬回 C 之後，Go 還是慢了 1.4 倍」首段，緊接在「Go is at 76% of C」引文之後（第 3 輪前已由 parent 改寫）",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [
+        "n29",
+        "n37"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The goal I set myself at that point was to see if I could learn enough SIMD to optimize the native Go encoder such that its performance would match how DCS uses C TurboPFor (via cgo). Beating C TurboPFor was possible in 2-3 commits (SIMD and bit width specialization). To my surprise, Claude Fable 5 pointed out that the encoder's block scanning could be done more efficiently using a technique called positional popcount, and that is another 2x speed-up! || To be clear: I am not saying the Go compiler beats C here. Certainly, the C compiler can also produce fast AVX512 code and can be used to implement positional popcount. When comparing apples to apples, i.e. backporting the AVX512 kernels and positional popcount technique to C TurboPFor, Go benchmarks a little slower at ≈1.4x C.",
+      "note": "第 3 輪定案。第 2 輪指認的方向性漂移（「後面的優化只會再逼近一些」把一次超車寫成始終沒追上）已從文中消失，改寫後逐項覆核：（a）方向已與原文一致——原文明寫 Beating C TurboPFor was possible in 2-3 commits，是超越而非逼近，文中的「甚至一度超車」方向正確，且「一度」保留了後文被 1.4 倍推翻的時間性；（b）兩處引用逐字支撐且歸屬正確——「Beating C TurboPFor」為原文逐字子字串，原文括號 (SIMD and bit width specialization) 正是文中歸給「SIMD 與 bit width 特化」的兩項，而 another 2x speed-up 在原文緊接 positional popcount 之後，文中歸給 positional popcount 亦正確；「2-3 commits」譯為「兩三個 commit」為忠實直譯，未擴大也未縮小；（c）≈1.4x 的條件仍完整——緊接的下一句（c36）保留原文 backporting the AVX512 kernels and positional popcount technique to C TurboPFor 的條件框定，改寫沒有把超車與 1.4 倍的先後與條件關係打亂；（d）沒有誇大——原文緊接超車句之後自己就寫了 To be clear: I am not saying the Go compiler beats C here，而文中該段落是以「故事如果在這裡打住，很容易寫成『Go 打敗了 C』的勝利敘事，但作者沒有這樣收尾」開場，等於把原文的自我限縮前置在超車敘述之前，敘事強度低於或等於原文，非上修。另核對超車的對照組：原文的目標句指明比較對象是 how DCS uses C TurboPFor (via cgo)，即未經改造的 C TurboPFor，文中未把它誤寫成已吃到同一套技巧的 C。殘留可挑剔處（不失分）：「Beating C TurboPFor」與「another 2x」兩處引文本輪已逐字重抓核實，但 notes[] 未新增對應註記（n29 只記錄 76% 那句），本筆的追溯層仍僅靠 n29，建議作者補一則含這段逐字引文的註記；本輪依交辦不得改動 notes[]，故僅記錄。",
+      "action": "correct",
+      "resolution": "corrected"
+    }
+  ],
+  "checked_at": "2026-09-07",
+  "checker_rounds": 3,
+  "coverage": {
+    "candidate_claims": 56,
+    "checked": 45,
+    "dropped_low_load": 11
+  }
+}
