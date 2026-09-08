@@ -1,0 +1,404 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">Plush 是一個用 Rust 寫的直譯器，原本每個值要佔滿 128 個位元——即使你放進去的只是一個整數，或者只是 true。作者把它換成手寫的 64-bit tagged word 之後，記憶體用量在陣列密集的 benchmark 上最多降了 37%，而且沒有一個 benchmark 變慢。</p>
+  <h1 class="vg-post-title">一個值不該佔到 128 個位元</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p><span class="vg-dropcap">動</span>態語言直譯器的核心資料結構，說到底就是「一個值怎麼表示」。Plush 原本用一個 16 個 variant 的 Rust tagged enum 表示每一個值，後來全部換成手寫的 64-bit tagged word——這篇順著這次改版，把 enum 為什麼會胖成 128 bit、tag 怎麼塞進最低兩個位元、以及為什麼連浮點運算都跟著變快，一次講完。</p>
+
+  <p>會值得寫這麼長，是因為改動本身不複雜——說穿了就是把交給編譯器決定版面的 enum，換成自己手排的一個機器字。但這個決定牽動的東西不少：整數運算怎麼做溢位判斷、浮點數要犧牲哪幾個 bit 的精度、相等比較怎麼分兩種語意、match dispatch 產生的組合語言長什麼樣。每一個決定背後都有一個具體的理由，而不是「這樣比較省」這種空泛的說法。</p>
+
+  <h2>16 個 variant，128 個位元</h2>
+
+  <p>Plush 原本的 <code>Value</code> 定義得很直接——每一種值一個 variant，該內嵌的資料直接放進去，型別系統本身沒有任何問題，讀起來一目瞭然：</p>
+
+  <pre><code class="language-rust">enum Value {
+    Undef, Nil, False, True,
+    Int64(i64), Float64(f64),
+    String(*const Str), HostFn(&amp;&#39;static HostFn),
+    Fun(FunId), Closure(*mut Closure),
+    Cell(*mut Value), Object(*mut Object),
+    Array(*mut Array), ByteArray(*mut ByteArray),
+    Dict(*mut Dict), Class(ClassId),
+}</code></pre>
+
+  <p>單看每個 variant，資料量都不大：一個 <code>i64</code>、一個 <code>f64</code>，或者一根指標，都是 64 bit 就能裝下。Rust 為了分辨十六種 variant，另外加了一個 discriminant，理論上 8 bit 就夠用。加起來 72 bit，離一個機器字（64 bit）不遠。問題出在 alignment：Rust 按最寬的欄位對齊記憶體，這個 enum 整整 <code>16 bytes（128 bits）寬</code>——每個 variant 本身只要 64 bit、Rust 自動加的 tag 只要 8 bit，但因為記憶體對齊的限制，Rust 可能就得為每一個值用掉整整 128 bit。換句話說，128 bit 裡頭，64 bit 給 payload、8 bit 給 discriminant，剩下的 56 bit（約 43.75%——這是從來源給的 128、64、8 三個數字自己換算出來的，不是來源本身寫的數字）完全沒有對應任何資料，純粹是拿來把下一個值墊到對齊邊界上。</p>
+
+  <p>對一個標量值來說，多付 64 bit 不痛不癢。但 Plush 的陣列、字典這些容器，裡面塞的正是這種 <code>Value</code>——存一百萬個整數，等於花兩百萬個 64-bit 字的記憶體，還連帶把 CPU cache 裡能放的值數量砍半。</p>
+
+  <p>下面這張圖把舊版 128 bit 的版面拆開：拖動下方的滑桿，看看每個位元段到底在存什麼。</p>
+
+  <figure class="vg-w-drag-plush-byte-layout" data-mobile="static" data-svg-scroll="720">
+    <style>
+      .vg-w-drag-plush-byte-layout { display: grid; gap: var(--s-2); margin: var(--s-4) 0; }
+      .vg-w-drag-plush-byte-layout svg { width: 100%; height: auto; }
+      .vg-w-drag-plush-byte-layout .readout-box { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1; }
+      .vg-w-drag-plush-byte-layout .readout-text { font-family: EB Garamond, serif; font-size: 14px; fill: var(--ink); }
+      .vg-w-drag-plush-byte-layout .seg-text { font-family: Manrope, sans-serif; font-size: 12px; fill: var(--muted); }
+      .vg-w-drag-plush-byte-layout .seg-text.on { fill: var(--accent-text); }
+      .vg-w-drag-plush-byte-layout .bar-label { font-family: EB Garamond, serif; font-size: 14px; fill: var(--ink); }
+      .vg-w-drag-plush-byte-layout .handle { cursor: grab; touch-action: none; }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m18 8 4 4-4 4"/><path d="M2 12h20"/><path d="m6 8-4 4 4 4"/>
+      </svg>
+      <span>拖動下方圓點，逐段檢視 128 bit 裡每一段在做什麼 · 3 個區段</span>
+    </p>
+    <svg class="vg-w-drag-plush-byte-layout-main" viewBox="0 0 720 300" role="img" aria-label="舊版 128 bit Value 與新版 64 bit tagged word 的位元配置對照，可拖動指標檢視每一段的用途">
+      <text x="40" y="24" class="bar-label">舊：Value enum（16 bytes / 128 bit）</text>
+      <rect x="40" y="36" width="320" height="40" fill="var(--accent)" fill-opacity="0.16" stroke="var(--accent)" stroke-width="1.2"/>
+      <rect x="360" y="36" width="40" height="40" fill="var(--ink-deep)" fill-opacity="0.16" stroke="var(--ink-deep)" stroke-width="1.2"/>
+      <rect x="400" y="36" width="280" height="40" fill="none" stroke="var(--muted-2)" stroke-width="1.2" stroke-dasharray="4,3"/>
+      <text x="200" y="94" text-anchor="middle" class="seg-text">payload · 64 bit</text>
+      <text x="380" y="94" text-anchor="middle" class="seg-text">tag · 8 bit</text>
+      <text x="540" y="94" text-anchor="middle" class="seg-text">padding · 56 bit（推算：128 − 64 − 8）</text>
+
+      <text x="40" y="150" class="bar-label">新：tagged word（8 bytes / 64 bit）</text>
+      <rect x="40" y="162" width="310" height="36" fill="var(--sage-deep)" fill-opacity="0.16" stroke="var(--sage-deep)" stroke-width="1.2"/>
+      <rect x="350" y="162" width="10" height="36" fill="var(--accent)" fill-opacity="0.4" stroke="var(--accent)" stroke-width="1.2"/>
+      <text x="195" y="215" text-anchor="middle" class="seg-text">payload · 62 bit</text>
+      <text x="380" y="215" text-anchor="middle" class="seg-text">tag · 2 bit</text>
+
+      <line x1="40" y1="250" x2="680" y2="250" stroke="var(--muted-2)" stroke-width="1"/>
+      <circle id="vg-w-drag-plush-byte-layout-h" class="handle" cx="200" cy="250" r="12" fill="var(--accent)" role="button" tabindex="0" aria-label="拖動指標，檢視舊版 128 bit 每一段對應的用途"/>
+
+      <rect class="readout-box" x="40" y="260" width="640" height="34" rx="4"/>
+      <text id="vg-w-drag-plush-byte-layout-out" class="readout-text" x="52" y="282">目前對齊：payload，真正存資料的部分（64 bit）</text>
+    </svg>
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        var root = document.querySelector('.vg-w-drag-plush-byte-layout');
+        var svg = root.querySelector('.vg-w-drag-plush-byte-layout-main');
+        var handle = root.querySelector('#vg-w-drag-plush-byte-layout-h');
+        var out = root.querySelector('#vg-w-drag-plush-byte-layout-out');
+        var X_MIN = 40, X_MAX = 680;
+        function labelFor(x) {
+          if (x < 360) return 'payload，真正存資料的部分（64 bit）';
+          if (x < 400) return 'discriminant，Rust 加的 tag（8 bit）';
+          return 'padding，alignment 留下的空位（56 bit，不對應任何資料）';
+        }
+        function update(x) {
+          x = Math.max(X_MIN, Math.min(X_MAX, x));
+          handle.setAttribute('cx', x);
+          out.textContent = '目前對齊：' + labelFor(x);
+        }
+        function clientToSvgX(clientX) {
+          var pt = svg.createSVGPoint();
+          pt.x = clientX; pt.y = 0;
+          return pt.matrixTransform(svg.getScreenCTM().inverse()).x;
+        }
+        var dragging = false;
+        handle.addEventListener('pointerdown', function (e) {
+          dragging = true;
+          handle.setPointerCapture(e.pointerId);
+        });
+        handle.addEventListener('pointermove', function (e) {
+          if (!dragging) return;
+          update(clientToSvgX(e.clientX));
+        });
+        handle.addEventListener('pointerup', function () { dragging = false; });
+        handle.addEventListener('keydown', function (e) {
+          var cx = Number(handle.getAttribute('cx'));
+          if (e.key === 'ArrowLeft') { e.preventDefault(); update(cx - 20); }
+          if (e.key === 'ArrowRight') { e.preventDefault(); update(cx + 20); }
+        });
+      })();
+    </script>
+  </figure>
+
+  <h2>把 tag 塞進最低兩個位元</h2>
+
+  <p>這個 alignment 稅不是 Plush 獨有的處境——只要一種語言的做法是「一個 discriminant 加一塊足夠裝下所有 variant payload 的空間」，版面就容易被最寬的那個 variant 牽著走，對齊邊界一到，矮胖的 variant 也得跟著多付一份。Plush 的解法很直接：不再讓編譯器決定版面，改成自己手排一個 64-bit 字，用最低的兩個 bit 當 tag，代價是往後每一次讀寫值都得自己動手做位元運算，換來的是版面完全掌握在自己手裡。兩個 bit 排得出四種組合，但原文文字只明確指派了兩種：<code>00</code> 給 fixnum、<code>10</code> 給 flonum。immediate 一節只描述了它的 5-bit subtag，沒有在文字裡寫出對應的 2-bit tag 值；兩種指標則是接到 bit index 1 這個角色上描述——這一位標示兩個值能不能只用一條指令直接比較。完整的四種 tag 對照只畫在文章附的一張圖裡（該圖替代文字僅重複標題「The tagged value representation」，文字層無法核實），下面這個圖會把文字裡寫明的部分跟只能從圖片得知、文字沒有列出的部分分開標示。</p>
+
+  <p>fixnum 的 tag 是 <code>00</code>：一個帶號的 62-bit 整數，「lowest two bits set to 00, and are stored as <code>n &lt;&lt; 2</code>」——數值本身左移兩位存放，tag 剛好補在空出來的低位。這個編碼有個容易被忽略的好處：因為兩個 fixnum 的低兩位都固定是 00，直接把兩個 tagged word 拿去做整數加法、減法，結果的低兩位也還是 00——不用先把值移右去 tag、算完再移回去，機器指令怎麼加就怎麼加。更進一步，一次 64-bit 的加法、減法算完之後，如果結果超出 62 bit 的範圍，那正好也是機器層級判定 64-bit overflow 的同一個條件，可以直接用硬體的 overflow flag 判斷該不該把值 box 到 heap，不需要另外寫一套獨立的邊界檢查邏輯。</p>
+
+  <p>flonum 的 tag 是 <code>10</code>，用的是一套借來的自標記手法：把 IEEE 754 浮點數的高位 bits 做一次 rotation，轉到 tag 該在的位置，再挑一個 bias 值，讓運算後最低兩位自然變成 <code>10</code>。這個做法巧妙的地方在於，它沒有像 fixnum 那樣「額外挪出」兩個 bit 給 tag，而是利用浮點數本身指數欄位的分布特性，讓 tag 這件事「順便」發生——rotation 加 bias 之後，原本就存在的位元剛好落在該落的位置。代價只有 2 bit 的指數精度，mantissa（決定浮點數有效位數的部分）完整保留，日常運算幾乎感覺不到差別。</p>
+
+  <p>immediate 底下切出一個 5-bit 的 subtag，用來分辨 nil、true、false、undef、function id、host function 這些不需要指標、彼此也不會混淆的小值——這個 subtag 對應的完整 2-bit tag 值，原文文字沒有寫出來，只出現在前面那張圖裡。5-bit 塞在同一個位元組裡，比對兩個 immediate 是否相等只要一次 8-bit 的整數比較，不用像指標那樣先解參照。這一類值有個共同特徵：它們的身分本身就是全部的資訊，不需要額外的 payload——true 就是 true，不需要再指向任何資料，所以拿一個小小的 subtag 表示「是哪一種」就已經足夠，完全不用碰到指標或 heap。</p>
+
+  <p>指標型別分成兩種，動機是讓相等比較快：大多數值用最便宜的參照相等（比位址），但字串被刻意設計成結構相等（比內容），為未來可能加上的字串 interning table 留一條後路。原文把這個判斷接到一個具體的位元角色上：作者選了 bit index 1，讓這一位標示「這兩個值能不能只用一條指令直接比較」，同一段還提到這條快速路徑同時服務整數、指標、handle，以及 true、false、nil、undef 這幾個 immediate 常數——範圍比「只分兩種指標」更廣。既然大多數指標走參照相等（可以直接比），字串走結構相等（不能直接比），兩種指標在 bit 1 上邏輯上就不會取同一個值——這是從上面這兩句自己推出來的，原文沒有直接寫出兩種指標各自完整的 2-bit tag。這個決定也反映了一個更根本的設計順序：先想清楚「這種值最常被拿來做什麼運算」，再回頭決定它該用哪種 tag——fixnum 常被拿來做算術，位元配置服務的是加減法；immediate 常被拿來做相等判斷，位元配置服務的是一次比較就夠。下面這個圖把文字裡寫明的 tag（<code>00</code>、<code>10</code>）跟只能從圖片得知、文字沒有列出的部分分開標示——點任何一種看細節。</p>
+
+  <figure class="vg-w-annotated-plush-tagword" data-mobile="static" data-svg-scroll="720">
+    <style>
+      .vg-w-annotated-plush-tagword { display: flex; flex-direction: column; gap: var(--s-3); margin: var(--s-4) 0; }
+      .vg-w-annotated-plush-tagword svg { width: 100%; height: auto; }
+      .vg-w-annotated-plush-tagword input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+      .vg-w-annotated-plush-tagword .component { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; cursor: pointer; transition: fill 200ms, stroke 200ms; }
+      .vg-w-annotated-plush-tagword .component:hover { stroke: var(--accent); }
+      .vg-w-annotated-plush-tagword .component:focus { outline: none; }
+      .vg-w-annotated-plush-tagword .component:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+      .vg-w-annotated-plush-tagword .component-text { pointer-events: none; font-family: EB Garamond, serif; font-size: 14px; }
+      .vg-w-annotated-plush-tagword .tag-text { pointer-events: none; font-family: Manrope, sans-serif; font-size: 12px; fill: var(--muted); }
+      .vg-w-annotated-plush-tagword .row { opacity: 0.45; transition: opacity 150ms; }
+      .vg-w-annotated-plush-tagword .row-marker { fill: transparent; transition: fill 150ms; }
+      .vg-w-annotated-plush-tagword .row-text { font-family: Manrope, sans-serif; font-size: 12px; fill: var(--muted); }
+      .vg-w-annotated-plush-tagword .tag-unknown { fill: none; stroke: var(--muted-2); stroke-width: 1; stroke-dasharray: 3,2; }
+      .vg-w-annotated-plush-tagword .detail { padding: var(--s-2); border-left: 2px solid var(--accent); display: none; }
+      .vg-w-annotated-plush-tagword .detail h3 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-annotated-plush-tagword .detail p { margin: 0 0 var(--s-1) 0; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-annotated-plush-tagword:has(#vg-w-annotated-plush-tagword-r1:checked) .component-1 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-annotated-plush-tagword:has(#vg-w-annotated-plush-tagword-r2:checked) .component-2 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-annotated-plush-tagword:has(#vg-w-annotated-plush-tagword-r3:checked) .component-3 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-annotated-plush-tagword:has(#vg-w-annotated-plush-tagword-r4:checked) .component-4 { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); }
+      .vg-w-annotated-plush-tagword:has(#vg-w-annotated-plush-tagword-r1:checked) .detail-1 { display: block; }
+      .vg-w-annotated-plush-tagword:has(#vg-w-annotated-plush-tagword-r2:checked) .detail-2 { display: block; }
+      .vg-w-annotated-plush-tagword:has(#vg-w-annotated-plush-tagword-r3:checked) .detail-3 { display: block; }
+      .vg-w-annotated-plush-tagword:has(#vg-w-annotated-plush-tagword-r4:checked) .detail-4 { display: block; }
+      .vg-w-annotated-plush-tagword:has(#vg-w-annotated-plush-tagword-r1:checked) .row-1 { opacity: 1; }
+      .vg-w-annotated-plush-tagword:has(#vg-w-annotated-plush-tagword-r2:checked) .row-2 { opacity: 1; }
+      .vg-w-annotated-plush-tagword:has(#vg-w-annotated-plush-tagword-r3:checked) .row-3 { opacity: 1; }
+      .vg-w-annotated-plush-tagword:has(#vg-w-annotated-plush-tagword-r4:checked) .row-4 { opacity: 1; }
+      .vg-w-annotated-plush-tagword:has(#vg-w-annotated-plush-tagword-r1:checked) .row-marker-1 { fill: var(--accent); }
+      .vg-w-annotated-plush-tagword:has(#vg-w-annotated-plush-tagword-r2:checked) .row-marker-2 { fill: var(--accent); }
+      .vg-w-annotated-plush-tagword:has(#vg-w-annotated-plush-tagword-r3:checked) .row-marker-3 { fill: var(--accent); }
+      .vg-w-annotated-plush-tagword:has(#vg-w-annotated-plush-tagword-r4:checked) .row-marker-4 { fill: var(--accent); }
+    </style>
+
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M9 9V4.5a2.5 2.5 0 0 1 5 0V9"/><path d="M5.5 13.5V9l4-1"/><path d="M14 9V6.5a1.5 1.5 0 0 1 3 0V9"/><path d="M17 9.5V8a1.5 1.5 0 0 1 3 0v3.5a6 6 0 0 1-6 6h-2a6 6 0 0 1-5-2.7L5.7 12a1.5 1.5 0 0 1 2.6-1.5"/>
+      </svg>
+      <span>點選任一種值看它怎麼編碼 · 4 種 tag</span>
+    </p>
+
+    <div class="ctl" data-vg-controls hidden>
+      <input type="radio" id="vg-w-annotated-plush-tagword-r1" name="vg-w-annotated-plush-tagword-sel" checked />
+      <input type="radio" id="vg-w-annotated-plush-tagword-r2" name="vg-w-annotated-plush-tagword-sel" />
+      <input type="radio" id="vg-w-annotated-plush-tagword-r3" name="vg-w-annotated-plush-tagword-sel" />
+      <input type="radio" id="vg-w-annotated-plush-tagword-r4" name="vg-w-annotated-plush-tagword-sel" />
+    </div>
+
+    <svg class="vg-w-annotated-plush-tagword-main" viewBox="0 0 480 400" role="img" aria-label="64-bit tagged word 的四排編碼：fixnum（tag 00）與 flonum（tag 10）原文文字明講，immediate 與指標的完整 tag 值僅見於圖片、標示為問號；選取的一排會整排提亮">
+      <rect class="component component-1" data-target="vg-w-annotated-plush-tagword-r1" role="button" tabindex="0" aria-label="選擇 fixnum" x="10" y="20" width="110" height="60"/>
+      <text class="component-text" x="65" y="46" text-anchor="middle" fill="var(--ink)">fixnum</text>
+      <text class="tag-text" x="65" y="64" text-anchor="middle">tag 00</text>
+
+      <rect class="component component-2" data-target="vg-w-annotated-plush-tagword-r2" role="button" tabindex="0" aria-label="選擇 flonum" x="130" y="20" width="110" height="60"/>
+      <text class="component-text" x="185" y="46" text-anchor="middle" fill="var(--ink)">flonum</text>
+      <text class="tag-text" x="185" y="64" text-anchor="middle">tag 10</text>
+
+      <rect class="component component-3" data-target="vg-w-annotated-plush-tagword-r3" role="button" tabindex="0" aria-label="選擇 immediate" x="250" y="20" width="110" height="60"/>
+      <text class="component-text" x="305" y="46" text-anchor="middle" fill="var(--ink)">immediate</text>
+      <text class="tag-text" x="305" y="64" text-anchor="middle">5-bit subtag</text>
+
+      <rect class="component component-4" data-target="vg-w-annotated-plush-tagword-r4" role="button" tabindex="0" aria-label="選擇指標" x="370" y="20" width="100" height="60"/>
+      <text class="component-text" x="420" y="46" text-anchor="middle" fill="var(--ink)">指標 ×2</text>
+      <text class="tag-text" x="420" y="64" text-anchor="middle">bit 1 分辨</text>
+
+      <line x1="10" y1="110" x2="470" y2="110" stroke="var(--muted-2)" stroke-width="1"/>
+
+      <g class="row row-1">
+        <rect class="row-marker row-marker-1" x="0" y="124" width="4" height="28"/>
+        <rect x="10" y="124" width="410" height="28" fill="var(--sage-deep)" fill-opacity="0.14" stroke="var(--sage-deep)" stroke-width="1"/>
+        <rect x="420" y="124" width="30" height="28" fill="var(--accent)" fill-opacity="0.3" stroke="var(--accent)" stroke-width="1"/>
+        <text class="row-text" x="215" y="142" text-anchor="middle">n（帶號 62-bit 整數，值本身左移兩位）</text>
+        <text class="row-text" x="435" y="142" text-anchor="middle">00</text>
+        <text class="row-text" x="215" y="170" text-anchor="middle">n &lt;&lt; 2；overflow 判定直接用 64-bit 溢位旗標</text>
+      </g>
+      <g class="row row-2">
+        <rect class="row-marker row-marker-2" x="0" y="188" width="4" height="28"/>
+        <rect x="10" y="188" width="160" height="28" fill="var(--ink-deep)" fill-opacity="0.14" stroke="var(--ink-deep)" stroke-width="1"/>
+        <rect x="170" y="188" width="250" height="28" fill="var(--sage-deep)" fill-opacity="0.14" stroke="var(--sage-deep)" stroke-width="1"/>
+        <rect x="420" y="188" width="30" height="28" fill="var(--accent)" fill-opacity="0.3" stroke="var(--accent)" stroke-width="1"/>
+        <text class="row-text" x="90" y="206" text-anchor="middle">指數（rotate + bias）</text>
+        <text class="row-text" x="295" y="206" text-anchor="middle">mantissa（完整保留）</text>
+        <text class="row-text" x="435" y="206" text-anchor="middle">10</text>
+        <text class="row-text" x="215" y="234" text-anchor="middle">只損失 2 bit 指數精度</text>
+      </g>
+      <g class="row row-3">
+        <rect class="row-marker row-marker-3" x="0" y="252" width="4" height="28"/>
+        <rect x="10" y="252" width="90" height="28" fill="var(--sage-deep)" fill-opacity="0.14" stroke="var(--sage-deep)" stroke-width="1"/>
+        <rect x="100" y="252" width="320" height="28" fill="none" stroke="var(--muted-2)" stroke-width="1" stroke-dasharray="4,3"/>
+        <rect class="tag-unknown" x="420" y="252" width="30" height="28"/>
+        <text class="row-text" x="55" y="270" text-anchor="middle">5-bit subtag</text>
+        <text class="row-text" x="260" y="270" text-anchor="middle">未使用</text>
+        <text class="row-text" x="435" y="270" text-anchor="middle">？</text>
+        <text class="row-text" x="215" y="298" text-anchor="middle">nil／true／false／undef／function id／host function</text>
+      </g>
+      <g class="row row-4">
+        <rect class="row-marker row-marker-4" x="0" y="316" width="4" height="28"/>
+        <rect x="10" y="316" width="410" height="28" fill="var(--sage-deep)" fill-opacity="0.14" stroke="var(--sage-deep)" stroke-width="1"/>
+        <rect class="tag-unknown" x="420" y="316" width="30" height="28"/>
+        <text class="row-text" x="215" y="334" text-anchor="middle">位址（bit 1：能否直接比較）</text>
+        <text class="row-text" x="435" y="334" text-anchor="middle">？</text>
+        <text class="row-text" x="215" y="362" text-anchor="middle">大多數值走參照相等；字串走結構相等</text>
+      </g>
+    </svg>
+
+    <div>
+      <div class="detail detail-1">
+        <h3>fixnum · tag 00</h3>
+        <p>帶號 62-bit 整數，存成 <code>n &lt;&lt; 2</code>，可以直接對 tagged word 做加減，不用先拆值。</p>
+        <p><strong>邊界</strong>：超出 62-bit 範圍就得 box 到 heap，見下一節。</p>
+      </div>
+      <div class="detail detail-2">
+        <h3>flonum · tag 10</h3>
+        <p>把 IEEE 754 的高位 bits rotate 到 tag 位置、再加一個 bias，讓最低兩位自然變成 10。</p>
+        <p><strong>代價</strong>：損失 2 bit 指數，mantissa 精度不受影響。</p>
+      </div>
+      <div class="detail detail-3">
+        <h3>immediate · 5-bit subtag</h3>
+        <p>5-bit subtag 分辨 nil、true、false、undef、function id、host function。</p>
+        <p><strong>不知道的事</strong>：對應的完整 2-bit tag 值，原文文字沒有寫出來，只在圖片裡看得到。</p>
+        <p><strong>比較成本</strong>：一次 8-bit 整數比較就夠。</p>
+      </div>
+      <div class="detail detail-4">
+        <h3>指標 ×2 · bit 1 分辨</h3>
+        <p>分兩種：大多數值用參照相等（比位址，能直接比較），字串用結構相等（比內容，不能直接比較），為未來字串 interning 留伏筆。原文把這個差異接到 bit index 1：這一位標示兩個值能不能只用一條指令直接比較，同一條快速路徑也服務整數、handle 與部分 immediate 常數。</p>
+        <p><strong>推得，不是原文明講</strong>：兩種指標在 bit 1 上邏輯上不會取同一個值，但兩者各自完整的 2-bit tag，原文沒有直接寫出——這是從上面那句自己推出來的。</p>
+      </div>
+    </div>
+
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        var root = document.querySelector('.vg-w-annotated-plush-tagword');
+        root.querySelectorAll('.component').forEach(function (rect) {
+          rect.addEventListener('click', function () {
+            var id = rect.getAttribute('data-target');
+            var radio = root.querySelector('#' + id);
+            if (radio) radio.checked = true;
+          });
+          rect.addEventListener('keydown', function (e) {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              rect.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            }
+          });
+        });
+      })();
+    </script>
+  </figure>
+
+  <p>四種 tag 排好之後，比對「這個值是哪一種」變成一次 2-bit 或 8-bit 的整數比較，不再需要像舊版那樣先跳進 enum 的 discriminant、再依 discriminant 決定怎麼解讀後面的 payload。這一步看起來只是換了個資料結構，實際上動到的是每一次值運算最前面的那道判斷——而這道判斷，剛好也是下一節組合語言變短的起點。四種 tag 加起來，也剛好對應到直譯器裡最常出現的四種值的形狀：一個能直接算的數字、一個需要犧牲一點精度的浮點數、一個不需要 payload 的固定身分、一個需要靠位址或內容辨識的物件。表示法跟著值的形狀走，而不是反過來讓值遷就一套通用的容器，這是整篇文章最核心的設計選擇。</p>
+
+  <h2>從四個 basic block 到一條直線</h2>
+
+  <p>值的表示法換了，match dispatch 也跟著重寫。作者盯著反組譯結果看 <code>Int64 + Int64</code> 這條最常見的路徑，發現舊版「it's spread over four disjoint basic blocks」——邏輯上是同一條加法，機器碼卻被拆成四個不連續的區塊。改寫之前，作者自己也只是懷疑：「I suspect that the code the Rust compiler generates for this is maybe not very efficient」，直到真的去看碼才確認問題出在哪。這句話本身也值得留意：連寫這套直譯器的人，一開始都只能用「suspect」這種猜測的語氣描述舊版的效能問題，沒有先看反組譯就下定論——這篇文章能寫成這樣，靠的與其說是直覺，不如說是願意真的去讀編譯器吐出來的碼。</p>
+
+  <p>新版把熱路徑寫在 if 的第一個分支——原文的說法是「we're explicitly testing for the likely hot path first in an <code>if</code> statement」，讓最常見的情況（兩個值都是同一種 tag）優先接受測試。效果最直接的地方是暫存器分配：「values now fit in a single register」，不再需要「spilling values to the native C/Rust stack immediately after popping them from the interpreter stack」。這件事解釋了一個乍看違反直覺的結果——連浮點運算為主的 benchmark 都變快了，因為問題從來不只是「值變小」，還包括「值能不能一路留在暫存器裡，不用來回搬到 stack」。</p>
+
+  <p>浮點快速路徑重寫前後的組合語言統計最能說明差距：</p>
+
+  <figure class="vg-w-table-plush-codegen" data-mobile="keep">
+    <style>
+      .vg-w-table-plush-codegen table { width: 100%; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-plush-codegen thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); }
+      .vg-w-table-plush-codegen tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); }
+      .vg-w-table-plush-codegen td.num { font-variant-numeric: tabular-nums; text-align: right; }
+      .vg-w-table-plush-codegen figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); padding: var(--s-1) var(--s-2) 0; }
+    </style>
+    <table>
+      <thead>
+        <tr><th>Float64 + Float64 快速路徑</th><th class="num">舊版</th><th class="num">新版</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>instructions</td><td class="num">52</td><td class="num">36</td></tr>
+        <tr><td>memory ops</td><td class="num">24</td><td class="num">9</td></tr>
+        <tr><td>branches taken</td><td class="num">4</td><td class="num">1</td></tr>
+      </tbody>
+    </table>
+    <figcaption>新版是「straight-line code with exactly one branch at the end」——不只變短，分支也幾乎消失。</figcaption>
+  </figure>
+
+  <p>值得留意的是，這張表講的是浮點路徑，不是整數路徑——四個不連續 basic block 那個問題出在 <code>Int64 + Int64</code>。兩件事分開看才準確：dispatch 結構的問題（碼被切散）跟暫存器分配的問題（值進出 stack）是兩層不同的浪費，新的表示法剛好同時解決了兩層。</p>
+
+  <p>這也是為什麼「換一種值的表示法」這件事，效果不會只停在記憶體用量上。舊版的 <code>Value</code> 本身就是一個 128-bit 的結構，塞進暫存器嫌太寬，編譯器多半只能把它當成一塊要透過指標存取的記憶體；新版縮到 64 bit 之後，一個值天生就跟一個機器字一樣大，編譯器才有機會真的把它當成暫存器裡的純量處理，而不是每次用到都要先算位址、再讀記憶體。組合語言變短，是這個前提條件成立之後的自然結果，不是額外的優化。</p>
+
+  <h2>benchmark 全面加速</h2>
+
+  <p>結果按作者自己的說法：「every single benchmark is faster, and some are faster by a lot」——沒有保留、沒有但書，是一個乾脆的結論。記憶體降幅最大的是 <code>mlp</code>——「a naively implemented multilayer neural network, with a lot of floating-point operations」，本身也是陣列用量很重的 benchmark，換成 tagged word 後記憶體用量最多降了 37%。</p>
+
+  <p>速度增益最大的兩個 benchmark 是 <code>binary_tree</code> 與 <code>linked_list</code>——這兩個都是指標密集的資料結構，原本每一個節點都要背著 128 bit 的 <code>Value</code>，改用 64 bit 之後直接受惠。有意思的是 <code>nbody</code>：這是另一個「floating-point heavy」的 benchmark，但作者也提到「fib and nbody...don't touch a lot of memory at all」——換句話說，nbody 變快不能歸因於記憶體變小，指向的正是上一節講的機制：值塞得進暫存器、碼變短，比記憶體佔用更直接地影響了速度。把 mlp 跟 nbody 放在一起比，剛好是同一套改動的兩種不同受惠方式：mlp 陣列多、記憶體降幅是主要訊號；nbody 記憶體用量本來就低、速度提升幾乎全部要歸功於碼變精簡。</p>
+
+  <figure class="vg-w-table-plush-benchmarks" data-mobile="keep">
+    <style>
+      .vg-w-table-plush-benchmarks table { width: 100%; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-plush-benchmarks thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); }
+      .vg-w-table-plush-benchmarks tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+    </style>
+    <table>
+      <thead>
+        <tr><th>benchmark</th><th>記憶體</th><th>速度</th><th>備註</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>mlp</td><td>最多降 37%</td><td>更快</td><td>陣列密集的多層神經網路模擬</td></tr>
+        <tr><td>binary_tree／linked_list</td><td>——</td><td>增益最大</td><td>指標密集的資料結構</td></tr>
+        <tr><td>nbody</td><td>本來就低（不動記憶體）</td><td>更快</td><td>浮點密集，證明加速不只來自記憶體</td></tr>
+        <tr><td>sha256_unfixed</td><td>一度暴增，一行修正後回到最小堆</td><td>仍比舊版快 12%</td><td>觸發 62-bit 溢位 boxing 的反例</td></tr>
+        <tr><td>全部 benchmark</td><td>——</td><td>沒有一個變慢</td><td>「some are faster by a lot」</td></tr>
+      </tbody>
+    </table>
+  </figure>
+
+  <p>把這張表跟第一節那張位元配置圖放在一起看，脈絡其實很一致：記憶體降最多的 <code>mlp</code>、速度增益最大的 <code>binary_tree</code> 與 <code>linked_list</code>，共通點都是大量、重複地建立同一種資料結構的節點——這正是舊版 128 bit 版面浪費最集中的地方，換表示法之後受惠也最明顯。而 <code>nbody</code> 提醒的是另一件事：就算一個 benchmark 從頭到尾沒有分配多少記憶體，值的表示法照樣能透過「進不進得了暫存器」這條路徑影響速度，記憶體只是這次改版眾多效果裡看得最清楚的一個。</p>
+
+  <h2>62-bit 的邊界</h2>
+
+  <p>tagged word 不是沒有代價。fixnum 只有 62-bit 的空間，超過這個範圍的整數會被 box 成一個指向 heap 的物件——作者選 62-bit 而不是隨便一個數字，是因為「for reference <code>2^64 ~= 1.84 * 10^19</code>」，這個範圍大到多數程式根本用不到，犧牲兩個 bit 換一個能直接塞進暫存器的表示法很划算。這個判斷背後其實是一個很實際的機率賭注：一般程式裡出現的整數，九成九不會逼近 64-bit 的上限，把這兩個很少被用到的 bit 挪去做 tag，付出的期望成本很低。但「多數程式」不是「所有程式」：「code that does left shifts, or relies on overflows for things like generating random numbers, can run into that」——左移運算、或者刻意利用溢位產生亂數的寫法，都可能一腳踩過這條邊界，而且往往是無聲無息地踩過去，直到有人發現記憶體用量不對勁。</p>
+
+  <p><code>sha256_unfixed</code> 就是活生生的例子：這個版本的計算方式沒有避開溢位，實測「allocating a total of 3,149,052 boxed integer values in a span of about 490 ms」——不到半秒鐘配置了三百多萬個 boxed 整數，記憶體用量因此一度反彈。這個數字之所以值得記下來，是因為它把「62-bit 邊界」從一個抽象規則變成一個看得到代價的事件：每一次溢位不是悄悄發生，而是實實在在地多一次 heap 配置、多一層間接。作者發現「the computation can easily be rearranged to avoid this」，改法只要一行，記憶體就「brings memory usage back all the way down to the minimum heap size」。而且即使是沒改、仍在踩坑的 <code>sha256_unfixed</code>，換成新表示法之後也還是比舊版整體快 12%——boxing 的代價存在，但沒有蓋過表示法本身帶來的好處，這也是為什麼作者沒有把 62-bit 的邊界當成需要重新設計的缺陷，而是當成使用者該知道的一條規則。</p>
+
+  <p>拖動下面的滑桿，看一個數字需要幾個 bit 表示，會不會被踢出 tagged word：</p>
+
+  <figure class="vg-w-range-plush-fixnum-boundary" data-mobile="keep">
+    <style>
+      .vg-w-range-plush-fixnum-boundary { margin: var(--s-4) 0; font-family: var(--sans); }
+      .vg-w-range-plush-fixnum-boundary .ctl { display: flex; align-items: center; gap: var(--s-2); font-size: var(--fs-sm); }
+      .vg-w-range-plush-fixnum-boundary input[type="range"] { flex: 1; accent-color: var(--accent); height: 36px; }
+      .vg-w-range-plush-fixnum-boundary .readout { font-variant-numeric: tabular-nums; min-width: 6ch; text-align: right; }
+      .vg-w-range-plush-fixnum-boundary .track { position: relative; height: 34px; margin-top: var(--s-2); border: 1px solid var(--line); overflow: hidden; }
+      .vg-w-range-plush-fixnum-boundary .zone-fixnum { position: absolute; left: 0; top: 0; bottom: 0; width: 87.1%; background: var(--sage-deep); opacity: 0.14; }
+      .vg-w-range-plush-fixnum-boundary .zone-heap { position: absolute; right: 0; top: 0; bottom: 0; width: 12.9%; background: var(--accent); opacity: 0.18; }
+      .vg-w-range-plush-fixnum-boundary .boundary-line { position: absolute; left: 87.1%; top: 0; bottom: 0; width: 2px; background: var(--accent); }
+      .vg-w-range-plush-fixnum-boundary .track-label { position: absolute; top: 8px; font-size: 11px; color: var(--muted); }
+      .vg-w-range-plush-fixnum-boundary .verdict { margin-top: var(--s-2); font-family: var(--scribed); font-size: var(--fs-sm); color: var(--ink); }
+      @media (hover: none) and (pointer: coarse) {
+        .vg-w-range-plush-fixnum-boundary .ctl { display: none; }
+      }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m18 8 4 4-4 4"/><path d="M2 12h20"/><path d="m6 8-4 4 4 4"/>
+      </svg>
+      <span>拖動滑桿看數值需要的位元數，跨過 62-bit 會發生什麼 · 邊界固定在 62</span>
+    </p>
+    <div class="ctl" data-vg-controls>
+      <label for="vg-w-range-plush-fixnum-boundary-x">需要的位元數：</label>
+      <input id="vg-w-range-plush-fixnum-boundary-x" type="range" min="8" max="70" step="1" value="40"/>
+      <span class="readout" id="vg-w-range-plush-fixnum-boundary-out">40 bit</span>
+    </div>
+    <div class="track">
+      <div class="zone-fixnum"></div>
+      <div class="zone-heap"></div>
+      <div class="boundary-line"></div>
+      <span class="track-label" style="left: 8px;">fixnum 區（≤ 62 bit）</span>
+      <span class="track-label" style="right: 8px;">box 到 heap（&gt; 62 bit）</span>
+    </div>
+    <p class="verdict" id="vg-w-range-plush-fixnum-boundary-verdict">40 bit 還在 62-bit 範圍內：留在暫存器裡當 fixnum，不用配置記憶體。</p>
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        var root = document.querySelector('.vg-w-range-plush-fixnum-boundary');
+        var inp = root.querySelector('input');
+        var out = root.querySelector('#vg-w-range-plush-fixnum-boundary-out');
+        var verdict = root.querySelector('#vg-w-range-plush-fixnum-boundary-verdict');
+        function onInput() {
+          var n = Number(inp.value);
+          out.textContent = n + ' bit';
+          if (n <= 62) {
+            verdict.textContent = n + ' bit 還在 62-bit 範圍內：留在暫存器裡當 fixnum，不用配置記憶體。';
+          } else {
+            verdict.textContent = n + ' bit 超過 62-bit：得 box 成一個指向 heap 的物件，多一次配置與一層間接。';
+          }
+        }
+        inp.addEventListener('input', onInput);
+        onInput();
+      })();
+    </script>
+  </figure>
+
+  <p class="vg-deep-closer"><strong>The lesson</strong>：如果手上的直譯器或 VM 還在用一個方便但胖到 128 bit 的 tagged enum，先算一次帳——語意上真正需要的位元數，和語言的 alignment 規則實際讓你多付的位元數，往往是兩個不同的數字；把 tag 塞進最低幾個 bit、把熱路徑寫在分支的第一格，換來的常常不只是記憶體變小，還有編譯器願意把值留在暫存器裡的那份效能。代價也要一併算進去：62-bit 的上限不是免費的，寫左移運算或靠溢位生成亂數之前，得先知道這條邊界在哪裡，出問題時才不會只看到記憶體用量異常，卻找不到原因。</p>
+</div>
