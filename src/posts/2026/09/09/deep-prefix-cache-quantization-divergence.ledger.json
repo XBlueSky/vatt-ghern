@@ -1,0 +1,667 @@
+{
+  "output_path": "src/posts/2026/09/09/deep-prefix-cache-quantization-divergence.html",
+  "spine": [
+    "1. Prefix caching 在 vLLM／SGLang 這類主流 open-source serving stack 裡預設打開,被當成不改變輸出、只省時間的 transparent optimization。",
+    "2. 論文固定 model、decoding 參數、seed、送出順序,以 batch size 1 序列送出,在兩個 serving engine、四種權重格式上跑同一個 80-episode 多輪 agentic tool-use workload,分別在快取開／關下量測。",
+    "3. 快取關掉時,800 個 episode 在所有配置下全部逐位元相同,把其他 nondeterminism 來源的上界壓到 0.5%——先排除『這只是隨機噪聲』與『量化本身數值不穩』兩個候選解釋。",
+    "4. 快取打開後,16-bit 精度下 36.2% 的 episode 走上不同軌跡,四位元下升到 75.0%——量化放大了快取引發的分歧,而不是引入了新的分歧來源。",
+    "5. 三個實驗把成因往下鎖定：單一 server-level prompt-cache 設定移動 37.5 個百分點的 run-to-run divergence；執行順序只有在該設定生效時才會改變結果；顯式還原 cache state 後,cached 與 recompute 兩條路徑各自對自己 40 之 40 可重現,但兩條路徑彼此仍在 14 個項目上不同。",
+    "6. 結論：cached serving 在給定 cache state 下是確定的,但實務上不可重現,因為那個 state 不在 request 裡、預設也不會被重置。",
+    "7. Quesma 對 Qwen3.8 27B 的量化 benchmark 是另一條獨立座標軸——Q4_K_M 在 agentic coding（Terminal-Bench 2.1）上追平 BF16,1-bit 才崩到接近亂猜——量化的『品質損失』跟這篇論文講的『快取放大的不確定性』是兩件不同的事,不該混為一談。"
+  ],
+  "sources": [
+    {
+      "url": "https://arxiv.org/abs/2609.04748",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": "2026-09",
+      "perspective": {
+        "mechanism": "prefix caching 讓 serving engine 跨 request 重用共享 prompt prefix 的 KV tensor；這個機制本身在正常設定下不改變輸出,但一旦權重被量化,快取狀態（是否命中、命中哪個版本）就變成一個沒有出現在 request 裡、也不會被預設重置的隱性變數,直接改變 agent 的執行軌跡。",
+        "tradeoff": "prefix caching 省下的是重算共享 prefix 的算力與延遲；用三個對照實驗換來的代價是找出,這個省下來的效率背後藏著一個未被追蹤的自由變數——cache state——而這個變數在量化模型上被放大到影響三分之二以上的 episode。",
+        "reader_use": "工程師在 debug『同一個 request 兩次結果不一樣』時,不該先懷疑量化的數值精度本身,而該先檢查 serving stack 的 prompt-cache／prefix-cache 設定是否開啟、cache state 是否可被顯式控制或重置——尤其是在用量化權重跑 agentic workload 的情況下。"
+      }
+    },
+    {
+      "url": "https://quesma.com/blog/qwen38-27b-quantizations-benchmarked/",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": "2026-08-26",
+      "perspective": {
+        "mechanism": "量化到 Q4_K_M（4-bit）在 Terminal-Bench 2.1 這類 agentic coding benchmark 上幾乎不掉品質、追平 BF16；但繼续往下量化到 1-bit（UD-IQ1_S／UD-IQ1_M）,分數會崩到接近隨機亂猜的水準——品質損失不是線性的,是在某個量化門檻之後才斷崖式下墜。",
+        "tradeoff": "選 Q4_K_M 換來的是模型體積從 55 GB（BF16）壓到 17 GB,幾乎沒有可感知的品質差異；再往下壓到 1-bit 換來更小的體積,代價是輸出品質掉到不可用。",
+        "reader_use": "工程師在挑量化等級時,可以把 Q4_K_M 當作『能塞進 GPU 記憶體、又不明顯犧牲 agentic 任務品質』的預設起點,但這條軸線量的是量化本身的品質損失,跟同一個量化模型在快取開著時軌跡是否穩定,是兩個要分開追蹤的問題。"
+      }
+    }
+  ],
+  "notes": [
+    {
+      "id": "n01",
+      "url": "https://arxiv.org/abs/2609.04748",
+      "quote": "Prefix caching, in which a serving engine reuses the key and value tensors of a shared prompt prefix across requests, is enabled by default in the major open-source stacks and treated as a transparent optimization.",
+      "hedge": "asserted",
+      "interpretation": "論文開場直接定義 prefix caching 的機制與它在業界的預設地位——這是整篇論文要挑戰的『它不改變輸出』的假設起點。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n02",
+      "url": "https://arxiv.org/abs/2609.04748",
+      "quote": "Holding the model, decoding parameters, seed, and request order fixed, and issuing every request serially at batch size one, we ran an eighty-episode multi-turn agentic tool-use workload with caching enabled and disabled across two engines and four weight formats.",
+      "hedge": "asserted",
+      "interpretation": "描述實驗設計：控制變數（model、decoding、seed、順序）、序列送出、80-episode 的多輪 agentic workload、兩個 engine、四種權重格式,快取開／關各跑一次。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n03",
+      "url": "https://arxiv.org/abs/2609.04748",
+      "quote": "Enabling the cache changed the agent's trajectory on 36.2 percent of episodes at 16-bit precision and on 75.0 percent at four-bit, a gradient that survives re-measurement under a controlled cache configuration.",
+      "hedge": "asserted",
+      "interpretation": "核心數據：打開快取相對於關閉快取,16-bit 下 36.2% 的 episode 軌跡改變,四位元下升到 75.0%,且這個梯度在受控 cache 設定下重測依然存在。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n04",
+      "url": "https://arxiv.org/abs/2609.04748",
+      "quote": "With caching disabled, repeated execution was bit-identical in every configuration, 0 of 800 episodes, which bounds other sources of nondeterminism at 0.5 percent.",
+      "hedge": "asserted",
+      "interpretation": "關掉快取後,涵蓋所有權重格式與 engine 配置的 800 個 episode 全部逐位元相同——排除『一般隨機噪聲』與『量化本身數值不穩』兩個候選解釋,把其他非確定性來源的上界壓到 0.5%。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n05",
+      "url": "https://arxiv.org/abs/2609.04748",
+      "quote": "Repeated cache-enabled runs did diverge, and three experiments locate the cause: a single server-level prompt-cache setting moves run-to-run divergence by 37.5 percentage points, execution order acts only while that setting is active, and restoring cache state makes the cached and recompute paths each reproduce on 40 of 40 items while still differing from each other on 14.",
+      "hedge": "asserted",
+      "interpretation": "三個實驗依序把成因鎖定：(1) 單一 server-level prompt-cache 設定的開關就移動 37.5 個百分點的 divergence；(2) 執行順序的效果只在該設定開啟時出現,設定關掉順序就不影響結果；(3) 把 cache state 顯式固定並分別重跑 cached／recompute 兩條路徑,各自對自己完全可重現（40/40）,但兩條路徑彼此在 14 個項目上不同——證明給定 cache state 是確定的,問題出在 state 本身是哪個版本。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n06",
+      "url": "https://arxiv.org/abs/2609.04748",
+      "quote": "Cached serving is deterministic given cache state, and irreproducible in practice because that state is absent from the request and never reset by default.",
+      "hedge": "asserted",
+      "interpretation": "論文的結論句：cache state 本身是確定性的,但因為它不是 request 的一部分、預設也不會被重置,實務上就變得不可重現——這是整篇論文要傳達的工程教訓。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n07",
+      "url": "https://quesma.com/blog/qwen38-27b-quantizations-benchmarked/",
+      "quote": "Not only does my measurement of BF16 replicate the stated result, but, to my surprise, Q4_K_M does as well.",
+      "hedge": "asserted",
+      "interpretation": "作者 Piotr Migdał 在 Terminal-Bench 2.1（agentic coding benchmark）上實測,BF16 與 4-bit 的 Q4_K_M 分數幾乎追平,連作者本人都對這個結果感到意外。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n08",
+      "url": "https://quesma.com/blog/qwen38-27b-quantizations-benchmarked/",
+      "quote": "the scores are around the random guessing level, with the smallest model being below that threshold.",
+      "hedge": "asserted",
+      "interpretation": "1-bit 量化（UD-IQ1_S／UD-IQ1_M）的分數掉到接近隨機亂猜的水準,其中最小的模型甚至低於這個門檻——品質崩潰是斷崖式的,不是漸進的。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n09",
+      "url": "https://quesma.com/blog/qwen38-27b-quantizations-benchmarked/",
+      "quote": "For most tasks Unsloth's Q4_K_M should be good enough, without any noticeable difference; for some simpler tasks UD-Q2_K_XL should be more than fine.",
+      "hedge": "hedged",
+      "interpretation": "作者給出的實務建議：多數任務選 Q4_K_M 就沒有明顯差異,更簡單的任務甚至 UD-Q2_K_XL 也夠用——用 should 表述,是建議而非保證。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n10",
+      "url": "https://arxiv.org/abs/2609.04748",
+      "quote": "Submitted on 4 Sep 2026",
+      "hedge": "asserted",
+      "interpretation": "arXiv 頁面的投稿日期標示,對應正文「2026 年 9 月掛上 arXiv」的說法;修復 c04 追溯缺口所補的 note,重抓頁面取得,原本 notes[] 只覆蓋摘要正文,沒有記錄投稿日期。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n11",
+      "url": "https://arxiv.org/abs/2609.04748",
+      "quote": "Same Request, Different Answer: Quantization Amplifies Cache-Induced Divergence in LLM Serving",
+      "hedge": "asserted",
+      "interpretation": "論文標題原文,逐字重抓確認;修復 c17／c18 追溯缺口所補的 note。標題本身用「Amplifies」一詞,支撐正文「量化『放大』了快取引發的分歧」的用詞轉述,但標題是否暗示「量化本身不是另一個分歧來源」這組對立,是本文的推論,已在正文標為推斷。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n12",
+      "url": "https://quesma.com/blog/qwen38-27b-quantizations-benchmarked/",
+      "quote": "Benchmarking Qwen3.8 27B quantizations: 4-bit holds up, 1-bit collapses",
+      "hedge": "asserted",
+      "interpretation": "該文的標題行，逐字取自頁面；用來支撐內文對這份 benchmark 的指涉（針對 Qwen3.8 27B 的量化比較）。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n13",
+      "url": "https://quesma.com/blog/qwen38-27b-quantizations-benchmarked/",
+      "quote": "Piotr Migdał·26 August 2026",
+      "hedge": "asserted",
+      "interpretation": "該文的署名與日期行，逐字取自頁面（中點分隔符兩側無空格）；用來把作者姓名與「八月底」這個時間點放進事實層，而不是只留在其他 note 的 interpretation 欄。",
+      "timeliness": "annual"
+    }
+  ],
+  "claims": [
+    {
+      "id": "c01",
+      "claim_text": "一個 80-episode 的多輪 agentic tool-use workload 在四位元權重下，打開 prefix cache 讓四分之三的 episode 走上不同的執行路徑；關掉快取，800 次重跑逐位元相同，一次例外都沒有。",
+      "location": "vg-deep-opener（hero）",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n03",
+        "n04"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Enabling the cache changed the agent's trajectory on 36.2 percent of episodes at 16-bit precision and on 75.0 percent at four-bit... With caching disabled, repeated execution was bit-identical in every configuration, 0 of 800 episodes.",
+      "note": "75.0% → 「四分之三」與 0/800 → 「一次例外都沒有」都是忠實轉述，未上修強度。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c02",
+      "claim_text": "prefix caching……預設打開，長年被當成一項不改變輸出、只省算力的 transparent optimization",
+      "location": "首段（lede）",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n01"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Prefix caching, in which a serving engine reuses the key and value tensors of a shared prompt prefix across requests, is enabled by default in the major open-source stacks and treated as a transparent optimization.",
+      "note": "機制描述與「預設打開／transparent optimization」逐項對得上。唯一超出來源的是「長年」這個時間跨度——摘要只說 treated as，未給年限；程度輕微，不足以翻案，但若要收緊可刪去「長年」。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c03",
+      "claim_text": "在主流 open-source serving stack 裡預設打開，長年被當成一項不改變輸出、只省算力的 transparent optimization",
+      "location": "首段（lede）第一句",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n01"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Prefix caching, in which a serving engine reuses the key and value tensors of a shared prompt prefix across requests, is enabled by default in the major open-source stacks and treated as a transparent optimization.",
+      "note": "修復落地：重抓 arxiv.org/abs/2609.04748 全頁，字串「vLLM」與「SGLang」皆不出現；正文已把具名 engine 移除，改回摘要原本的說法「主流 open-source serving stack」＝ the major open-source stacks，逐項對得上 n01，追溯改由 n01 承接。未引入新事實。非阻斷觀察（不改判、不需行動）：ledger 的 spine[1] 仍寫「在 vLLM／SGLang 這類主流 open-source serving stack 裡預設打開」，與已修正的正文不一致；spine 不是刊出文字，若父層順手收斂會更乾淨。",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c04",
+      "claim_text": "2026 年 9 月掛上 arXiv 的一篇論文測的正是這個預設假設",
+      "location": "首段（lede）",
+      "type": "date-version",
+      "load": "medium",
+      "note_ids": [
+        "n10"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "[Submitted on 4 Sep 2026]",
+      "note": "追溯缺口已補：n10 的 quote「Submitted on 4 Sep 2026」在重抓頁面上逐字存在（頁面呈現為方括號包住的「[Submitted on 4 Sep 2026]」，note 取的是其中的完整子字串，非拼接、非改寫），與正文「2026 年 9 月」相符。正文未改動、亦未新增事實。",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c05",
+      "claim_text": "固定模型、decoding 參數、seed、送出順序，以 batch size 為一的方式逐個序列送出 request，在兩個 serving engine、四種權重格式上重複跑同一個 80-episode 多輪 agentic tool-use workload，分別在快取開與關的情況下量測",
+      "location": "首段（lede）",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n02"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Holding the model, decoding parameters, seed, and request order fixed, and issuing every request serially at batch size one, we ran an eighty-episode multi-turn agentic tool-use workload with caching enabled and disabled across two engines and four weight formats.",
+      "note": "六項實驗設計細節（控制變數、batch size 1、序列送出、80 episode、兩 engine、四種權重格式、快取開關）逐一對得上摘要句。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c06",
+      "claim_text": "16 位元精度下開著快取讓 36.2% 的 episode 走上不同軌跡，量化到四位元後這個比例升到 75.0%",
+      "location": "首段（lede）",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n03"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Enabling the cache changed the agent's trajectory on 36.2 percent of episodes at 16-bit precision and on 75.0 percent at four-bit, a gradient that survives re-measurement under a controlled cache configuration.",
+      "note": "兩個數字與其精度綁定關係完全一致；來源 hedge 為 asserted，文中亦為直述，無強度差。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c07",
+      "claim_text": "['cache 關（800 ep）', 0], ['cache 開・16-bit', 36.2], ['cache 開・4-bit', 75.0]；figcaption「資料來源：arXiv 2609.04748 摘要」",
+      "location": "widget vg-w-chart-cache-quant-divergence 的資料陣列與 figcaption",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n03",
+        "n04"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Enabling the cache changed the agent's trajectory on 36.2 percent of episodes at 16-bit precision and on 75.0 percent at four-bit... With caching disabled, repeated execution was bit-identical in every configuration, 0 of 800 episodes.",
+      "note": "三根柱子的值全部來自摘要，沒有插補中間點；圖上把 0/800 標為「cache 關（800 ep）」與摘要的 0 of 800 episodes 一致。標註的資料來源（摘要）也與實際取材層級相符。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c08",
+      "claim_text": "論文測了四種權重格式，但摘要完整寫出的只有兩個端點的數字——16 位元與四位元……論文沒有在摘要層級給出中間值。",
+      "location": "圖後第一段",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n02",
+        "n03"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "deflated",
+      "evidence": "...across two engines and four weight formats. Enabling the cache changed the agent's trajectory on 36.2 percent of episodes at 16-bit precision and on 75.0 percent at four-bit",
+      "note": "重抓摘要全文確認：四種權重格式有寫，但只有 16-bit 與 4-bit 兩個百分比，中間兩種格式的數字確實不在摘要層級。作者主動聲明資料邊界、且據此拒絕在圖上補曲線，強度低於來源允許的範圍，屬 deflated，不需處理。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c09",
+      "claim_text": "一個合理的讀法是：這裡的「trajectory」指的是 agent 在多輪 tool-use 裡選擇呼叫哪個工具、帶什麼參數的整條路徑，不是文字生成的些微用詞差異，是動作序列本身分岔。照這個讀法，對一個會實際呼叫外部工具、修改檔案、送出 API 請求的 agent 來說，分岔的軌跡意味著兩次執行可能做了不同的事",
+      "location": "圖後第一段",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "修復落地：句首已加上「一個合理的讀法是：」，下游的風險敘事也改成「照這個讀法，…」，兩處都把推斷身分傳遞下去，不再以直述句冒充摘要說法。重抓摘要確認仍未定義 trajectory 內涵、也未與「用詞差異」對立，因此維持 inferred；已標記的推斷屬合法用法。未引入新事實。",
+      "action": "mark-inferred",
+      "resolution": "marked-inferred"
+    },
+    {
+      "id": "c10",
+      "claim_text": "「With caching disabled, repeated execution was bit-identical in every configuration, 0 of 800 episodes, which bounds other sources of nondeterminism at 0.5 percent.」800 個 episode，涵蓋所有權重格式與 engine 配置，全部逐位元相同——這也把其他非確定性來源的上界壓到 0.5%。",
+      "location": "H2「先排除隨機——關掉快取，800 個 episode 全部一模一樣」下",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n04"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "With caching disabled, repeated execution was bit-identical in every configuration, 0 of 800 episodes, which bounds other sources of nondeterminism at 0.5 percent.",
+      "note": "引文與重抓的摘要逐字相符，標點與大小寫一致，無截斷、無拼接。中譯把 in every configuration 展開成「涵蓋所有權重格式與 engine 配置」，與 n02 的實驗矩陣一致；0.5% 作為「上界」而非「實測值」的用法也與 bounds 相符。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c11",
+      "claim_text": "批次為一、序列送出，把 batching 帶來的額外變數排除在外，觀察對象只剩「快取開關」跟「權重精度」兩個變數。",
+      "location": "H2「先排除隨機」下第二段",
+      "type": "causal",
+      "load": "low",
+      "note_ids": [
+        "n02"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Holding the model, decoding parameters, seed, and request order fixed, and issuing every request serially at batch size one, we ran an eighty-episode multi-turn agentic tool-use workload with caching enabled and disabled across two engines and four weight formats.",
+      "note": "修復落地：「刻意排除」這個動機歸屬已刪除，現行句只描述做法（批次為一、序列送出）與其直接後果，對應 issuing every request serially at batch size one，追溯改由 n02 承接。非阻斷保留（低負載，不足以翻案）：句尾「觀察對象只剩『快取開關』跟『權重精度』兩個變數」略去了摘要同時列出的第三個維度——across two engines；嚴格說實驗矩陣是 engine × 權重格式 × 快取開關三軸，若要更貼近來源可寫成「只剩快取開關與權重精度兩個被拿來對照的變數」。",
+      "action": "mark-inferred",
+      "resolution": "marked-inferred"
+    },
+    {
+      "id": "c12",
+      "claim_text": "論文原文：「a single server-level prompt-cache setting moves run-to-run divergence by 37.5 percentage points」",
+      "location": "widget vg-w-pop-cache-glossary（server-level 設定 popover）",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n05"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "a single server-level prompt-cache setting moves run-to-run divergence by 37.5 percentage points",
+      "note": "逐字引文核對無誤，是 n05 長句中的完整子句，未跨句拼接。內文「run-to-run 的 divergence 幅度就移動了 37.5 個百分點」亦為直譯，未改動強度。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c13",
+      "claim_text": "第二個實驗，把同一批 request 換個順序送進去，只有在那顆 prompt-cache 設定處於開啟狀態時，順序才會改變結果；設定關掉，順序怎麼換都一樣。",
+      "location": "H2「那快取本身是不是本來就會這樣」下",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [
+        "n05"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "execution order acts only while that setting is active",
+      "note": "核心因果（順序只在該設定生效時起作用，以及其逆否「設定關掉順序不影響」）與來源一致。次要保留：摘要沒有描述這個實驗的操作程序，「把同一批 request 換個順序送進去」是作者依 n02『request order fixed』這個控制變數反推的合理程序描述，不影響結論，但嚴格說是重建而非引述。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c14",
+      "claim_text": "「server-level」這幾個字才是關鍵——論文說的是這顆設定掛在 serving engine 的行程上，不是隨每一個 request 帶入的參數。……一個合理的推測是，這也是它容易被忽略的原因：debug 時，大家習慣檢查 request 帶了什麼參數，不會想到去檢查 server 行程本身開了什麼組態。",
+      "location": "H2「那快取本身是不是本來就會這樣」下第三段（另見 popover 內同義句）",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [
+        "n05"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "a single server-level prompt-cache setting moves run-to-run divergence by 37.5 percentage points",
+      "note": "修復落地：round 1 的致命半句「使用者端完全看不到、也控制不到」已從正文與 popover 中消失，改成 server-level 一詞真正支撐的對比（掛在 server 端／不是隨 request 帶入的參數）；把 n06 的 cache state absent from the request 誤植到「這顆設定」上的合併敘述也不見了；「為什麼容易被忽略」則明確標為「一個合理的推測是」。非阻斷保留：來源用詞只到 server-level，正文以「行程」「跨所有 request 共享」具體化並冠上「論文說的是」，屬對 server-level 的合理展開但比來源多一層具體度；程度輕微，不改判。",
+      "action": "mark-inferred",
+      "resolution": "marked-inferred"
+    },
+    {
+      "id": "c15",
+      "claim_text": "（已刪除）原句「整條精度梯度的總跨幅是 38.8 個百分點」在現行正文中已不存在——全文搜尋「38.8」無任何命中，相減操作與「總跨幅」措辭一併移除。",
+      "location": "原 H2「那快取本身是不是本來就會這樣」下第四段（現已改寫）",
+      "type": "number",
+      "load": "medium",
+      "note_ids": [
+        "n03"
+      ],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": "Enabling the cache changed the agent's trajectory on 36.2 percent of episodes at 16-bit precision and on 75.0 percent at four-bit, a gradient that survives re-measurement under a controlled cache configuration.",
+      "note": "逐段複核第四段全文，作者自行相減得出的 38.8 與「總跨幅」說法已完全刪除，未在其他段落或 widget（圖表資料陣列、兩張表格、slider 標籤）以任何形式復現。刪除是行動矩陣允許的修法，無後續動作。",
+      "action": "mark-inferred",
+      "resolution": "marked-inferred"
+    },
+    {
+      "id": "c16",
+      "claim_text": "論文沒有給出 run-to-run divergence 的總幅度，所以這 37.5 個百分點佔了其中多少無從得知；能說的是，單獨一顆 server-level 設定的開關就足以移動這麼多。更關鍵的是重測結果：把 cache 設定固定住之後重新量測，16-bit 與四位元之間的分歧梯度依然存在——論文原句是「a gradient that survives re-measurement under a controlled cache configuration」，這個梯度在受控的 cache 設定下重新量測，並沒有被消掉。三個實驗合起來，把成因鎖定在 cache state 本身。",
+      "location": "H2「那快取本身是不是本來就會這樣——問題不在快取，在一顆設定」下第四段（同一 H2 第一段末句一併複查）",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [
+        "n03",
+        "n05"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Repeated cache-enabled runs did diverge, and three experiments locate the cause: a single server-level prompt-cache setting moves run-to-run divergence by 37.5 percentage points, execution order acts only while that setting is active, and restoring cache state makes the cached and recompute paths each reproduce on 40 of 40 items while still differing from each other on 14. ／ Enabling the cache changed the agent's trajectory on 36.2 percent of episodes at 16-bit precision and on 75.0 percent at four-bit, a gradient that survives re-measurement under a controlled cache configuration. ／ Cached serving is deterministic given cache state, and irreproducible in practice because that state is absent from the request and never reset by default.",
+      "note": "修復落地。重抓 arxiv.org/abs/2609.04748 取得完整摘要後逐句比對：(1)「大半」這個無分母的量級判斷在全文已不存在——搜尋「大半」「大部分」「絕大」皆無命中，本段改寫後不但沒有量級判斷，還主動宣告資料邊界（「37.5 個百分點佔了其中多少無從得知」），這正是 round 2 要求的修法；round 2 一併點名的前一段殘留也已改掉，現讀「這不是四種權重格式加總出來的效果，是單獨一顆設定的開關就能造成的移動幅度」，同樣不再有比例判斷。(2)「論文沒有給出 run-to-run divergence 的總幅度」與重抓結果相符：整份摘要沒有任何總幅度或分母數字。(3)「單獨一顆 server-level 設定的開關就足以移動這麼多」＝ a single server-level prompt-cache setting moves run-to-run divergence by 37.5 percentage points，強度未上修；「開關」的說法由第二個實驗的 while that setting is active 佐證（該設定有生效／不生效兩態）。(4) 英文引句「a gradient that survives re-measurement under a controlled cache configuration」與摘要逐字元相符，中譯忠實，未把「梯度存續」講成「梯度被解釋」。(5)「三個實驗合起來，把成因鎖定在 cache state 本身」對應 three experiments locate the cause＋結論句 deterministic given cache state，屬來源允許的收束。未引入新數字：全文仍無「38.8」，本段亦未出現任何摘要以外的數值。兩項非阻斷觀察（不改判、不需行動）：(a) 本段寫「論文沒有給出…總幅度」，但本輪只能核到摘要層級，同篇 c08 的措辭是「論文沒有在摘要層級給出中間值」，此處若比照補上「摘要層級」會更貼合可核實範圍——方向上是自我設限的陳述，錯的風險與傷害都低。(b) 前一段新寫的「這不是四種權重格式加總出來的效果」是作者為防誤讀而立的反面對照：摘要只說 a single … setting（單一設定），從未描述 37.5 pp 是否跨四種權重格式彙總，因此這個否定式在來源裡沒有對應句；它否定的是一種讀法而非新增一項正面事實，且該句真正承重的後半（單一設定即造成此移動）逐字有據，故列為殘留觀察而非翻案。另注：正文他處的「多數團隊…」（首段兩處、倒數第六段一處）與「大概率沒事」是關於團隊行為與品質風險的概括，不是對 divergence 的比例判斷，不在本項複查射程內。",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c17",
+      "claim_text": "論文標題已經把整個論證濃縮成一句話——「Same Request, Different Answer: Quantization Amplifies Cache-Induced Divergence in LLM Serving」",
+      "location": "H2「那快取本身是不是本來就會這樣」下末段",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n11"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Same Request, Different Answer: Quantization Amplifies Cache-Induced Divergence in LLM Serving",
+      "note": "追溯缺口已補且經得起查核：重抓頁面取得的標題與 n11 的 quote 逐字元相符（冒號、連字號、大小寫、in LLM Serving 結尾皆一致），正文引用的字串同樣逐字相符，無截斷、無拼接。正文未改動、未引入新事實。",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c18",
+      "claim_text": "論文標題寫的是「Quantization Amplifies Cache-Induced Divergence」——量化『放大』了快取引發的分歧。一個合理的讀法是，這個動詞選得有意思：『放大』暗示量化本身不是另外引入一種新的分歧來源，而是把原本就存在的快取效應加劇；但這組對比是本文的推論，論文沒有把兩者明講成對立。",
+      "location": "H2「同一個 request，四位元權重下四分之三的機率走上不同路」下",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n11"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Same Request, Different Answer: Quantization Amplifies Cache-Induced Divergence in LLM Serving",
+      "note": "兩半都修好了：前半改述為「論文標題寫的是」並引用標題中的逐字片段「Quantization Amplifies Cache-Induced Divergence」（重抓標題的完整子字串，核對無誤），由新增的 n11 承接追溯；後半的對立解讀已雙重標記——句首「一個合理的讀法是」、句尾再明說「這組對比是本文的推論，論文沒有把兩者明講成對立」，round 1 那句把自身解讀升格為「整篇論文的張力所在」的措辭已消失。未引入新事實。",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c19",
+      "claim_text": "論文結論句：「Cached serving is deterministic given cache state, and irreproducible in practice because that state is absent from the request and never reset by default.」",
+      "location": "widget vg-w-pop-cache-glossary（cache state popover）",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n06"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Cached serving is deterministic given cache state, and irreproducible in practice because that state is absent from the request and never reset by default.",
+      "note": "逐字相符。文中中譯（「不在 request payload 裡，也不會在下一次呼叫前被清空」）與 absent from the request / never reset by default 對應無誤。稱其為「結論句」也符合它在摘要中的位置（僅次於最後兩句方法性陳述）。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c20",
+      "claim_text": "分別在 cached path 與 recompute path 上，各自在 40 個項目上重新驗證（表格③「cached／recompute 兩條路徑各自在 40 個項目上驗證」；倒數第五段「800 個 episode 橫跨所有配置重複執行、cached 與 recompute 兩條路徑各自在 40 個項目上驗證」）",
+      "location": "H2「真正的成因」下首段；widget vg-w-table-cache-causality 第③列；及倒數第五段",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n04",
+        "n05"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "restoring cache state makes the cached and recompute paths each reproduce on 40 of 40 items while still differing from each other on 14",
+      "note": "三處誤讀全部改正：正文首段、表格第③列、倒數第五段一律改成「在 40 個項目上」，與來源的 40 of 40 items（項目數）相符；全文搜尋確認已無「40 次」「重跑 40」等以次數為單位的表述。以誤讀為基礎的讀者建議也重寫了：現在寫的是「不能只看一次性的功能測試通過與否——單次測試通過，證明不了系統在同樣的輸入下每次都給出同一個答案」，只主張『單次不足』，不再宣稱論文給了重跑次數；隨後的舉例「800 個 episode 橫跨所有配置重複執行」由 n04（0 of 800 episodes, in every configuration）支撐，「40 個項目」由 n05 支撐。未引入新數字。",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c21",
+      "claim_text": "各自 40/40 可重現，彼此仍有 14 項不同（另：可重現性表格「各自 40/40 可重現」「14/40 不同」）",
+      "location": "widget vg-w-table-cache-causality 第③列；widget vg-w-table-reproducibility-ladder 第二、三列；及「這正是第三個實驗用 40/40 證明的事」",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n05"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "restoring cache state makes the cached and recompute paths each reproduce on 40 of 40 items while still differing from each other on 14",
+      "note": "「40/40 可重現」與 reproduce on 40 of 40 逐項相符；「彼此仍有 14 項不同」與 differing from each other on 14 相符。表格寫成「14/40」時補上了分母，來源只說 on 14——但既然全集是 40 個項目，這個分母是來源結構直接蘊含的，屬合理呈現，不視為虛構。注意此項與 c20 共用同一句來源：數字 40 用在「項目」語境（本項）成立，用在「重跑次數」語境（c20）不成立。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c22",
+      "claim_text": "before/after slider 標籤「涵蓋 800 個 episode」「0/800 分歧」，figcaption「分岔比例（75.0%）與 episode 總數（800）取自 arXiv 2609.04748」",
+      "location": "widget vg-w-ba-cache-trajectory 的 before 圖層標籤與 figcaption；vg-w-table-reproducibility-ladder 第一列",
+      "type": "number",
+      "load": "medium",
+      "note_ids": [
+        "n03",
+        "n04"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "With caching disabled, repeated execution was bit-identical in every configuration, 0 of 800 episodes, which bounds other sources of nondeterminism at 0.5 percent.",
+      "note": "修復落地：圖層標籤由「重複執行 800 次」改為「涵蓋 800 個 episode」，figcaption 由「重跑次數（800）」改為「episode 總數（800）」，兩處都與 0 of 800 episodes 的單位一致，不再把 episode 總數說成同一個 request 的重跑次數。figcaption 仍保留「示意圖，非逐點量測資料」的界線聲明，75.0% 亦與 n03 相符。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c23",
+      "claim_text": "量化模型加上打開的快取，會讓這個假設在四分之三的案例上失效",
+      "location": "H2「真正的成因」下第三段",
+      "type": "number",
+      "load": "medium",
+      "note_ids": [
+        "n03"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Enabling the cache changed the agent's trajectory on 75.0 percent at four-bit",
+      "note": "「四分之三」即 75.0%，且文中已把條件限定在「量化模型 + 打開的快取」，與來源的四位元 + cache enabled 條件相符，沒有把數字外推到其他精度。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c24",
+      "claim_text": "Quesma 八月底一篇針對 Qwen3.8 27B 的量化 benchmark 是個乾淨的對照組：作者 Piotr Migdał 直接寫道",
+      "location": "H2「真正的成因：cache state 不在 request 裡，也不會被重置」下倒數第七段（Quesma 對照組）",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n12",
+        "n13"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "標題行：「Benchmarking Qwen3.8 27B quantizations: 4-bit holds up, 1-bit collapses」；署名行（頁面上另一行）：「Piotr Migdał·26 August 2026」——兩行為頁面上分開的兩個字串，本 evidence 以標示分隔，並未接成一條連續文字。",
+      "note": "ledger 修補確認有效。重抓 quesma.com/blog/qwen38-27b-quantizations-benchmarked/ 逐字核對：n12 的 quote「Benchmarking Qwen3.8 27B quantizations: 4-bit holds up, 1-bit collapses」在頁面上逐字元存在（冒號、逗號、連字號、大小寫皆一致）；n13 的 quote「Piotr Migdał·26 August 2026」亦逐字元存在，分隔符為中點（·）、兩側無空格，與 n13 interpretation 的描述相符。round 2 指出的問題（把兩行用頁面上不存在的破折號拼成單一 quote）已因拆成 n12／n13 而消除，兩則 quote 各自都是頁面上真實存在的連續字串。正文這句的三個事實成分逐一對得上：「針對 Qwen3.8 27B 的量化 benchmark」＝標題行、「作者 Piotr Migdał」與「八月底」＝署名行的 26 August 2026。正文未改動，未引入新事實。",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c25",
+      "claim_text": "「Not only does my measurement of BF16 replicate the stated result, but, to my surprise, Q4_K_M does as well.」——在 Terminal-Bench 2.1 這個 agentic coding benchmark 上，四位元的 Q4_K_M 追平了 BF16。",
+      "location": "H2「真正的成因」下倒數第七段",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n07"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Not only does my measurement of `BF16` replicate the stated result, but, to my surprise, `Q4_K_M` does as well.",
+      "note": "逐字相符（原文對 BF16 與 Q4_K_M 加了 code 標記，屬純格式差異）。重抓時特別確認這句所指的 benchmark 確為 Terminal-Bench 2.1，文中的 benchmark 歸屬正確。「追平」對應 replicate the stated result，未上修為「勝過」。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c26",
+      "claim_text": "「the scores are around the random guessing level, with the smallest model being below that threshold」，1-bit 量化的分數掉到接近亂猜的水準。",
+      "location": "H2「真正的成因」下倒數第七段",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n08"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "As you may see, the scores are around the random guessing level, with the smallest model being below that threshold.",
+      "note": "引文為原句去掉開頭「As you may see,」的逐字片段，屬合理截斷，未改變語意。1-bit 的歸屬經重抓確認（原文指最極端壓縮的 1-bit 模型低於隨機門檻）。一項保留：這句在原文的量測脈絡是 GPQA Diamond，而文中它緊接在 Terminal-Bench 2.1 那句之後、只用「再往下一級」帶過，未點名 benchmark——沒有說錯，但讀者容易誤讀成同一個 benchmark 上的結果。若要更精確可補上「（GPQA Diamond 上）」。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c27",
+      "claim_text": "Migdał 給的實務建議是：「For most tasks Unsloth's Q4_K_M should be good enough, without any noticeable difference; for some simpler tasks UD-Q2_K_XL should be more than fine.」",
+      "location": "H2「真正的成因」下倒數第七段",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n09"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "For most tasks Unsloth's `Q4_K_M` should be good enough, without any noticeable difference; for some simpler tasks `UD-Q2_K_XL` should be more than fine.",
+      "note": "逐字相符。n09 記為 hedged（should、for most tasks），文中以「實務建議」框住並保留原文 should，未把建議轉述成保證；隨後「這條建議管的是輸出品質夠不夠」也維持在建議層級。無強度上修。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c28",
+      "claim_text": "挑量化等級時可以參考 Terminal-Bench 2.1 或 GPQA Diamond 這類品質基準，但品質基準量的是分數本身，不是「同一個 request 重複呼叫是否給出同一個答案」這件事——兩者是不同的量測目標。",
+      "location": "H2「真正的成因」下倒數第七段",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [
+        "n07",
+        "n08"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "How does it work for programming? Terminal-Bench 2.1 is a standard agentic benchmark, with 89 tasks. ／ graduate-level science GPQA Diamond and instruction-following IFBench",
+      "note": "修復落地：round 1 的業界慣例斷言「這類基準通常只跑一次、或乾脆關掉快取」已從正文消失，改成不依賴慣例的說法（品質基準量的是分數本身，本篇論文量的是重複呼叫的一致性，兩者量測目標不同）——正是 round 1 建議的改法，且該敘述由兩份來源各自量測的對象直接支撐（Quesma 報分數，arXiv 報 divergence）。同段後半「量化前後跑一次 benchmark 分數差不多，不能直接當成可以放心上線的證據」亦只主張兩份報告量的是不同風險，未再宣稱任何 benchmark 執行慣例。新出現的具名 benchmark「GPQA Diamond」經本輪重抓確認確實出現在 Quesma 文中（且正是 n08 那句隨機猜測水準所屬的 benchmark），與 round 1 對 Terminal-Bench 2.1 的處理一致，不視為新增未查證事實；若要更嚴謹，可補一則以上列 evidence 為 quote 的 note，把兩個 benchmark 名稱落到事實層。",
+      "action": "mark-inferred",
+      "resolution": "marked-inferred"
+    },
+    {
+      "id": "c29",
+      "claim_text": "Migdał 量到的 1-bit 崩潰就是這種：分數掉到隨機猜測的水準。",
+      "location": "H2「真正的成因」下倒數第六段",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n08"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "As you may see, the scores are around the random guessing level, with the smallest model being below that threshold.",
+      "note": "修復落地：「而且每次都差不多爛」這個把跨次一致性掛到 Migdał 量測上的子句已刪除，現行句只剩由 n08 支撐的分數水準陳述，重抓原句逐字確認無誤。非阻斷保留：緊接其前用來定義失效模式類別的句子仍寫「同一個 request 反覆問，答案本身持續變差」，透過「就是這種」與 Migdał 的結果連結，仍隱含一點跨次穩定性的意味；但該句是作者對兩種失效模式的分類描述（非掛在來源名下的量測結果），且量測層面的歸屬已收斂到分數水準，不改判。",
+      "action": "mark-inferred",
+      "resolution": "marked-inferred"
+    },
+    {
+      "id": "c30",
+      "claim_text": "一個合理的機制推測是：四位元權重下數值精度變粗，原本只在小數點後幾位的差異，更容易在 agentic workflow 的某個決策點被放大成完全不同的 tool call、完全不同的分支——但論文本身沒有給出這層數值機制，這是本文的推測，也跟「關掉快取時量化模型逐位元相同」這個事實存在張力，值得讀者自行保留判斷。回到已經核實的部分：正因為關掉快取時逐位元相同這件事夠乾淨，把快取整個關掉才是排除故障最乾淨的第一步",
+      "location": "結論段（倒數第三段）",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [
+        "n04"
+      ],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": "With caching disabled, repeated execution was bit-identical in every configuration, 0 of 800 episodes, which bounds other sources of nondeterminism at 0.5 percent.",
+      "note": "修復落地且超出最低要求：數值機制敘事已標為「一個合理的機制推測是」，並自陳論文沒有給出這層機制、與 n04 存在張力、請讀者保留判斷——round 1 指出的張力被寫進正文而非掩蓋。下一句以「回到已經核實的部分」明確切回 n04 的事實（關掉快取逐位元相同），把『先關快取排查』的建議建立在已核實事實上，不再靠推測承重。同段「量化沒有創造這個問題，量化只是把模型對用了哪個版本的 cache 變得更敏感」與標題 Amplifies（n11）方向一致，未引入新事實或新數字。",
+      "action": "mark-inferred",
+      "resolution": "marked-inferred"
+    }
+  ],
+  "checked_at": "2026-09-09",
+  "checker_rounds": 3,
+  "coverage": {
+    "candidate_claims": 38,
+    "checked": 30,
+    "dropped_low_load": 8
+  }
+}

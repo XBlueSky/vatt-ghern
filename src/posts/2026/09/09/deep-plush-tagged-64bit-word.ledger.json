@@ -1,0 +1,854 @@
+{
+  "output_path": "src/posts/2026/09/09/deep-plush-tagged-64bit-word.html",
+  "spine": [
+    "1. Plush 的 Value 是一個 16-variant 的 Rust tagged enum，語意上每個值只要 64 bit，但因為 alignment，Rust 實際把它 pad 成整整 128 bit（16 bytes）。",
+    "2. 作者把它換成手寫的 64-bit tagged word，最低 2 bit 當 tag：00 給 fixnum，一個帶號 62-bit 整數，存成 n<<2，可以直接在 tagged word 上做加減，且溢位判斷剛好對應機器層級的 64-bit overflow。",
+    "3. 10 給 flonum，用一個借來的自標記手法：把 IEEE 754 的高位 bits rotate 進 tag 位置、加一個 bias，只犧牲 2 bit 指數、mantissa 精度完整保留。",
+    "4. 01 給 immediate，底下再用 5-bit subtag 塞 nil/true/false/undef/function id/host function，比對只要一個位元組；指標分兩種、比較方式不同（大多數走參照相等，字串走結構相等，為未來字串 interning 留伏筆）。",
+    "5. match dispatch 也重寫：舊版 Int64+Int64 快速路徑的組合語言分散在四個不連續的 basic block；新版把值塞進單一暫存器，不必立刻把值 spill 回 native stack，浮點快速路徑從 52 instructions/24 memory ops/4 branches 砍到 36/9/1。",
+    "6. 結果：mlp 這種 array 密集的 benchmark 記憶體降最多，達 37%；binary_tree 與 linked_list 這類指標密集的 benchmark 速度增益最大；所有 benchmark 都變快，連浮點的 mlp、nbody 也不例外。",
+    "7. 代價是 62-bit 上限：超過範圍的整數要 box 到 heap，左移運算或靠溢位生成亂數的寫法容易踩到；sha256_unfixed 曾因此記憶體退步，但一行修正就把它拉回最小堆大小，且仍比舊版快 12%。"
+  ],
+  "sources": [
+    {
+      "url": "https://pointersgonewild.com/2026-08-25-replacing-a-rust-enum-with-a-64-bit-word/",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": "2026-08-25",
+      "perspective": {
+        "mechanism": "把一個 16-variant 的 Rust tagged enum（因 alignment 而被 pad 成 128 bit）換成手寫的 64-bit tagged word：低 2 bit 當 tag，fixnum（00，n<<2、62-bit 帶號整數）、flonum（10，IEEE 754 指數 rotate + bias 的自標記法）、immediate（01，5-bit subtag）、兩種指標（依比較語意分開）；match dispatch 從分散在多個 basic block 的舊版改成直線碼，值能塞進單一暫存器不必 spill。",
+        "tradeoff": "拿掉的是 2 bit 的整數範圍與浮點指數精度（62-bit fixnum、少 2 bit 指數），換來的是記憶體減半、更好的 cache locality 與更精簡的編譯產物；代價落在超過 62-bit 範圍就得 box 到 heap，左移或靠溢位生成亂數這類寫法會撞到這條線，需要一次性重寫才能修正。",
+        "reader_use": "任何自己寫直譯器/VM、或在用其他語言 boxed 表示法的工程師，可以直接照抄「低位 tag + 移位存值」這套設計來把值表示從兩個字寬壓成一個字寬，並用同樣的方法（看反組譯的 basic block 數、memory ops、branch 數）驗證 codegen 有沒有真的變好，而不是只看 wall-clock。"
+      }
+    }
+  ],
+  "notes": [
+    {
+      "id": "n01",
+      "url": "https://pointersgonewild.com/2026-08-25-replacing-a-rust-enum-with-a-64-bit-word/",
+      "quote": "This enum is a whole 16 bytes (128 bits) wide.",
+      "hedge": "asserted",
+      "interpretation": "作者明確陳述舊版 Value enum 的實際大小是 128 bit，不是概算。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n02",
+      "url": "https://pointersgonewild.com/2026-08-25-replacing-a-rust-enum-with-a-64-bit-word/",
+      "quote": "Each enum variant needs only 64 bits, and the enum tag that Rust creates only needs 8 bits, but because of memory alignment constraints, Rust may need to use a whole 128 bits for each value.",
+      "hedge": "hedged",
+      "interpretation": "說明 128 bit 從何而來：每個 variant payload 只要 64 bit、Rust 自動加的 tag 只要 8 bit，問題出在 alignment 讓整個 enum 被 pad 成 128 bit。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n03",
+      "url": "https://pointersgonewild.com/2026-08-25-replacing-a-rust-enum-with-a-64-bit-word/",
+      "quote": "enum Value { Undef, Nil, False, True, Int64(i64), Float64(f64), String(*const Str), HostFn(&'static HostFn), Fun(FunId), Closure(*mut Closure), Cell(*mut Value), Object(*mut Object), Array(*mut Array), ByteArray(*mut ByteArray), Dict(*mut Dict), Class(ClassId), }",
+      "hedge": "asserted",
+      "interpretation": "原始 16-variant enum 的完整定義，顯示 payload 種類混雜（i64/f64 直接內嵌、其餘多半是指標）。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n04",
+      "url": "https://pointersgonewild.com/2026-08-25-replacing-a-rust-enum-with-a-64-bit-word/",
+      "quote": "A 64-bit overflow is also exactly the case where the result no longer fits in 62 bits, meaning we can use standard machine instructions to check for overflow.",
+      "hedge": "asserted",
+      "interpretation": "fixnum 選 62-bit 而非其他數字的技術理由：讓溢位判斷直接對應機器層級的 64-bit overflow flag，不用額外邏輯。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n05",
+      "url": "https://pointersgonewild.com/2026-08-25-replacing-a-rust-enum-with-a-64-bit-word/",
+      "quote": "Fixnums are signed integers that fit in a 62-bit range",
+      "hedge": "asserted",
+      "interpretation": "fixnum 的定義：帶號、62-bit 範圍。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n06",
+      "url": "https://pointersgonewild.com/2026-08-25-replacing-a-rust-enum-with-a-64-bit-word/",
+      "quote": "integer values that fit in the 62-bit fixnum range have their lowest two bits set to 00, and are stored as `n << 2`",
+      "hedge": "asserted",
+      "interpretation": "fixnum 的具體編碼：tag 為 00，數值本身左移兩位存放，代表可以直接對 tagged word 做整數運算而不用先 untag。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n07",
+      "url": "https://pointersgonewild.com/2026-08-25-replacing-a-rust-enum-with-a-64-bit-word/",
+      "quote": "For my boxing scheme, I picked a bias value such that the lowest two bits end up being `10`.",
+      "hedge": "asserted",
+      "interpretation": "flonum 的 tag 是 10，透過挑選 bias 值讓最低兩位自然變成 10。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n08",
+      "url": "https://pointersgonewild.com/2026-08-25-replacing-a-rust-enum-with-a-64-bit-word/",
+      "quote": "a rotation of the upper bits so they end up in the tag bit position, after adding a bias value such that the lower bits end up being the specific tag",
+      "hedge": "asserted",
+      "interpretation": "flonum 自標記法的核心機制：把 IEEE 754 高位 bits rotate 到 tag 位置、加 bias 讓低位自然對齊 tag。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n09",
+      "url": "https://pointersgonewild.com/2026-08-25-replacing-a-rust-enum-with-a-64-bit-word/",
+      "quote": "only lose two bits of exponent, and we keep the full precision of the mantissa",
+      "hedge": "asserted",
+      "interpretation": "flonum 編碼付出的代價只有 2 bit 指數精度，mantissa 完整保留。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n10",
+      "url": "https://pointersgonewild.com/2026-08-25-replacing-a-rust-enum-with-a-64-bit-word/",
+      "quote": "The immediates have a 5-bit subtag to indicate what kind of immediate they are.",
+      "hedge": "asserted",
+      "interpretation": "immediate（tag 01）底下再用 5-bit subtag 分辨 nil/true/false/undef/function id/host function 等，比較時只要一個位元組比對。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n11",
+      "url": "https://pointersgonewild.com/2026-08-25-replacing-a-rust-enum-with-a-64-bit-word/",
+      "quote": "The reason there are two kinds of pointers in this representation is that I wanted to make equality comparison between values fast...Most values in Plush are compared using simple reference equality, but I chose to have strings be compared for structural equality to allow the possibility of a string interning table later.",
+      "hedge": "asserted",
+      "interpretation": "兩種指標型別存在的理由是讓相等比較快：大多數值用參照相等，字串走結構相等（比對內容），為未來字串 interning 留伏筆。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n12",
+      "url": "https://pointersgonewild.com/2026-08-25-replacing-a-rust-enum-with-a-64-bit-word/",
+      "quote": "you can also borrow the two lowest bits of integer values, with the assumption that integer values will very rarely need to use the full 64-bit range, because for reference `2^64 ~= 1.84 * 10^19`",
+      "hedge": "asserted",
+      "interpretation": "作者對 62-bit 夠用的實務理由：2^64 大到程式幾乎用不到那麼大範圍的整數，借用最低兩位當 tag 划算。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n13",
+      "url": "https://pointersgonewild.com/2026-08-25-replacing-a-rust-enum-with-a-64-bit-word/",
+      "quote": "as much as 37% on the `mlp` benchmark which uses a lot of arrays",
+      "hedge": "asserted",
+      "interpretation": "記憶體降幅最大的例子是 mlp benchmark，因為大量使用 array，tagged word 讓每個元素從 128 bit 縮到 64 bit。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n14",
+      "url": "https://pointersgonewild.com/2026-08-25-replacing-a-rust-enum-with-a-64-bit-word/",
+      "quote": "The biggest performance gains are in the `binary_tree` and `linked_list` benchmarks.",
+      "hedge": "asserted",
+      "interpretation": "速度增益最大的兩個 benchmark 是指標密集的 binary_tree 與 linked_list；來源沒有給出這兩者各自的精確百分比。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n15",
+      "url": "https://pointersgonewild.com/2026-08-25-replacing-a-rust-enum-with-a-64-bit-word/",
+      "quote": "every single benchmark is faster, and some are faster by a lot.",
+      "hedge": "asserted",
+      "interpretation": "整體結論：所有 benchmark 都變快，但幅度不一。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n16",
+      "url": "https://pointersgonewild.com/2026-08-25-replacing-a-rust-enum-with-a-64-bit-word/",
+      "quote": "the updated `sha256_fixed` benchmark is faster than `sha256_unfixed`. That being said, `sha256_unfixed` is still running 12% faster with the new value representation than with the old version",
+      "hedge": "asserted",
+      "interpretation": "sha256_unfixed 是沒修正溢位問題的版本，即使仍會踩到 boxing，換成新表示法後還是比舊版本快 12%。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n17",
+      "url": "https://pointersgonewild.com/2026-08-25-replacing-a-rust-enum-with-a-64-bit-word/",
+      "quote": "It turns out that the computation can easily be rearranged to avoid this. It's a one-line fix, and brings memory usage back all the way down to the minimum heap size.",
+      "hedge": "asserted",
+      "interpretation": "sha256_unfixed 的記憶體退步只要調整運算寫法（一行修正）就能解決，調整後記憶體用量回到最小堆大小。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n18",
+      "url": "https://pointersgonewild.com/2026-08-25-replacing-a-rust-enum-with-a-64-bit-word/",
+      "quote": "In particular, code that does left shifts, or relies on overflows for things like generating random numbers, can run into that.",
+      "hedge": "asserted",
+      "interpretation": "62-bit fixnum 邊界對哪些寫法有感：左移運算與依賴溢位生成亂數的手法容易撞到這條線，被迫 box 到 heap。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n19",
+      "url": "https://pointersgonewild.com/2026-08-25-replacing-a-rust-enum-with-a-64-bit-word/",
+      "quote": "Looking at the disassembly for the `Int64 + Int64` fast path, it's spread over four disjoint basic blocks.",
+      "hedge": "asserted",
+      "interpretation": "舊版本 match dispatch 對 Int64+Int64 快速路徑的組合語言分散在四個不連續的 basic block，不是一條直線的碼。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n20",
+      "url": "https://pointersgonewild.com/2026-08-25-replacing-a-rust-enum-with-a-64-bit-word/",
+      "quote": "Despite that, the new float fast path is straight-line code with exactly one branch at the end, and it actually ends up shorter than the old version. We went from 52 instructions, 24 memory ops and 4 branches taken to 36 instructions, 9 memory ops and 1 branch taken.",
+      "hedge": "asserted",
+      "interpretation": "浮點快速路徑（Float64+Float64）重寫後的組合語言統計：指令數、記憶體存取次數、分支次數都大幅減少，且是直線碼、只有一個分支。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n21",
+      "url": "https://pointersgonewild.com/2026-08-25-replacing-a-rust-enum-with-a-64-bit-word/",
+      "quote": "The real win is that values now fit in a single register. The generated code is a lot more efficient as a result. We're not spilling values to the native C/Rust stack immediately after popping them from the interpreter stack.",
+      "hedge": "asserted",
+      "interpretation": "效能提升的核心機制：64-bit tagged word 能塞進單一暫存器，不用像以前那樣立刻把值 spill 回 native stack；用來解釋為何連浮點 benchmark 都變快。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n22",
+      "url": "https://pointersgonewild.com/2026-08-25-replacing-a-rust-enum-with-a-64-bit-word/",
+      "quote": "I suspect that the code the Rust compiler generates for this is maybe not very efficient.",
+      "hedge": "hedged",
+      "interpretation": "作者自己對舊版 Rust 編譯器產生的碼效率抱持保留態度，用推測語氣，不是斷言。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n23",
+      "url": "https://pointersgonewild.com/2026-08-25-replacing-a-rust-enum-with-a-64-bit-word/",
+      "quote": "The `mlp` benchmark is a naively implemented multilayer neural network, with a lot of floating-point operations.",
+      "hedge": "asserted",
+      "interpretation": "說明 mlp benchmark 的內容：一個陣列與浮點運算都很密集的類神經網路模擬，用來解釋它為何同時是記憶體降幅最大、又是浮點運算的例子。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n24",
+      "url": "https://pointersgonewild.com/2026-08-25-replacing-a-rust-enum-with-a-64-bit-word/",
+      "quote": "The `nbody` benchmark is also floating-point heavy.",
+      "hedge": "asserted",
+      "interpretation": "nbody 是另一個浮點運算密集的 benchmark。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n25",
+      "url": "https://pointersgonewild.com/2026-08-25-replacing-a-rust-enum-with-a-64-bit-word/",
+      "quote": "However, there are other benchmarks like `fib` and `nbody` which don't touch a lot of memory at all.",
+      "hedge": "asserted",
+      "interpretation": "fib、nbody 這類 benchmark 本來記憶體用量就低，所以它們變快不能歸因於記憶體改善，指向暫存器塞得下、碼變短這類機制。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n26",
+      "url": "https://pointersgonewild.com/2026-08-25-replacing-a-rust-enum-with-a-64-bit-word/",
+      "quote": "even though it's allocating a total of 3,149,052 boxed integer values in a span of about 490 ms",
+      "hedge": "asserted",
+      "interpretation": "具體量化 sha256_unfixed 溢位造成的 heap 配置壓力：約 490 毫秒內配置了 3,149,052 個 boxed 整數。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n27",
+      "url": "https://pointersgonewild.com/2026-08-25-replacing-a-rust-enum-with-a-64-bit-word/",
+      "quote": "The easy way to do that is to have one bit in the tag (I chose bit index 1) that tells us that two values can be compared directly using one comparison instruction.",
+      "hedge": "asserted",
+      "interpretation": "bit index 1 的角色：標示兩個值能不能只用一條指令直接比較。這是判斷兩種指標在這一位上不會取同一個值的根據，但原文沒有直接寫出兩種指標各自完整的 2-bit tag 值——這一步是從本句加下一句自己推出來的，post 中已明講為推得。重新抓取來源核對「can」與「can't」的用字：多次抓取確認正確用字為「can」（能直接比較），非「can't」。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n28",
+      "url": "https://pointersgonewild.com/2026-08-25-replacing-a-rust-enum-with-a-64-bit-word/",
+      "quote": "This allows us to have a fast path to compare integers, pointers, handles and small immediate constants like `true`, `false`, `nil` and `undef` using a single machine comparison instruction.",
+      "hedge": "asserted",
+      "interpretation": "bit 1 這個設計服務的範圍不只指標，也包含整數、handle，以及 true/false/nil/undef 這幾個 immediate 常數，用來支持 post 中「範圍比只分兩種指標更廣」的說法。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n29",
+      "url": "https://pointersgonewild.com/2026-08-25-replacing-a-rust-enum-with-a-64-bit-word/",
+      "quote": "In contrast, the way the code is formatted now, we're explicitly testing for the likely hot path first in an `if` statement.",
+      "hedge": "asserted",
+      "interpretation": "新版把最常見情況的判斷寫在 if 的第一個分支，對應「熱路徑優先接受測試」；來源用「testing ... first」，比 post 原本「不用經過任何跳轉就能算完」的講法保守，post 已改為對齊此措辭（優先接受測試）。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n30",
+      "url": "https://pointersgonewild.com/2026-08-25-replacing-a-rust-enum-with-a-64-bit-word/",
+      "quote": "The immediates have a 5-bit subtag to indicate what kind of immediate they are.",
+      "hedge": "asserted",
+      "interpretation": "重新抓取確認：全文文字層（含程式碼區塊、常數定義）從未出現以 01 作為 immediate tag 的字串；immediate 一節只給出 5-bit subtag，沒有給出對應的完整 2-bit tag 值。完整四種 tag 對照僅畫在文章的圖片「The tagged value representation」中，其 alt text 只重複標題，文字層無法核實。此 note 用來支持 post 中「原文文字沒有寫出 immediate 的 2-bit tag 值」的陳述。",
+      "timeliness": "durable"
+    }
+  ],
+  "claims": [
+    {
+      "id": "c01",
+      "claim_text": "記憶體用量在陣列密集的 benchmark 上最多降了 37%",
+      "location": "hero opener（vg-deep-opener）",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n13"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Some benchmarks show a big reduction in memory usage, as much as 37% on the `mlp` benchmark which uses a lot of arrays, while others don't really move.",
+      "note": "37% 明確是記憶體用量降幅、且是「as much as」的上限值；post 用「最多降了 37%」對齊了上限語氣，未升級成全體平均。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c02",
+      "claim_text": "而且沒有一個 benchmark 變慢",
+      "location": "hero opener；並在 benchmark 表格末列與收尾段重複",
+      "type": "superlative",
+      "load": "high",
+      "note_ids": [
+        "n15"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "deflated",
+      "evidence": "every single benchmark is faster, and some are faster by a lot.",
+      "note": "來源說法比 post 更強（全部變快 vs. 沒有一個變慢）；deflated 不是錯誤。另查證來源全文未報告任何 benchmark 變慢（僅 quicksort、sha256_unfixed 有記憶體退步，非速度退步），post 未把記憶體退步誤述為速度退步。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c03",
+      "claim_text": "Plush 原本用一個 16 個 variant 的 Rust tagged enum 表示每一個值",
+      "location": "開場段 + 「16 個 variant，128 個位元」下的 rust 程式碼區塊",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n03"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "enum Value { Undef, Nil, False, True, Int64(i64), Float64(f64), String(*const Str), HostFn(&'static HostFn), Fun(FunId), Closure(*mut Closure), Cell(*mut Value), Object(*mut Object), Array(*mut Array), ByteArray(*mut ByteArray), Dict(*mut Dict), Class(ClassId), }",
+      "note": "重新清點來源 enum 定義，逐一列出恰為 16 個 variant；post 程式碼區塊的 variant 名稱與 payload 型別與來源逐項相符，僅省略來源的行內註解。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c04",
+      "claim_text": "這個 enum 整整 16 bytes（128 bits）寬",
+      "location": "H2「16 個 variant，128 個位元」第三段",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n01"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "This enum is a whole 16 bytes (128 bits) wide.",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c05",
+      "claim_text": "每個 variant 本身只要 64 bit、Rust 自動加的 tag 只要 8 bit，但因為記憶體對齊的限制，Rust 可能就得為每一個值用掉整整 128 bit",
+      "location": "H2「16 個 variant，128 個位元」第三段",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [
+        "n02"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Each enum variant needs only 64 bits, and the enum tag that Rust creates only needs 8 bits, but because of memory alignment constraints, Rust may need to use a whole 128 bits for each value.",
+      "note": "note 記為 hedged（may need），post 用「可能就得」保留了同樣的猶豫語氣，未升級為斷言。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c06",
+      "claim_text": "padding · 56 bit（推算：128 − 64 − 8）",
+      "location": "vg-w-drag-plush-byte-layout SVG 標籤與 readout「padding，alignment 留下的空位（56 bit，不對應任何資料）」",
+      "type": "number",
+      "load": "medium",
+      "note_ids": [
+        "n01",
+        "n02"
+      ],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": "This enum is a whole 16 bytes (128 bits) wide. / Each enum variant needs only 64 bits, and the enum tag that Rust creates only needs 8 bits",
+      "note": "來源從未寫出 56 這個數字；widget 已在標籤內明示「推算：128 − 64 − 8」，屬合法的已標記推斷，且與來源的 128/64/8 三個數字算術一致。readout 文字（56 bit）雖未重複「推算」二字，但同一 widget 的靜態標籤已標示，視為已標記。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c07",
+      "claim_text": "換句話說，128 bit 裡頭，64 bit 給 payload、8 bit 給 discriminant，剩下的 56 bit（約 43.75%——這是從來源給的 128、64、8 三個數字自己換算出來的，不是來源本身寫的數字）完全沒有對應任何資料，純粹是拿來把下一個值墊到對齊邊界上",
+      "location": "H2「16 個 variant，128 個位元」第三段末；並在 vg-w-drag-plush-byte-layout 的 SVG 標籤「padding · 56 bit（推算：128 − 64 − 8）」與 readout「padding，alignment 留下的空位（56 bit，不對應任何資料）」重複",
+      "type": "number",
+      "load": "medium",
+      "note_ids": [
+        "n01",
+        "n02"
+      ],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": "The thing that's most unfortunate though is not the number of enum variants here, it's that this enum is a whole 16 bytes (128 bits) wide. / Each enum variant needs only 64 bits, and the enum tag that Rust creates only needs 8 bits, but because of memory alignment constraints, Rust may need to use a whole 128 bits for each value. / It might seem like no big deal, but if you have a large array of values, that array will end up with a ton of empty, wasted bytes inside of it.",
+      "note": "修正確實落地。「一半的位元」的未標記算術已消失；改成 56 bit，並在同一句括號內明講「這是從來源給的 128、64、8 三個數字自己換算出來的，不是來源本身寫的數字」，屬合法的已標記推斷。重抓來源逐字確認：全文不含數字 56，128/64/8 三個數字則逐字可查，56 = 128 − 64 − 8 算術正確；43.75% = 56/128 亦正確，「約」是弱化不是誇大。widget 與內文現在完全一致（SVG 標籤明寫「推算：128 − 64 − 8」，readout 的 56 bit 與內文同值），已無「widget 主張比內文強」的落差。未引入任何新的未出處事實：「完全沒有對應任何資料／墊到對齊邊界」對應來源的 memory alignment constraints 與 empty, wasted bytes。",
+      "action": "mark-inferred",
+      "resolution": "marked-inferred"
+    },
+    {
+      "id": "c08",
+      "claim_text": "兩個 bit 排得出四種組合，但原文文字只明確指派了兩種：00 給 fixnum、10 給 flonum。immediate 一節只描述了它的 5-bit subtag，沒有在文字裡寫出對應的 2-bit tag 值；兩種指標則是接到 bit index 1 這個角色上描述——這一位標示兩個值能不能只用一條指令直接比較",
+      "location": "H2「把 tag 塞進最低兩個位元」第一段；並在 vg-w-annotated-plush-tagword 的 aria-label、component-1/2（tag 00／tag 10）、component-3（5-bit subtag）、component-4（bit 1 分辨）呼應",
+      "type": "attribution",
+      "load": "high",
+      "note_ids": [
+        "n06",
+        "n07",
+        "n10",
+        "n27",
+        "n30"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "As stated earlier, integer values that fit in the 62-bit fixnum range have their lowest two bits set to 00, and are stored as `n << 2` / For my boxing scheme, I picked a bias value such that the lowest two bits end up being `10`. / The immediates have a 5-bit subtag to indicate what kind of immediate they are. / The easy way to do that is to have one bit in the tag (I chose bit index 1) that tells us that two values can be compared directly using one comparison instruction.",
+      "note": "修正落地且方向正確。重抓來源後再次窮舉：文字層（含 prose、程式碼區塊、常數定義、圖說與 alt text）確實只明文指派 00 給 fixnum、10 給 flonum；immediate 段落只給 5-bit subtag，指標段落只給 bit index 1 的角色，沒有任何一句把 2-bit 值指派給 immediate 或指標。post 的「只明確指派了兩種」與來源逐句相符，原本的 hedge inflation（「三種明確指派」）已消除。widget 與內文一致：component-3 已改為「5-bit subtag」、component-4 改為「bit 1 分辨」，SVG aria-label 亦同步改寫，不再有比內文更強的主張。殘留觀察（不構成 action，供 parent 判斷）：句中括號「完整的四種 tag 對照只畫在文章附的一張圖裡（該圖替代文字僅重複標題「The tagged value representation」）」——alt text 為「The tagged value representation」已抓取確認存在，但該圖內部是否真的畫出完整四種 2-bit 對照，文字抓取無從核實；post 自己已聲明「文字層無法核實」，語氣上未把它當成強事實，故不列為 unverifiable。",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c09",
+      "claim_text": "原文把這個判斷接到一個具體的位元角色上：作者選了 bit index 1，讓這一位標示「這兩個值能不能只用一條指令直接比較」，同一段還提到這條快速路徑同時服務整數、指標、handle，以及 true、false、nil、undef 這幾個 immediate 常數……既然大多數指標走參照相等（可以直接比），字串走結構相等（不能直接比），兩種指標在 bit 1 上邏輯上就不會取同一個值——這是從上面這兩句自己推出來的，原文沒有直接寫出兩種指標各自完整的 2-bit tag",
+      "location": "H2「把 tag 塞進最低兩個位元」第五段；並在 widget component-4「指標 ×2／bit 1 分辨」、row-4「位址（bit 1：能否直接比較）」與虛線「？」tag 框、detail-4「推得，不是原文明講」重複",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [
+        "n11",
+        "n27",
+        "n28"
+      ],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": "The easy way to do that is to have one bit in the tag (I chose bit index 1) that tells us that two values can be compared directly using one comparison instruction. / This allows us to have a fast path to compare integers, pointers, handles and small immediate constants like `true`, `false`, `nil` and `undef` using a single machine comparison instruction. / The reason there are two kinds of pointers in this representation is that I wanted to make equality comparison between values fast. / Most values in Plush are compared using simple reference equality, but I chose to have strings be compared for structural equality to allow the possibility of a string interning table later.",
+      "note": "與來源矛盾的「留給兩種指標型別共用」已完全移除，改寫後不再有任何與來源衝突的陳述。逐項核對：bit index 1 的角色描述與 n27 逐字相符（重抓確認用字為「can be compared directly」，非否定式）；「同時服務整數、指標、handle，以及 true、false、nil、undef」與 n28 的 integers, pointers, handles and small immediate constants like `true`, `false`, `nil` and `undef`逐項對應，未增刪類別；參照相等／結構相等／interning 後路與 n11 相符。結論句「兩種指標在 bit 1 上邏輯上就不會取同一個值」明講「這是從上面這兩句自己推出來的，原文沒有直接寫出」，符合出處四態的已標記推斷。widget 已同步：row-4 的 tag 框改為虛線「？」、detail-4 有獨立的「推得，不是原文明講」段落，widget 不再比內文主張更多。n27、n28 兩則新 note 的 quote 已對重抓文本逐字比對，均確實存在於來源。",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c10",
+      "claim_text": "immediate 底下切出一個 5-bit 的 subtag……這個 subtag 對應的完整 2-bit tag 值，原文文字沒有寫出來，只出現在前面那張圖裡",
+      "location": "H2「把 tag 塞進最低兩個位元」第四段；widget component-3「5-bit subtag」、row-3 虛線 tag 框「？」、detail-3 標題「immediate · 5-bit subtag」與「不知道的事」段落、SVG aria-label",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n10",
+        "n30"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Immediates are values like `nil`, `true`, `false`, `undef`, function and class ids, as well as host functions written in Rust that can be called from Plush. / The immediates have a 5-bit subtag to indicate what kind of immediate they are. / It's 5 bits because an 8-bit comparison on the lowest byte is just one instruction on modern CPUs, which means we can compare the subtag plus the tag bits in one instruction if we need to.",
+      "note": "本輪最關鍵的修正，四個位置全部清乾淨。重抓來源專門詢問字面值 01 是否出現於 prose／程式碼區塊／常數定義／alt text，答覆為明確的「不出現」；另問「有無任何句子指派 tag 位元樣式給 immediate 或指標」，答覆亦為否。對照 post 現況：內文第四段不再出現任何 2-bit 值，並反過來陳述「原文文字沒有寫出來」；component-3 改為「5-bit subtag」；row-3 的 tag 框改為 class tag-unknown 的虛線框、內容為「？」；detail-3 標題改為「immediate · 5-bit subtag」，並新增「不知道的事」段落。SVG aria-label 亦已同步（「immediate 與指標的完整 tag 值僅見於圖片、標示為問號」）。全篇通讀未再發現 01 字樣。n30 的 quote 與來源逐字相符。殘留觀察（本輪 scope 外，不改 verdict，供 parent 決定是否開新 claim）：row-3 中段虛線框標示「未使用」，來源從未說 immediate 的其餘位元未使用，且同一列自己列出的 function id／host function 依常理需要 payload——這是 widget 裡一個未出處且可能自相矛盾的標籤，但它不屬本輪指定重查的 c10 修正範圍，且無法判定是否為本輪新引入。",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c11",
+      "claim_text": "fixnum 的 tag 是 00：一個帶號的 62-bit 整數，「lowest two bits set to 00, and are stored as n << 2」",
+      "location": "H2「把 tag 塞進最低兩個位元」第二段；widget row-1「n（帶號 62-bit 整數，值本身左移兩位）」「n << 2」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n05",
+        "n06"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "As stated earlier, integer values that fit in the 62-bit fixnum range have their lowest two bits set to 00, and are stored as `n << 2` / Fixnums are signed integers that fit in a 62-bit range.",
+      "note": "引號內英文與來源逐字相符；「帶號 62-bit」亦逐字可查。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c12",
+      "claim_text": "一次 64-bit 的加法、減法算完之後，如果結果超出 62 bit 的範圍，那正好也是機器層級判定 64-bit overflow 的同一個條件，可以直接用硬體的 overflow flag 判斷該不該把值 box 到 heap",
+      "location": "H2「把 tag 塞進最低兩個位元」第二段末；widget row-1「overflow 判定直接用 64-bit 溢位旗標」",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [
+        "n04"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "A 64-bit overflow is also exactly the case where the result no longer fits in 62 bits, meaning we can use standard machine instructions to check for overflow.",
+      "note": "來源說的是「standard machine instructions」，post 說「硬體的 overflow flag」——同強度的具體化，未升級因果關係。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c13",
+      "claim_text": "flonum 的 tag 是 10，用的是一套借來的自標記手法：把 IEEE 754 浮點數的高位 bits 做一次 rotation，轉到 tag 該在的位置，再挑一個 bias 值，讓運算後最低兩位自然變成 10",
+      "location": "H2「把 tag 塞進最低兩個位元」第三段；widget row-2、detail-2",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n07",
+        "n08"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The scheme they present does a rotation of the upper bits so they end up in the tag bit position, after adding a bias value such that the lower bits end up being the specific tag that we want. / For my boxing scheme, I picked a bias value such that the lowest two bits end up being `10`.",
+      "note": "「借來的」亦可查：來源說明此法出自 Melançon、Serrano、Feeley 的 Float Self-Tagging 論文。tag 10 是全文明文指派的兩個 tag 之一。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c14",
+      "claim_text": "代價只有 2 bit 的指數精度，mantissa（決定浮點數有效位數的部分）完整保留",
+      "location": "H2「把 tag 塞進最低兩個位元」第三段末；widget row-2「只損失 2 bit 指數精度」",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n09"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "we only lose two bits of exponent, and we keep the full precision of the mantissa",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c15",
+      "claim_text": "底下再切出一個 5-bit 的 subtag，用來分辨 nil、true、false、undef、function id、host function……比對兩個 immediate 是否相等只要一次 8-bit 的整數比較",
+      "location": "H2「把 tag 塞進最低兩個位元」第四段；widget row-3、detail-3「一次 8-bit 整數比較就夠」",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n10"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Immediates are values like `nil`, `true`, `false`, `undef`, function and class ids, as well as host functions written in Rust that can be called from Plush. ... The immediates have a 5-bit subtag to indicate what kind of immediate they are. It's 5 bits because an 8-bit comparison on the lowest byte is just one instruction on modern CPUs, which means we can compare the subtag plus the tag bits in one instruction if we need to.",
+      "note": "5-bit subtag 與六種 immediate 種類、8-bit 比較都在來源逐字可查（來源另列 class ids，post 未列，屬省略非新增）。惟 n10 的 quote 只截到 subtag 那一句，未涵蓋 8-bit 比較的下一句——這是 ledger 的 quote 覆蓋不足，而非 post 的事實問題；建議補一則 note。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c16",
+      "claim_text": "剩下的指標型別分成兩種，動機是讓相等比較快：大多數值用最便宜的參照相等（比位址），但字串被刻意設計成結構相等（比內容），為未來可能加上的字串 interning table 留一條後路",
+      "location": "H2「把 tag 塞進最低兩個位元」第五段；widget row-4、detail-4",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [
+        "n11"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The reason there are two kinds of pointers in this representation is that I wanted to make equality comparison between values fast. ... Most values in Plush are compared using simple reference equality, but I chose to have strings be compared for structural equality to allow the possibility of a string interning table later.",
+      "note": "「留一條後路」對應來源的 possibility ... later，強度相符（未說成已經實作 interning）。注意此句驗證的是比較語意，不含 tag 值——tag 值部分見 c09、c10。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c17",
+      "claim_text": "發現舊版「it's spread over four disjoint basic blocks」——邏輯上是同一條加法，機器碼卻被拆成四個不連續的區塊",
+      "location": "H2「從四個 basic block 到一條直線」第一段",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n19"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Looking at the disassembly for the `Int64 + Int64` fast path, it's spread over four disjoint basic blocks.",
+      "note": "已確認這段觀察確實是針對舊版、且是 Int64 + Int64 路徑（緊接其後為 The code is fairly massive, and it has a bunch of spills...）。post 在後段特別區分整數路徑與浮點路徑，與來源一致。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c18",
+      "claim_text": "「I suspect that the code the Rust compiler generates for this is maybe not very efficient」",
+      "location": "H2「從四個 basic block 到一條直線」第一段",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n22"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "I suspect that the code the Rust compiler generates for this is maybe not very efficient.",
+      "note": "note 記為 hedged；post 明白把它當成「懷疑／猜測的語氣」處理，未當作結論引用，強度相符。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c19",
+      "claim_text": "instructions 52→36；memory ops 24→9；branches taken 4→1；新版是「straight-line code with exactly one branch at the end」",
+      "location": "vg-w-table-plush-codegen 表格與 figcaption",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n20"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Despite that, the new float fast path is straight-line code with exactly one branch at the end, and it actually ends up shorter than the old version. We went from 52 instructions, 24 memory ops and 4 branches taken to 36 instructions, 9 memory ops and 1 branch taken.",
+      "note": "六個數字逐一比對無誤，方向（舊→新）亦正確。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c20",
+      "claim_text": "值得留意的是，這張表講的是浮點路徑，不是整數路徑——四個不連續 basic block 那個問題出在 Int64 + Int64",
+      "location": "H2「從四個 basic block 到一條直線」第四段；表頭「Float64 + Float64 快速路徑」",
+      "type": "attribution",
+      "load": "high",
+      "note_ids": [
+        "n19",
+        "n20"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "I'm not going to show the whole floating-point fast path disassembly here because it's even longer... / Despite that, the new float fast path is straight-line code with exactly one branch at the end / Looking at the disassembly for the `Int64 + Int64` fast path, it's spread over four disjoint basic blocks.",
+      "note": "這是最容易被寫錯的歸屬。重抓來源確認 52/24/4 → 36/9/1 的前文確實在講 floating-point fast path，四個 basic block 則屬 Int64 + Int64；post 的區分與來源相符，表頭標示亦正確。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c21",
+      "claim_text": "「values now fit in a single register」，不再需要「spilling values to the native C/Rust stack immediately after popping them from the interpreter stack」",
+      "location": "H2「從四個 basic block 到一條直線」第二段",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n21"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The real win is that values now fit in a single register. The generated code is a lot more efficient as a result. We're not spilling values to the native C/Rust stack immediately after popping them from the interpreter stack.",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c22",
+      "claim_text": "新版把熱路徑寫在 if 的第一個分支——原文的說法是「we're explicitly testing for the likely hot path first in an if statement」，讓最常見的情況（兩個值都是同一種 tag）優先接受測試",
+      "location": "H2「從四個 basic block 到一條直線」第二段開頭；收尾段「把熱路徑寫在分支的第一格」呼應",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [
+        "n29"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "In contrast, the way the code is formatted now, we're explicitly testing for the likely hot path first in an `if` statement.",
+      "note": "追溯失敗已修復：c22 現在綁到新增的 n29，該 note 的 quote 經重抓逐字比對確實存在於來源，且 post 直接把英文原句放進引號內、字字相符（含 an `if` statement 的冠詞與措辭）。措辭亦已對齊：原本「不用經過任何跳轉就能算完」這個比來源強的說法已刪除，改為「優先接受測試」，正好對應來源的 testing ... first，不再暗示零跳轉。括號內「（兩個值都是同一種 tag）」未見於這句來源，但與來源自己界定的兩條 fast path（`Int64 + Int64` 與 float fast path，皆為同型別配對）一致，屬同強度的補述而非新事實。收尾段的重述同樣只說「寫在分支的第一格」，未回退到強版本。",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c23",
+      "claim_text": "「every single benchmark is faster, and some are faster by a lot」——沒有保留、沒有但書，是一個乾脆的結論",
+      "location": "H2「benchmark 全面加速」第一段",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n15"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "every single benchmark is faster, and some are faster by a lot.",
+      "note": "來源該句本身確為無保留的斷言（asserted），post 對「乾脆」的形容未超出原句強度。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c24",
+      "claim_text": "記憶體降幅最大的是 mlp——「a naively implemented multilayer neural network, with a lot of floating-point operations」，本身也是陣列用量很重的 benchmark，換成 tagged word 後記憶體用量最多降了 37%",
+      "location": "H2「benchmark 全面加速」第一段；benchmark 表格 mlp 列",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n13",
+        "n23"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Some benchmarks show a big reduction in memory usage, as much as 37% on the `mlp` benchmark which uses a lot of arrays, while others don't really move. / The `mlp` benchmark is a naively implemented multilayer neural network, with a lot of floating-point operations.",
+      "note": "「降幅最大」對應來源的 as much as（該句把 mlp 舉為上限案例），未過度推廣。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c25",
+      "claim_text": "速度增益最大的兩個 benchmark 是 binary_tree 與 linked_list",
+      "location": "H2「benchmark 全面加速」第二段；benchmark 表格",
+      "type": "superlative",
+      "load": "high",
+      "note_ids": [
+        "n14"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The biggest performance gains are in the `binary_tree` and `linked_list` benchmarks.",
+      "note": "post 未替這兩個 benchmark 編造百分比，與 note 記載「來源沒有給出精確百分比」一致；表格對應欄位填「增益最大」而非數字。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c26",
+      "claim_text": "這是另一個「floating-point heavy」的 benchmark，但作者也提到「fib and nbody...don't touch a lot of memory at all」",
+      "location": "H2「benchmark 全面加速」第二段；表格 nbody 列",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n24",
+        "n25"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The `nbody` benchmark is also floating-point heavy. / However, there are other benchmarks like `fib` and `nbody` which don't touch a lot of memory at all.",
+      "note": "引號內以刪節號銜接兩處，被引文字逐字相符，未改變語意。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c27",
+      "claim_text": "作者選 62-bit 而不是隨便一個數字，是因為「for reference 2^64 ~= 1.84 * 10^19」，這個範圍大到多數程式根本用不到",
+      "location": "H2「62-bit 的邊界」第一段",
+      "type": "number",
+      "load": "medium",
+      "note_ids": [
+        "n12"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "you can also borrow the two lowest bits of integer values, with the assumption that integer values will very rarely need to use the full 64-bit range, because for reference `2^64 ~= 1.84 * 10^19`",
+      "note": "來源用 assumption / very rarely，post 用「多數程式根本用不到」，屬同強度的常識化改寫，未把假設說成量測結果。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c28",
+      "claim_text": "「code that does left shifts, or relies on overflows for things like generating random numbers, can run into that」",
+      "location": "H2「62-bit 的邊界」第一段末；收尾段重述",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n18"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "In particular, code that does left shifts, or relies on overflows for things like generating random numbers, can run into that.",
+      "note": "post 譯文用「都可能一腳踩過這條邊界」，與來源 can run into 的可能性語氣相符。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c29",
+      "claim_text": "實測「allocating a total of 3,149,052 boxed integer values in a span of about 490 ms」——不到半秒鐘配置了三百多萬個 boxed 整數",
+      "location": "H2「62-bit 的邊界」第二段",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n26"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "That being said, `sha256_unfixed` is still running 12% faster with the new value representation than with the old version, even though it's allocating a total of 3,149,052 boxed integer values in a span of about 490 ms.",
+      "note": "數字與單位逐字相符，主語確為 sha256_unfixed。「不到半秒」對應 about 490 ms，「三百多萬」對應 3,149,052，皆為忠實換算。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c30",
+      "claim_text": "作者發現「the computation can easily be rearranged to avoid this」，改法只要一行，記憶體就「brings memory usage back all the way down to the minimum heap size」",
+      "location": "H2「62-bit 的邊界」第二段；表格 sha256_unfixed 列「一行修正後回到最小堆」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n17"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "It turns out that the computation can easily be rearranged to avoid this. It's a one-line fix, and brings memory usage back all the way down to the minimum heap size.",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c31",
+      "claim_text": "即使是沒改、仍在踩坑的 sha256_unfixed，換成新表示法之後也還是比舊版整體快 12%",
+      "location": "H2「62-bit 的邊界」第二段末；表格 sha256_unfixed 列「仍比舊版快 12%」",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n16"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "the updated `sha256_fixed` benchmark is faster than `sha256_unfixed`. That being said, `sha256_unfixed` is still running 12% faster with the new value representation than with the old version",
+      "note": "12% 的比較基準（新表示法下的 sha256_unfixed vs. 舊版）在 post 中被正確保留，未被誤植為修正後版本的增益。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c32",
+      "claim_text": "新：tagged word（8 bytes / 64 bit）；payload · 62 bit；tag · 2 bit",
+      "location": "vg-w-drag-plush-byte-layout SVG 下半部標籤",
+      "type": "number",
+      "load": "medium",
+      "note_ids": [
+        "n05",
+        "n06"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "integer values that fit in the 62-bit fixnum range have their lowest two bits set to 00, and are stored as `n << 2` / Fixnums are signed integers that fit in a 62-bit range",
+      "note": "62 + 2 = 64 與來源的 62-bit fixnum 範圍、最低兩位當 tag 一致。嚴格說 62/2 的切法是 fixnum 的情形（flonum 的 payload 另有 rotate 過的指數欄位），widget 以 fixnum 為代表版面，未逾越來源。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c33",
+      "claim_text": "fixnum 只有 62-bit 的空間，超過這個範圍的整數會被 box 成一個指向 heap 的物件",
+      "location": "H2「62-bit 的邊界」第一段；range widget 的 verdict 文字「超過 62-bit：得 box 成一個指向 heap 的物件」",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [
+        "n05",
+        "n18",
+        "n26"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Fixnums are signed integers that fit in a 62-bit range / In particular, code that does left shifts, or relies on overflows for things like generating random numbers, can run into that. / even though it's allocating a total of 3,149,052 boxed integer values in a span of about 490 ms",
+      "note": "來源以 sha256_unfixed 的 boxed integer values 配置量直接證實超出範圍即 box 到 heap；widget 的邊界值（62）與來源一致。",
+      "action": "none",
+      "resolution": "none-needed"
+    }
+  ],
+  "checked_at": "2026-09-09",
+  "checker_rounds": 2,
+  "coverage": {
+    "candidate_claims": 41,
+    "checked": 33,
+    "dropped_low_load": 8
+  }
+}
