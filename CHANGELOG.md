@@ -26,6 +26,22 @@ is cut. Until then, every merged PR shows up under `Unreleased`.
   unresolved conversations block merge.
 - `prismjs` promoted from transitive to direct dependency (it's imported
   by `eleventy.config.js`).
+- `skills/daily-news/scripts/weekly-window.mjs` — resolves which ISO week
+  a weekly rollup covers (plus `week_number` for the title), so the
+  window is never re-derived by hand at author time. Covered by
+  `tests/weekly-window.test.mjs`.
+
+### Changed
+
+- Weekly rollups now cover the ISO week that just ended (Mon–Sun)
+  instead of a rolling Tue–Mon window anchored on the publication day.
+  The old window dropped the covered week's Monday, pulled in the
+  publication day's own posts, and made the post's `第 W 週` title
+  disagree by one with the archive label the site derives from
+  `range.start`.
+- Weekly rollup skip threshold relaxed from ≤2 to ≤1 roundup in the
+  covered week, so a 3-posts-per-week cadence keeps a day of slack
+  instead of sitting exactly on the gate.
 
 ## 2026-05-18 — competitor borrowings (PR #6)
 

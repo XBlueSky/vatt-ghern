@@ -2,12 +2,14 @@
 
 A synthesised look-back across one week's roundups and deep-stories.
 Not a new reporting pass — purely a re-reading of what's already in
-`src/posts/YYYY/MM/DD/` for the previous 7 days.
+`src/posts/YYYY/MM/DD/` for the ISO week (Mon–Sun) that just ended.
 
 ## When this archetype runs
 
 Monday morning, via `/vatt-ghern:weekly` slash command (or the Claude
-routine). The skill executes a variant of the daily workflow:
+routine). The rollup covers the ISO week that just *ended* — Monday
+through Sunday, never a rolling window anchored on the publication day.
+The skill executes a variant of the daily workflow:
 
 - **Skip** Step 2 (fetch sources): no external candidates needed.
 - **Skip** Step 3 (score/filter), Step 4 (pick), Step 5 (deep-story
@@ -18,10 +20,22 @@ routine). The skill executes a variant of the daily workflow:
 
 ## Input
 
-The skill calls:
+The skill first resolves the covered week:
 
 ```bash
-node ${CLAUDE_PLUGIN_ROOT}/skills/daily-news/scripts/load-past-roundups.mjs --days=7
+node ${CLAUDE_PLUGIN_ROOT}/skills/daily-news/scripts/weekly-window.mjs
+```
+
+Returns `{today, publish_date, week_key, week_number, start, end,
+title_prefix}` — `start` is the covered week's Monday, `end` its Sunday.
+A mid-week catch-up run still resolves to the last *complete* week.
+Pass `--week=YYYY-Www` to backfill an older week.
+
+Then loads that week's posts — `--end` is the Sunday, so the window is
+the ISO week itself:
+
+```bash
+node ${CLAUDE_PLUGIN_ROOT}/skills/daily-news/scripts/load-past-roundups.mjs --days=7 --end=<end>
 ```
 
 The returned JSON has:
@@ -45,7 +59,11 @@ The rollup is a deep-story-style essay, so the universal contract from
 
 ## Title shape
 
-`第 W 週 ——〈主題短句〉` where W is the ISO week number. Example:
+`第 W 週 ——〈主題短句〉` where W is `week_number` from
+`weekly-window.mjs` — the week being *summarised*, not the week the post
+is published in (a Monday post about last week is 第 34 週, not 第 35 週).
+It must match the `第 W 週` label the archive prints for that week's
+section, which `eleventy.config.js` derives from `range.start`. Example:
 `第 20 週 —— LLM 排程的疲態`. Title is ≤ 28 chars including spaces.
 
 ## H2 sequence
@@ -73,10 +91,12 @@ Closer (free phrasing — any label that signals "this is the wrap").
 Before writing the H2, call the weekly-delta module:
 
 ```bash
-node skills/daily-news/scripts/decisions/weekly-delta.mjs --end=YYYY-MM-DD > delta.json
+node skills/daily-news/scripts/decisions/weekly-delta.mjs --end=<end> > delta.json
 ```
 
-`end` is the Monday of the rollup week. The module reads 14 days of
+`end` is the covered week's Sunday — the same `end` passed to
+`load-past-roundups.mjs`, so "this week" is the week the rollup is
+about. The module reads 14 days of
 sidecars via `load-past-roundups.mjs --days=14` internally, splits into
 this-week (days 1-7) and last-week (days 8-14), and emits:
 
@@ -140,17 +160,21 @@ opinion. The bard's hand is more visible here than in daily-roundups.
 ## Sidecar
 
 Path: `src/posts/YYYY/MM/DD/weekly.html` + `.11tydata.json`
-(YYYY-MM-DD is the Monday the rollup is published).
+(YYYY-MM-DD is the Monday the rollup is published — the day *after* the
+week it covers).
 
 Required fields:
 
 - `title` — see Title shape above
-- `date` — YYYY-MM-DD (Monday)
+- `date` — YYYY-MM-DD, the publication Monday (`publish_date`)
 - `archetype` — `"weekly-rollup"`
 - `summary` — 1 sentence framing the week
 - `tags` — union of underlying posts' tags, deduplicated, ≤ 12 items
 - `topics` — same
-- `range` — `{start, end}` from `load-past-roundups.mjs`
+- `range` — `{start, end}` from `weekly-window.mjs`: the covered ISO
+  week's Monday and Sunday. The archive buckets the rollup onto its week
+  by `isoWeekKey(range.start)`, so this field, not `date`, decides where
+  the post lands
 - `referenced_posts[]` — list of `/YYYY/MM/DD/<slug>/` URLs for every
   daily post the rollup cites. Required for backlinking.
 
@@ -166,6 +190,8 @@ and skips the dedup check; if it doesn't yet, set
 
 ## Frequency
 
-One per week. If a week was sparse (≤2 roundups across 7 days), skip
-the rollup that week — say so in the PR body's "weekly skipped"
-section.
+One per week. If a week was sparse (≤1 roundup across the ISO week),
+skip the rollup that week — say so in the PR body's "weekly skipped"
+section. A 3-roundup week is a normal week, not a degraded one: the
+theme H2 leans on fewer deep-stories, and 沒被合稱的個別亮點 draws from
+roundup items rather than deep-stories, but every H2 still carries.

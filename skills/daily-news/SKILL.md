@@ -20,10 +20,12 @@ Three invocation paths converge here:
   `${CLAUDE_PLUGIN_ROOT}/commands/daily-news.md`). Executes the full
   9-step workflow below.
 - **Weekly rollup** — `/vatt-ghern:weekly` (Monday morning). Skips
-  Steps 2–6; reads past 7 days via
-  `scripts/load-past-roundups.mjs --days=7`; computes week-over-week
-  delta via `scripts/decisions/weekly-delta.mjs --end=YYYY-MM-DD`;
-  authors one `weekly.html` using the `weekly-rollup` archetype.
+  Steps 2–6; resolves the covered ISO week (Mon–Sun, the one that just
+  ended) via `scripts/weekly-window.mjs`; reads it via
+  `scripts/load-past-roundups.mjs --days=7 --end=<Sunday>`; computes
+  week-over-week delta via
+  `scripts/decisions/weekly-delta.mjs --end=<Sunday>`; authors one
+  `weekly.html` using the `weekly-rollup` archetype.
 - **Monthly rollup** — `/vatt-ghern:monthly` (first of month). Same
   pattern as weekly but `--days=<28..31>` and `monthly-rollup` archetype.
 - **Routine fallback**: Claude Routines invoking the repo may load this
