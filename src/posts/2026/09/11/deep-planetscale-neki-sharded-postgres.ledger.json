@@ -1,0 +1,1123 @@
+{
+  "output_path": "src/posts/2026/09/11/deep-planetscale-neki-sharded-postgres.html",
+  "spine": [
+    "1. Neki 是 PlanetScale 的 sharded Postgres 平台，2026-09-10 進入 platform preview，核心設計原則是「stick to Postgres, don't work around it, fake it, or turn away from it」——每個 shard 都是貨真價實的 Postgres，沒有自訂儲存引擎。",
+    "2. 應用程式連到 Neki Router，Router 講標準 Postgres wire protocol（現有 driver/ORM 不用改），內部解析查詢、規劃哪些 shard 該跑、分派工作、把結果合併成一條串流，可垂直、水平擴充避免自己變瓶頸。",
+    "3. 每個 shard 是一個完整的 Postgres cluster：1 個 primary、至少 2 個 replica，橫跨 3 個可用區；shard group 把不同 table／workload 分配到不同的 shard 集合，shard index 定義路由欄位與 hash 方式，可先 unsharded 起步再決定要不要切。",
+    "4. connection pooling 交給跑在每個 Postgres instance 旁的 sidecar，因為同時控制 router 端與 Postgres 端的連線，pool 大小是量出來的而不是外部猜測，官方明講比擺一個 PgBouncer 有意義地更好。",
+    "5. control plane 負責節點健康檢查、switchover/failover，以及 reshard（provision new target nodes → catch up with replication → 用 __neki metafunction switch traffic → retire the old nodes）、schema 變更、版本升級這些工作流；data topology 是一份 JSON，把邏輯 table 映射到實體 shard。",
+    "6. 跟同公司過去八年經營的 sharded MySQL（合理推測即 Vitess，VTGate/VTTablet 架構）放一起看，角色大致對得上但 Neki 把 pooling 和 control plane 切得更細；跟「Postgres-compatible」的分散式資料庫相比，PlanetScale 自己的說法是那類產品會 hide the shard key、拿掉 extension、增加難處理的 complexity 與 latency。",
+    "7. 目前是 platform preview，PlanetScale 官方明講不要在 preview 期間跑 production workload，因為產品還在變、部分變動會是 breaking change。"
+  ],
+  "sources": [
+    {
+      "url": "https://planetscale.com/blog/introducing-neki",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": "2026-09-10",
+      "perspective": {
+        "mechanism": "Neki 用 router + 真 Postgres shard + 雙端控制的 pooling sidecar + control plane 這幾塊，把單一 Postgres 撐不住的規模橫向切開，同時盡量不繞開 Postgres 本身的行為，沒有自訂儲存引擎。",
+        "tradeoff": "換來『shard 還是真 Postgres』的代價，是仍需要處理 shard key、跨 shard 查詢這類分散式資料庫的固有問題；而且現在還在 platform preview，官方明講不能保證不出現 breaking change。",
+        "reader_use": "台灣工程師如果手上的 Postgres 已經被 vacuum、備份時間、連線數這些問題卡住，可以照 blog 給的路徑——sign in、opt in platform preview、建一個 Neki cluster——先在非 production 環境試路由行為跟 shard index 設計，但不要現在就把 production workload 搬過去。"
+      }
+    },
+    {
+      "url": "https://vitess.io/docs/overview/whatisvitess/",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": null,
+      "perspective": {
+        "mechanism": "Vitess 用 VTGate 當 MySQL protocol 的 proxy/router，VTTablet 跟著每個 MySQL instance 管查詢、連線、replication，topology service 記叢集狀態——這是 PlanetScale 過去在 MySQL 世界跑了很久的路線，跟 Neki 的分工方式可以直接對照。",
+        "tradeoff": "Vitess 的 router 跟 per-instance agent 是分開的兩層，跟 Neki 把 pooling 獨立成 sidecar、又另外設一個 control plane 的切法不完全一樣，複雜度分佈的位置不同。",
+        "reader_use": "拿 Vitess 的 VTGate/VTTablet 當參照，可以更快看懂 Neki 的 router/sidecar/control plane 三層各自對應到哪個熟悉的角色，判斷要不要在 Postgres 上冒險用一個更年輕的同款設計。"
+      }
+    },
+    {
+      "url": "https://planetscale.com/docs/neki",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": null,
+      "perspective": {
+        "mechanism": "文件再次確認 router 是一個 proxy，擋在 client 跟 Postgres node 之間，把 sharding、zero-downtime operations、online DDL、replication workflow 這些能力都包在同一條 connection string 後面，全部用真 Postgres 做到。",
+        "tradeoff": "文件說可以先從 unsharded cluster 開始，之後再依流量與存取模式決定要不要切 shard——這代表『要不要上分散式』被拉成一個可以延後的決定，而不是建表當下就要押注，但也代表評估者一開始拿不到完整的分片成本資訊。",
+        "reader_use": "評估 Neki 的人可以先用 unsharded cluster 跑起來，把 shard index／shard group 的設計留到真的看到瓶頸之後再做，降低一開始就要想清楚整套分片方案的門檻。"
+      }
+    }
+  ],
+  "notes": [
+    {
+      "id": "n01",
+      "url": "https://planetscale.com/blog/introducing-neki",
+      "quote": "You already know the problems that come with fast-growing Postgres databases: tables too large to vacuum or index without affecting traffic, backups taking hours, connection limits, maintenance windows for schema changes, transaction wraparound and so much more.",
+      "hedge": "asserted",
+      "interpretation": "用來說明為什麼要 shard——單一 Postgres 養大之後的常見症頭，是全文的問題陳述，後段的 control plane 內建 workflow 直接呼應這裡的『維護窗口』一項。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n02",
+      "url": "https://planetscale.com/blog/introducing-neki",
+      "quote": "stick to Postgres, don't work around it, fake it, or turn away from it",
+      "hedge": "asserted",
+      "interpretation": "Neki 的核心設計原則，直接引用當 opener 與 closer 的論點骨幹。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n03",
+      "url": "https://planetscale.com/blog/introducing-neki",
+      "quote": "no custom storage engine",
+      "hedge": "asserted",
+      "interpretation": "「真 Postgres」具體指的是沒有換掉儲存引擎。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n04",
+      "url": "https://planetscale.com/blog/introducing-neki",
+      "quote": "extensions, SQL support, and performance behave the way Postgres does",
+      "hedge": "asserted",
+      "interpretation": "因為沒換引擎，所以 extension、SQL、效能行為都跟原生 Postgres 一致，延伸推論維運工具（監控、巡檢腳本）理論上也照舊能用。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n05",
+      "url": "https://planetscale.com/blog/introducing-neki",
+      "quote": "Your application first connects to a Neki router. The router speaks the Postgres wire protocol so your existing drivers and ORMs keep working with a single connection string.",
+      "hedge": "asserted",
+      "interpretation": "router 是 client 端第一個碰到的東西，且完全相容既有 driver/ORM。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n06",
+      "url": "https://planetscale.com/blog/introducing-neki",
+      "quote": "a full Postgres query parser, a distributed query planner, query buffering and more",
+      "hedge": "asserted",
+      "interpretation": "router 內部具體有哪些模組；n31 進一步展開「and more」實際包含結果合併。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n07",
+      "url": "https://planetscale.com/blog/introducing-neki",
+      "quote": "Routers can scale vertically and horizontally, so no single router becomes the bottleneck.",
+      "hedge": "asserted",
+      "interpretation": "router 本身可以橫向擴充，不會變成單點瓶頸；router 無資料狀態，跟 shard 擴充是兩條不同的成本曲線。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n08",
+      "url": "https://planetscale.com/blog/introducing-neki",
+      "quote": "Each shard is a full Postgres cluster with one primary and at least two replicas across 3 availability zones.",
+      "hedge": "asserted",
+      "interpretation": "明確的 shard HA 拓樸數字：1 primary + 至少 2 replica + 3 個可用區。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n09",
+      "url": "https://planetscale.com/blog/introducing-neki",
+      "quote": "Shards are organized into shard groups, so different tables or workloads can live on different sets of shards.",
+      "hedge": "asserted",
+      "interpretation": "shard group 的作用是把不同 table/workload 分配到不同 shard 集合。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n10",
+      "url": "https://planetscale.com/blog/introducing-neki",
+      "quote": "You define shard indexes, which specify the column Neki routes on and how that value gets hashed, and shard groups, which control how many shards a set of tables spreads across and which shards those are.",
+      "hedge": "asserted",
+      "interpretation": "shard index 定義路由欄位與 hash 方式；shard group 定義 shard 數量與範圍——兩者是不同的設定物件，彼此獨立調整。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n11",
+      "url": "https://planetscale.com/blog/introducing-neki",
+      "quote": "Sidecars run alongside every Postgres instance. This is the piece that makes Neki's connection handling meaningfully better than just sticking PgBouncer in front of a database.",
+      "hedge": "asserted",
+      "interpretation": "sidecar 跟每個 Postgres instance 一起跑，PlanetScale 自己拿它跟「在資料庫前擺一個 PgBouncer」比較。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n12",
+      "url": "https://planetscale.com/blog/introducing-neki",
+      "quote": "Because Neki controls both ends of the connection, the router side and the Postgres side, it can size pools to what each instance can actually serve instead of estimating from outside the process.",
+      "hedge": "asserted",
+      "interpretation": "因為同時控制兩端，pool 大小是量出來的而不是外部估的；外部 pooler 猜測的根本原因是它站在另一個 process，結構上看不到 Postgres 側的真實餘裕。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n13",
+      "url": "https://planetscale.com/blog/introducing-neki",
+      "quote": "The control plane tracks the health of every node, runs planned switchovers and unplanned failovers, and coordinates the workflows that reshard data, apply schema changes, and perform version upgrades.",
+      "hedge": "asserted",
+      "interpretation": "control plane 的完整職責清單；switchover（計劃內）與 failover（計劃外）並列同一句，代表兩者走同一條處理路徑。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n14",
+      "url": "https://planetscale.com/blog/introducing-neki",
+      "quote": "Tying it together is the data topology, a JSON configuration that maps your logical tables onto physical shards.",
+      "hedge": "asserted",
+      "interpretation": "data topology 是一份 JSON，把邏輯 table 對應到實體 shard。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n15",
+      "url": "https://planetscale.com/blog/introducing-neki",
+      "quote": "Postgres-\"compatible\" distributed databases hide the shard key from you, take away your extensions, and add complexity and latency which becomes difficult to handle and debug.",
+      "hedge": "asserted",
+      "interpretation": "PlanetScale 對「相容 Postgres」路線的批評，是比較段落的核心引用，屬於廠商自己的立場而非中立評測。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n16",
+      "url": "https://planetscale.com/blog/introducing-neki",
+      "quote": "Neki is built from lessons we've learned over eight years of running some of the largest sharded MySQL clusters in the world.",
+      "hedge": "asserted",
+      "interpretation": "設計養分來自 PlanetScale 過去八年的 sharded MySQL 經驗；文章沒有點名 Vitess，文中對 Vitess 的連結標記為推斷。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n17",
+      "url": "https://planetscale.com/blog/introducing-neki",
+      "quote": "Thousands of production workloads with millions of queries per second for companies where even a few seconds of downtime is a very public event.",
+      "hedge": "asserted",
+      "interpretation": "這句描述的是 PlanetScale 既有 MySQL/Vitess 艦隊的規模，不是 Neki 本身（Neki 才剛進 preview），引用時需標清楚對象。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n18",
+      "url": "https://planetscale.com/blog/introducing-neki",
+      "quote": "Sign in to PlanetScale, opt in to the platform preview, and create a Neki cluster.",
+      "hedge": "asserted",
+      "interpretation": "讀者要試用 Neki 的具體步驟。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n19",
+      "url": "https://planetscale.com/blog/introducing-neki",
+      "quote": "not run production workloads on Neki during the platform preview",
+      "hedge": "asserted",
+      "interpretation": "官方明講 preview 階段不要拿去扛 production；此範圍也涵蓋 control plane 執行的 reshard、failover 等工作流，不只一般查詢路徑。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n20",
+      "url": "https://planetscale.com/blog/introducing-neki",
+      "quote": "the product is still changing, and some of those changes will be breaking",
+      "hedge": "asserted",
+      "interpretation": "解釋為什麼不建議正式上線用——之後會有 breaking change。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n21",
+      "url": "https://planetscale.com/blog/introducing-neki",
+      "quote": "Publish date: September 10, 2026",
+      "hedge": "asserted",
+      "interpretation": "頁面 metadata 確認的發布日期，對應 news_id 給的日期。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n22",
+      "url": "https://planetscale.com/blog/introducing-neki",
+      "quote": "When we released PlanetScale Postgres a year and a half ago, we knew we needed to do more.",
+      "hedge": "asserted",
+      "interpretation": "Neki 是 PlanetScale 先前「PlanetScale Postgres」產品之後的下一步，不是憑空冒出來的新品線。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n23",
+      "url": "https://vitess.io/docs/overview/whatisvitess/",
+      "quote": "an open-source database clustering system for horizontal scaling of MySQL. It distributes data across multiple MySQL instances through sharding while presenting a unified database interface to your application.",
+      "hedge": "asserted",
+      "interpretation": "Vitess 官方對自己的定義，拿來跟 Neki 的定位做比較。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n24",
+      "url": "https://vitess.io/docs/overview/whatisvitess/",
+      "quote": "A proxy that accepts MySQL protocol connections from your application and routes queries to the appropriate shards.",
+      "hedge": "asserted",
+      "interpretation": "VTGate 對應 Neki Router 的角色。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n25",
+      "url": "https://vitess.io/docs/overview/whatisvitess/",
+      "quote": "An agent running alongside each MySQL instance that manages queries, connections, and replication.",
+      "hedge": "asserted",
+      "interpretation": "VTTablet 是跟著每個 MySQL instance 跑的 agent，職責涵蓋查詢/連線/replication，是 Neki sidecar 加部分 control plane 職責的混合對照對象。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n26",
+      "url": "https://vitess.io/docs/overview/whatisvitess/",
+      "quote": "Vitess served all YouTube database traffic for over five years.",
+      "hedge": "asserted",
+      "interpretation": "Vitess 有超過五年扛 YouTube 全站流量的實績，用來對比 Neki 目前只是 preview。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n27",
+      "url": "https://vitess.io/docs/overview/whatisvitess/",
+      "quote": "Vitess supports a variety of sharding schemes. It can also migrate tables into different databases and scale the number of shards up or down.",
+      "hedge": "asserted",
+      "interpretation": "Vitess 也有 resharding 能力，跟 Neki control plane 的 reshard workflow 對應。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n28",
+      "url": "https://planetscale.com/docs/neki",
+      "quote": "It accomplishes this by placing a sophisticated proxy (router) between clients and the Postgres nodes.",
+      "hedge": "asserted",
+      "interpretation": "文件再次確認 router 是擋在 client 跟 Postgres node 之間的 proxy，與 blog 描述一致。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n29",
+      "url": "https://planetscale.com/docs/neki",
+      "quote": "sharding, zero-downtime operations, online DDL, replication workflows, and sophisticated cluster management capabilities, all using real Postgres",
+      "hedge": "asserted",
+      "interpretation": "文件列出的能力清單，補充 blog 沒細講的 online DDL / zero-downtime operations，且每一項都強調用真 Postgres 做到。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n30",
+      "url": "https://planetscale.com/docs/neki",
+      "quote": "an unsharded cluster",
+      "hedge": "asserted",
+      "interpretation": "可以先從 unsharded cluster 開始，之後再依 traffic、access patterns、data 決定要不要切 shard——部署彈性，分片可以是延後的決定，可跟 shard_index/shard_group 兩顆獨立旋鈕的敘事合起來看成「兩個時間點分別決定」。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n31",
+      "url": "https://planetscale.com/blog/introducing-neki",
+      "quote": "It parses your query, builds a plan that decides which shards should run it, sends the work out, and combines the results back into one stream.",
+      "hedge": "asserted",
+      "interpretation": "完整描述 router 的四步驟流程：解析、規劃、分派、合併結果——具體展開先前引用的「query parser/planner/buffering」，說明「buffering and more」的「more」實際是結果合併。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n32",
+      "url": "https://planetscale.com/blog/introducing-neki",
+      "quote": "a workflow you run against the cluster you already have ... Workflows provision new target nodes, catch them up with replication, switch traffic with a `__neki` metafunction, and retire the old nodes.",
+      "hedge": "asserted",
+      "interpretation": "reshard workflow 的具體四步驟：準備新節點、用 replication 追上、用 __neki metafunction 切流量、退役舊節點——是 control plane「協調 reshard」這句話的具體展開，用於 range-input-binding widget 的四個階段。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n33",
+      "url": "https://planetscale.com/blog/introducing-neki",
+      "quote": "Everything you would normally schedule a maintenance window for runs as a built-in workflow in Neki ... schema changes, version upgrades, planned and unplanned failovers, imports, and resharding",
+      "hedge": "asserted",
+      "interpretation": "把原本需要維護窗口的操作（呼應開頭 n01 的痛點：改 schema 得留維護窗口）都變成內建 workflow，直接對應「改 schema 得留維護窗口」這個問題。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n34",
+      "url": "https://planetscale.com/blog/introducing-neki",
+      "quote": "Each shard uses a configuration profile that defines its instance size, replica count, storage, Postgres parameters, and extensions, so you can size each group for its own traffic.",
+      "hedge": "asserted",
+      "interpretation": "直接反駁了一個原先誤植的『文章沒有說是否所有 shard 用一樣複製數』的沉默宣稱——這句話明講不同 shard group 可以各自配置不同的 replica count 等參數，是同一段落緊接在『at least two replicas / 3 AZ』之後的句子。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n35",
+      "url": "https://planetscale.com/docs/neki",
+      "quote": "Neki is built by PlanetScale, the maintainers of Vitess.",
+      "hedge": "asserted",
+      "interpretation": "在標題「From the maintainers of Vitess」底下明講的一句話，直接證實 Neki 跟 Vitess 的關聯，不需要再靠推斷連結——比部落格文章本身更明確的來源。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n36",
+      "url": "https://planetscale.com/docs/neki",
+      "quote": "Neki is not a Vitess port. It is built from scratch to specifically solve the scalability and operational challenges of Postgres.",
+      "hedge": "asserted",
+      "interpretation": "劃清界線：Neki 跟 Vitess 共享的是團隊與設計經驗，不是共用程式碼或直接移植，避免把兩者的架構等同看待。",
+      "timeliness": "durable"
+    }
+  ],
+  "claims": [
+    {
+      "id": "c01",
+      "claim_text": "Neki 的設計規則：stick to Postgres, don't work around it, fake it, or turn away from it",
+      "location": "opener",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n02"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "stick to Postgres, don't work around it, fake it, or turn away from it",
+      "note": "PRESENT-VERBATIM；保持英文原句並歸屬給 PlanetScale。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c02",
+      "claim_text": "PlanetScale 對「相容 Postgres」路線的批評",
+      "location": "opener + H2 五 + container-query widget",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n15"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Postgres-\"compatible\" distributed databases hide the shard key from you, take away your extensions, and add complexity and latency which becomes difficult to handle and debug.",
+      "note": "PRESENT-VERBATIM；廠商立場在正文與 figcaption 兩處揭露，未當中立評測。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c03",
+      "claim_text": "PlanetScale 在 9 月 10 日把 Neki 放進 platform preview",
+      "location": "首段",
+      "type": "date-version",
+      "load": "high",
+      "note_ids": [
+        "n21",
+        "n18"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Publish date: September 10, 2026",
+      "note": "再抓確認刊登日；本文日期為次日，volatile 宣稱的時效無虞。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c04",
+      "claim_text": "單一 Postgres 養大後的症頭清單",
+      "location": "首段",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n01"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "You already know the problems that come with fast-growing Postgres databases: tables too large to vacuum or index without affecting traffic, backups taking hours, connection limits, maintenance windows for schema changes, transaction wraparound and so much more.",
+      "note": "PRESENT-VERBATIM；清單逐項 1:1 對應，未增列。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c05",
+      "claim_text": "沒有自訂儲存引擎，extension、SQL 支援、效能表現都跟原生 Postgres 一致",
+      "location": "首段",
+      "type": "attribution",
+      "load": "high",
+      "note_ids": [
+        "n03",
+        "n04"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "no custom storage engine ... extensions, SQL support, and performance behave the way Postgres does",
+      "note": "兩段皆 PRESENT-VERBATIM，強度相同。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c06",
+      "claim_text": "一年半以前推出過 PlanetScale Postgres",
+      "location": "首段",
+      "type": "date-version",
+      "load": "medium",
+      "note_ids": [
+        "n22"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "When we released PlanetScale Postgres a year and a half ago, we knew we needed to do more.",
+      "note": "PRESENT-VERBATIM；沿用來源自身的相對時間，未轉成無法查證的絕對日期。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c07",
+      "claim_text": "應用程式先連 Neki router，講標準 Postgres wire protocol，driver/ORM 不用改",
+      "location": "H2 一",
+      "type": "attribution",
+      "load": "high",
+      "note_ids": [
+        "n05",
+        "n28"
+      ],
+      "independence": "echo",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Your application first connects to a Neki router. The router speaks the Postgres wire protocol so your existing drivers and ORMs keep working with a single connection string.",
+      "note": "blog PRESENT-VERBATIM；docs 頁另述 router 為 proxy。兩者同屬 PlanetScale，故為 echo 而非互證，但本文未宣稱多來源確認。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c08",
+      "claim_text": "router 內含 query parser、分散式 query planner、query buffering",
+      "location": "H2 一",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n06"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "a full Postgres query parser, a distributed query planner, query buffering and more",
+      "note": "PRESENT-VERBATIM。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c09",
+      "claim_text": "router 解析查詢、規劃 shard、分派工作、合併結果成一條串流",
+      "location": "H2 一",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n31"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "It parses your query, builds a plan that decides which shards should run it, sends the work out, and combines the results back into one stream.",
+      "note": "PRESENT-VERBATIM；中譯忠實四步驟，無增添細節。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c10",
+      "claim_text": "「這很可能就是」query buffering and more 裡 and more 實際在做的事",
+      "location": "H2 一第二段",
+      "type": "causal",
+      "load": "low",
+      "note_ids": [
+        "n06",
+        "n31"
+      ],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "第一輪為未標記推斷：來源未把模組清單的 and more 等同於結果合併。已由「這正是」改為「這很可能就是」。",
+      "action": "mark-inferred",
+      "resolution": "marked-inferred"
+    },
+    {
+      "id": "c11",
+      "claim_text": "多 shard 查詢跟連到單一 Postgres 沒有可觀察的差異",
+      "location": "H2 一第三段（已刪除）",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [],
+      "independence": "single-source",
+      "verdict": "unverifiable",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "第一輪查核：直接詢問來源是否宣稱多 shard 查詢與單一 Postgres 無可觀察差異，答案為否；且此說與本文自己承認「跨 shard 查詢代價未載」相衝突（延遲是可觀察的）。已整句刪除，僅保留兩項有據事實（同樣的 wire protocol 格式、單一合併串流）。",
+      "action": "delete",
+      "resolution": "deleted"
+    },
+    {
+      "id": "c12",
+      "claim_text": "router 可垂直、也可水平擴充，避免單一 router 成為瓶頸",
+      "location": "H2 一第四段",
+      "type": "attribution",
+      "load": "high",
+      "note_ids": [
+        "n07"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Routers can scale vertically and horizontally, so no single router becomes the bottleneck.",
+      "note": "PRESENT-VERBATIM，含因果子句。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c13",
+      "claim_text": "router 疊多台與前置負載平衡、無資料狀態的描述",
+      "location": "H2 一第四段",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [
+        "n07"
+      ],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "第一輪為未標記推斷：來源既未稱 router 無狀態，也未提負載平衡，且 query buffering 反而與純無狀態相衝。已加「合理的推測是」標記負載平衡、為無狀態說法補上 query buffering 的但書（不算完全無狀態），並把據此推出的容量規劃建議改為或許／大概／可能等推測語氣。",
+      "action": "mark-inferred",
+      "resolution": "marked-inferred"
+    },
+    {
+      "id": "c14",
+      "claim_text": "每個 shard 是完整 Postgres cluster：1 primary、至少 2 replica、跨 3 個可用區",
+      "location": "H2 二 + diagram detail-2 + 3D figcaption",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n08"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Each shard is a full Postgres cluster with one primary and at least two replicas across 3 availability zones.",
+      "note": "PRESENT-VERBATIM；三處重複皆保留「至少」，未在標題句悄悄丟掉限定語。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c15",
+      "claim_text": "固定的 3 個可用區能不能調整，文章沒有講",
+      "location": "H2 二第一段",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n08"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Each shard is a full Postgres cluster with one primary and at least two replicas across 3 availability zones.",
+      "note": "來源沉默宣稱，對抗式查核：直接詢問 3 AZ 是否可設定／可調整，答案為否。沉默宣稱正確。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c16",
+      "claim_text": "不同 shard group 可以有不同的 replica 數（每個 shard 有 configuration profile 定義 replica count）；額外 replica 的計費影響與對 catch-up 時間的影響則未載",
+      "location": "H2 二第一段",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n34"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Each shard uses a configuration profile that defines its instance size, replica count, storage, Postgres parameters, and extensions, so you can size each group for its own traffic.",
+      "note": "第一輪唯一實質錯誤——錯誤的來源沉默宣稱。來源在「at least two replicas」後兩句就回答了 replica 數是否一致與能否為特定 workload 加開。已補 n34 並改寫該句直述來源說法，同時保留同句中兩項經查證確實未載的沉默宣稱（計費、catch-up 時長）。",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c17",
+      "claim_text": "選錯 shard index 路由欄位、或跨多 shard 查詢的實際代價，官方沒有寫",
+      "location": "H2 二第二段",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n10"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "It parses your query, builds a plan that decides which shards should run it, sends the work out, and combines the results back into one stream.",
+      "note": "來源沉默宣稱，對抗式查核涵蓋 blog 與 docs 兩個來源：跨 shard 查詢的效能代價、選錯路由欄位的後果與事後變更方式，四問皆為否。沉默宣稱正確，且「這裡不替它猜」是正確的紀律。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c18",
+      "claim_text": "shard group 把不同 table 或 workload 分配到不同 shard 集合",
+      "location": "H2 二第二段",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n09"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Shards are organized into shard groups, so different tables or workloads can live on different sets of shards.",
+      "note": "PRESENT-VERBATIM。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c19",
+      "claim_text": "shard index 決定路由欄位與 hash 方式；shard group 決定攤成幾個 shard、攤在哪幾個",
+      "location": "H2 二第二段 + diagram detail-2",
+      "type": "attribution",
+      "load": "high",
+      "note_ids": [
+        "n10"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "You define shard indexes, which specify the column Neki routes on and how that value gets hashed, and shard groups, which control how many shards a set of tables spreads across and which shards those are.",
+      "note": "PRESENT-VERBATIM；兩個子句逐一對應。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c20",
+      "claim_text": "shard index 與 shard group 兩者的變更是否互不牽動",
+      "location": "H2 二第二段",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [
+        "n10"
+      ],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "第一輪為未標記推斷：來源確立兩者是不同設定物件，但未述變更互不影響。已改為「文章沒有明講改其中一個是否完全不影響另一個，但兩者被定義成獨立的物件，看起來是設計成可以分開調整」。",
+      "action": "mark-inferred",
+      "resolution": "marked-inferred"
+    },
+    {
+      "id": "c21",
+      "claim_text": "reshard workflow 讀起來是針對 shard_group 底下的 shard 數量調整；換 shard_index 路由欄位是否走同一套 workflow，文章沒有另外交代",
+      "location": "H2 二第二段結尾",
+      "type": "attribution",
+      "load": "low",
+      "note_ids": [
+        "n32",
+        "n10"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Workflows provision new target nodes, catch them up with replication, switch traffic with a `__neki` metafunction, and retire the old nodes.",
+      "note": "第一輪為引文漂移：原稿宣稱來源「明確」指向 shard_group 的 shard 數量，來源並未如此明言。已把「明確是」降級為「讀起來是」。同句後半的沉默宣稱經查證正確，保留。",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c22",
+      "claim_text": "sidecar 跟著每個 Postgres instance 跑；PlanetScale 稱其比在資料庫前擺 PgBouncer 有意義地更好",
+      "location": "H2 三",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n11"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Sidecars run alongside every Postgres instance. This is the piece that makes Neki's connection handling meaningfully better than just sticking PgBouncer in front of a database.",
+      "note": "PRESENT-VERBATIM；「有意義地更好」對應 meaningfully better 未膨脹，且明確歸屬給 PlanetScale 而非中立結論。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c23",
+      "claim_text": "因為兩端都在 Neki 控制之下，pool 大小是量出來的而非外部估算",
+      "location": "H2 三第一段 + diagram detail-3",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [
+        "n12"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Because Neki controls both ends of the connection, the router side and the Postgres side, it can size pools to what each instance can actually serve instead of estimating from outside the process.",
+      "note": "PRESENT-VERBATIM，含 Because...it can 因果；後續段落以「理論上」收斂結果宣稱。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c24",
+      "claim_text": "1 個 primary、至少 2 個 replica，代表底下至少同時跑著 3 個 sidecar",
+      "location": "H2 三最後一段",
+      "type": "number",
+      "load": "low",
+      "note_ids": [
+        "n08",
+        "n11"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Sidecars run alongside every Postgres instance.",
+      "note": "第一輪為未標記推導，且把別處保留的「至少」轉成固定值 3。已在兩側都補回「至少」。",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c25",
+      "claim_text": "示意圖，非實測資料",
+      "location": "svg-path-morph widget affordance",
+      "type": "attribution",
+      "load": "low",
+      "note_ids": [
+        "n12"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "deflated",
+      "evidence": "Because Neki controls both ends of the connection, the router side and the Postgres side, it can size pools to what each instance can actually serve instead of estimating from outside the process.",
+      "note": "父層指名查核項，乾淨：標籤存在，widget 無數值座標軸，唯一標註線是概念性上限，按鈕文字寫「畫法」而非資料，最接近的正文以「理論上」收斂。deflated：把來源主張的設計性質降級呈現為示意，方向安全。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c26",
+      "claim_text": "control plane 追蹤節點健康、跑計畫內 switchover 與計畫外 failover，協調 reshard、schema 變更、版本升級",
+      "location": "H2 四 + diagram detail-4",
+      "type": "attribution",
+      "load": "high",
+      "note_ids": [
+        "n13"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The control plane tracks the health of every node, runs planned switchovers and unplanned failovers, and coordinates the workflows that reshard data, apply schema changes, and perform version upgrades.",
+      "note": "PRESENT-VERBATIM；六項職責同序出現。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c27",
+      "claim_text": "用什麼指標判定健康、撐多久觸發 failover，文章沒有寫",
+      "location": "H2 四第一段",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n13"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The control plane tracks the health of every node, runs planned switchovers and unplanned failovers, and coordinates the workflows that reshard data, apply schema changes, and perform version upgrades.",
+      "note": "來源沉默宣稱，對抗式查核涵蓋 blog 與 docs：健康判定指標與 failover 觸發時機兩問皆為否。兩半皆正確。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c28",
+      "claim_text": "switchover 與 failover 是否走同一條處理路徑",
+      "location": "H2 四第一段",
+      "type": "causal",
+      "load": "low",
+      "note_ids": [
+        "n13"
+      ],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "第一輪為未標記推斷：同句並列不等於架構陳述。已改為「兩者至少都收進 control plane 這一層處理，是不是走同一條程式路徑，文章沒有明講」。",
+      "action": "mark-inferred",
+      "resolution": "marked-inferred"
+    },
+    {
+      "id": "c29",
+      "claim_text": "reshard 四步驟：備新節點、用 replication 追上、以 __neki metafunction 切流量、退役舊節點",
+      "location": "H2 四第二段 + range widget",
+      "type": "attribution",
+      "load": "high",
+      "note_ids": [
+        "n32"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Workflows provision new target nodes, catch them up with replication, switch traffic with a `__neki` metafunction, and retire the old nodes.",
+      "note": "PRESENT-VERBATIM，含 metafunction 名稱與順序；widget 四階段標題逐字重現英文步驟。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c30",
+      "claim_text": "reshard 的 replication 是否與 shard 內 primary/replica 同一套機制",
+      "location": "H2 四第二段 + range widget 第 2 階段",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "第一輪為未標記推斷，且在正文與 widget 兩處都陳述為事實。直接詢問來源是否指明兩者為同一機制，答案為否。兩處皆已改為「看起來……是同一個詞，但文章沒有明講兩者是不是同一套實作」，下游的成熟度推論改以「如果是」條件化。",
+      "action": "mark-inferred",
+      "resolution": "marked-inferred"
+    },
+    {
+      "id": "c31",
+      "claim_text": "合理的推測是，reshard 還沒被時間驗證的集中在切流量與退役兩步",
+      "location": "H2 四第二段",
+      "type": "causal",
+      "load": "low",
+      "note_ids": [
+        "n19",
+        "n32"
+      ],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "deflated",
+      "evidence": "the product is still changing, and some of those changes will be breaking",
+      "note": "作者綜合判斷，已用標準推斷標記；來源只支持一般性的 preview 但書，本文未假裝更多。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c32",
+      "claim_text": "data topology 是一份 JSON 設定，把邏輯 table 對應到實體 shard",
+      "location": "H2 四第三段 + diagram detail-4",
+      "type": "attribution",
+      "load": "high",
+      "note_ids": [
+        "n14"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Tying it together is the data topology, a JSON configuration that maps your logical tables onto physical shards.",
+      "note": "PRESENT-VERBATIM。父層指名查核項在此釐清：本稿並無 topology.json 範例 widget，全文亦無任何字面 JSON 範例，正文僅說「一份 JSON 設定」，與來源 a JSON configuration 相符，故 (示意) 標籤不適用於本稿。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c33",
+      "claim_text": "shard index 定義的路由欄位與 hash 規則也是這份設定的一部分",
+      "location": "H2 四第三段",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n14",
+        "n10"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Tying it together is the data topology, a JSON configuration that maps your logical tables onto physical shards. You define shard indexes, which specify the column Neki routes on and how that value gets hashed, and shard groups, which control how many shards a set of tables spreads across and which shards those are.",
+      "note": "對抗式查核：來源把 You define shard indexes 緊接在 data topology 句之後，屬同一設定的描述，支持力度相符。同句中「改的範圍就停在這裡」是較弱的連結，來源未如此界定影響範圍，僅於本註記標示。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c34",
+      "claim_text": "可以先用 unsharded cluster 起步，之後再依流量、存取模式、資料量決定要不要切",
+      "location": "H2 二第四段",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n30"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Whether you later shard depends on your traffic, access patterns, and data",
+      "note": "n30 原僅記錄三字片語，屬過薄的 note；再抓於 docs 頁找到完整支撐句，三項因素逐一對應，且本文正確歸屬給官方文件而非發布文章。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c35",
+      "claim_text": "unsharded cluster 底下 router、sidecar、control plane 是否照跑",
+      "location": "H2 二第四段",
+      "type": "attribution",
+      "load": "low",
+      "note_ids": [],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "第一輪為未標記推斷：直接詢問來源是否稱 unsharded cluster 仍跑三層，答案為否，來源只提 unsharded 的好處。已加「合理的推測是」並註明文章沒有明講該拓樸。",
+      "action": "mark-inferred",
+      "resolution": "marked-inferred"
+    },
+    {
+      "id": "c36",
+      "claim_text": "原本要排維護窗口的操作在 Neki 裡全變成內建 workflow",
+      "location": "H2 四第三段",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n33"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Everything you would normally schedule a maintenance window for runs as a built-in workflow in Neki ... schema changes, version upgrades, planned and unplanned failovers, imports, and resharding",
+      "note": "PRESENT-VERBATIM，框架句與五項清單同序。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c37",
+      "claim_text": "preview 期間不要跑 production workload，理由是產品仍在變且部分變動不向下相容",
+      "location": "H2 四第四段 + closer",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n19",
+        "n20"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "You should not run production workloads on Neki during the platform preview. ... the product is still changing, and some of those changes will be breaking",
+      "note": "n19 為來源句的逐字子字串，可接受；n20 PRESENT-VERBATIM。本文把但書範圍延伸到 control plane 工作流，屬 production workloads on Neki 的平實讀法而非過度延伸。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c38",
+      "claim_text": "Neki 由 PlanetScale 打造，即 Vitess 的維護者；但 Neki 不是 Vitess 的移植，而是為 Postgres 從頭寫的",
+      "location": "H2 五第一段",
+      "type": "attribution",
+      "load": "high",
+      "note_ids": [
+        "n16",
+        "n35",
+        "n36"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Neki is built by PlanetScale, the maintainers of Vitess. ... Neki is not a Vitess port. It is built from scratch to specifically solve the scalability and operational challenges of Postgres.",
+      "note": "父層指名查核項。第一輪確認：發布文章全文未出現 Vitess 一詞，原稿的「合理的推測是」標記正確且位置精準，所有 Vitess 事實均引自 vitess.io。查核另發現本文既有的 docs 來源已直接載明維護者關係，屬 hedge 弱於證據（deflated，非錯誤）。本輪已補 n35/n36 並把 Vitess 身分改為直接引用，同時加入「不是移植」一句，避免兩套系統的關係被過度解讀為共用程式碼。",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c39",
+      "claim_text": "Vitess 官方定義與 VTGate／VTTablet 角色",
+      "location": "H2 五第一段 + container-query widget",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n23",
+        "n24",
+        "n25"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Vitess is an open-source database clustering system for horizontal scaling of MySQL. ... VTGate: A proxy that accepts MySQL protocol connections from your application and routes queries to the appropriate shards. ... VTTablet: An agent running alongside each MySQL instance that manages queries, connections, and replication.",
+      "note": "三則 note 於 vitess.io 再抓皆 PRESENT-VERBATIM；Vitess 事實引自 Vitess 自身文件，未引自 PlanetScale 發布文章——正是父層要確認的引用模式。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c40",
+      "claim_text": "Vitess 曾扛 YouTube 全站資料庫流量超過五年",
+      "location": "H2 五第二段 + widget",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n26"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Vitess served all YouTube database traffic for over five years.",
+      "note": "PRESENT-VERBATIM 於 vitess.io；來源用過去式 served，widget 亦作「已經扛了……超過五年」，未漂移為現在式。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c41",
+      "claim_text": "Vitess 也能把 table 遷到不同資料庫並增減 shard 數",
+      "location": "H2 五第二段",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n27"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Vitess supports a variety of sharding schemes. It can also migrate tables into different databases and scale the number of shards up or down.",
+      "note": "PRESENT-VERBATIM；本文只引能力子句，未把來源更強的「僅數秒唯讀停機」宣稱搬進 Neki 比較，屬克制。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c42",
+      "claim_text": "VTGate 對應 router，VTTablet 的職責被 Neki 拆成 sidecar 與 control plane",
+      "location": "H2 五第二段",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [
+        "n24",
+        "n25",
+        "n05",
+        "n11",
+        "n13"
+      ],
+      "independence": "corroborated",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": "An agent running alongside each MySQL instance that manages queries, connections, and replication.",
+      "note": "對照兩側各有已核實的 note，且兩來源出處確實獨立（vitess.io 文件 vs PlanetScale 發布文章），故事實輸入為 corroborated。對應關係本身是作者分析，但以「拿這兩層對照」透明呈現並以「大致對得上」收斂，未歸給任一來源。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c43",
+      "claim_text": "Neki 文件列出的能力清單，全部用真 Postgres 做到",
+      "location": "H2 五第三段",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n29"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "sharding, zero-downtime operations, online DDL, replication workflows, and sophisticated cluster management capabilities, all using real Postgres",
+      "note": "PRESENT-VERBATIM 於 docs 頁，且正確歸屬給「Neki 文件」而非發布文章。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c44",
+      "claim_text": "登入 PlanetScale、選擇加入 platform preview、建一個 Neki cluster",
+      "location": "H2 五第四段",
+      "type": "attribution",
+      "load": "low",
+      "note_ids": [
+        "n18"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Sign in to PlanetScale, opt in to the platform preview, and create a Neki cluster.",
+      "note": "PRESENT-VERBATIM；三步驟逐一對譯。",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c45",
+      "claim_text": "thousands of production workloads with millions of queries per second 講的是既有 MySQL 艦隊，不是剛進 preview 的 Neki",
+      "location": "H2 五第四段",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n17",
+        "n16"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Neki is built from lessons we've learned over eight years of running some of the largest sharded MySQL clusters in the world. Thousands of production workloads with millions of queries per second for companies where even a few seconds of downtime is a very public event.",
+      "note": "父層指名查核項，乾淨。查核直接詢問該句描述對象，確認為 PlanetScale 既有 MySQL 艦隊；該句緊接八年 sharded MySQL 句之後，前後文無 Neki 指涉。本文歸屬正確，且明確警告不要當成 Neki 已驗證的容量數字——查核稱這是全文風險最高的數字而處理正確。",
+      "action": "none",
+      "resolution": "none-needed"
+    }
+  ],
+  "checked_at": "2026-09-11",
+  "checker_rounds": 2,
+  "coverage": {
+    "candidate_claims": 52,
+    "checked": 45,
+    "dropped_low_load": 7
+  }
+}
