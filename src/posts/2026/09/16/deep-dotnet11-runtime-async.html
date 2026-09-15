@@ -1,0 +1,465 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">把 30 層 async 呼叫疊起來丟出一個例外，舊版 .NET 要讓 30 個編譯器生成的 state machine 各自接住、各自存起來，合計 51.302 微秒、配置 84.2 KB。.NET 11 只讓 dispatch loop 走過去接一次，同一組測試掉到 10.721 微秒、5.71 KB。</p>
+  <h1 class="vg-post-title">把 async 搬進 runtime</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p><span class="vg-dropcap">舊</span>版 C# 的 async/await，把降級這件事完全交給編譯器——編譯期就得把 state machine 的形狀定案：欄位要放哪些值、哪些區域變數必須撐過一次懸掛與恢復，全部得先想清楚才能生出程式碼。.NET 11 的 runtime async 把這一段責任搬進 JIT：編譯器不再自己動手轉換，只在 metadata 裡把方法標成 async、吐出精簡的 IL，真正的降級留給 JIT 在執行期依實際發生的事去做。目前這條路要靠 <code>&lt;Features&gt;$(Features);runtime-async=on&lt;/Features&gt;</code> 這個編譯器 feature 開關選擇性打開，還不是預設行為。但它牽動的東西不只 async 一個角落——同一份效能整理裡，JIT 在 escape analysis 跟邊界檢查消除上也各自往前推了一步，三條線收在同一個論點上。</p>
+
+  <p>這三條線做的其實是同一件事：找出一層「執行期才能真正確定、編譯器只好先保守處理」的抽象，證明安全之後就把它拆掉。跟傳統效能優化把迴圈寫得更緊、指令排得更密不一樣，這裡動的是抽象本身的位置——從編譯期挪到執行期、從 heap 挪到 stack、從間接呼叫挪到直接呼叫。下面這疊層，由上而下大致對應文章拆掉的幾種保守假設，後面幾節會依序拆開講。</p>
+
+  <p>這個順序也解釋了為什麼這份效能整理讀起來跟一般的優化清單不太一樣——它持續在問同一個問題：這一層抽象，JIT 有沒有辦法在執行期自己證明用不到。runtime async 排在最前面，因為它動的範圍最大：幾乎每一支服務端程式碼都寫著 async/await。這也是為什麼 C# 編譯器過去要在編譯期就把 state machine 的欄位、懸掛點通通定案——它沒有機會等到執行期才知道一次呼叫是否真的需要懸掛。</p>
+
+  <figure class="vg-w-3d-abstraction-layers" data-mobile="keep">
+    <style>
+      .vg-w-3d-abstraction-layers { margin: var(--s-4) 0; }
+      .vg-w-3d-abstraction-layers .stage { perspective: 1200px; height: 300px; display: flex; align-items: center; justify-content: center; }
+      .vg-w-3d-abstraction-layers .stack {
+        transform-style: preserve-3d;
+        transform: rotateX(-18deg) rotateY(-26deg);
+        width: 300px;
+        height: 220px;
+        position: relative;
+      }
+      .vg-w-3d-abstraction-layers .layer {
+        position: absolute;
+        width: 300px;
+        height: 44px;
+        border: 1.5px solid var(--ink);
+        background: var(--bg-soft);
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        text-align: center;
+        padding: 0 var(--s-2);
+        box-sizing: border-box;
+      }
+      .vg-w-3d-abstraction-layers .layer .name { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.04em; color: var(--ink); }
+      .vg-w-3d-abstraction-layers .layer .sub { font-family: var(--scribed); font-size: 11px; color: var(--muted); margin-top: 2px; }
+      .vg-w-3d-abstraction-layers .l1 { transform: translateZ(78px); background: color-mix(in oklab, var(--accent) 22%, var(--bg-soft)); }
+      .vg-w-3d-abstraction-layers .l2 { transform: translateZ(26px); }
+      .vg-w-3d-abstraction-layers .l3 { transform: translateZ(-26px); }
+      .vg-w-3d-abstraction-layers .l4 { transform: translateZ(-78px); background: color-mix(in oklab, var(--sage) 26%, var(--bg-soft)); }
+      @media (max-width: 480px) {
+        .vg-w-3d-abstraction-layers .stack { transform: none; display: grid; gap: var(--s-2); height: auto; position: static; }
+        .vg-w-3d-abstraction-layers .layer { position: static; transform: none !important; width: 100%; }
+        .vg-w-3d-abstraction-layers .stage { height: auto; padding: var(--s-2) 0; }
+      }
+    </style>
+    <div class="stage">
+      <div class="stack">
+        <div class="layer l1"><span class="name">C# 編譯器 · state machine</span><span class="sub">runtime async：改交給 JIT 在執行期處理</span></div>
+        <div class="layer l2"><span class="name">Task ／ continuation 配置</span><span class="sub">同步完成路徑：直接回傳值，不鋪 continuation</span></div>
+        <div class="layer l3"><span class="name">heap · enumerator ／ GVM 間接呼叫</span><span class="sub">escape analysis ＋ devirtualization：證明安全就搬上 stack、去掉跳轉</span></div>
+        <div class="layer l4"><span class="name">陣列 ／ span 邊界檢查</span><span class="sub">range analysis：證明 index 落在範圍內就省掉檢查</span></div>
+      </div>
+    </div>
+    <figcaption>由上而下：C# 編譯器生成的 state machine 型別、同步完成時原本要配置的 Task／continuation、enumerator 與泛型虛擬呼叫原本假設會逃逸或需要間接跳轉、陣列存取原本每次都要做的邊界檢查——.NET 11 在能證明安全時，把這四層各自拆掉一部分。</figcaption>
+  </figure>
+
+  <h2>runtime async：state machine 從編譯器搬進 JIT</h2>
+
+  <p>傳統模型下，一個 async 方法在編譯期就會被整個改寫：方法體依 await 點切成幾段，對應的區域變數挪進一個新生的型別當欄位，呼叫端看到的是一個包著這個型別的 Task。這個轉換的關鍵限制是時機——編譯器沒辦法知道這個方法真正跑起來的時候，await 的東西是不是早就完成了，所以它只能假設「有可能要真的懸掛」，把整套機制先準備好。runtime async 把這個決定挪到 JIT，因為 JIT 看得到的是實際跑起來的樣子：一個 async 方法呼叫另一個 async 方法，JIT 可以直接辨認出這是一次直接呼叫，不必先假設它會經過某個抽象的 awaiter 介面。</p>
+
+  <p>這個挪動最先受益的是最常見的情況——呼叫鏈根本沒有真的懸掛。如果一路往下每一層的 awaiter 都已經完成，MoveNext 可以直接同步跑到底，不需要真的鋪一份 continuation，也不需要為了讓呼叫端等待而配置一個 Task。這條快路徑不必開發者多寫一行程式碼去觸發，是 JIT 認出模式之後自動選的路。兩層互相呼叫、全部同步完成的測試裡，runtime async 版本比舊版快三倍以上，而且完全沒有中介的 Task 配置——舊版每一層呼叫，不管最後有沒有真的懸掛，都得先把一個 Task 物件生出來擺著。</p>
+
+  <p>這也是為什麼舊模型的成本結構長年被詬病：Task 本身是一個 heap 物件，舊模型底下，那些「只是把結果從一個 async 方法直接搬到下一個」的 Task，一樣得完整配置出來。合理的推測是，一個高並發服務如果每次呼叫鏈都要配置好幾層這種 Task，GC 壓力會隨著 QPS 疊上去，即使每一層最後都同步完成。runtime async 讓 JIT 有足夠資訊避免生出這些純粹搬運用的 Task——先假設會同步完成，真的要懸掛才鋪 continuation、配置 Task。</p>
+
+  <h2>例外穿過多層 async：一次 catch 取代十次</h2>
+
+  <p>同步完成路徑省的是常態開銷，例外處理省的是失敗路徑的開銷，而且省得更兇。舊模型裡，每個 async 方法都是獨立的一份 state machine，各自被包進一層 try/catch——這是編譯器要把例外正確地灌回外層那個 Task 的必要手段，不這樣做，呼叫端就看不到方法內部真正丟出的例外。代價是，一個例外如果要穿過十層這樣的 async helper 往上傳，即使沒有一層真的打算處理它，也會被個別丟出、接住、存起來整整十次。runtime async 把這個責任收回到單一個 dispatch loop：例外只在最外層被接住一次，沿路走過那些沒有 handler 的 continuation record，直到真正會被外部觀察到的 root task 上才標記成失敗。</p>
+
+  <p>三十層深的測試把這個差距量出來：舊模型 51.302 微秒、配置 84.2 KB；runtime async 10.721 微秒、配置 5.71 KB——時間掉到約五分之一，配置掉到約十五分之一。同一件事——接住例外、往外傳——原本要做三十次，現在只需要做一次。底下這個模擬把兩種機制的動態行為放在一起，播放之後可以看例外往上爬的時候，兩邊各自在做什麼。</p>
+
+  <figure class="vg-w-canvas-exception-unwind" data-mobile="swap" data-mobile-summary="30 層深的例外，舊模型逐層接住、存起來要 51.302 微秒、84.2 KB；runtime async 一次接住走完，10.721 微秒、5.71 KB。">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M6 3v18l4-4h8l-4-4h4l-4-4h4l-8-6z"/>
+      </svg>
+      <span>按播放看例外往上爬 · 30 層 async frame</span>
+    </p>
+    <style>
+      .vg-w-canvas-exception-unwind { display: grid; grid-template-rows: auto auto 1fr auto; gap: var(--s-2); margin: var(--s-4) 0; }
+      .vg-w-canvas-exception-unwind .toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+      .vg-w-canvas-exception-unwind button { font-family: var(--sans); font-size: var(--fs-sm); padding: 6px 14px; min-height: 44px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); cursor: pointer; }
+      .vg-w-canvas-exception-unwind button:hover { border-color: var(--accent); color: var(--accent-text); }
+      .vg-w-canvas-exception-unwind canvas { width: 100%; height: auto; aspect-ratio: 16 / 9; display: block; }
+      .vg-w-canvas-exception-unwind .readouts { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s-3); }
+      .vg-w-canvas-exception-unwind .readouts .col { padding: var(--s-2); border-left: 2px solid var(--muted-2); font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-canvas-exception-unwind .readouts .col.rt { border-left-color: var(--accent); }
+      .vg-w-canvas-exception-unwind .readouts h4 { margin: 0 0 4px; font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+      .vg-w-canvas-exception-unwind .readouts .num { font-family: "JetBrains Mono", monospace; font-variant-numeric: tabular-nums; color: var(--ink); }
+      .vg-w-canvas-exception-unwind figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+      @media (max-width: 720px) {
+        .vg-w-canvas-exception-unwind canvas { aspect-ratio: 4 / 3; }
+        .vg-w-canvas-exception-unwind .readouts { grid-template-columns: 1fr; }
+      }
+    </style>
+
+    <div class="toolbar" data-vg-controls>
+      <button type="button" data-role="toggle">▷ 播放</button>
+      <button type="button" data-role="reset">↺ 重置</button>
+      <span style="margin-left: auto" data-role="clock">t = 0.00s</span>
+    </div>
+
+    <canvas class="vg-w-canvas-exception-unwind-main"></canvas>
+
+    <div class="readouts">
+      <div class="col">
+        <h4>classic（編譯器 state machine）</h4>
+        <p>接住次數：<span class="num" data-role="classic-catches">0</span> ／ 耗時：<span class="num" data-role="classic-us">0.000</span> μs ／ 配置：<span class="num" data-role="classic-kb">0.00</span> KB</p>
+      </div>
+      <div class="col rt">
+        <h4>runtime async</h4>
+        <p>接住次數：<span class="num" data-role="async-catches">0</span> ／ 耗時：<span class="num" data-role="async-us">0.000</span> μs ／ 配置：<span class="num" data-role="async-kb">0.00</span> KB</p>
+      </div>
+    </div>
+
+    <figcaption>兩欄各代表 30 層深的 async 呼叫鏈丟出一個例外。classic 欄每經過一層就亮一格、接一次；runtime async 欄只在走到最外層的 dispatch loop 時亮一次。終值取自實測：51.302 μs／84.2 KB 對 10.721 μs／5.71 KB。</figcaption>
+
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        var root = document.querySelector('.vg-w-canvas-exception-unwind');
+        if (!root) return;
+        var canvas = root.querySelector('canvas.vg-w-canvas-exception-unwind-main');
+        var toggle = root.querySelector('[data-role="toggle"]');
+        var resetBtn = root.querySelector('[data-role="reset"]');
+        var clock = root.querySelector('[data-role="clock"]');
+        var ctx = canvas.getContext('2d');
+
+        function getCssVar(name) {
+          return getComputedStyle(root).getPropertyValue(name).trim() || '#888';
+        }
+
+        function resize() {
+          var dpr = window.devicePixelRatio || 1;
+          var rect = canvas.getBoundingClientRect();
+          canvas.width = rect.width * dpr;
+          canvas.height = rect.height * dpr;
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        }
+        window.addEventListener('resize', resize);
+        resize();
+
+        var N = 30;
+        var CLASSIC = { us: 51.302, kb: 84.2 };
+        var ASYNCR = { us: 10.721, kb: 5.71 };
+        var DURATION = 6000;
+        var running = false;
+        var startedAt = 0;
+        var elapsedMs = 0;
+
+        var classicCatches = root.querySelector('[data-role="classic-catches"]');
+        var classicUs = root.querySelector('[data-role="classic-us"]');
+        var classicKb = root.querySelector('[data-role="classic-kb"]');
+        var asyncCatches = root.querySelector('[data-role="async-catches"]');
+        var asyncUs = root.querySelector('[data-role="async-us"]');
+        var asyncKb = root.querySelector('[data-role="async-kb"]');
+
+        function frameIndexFor(ms) {
+          var t = Math.max(0, Math.min(DURATION, ms));
+          return Math.floor((t / DURATION) * N);
+        }
+
+        function draw(fi) {
+          var rect = canvas.getBoundingClientRect();
+          var W = rect.width, H = rect.height;
+          ctx.clearRect(0, 0, W, H);
+
+          var margin = { top: 30, bottom: 22, left: 14, right: 14 };
+          var gap = 14;
+          var usableW = W - margin.left - margin.right - gap;
+          var colW = usableW / 2;
+          var usableH = H - margin.top - margin.bottom;
+          var rh = usableH / N;
+
+          ctx.font = '12px "IM Fell English", serif';
+          ctx.fillStyle = getCssVar('--muted');
+          ctx.fillText('classic', margin.left, margin.top - 10);
+          ctx.fillText('runtime async', margin.left + colW + gap, margin.top - 10);
+
+          var accent = getCssVar('--accent');
+          var sage = getCssVar('--sage-deep');
+          var muted2 = getCssVar('--muted-2');
+
+          for (var i = 0; i < N; i++) {
+            var y = margin.top + usableH - (i + 1) * rh;
+            var caughtClassic = i < fi;
+
+            ctx.fillStyle = caughtClassic ? accent : 'transparent';
+            ctx.globalAlpha = caughtClassic ? 0.78 : 1;
+            ctx.fillRect(margin.left, y, colW, rh - 2);
+            ctx.strokeStyle = muted2;
+            ctx.lineWidth = 1;
+            ctx.globalAlpha = 1;
+            ctx.strokeRect(margin.left, y, colW, rh - 2);
+
+            var passed = i < fi;
+            var isTop = i === N - 1;
+            var x2 = margin.left + colW + gap;
+            if (passed) {
+              ctx.fillStyle = (isTop && fi >= N) ? accent : sage;
+              ctx.globalAlpha = (isTop && fi >= N) ? 0.85 : 0.28;
+              ctx.fillRect(x2, y, colW, rh - 2);
+            }
+            ctx.globalAlpha = 1;
+            ctx.strokeStyle = muted2;
+            ctx.strokeRect(x2, y, colW, rh - 2);
+          }
+        }
+
+        function update() {
+          var fi = frameIndexFor(elapsedMs);
+          var frac = fi / N;
+          classicCatches.textContent = String(fi);
+          classicUs.textContent = (CLASSIC.us * frac).toFixed(3);
+          classicKb.textContent = (CLASSIC.kb * frac).toFixed(2);
+          asyncCatches.textContent = fi >= N ? '1' : '0';
+          asyncUs.textContent = (ASYNCR.us * frac).toFixed(3);
+          asyncKb.textContent = (ASYNCR.kb * frac).toFixed(2);
+          clock.textContent = 't = ' + (elapsedMs / 1000).toFixed(2) + 's';
+          draw(fi);
+        }
+
+        var raf = null;
+        function tick(now) {
+          if (running) {
+            elapsedMs = Math.min(DURATION, now - startedAt);
+            update();
+            if (elapsedMs >= DURATION) {
+              running = false;
+              toggle.textContent = '▷ 播放';
+            }
+          }
+          raf = requestAnimationFrame(tick);
+        }
+        raf = requestAnimationFrame(tick);
+
+        toggle.addEventListener('click', function () {
+          if (!running) {
+            if (elapsedMs >= DURATION) elapsedMs = 0;
+            startedAt = performance.now() - elapsedMs;
+            running = true;
+            toggle.textContent = '⏸ 暫停';
+          } else {
+            running = false;
+            toggle.textContent = '▷ 播放';
+          }
+        });
+        resetBtn.addEventListener('click', function () {
+          running = false;
+          elapsedMs = 0;
+          toggle.textContent = '▷ 播放';
+          update();
+        });
+
+        update();
+      })();
+    </script>
+  </figure>
+
+  <p>沿路走過的那些 continuation record，本質上只是記著這一段暫停在哪裡、要跳回哪個位址繼續執行的一小塊資料，不像舊模型的 state machine 型別要背著完整的例外處理邏輯。dispatch loop 走過去只是比對一下有沒有 handler，沒有就繼續往外，這一步的成本跟真的 catch 一次、把 exception 物件存進欄位裡完全不是同一個量級。</p>
+
+  <h2>二進位變小的原因</h2>
+
+  <p>二進位縮小是同一個機制的自然結果。舊模型下，每個 async 方法都要各自生出一份 state machine 型別與相關欄位——方法數量一多，光是這些型別本身的 metadata 與程式碼就佔掉可觀的空間。runtime async 底下，這些型別不再需要在編譯期就生出來：編譯器吐出的 IL 精簡得多，state machine 真正的版面交由 JIT 在執行期依需要鋪陳。十個串接 async 方法的測試 assembly 量出來，編譯器版本是 10,752 bytes，runtime async 版本是 5,632 bytes，幾乎打對折。對容器化部署、或是需要把 assembly 塞進較小映像的場景，這個差距會隨著 async 方法數量線性放大。這個效果如果應用在 Native AOT 這類需要縮小啟動映像的場景，合理的推測是影響會更明顯：AOT 編譯不像 JIT 有執行期可以重新鋪版面，state machine 型別原本就得整份預先產生、整份打進最終產物，runtime async 讓這份產物在編譯當下就變薄。</p>
+
+  <h2>Deabstraction 第二條線：enumerator 上 stack、GVM 去虛擬化、delegate 少一個欄位</h2>
+
+  <p>runtime async 是這份效能整理裡結構性最完整的一塊，但不是唯一一塊。同一版 JIT 在 escape analysis 上也往前推了一步，做法是 conditional escape analysis（CEA）。過去 JIT 判斷一個物件會不會逃逸，遇到稍微複雜一點的控制流就容易舉手投降，乾脆假設會逃逸，把它配置在 heap 上——保守但安全，代價是 GC 要多背一個物件。CEA 換了個問法：不是單純判斷「會不會逃逸」，而是去記錄 fast-path 配置跟後面 guard 檢查用到的那個 enumerator 區域變數之間的關係。這讓 JIT 能在更複雜的分支下依然證明「這個配置到不了會讓它逃逸的 fallback 呼叫路徑」——證明成立，就把它直接放上 stack，連帶讓一整段 foreach 迴圈不再碰 GC。foreach 走 IEnumerable&lt;int&gt; 的一個 benchmark 量出這個差距：.NET 10 配置 32 bytes、耗時 13.874 ns；.NET 11 配置直接歸零，耗時降到 2.674 ns。</p>
+
+  <figure class="vg-w-morph-enumerator-escape" data-mobile="static" data-svg-scroll="640">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M9 9V4.5a2.5 2.5 0 0 1 5 0V9"/><rect x="3" y="9" width="18" height="12" rx="2"/>
+      </svg>
+      <span>按「搬到 stack」看 enumerator 的位置怎麼變 · 一次點擊</span>
+    </p>
+    <style>
+      .vg-w-morph-enumerator-escape { margin: var(--s-4) 0; }
+      .vg-w-morph-enumerator-escape svg.vg-w-morph-enumerator-escape-main { width: 100%; height: auto; min-width: 640px; }
+      .vg-w-morph-enumerator-escape .controls { margin: var(--s-2) 0; }
+      .vg-w-morph-enumerator-escape button { font-family: var(--sans); font-size: var(--fs-sm); padding: 6px 14px; min-height: 44px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); cursor: pointer; }
+      .vg-w-morph-enumerator-escape button:hover { border-color: var(--accent); color: var(--accent-text); }
+      .vg-w-morph-enumerator-escape .enumerator { fill: var(--accent); transform: translate(112px, 78px); transition: transform 700ms ease-in-out, fill 700ms; }
+      .vg-w-morph-enumerator-escape.is-stack .enumerator { transform: translate(478px, 150px); fill: var(--sage-deep); }
+      .vg-w-morph-enumerator-escape figcaption { font-family: var(--scribed); font-size: var(--fs-sm); color: var(--muted); }
+    </style>
+
+    <div class="controls" data-vg-controls>
+      <button type="button" data-role="morph-toggle">搬到 stack</button>
+    </div>
+
+    <svg class="vg-w-morph-enumerator-escape-main" viewBox="0 0 720 280" role="img" aria-label="enumerator 從 heap 搬到 stack 的示意圖">
+      <rect x="40" y="40" width="180" height="100" fill="none" stroke="var(--muted-2)" stroke-width="1.5" stroke-dasharray="4,3"/>
+      <text x="50" y="30" fill="var(--muted)" font-family="IM Fell English, serif" font-style="italic" font-size="13">heap（GC 追蹤）</text>
+
+      <rect x="420" y="40" width="240" height="200" fill="none" stroke="var(--ink)" stroke-width="1.5"/>
+      <text x="430" y="30" fill="var(--muted)" font-family="IM Fell English, serif" font-style="italic" font-size="13">stack frame（呼叫端）</text>
+
+      <path class="vg-w-morph-enumerator-escape-route" d="M130 78 Q 300 20 420 90" fill="none" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="3,3"/>
+
+      <rect class="enumerator" x="-7" y="-7" width="14" height="14"/>
+      <text x="50" y="110" fill="var(--ink)" font-family="EB Garamond, serif" font-size="13">enumerator 區域變數</text>
+
+      <text x="40" y="180" fill="var(--muted)" font-family="EB Garamond, serif" font-size="13" data-role="stat-line">.NET 10：32 bytes ／ 13.874 ns（配置在 heap）</text>
+      <text x="420" y="260" fill="var(--muted)" font-family="EB Garamond, serif" font-size="13" data-role="stat-line-2">.NET 11 證明不逃逸後：0 bytes ／ 2.674 ns（直接在 stack）</text>
+    </svg>
+
+    <figcaption>預設畫面（左）是 .NET 10 的保守結果：CEA 無法排除逃逸，物件配置在 heap。按下按鈕，模擬 CEA 證明「配置到不了 fallback 呼叫」之後，同一個 enumerator 直接落在呼叫端的 stack frame 裡，不再需要 GC 追蹤。</figcaption>
+
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        var root = document.querySelector('.vg-w-morph-enumerator-escape');
+        if (!root) return;
+        var btn = root.querySelector('[data-role="morph-toggle"]');
+        var route = root.querySelector('.vg-w-morph-enumerator-escape-route');
+        var A = 'M130 78 Q 300 20 420 90';
+        var B = 'M130 78 Q 300 140 420 150';
+        var toStack = false;
+        btn.addEventListener('click', function () {
+          toStack = !toStack;
+          root.classList.toggle('is-stack', toStack);
+          if (typeof route.animate === 'function') {
+            route.animate(
+              [{ d: "path('" + (toStack ? A : B) + "')" }, { d: "path('" + (toStack ? B : A) + "')" }],
+              { duration: 700, easing: 'ease-in-out', fill: 'forwards' }
+            );
+          } else {
+            route.setAttribute('d', toStack ? B : A);
+          }
+          btn.textContent = toStack ? '搬回 heap' : '搬到 stack';
+        });
+      })();
+    </script>
+  </figure>
+
+  <p>虛擬呼叫跟泛型共享程式碼都是為了不把同一段邏輯抄好幾份而付的代價：CLR 用一次間接跳轉換來程式碼共用，用一份泛型字典換來型別參數不用在編譯期展開成好幾份組合語言。這個代價平常小到感覺不到，但寫在熱路徑裡、被呼叫幾億次，累積起來就不是小事。去虛擬化要做的，是在能證明這裡型別已知、不需要真的查表的少數情況下，把間接跳轉繞過去。</p>
+
+  <p>另一條腿是泛型虛擬方法（GVM）的去虛擬化。虛擬呼叫本來就要多一層跳轉——執行期查表找到真正該呼叫的實作；泛型虛擬方法更麻煩，因為同一份程式碼常常要在多個型別實例之間共用，型別參數要另外傳。有兩個 PR 在拆這層：#122023 先讓 JIT 能對「non-shared」的 GVM 去虛擬化——型別參數編譯期就固定、不需要跨型別共用程式碼的那種情況；#128702 把範圍擴大到「shared」GVM 跟 default interface implementation，涵蓋面更廣。把一個新配置的物件轉型成介面再呼叫其泛型虛擬方法的 benchmark 顯示，去虛擬化後耗時從 6.678 ns 降到 1.764 ns，原本那次配置的 24 bytes 直接消失——物件被 JIT 連帶內聯掉，連配置的理由都不存在了。去虛擬化是連鎖反應的起點：兩次呼叫都被去虛擬化並內聯之後，原本要在執行期才查得到的 <code>Unsafe.SizeOf&lt;T&gt;()</code> 也變成編譯期常數，可以再被摺疊、消去。default interface implementation 這幾年在 C# 生態裡用得越來越多，介面直接帶預設實作，寫起來方便；站在 JIT 的角度，它一樣是一次要查表才能決定該跑哪份程式碼的虛擬呼叫，#122023 跟 #128702 合起來都涵蓋到了。</p>
+
+  <p>delegate 的改動看起來瑣碎，邏輯完全一樣。一個 delegate 物件原本要記住目標物件、方法指標之類的幾個欄位才能在呼叫時找到正確的方法；CoreCLR 這次讓每個 delegate 物件少放一個指標大小的欄位，在 64-bit process 上每個 delegate 省下 8 bytes。省的是物件的重量——closed-instance delegate 的配置從 64 bytes 降到 56 bytes，連帶讓比較兩個 delegate 是否相等、算它的雜湊值這類要碰欄位的操作也跟著變快；文章把這一段的效益歸給更新後的版面讓相等比較與雜湊運算更直接取得需要的方法識別資訊。三個改動的方向一致：讓執行期能表達的東西變多，編譯器就不用什麼都往壞處想。delegate 在 .NET 裡幾乎無所不在——LINQ 的每個 lambda、event 的每個 handler、Func/Action 型別的每一次呼叫底層都是它，欄位減少的效益因此攤在整個生態系的記憶體足跡上。底下這張表把幾組數字放在一起看。</p>
+
+  <figure class="vg-w-table-net11-benchmarks" data-mobile="keep">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m21 16-4 4-4-4"/><path d="M17 20V4"/><path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>
+      </svg>
+      <span>點欄位標題排序 · 4 欄 × 6 列</span>
+    </p>
+    <style>
+      .vg-w-table-net11-benchmarks { margin: var(--s-4) 0; }
+      .vg-w-table-net11-benchmarks table { width: 100%; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-net11-benchmarks thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); cursor: pointer; user-select: none; }
+      .vg-w-table-net11-benchmarks thead th[data-sort] { color: var(--accent-text); }
+      .vg-w-table-net11-benchmarks thead th[data-sort]::after { content: ' \25be'; font-size: 0.7em; }
+      .vg-w-table-net11-benchmarks thead th[data-sort="asc"]::after { content: ' \25b4'; font-size: 0.7em; }
+      .vg-w-table-net11-benchmarks tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); }
+      .vg-w-table-net11-benchmarks td.num { font-variant-numeric: tabular-nums; text-align: right; font-family: "JetBrains Mono", monospace; }
+      .vg-w-table-net11-benchmarks tbody tr:hover td { background: var(--bg-soft); }
+      .vg-w-table-net11-benchmarks caption { text-align: left; caption-side: top; font-family: var(--scribed); font-style: italic; color: var(--muted); font-size: var(--fs-sm); padding: var(--s-1) 0; }
+    </style>
+    <table>
+      <caption>六組真實 benchmark：每一組都是 JIT 在能證明安全時，把一層原本保守的保護拆掉之後量出的結果。</caption>
+      <thead>
+        <tr>
+          <th data-key="name">項目</th>
+          <th data-key="before" class="num">before</th>
+          <th data-key="after" class="num">after</th>
+          <th data-key="ratio" class="num">比例</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>enumerator（foreach）</td><td class="num">13.874 ns ／ 32 B</td><td class="num">2.674 ns ／ 0 B</td><td class="num" data-sortval="0.19">0.19×</td></tr>
+        <tr><td>GVM 去虛擬化（non-shared）</td><td class="num">6.678 ns ／ +24 B</td><td class="num">1.764 ns ／ 0 B</td><td class="num" data-sortval="0.26">0.26×</td></tr>
+        <tr><td>delegate（closed-instance）</td><td class="num">7.395 ns ／ 64 B</td><td class="num">6.844 ns ／ 56 B</td><td class="num" data-sortval="0.88">0.88×</td></tr>
+        <tr><td>delegate Equals</td><td class="num">3.254 ns</td><td class="num">2.215 ns</td><td class="num" data-sortval="0.68">0.68×</td></tr>
+        <tr><td>例外穿越 30 層 async</td><td class="num">51.302 μs ／ 84.2 KB</td><td class="num">10.721 μs ／ 5.71 KB</td><td class="num" data-sortval="0.21">0.21×</td></tr>
+        <tr><td>二進位（10 個串接 async 方法）</td><td class="num">10,752 bytes</td><td class="num">5,632 bytes</td><td class="num" data-sortval="0.52">0.52×</td></tr>
+      </tbody>
+    </table>
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        var root = document.querySelector('.vg-w-table-net11-benchmarks');
+        if (!root) return;
+        var headers = root.querySelectorAll('thead th');
+        var tbody = root.querySelector('tbody');
+        var activeKey = null, asc = true;
+        headers.forEach(function (h, idx) {
+          h.addEventListener('click', function () {
+            var key = h.dataset.key;
+            if (activeKey === key) { asc = !asc; } else { activeKey = key; asc = true; }
+            headers.forEach(function (x) { x.removeAttribute('data-sort'); });
+            h.setAttribute('data-sort', asc ? 'asc' : 'desc');
+            var rows = Array.prototype.slice.call(tbody.querySelectorAll('tr'));
+            rows.sort(function (a, b) {
+              var ac = a.children[idx], bc = b.children[idx];
+              var av = ac.dataset.sortval !== undefined ? Number(ac.dataset.sortval) : ac.textContent.trim();
+              var bv = bc.dataset.sortval !== undefined ? Number(bc.dataset.sortval) : bc.textContent.trim();
+              var cmp;
+              if (typeof av === 'number' && typeof bv === 'number') { cmp = av - bv; }
+              else { cmp = String(av).localeCompare(String(bv)); }
+              return asc ? cmp : -cmp;
+            });
+            rows.forEach(function (r) { tbody.appendChild(r); });
+          });
+        });
+      })();
+    </script>
+  </figure>
+
+  <h2>邊界檢查消除：同一個論點的第三個例證</h2>
+
+  <p>第三條線是陣列與 span 的邊界檢查消除，做法是把 JIT 的範圍分析（range analysis）再收緊一輪，而不是換一種指令排列。以前 JIT 原始碼裡有一段註解坦白承認自己放棄：遇到「!= 某個常數」這種條件，它形容成這給不了區間什麼資訊，乾脆跳過。PR #121273 把這段放棄改寫成檢查：這個被排除的常數是不是剛好卡在追蹤範圍的邊界上，是的話就把範圍收緊——這對 C# 的 list pattern 特別有用，因為 pattern matching 產生的分支經常正好長這個樣子。位元運算這邊，PR #122263 補了一段：遇到用遮罩位元欄位算查表索引，像 <code>((b &amp; 0x03) &lt;&lt; 4) | ((b &amp; 0xf0) &gt;&gt; 4)</code> 這種寫法，JIT 現在能從兩個用 OR 接起來的位元運算各自推出上界，證明結果落在小查表的合法範圍內。邊界檢查，就這樣被拿掉了。</p>
+
+  <p>另外兩個改動處理的是守衛與傳播順序。PR #125056 讓 <code>(uint)i &lt; span.Length</code> 這種把 index 轉成 unsigned 再比較的寫法，在 true 分支裡記住 index 的精確範圍，連 <code>i - 1</code> 這種衍生運算式的邊界檢查都能一併省掉。PR #121527 則處理同一個 basic block 內部的順序：以前 assertion 要跨 block 才會被記住，新版讓 JIT 依執行順序把同一個 block 裡前面產生的 assertion 往後帶，後面同一個索引的存取就不用重新檢查一次。四個改動分別由不同的 PR 送進 JIT：#121273、#122263、#125056、#121527。</p>
+
+  <figure class="vg-w-pop-bounds-check" data-mobile="keep">
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <circle cx="12" cy="12" r="9"/><path d="M12 16v-4"/><path d="M12 8h.01"/>
+      </svg>
+      <span>底線詞可 hover 或 tap 看細節 · 3 個範圍分析技巧</span>
+    </p>
+    <style>
+      .vg-w-pop-bounds-check { position: relative; margin: var(--s-4) 0; }
+      .vg-w-pop-bounds-check p.lede { font-family: var(--serif); font-size: var(--fs-sm); line-height: 1.8; }
+      .vg-w-pop-bounds-check .term { position: relative; anchor-name: --vg-term; text-decoration: underline dotted var(--muted); cursor: help; color: var(--accent-text); }
+      .vg-w-pop-bounds-check .pop {
+        position: absolute;
+        top: 100%;
+        left: 0;
+        margin-top: 4px;
+        padding: var(--s-1) var(--s-2);
+        background: var(--bg-soft);
+        border: 1px solid var(--line);
+        font-family: var(--scribed);
+        font-size: var(--fs-sm);
+        color: var(--ink-soft);
+        max-width: 34ch;
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 120ms;
+        z-index: 2;
+      }
+      .vg-w-pop-bounds-check .term:hover + .pop,
+      .vg-w-pop-bounds-check .term:focus + .pop { opacity: 1; pointer-events: auto; }
+      @supports (position-anchor: --x) {
+        .vg-w-pop-bounds-check .pop { position-anchor: --vg-term; top: anchor(bottom); left: anchor(start); margin-top: var(--s-1); }
+      }
+    </style>
+    <p class="lede">三個代表性的範圍分析改動：<span class="term" tabindex="0">!= 常數收斂</span><span class="pop">遇到「index != 某常數」的守衛，檢查這個常數是否卡在追蹤區間的邊界上，是的話就把區間收緊——對 C# list pattern 產生的分支特別有效。</span>、<span class="term" tabindex="0">位元運算上界組合</span><span class="pop">遇到用遮罩位元欄位算查表索引（如 (b&amp;0x03)&lt;&lt;4 | (b&amp;0xf0)&gt;&gt;4），JIT 能把兩個 OR 起來的位元運算各自的上界組合，證明索引落在小查表範圍內。</span>、<span class="term" tabindex="0">unsigned 守衛範圍記憶</span><span class="pop">(uint)i &lt; span.Length 這種守衛成立後，JIT 記住 true 分支裡 index 落在 [0, int.MaxValue-1]，連 i-1 這種衍生運算式的邊界檢查也能省掉。</span>——三個改動各自處理不同的程式碼形狀，但都是同一種手法：讓 JIT 在證明範圍安全時走得更遠一點。</p>
+  </figure>
+
+  <p>邊界檢查本身不貴——一次比較加一次分支，但陣列與 span 存取在迴圈裡通常是最熱的路徑，一次疊代省一次比較，乘上百萬次疊代就是可觀的差距。範圍分析要做的事情，是在編譯期就把這次存取一定安全的證明鋪好，讓 JIT 敢把這次比較連同分支一起刪掉。</p>
+
+  <p>三條線碰的是完全不同的東西——async 呼叫鏈、enumerator、虛擬呼叫、delegate、陣列存取——方法論卻是同一套：先讓 JIT 能證明某個原本保守的假設其實不成立，再把因為那個假設而多付的成本整段拆掉。文章對這個方法論的形容很直接：真正的效能工作就是這樣，一路累積、一個疊一個，直到整體在量測上明顯不一樣。這也是為什麼這份整理裡找不到一條「把某個迴圈重寫得更快」的條目——動的從頭到尾都是抽象本身該擺在哪裡。</p>
+
+  <p>這些優化都不是免費的：JIT 要在編譯這段程式碼的當下多跑一輪分析——escape analysis 追蹤配置與 guard 之間的關係，range analysis 沿著 block 把 assertion 收攏，devirtualization 先確認型別是否真的已知。分析證得出來就拆抽象，證不出來就退回原本保守的路徑，不會讓程式跑錯，只是少拿到那一段效能。以 enumerator 為例，CEA 證不出「配置到不了 fallback 呼叫」的情況，物件還是照舊配置在 heap，跟 .NET 10 的行為一樣；GVM 也是同理，non-shared 跟 shared 兩種案例各自有各自的 PR 在處理，本身就是承認並非所有泛型虛擬呼叫都能一視同仁去虛擬化；邊界檢查那邊，範圍分析證不出安全時，JIT 一樣照舊留著那次比較與分支，不會冒險拿掉。runtime async 目前仍是要靠 <code>runtime-async=on</code> 這個編譯器 feature 手動打開，還不是預設值——文章沒有談要不要在正式環境打開這個開關，只確定它現在是選擇性的。</p>
+
+  <p class="vg-deep-closer"><strong>The unlock</strong>：寫法完全不用變——async/await 照舊寫、foreach 照舊寫、interface 照舊呼叫，JIT 能證明安全時，直接把 state machine、heap 配置、間接跳轉、邊界檢查這些保守假設拆掉，效能差距是搬掉抽象換來的，不是換一種寫法換來的。升級之後值得檢查的是這些條件——同步完成、不逃逸、型別已知、範圍可證——在自己的服務裡成立的比例有多高，那決定了實際能吃到多少這份差距。</p>
+</div>
