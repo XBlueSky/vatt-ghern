@@ -1,0 +1,747 @@
+{
+  "output_path": "src/posts/2026/09/16/deep-dotnet11-runtime-async.html",
+  "spine": [
+    "1. .NET 11 把 async 狀態機的降級從 C# 編譯器搬進 JIT——編譯器只留最小 IL 加 metadata 標記,舊模型每個 async 方法要生成的 entry method、state-machine 型別、captured-state 欄位、MoveNext body 全部消失。",
+    "2. 同步完成路徑因此變得零配置:一條 async 呼叫鏈若每一層都同步完成,JIT 直接呼叫對方的 AsyncCall 變體、拿回一個值,不必materialize 任何 Task 物件——兩層鏈結實測快三倍以上。",
+    "3. 例外穿過多層 async 的成本結構整個改寫:舊模型每層各自 throw/catch/store 一次,新模型只有 dispatch loop 做一次 catch、走過沒有 handler 的 continuation record——30 層深的測試從 51.302 μs/84.2 KB 降到 10.721 μs/5.71 KB。",
+    "4. 二進位變小是同一個原因的副作用:不再需要為每個 async 方法生成獨立的 state-machine 型別與欄位,十個串接 async 方法的組件從 10,752 bytes 降到 5,632 bytes,約略減半。",
+    "5. 同一份 release 的第二條線是 JIT 的 deabstraction/escape analysis:conditional escape analysis 讓 foreach 用到的 enumerator 從『先假設會逃逸而配置在 heap』改成能證明不逃逸就直接配置在 stack。",
+    "6. GVM devirtualization 與 delegate 減少一個指標欄位是同一種操作的兩個例子——把執行期才能解決的間接呼叫或欄位,在能證明安全時直接在 JIT 階段拆掉、變成直接呼叫或省掉記憶體。",
+    "7. 邊界檢查消除那輪範圍分析(!= 常數收斂、逐區塊 assertion 傳遞、位元運算上界組合、unsigned 守衛)是第三個例證,三條線收在同一個論點:.NET 11 的加速主要來自把抽象拆掉,不是把迴圈寫快。"
+  ],
+  "sources": [
+    {
+      "url": "https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-11/",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": "2026-09",
+      "perspective": {
+        "mechanism": "runtime async 把 async 狀態機的降級從編譯期搬到執行期,由 JIT 依實際呼叫模式決定同步完成走直接值回傳、非同步完成才鋪 continuation;deabstraction 這條線(enumerator stack 化、GVM devirtualize、delegate 減欄位)則是 JIT 在能證明安全時把間接呼叫、heap 配置直接拆掉。",
+        "tradeoff": "把決策從編譯期挪到執行期,代價是 JIT 要做更多分析(escape analysis、range analysis、devirtualization 條件檢查),換來的是不用再為『大多數呼叫其實同步完成』這種常見情境預先付 Task 配置與例外重複攔截的成本;這些優化都要求 JIT 能先『證明』安全(不逃逸、範圍不重疊、型別已知),證明失敗就退回舊行為。",
+        "reader_use": "要升級到 .NET 11 且大量使用 async 鏈式呼叫、foreach over IEnumerable、delegate 密集或有大量邊界檢查的熱路徑的工程師,可以預期不必改程式碼就拿到這些收益;runtime async 目前是要用 <Features>$(Features);runtime-async=on</Features> 選擇性開啟的編譯器 feature,升級前要確認這個開關。"
+      }
+    }
+  ],
+  "notes": [
+    {
+      "id": "n01",
+      "url": "https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-11/",
+      "quote": "The compiler has to make decisions before the program runs about the state-machine layout, which values might need to survive",
+      "hedge": "asserted",
+      "interpretation": "描述舊模型的核心限制:編譯期就要把「state machine 長什麼樣、哪些值要活過 await」定死,這正是 runtime async 想拆掉的那層抽象。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n02",
+      "url": "https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-11/",
+      "quote": "Rather than the C# compiler being responsible for the transformation, the JIT is.",
+      "hedge": "asserted",
+      "interpretation": "runtime async 的核心變化:async 狀態機降級這件事的責任方從編譯器換成 JIT,發生在執行期而非編譯期。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n04",
+      "url": "https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-11/",
+      "quote": "If every awaiter is already complete, `MoveNext` can run all the way through synchronously.",
+      "hedge": "asserted",
+      "interpretation": "同步完成路徑「零配置」的機制基礎:awaiter 已完成時執行不會真的懸掛,直接往下跑完,不需要開發者寫任何特殊程式碼去觸發這條快路徑。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n05",
+      "url": "https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-11/",
+      "quote": "more than 3x faster and avoids both intermediate task allocations.",
+      "hedge": "asserted",
+      "interpretation": "兩層同步完成的 async 呼叫鏈,runtime async 版本比舊版快三倍以上,而且沒有產生中介的 Task 配置。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n06",
+      "url": "https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-11/",
+      "quote": "An exception crossing ten such async helpers can therefore be thrown, caught, and stored ten times even though none of the source methods has an explicit handler.",
+      "hedge": "asserted",
+      "interpretation": "舊模型例外傳遞的病理:每一層產生的 state machine 各自有 try/catch 包裝,例外會被重複攔截、儲存十次,即使沒有一層真的要處理它。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n07",
+      "url": "https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-11/",
+      "quote": "51.302 μs, 84.2 KB allocated",
+      "hedge": "asserted",
+      "interpretation": "30 層深例外測試中,舊的編譯器 state-machine 模型耗時 51.302 微秒、配置 84.2 KB。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n08",
+      "url": "https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-11/",
+      "quote": "10.721 μs, 5.71 KB allocated",
+      "hedge": "asserted",
+      "interpretation": "同一個 30 層測試在 runtime async 下降到 10.721 微秒、5.71 KB 配置——時間降到約五分之一,配置降到約十五分之一。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n09",
+      "url": "https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-11/",
+      "quote": "Compiler: 10,752 bytes (1.00); Runtime async: 5,632 bytes (0.52)",
+      "hedge": "asserted",
+      "interpretation": "十個串接 async 方法的測試組件,編譯器產生的 state-machine 版本二進位是 10,752 bytes,runtime async 版本是 5,632 bytes,約略減半。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n10",
+      "url": "https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-11/",
+      "quote": "CEA instead records the relationship between the fast-path allocation and the enumerator local tested by the later guards.",
+      "hedge": "asserted",
+      "interpretation": "conditional escape analysis(CEA)的機制:不是單純判斷「這個物件會不會逃逸」,而是記錄 fast-path 配置跟後面 guard 檢查用的 enumerator 區域變數之間的關係,讓 JIT 在更複雜的控制流程下仍能證明不逃逸。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n11",
+      "url": "https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-11/",
+      "quote": "ReadOnlyInstance: .NET 10.0 allocated 32 bytes at 13.874 ns; .NET 11.0 eliminated the allocation at 2.674 ns (0.19× ratio)",
+      "hedge": "asserted",
+      "interpretation": "foreach 走 IEnumerable<int> 的 enumerator,.NET 10 因為編譯器無法證明不逃逸而配置在 heap(32 bytes、13.874 ns),.NET 11 靠 CEA 把它改成 stack 配置,時間降到 2.674 ns、配置歸零。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n12",
+      "url": "https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-11/",
+      "quote": "can't reach the fallback calls, so it can be stack-allocated.",
+      "hedge": "asserted",
+      "interpretation": "stack 配置成立的條件:JIT 要先證明 foreach 迴圈裡配置的 enumerator 不可能走到會讓它逃逸的 fallback 呼叫路徑,才敢把它放到 stack 上。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n13",
+      "url": "https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-11/",
+      "quote": "the JIT to devirtualize non-shared GVMs",
+      "hedge": "asserted",
+      "interpretation": "dotnet/runtime#122023 讓 JIT 能對「non-shared」的泛型虛擬方法(GVM)做去虛擬化——型別參數編譯期就固定、不需要跨型別共用程式碼的情況。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n14",
+      "url": "https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-11/",
+      "quote": "shared GVMs and default interface implementations",
+      "hedge": "asserted",
+      "interpretation": "dotnet/runtime#128702 把去虛擬化範圍擴大到「shared」GVM(多個型別實例共用同一份泛型程式碼)跟 default interface method 的情況。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n15",
+      "url": "https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-11/",
+      "quote": "NonShared: 6.678 ns → 1.764 ns (0.26× ratio); 24 B allocation eliminated",
+      "hedge": "asserted",
+      "interpretation": "把一個新配置的物件轉型成介面再呼叫其泛型虛擬方法,devirtualize 後耗時剩不到三成、且該次配置的 24 bytes 完全消失,因為物件被 JIT 直接內聯掉。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n16",
+      "url": "https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-11/",
+      "quote": "devirtualizes and inlines both calls. That in turn exposes `Unsafe.SizeOf<T>()` as a constant.",
+      "hedge": "asserted",
+      "interpretation": "去虛擬化不是終點而是連鎖反應的起點:兩次呼叫都被去虛擬化並內聯之後,原本要在執行期才知道的 Unsafe.SizeOf<T>() 也變成編譯期常數,可以進一步被摺疊、消去。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n17",
+      "url": "https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-11/",
+      "quote": "removing one pointer-sized field from every delegate object. That saves 8 bytes per delegate in a 64-bit CoreCLR process.",
+      "hedge": "asserted",
+      "interpretation": "CoreCLR 讓每個 delegate 物件少放一個指標大小的欄位,在 64-bit process 上每個 delegate 省 8 bytes——delegate 本身變小,不是呼叫變快。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n18",
+      "url": "https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-11/",
+      "quote": "ClosedInstance: 7.395 ns → 6.844 ns; 64 B → 56 B (0.88× allocation ratio)",
+      "hedge": "asserted",
+      "interpretation": "少一個欄位讓 closed-instance delegate 配置從 64 bytes 降到 56 bytes、建立時間略降。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n19",
+      "url": "https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-11/",
+      "quote": "That's how real performance work goes, accumulating gain after gain, each compounding on the last, until the whole thing is measurably, provably louder.",
+      "hedge": "asserted",
+      "interpretation": "文章對自己方法論的總結:不是靠單一大絕招,而是一連串小改動疊加——拿來收束「.NET 11 的加速來自拆抽象、不是把迴圈寫快」這個論點很貼切。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n20",
+      "url": "https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-11/",
+      "quote": "We have a != assertion, but it doesn't tell us much about the interval. So just skip it.",
+      "hedge": "asserted",
+      "interpretation": "範圍分析改進前,JIT 原始碼裡的舊註解:遇到「!= 常數」這種條件直接放棄收斂範圍;PR #121273 讓它改成檢查這個排除的常數是不是恰好卡在區間邊界,若是就能收斂,這對 C# list pattern 特別有用。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n21",
+      "url": "https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-11/",
+      "quote": "((b & 0x03) << 4) | ((b & 0xf0) >> 4)",
+      "hedge": "asserted",
+      "interpretation": "位元運算範圍分析(PR #122263)舉的例子:用遮罩位元欄位算出一個查表索引,JIT 現在能從兩個 OR 起來的位元運算個別推出上界,證明結果落在小查表的合法範圍內,免除邊界檢查。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n22",
+      "url": "https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-11/",
+      "quote": "(uint)i < span.Length",
+      "hedge": "asserted",
+      "interpretation": "PR #125056 處理的守衛模式:把 index 轉成 unsigned 再跟 span.Length 比較,是常見的「同時擋掉負數與超界」寫法,JIT 現在能記住 true 分支裡 index 的精確範圍,連 i-1 這種衍生運算式的邊界檢查也能一併消掉。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n24",
+      "url": "https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-11/",
+      "quote": "The PR fixed it to walk the current block's tree in execution order, accumulating assertions as it went.",
+      "hedge": "asserted",
+      "interpretation": "PR #121527 讓 JIT 在同一個 basic block 內,依執行順序把前面產生的 assertion 一路累積下去用,不必等到跨 block 才能用得到——同一個 block 裡前面剛做過的邊界檢查所建立的 assertion,後面同一個 block 的存取就能直接受益。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n25",
+      "url": "https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-11/",
+      "quote": "After a real suspension, one dispatch-loop catch walks past continuation records that have no handler and faults the observable root task once.",
+      "hedge": "asserted",
+      "interpretation": "runtime async 底下例外的處理路徑:一旦真的發生懸掛,只由單一個 dispatch loop 的 catch 走過那些沒有 handler 的 continuation record,最後在外部看得到的 root task 上標記一次失敗——對應舊模型每層各自 catch、存一次的病理。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n26",
+      "url": "https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-11/",
+      "quote": "The C# compiler emits a much smaller suspension-aware IL contract for each eligible `async` method and marks the method as `async` in metadata.",
+      "hedge": "asserted",
+      "interpretation": "runtime async 底下 C# 編譯器實際吐出的東西:一份小得多、帶著懸掛語意的 IL 合約,並在 metadata 裡把方法標成 async,真正的降級留給 JIT 在執行期做。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n27",
+      "url": "https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-11/",
+      "quote": "DelegateEquals: 3.254 ns / 2.215 ns",
+      "hedge": "asserted",
+      "interpretation": "少一個欄位的 delegate 在 Equals 這種要比較欄位內容的操作上也變快,從 3.254 ns 降到 2.215 ns,因為要比對的欄位少了一個。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n28",
+      "url": "https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-11/",
+      "quote": "Rather, it gives the JIT enough information to avoid materializing some task objects that existed only to carry a result from one async method directly into the next.",
+      "hedge": "asserted",
+      "interpretation": "舊模型會材化出一批 Task 物件,唯一的作用只是把結果從一個 async 方法直接搬到下一個;runtime async 讓 JIT 有足夠資訊避免生出這些純粹搬運用的 Task。文章沒有給出這類多餘配置對 GC 或 QPS 的量化影響,只描述這個材化行為本身。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n23",
+      "url": "https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-11/",
+      "quote": "<Features>$(Features);runtime-async=on</Features>",
+      "hedge": "asserted",
+      "interpretation": "目前 runtime async 是要靠這個編譯器 feature 開關選擇性啟用,不是 .NET 11 的預設行為。",
+      "timeliness": "annual"
+    }
+  ],
+  "claims": [
+    {
+      "id": "c01",
+      "claim_text": "合計 51.302 微秒、配置 84.2 KB",
+      "location": "vg-deep-opener（hero）",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n07"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Re-fetched exception benchmark table: \"Depth 30, Yield False, Classic: 51.302 μs, 84.2 KB allocated\".",
+      "note": "First-party Microsoft benchmark; single-source vendor figure reported in the hero.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c02",
+      "claim_text": "同一組測試掉到 10.721 微秒、5.71 KB",
+      "location": "vg-deep-opener（hero）",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n08"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Re-fetched table row: \"Depth 30, Yield False, ... Runtime: 10.721 μs, 5.71 KB allocated\".",
+      "note": "Source also has a Yield=True row (65.974 / 11.254 μs); the post's figures are the Yield=False row and are not mislabelled.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c03",
+      "claim_text": "runtime async 目前要靠 runtime-async=on 這個編譯器 feature 開關選擇性打開，還不是預設行為",
+      "location": "第一段與結尾倒數第二段",
+      "type": "attribution",
+      "load": "high",
+      "note_ids": [
+        "n23"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Source gives the switch verbatim and says \"In .NET 11, application code opts in with a compiler feature switch\" plus \"My hope is that it'll be on by default starting in .NET 12.\"",
+      "note": "Not-yet-default is supported by the author's own hope for .NET 12. Timeliness annual — switch status can change next release.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c04",
+      "claim_text": "編譯器不再自己動手轉換……真正的降級留給 JIT 在執行期依實際發生的事去做",
+      "location": "第一段",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [
+        "n02"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "\"Rather than the C# compiler being responsible for the transformation, the JIT is.\"",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c05",
+      "claim_text": "編譯期就得把 state machine 的形狀定案",
+      "location": "第一段",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n01"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "\"The compiler has to make decisions before the program runs about the state-machine layout, which values might need to survive, how many awaiter fields are required...\"",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c06",
+      "claim_text": "如果一路往下每一層的 awaiter 都已經完成，MoveNext 可以直接同步跑到底",
+      "location": "H2「runtime async」",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [
+        "n04"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "\"If every awaiter is already complete, `MoveNext` can run all the way through synchronously.\"",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c07",
+      "claim_text": "兩層互相呼叫、全部同步完成的測試裡，runtime async 版本比舊版快三倍以上，而且完全沒有中介的 Task 配置",
+      "location": "H2「runtime async」",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n05"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "\"The synchronously completing chain is more than 3x faster and avoids both intermediate task allocations.\" Benchmark rows: ClassicCompleted 21.221 ns / 144 B; RuntimeCompleted 6.151 ns / 0 B.",
+      "note": "The 144 B to 0 B figures are in the source and consistent with the post's wording; the post does not quote them, so no drift.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c08",
+      "claim_text": "一個例外如果要穿過十層這樣的 async helper 往上傳……也會被個別丟出、接住、存起來整整十次",
+      "location": "H2「例外穿過多層 async」",
+      "type": "attribution",
+      "load": "high",
+      "note_ids": [
+        "n06"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "\"An exception crossing ten such async helpers can therefore be thrown, caught, and stored ten times even though none of the source methods has an explicit handler.\"",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c09",
+      "claim_text": "runtime async 把這個責任收回到單一個 dispatch loop：例外只在最外層被接住一次……",
+      "location": "H2「例外穿過多層 async」",
+      "type": "causal",
+      "load": "high",
+      "note_ids": [
+        "n25"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Round 2 re-fetched and located n25 verbatim: the source sentence ends \"...and after a real suspension, one dispatch-loop catch walks past continuation records that have no handler and faults the observable root task once.\" Each prose element maps to source text and none exceeds it.",
+      "note": "Round 1 was a trace failure (prose accurate, binding missing). Round 2 confirms n25 is a contiguous substring of the source truncated at a clause boundary; the dropped prefix describes the synchronous path as having zero intermediate catches, so the truncation does not inflate. Trace failure closed.",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c10",
+      "claim_text": "時間掉到約五分之一，配置掉到約十五分之一",
+      "location": "H2「例外穿過多層 async」",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n07",
+        "n08"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Arithmetic over the verified figures: 10.721/51.302 = 0.209 and 5.71/84.2 = 1/14.7. Both 約-hedged statements hold.",
+      "note": "Corrected during this run from an earlier 「約六分之一」, which the arithmetic does not support.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c11",
+      "claim_text": "十個串接 async 方法的測試 assembly……編譯器版本是 10,752 bytes，runtime async 版本是 5,632 bytes",
+      "location": "H2「二進位變小的原因」",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n09"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Table: \"Compiler: 10,752 bytes (1.00)\" / \"Runtime async: 5,632 bytes (0.52)\" for a sample with ten Task-returning async methods.",
+      "note": "「幾乎打對折」 matches the source's 0.52 ratio.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c12",
+      "claim_text": "只在 metadata 裡把方法標成 async、吐出精簡的 IL",
+      "location": "第一段",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n26",
+        "n02"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Round 2 confirms n26 is verbatim and complete: \"The C# compiler emits a much smaller suspension-aware IL contract for each eligible `async` method and marks the method as `async` in metadata.\"",
+      "note": "Round 1 was a trace failure. Round 2 notes the prose's 「只」 is licensed by the already-verified n02, and 「精簡的 IL」 is weaker than the source's \"much smaller\" — a deflation, not an inflation. Trace failure closed.",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c13",
+      "claim_text": "這個效果如果應用在 Native AOT 這類需要縮小啟動映像的場景，合理的推測是影響會更明顯",
+      "location": "H2「二進位變小的原因」",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": "No source passage on Native AOT interaction surfaced in three extraction passes; the text marks itself as inference with 「合理的推測是」.",
+      "note": "Legitimately marked inference per 出處四態.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c14",
+      "claim_text": "CEA 換了個問法……去記錄 fast-path 配置跟後面 guard 檢查用到的那個 enumerator 區域變數之間的關係",
+      "location": "H2「Deabstraction 第二條線」",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n10"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "\"CEA instead records the relationship between the fast-path allocation and the enumerator local tested by the later guards.\"",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c15",
+      "claim_text": "證明成立，就把它直接放上 stack",
+      "location": "H2「Deabstraction 第二條線」",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [
+        "n12"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "\"in that clone, the object can't reach the fallback calls, so it can be stack-allocated and often promoted into separate scalar locals.\"",
+      "note": "n12's quote is a truncation of the full sentence; the omitted clause does not change strength or meaning.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c16",
+      "claim_text": ".NET 10 配置 32 bytes、耗時 13.874 ns；.NET 11 配置直接歸零，耗時降到 2.674 ns",
+      "location": "H2「Deabstraction 第二條線」／morph widget／benchmark 表",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n11"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "ReadOnlyInstance benchmark: .NET 10.0 13.874 ns / 32 B; .NET 11.0 2.674 ns / 0 B; ratio 0.19x matching the table row.",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c17",
+      "claim_text": "#122023 先讓 JIT 能對 non-shared 的 GVM 去虛擬化",
+      "location": "H2「Deabstraction 第二條線」",
+      "type": "attribution",
+      "load": "high",
+      "note_ids": [
+        "n13"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "dotnet/runtime#122023 is cited as the PR that \"enables the JIT to devirtualize non-shared GVMs\" — PR id and behaviour match, not transposed.",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c18",
+      "claim_text": "#128702 把範圍擴大到 shared GVM 跟 default interface implementation",
+      "location": "H2「Deabstraction 第二條線」",
+      "type": "attribution",
+      "load": "high",
+      "note_ids": [
+        "n14"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "dotnet/runtime#128702 \"extends that support to shared GVMs and default interface implementations\".",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c19",
+      "claim_text": "去虛擬化後耗時從 6.678 ns 降到 1.764 ns，原本那次配置的 24 bytes 直接消失",
+      "location": "H2「Deabstraction 第二條線」／benchmark 表",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n15"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "GVM benchmark: NonShared 6.678 ns to 1.764 ns, 24 B allocation eliminated; source: \".NET 11 devirtualizes and inlines the call, eliminating the box and its 24-byte allocation.\"",
+      "note": "Source also lists a Shared row at 7.166 ns; the post labels its row non-shared, the correct pairing for 6.678 ns.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c20",
+      "claim_text": "原本要在執行期才查得到的 Unsafe.SizeOf<T>() 也變成編譯期常數",
+      "location": "H2「Deabstraction 第二條線」",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [
+        "n16"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "\"That in turn exposes `Unsafe.SizeOf<T>()` as a constant and proves that the short-lived `Processor` doesn't need to be allocated at all.\"",
+      "note": "n16 stitches two adjacent source sentences; both halves are verbatim, so trivially reformatted rather than fabricated.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c21",
+      "claim_text": "CoreCLR 這次讓每個 delegate 物件少放一個指標大小的欄位，在 64-bit process 上每個 delegate 省下 8 bytes",
+      "location": "H2「Deabstraction 第二條線」",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n17"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Source (dotnet/runtime#99200) \"removing one pointer-sized field from every delegate object\" and \"saves 8 bytes per delegate in a 64-bit CoreCLR process\".",
+      "note": "The post omits the PR id here, which is safer than citing it wrongly.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c22",
+      "claim_text": "closed-instance delegate 的配置從 64 bytes 降到 56 bytes",
+      "location": "H2「Deabstraction 第二條線」／benchmark 表",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n18"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "ClosedInstance benchmark: 7.395 ns to 6.844 ns; 64 B to 56 B, matching the table row's 0.88x.",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c23",
+      "claim_text": "delegate Equals ／ 3.254 ns ／ 2.215 ns",
+      "location": "vg-w-table-net11-benchmarks 表格第四列",
+      "type": "number",
+      "load": "low",
+      "note_ids": [
+        "n27",
+        "n17",
+        "n18"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Round 2 reached the delegate benchmark output on two fetches: DelegateEquals 3.254 ns (.NET 10.0) and 2.215 ns (.NET 11.0), ratio 0.68, exactly matching the widget row including its data-sortval.",
+      "note": "Round 1 was a trace failure on the table row. Round 2 confirms the figures and notes that n27 condenses a BenchmarkDotNet two-row table into one line — the same house style as six other accepted benchmark notes in this ledger, non-blocking. The checker also flagged, out of scope, an unmarked causal because-clause in the adjacent prose; that clause has been rewritten to the attribution the source actually gives.",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c24",
+      "claim_text": "PR #121273 把這段放棄改寫成檢查……這對 C# 的 list pattern 特別有用",
+      "location": "H2「邊界檢查消除」",
+      "type": "attribution",
+      "load": "high",
+      "note_ids": [
+        "n20"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Old JIT comment verbatim: \"We have a != assertion, but it doesn't tell us much about the interval. So just skip it.\" attached to dotnet/runtime#121273; source adds \"C# list patterns, introduced in C# 11, generate just such comparison sequences.\"",
+      "note": "PR id and behaviour correctly paired; the list-pattern link is the source's own.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c25",
+      "claim_text": "PR #122263 補了一段：遇到用遮罩位元欄位算查表索引",
+      "location": "H2「邊界檢查消除」",
+      "type": "attribution",
+      "load": "high",
+      "note_ids": [
+        "n21"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "dotnet/runtime#122263 is the PR attached to the masked-bitfield indexing pattern in the bounds-check section.",
+      "note": "Expression reproduced character-for-character; PR id not transposed with #121273.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c26",
+      "claim_text": "PR #125056 讓 (uint)i < span.Length 這種守衛……連 i - 1 這種衍生運算式的邊界檢查都能一併省掉",
+      "location": "H2「邊界檢查消除」",
+      "type": "attribution",
+      "load": "high",
+      "note_ids": [
+        "n22"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "dotnet/runtime#125056 is the unsigned-guard PR; source says the pre-existing gap \"could leave bounds checks on expressions like `i - 1` in place.\"",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c27",
+      "claim_text": "PR #121527 則處理同一個 basic block 內部的順序",
+      "location": "H2「邊界檢查消除」",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n24"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "dotnet/runtime#121527 is the PR for this change; source wording: \"The PR fixed it to walk the current block's tree in execution order, accumulating assertions as it went.\"",
+      "note": "Round 1 noted n24's quote was a paraphrase; the fix round replaced it with the source's actual sentence.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c28",
+      "claim_text": "文章對這個方法論的形容很直接：真正的效能工作就是這樣，一路累積、一個疊一個",
+      "location": "結尾第三段",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n19"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "\"That's how real performance work goes, accumulating gain after gain, each compounding on the last, until the whole thing is measurably, provably louder.\"",
+      "note": "Rendered as indirect speech and drops the source's \"louder\" metaphor; that is translation, not inflation.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c29",
+      "claim_text": "GC 壓力會隨著 QPS 線性疊上去",
+      "location": "H2「runtime async」末段",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [
+        "n28"
+      ],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "deflated",
+      "evidence": "Round 2 confirms n28 verbatim and complete, and confirms the inference marker now sits on the sentence carrying the unsupported claim: the paragraph opens on the grounded n28 material, prefixes the QPS/GC sentence with 「合理的推測是」, and closes on the n28 fact.",
+      "note": "Round 1 found this stated flatly. The round-1 wording 「線性疊上去」 was also dropped to 「疊上去」, removing a quantitative shape the source never asserts. Unmarked-inference defect closed.",
+      "action": "mark-inferred",
+      "resolution": "marked-inferred"
+    }
+  ],
+  "checked_at": "2026-09-16",
+  "checker_rounds": 2,
+  "coverage": {
+    "candidate_claims": 36,
+    "checked": 29,
+    "dropped_low_load": 7
+  }
+}
