@@ -1,0 +1,495 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">Log 最基本的操作是 append，而 R2 不支援 append。K2 要在這樣的儲存上，蓋出一條有序的 log。</p>
+  <h1 class="vg-post-title">{{ title }}</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p><span class="vg-dropcap">K</span>2 是 Cloudflare 推出的 serverless 事件串流服務，資料放在 R2 物件儲存上，對外提供有順序、可持久保存的 log，使用者不必自己維運 broker 叢集。文章從 RPC 架構的老問題講起：生產端與消費端「must align in scale and in time」。生產端送得比消費端處理得快，或消費端與下游服務暫時不可用，事件就會掉。K2 站在兩端之間，把規模與時間上的耦合拆開，讓寫入和讀取各走各的節奏。文章是 Cloudflare 自己的發表，本文的數字與引語都出自這一份來源，沒有第二方的獨立量測。</p>
+
+  <h2>沒有 append 的儲存層上，log 怎麼成立</h2>
+
+  <p>文章對底層架構只用一句話交代：「Under the hood, K2 implements a partitioned, durable log on top of R2 object storage」。耐久性來自 R2，文章形容為「extremely durable storage (11 9s!)」。K2 自己不做副本複製，也不跑共識協定，這個取捨寫在另一句：「Offloading replication and consensus to the storage layer allows us to make the application layer (K2 in this case) radically simpler, cheaper, and higher performance.」副本與共識由儲存層負責，應用層就只剩 log 本身的語意要處理：資料怎麼切、順序怎麼排、讀取者怎麼領。</p>
+
+  <p>把 log 蓋在物件儲存上，第一個撞到的限制是 R2「does not support appends, the standard operation on a log」。Log 的寫入模型是在尾端不斷追加，物件儲存的寫入模型是整個物件一次寫入。兩者對不上，K2 的處理方式是改變寫入的單位：「we must write complete files, or segments, that are large enough to overcome the cost of writing and reading each one」。K2 寫進 R2 的是一個個完整的 segment 檔，每個 segment 都要夠大，才攤得平單次寫入與單次讀取的成本。</p>
+
+  <p>這句話藏著設計上最重要的耦合：segment 要夠大，事件就得先等人湊齊，所以寫入延遲裡一定有一段是等待。這一點到寫入路徑那一節會量到數字。至於 segment 的實際大小與湊批的等待上限，文章都沒有公開。</p>
+
+  <p>把這兩句併起來看，K2 的設計方向就清楚了：對外是一條 log，落到 R2 的卻是一個個寫完就定型的檔案。要驗證這套設計，讀者能先問三件事，segment 多大、湊批最久等多久、單次寫入的成本怎麼攤。三個答案文章都沒給，所以這一節只能確定方向，還算不出任何一條延遲或成本曲線。</p>
+
+  <p>另一個值得先記下的字是 partitioned。文章說 K2 實作的是「partitioned」log，引用的段落沒有展開 partition 怎麼劃分，也沒有說使用者能不能指定 partition。路線圖列了「Message keys and key-based ordering guarantees」一項，表示按 key 分流與按 key 保序目前還沒有。談順序時會再用到這一點。</p>
+
+  <figure class="vg-w-arch-k2-write-read" data-mobile="keep" data-svg-scroll="720">
+    <style>
+      .vg-w-arch-k2-write-read svg.vg-w-arch-k2-write-read-main { width: 100%; height: auto; max-width: 880px; }
+      .vg-w-arch-k2-write-read .box { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; }
+      .vg-w-arch-k2-write-read .seg { fill: var(--accent); fill-opacity: 0.2; stroke: var(--accent); stroke-width: 1.2; }
+      .vg-w-arch-k2-write-read .sub { fill: var(--sage-deep); fill-opacity: 0.18; stroke: var(--sage-deep); stroke-width: 1.5; }
+      .vg-w-arch-k2-write-read .unk { fill: none; stroke: var(--muted); stroke-width: 1.2; stroke-dasharray: 4 3; }
+      .vg-w-arch-k2-write-read .flow { stroke: var(--muted); stroke-width: 1.6; fill: none; }
+      .vg-w-arch-k2-write-read .t { font-family: EB Garamond, serif; font-size: 14px; fill: var(--ink); }
+      .vg-w-arch-k2-write-read .ts { font-family: EB Garamond, serif; font-size: 13px; fill: var(--ink-soft); }
+      .vg-w-arch-k2-write-read .th { font-family: Manrope, sans-serif; font-size: 13px; fill: var(--accent-text); }
+      .vg-w-arch-k2-write-read .tm { font-family: IM Fell English, serif; font-style: italic; font-size: 12px; fill: var(--muted); }
+      .vg-w-arch-k2-write-read .dot { fill: var(--accent); }
+      .vg-w-arch-k2-write-read .n { font-family: Manrope, sans-serif; font-size: 12px; fill: var(--bg); text-anchor: middle; }
+      .vg-w-arch-k2-write-read ol { margin: var(--s-2) 0 0 0; padding-left: 1.4em; font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink-soft); }
+      .vg-w-arch-k2-write-read li { margin-bottom: 4px; }
+    </style>
+    <svg class="vg-w-arch-k2-write-read-main" viewBox="0 0 720 340" role="img" aria-label="K2 讀寫路徑：Producer 經 HTTP API 或 Worker binding 送進 edge service 的記憶體批次，整批寫成 R2 上的 segment 檔，offset 由 R2 原子操作決定，兩個 subscription 各自讀取">
+      <defs>
+        <marker id="vg-w-arch-k2-write-read-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="var(--muted)" /></marker>
+      </defs>
+      <text x="20" y="24" class="th">K2 讀寫路徑（依文章描述整理）</text>
+
+      <rect class="box" x="20" y="130" width="120" height="80" />
+      <text x="80" y="156" text-anchor="middle" class="t">Producer</text>
+      <text x="80" y="176" text-anchor="middle" class="ts">HTTP API</text>
+      <text x="80" y="194" text-anchor="middle" class="ts">Worker binding</text>
+      <line class="flow" x1="140" y1="170" x2="188" y2="170" marker-end="url(#vg-w-arch-k2-write-read-arrow)" />
+
+      <rect class="box" x="190" y="110" width="150" height="120" />
+      <text x="265" y="138" text-anchor="middle" class="t">edge service</text>
+      <text x="265" y="164" text-anchor="middle" class="ts">記憶體累積寫入</text>
+      <text x="265" y="186" text-anchor="middle" class="ts">短暫等待後</text>
+      <text x="265" y="206" text-anchor="middle" class="ts">整批寫成 segment</text>
+      <line class="flow" x1="340" y1="170" x2="388" y2="170" marker-end="url(#vg-w-arch-k2-write-read-arrow)" />
+
+      <rect class="box" x="390" y="60" width="170" height="240" />
+      <text x="475" y="84" text-anchor="middle" class="t">R2 物件儲存</text>
+      <rect class="seg" x="410" y="100" width="130" height="36" />
+      <text x="475" y="123" text-anchor="middle" class="ts">segment</text>
+      <rect class="seg" x="410" y="148" width="130" height="36" />
+      <text x="475" y="171" text-anchor="middle" class="ts">segment</text>
+      <rect class="seg" x="410" y="196" width="130" height="36" />
+      <text x="475" y="219" text-anchor="middle" class="ts">segment</text>
+      <text x="475" y="256" text-anchor="middle" class="ts">offset 嚴格遞增</text>
+      <text x="475" y="276" text-anchor="middle" class="ts">由 R2 原子操作決定</text>
+
+      <line class="flow" x1="560" y1="130" x2="588" y2="108" marker-end="url(#vg-w-arch-k2-write-read-arrow)" />
+      <line class="flow" x1="560" y1="230" x2="588" y2="252" marker-end="url(#vg-w-arch-k2-write-read-arrow)" />
+
+      <rect class="sub" x="590" y="60" width="120" height="100" />
+      <text x="650" y="88" text-anchor="middle" class="t">subscription A</text>
+      <text x="650" y="112" text-anchor="middle" class="ts">consumer 池</text>
+      <text x="650" y="132" text-anchor="middle" class="ts">lease 5 分鐘</text>
+      <rect class="sub" x="590" y="200" width="120" height="100" />
+      <text x="650" y="228" text-anchor="middle" class="t">subscription B</text>
+      <text x="650" y="252" text-anchor="middle" class="ts">consumer 池</text>
+      <text x="650" y="272" text-anchor="middle" class="ts">ack / nack / extend</text>
+
+      <circle class="dot" cx="80" cy="112" r="11" /><text x="80" y="116" class="n">1</text>
+      <circle class="dot" cx="265" cy="92" r="11" /><text x="265" y="96" class="n">2</text>
+      <circle class="dot" cx="475" cy="40" r="11" /><text x="475" y="44" class="n">3</text>
+      <circle class="dot" cx="475" cy="320" r="11" /><text x="475" y="324" class="n">4</text>
+      <circle class="dot" cx="650" cy="40" r="11" /><text x="650" y="44" class="n">5</text>
+
+      <rect class="unk" x="20" y="302" width="340" height="30" />
+      <text x="30" y="322" class="tm">虛線框：segment 大小、等待時間、原子操作種類，文章未公開</text>
+    </svg>
+    <ol>
+      <li>事件經 HTTP API 或 Worker binding 送入，K2 把資料當成 bytes，編碼格式由應用自己決定。</li>
+      <li>edge service 先把寫入累積在記憶體，等一小段時間讓資料到齊。</li>
+      <li>R2 不支援 append，所以整批事件寫成一個完整的 segment 檔。</li>
+      <li>順序與嚴格遞增的 offset 靠 R2 的原子操作取得，沒有獨立的協調服務。</li>
+      <li>每個 subscription 領到的是一批事件加上 5 分鐘的 lease，之後 ack、nack 或 extend。</li>
+    </ol>
+  </figure>
+
+  <h2>記憶體批次，與約 1 秒的 p99</h2>
+
+  <p>寫入路徑的描述只有兩句：「We do this by first accumulating writes in-memory on an edge service. After waiting a short period for data to arrive, we write all events as a segment file.」生產端這一側，文章說資料經「an HTTP API or Worker binding」送入，K2 把資料當成 bytes，所以「you can use whatever format or encoding makes sense for your application」。K2 不替事件規定 schema，也不解析內容，它比較像一條位元組的管線，格式的責任留在兩端的應用程式。</p>
+
+  <p>bytes 的選擇也有代價。K2 不解析內容，事件的 schema 怎麼演進、編碼怎麼標版本，全由應用自己管；同一條 stream 若中途換了編碼，消費端得自己認得出來。文章只說格式由應用決定，引用的段落沒有談版本管理，團隊導入前最好先把事件格式與版本欄位定下來，這是本文補上的提醒。</p>
+
+  <p>上圖第二步的記憶體批次，是整個設計裡最容易被忽略的一環。事件進到 edge service 之後、寫進 R2 之前，只存在記憶體裡。R2 的 11 個 9 是儲存層的耐久性，從這個層次推得，它描述的是寫進 R2 之後的物件，湊批期間停在記憶體的那一小段不在其中。文章量的是「produce latency at the 99th percentile of response times」，回應時間包含等待湊批與寫入 R2 兩段，所以本文推測回應要等 segment 寫完才回去，耐久性的邊界也因此落在回應之後，而不在請求進來的那一刻；這是推測，文章沒有明說。生產端何時收到成功回應、edge service 在湊批期間失效會怎樣，引用的段落都沒寫。需要確認的團隊，該直接問 Cloudflare 或自己測。</p>
+
+  <p>延遲的數字文章給得很直接：「Writing to object storage is slower than a local disk, and we have to wait for the local batch to accumulate before starting the write. In our initial release of K2, this adds up to about 1 second of produce latency at the 99th percentile of response times.」兩個原因都點明了：物件儲存比本機磁碟慢，加上要等批次湊齊才開始寫。大約 1 秒的 p99 是「initial release」的數字，路線圖另列了「Express tier with lower produce and end-to-end latencies」，連文章自己也把現在的水準當作第一版。給的只有 p99，沒有 p50，也沒有端到端延遲，也就是從生產到被消費者讀到的總時間。</p>
+
+  <p>p99 描述的是尾端。照定義，一百次寫入裡大約有九十九次落在約 1 秒以內，剩下那一次可能更久，文章沒給最大值。對每秒都在寫入的生產端，這個尾端天天都會碰到，逾時與重試的設定以 1 秒為底再留餘裕才合理，這是從定義往下讀的結果。至於 p50 落在哪裡，文章沒量，也就無從得知多數請求實際等多久。</p>
+
+  <p>湊批的等待時間，是延遲與成本之間的旋鈕。segment 越大，單次寫入與單次讀取的成本越容易攤薄，湊滿它也要等更久。K2 在兩端之間選了哪個折衷點，文章沒有公開；這個折衷點加上 R2 寫入本身的耗時，構成了文章承認的那約 1 秒。</p>
+
+  <p>這個延遲適合什麼用途，文章沒列建議情境，這裡依量級先這樣讀：記錄事件、搬運資料、非同步的後處理，這類不卡在使用者請求路徑上的工作負載，大約 1 秒的 p99 多半能接受。要在請求路徑裡同步等寫入完成的場景，就得先問這 1 秒值不值得。</p>
+
+  <p>讀取端有一個對稱的問題。文章把成本寫成「writing and reading each one」，寫與讀都以 segment 為單位計算，但 consumer 領到的「一批事件」是否剛好等於一個 segment，引用的段落沒有說明。兩個名詞各自出現在寫入路徑與消費路徑，彼此的對應關係在文章裡是空白的；本文的圖把它們畫在同一條路徑上，只表示資料的流向，批與 segment 是否一對一，圖上沒有主張。</p>
+
+  <p>edge 這個詞也值得停一下。文章在談為什麼不採用 Kafka 時說，Cloudflare 的 edge「spans a huge number of servers across over 335 cities」。K2 的批次發生在 edge service 上，而 edge 是很多台伺服器，所以同一條 stream 的寫入很可能從不同的伺服器進來，文章沒有直接描述同一條 stream 的寫入路由。各處湊好的批，誰來決定先後？下一節處理這個問題。</p>
+
+  <h2>不靠協調服務的 offset</h2>
+
+  <p>文章對順序的說明只有一句：「We achieve ordering and strictly incrementing offsets using R2's atomic operations without needing a separate coordination service.」這句話交代了順序從哪裡來：offset 嚴格遞增，順序就定了；做法是 R2 的原子操作；另外沒有獨立的協調服務。至於是條件式寫入、版本比對還是別的機制，文章沒說。</p>
+
+  <p>嚴格遞增這四個字，檢查時要抓準範圍。它保證後一筆的 offset 比前一筆大，文章沒寫 offset 是否連續，所以消費端的程式不該拿「offset 少了一號」當成資料遺失的訊號。這一點是對字面的謹慎讀法，實際行為得以 Cloudflare 文件或實測為準。</p>
+
+  <p>順序問題需要有個機制裁決先後，K2 把這個工作放進 R2 已經提供的原子性裡。這與前面引用的設計原則同一條線：「Offloading replication and consensus to the storage layer」。副本與共識交出去，順序也交出去，應用層剩下的元件就更少。「radically simpler, cheaper, and higher performance」這三個形容詞沒有附上對照量測，只能當設計目標看。</p>
+
+  <p>順序保證的範圍要讀仔細。文章的保證是 offset 嚴格遞增，這是一條 stream 之內的全序。路線圖同時列出兩項：「Higher write parallelism, up to multi-GB/s streams」與「Message keys and key-based ordering guarantees」。前者對照現在每條 stream 30 MB/s 的寫入上限，後者說明按 key 的保序目前沒有。文章沒明說這幾項之間的因果，這裡先這樣讀：單條 stream 的全序與它的寫入上限有關，要在同一個全序下提高寫入就得靠更多平行度，而按 key 保序正好能讓平行度不破壞順序。</p>
+
+  <p>實務上的讀法是：現在要的是跨事件的全序，就用一條 stream，並且接受 30 MB/s 的上限；要的是按使用者或按訂單保序，目前沒有 key 這一層，只能自己處理，或等路線圖兌現。路線圖沒有給時程。</p>
+
+  <h2>subscription 與 5 分鐘的 lease</h2>
+
+  <p>消費端的第一個概念是 subscription。文章說它帶來 read parallelism，也就是「scaling out to multiple readers to handle more load than a single server can manage」。同一個 subscription 底下的 consumer 分攤資料，文章的說法是「splitting work amongst multiple consumers such that each consumer gets a portion of the data」。另一種是每個 consumer 各有一個 subscription，也就是「the pub/sub pattern」，此時「each consumer sees all of the messages」。第三種是兩者混用。下面的圖把前兩種擺在同一個畫面上切換。</p>
+
+  <figure class="vg-w-morph-k2-subscriptions" data-mobile="swap" data-svg-scroll="720" data-mobile-summary="同一個 subscription 的 consumer 分攤訊息，各開 subscription 則各看全部，也能混成多個獨立 pool。">
+    <style>
+      .vg-w-morph-k2-subscriptions { display: grid; gap: var(--s-2); }
+      .vg-w-morph-k2-subscriptions .controls { display: flex; flex-wrap: wrap; gap: var(--s-2); }
+      .vg-w-morph-k2-subscriptions button { min-height: 44px; padding: var(--s-1) var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); background: var(--bg-soft); border: 1px solid var(--muted-2); border-radius: 2px; cursor: pointer; }
+      .vg-w-morph-k2-subscriptions button[aria-pressed="true"] { color: var(--accent-text); border-color: var(--accent); }
+      .vg-w-morph-k2-subscriptions svg.vg-w-morph-k2-subscriptions-main { width: 100%; height: auto; max-width: 880px; }
+      .vg-w-morph-k2-subscriptions .box { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; }
+      .vg-w-morph-k2-subscriptions .sub { fill: var(--sage-deep); fill-opacity: 0.18; stroke: var(--sage-deep); stroke-width: 1.5; }
+      .vg-w-morph-k2-subscriptions .cons { fill: var(--accent); fill-opacity: 0.16; stroke: var(--accent); stroke-width: 1.5; }
+      .vg-w-morph-k2-subscriptions .arrow { fill: none; stroke: var(--muted); stroke-width: 1.8; }
+      .vg-w-morph-k2-subscriptions .t { font-family: EB Garamond, serif; font-size: 14px; fill: var(--ink); }
+      .vg-w-morph-k2-subscriptions .ts { font-family: EB Garamond, serif; font-size: 13px; fill: var(--ink-soft); }
+      .vg-w-morph-k2-subscriptions .tm { font-family: IM Fell English, serif; font-style: italic; font-size: 12px; fill: var(--muted); }
+      @media (max-width: 720px) { .vg-w-morph-k2-subscriptions button { flex: 1 1 100%; } }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m18 8 4 4-4 4"/><path d="M2 12h20"/><path d="m6 8-4 4 4 4"/></svg>
+      <span>切換兩種 subscription 配置，箭頭會重新接線 · 2 種模式</span>
+    </p>
+    <div class="controls" data-vg-controls>
+      <button type="button" id="vg-w-morph-k2-subscriptions-b-split" aria-pressed="true">共用一個 subscription</button>
+      <button type="button" id="vg-w-morph-k2-subscriptions-b-pubsub" aria-pressed="false">各自一個 subscription</button>
+    </div>
+    <svg class="vg-w-morph-k2-subscriptions-main" viewBox="0 0 720 280" role="img" aria-label="同一條 stream 接到 subscription，再分給兩個 consumer，可在共用與各自 subscription 兩種配置之間切換">
+      <defs>
+        <marker id="vg-w-morph-k2-subscriptions-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="var(--muted)" /></marker>
+      </defs>
+      <rect class="box" x="20" y="100" width="130" height="80" />
+      <text x="85" y="136" text-anchor="middle" class="t">stream</text>
+      <text x="85" y="158" text-anchor="middle" class="ts">有序的 log</text>
+
+      <path id="vg-w-morph-k2-subscriptions-a1" class="arrow" marker-end="url(#vg-w-morph-k2-subscriptions-arrow)" d="M150 140 C 220 140 230 140 288 140" />
+      <path id="vg-w-morph-k2-subscriptions-a2" class="arrow" marker-end="url(#vg-w-morph-k2-subscriptions-arrow)" d="M150 140 C 220 140 230 140 288 140" opacity="0" />
+      <path id="vg-w-morph-k2-subscriptions-b1" class="arrow" marker-end="url(#vg-w-morph-k2-subscriptions-arrow)" d="M420 140 C 490 140 490 68 558 68" />
+      <path id="vg-w-morph-k2-subscriptions-b2" class="arrow" marker-end="url(#vg-w-morph-k2-subscriptions-arrow)" d="M420 140 C 490 140 490 212 558 212" />
+
+      <g id="vg-w-morph-k2-subscriptions-g1">
+        <rect class="sub" x="290" y="120" width="130" height="40" />
+        <text x="355" y="145" text-anchor="middle" class="t" id="vg-w-morph-k2-subscriptions-s1t">subscription</text>
+      </g>
+      <g id="vg-w-morph-k2-subscriptions-g2" opacity="0">
+        <rect class="sub" x="290" y="120" width="130" height="40" />
+        <text x="355" y="145" text-anchor="middle" class="t" id="vg-w-morph-k2-subscriptions-s2t" display="none">subscription 2</text>
+      </g>
+
+      <rect class="cons" x="560" y="46" width="130" height="44" />
+      <text x="625" y="66" text-anchor="middle" class="t">Consumer A</text>
+      <text x="625" y="82" text-anchor="middle" class="ts" id="vg-w-morph-k2-subscriptions-ta">各拿一部分資料</text>
+      <rect class="cons" x="560" y="190" width="130" height="44" />
+      <text x="625" y="210" text-anchor="middle" class="t">Consumer B</text>
+      <text x="625" y="226" text-anchor="middle" class="ts" id="vg-w-morph-k2-subscriptions-tb">各拿一部分資料</text>
+
+      <text x="20" y="266" class="tm" id="vg-w-morph-k2-subscriptions-cap">共用一個 subscription，consumer 分攤這條 stream；文章未說明分配規則</text>
+    </svg>
+    <script>
+    (function () {
+      if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+      var root = document.querySelector('.vg-w-morph-k2-subscriptions');
+      if (!root) return;
+      var P = 'vg-w-morph-k2-subscriptions-';
+      function $(id) { return root.querySelector('#' + P + id); }
+      var D = {
+        split: {
+          a1: 'M150 140 C 220 140 230 140 288 140',
+          a2: 'M150 140 C 220 140 230 140 288 140',
+          b1: 'M420 140 C 490 140 490 68 558 68',
+          b2: 'M420 140 C 490 140 490 212 558 212'
+        },
+        pubsub: {
+          a1: 'M150 140 C 220 140 230 68 288 68',
+          a2: 'M150 140 C 220 140 230 212 288 212',
+          b1: 'M420 68 C 490 68 490 68 558 68',
+          b2: 'M420 212 C 490 212 490 212 558 212'
+        }
+      };
+      var TEXT = {
+        split: { cons: '各拿一部分資料', cap: '共用一個 subscription，consumer 分攤這條 stream；文章未說明分配規則' },
+        pubsub: { cons: '看到全部訊息', cap: '每個 consumer 各有 subscription，各自看到所有訊息' }
+      };
+      var paths = { a1: $('a1'), a2: $('a2'), b1: $('b1'), b2: $('b2') };
+      var g1 = $('g1'), g2 = $('g2');
+      var btnSplit = $('b-split'), btnPub = $('b-pubsub');
+      var mode = 'split';
+      var running = [];
+      var reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      function setText(m) {
+        $('ta').textContent = TEXT[m].cons;
+        $('tb').textContent = TEXT[m].cons;
+        $('cap').textContent = TEXT[m].cap;
+        btnSplit.setAttribute('aria-pressed', m === 'split' ? 'true' : 'false');
+        btnPub.setAttribute('aria-pressed', m === 'pubsub' ? 'true' : 'false');
+      }
+      function setMode(next) {
+        if (next === mode) return;
+        running.forEach(function (a) { try { a.finish(); } catch (e) {} });
+        running = [];
+        var from = D[mode], to = D[next];
+        var dur = reduce ? 0 : 500;
+        Object.keys(paths).forEach(function (k) {
+          var p = paths[k];
+          try {
+            var anim = p.animate(
+              [{ d: "path('" + from[k] + "')" }, { d: "path('" + to[k] + "')" }],
+              { duration: dur, easing: 'ease-in-out', fill: 'forwards' }
+            );
+            running.push(anim);
+            anim.finished.then(function () { p.setAttribute('d', to[k]); anim.cancel(); }, function () {});
+          } catch (e) {
+            p.setAttribute('d', to[k]);
+          }
+        });
+        var pub = next === 'pubsub';
+        paths.a2.setAttribute('opacity', pub ? '1' : '0');
+        g2.setAttribute('opacity', pub ? '1' : '0');
+        $('s2t').setAttribute('display', pub ? 'inline' : 'none');
+        var opts = { duration: dur, easing: 'ease-in-out', fill: 'forwards' };
+        var a = g1.animate([{ transform: 'translateY(' + (pub ? 0 : -72) + 'px)' }, { transform: 'translateY(' + (pub ? -72 : 0) + 'px)' }], opts);
+        var b = g2.animate([{ transform: 'translateY(' + (pub ? 0 : 72) + 'px)' }, { transform: 'translateY(' + (pub ? 72 : 0) + 'px)' }], opts);
+        running.push(a, b);
+        $('s1t').textContent = pub ? 'subscription 1' : 'subscription';
+        mode = next;
+        setText(next);
+      }
+      btnSplit.addEventListener('click', function () { setMode('split'); });
+      btnPub.addEventListener('click', function () { setMode('pubsub'); });
+      setText('split');
+    })();
+    </script>
+  </figure>
+
+  <p>混合配置是「multiple independent consumer pools」：每個 pool 有自己的 subscription，pool 之內分攤，pool 之間各看全部。同一條事件流因此可以同時餵給即時處理的 pool 與另一組寫入下游系統的 pool，彼此的進度互不影響，因為 subscription 各自獨立。文章在後面對比 Queues 時，也把「fan-out consumption」列為 K2 的設計目標之一。</p>
+
+  <p>消費端的第二個概念是 lease。文章寫道，呼叫 consume 時客戶端拿到「a lease for that particular batch of events for 5 minutes」，接著有三個動作：「ack the batch, which marks it as processed and ensures it will not be redelivered」、「nack (negative ack) it, meaning we've failed to process it and would like it to be redelivered」，或「extend its lease, in case it needs more time to complete processing」。領取、處理、回報，三步各有明確的出口。</p>
+
+  <figure class="vg-w-range-k2-lease" data-mobile="static" data-svg-scroll="720">
+    <style>
+      .vg-w-range-k2-lease { display: grid; gap: var(--s-2); }
+      .vg-w-range-k2-lease .controls { display: flex; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+      .vg-w-range-k2-lease .controls input { flex: 1; height: 36px; accent-color: var(--accent); touch-action: none; }
+      .vg-w-range-k2-lease .readout { font-variant-numeric: tabular-nums; color: var(--ink); min-width: 9ch; text-align: right; }
+      .vg-w-range-k2-lease svg.vg-w-range-k2-lease-main { width: 100%; height: auto; max-width: 880px; }
+      .vg-w-range-k2-lease .t { font-family: EB Garamond, serif; font-size: 13px; fill: var(--ink); }
+      .vg-w-range-k2-lease .tm { font-family: IM Fell English, serif; font-style: italic; font-size: 12px; fill: var(--muted); }
+      .vg-w-range-k2-lease .ok { fill: var(--sage-deep); }
+      .vg-w-range-k2-lease .warn { fill: var(--accent-text); }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m18 8 4 4-4 4"/><path d="M2 12h20"/><path d="m6 8-4 4 4 4"/></svg>
+      <span>拖曳處理時間，看它落在 5 分鐘 lease 的哪一側 · 0 到 10 分鐘</span>
+    </p>
+    <div class="controls" data-vg-controls>
+      <label for="vg-w-range-k2-lease-t">處理時間</label>
+      <input id="vg-w-range-k2-lease-t" type="range" min="0" max="10" step="0.5" value="3" />
+      <span class="readout" id="vg-w-range-k2-lease-readout">3 分鐘</span>
+    </div>
+    <svg class="vg-w-range-k2-lease-main" viewBox="0 0 720 230" role="img" aria-label="一批事件的 5 分鐘 lease 時間軸，標記顯示處理時間落在 lease 之內或之外">
+      <rect x="60" y="40" width="300" height="34" fill="var(--sage-deep)" fill-opacity="0.2" stroke="var(--sage-deep)" stroke-width="1.2" />
+      <text x="70" y="62" class="t">lease 5 分鐘（文章給定）</text>
+      <rect x="360" y="40" width="300" height="34" fill="none" stroke="var(--muted-2)" stroke-width="1.2" stroke-dasharray="4 3" />
+      <text x="370" y="62" class="tm">超過 5 分鐘</text>
+      <line x1="60" y1="96" x2="660" y2="96" stroke="var(--muted-2)" stroke-width="1" />
+      <g stroke="var(--muted-2)" stroke-width="1">
+        <line x1="60" y1="92" x2="60" y2="100" /><line x1="120" y1="92" x2="120" y2="100" /><line x1="180" y1="92" x2="180" y2="100" /><line x1="240" y1="92" x2="240" y2="100" /><line x1="300" y1="92" x2="300" y2="100" /><line x1="360" y1="92" x2="360" y2="100" /><line x1="420" y1="92" x2="420" y2="100" /><line x1="480" y1="92" x2="480" y2="100" /><line x1="540" y1="92" x2="540" y2="100" /><line x1="600" y1="92" x2="600" y2="100" /><line x1="660" y1="92" x2="660" y2="100" />
+      </g>
+      <g text-anchor="middle">
+        <text x="60" y="116" class="tm">0</text><text x="120" y="116" class="tm">1</text><text x="180" y="116" class="tm">2</text><text x="240" y="116" class="tm">3</text><text x="300" y="116" class="tm">4</text><text x="360" y="116" class="tm">5</text><text x="420" y="116" class="tm">6</text><text x="480" y="116" class="tm">7</text><text x="540" y="116" class="tm">8</text><text x="600" y="116" class="tm">9</text><text x="660" y="116" class="tm">10 分鐘</text>
+      </g>
+      <line id="vg-w-range-k2-lease-marker" x1="240" y1="30" x2="240" y2="96" stroke="var(--accent)" stroke-width="2.5" />
+      <circle id="vg-w-range-k2-lease-dot" cx="240" cy="96" r="6" fill="var(--accent)" />
+      <text x="60" y="146" class="tm">extend 可延長 lease，文章未說明一次延長多久</text>
+      <text id="vg-w-range-k2-lease-l1" x="60" y="182" class="t ok">處理時間 3 分鐘，仍在 lease 之內</text>
+      <text id="vg-w-range-k2-lease-l2" x="60" y="204" class="tm">此時可以 ack、nack，或 extend 延長 lease</text>
+    </svg>
+    <script>
+    (function () {
+      if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+      var root = document.querySelector('.vg-w-range-k2-lease');
+      if (!root) return;
+      var P = 'vg-w-range-k2-lease-';
+      var input = root.querySelector('#' + P + 't');
+      var readout = root.querySelector('#' + P + 'readout');
+      var marker = root.querySelector('#' + P + 'marker');
+      var dot = root.querySelector('#' + P + 'dot');
+      var l1 = root.querySelector('#' + P + 'l1');
+      var l2 = root.querySelector('#' + P + 'l2');
+      function update() {
+        var t = Number(input.value);
+        var x = 60 + 60 * t;
+        marker.setAttribute('x1', x);
+        marker.setAttribute('x2', x);
+        dot.setAttribute('cx', x);
+        readout.textContent = t + ' 分鐘';
+        if (t <= 5) {
+          l1.textContent = '處理時間 ' + t + ' 分鐘，仍在 lease 之內';
+          l1.setAttribute('class', 't ok');
+          l2.textContent = '此時可以 ack、nack，或 extend 延長 lease';
+        } else {
+          l1.textContent = '處理時間 ' + t + ' 分鐘，已超過 5 分鐘的 lease';
+          l1.setAttribute('class', 't warn');
+          l2.textContent = '文章未說明 lease 過期後的行為，合理的推測是這批資料可重新投遞（推測）';
+        }
+      }
+      input.addEventListener('input', update);
+      update();
+    })();
+    </script>
+  </figure>
+
+  <p>三個出口的語意，文章寫得很清楚。ack 之後不會重新投遞；nack 表示處理失敗、希望重新投遞；extend 是手上的批次還沒處理完，需要更多時間。lease 到期而消費者既沒 ack 也沒 nack 時會發生什麼，文章沒寫。nack 的描述是「would like it to be redelivered」，本文由此推測到期的批次會回到可重新投遞的狀態。extend 一次能延長多久，以及投遞語意是否保證至少一次，同樣沒有答案。</p>
+
+  <p>拿 5 分鐘換算，lease 是 300 秒。一批事件平均處理 3 分鐘，落在 lease 之內，處理完 ack 即可；處理時間逼近 5 分鐘，就得在途中 extend，而一次延長多久文章沒說，程式裡別假設一次延長就夠。三個出口之中，只有 ack 有明確保證，也就是不會重新投遞；nack 用的是 would like it to be redelivered，語氣是希望，文章沒有承諾投遞次數或時限。</p>
+
+  <p>還有一件事會影響程式寫法。文章說 K2 的訊息「produced and consumed as batches」，而 lease 的單位是一整批事件。同一批裡有一筆處理失敗，能做的就是 nack 整批，沒有只重送那一筆的出口，這與文章自己的說法吻合：批次處理「enabling efficient processing at the expense of message-level retries」。整批重送代表同一筆事件可能再來一次，消費端的處理邏輯最好重複執行也不會出錯。文章沒有討論冪等性，這一條是本文補上的建議。</p>
+
+  <h2>價格表上的三個數字，與兩條限制</h2>
+
+  <p>文章列出的限制是「Maximum of 10GB of storage used」與「30 MB/s produce per stream」，價格表是 Data Produced 每 GB 0.04 美元、Data Consumed 每 GB 0.04 美元、Data Retained 每 GB 每月 0.02 美元。文章示範的 stream 設定裡，<code>retention_seconds</code> 是 604800，也就是 7 天。下面的計算器把這幾個數字接起來，三個滑桿分別是每日寫入量、subscription 數、保留天數。月費是本文用自己的假設算的：每個 subscription 把全部資料讀一次、一個月以 30 天計、保留量取穩態平均，也就是每日寫入量乘上保留天數。</p>
+
+  <figure class="vg-w-param-k2-cost" data-mobile="static" data-svg-scroll="720">
+    <style>
+      .vg-w-param-k2-cost { display: grid; gap: var(--s-2); }
+      .vg-w-param-k2-cost .controls { display: grid; gap: var(--s-1); }
+      .vg-w-param-k2-cost .row { display: grid; grid-template-columns: 13ch 1fr 14ch; align-items: center; gap: var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); color: var(--muted); }
+      .vg-w-param-k2-cost .row input { width: 100%; height: 36px; accent-color: var(--accent); touch-action: none; }
+      .vg-w-param-k2-cost .readout { font-variant-numeric: tabular-nums; color: var(--ink); text-align: right; }
+      .vg-w-param-k2-cost svg.vg-w-param-k2-cost-main { width: 100%; height: auto; max-width: 880px; }
+      .vg-w-param-k2-cost .t { font-family: EB Garamond, serif; font-size: 13px; fill: var(--ink); }
+      .vg-w-param-k2-cost .tl { font-family: EB Garamond, serif; font-size: 16px; fill: var(--ink); }
+      .vg-w-param-k2-cost .tm { font-family: IM Fell English, serif; font-style: italic; font-size: 12px; fill: var(--muted); }
+      .vg-w-param-k2-cost .num { font-family: JetBrains Mono, monospace; font-size: 12px; fill: var(--ink); }
+      .vg-w-param-k2-cost .warn { fill: var(--accent-text); }
+      .vg-w-param-k2-cost .good { fill: var(--sage-deep); }
+      @media (max-width: 720px) { .vg-w-param-k2-cost .row { grid-template-columns: 1fr; } .vg-w-param-k2-cost .readout { text-align: left; } }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m18 8 4 4-4 4"/><path d="M2 12h20"/><path d="m6 8-4 4 4 4"/></svg>
+      <span>拖曳寫入量、subscription 數、保留天數，看月費怎麼分配 · 3 個滑桿</span>
+    </p>
+    <div class="controls" data-vg-controls>
+      <div class="row"><label for="vg-w-param-k2-cost-in-gb">每日寫入</label><input id="vg-w-param-k2-cost-in-gb" type="range" min="0" max="100" step="1" value="67" /><span class="readout" id="vg-w-param-k2-cost-out-gb">100 GB / 天</span></div>
+      <div class="row"><label for="vg-w-param-k2-cost-in-subs">subscription</label><input id="vg-w-param-k2-cost-in-subs" type="range" min="1" max="8" step="1" value="2" /><span class="readout" id="vg-w-param-k2-cost-out-subs">2 個</span></div>
+      <div class="row"><label for="vg-w-param-k2-cost-in-days">保留天數</label><input id="vg-w-param-k2-cost-in-days" type="range" min="1" max="30" step="1" value="7" /><span class="readout" id="vg-w-param-k2-cost-out-days">7 天</span></div>
+    </div>
+    <svg class="vg-w-param-k2-cost-main" viewBox="0 0 720 310" role="img" aria-label="依文章價格表估算的 K2 月費：寫入、讀取、保留三項長條，以及與 beta 限制的比較">
+      <text x="20" y="24" class="tm">月費估算（30 天、穩態、每個 subscription 讀全部資料一次）</text>
+      <text x="20" y="78" class="t">寫入 produced</text>
+      <rect id="vg-w-param-k2-cost-bar-p" x="200" y="60" width="180" height="26" fill="var(--accent)" fill-opacity="0.5" stroke="var(--accent)" />
+      <text id="vg-w-param-k2-cost-val-p" x="388" y="78" class="num">$120.00</text>
+      <text x="20" y="128" class="t">讀取 consumed</text>
+      <rect id="vg-w-param-k2-cost-bar-c" x="200" y="110" width="360" height="26" fill="var(--sage-deep)" fill-opacity="0.45" stroke="var(--sage-deep)" />
+      <text id="vg-w-param-k2-cost-val-c" x="568" y="128" class="num">$240.00</text>
+      <text x="20" y="178" class="t">保留 retained</text>
+      <rect id="vg-w-param-k2-cost-bar-r" x="200" y="160" width="21" height="26" fill="var(--ink-deep)" fill-opacity="0.4" stroke="var(--ink-deep)" />
+      <text id="vg-w-param-k2-cost-val-r" x="229" y="178" class="num">$14.00</text>
+      <text id="vg-w-param-k2-cost-total" x="20" y="218" class="tl">合計 $374.00 / 月</text>
+      <text id="vg-w-param-k2-cost-formula" x="20" y="238" class="tm">寫入 3,000 GB × $0.04 + 讀取 6,000 GB × $0.04 + 平均保留 700 GB × $0.02</text>
+      <text id="vg-w-param-k2-cost-lim-store" x="20" y="266" class="t warn">穩態保留約 700 GB，高於文章列出的儲存上限 10 GB</text>
+      <text id="vg-w-param-k2-cost-lim-rate" x="20" y="288" class="t good">平均寫入約 1.16 MB/s，低於單一 stream 的 30 MB/s 上限</text>
+    </svg>
+    <script>
+    (function () {
+      if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+      var root = document.querySelector('.vg-w-param-k2-cost');
+      if (!root) return;
+      var P = 'vg-w-param-k2-cost-';
+      function $(id) { return root.querySelector('#' + P + id); }
+      var inGb = $('in-gb'), inSubs = $('in-subs'), inDays = $('in-days');
+      function fmtN(n) {
+        var v = n >= 100 ? Math.round(n) : Math.round(n * 10) / 10;
+        return v.toLocaleString('en-US');
+      }
+      function fmtMoney(n) {
+        return '$' + n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      }
+      function update() {
+        var raw = 0.1 * Math.pow(30000, Number(inGb.value) / 100);
+        var gb = raw >= 10 ? Math.round(raw) : Math.round(raw * 10) / 10;
+        var subs = Number(inSubs.value);
+        var days = Number(inDays.value);
+        var produced = gb * 30;
+        var consumed = produced * subs;
+        var retained = gb * days;
+        var cp = produced * 0.04, cc = consumed * 0.04, cr = retained * 0.02;
+        var total = cp + cc + cr;
+        var max = Math.max(cp, cc, cr, 0.000001);
+        var scale = 360 / max;
+        $('out-gb').textContent = fmtN(gb) + ' GB / 天';
+        $('out-subs').textContent = subs + ' 個';
+        $('out-days').textContent = days + ' 天';
+        var items = [['p', cp], ['c', cc], ['r', cr]];
+        items.forEach(function (it) {
+          var w = Math.max(2, it[1] * scale);
+          $('bar-' + it[0]).setAttribute('width', w.toFixed(1));
+          var v = $('val-' + it[0]);
+          v.setAttribute('x', (200 + w + 8).toFixed(1));
+          v.textContent = fmtMoney(it[1]);
+        });
+        $('total').textContent = '合計 ' + fmtMoney(total) + ' / 月';
+        $('formula').textContent = '寫入 ' + fmtN(produced) + ' GB × $0.04 + 讀取 ' + fmtN(consumed) + ' GB × $0.04 + 平均保留 ' + fmtN(retained) + ' GB × $0.02';
+        var overStore = retained > 10;
+        var ls = $('lim-store');
+        ls.textContent = '穩態保留約 ' + fmtN(retained) + ' GB，' + (overStore ? '高於' : '低於') + '文章列出的儲存上限 10 GB';
+        ls.setAttribute('class', 't ' + (overStore ? 'warn' : 'good'));
+        var rate = gb * 1000 / 86400;
+        var overRate = rate > 30;
+        var lr = $('lim-rate');
+        lr.textContent = '平均寫入約 ' + rate.toFixed(2) + ' MB/s，' + (overRate ? '高於' : '低於') + '單一 stream 的 30 MB/s 上限';
+        lr.setAttribute('class', 't ' + (overRate ? 'warn' : 'good'));
+      }
+      inGb.addEventListener('input', update);
+      inSubs.addEventListener('input', update);
+      inDays.addEventListener('input', update);
+      update();
+    })();
+    </script>
+  </figure>
+
+  <p>預設的情境是每天寫入 100 GB、兩個各讀全部資料的 subscription、保留 7 天：寫入 120 美元、讀取 240 美元、保留 14 美元，合計 374 美元。讀取這一項最大，原因在價格表本身：寫入與讀取的單價都是每 GB 0.04 美元，而讀取量是寫入量乘上 subscription 數。每多一個各讀全部資料的 subscription，月費就多一份寫入費用的大小；保留只有每 GB 每月 0.02 美元，在這個例子裡幾乎可以忽略。反過來，所有 consumer 都在同一個 subscription 底下分攤的話，讀取量等於寫入量。subscription 怎麼切，直接決定帳單，也決定資料的流向。</p>
+
+  <p>把 subscription 降到一個，同樣每天 100 GB、保留 7 天，寫入 120 美元、讀取 120 美元、保留 14 美元，合計 254 美元，比兩個 subscription 的 374 美元少 120 美元，剛好是多出來那份讀取費。這個差額就是切 subscription 的定價。若兩組 consumer 其實只想平分工作，併進同一個 subscription 就能省下這筆；若兩組各自要看到全部事件，這筆費用就是 fan-out 的價格，文章把 fan-out consumption 列為設計目標，帳單上看得到它的成本。</p>
+
+  <p>保留費的換算很直觀：每 GB 每月 0.02 美元，一份資料放兩個月，保留費就等於寫入它一次的費用。文章把「long-term retention」列為 K2 的設計目標，價格表給出的單價與這個目標相容；實際保留多久才划算，要看資料被讀幾遍，這取決於各團隊的 subscription 設計。</p>
+
+  <p>兩條限制線在同一張圖裡也各說了一件事。30 MB/s 換算成一天，是 30 乘上 86,400 秒，約 2,592 GB，所以每日 100 GB 平均下來只有約 1.16 MB/s，離單 stream 的寫入上限很遠；平均速率不等於尖峰，流量集中在短時間時，該看的是尖峰。儲存上限的約束要緊得多：10 GB 除以 7 天，保留 7 天時每天只能寫約 1.4 GB 就會碰到上限。預設情境的穩態保留約 700 GB，遠超過 10 GB。文章把這些列為目前的限制，路線圖也提到更高的寫入平行度，但在現階段，儲存上限比寫入速率更先擋住真實的工作負載。價格與上限會不會調整，以官方文件為準。</p>
+
+  <h2>和 Queues、Pipelines、Kafka 的邊界</h2>
+
+  <p>Cloudflare 已經有 Queues 與 Pipelines，文章花了一段話替 K2 劃界。Queues 的重心是「tracking individual items of expensive or time consuming work that need to be asynchronously completed」，支援「complex logic on the grain of a particular work item, like retries, delays, and dead-letter queues」。K2 則是「designed for high-scale data movement, long-term retention, and fan-out consumption」，並且訊息以批次為單位處理，換來「efficient processing at the expense of message-level retries」。兩者的差別在粒度：Queues 追蹤一件一件的工作，K2 搬運一批一批的資料。</p>
+
+  <figure class="vg-w-table-k2-neighbors" data-mobile="keep">
+    <style>
+      .vg-w-table-k2-neighbors { overflow-x: auto; }
+      .vg-w-table-k2-neighbors table { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-k2-neighbors thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); }
+      .vg-w-table-k2-neighbors tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+      .vg-w-table-k2-neighbors tbody td:first-child { font-family: var(--display); color: var(--accent-text); white-space: nowrap; }
+    </style>
+    <table>
+      <thead>
+        <tr><th>產品</th><th>文章描述的設計重心</th><th>文章給的取捨或建議</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Queues</td><td>追蹤一件一件昂貴或耗時、需要非同步完成的工作</td><td>支援 retries、delays、dead-letter queues 這類以單一工作項為粒度的邏輯</td></tr>
+        <tr><td>K2</td><td>高規模的資料搬運、長期保留、fan-out 消費</td><td>以批次生產與消費，換來處理效率，代價是沒有訊息層級的重試</td></tr>
+        <tr><td>Pipelines</td><td>事件的攝取服務</td><td>最終目的地是 object storage 或 Iceberg tables 時選 Pipelines，要自訂處理或寫到其他目的地時選 K2</td></tr>
+      </tbody>
+    </table>
+  </figure>
+
+  <p>Pipelines 的邊界由文章直接給了建議：「We recommend Pipelines when the end result is writing your events to object storage or Iceberg tables, and K2 when doing custom processing or writing to other destinations.」把表格讀成決策規則：資料終點是 object storage 或 Iceberg，Pipelines 已經夠用；需要自己寫處理邏輯、或終點是別的系統，才輪到 K2。至於 K2 與 Queues 的選擇，看工作單位：每件工作要單獨重試、延遲或進 dead-letter，選 Queues；整批搬運、長期保留、多組消費，選 K2。</p>
+
+  <p>判斷用 Queues 還是 K2，可以先問失敗的單位是什麼。文章的分界落在粒度上：Queues 的 retries、delays、dead-letter queues 都綁在單一工作項上，K2 的重送綁在整批上。需要某一筆工作失敗後單獨延遲再試，K2 的批次模型給不出這個出口；只要能接受整批重來，K2 換到的是處理效率。</p>
+
+  <p>Kafka 在文章裡的地位不太一樣。文章的說法是：「Pipelines runs on the Cloudflare edge, which spans a huge number of servers across over 335 cities. Our unique architecture means we often cannot run traditional distributed systems software like Kafka」。這是一個關於部署環境的論證：Cloudflare 自己的平台形狀，讓它不能直接跑 Kafka 這類傳統分散式系統，所以才把副本與共識交給 R2。路線圖列了「Drop-in support for Apache Kafka clients」，相容 Kafka 客戶端是計畫中的功能，目前還沒有。</p>
+
+  <p>文章沒有拿 K2 與 Kafka 做逐項的延遲、吞吐或成本對照，這裡也不補。能從文章讀出的只有結構上的差異：K2 的耐久性與副本在 R2，順序來自 R2 的原子操作，沒有獨立的協調服務；代價是約 1 秒的 p99 寫入延遲、批次層級的重試，以及目前每條 stream 30 MB/s 與 10 GB 儲存的限制。從這些限制與路線圖缺的項目推得，需要毫秒級延遲、或需要按 key 保序的工作負載，現階段不適合 K2。</p>
+
+  <p>放在台灣工程團隊的視角，評估 K2 可以逐條過一遍：能不能接受約 1 秒的 p99 寫入延遲；處理邏輯能不能以批次為單位重試、並容忍整批重送；需不需要按 key 保序，目前沒有；每條 stream 的寫入與儲存量是否在目前限制之內；subscription 要怎麼切，因為它同時決定資料流向與讀取費用。五條都過，K2 省下的是 broker 叢集的維運；任何一條不過，路線圖裡對應的項目就是該追蹤的清單。</p>
+
+  <p class="vg-deep-closer"><strong>What this enables</strong>：不自己養 broker，就能得到一條有序、可保留、可多組消費的 log，代價是約 1 秒的 p99 寫入延遲、批次層級的重試，以及目前單 stream 30 MB/s 與 10 GB 儲存的上限。</p>
+</div>
