@@ -125,9 +125,9 @@ updates `checker_rounds`.
 
 In Step 7.6a, parent dispatches **1 checker per post** — up to 4
 Agent tool blocks (1 roundup + 3 deep-stories) in ONE response,
-`subagent_type: general-purpose`, **`model: "opus"` required** (same
+`subagent_type: general-purpose`, **`model: "sonnet"` required** (same
 rationale as Steps 7b/7.5a: verdict judgment on hedge strength and
-source independence is design-grade; if Opus is unavailable, report
+source independence is design-grade; if Sonnet is unavailable, report
 BLOCKED rather than fall back). Parent writes each returned ledger to
 the committed path (`src/posts/YYYY/MM/DD/<slug>.ledger.json`),
 applies the action matrix, runs the Step 7.6c fix loop, and finally

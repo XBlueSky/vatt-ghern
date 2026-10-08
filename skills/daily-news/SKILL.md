@@ -614,14 +614,14 @@ looks at story arc, hook strength, or whether H2s are template-shaped.
 
 **Wallclock is NOT capped** in this step. Quality trumps speed.
 
-**No skip clause exists.** If wall-clock or Opus-budget anxiety makes
+**No skip clause exists.** If wall-clock or Sonnet-budget anxiety makes
 the full dual-reviewer pass feel expensive, the only legal response is
 to **drop deep-stories (N → N-1) so the remaining gate fits**, never
 skip the gate to ship more posts. PR #32 (2026-05-22) shipped 3 deep
 stories with a self-declared "deviation: 7.5 skipped because parallel
-dispatch already consumed multiple Opus batches" — this is exactly the
+dispatch already consumed multiple Sonnet batches" — this is exactly the
 pattern this clause forbids. The cost arithmetic the routine performed
-("8 more Opus dispatches with retry potential") is irrelevant: if you
+("8 more Sonnet dispatches with retry potential") is irrelevant: if you
 cannot afford 8 reviewer dispatches, you cannot afford 3 deep stories
 in this run. Trim to 2 or 1.
 
@@ -641,7 +641,7 @@ reasons.
 Step 7c sub-agent self-checks (the author reading the archetype
 reference + persona before drafting) are **not a substitute** for
 Step 7.5 — author self-check is biased and shallow by construction;
-the whole point of dispatching an independent Opus reviewer is to get
+the whole point of dispatching an independent Sonnet reviewer is to get
 a judgment the author cannot give itself. Wording like "the Step 7c
 sub-agent self-checks plus the Step 8 mechanical checks serve as the
 quality gate for this run" is a rationalization, not a substitution
@@ -655,13 +655,13 @@ claim to replace the Step 7.5 quality review.)
 
 For each post produced in Steps 6 + 7 (1 roundup + N deep-stories,
 max 3), dispatch **2 independent reviewer sub-agents** with
-`subagent_type: general-purpose` and **`model: "opus"` required**.
+`subagent_type: general-purpose` and **`model: "sonnet"` required**.
 Reviewer quality judgment (Axis 2 structural coherence, Axis 4 depth
-vs. paraphrase, Axis 6 anti-template) is a design-grade task. Running
-reviewer on the same model family as author also produces LLM-judging-LLM
-bias — using Opus widens the judgment-power gap now that author defaults
-to Sonnet. If Opus is unavailable at dispatch time, report BLOCKED rather
-than fall back. Each reviewer's brief follows the template in
+vs. paraphrase, Axis 6 anti-template) is a design-grade task; Sonnet 5.5
+is strong enough for it, so all sub-agents (author, reviewer, checker)
+use the same model. Reviewer independence comes from the separate
+context and the fresh-eyes brief, not from a different model. If Sonnet
+is unavailable at dispatch time, report BLOCKED rather than fall back. Each reviewer's brief follows the template in
 `${CLAUDE_PLUGIN_ROOT}/skills/daily-news/references/content-reviewer-brief.md`
 with the per-post values substituted.
 
@@ -714,7 +714,7 @@ original brief (from Step 7a — held by parent) PLUS:
 Parent dispatches retry author sub-agents in parallel (one per post
 needing retry) — **same `model: "sonnet"` requirement as Step 7b**.
 After all retries return, re-dispatch the dual reviewers (Step 7.5a,
-also Opus) for each retried post; consolidate again (Step 7.5b).
+also Sonnet) for each retried post; consolidate again (Step 7.5b).
 
 Iteration budget per post:
 - **BLOCKING**: up to 5 retry rounds. If still BLOCKING after 5 →
@@ -737,7 +737,7 @@ roundup's blocking axes.
 
 After all per-post retries settle, count the number of deep-stories
 still in the batch (`N_final`). If `N_final >= 2`, dispatch ONE
-inter-post reviewer sub-agent (**`model: "opus"` required**, same
+inter-post reviewer sub-agent (**`model: "sonnet"` required**, same
 rationale as Step 7.5a) with the inter-post brief variant from
 `content-reviewer-brief.md`. It scores Axis 7 only.
 
@@ -746,9 +746,9 @@ If `batch_score < 7`:
 2. Construct a retry brief: original brief + "find another angle"
    instruction + the inter-post reviewer's justification on what
    makes this post too-similar-to-others.
-3. Dispatch one retry author sub-agent for that post (Opus, per
+3. Dispatch one retry author sub-agent for that post (Sonnet, per
    Step 7b).
-4. Re-dispatch the inter-post reviewer (Opus, per above).
+4. Re-dispatch the inter-post reviewer (Sonnet, per above).
 5. Up to 2 inter-post retry rounds. If still `batch_score < 7`
    after round 2, accept and log to
    `## Inter-post diversity concerns`.
@@ -803,8 +803,8 @@ unresolved.
 
 For each post (1 roundup + N deep-stories), dispatch **1 checker
 sub-agent** with `subagent_type: general-purpose` and **`model:
-"opus"` required** (hedge-strength and source-independence judgment
-is design-grade; if Opus is unavailable, report BLOCKED rather than
+"sonnet"` required** (hedge-strength and source-independence judgment
+is design-grade; if Sonnet is unavailable, report BLOCKED rather than
 fall back). All ≤4 dispatches in ONE response. Each checker (tools:
 Read + WebFetch only):
 
@@ -833,7 +833,7 @@ visible hedged attribution).
 #### Step 7.6c: Fix loop
 
 For each post with actionable claims, dispatch one retry author
-sub-agent (Opus, per Step 7b) whose brief contains the claim list,
+sub-agent (Sonnet, per Step 7b) whose brief contains the claim list,
 each claim's verdict + evidence + bound notes, and the **fix
 discipline**: deletion, hedging, marking-as-inference, or correcting
 to what the note's quote actually says ONLY — a fix may not
@@ -1320,7 +1320,7 @@ the publish gate (`check-quality-gate-evidence.mjs`) will fail if the
 reviewer JSON artifacts under `/tmp/vg-quality-YYYY-MM-DD/` are
 missing.
 
-Wall-clock or Opus-budget pressure is NOT a valid reason to omit this
+Wall-clock or Sonnet-budget pressure is NOT a valid reason to omit this
 section. If the routine cannot afford full reviewer dispatches for N
 deep-stories, the routine MUST drop deep-stories until N fits the
 budget, per Step 7.5 "No skip clause exists" paragraph. Shipping more
@@ -1401,7 +1401,7 @@ reason) fails the publish gate.
   - `Step 8.5 Blocking visual issue unfixable after 5 iterations on <slug>`
   - `Step 7.6 fact-check: high-load unverifiable claim unresolved after 3 rounds on <slug>`
 
-"Budget" / "wallclock" / "dispatch cost" / "Opus quota" is NOT a
+"Budget" / "wallclock" / "dispatch cost" / "Sonnet quota" is NOT a
 valid Step 5 reason — see SKILL.md Step 5c. If you wrote one of those
 phrases here, the routine has a bug in Step 5 and you should re-pick
 deep stories at N = 3.
