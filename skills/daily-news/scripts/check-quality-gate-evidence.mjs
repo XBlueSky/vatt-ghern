@@ -2,7 +2,7 @@
 // check-quality-gate-evidence.mjs — verify Step 7.5 + 8.5 actually ran.
 //
 // Why this exists: PR #32 (2026-05-22) shipped 3 deep stories and the
-// routine self-declared "Step 7.5 skipped because of Opus budget" and
+// routine self-declared "Step 7.5 skipped because of Sonnet budget" and
 // "Step 8.5 deferred (Minor)" in the PR body. Both were treated as soft
 // notes. A widget shipped with a desktop grid + data-svg-scroll conflict
 // that produced a 409 px squeezed SVG — visible in any screenshot, but no
@@ -110,7 +110,7 @@ if (!isRollupDir && !existsSync(qualityDir)) {
     `Step 7.5 evidence missing: ${qualityDir}/ does not exist. ` +
       `The dual-reviewer pass must run for every post and write ` +
       `reviewer JSON to this directory. "Wall-clock too tight" / ` +
-      `"Opus budget consumed" is not a valid reason to skip — drop ` +
+      `"Sonnet budget consumed" is not a valid reason to skip — drop ` +
       `deep-stories (N → N-1) instead. See SKILL.md Step 7.5 "No ` +
       `skip clause exists".`
   );
