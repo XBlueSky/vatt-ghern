@@ -1,0 +1,431 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">同一個 Hyperdrive 實例，每十萬次查詢大約有一次該有資料卻拿到空結果，而且只發生在開了快取的實例上。追到最後，原因是 Client 存進共用快取的那串位元組，格式是寫給 Worker 看的，Endpoint 預期的卻是另一種。</p>
+  <h1 class="vg-post-title">{{ title }}</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p><span class="vg-dropcap">C</span>loudflare 宣布 Hyperdrive 對 MySQL 的支援正式 GA。文章形容 beta 到 GA 之間的差別，只是「20 bug fixes in a trenchcoat」，也就是塞在一件風衣裡的二十個 bug 修正。beta 期間的目標，他們寫的是驗證真實的客戶用量能達到 99.99% 的生產可用性目標。這些問題有些「small and easy to fix once reported」，回報之後很容易修；其中一個卻讓團隊翻了好幾天的 telemetry、文件與程式碼。它的症狀是查詢拿到空結果，出現頻率低到幾乎無法重現，根因則是一個從 Postgres 帶過來的假設。這篇照追查的順序走一遍：症狀、被排除的方向、真正的線索，最後是修復。</p>
+
+  <p>先交代 Hyperdrive 是什麼。文章的定義是「a distributed database connection pooler that connects Cloudflare Workers to SQL databases」：它在 Cloudflare 的全球網路上保持溫熱的 SQL 連線，讓許多 Worker 請求共用這些連線。除了連線池，它還能把常見的查詢結果快取在全球 CDN cache 裡。後面整個故事，就發生在這個快取層和它旁邊的協定轉換之間。</p>
+
+  <h2>該有資料卻回空，十萬次裡大約一次</h2>
+
+  <p>症狀是 beta 期間由流量最大的 MySQL 客戶回報的。文章的原話是客戶看到「a small but consistent rate of empty query responses」，而這些查詢預期得到的回應，是「a non-empty response was always expected」。文章沒有點名這位客戶，也沒有交代這個現象持續了多久，只說他們是 highest-volume MySQL customer。錯誤率約 0.001%。換成比較直覺的單位，是十萬次查詢裡大約一次。</p>
+
+  <p>症狀的形狀也值得停一下。客戶拿到的不是例外，也不是連線中斷，而是一個「空」的查詢回應，查詢本身看起來成功了。我的推論是，這種錯誤比明確的失敗更難處理：應用程式很容易把空結果當成合法的答案往下走，錯誤要等到下游發現資料不見了才浮出來，離出事的那一次查詢已經隔了好幾層。文章只說客戶回報了這個現象，沒有描述客戶端怎麼發現的，所以這一段屬於推論，不是文章的內容。</p>
+
+  <p>0.001% 這個數字，決定了後面整場調查的難度。文章自己的說法是，這個錯誤率「made it very hard to find relevant end-to-end execution traces」。我的推論是：錯誤這麼稀，手動重現幾次、跑一輪壓測，都很可能一次也碰不到，能依賴的只剩線上流量，而你得先從線上流量裡撈到那一次。下面的圖用單純的乘法把這件事算出來。第一個滑桿調每日查詢量，第二個調你只追蹤多少比例的請求，兩個點分別是預期出錯的查詢數，以及預期被追蹤到的出錯查詢數。追蹤取樣率是我設的假設，文章沒有給過 Cloudflare 實際的取樣率，這張圖只是算術示意。</p>
+
+  <figure class="vg-w-range-hyperdrive-rare-rate" data-mobile="swap" data-svg-scroll="720" data-mobile-summary="以 0.001% 的錯誤率算，每一百萬次查詢約有 10 次出錯；若只追蹤其中 1%，平均要一千萬次查詢才抓得到一條失敗的完整軌跡。">
+    <style>
+      .vg-w-range-hyperdrive-rare-rate { display: grid; gap: var(--s-2); }
+      .vg-w-range-hyperdrive-rare-rate svg.vg-w-range-hyperdrive-rare-rate-main { width: 100%; height: auto; }
+      .vg-w-range-hyperdrive-rare-rate .controls { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s-3); }
+      .vg-w-range-hyperdrive-rare-rate .ctl { display: grid; gap: var(--s-1); font-family: var(--sans); font-size: var(--fs-sm); color: var(--ink); }
+      .vg-w-range-hyperdrive-rare-rate .ctl output { font-family: JetBrains Mono, monospace; font-size: var(--fs-sm); color: var(--accent-text); }
+      .vg-w-range-hyperdrive-rare-rate input[type="range"] { width: 100%; height: 36px; accent-color: var(--accent); touch-action: none; }
+      .vg-w-range-hyperdrive-rare-rate .readout { margin: 0; padding: var(--s-2); border-left: 2px solid var(--accent); background: var(--bg-soft); font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink); }
+      @media (max-width: 720px) { .vg-w-range-hyperdrive-rare-rate .controls { grid-template-columns: 1fr; } }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m18 8 4 4-4 4"/><path d="M2 12h20"/><path d="m6 8-4 4 4 4"/></svg>
+      <span>拖曳兩個滑桿，看稀有錯誤何時才抓得到 · 錯誤率固定 0.001%</span>
+    </p>
+    <div class="controls" data-vg-controls>
+      <label class="ctl">每日查詢量 <span data-n-out>1,000,000</span>
+        <input type="range" data-n min="3" max="8" step="0.05" value="6" aria-label="每日查詢量，對數刻度">
+      </label>
+      <label class="ctl">追蹤取樣率 <span data-s-out>1%</span>
+        <input type="range" data-s min="-1" max="2" step="0.05" value="0" aria-label="追蹤取樣率，對數刻度">
+      </label>
+    </div>
+    <svg class="vg-w-range-hyperdrive-rare-rate-main" viewBox="0 0 720 230" role="img" aria-label="對數座標軸上標出預期出錯的查詢數與預期被追蹤到的出錯查詢數">
+      <text x="40" y="34" fill="var(--muted)" font-family="IM Fell English, serif" font-style="italic" font-size="13">預期每天出錯的查詢數（次）</text>
+      <text x="40" y="100" fill="var(--muted)" font-family="IM Fell English, serif" font-style="italic" font-size="13">預期每天被追蹤到的出錯查詢數（條）</text>
+      <line x1="40" y1="180" x2="680" y2="180" stroke="var(--muted-2)" stroke-width="1.5"/>
+      <line x1="40" y1="174" x2="40" y2="186" stroke="var(--muted-2)"/><text x="40" y="203" text-anchor="middle" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="11">0.00001</text>
+      <line x1="120" y1="174" x2="120" y2="186" stroke="var(--muted-2)"/><text x="120" y="203" text-anchor="middle" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="11">0.0001</text>
+      <line x1="200" y1="174" x2="200" y2="186" stroke="var(--muted-2)"/><text x="200" y="203" text-anchor="middle" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="11">0.001</text>
+      <line x1="280" y1="174" x2="280" y2="186" stroke="var(--muted-2)"/><text x="280" y="203" text-anchor="middle" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="11">0.01</text>
+      <line x1="360" y1="174" x2="360" y2="186" stroke="var(--muted-2)"/><text x="360" y="203" text-anchor="middle" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="11">0.1</text>
+      <line x1="440" y1="174" x2="440" y2="186" stroke="var(--muted-2)"/><text x="440" y="203" text-anchor="middle" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="11">1</text>
+      <line x1="520" y1="174" x2="520" y2="186" stroke="var(--muted-2)"/><text x="520" y="203" text-anchor="middle" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="11">10</text>
+      <line x1="600" y1="174" x2="600" y2="186" stroke="var(--muted-2)"/><text x="600" y="203" text-anchor="middle" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="11">100</text>
+      <line x1="680" y1="174" x2="680" y2="186" stroke="var(--muted-2)"/><text x="680" y="203" text-anchor="middle" fill="var(--muted)" font-family="JetBrains Mono, monospace" font-size="11">1000</text>
+      <line data-guide-a x1="520" y1="64" x2="520" y2="180" stroke="var(--accent)" stroke-width="1" stroke-dasharray="3 3"/>
+      <line data-guide-b x1="360" y1="130" x2="360" y2="180" stroke="var(--sage-deep)" stroke-width="1" stroke-dasharray="3 3"/>
+      <circle data-dot-a cx="520" cy="64" r="9" fill="var(--accent)"/>
+      <circle data-dot-b cx="360" cy="130" r="9" fill="var(--sage-deep)"/>
+      <text data-val-a x="506" y="52" text-anchor="end" fill="var(--ink)" font-family="JetBrains Mono, monospace" font-size="13">10</text>
+      <text data-val-b x="346" y="118" text-anchor="end" fill="var(--ink)" font-family="JetBrains Mono, monospace" font-size="13">0.10</text>
+    </svg>
+    <p class="readout" data-readout>每天 1,000,000 次查詢 × 0.001% ≈ 10 次出錯。追蹤 1% 的請求，預期每天抓到 0.10 條失敗的軌跡，平均要 10,000,000 次查詢才抓到一條。</p>
+    <figcaption>算式只有兩步：出錯數 = 查詢量 × 0.00001；被追蹤到的出錯數 = 出錯數 × 取樣率。0.001% 來自文章，查詢量與取樣率是示意用的假設。</figcaption>
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        const root = document.querySelector('.vg-w-range-hyperdrive-rare-rate');
+        const n = root.querySelector('[data-n]');
+        const s = root.querySelector('[data-s]');
+        const nOut = root.querySelector('[data-n-out]');
+        const sOut = root.querySelector('[data-s-out]');
+        const readout = root.querySelector('[data-readout]');
+        const dotA = root.querySelector('[data-dot-a]');
+        const dotB = root.querySelector('[data-dot-b]');
+        const guideA = root.querySelector('[data-guide-a]');
+        const guideB = root.querySelector('[data-guide-b]');
+        const valA = root.querySelector('[data-val-a]');
+        const valB = root.querySelector('[data-val-b]');
+        const RATE = 0.00001;
+
+        function fmt(x) {
+          if (x >= 1000) return Math.round(x).toLocaleString('en-US');
+          if (x >= 10) return x.toFixed(0);
+          if (x >= 1) return x.toFixed(1);
+          if (x >= 0.01) return x.toFixed(2);
+          return x.toExponential(1);
+        }
+        function xpos(v) {
+          const x = 40 + (Math.log10(v) + 5) * 80;
+          return Math.max(40, Math.min(680, x));
+        }
+        function place(dot, guide, label, v) {
+          const x = xpos(v);
+          dot.setAttribute('cx', String(x));
+          guide.setAttribute('x1', String(x));
+          guide.setAttribute('x2', String(x));
+          label.setAttribute('x', String(x > 560 ? x - 14 : x + 14));
+          label.setAttribute('text-anchor', x > 560 ? 'end' : 'start');
+          label.textContent = fmt(v);
+        }
+        function render() {
+          const q = Math.pow(10, parseFloat(n.value));
+          const pct = Math.pow(10, parseFloat(s.value));
+          const failures = q * RATE;
+          const captured = failures * pct / 100;
+          const perTrace = 1 / (RATE * pct / 100);
+          nOut.textContent = fmt(q);
+          sOut.textContent = (pct >= 10 ? pct.toFixed(0) : pct.toFixed(1)) + '%';
+          place(dotA, guideA, valA, failures);
+          place(dotB, guideB, valB, captured);
+          readout.textContent = '每天 ' + fmt(q) + ' 次查詢 × 0.001% ≈ ' + fmt(failures) + ' 次出錯。追蹤 ' + sOut.textContent + ' 的請求，預期每天抓到 ' + fmt(captured) + ' 條失敗的軌跡，平均要 ' + fmt(perTrace) + ' 次查詢才抓到一條。';
+        }
+        n.addEventListener('input', render);
+        s.addEventListener('input', render);
+        render();
+      })();
+    </script>
+  </figure>
+
+  <p>預設值是每天一百萬次查詢、追蹤 1% 的請求：預期每天出錯十次，其中被追蹤到的只有 0.1 條，平均要累積一千萬次查詢才有一條失敗的軌跡。把取樣率拉到 100% 才能補上這個缺口，而這是整場調查一開始就卡住的地方。光看症狀，只知道有東西在漏，不知道是哪一層漏的。</p>
+
+  <h2>第一輪：翻 telemetry、加 trace、查網路</h2>
+
+  <p>團隊的第一步很標準。文章說他們「started the investigation by combing through all of our telemetry and understanding the user’s logic」，先把監測資料整個翻過一遍，並弄懂客戶的程式邏輯，才能說那些查詢「一定」不該回空。接著他們把這個 Hyperdrive 實例的 trace 取樣率調高，目的寫得很明白：希望看到這個錯誤的執行流程。這兩步背後的想法很樸素，只要抓到一條失敗請求從頭到尾的軌跡，哪一段回了空，一眼就看得出來。</p>
+
+  <p>這條路沒有走通，原因就是上一節的算術：軌跡要靠錯誤自己出現才抓得到，而它十萬次才出現一次。文章接著寫，他們也找過網路問題，「but nothing seemed to account for this behavior」，沒有任何一項能解釋這個現象。網路是空回應與卡住的第一嫌疑，這是我的推論：封包遺失、連線中斷、逾時，都會讓查詢拿不到資料。這裡的措辭值得留意，文章說的是找不到能解釋這個現象的網路問題，沒有宣稱已經證明網路完全沒事，所以這一格在下面的漏斗裡標的是「沒有一項能解釋」，不是「已排除」。</p>
+
+  <p>剩下的只有一條線索，文章寫成「the bug only occurred on Hyperdrive instances with caching enabled」。沒開快取的實例沒有這個問題。團隊的結論是「This made us suspect an issue with Hyperdrive’s MySQL caching」。這條線索沒有說明原因，但它把嫌疑從整條請求路徑縮到了快取。下面的漏斗把這一輪的收斂畫出來，條的長度只表示嫌疑範圍縮小的順序，不是機率。</p>
+
+  <figure class="vg-w-funnel-hyperdrive-suspects" data-mobile="keep" data-svg-scroll="720">
+    <style>
+      .vg-w-funnel-hyperdrive-suspects svg { width: 100%; height: auto; }
+    </style>
+    <svg viewBox="0 0 720 340" role="img" aria-label="嫌疑範圍如何從空回應收斂到 MySQL 快取，再轉向協定">
+      <rect x="20" y="20" width="300" height="40" rx="2" fill="var(--accent)" fill-opacity="0.12" stroke="var(--accent)" stroke-width="1.5"/>
+      <text x="34" y="46" fill="var(--ink)" font-family="JetBrains Mono, monospace" font-size="13">1</text>
+      <text x="340" y="37" fill="var(--ink)" font-family="Manrope, sans-serif" font-size="14">客戶回報：該有資料卻拿到空回應</text>
+      <text x="340" y="55" fill="var(--muted)" font-family="Manrope, sans-serif" font-size="12">約 0.001% 的查詢</text>
+
+      <rect x="20" y="84" width="240" height="40" rx="2" fill="var(--accent)" fill-opacity="0.22" stroke="var(--accent)" stroke-width="1.5"/>
+      <text x="34" y="110" fill="var(--ink)" font-family="JetBrains Mono, monospace" font-size="13">2</text>
+      <text x="340" y="101" fill="var(--ink)" font-family="Manrope, sans-serif" font-size="14">翻遍 telemetry，提高該實例的 trace 取樣</text>
+      <text x="340" y="119" fill="var(--muted)" font-family="Manrope, sans-serif" font-size="12">錯誤太稀有，很難找到端到端的軌跡</text>
+
+      <rect x="20" y="148" width="180" height="40" rx="2" fill="var(--accent)" fill-opacity="0.32" stroke="var(--accent)" stroke-width="1.5"/>
+      <text x="34" y="174" fill="var(--ink)" font-family="JetBrains Mono, monospace" font-size="13">3</text>
+      <text x="340" y="165" fill="var(--ink)" font-family="Manrope, sans-serif" font-size="14">查網路問題</text>
+      <text x="340" y="183" fill="var(--muted)" font-family="Manrope, sans-serif" font-size="12">沒有一項能解釋這個現象</text>
+
+      <rect x="20" y="212" width="120" height="40" rx="2" fill="var(--accent)" fill-opacity="0.45" stroke="var(--accent)" stroke-width="1.5"/>
+      <text x="34" y="238" fill="var(--ink)" font-family="JetBrains Mono, monospace" font-size="13">4</text>
+      <text x="340" y="229" fill="var(--ink)" font-family="Manrope, sans-serif" font-size="14">線索：只出現在開了 caching 的實例</text>
+      <text x="340" y="247" fill="var(--muted)" font-family="Manrope, sans-serif" font-size="12">於是懷疑 MySQL 快取</text>
+
+      <rect x="20" y="276" width="60" height="40" rx="2" fill="var(--accent)" fill-opacity="0.6" stroke="var(--accent)" stroke-width="1.5"/>
+      <text x="34" y="302" fill="var(--ink)" font-family="JetBrains Mono, monospace" font-size="13">5</text>
+      <text x="340" y="293" fill="var(--ink)" font-family="Manrope, sans-serif" font-size="14">轉向研讀 MySQL 協定</text>
+      <text x="340" y="311" fill="var(--muted)" font-family="Manrope, sans-serif" font-size="12">檢查是否帶著 Postgres 協定的假設</text>
+    </svg>
+    <figcaption>順序依文章的敘述排列。條的寬度只表示嫌疑範圍逐步縮小，不代表機率。</figcaption>
+  </figure>
+
+  <p>懷疑快取之後，要回答的是快取裡到底出了什麼事。這得先知道 Hyperdrive 的快取是怎麼放的。</p>
+
+  <h2>第二輪：快取怎麼放，MySQL 協定又被當成了什麼</h2>
+
+  <p>每個 Hyperdrive 實例都是分成兩個節點的架構，一個叫 Client，一個叫 Endpoint。Client 跑在使用者 Worker 的同一台機器上，處理本地快取（如果有開），需要時把查詢轉給 Endpoint。Endpoint 握著連線池，放在離來源資料庫最近的資料中心。兩個節點各自使用所在資料中心的 Cloudflare CDN cache。文章接著強調一句：如果兩個節點剛好在同一個資料中心，它們會共用同一份快取。</p>
+
+  <p>共用快取通常對效能有利，文章原話是「generally good for performance」。做法是把查詢的 wire message 內容做一些正規化後取雜湊，再把結果位元組存進快取。於是在同一個資料中心，Client 收到請求，而 Endpoint 剛好快取過同一個查詢的結果，Client 就能直接從共用快取回應。文章同時指出這個設計成立的前提，是「this scheme requires that the same bytes are cached for the same response」，不管那份位元組是 Client 存的還是 Endpoint 存的。同一個查詢對應的位元組，誰存都必須一樣。這個前提先記著。</p>
+
+  <p>既然拿不到直接的軌跡，團隊決定花時間研讀 MySQL client/server protocol。他們給的動機很具體：「Perhaps we had an assumption about Postgres’ protocol built into our MySQL handling that was causing these issues」，也就是 MySQL 的處理有可能不自覺帶著 Postgres 協定的假設。文章在開頭說過，他們一直在讓 MySQL 的處理跟 Postgres 支援一樣可靠，Postgres 就是對照的基準。我的推論是，這是個好假設：它能解釋為什麼只有 MySQL 出事，而且不必先抓到軌跡，靠讀文件與程式碼就能驗證。</p>
+
+  <p>MySQL 協定放進連線池之後，很容易讓人搞混，因為有兩個東西在當 client、兩個在當 server。Worker 裡的 MySQL client library 是第一個 client，它連的第一個「server」是 Hyperdrive Client；Hyperdrive Endpoint 則扮演 MySQL client，連到真正的來源資料庫。協定先走 Connection Phase，雙方談定認證方式與 capabilities，再進入 Command Phase，由 client 送出 SQL 之類的指令，server 回應並等待下一個。</p>
+
+  <p>把這條鏈從頭走一遍，會更清楚每一段各說什麼語言。Worker 的 driver 帶著它自己的 capabilities，跟 Hyperdrive Client 說話；Hyperdrive Client 在這段關係裡扮演 server，所以回給 Worker 的位元組要符合 Worker 的 capabilities。往後一段，Endpoint 帶著 Hyperdrive 固定的那組 capabilities，跟來源資料庫說話，來源回來的位元組就是這個編碼。兩個節點之間用什麼格式轉手，文章沒有展開，只說 Endpoint 永遠用 Hyperdrive 的能力工作。換句話說，同一份查詢結果，在鏈上至少會以兩種編碼出現，一種屬於 Worker 這一側，一種屬於來源這一側，翻譯就發生在 Client。</p>
+
+  <p>capabilities 是這一輪的關鍵。每個 capability 是一個功能，例如 Command Phase 能不能壓縮。文章說雙方「must only use features which the other supports」，否則會出現 protocol desync，行為無法預期。這對 Hyperdrive 特別麻煩，因為它對來源資料庫是 client，對 Worker 卻是 server。為了能解析來源 MySQL server 的訊息，Hyperdrive 對來源使用一組固定的 capability flags；這組旗標可能跟 Worker 那邊的 client 不一樣，所以 Hyperdrive 得把來源的回應，從自己能力編碼的版本，翻譯成 Worker 期待的版本。</p>
+
+  <p>文章舉的具體差異是 <code>CLIENT_DEPRECATE_EOF</code>。他們在除錯時發現，Node.js 常用的 MySQL client library mysql2 目前不支援這個 capability，而它改變的是結果集怎麼結尾。沒有協商它，server 會在欄位定義和資料列之間送一個 EOF 封包，結果集尾端再送一個 EOF 封包。協商了它，中間那個 metadata EOF 封包不再送出，結尾的 EOF 換成 OK 封包。文章補充，MySQL server 5.7.5 以上支援這個 capability，但新的 OK 封包行為只有在 client 協商時才會用。下圖照文章的描述畫出兩種封包序列。</p>
+
+  <figure class="vg-w-packets-hyperdrive-eof" data-mobile="keep" data-svg-scroll="720">
+    <style>
+      .vg-w-packets-hyperdrive-eof svg { width: 100%; height: auto; }
+    </style>
+    <svg viewBox="0 0 720 330" role="img" aria-label="有無 CLIENT_DEPRECATE_EOF 時結果集的封包序列，以及以第一種格式的位元組被當成第二種來讀的推演">
+      <text x="20" y="30" fill="var(--muted)" font-family="IM Fell English, serif" font-style="italic" font-size="13">結果集的封包序列（只畫文章提到的幾種）</text>
+
+      <text x="20" y="72" fill="var(--ink)" font-family="Manrope, sans-serif" font-size="13">協商了</text>
+      <text x="20" y="90" fill="var(--ink)" font-family="JetBrains Mono, monospace" font-size="12">CLIENT_DEPRECATE_EOF</text>
+      <rect x="200" y="62" width="120" height="34" rx="2" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.5"/>
+      <text x="260" y="84" text-anchor="middle" fill="var(--ink)" font-family="Manrope, sans-serif" font-size="13">欄位定義</text>
+      <rect x="326" y="62" width="200" height="34" rx="2" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.5"/>
+      <text x="426" y="84" text-anchor="middle" fill="var(--ink)" font-family="Manrope, sans-serif" font-size="13">資料列</text>
+      <rect x="532" y="62" width="70" height="34" rx="2" fill="var(--sage)" fill-opacity="0.35" stroke="var(--sage-deep)" stroke-width="1.5"/>
+      <text x="567" y="84" text-anchor="middle" fill="var(--ink)" font-family="JetBrains Mono, monospace" font-size="13">OK</text>
+
+      <text x="20" y="148" fill="var(--ink)" font-family="Manrope, sans-serif" font-size="13">沒協商</text>
+      <text x="20" y="166" fill="var(--muted)" font-family="Manrope, sans-serif" font-size="12">例如 mysql2（文章指它目前不支援）</text>
+      <rect x="200" y="138" width="120" height="34" rx="2" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.5"/>
+      <text x="260" y="160" text-anchor="middle" fill="var(--ink)" font-family="Manrope, sans-serif" font-size="13">欄位定義</text>
+      <rect x="326" y="138" width="70" height="34" rx="2" fill="var(--accent)" fill-opacity="0.18" stroke="var(--accent)" stroke-width="1.5"/>
+      <text x="361" y="160" text-anchor="middle" fill="var(--ink)" font-family="JetBrains Mono, monospace" font-size="13">EOF</text>
+      <rect x="402" y="138" width="200" height="34" rx="2" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.5"/>
+      <text x="502" y="160" text-anchor="middle" fill="var(--ink)" font-family="Manrope, sans-serif" font-size="13">資料列</text>
+      <rect x="608" y="138" width="70" height="34" rx="2" fill="var(--accent)" fill-opacity="0.18" stroke="var(--accent)" stroke-width="1.5"/>
+      <text x="643" y="160" text-anchor="middle" fill="var(--ink)" font-family="JetBrains Mono, monospace" font-size="13">EOF</text>
+
+      <line x1="20" y1="200" x2="700" y2="200" stroke="var(--line)" stroke-width="1"/>
+      <text x="20" y="226" fill="var(--ink)" font-family="Manrope, sans-serif" font-size="13">推演（非文章的圖）</text>
+      <text x="20" y="244" fill="var(--muted)" font-family="Manrope, sans-serif" font-size="12">第一種格式被當成第二種來讀</text>
+      <text x="200" y="216" fill="var(--muted)" font-family="Manrope, sans-serif" font-size="12">讀的一方期待</text>
+      <rect x="200" y="222" width="120" height="26" rx="2" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1"/>
+      <text x="260" y="240" text-anchor="middle" fill="var(--ink)" font-family="Manrope, sans-serif" font-size="12">欄位定義</text>
+      <rect x="326" y="222" width="70" height="26" rx="2" fill="var(--accent)" fill-opacity="0.18" stroke="var(--accent)" stroke-width="1"/>
+      <text x="361" y="240" text-anchor="middle" fill="var(--ink)" font-family="JetBrains Mono, monospace" font-size="12">EOF</text>
+      <rect x="402" y="222" width="200" height="26" rx="2" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1"/>
+      <text x="502" y="240" text-anchor="middle" fill="var(--ink)" font-family="Manrope, sans-serif" font-size="12">資料列</text>
+      <rect x="608" y="222" width="70" height="26" rx="2" fill="var(--accent)" fill-opacity="0.18" stroke="var(--accent)" stroke-width="1"/>
+      <text x="643" y="240" text-anchor="middle" fill="var(--ink)" font-family="JetBrains Mono, monospace" font-size="12">EOF</text>
+
+      <text x="200" y="272" fill="var(--muted)" font-family="Manrope, sans-serif" font-size="12">實際收到</text>
+      <rect x="200" y="278" width="120" height="26" rx="2" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1"/>
+      <text x="260" y="296" text-anchor="middle" fill="var(--ink)" font-family="Manrope, sans-serif" font-size="12">欄位定義</text>
+      <rect x="326" y="278" width="200" height="26" rx="2" fill="var(--bg-soft)" stroke="var(--accent)" stroke-width="2" stroke-dasharray="4 3"/>
+      <text x="426" y="296" text-anchor="middle" fill="var(--ink)" font-family="Manrope, sans-serif" font-size="12">資料列</text>
+      <rect x="532" y="278" width="70" height="26" rx="2" fill="var(--sage)" fill-opacity="0.35" stroke="var(--sage-deep)" stroke-width="1"/>
+      <text x="567" y="296" text-anchor="middle" fill="var(--ink)" font-family="JetBrains Mono, monospace" font-size="12">OK</text>
+      <text x="326" y="322" fill="var(--accent-text)" font-family="Manrope, sans-serif" font-size="12">本來該出現 EOF 的位置，來的是資料列</text>
+    </svg>
+    <figcaption>前兩排依文章對 CLIENT_DEPRECATE_EOF 的描述繪製，封包內部欄位未畫出。最下面一組是依這個描述做的推演。</figcaption>
+  </figure>
+
+  <p>Hyperdrive 本身支援 <code>CLIENT_DEPRECATE_EOF</code>，但 Worker 的 driver 未必支援，所以 Hyperdrive 會依 Worker driver 的預期調整行為。文章的說法是，這「means rewriting result sets to include EOFs and to translate all OK packets to EOFs when required」，需要時補上 EOF，並把所有 OK 封包翻成 EOF。圖的最後一組是我自己的推演，不是文章的圖：如果一份依第一種格式編碼的位元組，被當成第二種來讀，期待 EOF 的位置上出現的會是資料列。文章對後果的描述比較籠統，說是 MySQL 回應以錯的 capabilities 編碼，造成非預期的空結果與卡住。更細的解析行為，我不替它補。</p>
+
+  <p>到這裡，團隊讀文件、翻 telemetry、看 Hyperdrive 的程式碼，文章說這樣花了好幾天，然後「everything clicked」。缺的最後一塊拼圖，不在協定文件裡，而在 Hyperdrive Client 的快取程式碼：一個錯誤的假設。</p>
+
+  <h2>根因：Client 把寫給 Worker 的位元組存進了共用快取</h2>
+
+  <p>那個假設是這樣的。實作 Postgres 的 Client 快取時，他們把「we can cache exactly the bytes we wrote back to the Worker」當成前提，也就是 Client 寫回給 Worker 的那串位元組，可以原封不動存進快取。文章說這個假設對 Postgres 的 wire protocol 是合理的，到了 MySQL 卻不再成立，原因是 MySQL capabilities 的不一致。這裡連回前面兩節：Endpoint 永遠用 Hyperdrive 的 capabilities 工作，Client 寫回給 Worker 的位元組卻已經翻譯成 Worker 的 capabilities。Client 存進快取的，因此是跟 Endpoint 預期不同格式的位元組。</p>
+
+  <p>文章沒有解釋這個假設為什麼在 Postgres 上合理，只說它「reasonable」。一種可能是 Postgres 的回應位元組不隨 client 協商的功能而改變，所以寫給 Worker 的和寫給 Endpoint 的是同一份；這只是我的猜測，文章沒有這樣寫。對 MySQL 來說，同一個查詢結果會因為 Worker driver 有沒有協商某個 capability 而變成不同的位元組序列，「寫給 Worker 的位元組」和「Endpoint 預期的位元組」從此是兩個不同的東西。假設沒有變，變的是協定。</p>
+
+  <p>把這些線索接起來，就能說明為什麼壞掉的是特定情境。文章對條件寫得很精確：錯誤發生在 Client 和 Endpoint 位於同一個資料中心、共用同一份快取，而且其中一個讀到另一個存進去的值的時候。換句話說，單獨看任何一個節點的程式碼都說得通，錯的是兩個節點對「快取裡的位元組是什麼格式」沒有共識。這也回頭解釋了第一輪拿到的那條線索：關掉快取，就沒有可以被讀錯的值。</p>
+
+  <p>文章列了兩個情境。第一個是 Endpoint 寫、Client 讀：Endpoint 正在處理查詢 Q，從來源拿到回應 R，把以 Hyperdrive 能力編碼的位元組 R_hyperdrive 存進共用快取；Client 收到另一個對 Q 的請求，查共用快取找到 R_hyperdrive，然後「responds to the Worker with R_hyperdrive without translating to the Worker’s capabilities」，沒有翻譯成 Worker 的能力就直接回給 Worker。</p>
+
+  <p>第二個反過來，是 Client 寫、Endpoint 讀：Client 剛服務完 Q，把翻譯過的 R_worker 寫進快取；Endpoint 正在處理 Q，查快取找到 R_worker；Endpoint 把它送給另一個 Client，那個 Client 嘗試把 R_worker 翻譯成 Worker 的能力，結果「ends up sending an early EOF or hangs」，送出提早的 EOF，或是卡住。下面的探針把這兩個情境，加上不同資料中心與修復後的版本，排成三組可以自己撥的開關。</p>
+
+  <figure class="vg-w-probe-hyperdrive-shared-cache" data-mobile="static" data-svg-scroll="720">
+    <style>
+      .vg-w-probe-hyperdrive-shared-cache { display: grid; gap: var(--s-2); }
+      .vg-w-probe-hyperdrive-shared-cache svg.vg-w-probe-hyperdrive-shared-cache-main { width: 100%; height: auto; }
+      .vg-w-probe-hyperdrive-shared-cache .controls { display: grid; gap: var(--s-2); }
+      .vg-w-probe-hyperdrive-shared-cache .grp { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s-1); }
+      .vg-w-probe-hyperdrive-shared-cache .lab { font-family: var(--sans); font-size: var(--fs-xs); letter-spacing: 0.04em; color: var(--muted); min-width: 9em; }
+      .vg-w-probe-hyperdrive-shared-cache .grp button { min-height: 44px; padding: var(--s-1) var(--s-2); border: 1px solid var(--muted-2); background: var(--bg-soft); color: var(--ink); font-family: var(--sans); font-size: var(--fs-sm); cursor: pointer; }
+      .vg-w-probe-hyperdrive-shared-cache .grp button:hover { border-color: var(--accent); }
+      .vg-w-probe-hyperdrive-shared-cache .grp button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+      .vg-w-probe-hyperdrive-shared-cache .grp button[aria-pressed="true"] { border-color: var(--accent); background: var(--accent); background: color-mix(in srgb, var(--accent) 18%, var(--bg-soft)); color: var(--accent-text); }
+      .vg-w-probe-hyperdrive-shared-cache .result-rect { fill: var(--bg-soft); stroke: var(--sage-deep); stroke-width: 1.5; }
+      .vg-w-probe-hyperdrive-shared-cache .result-rect.bad { stroke: var(--accent); stroke-width: 2; }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 4.1 12 6"/><path d="m5.1 8-2.9-.8"/><path d="m6 12-1.9 2"/><path d="M7.2 2.2 8 5.1"/><path d="M9.037 9.69a.498.498 0 0 1 .653-.653l11 4.5a.5.5 0 0 1-.074.949l-4.349 1.041a1 1 0 0 0-.74.739l-1.04 4.35a.5.5 0 0 1-.95.074z"/></svg>
+      <span>撥三組開關，看哪種組合會讀到錯的位元組 · 2 × 2 × 2 種組合</span>
+    </p>
+    <div class="controls" data-vg-controls role="group" aria-label="快取情境的三組開關">
+      <div class="grp"><span class="lab">兩個節點的位置</span>
+        <button type="button" data-k="dc" data-v="same" aria-pressed="true">同一資料中心</button>
+        <button type="button" data-k="dc" data-v="diff" aria-pressed="false">不同資料中心</button>
+      </div>
+      <div class="grp"><span class="lab">誰先把結果寫進快取</span>
+        <button type="button" data-k="w" data-v="endpoint" aria-pressed="true">Endpoint</button>
+        <button type="button" data-k="w" data-v="client" aria-pressed="false">Client</button>
+      </div>
+      <div class="grp"><span class="lab">版本</span>
+        <button type="button" data-k="v" data-v="before" aria-pressed="true">修復前</button>
+        <button type="button" data-k="v" data-v="after" aria-pressed="false">修復後</button>
+      </div>
+    </div>
+    <svg class="vg-w-probe-hyperdrive-shared-cache-main" viewBox="0 0 720 310" role="img" aria-label="Endpoint 與 Client 透過資料中心快取交換查詢結果位元組，並顯示讀取方會得到什麼">
+      <text x="20" y="34" fill="var(--muted)" font-family="IM Fell English, serif" font-style="italic" font-size="13">同一個查詢 Q 的結果位元組</text>
+      <rect x="20" y="56" width="170" height="80" rx="2" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.5"/>
+      <text data-writer-name x="105" y="92" text-anchor="middle" fill="var(--ink)" font-family="JetBrains Mono, monospace" font-size="15">Endpoint</text>
+      <text x="105" y="118" text-anchor="middle" fill="var(--muted)" font-family="Manrope, sans-serif" font-size="12">寫入的一方</text>
+      <line x1="190" y1="96" x2="250" y2="96" stroke="var(--ink)" stroke-width="1.5"/>
+      <text x="220" y="86" text-anchor="middle" fill="var(--muted)" font-family="Manrope, sans-serif" font-size="12">寫入</text>
+      <rect data-cache-rect x="250" y="46" width="220" height="100" rx="2" fill="var(--bg-soft)" stroke="var(--sage-deep)" stroke-width="1.5"/>
+      <text x="360" y="68" text-anchor="middle" fill="var(--muted)" font-family="Manrope, sans-serif" font-size="12">資料中心快取裡的位元組</text>
+      <text data-cache-label x="360" y="100" text-anchor="middle" fill="var(--ink)" font-family="JetBrains Mono, monospace" font-size="16">R_hyperdrive</text>
+      <text data-cache-sub x="360" y="126" text-anchor="middle" fill="var(--muted)" font-family="Manrope, sans-serif" font-size="12">Hyperdrive 能力編碼</text>
+      <line data-read-line x1="470" y1="96" x2="530" y2="96" stroke="var(--ink)" stroke-width="1.5"/>
+      <text data-read-label x="500" y="86" text-anchor="middle" fill="var(--muted)" font-family="Manrope, sans-serif" font-size="12">讀取</text>
+      <rect x="530" y="56" width="170" height="80" rx="2" fill="var(--bg-soft)" stroke="var(--muted-2)" stroke-width="1.5"/>
+      <text data-reader-name x="615" y="92" text-anchor="middle" fill="var(--ink)" font-family="JetBrains Mono, monospace" font-size="15">Client</text>
+      <text x="615" y="118" text-anchor="middle" fill="var(--muted)" font-family="Manrope, sans-serif" font-size="12">讀取的一方</text>
+      <text x="20" y="180" fill="var(--muted)" font-family="IM Fell English, serif" font-style="italic" font-size="13">結果</text>
+      <rect data-result-rect class="result-rect bad" x="20" y="192" width="680" height="96" rx="2"/>
+      <text data-out1 x="36" y="224" fill="var(--ink)" font-family="Manrope, sans-serif" font-size="14">Client 讀到 R_hyperdrive，沒有翻譯成 Worker 的能力就回給 Worker。</text>
+      <text data-out2 x="36" y="256" fill="var(--accent-text)" font-family="Manrope, sans-serif" font-size="13">回應以錯的 capabilities 編碼，文章把後果寫成非預期的空結果與卡住。</text>
+    </svg>
+    <figcaption>情境依文章的兩個失敗流程繪製。不同資料中心與修復後兩種結果，是依文章的發生條件與修復描述推演的示意。</figcaption>
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        const root = document.querySelector('.vg-w-probe-hyperdrive-shared-cache');
+        const st = { dc: 'same', w: 'endpoint', v: 'before' };
+        const q = function (sel) { return root.querySelector(sel); };
+        const writerName = q('[data-writer-name]');
+        const readerName = q('[data-reader-name]');
+        const cacheLabel = q('[data-cache-label]');
+        const cacheSub = q('[data-cache-sub]');
+        const cacheRect = q('[data-cache-rect]');
+        const readLine = q('[data-read-line]');
+        const readLabel = q('[data-read-label]');
+        const resultRect = q('[data-result-rect]');
+        const out1 = q('[data-out1]');
+        const out2 = q('[data-out2]');
+
+        function compute() {
+          const wName = st.w === 'endpoint' ? 'Endpoint' : 'Client';
+          const rName = st.w === 'endpoint' ? 'Client' : 'Endpoint';
+          const r = { w: wName, r: rName, bad: false, shared: true };
+          if (st.dc === 'diff') {
+            r.shared = false;
+            r.label = '各自的快取';
+            r.sub = '不共用，各讀各的';
+            r.o1 = '兩個節點在不同資料中心，各讀各的快取。';
+            r.o2 = '讀到的都是自己存的格式，這條路徑不會出錯（依文章的發生條件推演）。';
+          } else if (st.v === 'after') {
+            r.label = 'R_hyperdrive';
+            r.sub = 'canonical，Hyperdrive 能力';
+            r.o1 = '不論由誰寫入，快取裡都是同一份 canonical 位元組。';
+            r.o2 = st.w === 'endpoint'
+              ? 'Client 讀到後，依 Worker 的能力處理再回應（依文章描述推得）。'
+              : 'Endpoint 讀到的，就是它本來使用的格式。';
+          } else if (st.w === 'endpoint') {
+            r.label = 'R_hyperdrive';
+            r.sub = 'Hyperdrive 能力編碼';
+            r.bad = true;
+            r.o1 = 'Client 讀到 R_hyperdrive，沒有翻譯成 Worker 的能力就回給 Worker。';
+            r.o2 = '回應以錯的 capabilities 編碼，文章把後果寫成非預期的空結果與卡住。';
+          } else {
+            r.label = 'R_worker';
+            r.sub = '依 Worker 能力翻譯';
+            r.bad = true;
+            r.o1 = 'Endpoint 讀到 R_worker，把它送給另一個 Client。';
+            r.o2 = '那個 Client 嘗試翻譯它，最後送出提早的 EOF，或是卡住。';
+          }
+          return r;
+        }
+
+        function render() {
+          const r = compute();
+          writerName.textContent = r.w;
+          readerName.textContent = r.r;
+          cacheLabel.textContent = r.label;
+          cacheSub.textContent = r.sub;
+          cacheRect.setAttribute('stroke-dasharray', r.shared ? '' : '5 4');
+          readLine.setAttribute('stroke-opacity', r.shared ? '1' : '0.25');
+          readLabel.setAttribute('fill-opacity', r.shared ? '1' : '0.4');
+          resultRect.classList.toggle('bad', r.bad);
+          out1.textContent = r.o1;
+          out2.textContent = r.o2;
+          out2.setAttribute('fill', r.bad ? 'var(--accent-text)' : 'var(--sage-deep)');
+        }
+
+        root.querySelectorAll('button[data-k]').forEach(function (btn) {
+          btn.addEventListener('click', function () {
+            const k = btn.getAttribute('data-k');
+            st[k] = btn.getAttribute('data-v');
+            root.querySelectorAll('button[data-k="' + k + '"]').forEach(function (b) {
+              b.setAttribute('aria-pressed', b === btn ? 'true' : 'false');
+            });
+            render();
+          });
+        });
+        render();
+      })();
+    </script>
+  </figure>
+
+  <p>撥一撥可以看到文章沒有明說、但從它的條件直接推得的幾件事（這些是我做的推演）：兩個節點在不同資料中心時，各自讀的是自己所在的快取，讀到的都是自己存的那一種，不會出錯；在同一個資料中心時，不論誰先寫，都有一個方向會讀到格式不對的位元組。</p>
+
+  <p>為什麼只有 0.001%？文章沒有解釋這個比例怎麼來。合理的推測是它來自條件的疊加：要在同一個資料中心，要有一個節點讀到另一個節點存的值，Worker 的 driver 的 capabilities 還要跟 Hyperdrive 的不同，才需要翻譯。每個條件單獨都不稀有，疊在一起的機率就很低。這個推測文章沒有驗證，只是說明一個錯誤的假設為什麼可以產生這麼低的錯誤率。</p>
+
+  <p>修復的描述很短：「Once we found this type of failure mode, the fix was simple」。做法是現在一律把查詢結果位元組的 canonical 版本寫回快取，用 Hyperdrive 的 capabilities 編碼，「no matter which node stored it」。這樣快取裡的位元組不再取決於誰寫入，前面那個「同一個查詢、同樣的位元組」的前提就恢復了。釋出之後，文章說 empty row 的問題消失了，Client 連線的成功率達到 99.99%。</p>
+
+  <p>修法的選擇也有別的可能。文章只說快取的鍵來自正規化後的 wire message 雜湊，沒有說鍵裡有沒有納入 Worker 的 capabilities。如果把 capabilities 一併算進鍵，Client 與 Endpoint 就不會讀到彼此格式不同的值，代價是同一個查詢會因 driver 不同而各存一份，命中率隨之下降。這是我設想的另一條路，文章沒有討論，也沒有說他們為什麼不選這條。他們選的是讓快取裡只有一種格式，鍵不用動，格式的差異留給讀的一方在出口處理。</p>
+
+  <p>這個結果有幾處要讀仔細。文章沒有給修復前的成功率，只給了 0.001% 的出現率和修復後的 99.99%，所以不能把兩個數字相減當成改善幅度。99.99% 是 Client 連線的成功率，beta 的目標則是 99.99% 的生產可用性目標，兩者是不是同一個指標，文章沒有說。另外有一點是我的推論：修復的代價是 Client 讀快取時得走一次翻譯，因為快取裡不再是它能直接轉給 Worker 的格式；文章沒有量這個代價。</p>
+
+  <p>回頭看這場調查的方法，有一點很明顯：兩條一開始的路，翻 telemetry 與加 trace，目標都是抓到一次失敗請求的完整軌跡，而稀有度讓這個目標落空；最後解開問題的是另一種做法，把症狀裡唯一可靠的條件（只在開快取時發生）當成限定範圍的工具，再回到協定文件與自己的程式碼，找哪一個假設跟協定對不上。這是我對文章敘述順序的讀法。文章沒有把它寫成方法論，但時間線就是這樣排的。當觀測沒辦法放大訊號時，縮小搜尋範圍加上對照規格，是另一條路。</p>
+
+  <h2>風衣裡的其他 bug：同一個形狀</h2>
+
+  <p>在這個 bug 之前，文章先講了幾個比較小的問題。beta 最早被回報的問題之一，是寫進資料庫的 emoji 沒有被正確傳回。這是字元編碼的問題：Hyperdrive 在啟動握手時協商的編碼是 <code>utf8</code>，而文章指出 <code>utf8</code> 是 <code>utf8mb3</code> 的棄用別名，要拿到完整的 UTF-8，握手得改用 <code>utf8mb4</code>。改過之後 emoji 的問題就解了。</p>
+
+  <p>另一個編碼 bug 出現在他們加上 <code>COM_RESET_CONNECTION</code> 做連線清理之後。這個指令是用來清掉連線上的 session 狀態，卻不會把連線狀態重設成他們協商的字元集，而是重設成 server 的預設值。於是清理這個步驟又把編碼問題帶了回來。修法是每次連線重設後，一律再下指令把編碼設回 <code>utf8mb4</code>。下表把三個 bug 並排。</p>
+
+  <figure class="vg-w-table-hyperdrive-three-bugs" data-mobile="keep">
+    <style>
+      .vg-w-table-hyperdrive-three-bugs { overflow-x: auto; }
+      .vg-w-table-hyperdrive-three-bugs table { width: 100%; min-width: 560px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-hyperdrive-three-bugs caption { text-align: left; caption-side: top; font-family: var(--scribed); font-style: italic; color: var(--muted); font-size: var(--fs-sm); padding: var(--s-1) 0; }
+      .vg-w-table-hyperdrive-three-bugs thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); }
+      .vg-w-table-hyperdrive-three-bugs tbody td { padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+      .vg-w-table-hyperdrive-three-bugs tbody td:first-child { font-family: var(--sans); font-size: var(--fs-xs); letter-spacing: 0.04em; color: var(--ink); white-space: nowrap; }
+      .vg-w-table-hyperdrive-three-bugs tbody tr:last-child td { background: var(--bg-soft); }
+    </style>
+    <table>
+      <caption>文章裡展開的三個 bug。第三列是本文的主角，其餘兩列是文章提到的較小問題。</caption>
+      <thead>
+        <tr><th>bug</th><th>症狀</th><th>原因</th><th>修法</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>emoji 編碼</td><td>寫進資料庫的 emoji 沒有被正確傳回</td><td>握手協商 utf8，它是 utf8mb3 的棄用別名</td><td>握手改用 utf8mb4</td></tr>
+        <tr><td>連線重設</td><td>加上連線清理後又出現編碼問題</td><td>COM_RESET_CONNECTION 把連線重設成 server 預設，不是協商的字元集</td><td>每次重設後再下指令設回 utf8mb4</td></tr>
+        <tr><td>快取位元組</td><td>約 0.001% 的查詢拿到空結果，卡住或提早 EOF</td><td>Client 快取了寫給 Worker 的位元組，格式不是 Endpoint 預期的</td><td>一律把 Hyperdrive 能力編碼的 canonical 版本寫進快取</td></tr>
+      </tbody>
+    </table>
+  </figure>
+
+  <p>三個 bug 擺在一起，形狀很像：每一個都是某一層的預設行為，被當成了本來就成立的事。utf8 看起來就是 UTF-8；連線重設看起來會回到剛協商完的狀態；寫給 Worker 的位元組看起來就是可以拿去快取的位元組。這是我的歸納，文章在這一段沒有做這種總結。第三個的特殊之處在於，它的假設不是來自 MySQL 的某個預設值，而是從 Postgres 的實作帶過來的：在 Postgres 的 wire protocol 上合理，到了 capabilities 會變動的協定上就失效。</p>
+
+  <p>對讀者的用處，在於可以拿來當檢查清單，以下是我的推論，文章沒有給這類建議。如果你的系統在中間做協定轉換，又讓不同節點共用同一份快取，值得問兩件事：快取裡存的是原始位元組，還是某個讀者專屬的版本；存的人和讀的人，對這份位元組的格式有沒有共同的規範。Hyperdrive 選的是明確的一種答案：統一存 canonical，由讀的一方自己翻譯。</p>
+
+  <p>文章的結尾只剩使用方式：可以透過 dashboard 或 wrangler，為既有的 MySQL 相容資料庫建立 Hyperdrive，也可以連到新的 PlanetScale 資料庫，有問題就到 Discord 回報。文章沒有列出那二十個修正的清單，只展開了其中三個。</p>
+
+  <p class="vg-deep-closer"><strong>Next time</strong>：下次遇到只在開了快取時出現、稀有到抓不到軌跡的錯誤，先問快取裡的位元組，是不是每一個讀者都能直接使用的那一份。</p>
+</div>
