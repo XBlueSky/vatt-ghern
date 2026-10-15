@@ -1,0 +1,1312 @@
+{
+  "output_path": "src/posts/2026/10/16/deep-git-on-s3-enroute.html",
+  "spine": [
+    "1. 磁碟式 Git 的成本是 RAID、副本與分片再平衡；物件儲存把耐久、複製與容量接走，但 Git 的資料模型假設快速隨機存取。",
+    "2. WAL-on-S3（Cursor Continuity 與開源仿作）把規模與耐久移進桶，讀取擴展得好，但作者認為每個 push 仍得落在磁碟上的單一 repository，寫入實質是單一寫入者。",
+    "3. Enroute 只讓 ref 更新排隊（compare-and-swap），push 的前置工作由 compute 平行做；ledger 用 Raft 把提交壓到 1-2 毫秒，避開桶的往返。",
+    "4. 讀取側靠 segment 格式：每個 commit 一個 segment，delta 只指向 parent 的同一檔案，client 缺哪些 commit 就拿哪些 segment，不必走物件圖。",
+    "5. 小 push 先進日誌、約每秒 flush 一次、約八個同級 layer 合併，讓桶上昂貴的往返與 push 次數脫鉤。",
+    "6. 所有效能數字都是廠商自測：7,600 以上 push/秒、shallow clone 快 2 倍以上、完整 clone 慢約 17%、增量 fetch 慢約 13%；環境只有 EC2 與 S3 一句話，跨系統倍數作者自承設定不同。",
+    "7. 選擇規則：寫入速率在百次/秒量級就不必換；大量 agent 並行寫同一 repo 才值得評估 Enroute，且作者自列未完成項目（SSH、GC、冷啟動、快取設定）仍多，需自己用 forgemark 重跑。"
+  ],
+  "sources": [
+    {
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": "2026-10-13",
+      "perspective": {
+        "mechanism": "ledger（每個 repo 一份 Raft 日誌，記 refs 與 layer 清單）加無狀態 compute 加桶內不可變 layer；push 只排序 ref 更新，讀取靠按 commit 切開的 segment，不必走物件圖。",
+        "tradeoff": "拿掉單一寫入者的上限，換來完整 clone 約慢 17%、增量 fetch 約慢 13%、冷節點慢、GC 與 SSH 尚未完成；所有數字為廠商自測，環境描述極少。",
+        "reader_use": "台灣的基礎設施工程師可用文中的三路線對照判斷自己的瓶頸是讀還是寫；只有大量 agent 並行寫同一 repo 才需要評估，並應用 forgemark 在自己的環境重跑。"
+      }
+    },
+    {
+      "url": "https://github.com/enroute-sh/enroute",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": null,
+      "perspective": {
+        "mechanism": "README 把 Enroute 描述為建在物件儲存之上的可程式化 git 基礎設施，採 Apache-2.0。",
+        "tradeoff": "README 只用來確認授權與定位；效能與設計細節仍以作者部落格為準。",
+        "reader_use": "確認授權為 Apache-2.0，可自行評估與重跑 benchmark。"
+      }
+    }
+  ],
+  "notes": [
+    {
+      "id": "n01",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "has relied heavily on SSDs as the primary storage mechanism",
+      "hedge": "asserted",
+      "interpretation": "作者對磁碟式 Git 託管的描述；brief 與文章連結指向 GitHub 的 Spokes（dgit）架構作為例子。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n02",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "Disks can fail, so one needs RAID and/or backups.",
+      "hedge": "asserted",
+      "interpretation": "磁碟式成本之一。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n03",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "Servers can fail, so every repository needs replicas to be highly available.",
+      "hedge": "asserted",
+      "interpretation": "成本之二：副本。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n04",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "And any disk eventually fills up, so repositories must be sharded and rebalanced across a fleet of file servers.",
+      "hedge": "asserted",
+      "interpretation": "成本之三：分片與再平衡。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n05",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "The advantages are obvious: a bucket is durable, replicates itself and it never fills up.",
+      "hedge": "asserted",
+      "interpretation": "桶對應磁碟式的三項成本；對應關係是我的整理。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n06",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "This only makes sense, since both the Git client but also the Git data model virtually assume fast random access storage.",
+      "hedge": "asserted",
+      "interpretation": "磁碟式有其理由。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n07",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "Each object is its own key, and each GET only tells you which keys to fetch next.",
+      "hedge": "asserted",
+      "interpretation": "逐物件讀取的往返問題。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n08",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "every one of these steps would be a 30-40ms round trip.",
+      "hedge": "asserted",
+      "interpretation": "前半句為 If one were to treat Git as just content-addressed storage on object storage；作者估算，非量測。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n09",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "Most prominently, in August, Cursor/SpaceX described Continuity, their S3-backed Git storage",
+      "hedge": "asserted",
+      "interpretation": "WAL-on-S3 代表；開源仿作的說法出自同一段 implementations。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n10",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "Firstly, while they perform well when scaling out reads, they typically falter under write-heavy traffic.",
+      "hedge": "hedged",
+      "interpretation": "批評之一，語氣為 typically。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n11",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "And secondly, they still rely on the canonical Git CLI which memory maps files on disk,",
+      "hedge": "asserted",
+      "interpretation": "批評之二。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n12",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "With these improvements, Cursor reports up to 120 pushes/s on S3 Standard and more than 300 on S3 Express One Zone",
+      "hedge": "asserted",
+      "interpretation": "Cursor 回報的數字，由 Enroute 文章轉引；我未讀 Cursor 原文。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n13",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "At the end of the day, no matter how fast the WAL is, every push still has to land in one repository on disk.",
+      "hedge": "asserted",
+      "interpretation": "作者的核心論點。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n14",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "However many servers you run, a repository can only ingest as fast as one machine can apply and compact.",
+      "hedge": "asserted",
+      "interpretation": "單機上限。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n15",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "A small cluster of nodes that keeps one replicated log per repository using Raft consensus.",
+      "hedge": "asserted",
+      "interpretation": "ledger 的定義。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n16",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "The log holds the repository's refs and the list of layers that make up its data.",
+      "hedge": "asserted",
+      "interpretation": "日誌內容。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n17",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "A layer is an immutable file of Git objects with its own index, much like a Git pack.",
+      "hedge": "asserted",
+      "interpretation": "layer 的定義。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n18",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "Committing a log entry typically requires 1-2 milliseconds of network and disk latency, not a bucket round trip.",
+      "hedge": "hedged",
+      "interpretation": "ledger 提交延遲，語氣為 typically；作者自述。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n19",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "With group commits, one fsync covers every push that arrives in the same moment, across all repositories.",
+      "hedge": "asserted",
+      "interpretation": "group commit。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n20",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "Only the ref update is ordered, and it commits in milliseconds once two ledger nodes have it.",
+      "hedge": "asserted",
+      "interpretation": "只排序 ref 更新。「這是 push 關鍵路徑避開桶的原因」是我的整理，已在文中標為推測。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n21",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "Compute is fully stateless and holds nothing but cache.",
+      "hedge": "asserted",
+      "interpretation": "無狀態 compute；另句 Compute nodes keep nothing that can't be rebuilt from the ledger and the bucket.",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n22",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "Most of a push’s work happens before it is committed",
+      "hedge": "asserted",
+      "interpretation": "後接索引 pack、驗證每個物件並重新編碼（閱讀時的內容）。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n23",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "Compute nodes are capable of running this work in parallel without having to take any locks.",
+      "hedge": "asserted",
+      "interpretation": "平行、不加鎖。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n24",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "Only commits are applied in order through a compare-and-swap on the refs the push moves.",
+      "hedge": "asserted",
+      "interpretation": "序列化範圍縮到 ref 的 CAS。「從整個 repository 縮小」是我的整理。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n25",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "Pushes to different branches never conflict and readers work on immutable snapshots, so they never starve writers.",
+      "hedge": "asserted",
+      "interpretation": "不同分支不衝突。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n26",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "Object storage is great for data at rest, but a conditional GET or PUT takes tens of milliseconds.",
+      "hedge": "asserted",
+      "interpretation": "桶的延遲。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n27",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "Small pushes are first stored in the ledger log.",
+      "hedge": "asserted",
+      "interpretation": "小 push 先進日誌。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n28",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "About once a second they are merged into one file and uploaded: one upload for about 300 pushes.",
+      "hedge": "hedged",
+      "interpretation": "約每秒一次，約 300 個 push 一次上傳；兩個都是「about」。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n29",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "Only layers larger than 1 MiB are uploaded directly to the bucket and then committed as a ledger entry.",
+      "hedge": "asserted",
+      "interpretation": "1 MiB 直傳門檻。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n30",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "Once about eight layers of similar size pile up, they are merged into one layer roughly eight times larger.",
+      "hedge": "hedged",
+      "interpretation": "約八個同級合併成約八倍。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n31",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "Merges only copy bytes without recompressing them, so they are relatively inexpensive to run.",
+      "hedge": "asserted",
+      "interpretation": "合併不重新壓縮。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n32",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "Only refs and the layer list remain on the ledger nodes in the long run.",
+      "hedge": "asserted",
+      "interpretation": "長期留在 ledger 的只有 refs 與 layer 清單。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n33",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "Each segment holds the set of objects representing the delta to the commit’s parents.",
+      "hedge": "asserted",
+      "interpretation": "segment 的定義。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n34",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "Multiple consecutive segments are grouped into layers, which are immutable files with a table of contents at the end.",
+      "hedge": "asserted",
+      "interpretation": "segment 組成 layer。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n35",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "The segment of a commit in combination with its ancestors holds all necessary data that is reachable from a commit.",
+      "hedge": "asserted",
+      "interpretation": "commit 加祖先的 segment 握有全部可達資料。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n36",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "Enroute rebuilds object deltas in the segment by picking from possible delta bases constrained to the segment’s ancestors.",
+      "hedge": "asserted",
+      "interpretation": "delta base 限制在祖先。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n37",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "In Enroute, a delta only points to the same file in the parent commit, so a client that has the parent can use it directly.",
+      "hedge": "asserted",
+      "interpretation": "delta 只指向 parent 的同一檔案。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n38",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "The server's job is to send everything reachable from the requested commit without sending data already available.",
+      "hedge": "asserted",
+      "interpretation": "伺服器的工作。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n39",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "A client missing C3 to C6 gets exactly those four segments, with no tree walk.",
+      "hedge": "asserted",
+      "interpretation": "例子。「每步往返成本不再按圖深度累加」是我的歸納，文中已說明。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n40",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "The same object can appear in several commits' segments, but a valid packfile may contain each object only once.",
+      "hedge": "asserted",
+      "interpretation": "caveat 一。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n41",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "Enroute deduplicates while building the object list, and then skips those duplicates during segment streaming.",
+      "hedge": "asserted",
+      "interpretation": "去重做法。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n42",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "A shallow clone has none of the parent commits, so objects stored as deltas at its boundaries have to be sent in full.",
+      "hedge": "asserted",
+      "interpretation": "caveat 二。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n43",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "Enroute rebuilds them in bulk and caches the results, so repeated shallow clones with the same boundary can be fast.",
+      "hedge": "hedged",
+      "interpretation": "批次重建並快取，can be fast。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n44",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "A clone with --filter=blob:none skips file contents and fetches single files later.",
+      "hedge": "asserted",
+      "interpretation": "caveat 三：partial clone。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n45",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "Layers cluster objects of the same kind closer together, to make it cheap to apply this type of filter.",
+      "hedge": "asserted",
+      "interpretation": "layer 把同類物件放近。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n46",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "It reads the refs and the layer metadata, fetches only the chunks it needs, and keeps them on disk for the next request.",
+      "hedge": "asserted",
+      "interpretation": "讀路徑。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n47",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "When a request needs more data that isn't on disk, the node fetches just the chunks it needs, with parallel ranged GETs.",
+      "hedge": "asserted",
+      "interpretation": "平行 ranged GET。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n48",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "In our tests, a node with an empty disk served a full clone of linux.git in 128.6 seconds, against 126.0 seconds warm.",
+      "hedge": "asserted",
+      "interpretation": "作者自測；差距 2.6 秒為我的減法。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n49",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "But even a cold cache costs less than you might think.",
+      "hedge": "hedged",
+      "interpretation": "作者結論。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n50",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "In these tests, Enroute demonstrates a peak performance of more than 7,600 pushes per second into a single repository.",
+      "hedge": "asserted",
+      "interpretation": "廠商自測峰值。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n51",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "Enroute takes 7,619 pushes per second into one repository",
+      "hedge": "asserted",
+      "interpretation": "圖片 alt 文字，7,619。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n52",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "Running in the cloud on EC2 and S3",
+      "hedge": "asserted",
+      "interpretation": "環境描述僅此一句；我讀到的版本未見執行個體型號與叢集規模。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n53",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "which is capable of simulating large numbers of concurrent agents",
+      "hedge": "asserted",
+      "interpretation": "forgemark 的描述，後接 pushing to branches of one shared repository。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n54",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "this is roughly 18 times what Entire.io reports",
+      "hedge": "hedged",
+      "interpretation": "對 Entire.io 回報的倍數，roughly。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n55",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "more than 1,000 times what GitHub is currently able to handle",
+      "hedge": "asserted",
+      "interpretation": "對 GitHub 的倍數，數字為作者自己用 forgemark 跑的。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n56",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "the numbers come from slightly different setups but give a good sense on the order of magnitude",
+      "hedge": "hedged",
+      "interpretation": "作者自承設定不同，只當量級參考。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n57",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "The Enroute and GitHub numbers are our own forgemark runs",
+      "hedge": "asserted",
+      "interpretation": "Enroute 與 GitHub 的數字為自測；Entire 的為對方回報。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n58",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "a write-ahead log on local disk.",
+      "hedge": "asserted",
+      "interpretation": "walgit 的描述；文章有 1 到 512 並行 push 的比較圖，內文沒有數字。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n59",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "We compared Enroute with a warm and cold cache against stock Git 2.56.0",
+      "hedge": "asserted",
+      "interpretation": "對照組。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n60",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "served by git http-backend behind Apache, using a repacked copy of linux.git",
+      "hedge": "asserted",
+      "interpretation": "stock Git 的服務方式與資料。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n61",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "Enroute managed to shine on the shallow benchmark, with its clones being more than 2x faster.",
+      "hedge": "asserted",
+      "interpretation": "shallow clone 快 2 倍以上。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n62",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "Partial clones are on par, full clones are about 17% slower and incremental fetches about 13% slower.",
+      "hedge": "hedged",
+      "interpretation": "持平、慢約 17%、慢約 13%。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n63",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "a warm cache mostly improves shallow clones and incremental fetches",
+      "hedge": "hedged",
+      "interpretation": "暖快取主要改善的項目。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n64",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "Interestingly, the biggest performance gap is now on the client side.",
+      "hedge": "asserted",
+      "interpretation": "差距在 client 端。與 segment 格式的因果是我的推測，已在文中標為推測。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n65",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "the Git client then spends more time validating the pack and decoding deltas than the server spent sending it.",
+      "hedge": "asserted",
+      "interpretation": "client 花在驗證與解 delta 的時間較長。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n66",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "Layers are immutable, so a deleted branch or a force-push leaves unreachable objects behind.",
+      "hedge": "asserted",
+      "interpretation": "GC 問題。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n67",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "We need a way to find them and rewrite layers without blocking reads or pushes.",
+      "hedge": "asserted",
+      "interpretation": "GC 尚待設計。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n68",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "Enroute currently speaks Git over HTTP smart protocol.",
+      "hedge": "asserted",
+      "interpretation": "目前協定範圍。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n69",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "SSH and a few less common parts of the protocol are still missing.",
+      "hedge": "asserted",
+      "interpretation": "SSH 尚缺。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n70",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "The fetch performance of a cold compute node lies far below what is possible once the node is warmed up and the cache is hot.",
+      "hedge": "asserted",
+      "interpretation": "冷啟動限制。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n71",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "Enroute currently doesn't coordinate which compute node serves which repository,",
+      "hedge": "asserted",
+      "interpretation": "目前不協調 compute 與 repository 的對應；句子後半文中不引用。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n72",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "Right now every node caches data the same way.",
+      "hedge": "asserted",
+      "interpretation": "快取不可設定。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n73",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "But it is only the start, and there is still a lot we want to improve and find out:",
+      "hedge": "asserted",
+      "interpretation": "作者對現況的定性。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n74",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "Enroute is open source.",
+      "hedge": "asserted",
+      "interpretation": "結尾。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n75",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "we have built a new kind of git server that is based on modern database principles",
+      "hedge": "asserted",
+      "interpretation": "tl;dr 的前半句，作者總括。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n76",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "Not only is this effectively a single-writer system",
+      "hedge": "asserted",
+      "interpretation": "作者對 WAL 路線的評語（partial sentence）。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n77",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "While these implementations have been successful in moving the burden of scalability and durability into object storage",
+      "hedge": "asserted",
+      "interpretation": "作者承認 WAL 路線的貢獻；implementations 含開源仿作。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n78",
+      "url": "https://github.com/enroute-sh/enroute",
+      "quote": "Enroute is licensed under Apache-2.0.",
+      "hedge": "asserted",
+      "interpretation": "README 授權聲明。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n80",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "to measure how quickly a new node gets fast on large repositories",
+      "hedge": "asserted",
+      "interpretation": "未完成清單中 compute 自動擴縮的項目（partial sentence）；表示新節點變快所需時間尚未量測。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n79",
+      "url": "https://github.com/enroute-sh/enroute",
+      "quote": "Programmable git infrastructure on top of object storage.",
+      "hedge": "asserted",
+      "interpretation": "README 定位語；post 未引用，僅用於確認專案性質。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n81",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "We want the best of both worlds, and pick bases that are both fast to serve and fast to decode.",
+      "hedge": "asserted",
+      "interpretation": "作者把更聰明的 delta base 選擇列為待做，目標是同時快送出、快解碼。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n82",
+      "url": "https://enroute.sh/blog/everyone-is-doing-git-on-s3-wrong",
+      "quote": "We want to make it configurable what gets cached and for how long,",
+      "hedge": "asserted",
+      "interpretation": "作者想讓快取內容與時間可設定；目前每個節點的快取方式相同（見 n72）。",
+      "timeliness": "durable"
+    }
+  ],
+  "claims": [
+    {
+      "id": "c01",
+      "claim_text": "作者自家 benchmark 報出單一 repo 每秒超過 7,600 次 push，這是廠商自測的數字",
+      "location": "opener",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n50",
+        "n57"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "In these tests, Enroute demonstrates a peak performance of more than 7,600 pushes per second into a single repository.",
+      "note": "Attributed as vendor-run in the text. Article confirms 'our own forgemark runs'.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c02",
+      "claim_text": "圖片的替代文字（alt text）寫的是 7,619",
+      "location": "under H2「寫入：每次 push 最後落在哪裡」",
+      "type": "number",
+      "load": "low",
+      "note_ids": [
+        "n51"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Enroute takes 7,619 pushes per second into one repository",
+      "note": "Checker found 7,619 only in the image alt text; post wording changed from 圖說 to 圖片的替代文字 (parent fix, round 1).",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c03",
+      "claim_text": "環境只有一句「Running in the cloud on EC2 and S3」，我讀到的版本沒有給執行個體型號或叢集規模",
+      "location": "under H2「寫入」",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n52"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Running in the cloud on EC2 and S3",
+      "note": "Fetch confirmed no instance types or cluster size are given.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c04",
+      "claim_text": "說它約是 Entire.io 回報數字的 18 倍，也是 GitHub 目前能處理的「more than 1,000 times」",
+      "location": "under H2「寫入」",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n54",
+        "n55",
+        "n57"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "this is roughly 18 times what Entire.io reports / more than 1,000 times what GitHub is currently able to handle",
+      "note": "Post says 約 (matches 'roughly'). GitHub figure is Enroute's own forgemark run, Entire's is Entire-reported; both disclosed in the post. Adjacent sentence discloses different setups.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c05",
+      "claim_text": "作者承認「the numbers come from slightly different setups but give a good sense on the order of magnitude」",
+      "location": "under H2「寫入」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n56"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "the numbers come from slightly different setups but give a good sense on the order of magnitude",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c06",
+      "claim_text": "Enroute 與 GitHub 的部分作者明說是「our own forgemark runs」...Cursor 與 Entire 的數字則是對方自己回報、由這篇文章轉引",
+      "location": "2nd paragraph",
+      "type": "attribution",
+      "load": "high",
+      "note_ids": [
+        "n57",
+        "n12",
+        "n54"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "The Enroute and GitHub numbers are our own forgemark runs",
+      "note": "Article states Entire produced its own number and that 'Cursor's numbers are from its blog post' (links cursor.com/blog/git-at-any-scale). Post's second-hand attribution is honest.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c07",
+      "claim_text": "Cursor 回報的寫入數字是這樣：在 S3 Standard 上最高每秒 120 次 push，在 S3 Express One Zone 上超過 300 次",
+      "location": "under H2「寫入」",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n12"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Cursor reports up to 120 pushes/s on S3 Standard and more than 300 on S3 Express One Zone",
+      "note": "Second-hand via Enroute article; post (text and figcaption) says so and says Cursor original was not read. Hedges 'up to'/'more than' preserved. Volatile, but dated attribution (August) present.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c08",
+      "claim_text": "文章附的例子是 GitHub 的 Spokes 架構 / 例：GitHub Spokes",
+      "location": "1st paragraph and comparison figure",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n01"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "has relied heavily on SSDs as the primary storage mechanism (article intro cites 'GitHub's Spokes architecture' as the example)",
+      "note": "Spokes label does appear in the article intro; post correctly credits it to the article, not as its own assertion.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c09",
+      "claim_text": "Cursor 與 SpaceX 在八月描述的 Continuity，他們以 S3 為底的 Git 儲存",
+      "location": "under H2「寫入」",
+      "type": "date-version",
+      "load": "medium",
+      "note_ids": [
+        "n09"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Most prominently, in August, Cursor/SpaceX described Continuity, their S3-backed Git storage",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c10",
+      "claim_text": "Cursor 在八月描述的 Continuity 與幾個開源實作都走這個方向",
+      "location": "1st paragraph",
+      "type": "attribution",
+      "load": "low",
+      "note_ids": [
+        "n09",
+        "n77"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "What followed were many open source implementations copying the same approach of an S3-backed write-ahead log (WAL) for Git.",
+      "note": "Article says 'many' open-source implementations, none named; 幾個 is acceptable. The supporting sentence is not in the ledger notes verbatim (n77 covers a neighbouring sentence); consider adding it as a note.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c11",
+      "claim_text": "作者承認這類實作「successful in moving the burden of scalability and durability into object storage」",
+      "location": "under H2「寫入」",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n77"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "successful in moving the burden of scalability and durability into object storage",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c12",
+      "claim_text": "這些做法讀取擴展得好，寫入密集時卻容易撐不住；其二，它們仍依賴會用 memory map 讀寫磁碟檔案的標準 Git CLI",
+      "location": "under H2「寫入」",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n10",
+        "n11"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "they perform well when scaling out reads, they typically falter under write-heavy traffic",
+      "note": "Post's 容易 matches 'typically'. Presented as the author's criticism.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c13",
+      "claim_text": "「no matter how fast the WAL is, every push still has to land in one repository on disk.」",
+      "location": "under H2「寫入」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n13"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "At the end of the day, no matter how fast the WAL is, every push still has to land in one repository on disk.",
+      "note": "Attributed as the author's argument.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c14",
+      "claim_text": "文章對這條路線的整體評語，就是它實質上是單一寫入者的系統",
+      "location": "under H2「寫入」",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n76",
+        "n14"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Not only is this effectively a single-writer system",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c15",
+      "claim_text": "文章說...真正按順序套用的只有 commit，方式是對該 push 要移動的 ref 做 compare-and-swap。推到不同分支的 push 彼此不衝突，讀取走不可變的快照",
+      "location": "under H2「寫入」",
+      "type": "attribution",
+      "load": "high",
+      "note_ids": [
+        "n22",
+        "n23",
+        "n24",
+        "n25"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Only commits are applied in order through a compare-and-swap on the refs the push moves.",
+      "note": "Pre-commit work 'indexing the pack, validating every object and re-encoding it for storage' confirmed in fetch.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c16",
+      "claim_text": "如果只把 Git 當成物件儲存上的 content-addressed storage，這些步驟「every one of these steps would be a 30-40ms round trip.」作者的估算",
+      "location": "under H2「讀取」",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n07",
+        "n08",
+        "n26"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "every one of these steps would be a 30-40ms round trip.",
+      "note": "Post correctly calls it author's estimate, not a measurement.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c17",
+      "claim_text": "每個 commit 記成一個 segment...連續的 segment 組成 layer...「a delta only points to the same file in the parent commit」",
+      "location": "under H2「讀取」",
+      "type": "attribution",
+      "load": "high",
+      "note_ids": [
+        "n33",
+        "n34",
+        "n35",
+        "n36",
+        "n37"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "In Enroute, a delta only points to the same file in the parent commit, so a client that has the parent can use it directly.",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c18",
+      "claim_text": "client 缺 C3 到 C6，就拿到剛好那四個 segment，「with no tree walk」",
+      "location": "under H2「讀取」",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n38",
+        "n39"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "A client missing C3 to C6 gets exactly those four segments, with no tree walk.",
+      "note": "The 往返成本不再按深度累加 sentence is explicitly marked in the post as the author's own summary (inferred, marked).",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c19",
+      "claim_text": "文章自己列了三項[代價]：去重、shallow clone 邊界完整送出並批次重建快取、--filter=blob:none partial clone 與 layer 同類物件放近",
+      "location": "under H2「讀取」",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n40",
+        "n41",
+        "n42",
+        "n43",
+        "n44",
+        "n45"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Enroute rebuilds them in bulk and caches the results, so repeated shallow clones with the same boundary can be fast.",
+      "note": "Post says 可以很快 (matches 'can be fast').",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c20",
+      "claim_text": "磁碟全空的節點服務 linux.git 的完整 clone 用了 128.6 秒，暖快取則是 126.0 秒...差距約 2.6 秒，作者的結論是「even a cold cache costs less than you might think」",
+      "location": "under H2「讀取」",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n48",
+        "n49"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "In our tests, a node with an empty disk served a full clone of linux.git in 128.6 seconds, against 126.0 seconds warm.",
+      "note": "Post labels it author self-test. 2.6 s is correct subtraction.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c21",
+      "claim_text": "約每秒一次，一個 compute 節點把日誌裡的 layer 合成一個檔案上傳，文章的說法是「one upload for about 300 pushes」。只有大於 1 MiB 的 layer 才直接上傳...約八個大小相近時，會合併成一個大約八倍的 layer，合併只複製位元組、不重新壓縮",
+      "location": "under H2「狀態放在哪」",
+      "type": "number",
+      "load": "medium",
+      "note_ids": [
+        "n27",
+        "n28",
+        "n29",
+        "n30",
+        "n31",
+        "n32"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "About once a second they are merged into one file and uploaded: one upload for about 300 pushes.",
+      "note": "Article: 'About once a second, a compute node flushes the layers from the log.' Post keeps 約 hedges.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c22",
+      "claim_text": "ledger 提交一筆日誌通常只要 1-2 毫秒的網路與磁碟延遲，「not a bucket round trip」；group commit 讓同一瞬間到達的所有 push，跨所有 repository，共用一次 fsync。ref 更新在兩個 ledger 節點收到之後，就在毫秒內提交",
+      "location": "under H2「狀態放在哪」",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n18",
+        "n19",
+        "n20",
+        "n26"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Committing a log entry typically requires 1-2 milliseconds of network and disk latency, not a bucket round trip.",
+      "note": "Post keeps 通常 (matches 'typically'); it is the author's self-description. The causal sentence 這就是關鍵路徑能避開桶的原因 is explicitly marked as the author's inference in the text.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c23",
+      "claim_text": "一小群節點，每個 repository 用 Raft 共識維護一份複製日誌...layer 的定義是「an immutable file of Git objects with its own index, much like a Git pack」...「a new kind of git server that is based on modern database principles」",
+      "location": "under H2「狀態放在哪」",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n15",
+        "n16",
+        "n17",
+        "n75"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "A layer is an immutable file of Git objects with its own index, much like a Git pack.",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c24",
+      "claim_text": "「Compute is fully stateless and holds nothing but cache.」...作者在未完成清單裡寫「The fetch performance of a cold compute node lies far below...」，也承認目前並不協調哪個 compute 節點服務哪個 repository",
+      "location": "under H2「狀態放在哪」",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n21",
+        "n70",
+        "n71"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Compute is fully stateless and holds nothing but cache.",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c25",
+      "claim_text": "對照組是 stock Git 2.56.0，由 Apache 後面的 git http-backend 服務，用的是 linux.git 重新 repack 過的副本",
+      "location": "under H2「作者自己的 benchmark」",
+      "type": "date-version",
+      "load": "medium",
+      "note_ids": [
+        "n59",
+        "n60"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "We compared Enroute with a warm and cold cache against stock Git 2.56.0 / served by git http-backend behind Apache, using a repacked copy of linux.git",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c26",
+      "claim_text": "shallow clone 快了兩倍以上；partial clone 持平；完整 clone 慢約 17%，增量 fetch 慢約 13%。他補充暖快取主要改善的是 shallow clone 與增量 fetch",
+      "location": "under H2「作者自己的 benchmark」 and scoreboard figure",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n61",
+        "n62",
+        "n63"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Partial clones are on par, full clones are about 17% slower and incremental fetches about 13% slower.",
+      "note": "Post keeps 約 and labels all as author self-test.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c27",
+      "claim_text": "他寫「Interestingly, the biggest performance gap is now on the client side.」，並說 Git client 花在驗證 pack 與解 delta 的時間，比伺服器送出它的時間還長",
+      "location": "under H2「作者自己的 benchmark」",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n64",
+        "n65"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Interestingly, the biggest performance gap is now on the client side.",
+      "note": "The link to the segment format is marked in the post as the author's own speculation.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c28",
+      "claim_text": "他把更聰明的 delta base 選擇列為待改善項目；目前每個節點的快取方式也都一樣，作者想讓快取內容與時間可以設定",
+      "location": "under H2「作者自己的 benchmark」, 未完成清單 paragraph",
+      "type": "attribution",
+      "load": "low",
+      "note_ids": [
+        "n81",
+        "n82",
+        "n72"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "We want the best of both worlds, and pick bases that are both fast to serve and fast to decode. / We want to make it configurable what gets cached and for how long,",
+      "note": "Trace failure fixed by adding notes n81/n82 with verbatim quotes from a parent re-fetch of the source (fix round; no prose change needed).",
+      "action": "correct",
+      "resolution": "corrected"
+    },
+    {
+      "id": "c29",
+      "claim_text": "layer 不可變，所以刪掉的分支或 force-push 會留下不可達的物件，作者說需要一套不阻塞讀取與 push 的方式去找出它們並重寫 layer。目前只講 Git over HTTP smart protocol，SSH 與一些較少用的協定部分仍缺",
+      "location": "under H2「作者自己的 benchmark」",
+      "type": "attribution",
+      "load": "high",
+      "note_ids": [
+        "n66",
+        "n67",
+        "n68",
+        "n69"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Layers are immutable, so a deleted branch or a force-push leaves unreachable objects behind.",
+      "note": "Volatile, source dated 2026-10-13 (3 days before post); acceptable.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c30",
+      "claim_text": "他開頭就寫「But it is only the start」。文章最後說 Enroute 是開源的，repo 的 README 寫明採 Apache-2.0",
+      "location": "under H2「作者自己的 benchmark」",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n73",
+        "n74",
+        "n78"
+      ],
+      "independence": "corroborated",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "Enroute is open source. / README: released under the Apache License 2.0",
+      "note": "Blog and README are separate pages but both Enroute-authored; license claim rests on README. Note n78 quote 'Apache-2.0' is a trivial reformat of 'Apache License 2.0'. Post says 他開頭就寫 for 'only the start' (the ledger quote sits in a list intro); position within article not verified, low risk.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c31",
+      "claim_text": "forgemark 用來模擬「large numbers of concurrent agents」同時推向一個共享 repository 的分支；文章連到 forgemark 的 repo",
+      "location": "under H2「寫入」 and H2「怎麼選」",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n53"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "we used forgemark, which is capable of simulating large numbers of concurrent agents pushing to branches",
+      "note": "Article links https://github.com/entireio/forgemark (a tool published by Entire, whose number the article compares against); the post does not misstate this. n53 quote is a trimmed span of that sentence.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c32",
+      "claim_text": "對 walgit（作者形容為「a write-ahead log on local disk」）的比較圖，從 1 個到 512 個並行 pusher，圖中數字沒有出現在內文",
+      "location": "under H2「寫入」",
+      "type": "quote",
+      "load": "low",
+      "note_ids": [
+        "n58"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "a write-ahead log on local disk.",
+      "note": "Fetch confirmed 1 to 512 range and that the text gives no figures.",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c33",
+      "claim_text": "新加入的節點...文章把「measure how quickly a new node gets fast on large repositories」列為待做，也就是這段時間目前還沒有數字",
+      "location": "under H2「作者自己的 benchmark」",
+      "type": "quote",
+      "load": "low",
+      "note_ids": [
+        "n80"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "to measure how quickly a new node gets fast on large repositories",
+      "note": "The surrounding causal conclusion is marked as 合理的推測 in the text.",
+      "action": "none",
+      "resolution": "none-needed"
+    }
+  ],
+  "checked_at": "2026-10-16",
+  "checker_rounds": 2,
+  "coverage": {
+    "candidate_claims": 36,
+    "checked": 33,
+    "dropped_low_load": 3
+  }
+}
