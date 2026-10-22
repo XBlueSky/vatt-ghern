@@ -1,0 +1,381 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">一筆寫入要等五個 replica 裡最慢的那個回應，而其中有的已經在 Azure，最忙的 repository 又偏偏卡在一趟 25ms 的往返上。這時該縮短的是往返，還是需要往返的寫入有多少筆？</p>
+  <h1 class="vg-post-title">{{ title }}</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p><span class="vg-dropcap">G</span>itHub 工程部落格在 2026 年 10 月 21 日發表「The bridge to agent-scale Git infrastructure」，作者是 Eleanor White 與 Victoria Dye。文章講的是 GitHub 怎麼在服務不中斷的前提下改寫 Git 儲存層：資料先搬，架構後換。搬的部分已經接近完成，文章說他們把 99.99999% 的 repository 複製了一份到 Azure；沒搬完的是平台上最忙的那批，被一件事擋住，就是一趟 25ms 的往返。換的部分有兩步，一是把 quorum 的範圍從整個 repository 縮到單一 reference，二是讓 object storage 以 virtual replica 的身分加入，讀取因此可以脫離寫入各自擴充。下面先看起點的寫入路徑為什麼慢，再依序看鎖、寫入端的 virtual replica、讀取端的 virtual replica 各拆掉哪一段等待，最後把三個零件接回同一條路上。</p>
+
+  <figure class="vg-w-write-scope-lanes" data-mobile="static" data-svg-scroll="720">
+    <style>
+      .vg-w-write-scope-lanes { display: block; }
+      .vg-w-write-scope-lanes svg.vg-w-write-scope-lanes-main { width: 100%; height: auto; }
+      .vg-w-write-scope-lanes .ctl { display: flex; flex-wrap: wrap; gap: var(--s-2); margin: 0 0 var(--s-2) 0; }
+      .vg-w-write-scope-lanes .ctl label { display: flex; align-items: center; gap: 8px; min-height: 44px; padding: 0 var(--s-2); border: 1px solid var(--line); cursor: pointer; font-family: var(--sans); font-size: var(--fs-sm); color: var(--ink); }
+      .vg-w-write-scope-lanes .ctl input { accent-color: var(--accent); width: 20px; height: 20px; }
+      .vg-w-write-scope-lanes:has(#vg-w-write-scope-lanes-r1:checked) .ctl label:has(#vg-w-write-scope-lanes-r1) { border-color: var(--accent); color: var(--accent-text); }
+      .vg-w-write-scope-lanes:has(#vg-w-write-scope-lanes-r2:checked) .ctl label:has(#vg-w-write-scope-lanes-r2) { border-color: var(--accent); color: var(--accent-text); }
+      .vg-w-write-scope-lanes .m-ref { display: none; }
+      .vg-w-write-scope-lanes:has(#vg-w-write-scope-lanes-r2:checked) .m-ref { display: block; }
+      .vg-w-write-scope-lanes:has(#vg-w-write-scope-lanes-r2:checked) .m-repo { display: none; }
+      .vg-w-write-scope-lanes .blk { stroke: var(--muted-2); stroke-width: 1.2; }
+      .vg-w-write-scope-lanes .c-main { fill: var(--accent); fill-opacity: 0.35; }
+      .vg-w-write-scope-lanes .c-fa { fill: var(--sage-deep); fill-opacity: 0.35; }
+      .vg-w-write-scope-lanes .c-fb { fill: var(--ink-deep); fill-opacity: 0.3; }
+      .vg-w-write-scope-lanes .c-rel { fill: var(--muted-2); fill-opacity: 0.5; }
+      .vg-w-write-scope-lanes .wid { font-family: JetBrains Mono, monospace; font-size: 13px; fill: var(--ink); }
+      .vg-w-write-scope-lanes .wref { font-family: JetBrains Mono, monospace; font-size: 11px; fill: var(--ink-soft); }
+      .vg-w-write-scope-lanes .lane { font-family: JetBrains Mono, monospace; font-size: 12px; fill: var(--ink); }
+      .vg-w-write-scope-lanes .tk { font-family: JetBrains Mono, monospace; font-size: 11px; fill: var(--muted); }
+      .vg-w-write-scope-lanes .head { font-family: IM Fell English, serif; font-style: italic; font-size: 16px; fill: var(--ink); }
+      .vg-w-write-scope-lanes .lab { font-family: Spectral, serif; font-size: 13px; fill: var(--ink-soft); }
+      .vg-w-write-scope-lanes .out { font-family: EB Garamond, serif; font-size: 17px; fill: var(--ink); }
+      .vg-w-write-scope-lanes .note { font-family: IM Fell English, serif; font-style: italic; font-size: 12px; fill: var(--muted); }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21 16-4 4-4-4"/><path d="M17 20V4"/><path d="m3 8 4-4 4 4"/><path d="M7 4v16"/></svg>
+      <span>切換鎖的範圍，看同一批 7 筆寫入要排幾格 · 2 modes</span>
+    </p>
+    <div class="ctl" data-vg-controls>
+      <label><input type="radio" id="vg-w-write-scope-lanes-r1" name="vg-w-write-scope-lanes-sel" data-vg-controls checked />整個 repository 一把鎖</label>
+      <label><input type="radio" id="vg-w-write-scope-lanes-r2" name="vg-w-write-scope-lanes-sel" data-vg-controls />每個 reference 各自序列化</label>
+    </div>
+    <svg class="vg-w-write-scope-lanes-main m-repo" viewBox="0 0 720 340" role="img" aria-label="同一批 7 筆寫入在兩種鎖範圍下的排程，整個 repository 一把鎖需要 7 格，每個 reference 各自序列化最少 3 格">
+        <text x="24" y="30" class="head">整個 repository 一把鎖：寫入排成一列</text>
+        <text x="24" y="52" class="lab">不管碰哪個 reference，後面的寫入都要等前面的 commit</text>
+        <text x="100" y="127" class="lane" text-anchor="end">repo 鎖</text>
+        <rect class="blk c-main" x="110" y="100" width="76" height="52"/><text class="wid" x="148" y="123" text-anchor="middle">W1</text><text class="wref" x="148" y="141" text-anchor="middle">main</text>
+        <rect class="blk c-fa" x="190" y="100" width="76" height="52"/><text class="wid" x="228" y="123" text-anchor="middle">W2</text><text class="wref" x="228" y="141" text-anchor="middle">feature-a</text>
+        <rect class="blk c-main" x="270" y="100" width="76" height="52"/><text class="wid" x="308" y="123" text-anchor="middle">W3</text><text class="wref" x="308" y="141" text-anchor="middle">main</text>
+        <rect class="blk c-fb" x="350" y="100" width="76" height="52"/><text class="wid" x="388" y="123" text-anchor="middle">W4</text><text class="wref" x="388" y="141" text-anchor="middle">feature-b</text>
+        <rect class="blk c-fa" x="430" y="100" width="76" height="52"/><text class="wid" x="468" y="123" text-anchor="middle">W5</text><text class="wref" x="468" y="141" text-anchor="middle">feature-a</text>
+        <rect class="blk c-rel" x="510" y="100" width="76" height="52"/><text class="wid" x="548" y="123" text-anchor="middle">W6</text><text class="wref" x="548" y="141" text-anchor="middle">release</text>
+        <rect class="blk c-main" x="590" y="100" width="76" height="52"/><text class="wid" x="628" y="123" text-anchor="middle">W7</text><text class="wref" x="628" y="141" text-anchor="middle">main</text>
+        <text class="tk" x="148" y="176" text-anchor="middle">格 1</text><text class="tk" x="228" y="176" text-anchor="middle">格 2</text><text class="tk" x="308" y="176" text-anchor="middle">格 3</text><text class="tk" x="388" y="176" text-anchor="middle">格 4</text><text class="tk" x="468" y="176" text-anchor="middle">格 5</text><text class="tk" x="548" y="176" text-anchor="middle">格 6</text><text class="tk" x="628" y="176" text-anchor="middle">格 7</text>
+        <text x="24" y="224" class="lab">W2、W4、W6 和 main 上的寫入毫無關係，卻也排在同一條隊伍裡。</text>
+      <text x="24" y="304" class="out">同一批 7 筆寫入：一把鎖需要 7 格，各 reference 獨立最少 3 格</text>
+      <text x="24" y="326" class="note">玩具模型：每筆寫入耗時相同，不含網路與儲存細節，數字不是文章的量測</text>
+    </svg>
+    <svg class="vg-w-write-scope-lanes-main m-ref" viewBox="0 0 720 340" role="img" aria-label="同一批 7 筆寫入在兩種鎖範圍下的排程，整個 repository 一把鎖需要 7 格，每個 reference 各自序列化最少 3 格">
+        <text x="24" y="30" class="head">每個 reference 各自序列化：不同 reference 並行</text>
+        <text x="24" y="52" class="lab">只有寫同一個 reference 的寫入才需要互相等</text>
+        <text x="100" y="99" class="lane" text-anchor="end">main</text>
+        <rect class="blk c-main" x="110" y="76" width="76" height="40"/><text class="wid" x="148" y="101" text-anchor="middle">W1</text>
+        <rect class="blk c-main" x="190" y="76" width="76" height="40"/><text class="wid" x="228" y="101" text-anchor="middle">W3</text>
+        <rect class="blk c-main" x="270" y="76" width="76" height="40"/><text class="wid" x="308" y="101" text-anchor="middle">W7</text>
+        <text x="100" y="145" class="lane" text-anchor="end">feature-a</text>
+        <rect class="blk c-fa" x="110" y="122" width="76" height="40"/><text class="wid" x="148" y="147" text-anchor="middle">W2</text>
+        <rect class="blk c-fa" x="190" y="122" width="76" height="40"/><text class="wid" x="228" y="147" text-anchor="middle">W5</text>
+        <text x="100" y="191" class="lane" text-anchor="end">feature-b</text>
+        <rect class="blk c-fb" x="110" y="168" width="76" height="40"/><text class="wid" x="148" y="193" text-anchor="middle">W4</text>
+        <text x="100" y="237" class="lane" text-anchor="end">release</text>
+        <rect class="blk c-rel" x="110" y="214" width="76" height="40"/><text class="wid" x="148" y="239" text-anchor="middle">W6</text>
+        <text class="tk" x="148" y="274" text-anchor="middle">格 1</text><text class="tk" x="228" y="274" text-anchor="middle">格 2</text><text class="tk" x="308" y="274" text-anchor="middle">格 3</text>
+        <text x="380" y="99" class="lab">最長的一條在 main，決定總格數</text>
+      <text x="24" y="304" class="out">同一批 7 筆寫入：一把鎖需要 7 格，各 reference 獨立最少 3 格</text>
+      <text x="24" y="326" class="note">玩具模型：每筆寫入耗時相同，不含網路與儲存細節，數字不是文章的量測</text>
+    </svg>
+    <figcaption>這是為了說明鎖的範圍而排的玩具例子，W1 到 W7 是我編的七筆寫入，不是文章的資料。同一個 reference 上的寫入仍然排隊，所以 main 那條線決定總長度。</figcaption>
+  </figure>
+
+  <h2>五份副本、一把涵蓋整個 repository 的鎖</h2>
+
+  <p>先看起點。文章說，大多數 repository 有五個 replica，用來在持久性、可用性與擴充之間取平衡：「Most repositories have five replicas to balance durability, availability, and scale.」每個 replica 都持有 repository 的完整副本（「replicas that each hold a full copy of the repository」）。遷移的做法是把其中一部分副本放到 Azure。第一份副本在 2025 年 8 月落在 Azure 的 Central US 區域；文章寫現在大多數 repository 的五個 replica 裡有兩個在 Azure，Azure 服務約一半的 Git 流量。</p>
+
+  <p>為什麼資料要先搬？文章的取捨寫得很直接：要把工作排好順序，「move the data first, then evolve the architecture once it arrived」。我讀到的理由偏向風險與容量，也就是在成長持續、容量吃緊的時候，儲存和代管不適合同時換。搬遷期間的流量規則只有一句：「During the migration, traffic follows the data.」每多一個 replica 搬到 Azure，能由 Azure 服務的流量比例就跟著上升。</p>
+
+  <p>搬完的結果，文章用一句話形容：99.99999% 的 Git repository「began living in two places at once」，同時存在兩個地方。合理的推測是，這就是後面所有架構改動的前提。quorum 的成員分在兩個區域，寫入才會碰到跨區的往返，鎖與 quorum 的設計也才從單機房內的取捨，變成要把跨區延遲算進去的取捨。</p>
+
+  <p>搬完之後架構才開始動，起點的寫入路徑有兩個性質。第一個是 quorum 的行為：文章說 Spokes 的 quorum 只需要多數就能 commit 一筆寫入，卻會等每個健康的 replica 回應。五個 replica 的多數是三個。第二個是鎖的範圍：每筆寫入持有整個 repository 的鎖，直到它 commit（「each write holds a repository-wide lock until it commits」）。兩個性質疊在一起，文章的結論是「the slowest healthy replica sets the latency of every write」，最慢的那個健康 replica 決定每一筆寫入的延遲。</p>
+
+  <figure class="vg-w-replica-wait-compare" data-mobile="keep" data-svg-scroll="720">
+    <style>
+      .vg-w-replica-wait-compare { display: block; }
+      .vg-w-replica-wait-compare svg.vg-w-replica-wait-compare-main { width: 100%; height: auto; }
+      .vg-w-replica-wait-compare .head { font-family: IM Fell English, serif; font-style: italic; font-size: 16px; fill: var(--ink); }
+      .vg-w-replica-wait-compare .rn { font-family: JetBrains Mono, monospace; font-size: 12px; fill: var(--ink); }
+      .vg-w-replica-wait-compare .az { font-family: JetBrains Mono, monospace; font-size: 11px; fill: var(--sage-deep); }
+      .vg-w-replica-wait-compare .bar { fill: var(--sage-deep); fill-opacity: 0.4; stroke: var(--muted-2); stroke-width: 1; }
+      .vg-w-replica-wait-compare .bar.slow { fill: var(--accent); fill-opacity: 0.45; }
+      .vg-w-replica-wait-compare .mk { stroke: var(--ink); stroke-width: 1.5; stroke-dasharray: 5 4; }
+      .vg-w-replica-wait-compare .mt { font-family: Spectral, serif; font-size: 13px; fill: var(--ink); }
+      .vg-w-replica-wait-compare .lab { font-family: Spectral, serif; font-size: 13px; fill: var(--ink-soft); }
+      .vg-w-replica-wait-compare .note { font-family: IM Fell English, serif; font-style: italic; font-size: 12px; fill: var(--muted); }
+    </style>
+    <svg class="vg-w-replica-wait-compare-main" viewBox="0 0 720 330" role="img" aria-label="五個 replica 的回應時間示意：第三個回應時多數已達成，但寫入要等到最慢的第五個回應">
+      <text x="24" y="26" class="head">多數是 3 個，等待的卻是全部健康的 replica</text>
+      <text x="24" y="76" class="rn">replica 1</text><rect class="bar" x="130" y="62" width="190" height="20"/>
+      <text x="24" y="112" class="rn">replica 2</text><rect class="bar" x="130" y="98" width="250" height="20"/>
+      <text x="24" y="148" class="rn">replica 3</text><rect class="bar" x="130" y="134" width="320" height="20"/>
+      <text x="24" y="184" class="rn">replica 4</text><text x="96" y="184" class="az">Azure</text><rect class="bar" x="130" y="170" width="390" height="20"/>
+      <text x="24" y="220" class="rn">replica 5</text><text x="96" y="220" class="az">Azure</text><rect class="bar slow" x="130" y="206" width="480" height="20"/>
+      <line class="mk" x1="450" y1="44" x2="450" y2="238"/>
+      <line class="mk" x1="610" y1="44" x2="610" y2="238"/>
+      <text x="446" y="258" class="mt" text-anchor="end">第 3 個回應：多數已達成</text>
+      <text x="614" y="258" class="mt" text-anchor="end">第 5 個回應：寫入完成</text>
+      <text x="24" y="288" class="lab">這段等待期間，同一個 repository 的其他寫入都在鎖外排隊</text>
+      <text x="24" y="312" class="note">示意圖：橫條長短只表示先後順序，沒有實際數值；哪兩個 replica 在 Azure 也只是示意</text>
+    </svg>
+    <figcaption>多數決只決定「可以 commit」的門檻，文章描述的實作多等了一步。最慢那條橫條延伸多長，整個 repository 的寫入佇列就停多久。</figcaption>
+  </figure>
+
+  <p>這也說明 25ms 為什麼是問題。文章寫的是，一個 replica 搬到 Azure 的目標區域之後，距離資料中心約 1,000 英里，每趟網路往返約 25ms，而一筆寫入需要多趟往返。對已經逼近吞吐上限的 repository，原文的說法是「A repository already near its throughput ceiling can't absorb that on every serialized write; it would fall further behind with every push.」每筆序列化的寫入都要付這筆往返，它吸收不了，每多一次 push 就落後更多。</p>
+
+  <h2>把 quorum 的範圍縮到單一 reference</h2>
+
+  <p>文章的對策是改變 quorum 管轄的單位：「we’re changing the scope of the quorum from the whole repository to individual references.」過去 quorum 與鎖的單位都是 repository，現在縮到 reference。依據是 Git 本身的性質，文章寫的是「Git’s consistency requirements apply to each reference individually.」Git 對一致性的要求本來就是逐 reference 的，branch 這類 reference 各自有自己的歷史與移動規則，一個 reference 往前推進，不需要另一個 reference 同意。把鎖放大到整個 repository，等於多收了一份 Git 並沒有要求的保護。</p>
+
+  <p>上面的小工具把這個差別拆成最小版本。七筆寫入落在四個 reference 上：一把 repository 鎖下，它們排成七格；改成每個 reference 一條線，main 上的三筆仍然要依序，其他三條線各自跑完，總長度只剩三格。這個例子裡我刻意讓每筆耗時相同，也沒有放進網路與儲存，目的只是讓你看到「誰不需要等誰」。同一個 reference 上的寫入仍然排隊，這個限制在新架構裡沒有消失，只是不再外溢到不相干的 reference。</p>
+
+  <p>小工具裡七格對三格約是 2.3 倍，這個比值只是例題的幾何，和文章的 3 到 4 倍沒有對應關係。前者取決於我挑了幾筆寫入、落在哪幾個 reference，後者來自文章的測試流量。兩個數字放在一起只能說明同一件事：寫入越分散在不同 reference 上，縮小鎖範圍的收益越大。</p>
+
+  <p>文章給的量測是：在內部測試、貼近實際流量的條件下，寫入不同 reference 的情況，吞吐量一致高出 3 到 4 倍，延遲也更低。證據強度只有這一層：來源是 GitHub 自己的工程部落格，測試條件沒有更多細節，我沒有讀到獨立重現，也沒有讀到失敗情境的描述，所以這個倍數適合當成機制有效的訊號，不適合直接拿去和別的系統比較。倍數的前提是寫入落在不同 reference；照這個機制推算，流量若集中在同一個 reference，例如全部推同一條 main，好處會小很多。</p>
+
+  <p>還有一個必須講清楚的邊界：縮小 quorum 的範圍，並沒有改變 quorum 本身。文章後面承認「the quorum remains the bounding factor for increasing further」，要再往上推，quorum 仍然是上限。範圍縮小解開的是不相干寫入互等的那一層浪費，每個 reference 內部的共識成本還在。這也是下一步要把 object storage 拉進來的原因。</p>
+
+  <p>回頭看小工具的兩種排法，有一個容易讀錯的地方。文章說變的是 quorum 的範圍，從整個 repository 到單一 reference；文章沒有說 replica 的數量變了，我讀到的版本也沒有說它不變。所以比較保守的讀法是：誰需要等誰的邊界從 repository 移到 reference，至於五個 replica 怎麼分工，這一步沒有給新資訊。</p>
+
+  <h2>把 object storage 放進 quorum：virtual write replica</h2>
+
+  <p>文章的第二步從 quorum 的成員下手：「The first step is making object storage a member of the quorum, but a special one that we call a virtual replica.」成員很特別，因為它不是一台持有完整副本的機器。代表它的運算資源，文章稱為「our first fully ephemeral node」，是他們第一個完全暫態的節點。它的角色是橋接：「It serves as a bridge to object storage, streaming incoming writes and serving no reads.」只把進來的寫入串流到 object storage，不提供任何讀取。</p>
+
+  <p>成為 quorum 成員有一個直接後果，文章寫得明確：「Because it’s a member of the quorum, a write isn’t acknowledged until it’s durable in object storage.」寫入要等到在 object storage 裡持久化，才會被確認。這裡的設計意圖，我的解讀是讓持久性由 object storage 背書，而不是靠哪一台暫態節點記住資料；暫態節點可以隨時被換掉，只要 object storage 裡已經有那筆寫入。</p>
+
+  <p>代價也在這一步出現：每筆寫入的確認多了一個條件，必須等 object storage 持久化。文章的緩解方法是合併。這個節點會把不同 reference 上的交易合成一組儲存 I/O，原文是「coalesces transactions on disjoint references into a single set of network I/Os to object storage」，結果是「a busy repository pays for one round trip across many concurrent writes instead of one per write」。忙碌的 repository 面對許多並行寫入，只付一趟往返，而不是一筆一趟。和前一節對起來看，這就是縮小 quorum 範圍之後才有的機會：不同 reference 的寫入互不排隊，才有大量彼此獨立的交易可以一起送出。</p>
+
+  <figure class="vg-w-coalesce-roundtrips" data-mobile="static" data-svg-scroll="720">
+    <style>
+      .vg-w-coalesce-roundtrips { display: block; }
+      .vg-w-coalesce-roundtrips svg.vg-w-coalesce-roundtrips-main { width: 100%; height: auto; }
+      .vg-w-coalesce-roundtrips .ctl { display: flex; align-items: center; flex-wrap: wrap; gap: var(--s-2); margin: 0 0 var(--s-2) 0; font-family: var(--sans); font-size: var(--fs-sm); color: var(--ink); }
+      .vg-w-coalesce-roundtrips .ctl input[type="range"] { height: 36px; accent-color: var(--accent); min-width: 180px; touch-action: none; }
+      .vg-w-coalesce-roundtrips .head { font-family: IM Fell English, serif; font-style: italic; font-size: 16px; fill: var(--ink); }
+      .vg-w-coalesce-roundtrips .sq { fill: var(--accent); fill-opacity: 0.45; stroke: var(--muted-2); stroke-width: 1; }
+      .vg-w-coalesce-roundtrips .sq.off { fill-opacity: 0.06; stroke-opacity: 0.4; }
+      .vg-w-coalesce-roundtrips .ln { stroke: var(--ink); stroke-width: 1.4; }
+      .vg-w-coalesce-roundtrips .ln.off { stroke-opacity: 0.12; }
+      .vg-w-coalesce-roundtrips .grp { fill: none; stroke: var(--sage-deep); stroke-width: 2; }
+      .vg-w-coalesce-roundtrips .lab { font-family: Spectral, serif; font-size: 13px; fill: var(--ink-soft); }
+      .vg-w-coalesce-roundtrips .tt { font-family: JetBrains Mono, monospace; font-size: 12px; fill: var(--muted); }
+      .vg-w-coalesce-roundtrips .out { font-family: EB Garamond, serif; font-size: 17px; fill: var(--ink); }
+      .vg-w-coalesce-roundtrips .note { font-family: IM Fell English, serif; font-style: italic; font-size: 12px; fill: var(--muted); }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3 4 7l4 4"/><path d="M4 7h16"/><path d="m16 21 4-4-4-4"/><path d="M20 17H4"/></svg>
+      <span>拖動並行寫入的筆數，數 object storage 的往返次數 · 1 到 8 筆</span>
+    </p>
+    <div class="ctl" data-vg-controls>
+      <label for="vg-w-coalesce-roundtrips-n">並行寫入筆數（落在互不相同的 reference）</label>
+      <input type="range" id="vg-w-coalesce-roundtrips-n" min="1" max="8" step="1" value="6" data-vg-controls />
+      <span id="vg-w-coalesce-roundtrips-nv">6</span>
+    </div>
+    <svg class="vg-w-coalesce-roundtrips-main" viewBox="0 0 720 250" role="img" aria-label="六筆落在不同 reference 的並行寫入，逐筆送出需要六趟 object storage 往返，合併後只需一趟">
+      <text x="24" y="26" class="head">逐筆各付一趟</text>
+      <text x="400" y="26" class="head">合併成一組 I/O</text>
+      <g id="vg-w-coalesce-roundtrips-left">
+        <rect id="vg-w-coalesce-roundtrips-a1" class="sq" x="24" y="48" width="32" height="32"/><line id="vg-w-coalesce-roundtrips-l1" class="ln" x1="40" y1="80" x2="40" y2="126"/>
+        <rect id="vg-w-coalesce-roundtrips-a2" class="sq" x="64" y="48" width="32" height="32"/><line id="vg-w-coalesce-roundtrips-l2" class="ln" x1="80" y1="80" x2="80" y2="126"/>
+        <rect id="vg-w-coalesce-roundtrips-a3" class="sq" x="104" y="48" width="32" height="32"/><line id="vg-w-coalesce-roundtrips-l3" class="ln" x1="120" y1="80" x2="120" y2="126"/>
+        <rect id="vg-w-coalesce-roundtrips-a4" class="sq" x="144" y="48" width="32" height="32"/><line id="vg-w-coalesce-roundtrips-l4" class="ln" x1="160" y1="80" x2="160" y2="126"/>
+        <rect id="vg-w-coalesce-roundtrips-a5" class="sq" x="184" y="48" width="32" height="32"/><line id="vg-w-coalesce-roundtrips-l5" class="ln" x1="200" y1="80" x2="200" y2="126"/>
+        <rect id="vg-w-coalesce-roundtrips-a6" class="sq" x="224" y="48" width="32" height="32"/><line id="vg-w-coalesce-roundtrips-l6" class="ln" x1="240" y1="80" x2="240" y2="126"/>
+        <rect id="vg-w-coalesce-roundtrips-a7" class="sq off" x="264" y="48" width="32" height="32"/><line id="vg-w-coalesce-roundtrips-l7" class="ln off" x1="280" y1="80" x2="280" y2="126"/>
+        <rect id="vg-w-coalesce-roundtrips-a8" class="sq off" x="304" y="48" width="32" height="32"/><line id="vg-w-coalesce-roundtrips-l8" class="ln off" x1="320" y1="80" x2="320" y2="126"/>
+      </g>
+      <text x="24" y="146" class="tt">object storage</text>
+      <rect class="grp" x="394" y="42" width="320" height="44" rx="4"/>
+      <g id="vg-w-coalesce-roundtrips-right">
+        <rect id="vg-w-coalesce-roundtrips-b1" class="sq" x="404" y="48" width="32" height="32"/>
+        <rect id="vg-w-coalesce-roundtrips-b2" class="sq" x="444" y="48" width="32" height="32"/>
+        <rect id="vg-w-coalesce-roundtrips-b3" class="sq" x="484" y="48" width="32" height="32"/>
+        <rect id="vg-w-coalesce-roundtrips-b4" class="sq" x="524" y="48" width="32" height="32"/>
+        <rect id="vg-w-coalesce-roundtrips-b5" class="sq" x="564" y="48" width="32" height="32"/>
+        <rect id="vg-w-coalesce-roundtrips-b6" class="sq" x="604" y="48" width="32" height="32"/>
+        <rect id="vg-w-coalesce-roundtrips-b7" class="sq off" x="644" y="48" width="32" height="32"/>
+        <rect id="vg-w-coalesce-roundtrips-b8" class="sq off" x="684" y="48" width="24" height="32"/>
+      </g>
+      <line class="ln" x1="554" y1="86" x2="554" y2="126"/>
+      <text x="400" y="146" class="tt">object storage</text>
+      <text id="vg-w-coalesce-roundtrips-out" x="24" y="196" class="out">6 筆並行寫入：逐筆 6 趟往返，合併後 1 趟</text>
+      <text x="24" y="222" class="note">只算往返次數，按文章對合併的描述；單趟耗時與合併的實際上限，文章沒有給數字</text>
+    </svg>
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        var root = document.querySelector('.vg-w-coalesce-roundtrips');
+        if (!root) return;
+        var P = 'vg-w-coalesce-roundtrips-';
+        var inp = root.querySelector('#' + P + 'n');
+        var nv = root.querySelector('#' + P + 'nv');
+        var out = root.querySelector('#' + P + 'out');
+        function render() {
+          var n = Number(inp.value);
+          nv.textContent = String(n);
+          for (var i = 1; i <= 8; i++) {
+            var on = i <= n;
+            root.querySelector('#' + P + 'a' + i).setAttribute('class', on ? 'sq' : 'sq off');
+            root.querySelector('#' + P + 'l' + i).setAttribute('class', on ? 'ln' : 'ln off');
+            root.querySelector('#' + P + 'b' + i).setAttribute('class', on ? 'sq' : 'sq off');
+          }
+          out.textContent = n + ' 筆並行寫入：逐筆 ' + n + ' 趟往返，合併後 1 趟';
+        }
+        inp.addEventListener('input', render);
+        render();
+      })();
+    </script>
+    <figcaption>合併的好處隨並行筆數線性放大：只有一筆時，兩邊都是一趟，沒有差別。寫入落在同一個 reference 時它們本來就要排隊，沒有「並行」可以合併。</figcaption>
+  </figure>
+
+  <p>合併和縮小範圍是咬在一起的兩個動作。如果鎖還涵蓋整個 repository，同一時刻只有一筆寫入在飛，沒有「許多並行寫入」可以合；範圍縮到 reference 之後，不同 reference 的寫入同時進行，virtual write replica 才有一批彼此獨立的交易可以一起送出。反過來看，確認條件變嚴本來會讓每筆寫入更慢，合併把這筆額外的往返成本攤給同一批裡的所有寫入，寫入越忙，每筆分到的成本越少。上面的小工具只數往返次數，一筆時兩邊沒有差別，筆數越多差距越大，忙碌的 repository 正是文章點名受益的對象。</p>
+
+  <h2>不進 quorum 的讀取：virtual read replica</h2>
+
+  <p>寫入路徑處理完，另一半是讀取。文章對現況的描述是：「Today, reads and writes hit the same replicas, so they compete for the same resources and can’t be scaled independently.」讀和寫打在同一批 replica 上，搶同樣的資源，無法各自擴充。這個耦合的代價取決於讀寫比例，文章給的數字是「Most repositories are heavily read-skewed, with somewhere between 100 and 1,000 reads for every write.」大多數 repository 每一次寫入對應 100 到 1,000 次讀取。</p>
+
+  <p>解法是第二種虛擬節點。文章寫的是新的 read replica 會「warms its cache from Azure Blob Storage and starts taking read traffic without joining the quorum」：從 Azure Blob Storage 把快取暖起來，就開始接讀取流量，不加入 quorum。它的資料來源是「using object storage as the source of truth and reconciling its local state against it in the background」，以 object storage 為準，在背景把本地狀態對帳。結果是文章說的「we can begin to decouple read traffic from the write quorum, and independently scale the compute needed for each」，讀取流量與寫入 quorum 可以開始脫鉤，各自擴充需要的運算。</p>
+
+  <p>「各自擴充運算」的背景是現況：今天讀寫打在同一批 replica 上，搶同樣的資源，無法各自擴充。以下是我的推論：起點的 quorum 會等每個健康的 replica，想多撐讀取而多養 replica，寫入就多一個要等的對象。文章的解法是讓 read replica 不進 quorum，並以持久存放在 Azure Blob Storage、隨每筆寫入更新的資料為基礎（「Once repository data is durably stored in Azure Blob Storage and updated with each incoming write, we can begin to decouple read traffic from the write quorum, and independently scale the compute needed for each」），照這句話，讀取這一側的運算可以開始獨立擴充，而 read replica 不加入 quorum。</p>
+
+  <figure class="vg-w-read-write-split" data-mobile="static" data-svg-scroll="720">
+    <style>
+      .vg-w-read-write-split { display: block; }
+      .vg-w-read-write-split svg.vg-w-read-write-split-main { width: 100%; height: auto; }
+      .vg-w-read-write-split .ctl { display: flex; align-items: center; flex-wrap: wrap; gap: var(--s-2); margin: 0 0 var(--s-2) 0; font-family: var(--sans); font-size: var(--fs-sm); color: var(--ink); }
+      .vg-w-read-write-split .ctl input[type="range"] { height: 36px; accent-color: var(--accent); min-width: 200px; touch-action: none; }
+      .vg-w-read-write-split .head { font-family: IM Fell English, serif; font-style: italic; font-size: 16px; fill: var(--ink); }
+      .vg-w-read-write-split .wr { fill: var(--accent); fill-opacity: 0.6; }
+      .vg-w-read-write-split .rd { fill: var(--sage-deep); fill-opacity: 0.4; }
+      .vg-w-read-write-split .frame { fill: none; stroke: var(--muted-2); stroke-width: 1.2; }
+      .vg-w-read-write-split .lab { font-family: Spectral, serif; font-size: 13px; fill: var(--ink-soft); }
+      .vg-w-read-write-split .tt { font-family: JetBrains Mono, monospace; font-size: 12px; fill: var(--muted); }
+      .vg-w-read-write-split .out { font-family: EB Garamond, serif; font-size: 17px; fill: var(--ink); }
+      .vg-w-read-write-split .note { font-family: IM Fell English, serif; font-style: italic; font-size: 12px; fill: var(--muted); }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18-6-6 6-6"/><path d="m15 6 6 6-6 6"/></svg>
+      <span>拖動讀寫比，看讀取占掉多少請求 · 每筆寫入對應 100 到 1,000 次讀取</span>
+    </p>
+    <div class="ctl" data-vg-controls>
+      <label for="vg-w-read-write-split-r">每 1 筆寫入對應的讀取次數</label>
+      <input type="range" id="vg-w-read-write-split-r" min="100" max="1000" step="50" value="100" data-vg-controls />
+      <span id="vg-w-read-write-split-rv">100</span>
+    </div>
+    <svg class="vg-w-read-write-split-main" viewBox="0 0 720 270" role="img" aria-label="每筆寫入對應 100 次讀取時，讀取占請求數 99.0%，今天讀寫共用同一批 replica，之後 quorum 只處理寫入">
+      <text x="24" y="26" class="head">今天：讀寫共用同一批 replica</text>
+      <rect class="frame" x="24" y="44" width="300" height="34"/>
+      <rect id="vg-w-read-write-split-lrd" class="rd" x="24" y="44" width="297.03" height="34"/>
+      <rect id="vg-w-read-write-split-lwr" class="wr" x="321.03" y="44" width="2.97" height="34"/>
+      <text x="24" y="100" class="tt">同一批 replica 的請求</text>
+
+      <text x="396" y="26" class="head">之後：讀取移出 quorum</text>
+      <rect class="frame" x="396" y="44" width="300" height="34"/>
+      <rect id="vg-w-read-write-split-qwr" class="wr" x="396" y="44" width="2.97" height="34"/>
+      <text x="396" y="100" class="tt">quorum 的請求（只剩寫入）</text>
+      <rect class="frame" x="396" y="116" width="300" height="34"/>
+      <rect id="vg-w-read-write-split-rrd" class="rd" x="396" y="116" width="297.03" height="34"/>
+      <text x="396" y="172" class="tt">virtual read replica 的請求（讀取）</text>
+
+      <text id="vg-w-read-write-split-out" x="24" y="212" class="out">每 1 筆寫入對應 100 次讀取：讀取占請求數 99.0%</text>
+      <text x="24" y="238" class="note">以請求數計，不等於資源成本；100 到 1,000 的範圍出自文章，占比是我的算術</text>
+    </svg>
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        var root = document.querySelector('.vg-w-read-write-split');
+        if (!root) return;
+        var P = 'vg-w-read-write-split-';
+        var inp = root.querySelector('#' + P + 'r');
+        var rv = root.querySelector('#' + P + 'rv');
+        var out = root.querySelector('#' + P + 'out');
+        var W = 300;
+        function set(id, attrs) {
+          var el = root.querySelector('#' + P + id);
+          Object.keys(attrs).forEach(function (k) { el.setAttribute(k, String(attrs[k])); });
+        }
+        function render() {
+          var r = Number(inp.value);
+          var frac = r / (r + 1);
+          var rd = W * frac;
+          var wr = W - rd;
+          rv.textContent = String(r);
+          set('lrd', { width: rd.toFixed(2) });
+          set('lwr', { x: (24 + rd).toFixed(2), width: wr.toFixed(2) });
+          set('qwr', { width: wr.toFixed(2) });
+          set('rrd', { width: rd.toFixed(2) });
+          out.textContent = '每 1 筆寫入對應 ' + r + ' 次讀取：讀取占請求數 ' + (frac * 100).toFixed(1) + '%';
+        }
+        inp.addEventListener('input', render);
+        render();
+      })();
+    </script>
+    <figcaption>拖到 1,000，讀取占比是 99.9%。這張圖只說明「為什麼讀寫共用一批資源會讓寫入那一小條被淹沒」，不預測任何延遲。</figcaption>
+  </figure>
+
+  <p>文章對這個設計的限制講得很誠實。背景對帳「makes them a good fit for some read workloads but not all of them」，適合一部分讀取負載，不是全部。機制上的含義可以直接推出來：read replica 的本地狀態是在背景向 object storage 對帳，不屬於 quorum，因此它看到的狀態可能落後 quorum 一小段時間，適合一部分讀取負載，也就不意外。</p>
+
+  <p>三種節點各自站在哪裡，用一張圖並排會比文字清楚。一般 replica 持有完整副本，在 quorum 內，讀寫都做；virtual write replica 在 quorum 內，只收寫入，不提供讀取；virtual read replica 在 quorum 外，只提供讀取。注意兩個虛擬節點的分工是互補的：一個把寫入的持久性接到 object storage，一個把讀取的資料來源接到 object storage，object storage 因此同時是寫入端的持久層，也是讀取端的真實來源。</p>
+
+  <figure class="vg-w-replica-roles" data-mobile="keep">
+    <style>
+      .vg-w-replica-roles { display: block; }
+      .vg-w-replica-roles .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--s-2); }
+      @media (max-width: 720px) { .vg-w-replica-roles .grid { grid-template-columns: 1fr; } }
+      .vg-w-replica-roles .card { border: 1px solid var(--muted-2); border-top: 3px solid var(--accent); padding: var(--s-2); background: var(--bg-soft); }
+      .vg-w-replica-roles .card.vw { border-top-color: var(--ink-deep); }
+      .vg-w-replica-roles .card.vr { border-top-color: var(--sage-deep); }
+      .vg-w-replica-roles h3 { margin: 0 0 var(--s-1) 0; font-family: var(--display); font-size: var(--fs-md); color: var(--ink); }
+      .vg-w-replica-roles dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 6px var(--s-2); font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-replica-roles dt { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); padding-top: 2px; }
+      .vg-w-replica-roles dd { margin: 0; color: var(--ink); }
+    </style>
+    <div class="grid">
+      <div class="card">
+        <h3>一般 replica</h3>
+        <dl>
+          <dt>在 quorum</dt><dd>是</dd>
+          <dt>持有資料</dt><dd>完整副本</dd>
+          <dt>讀取</dt><dd>提供，與寫入共用資源</dd>
+        </dl>
+      </div>
+      <div class="card vw">
+        <h3>virtual write replica</h3>
+        <dl>
+          <dt>在 quorum</dt><dd>是</dd>
+          <dt>性質</dt><dd>暫態節點，橋接 object storage</dd>
+          <dt>寫入</dt><dd>串流到 object storage，持久化後才確認</dd>
+          <dt>讀取</dt><dd>不提供</dd>
+        </dl>
+      </div>
+      <div class="card vr">
+        <h3>virtual read replica</h3>
+        <dl>
+          <dt>在 quorum</dt><dd>否</dd>
+          <dt>資料來源</dt><dd>object storage，背景對帳</dd>
+          <dt>暖機</dt><dd>從 Azure Blob Storage 暖快取</dd>
+          <dt>讀取</dt><dd>提供，可隨需擴充；適合部分讀取負載</dd>
+        </dl>
+      </div>
+    </div>
+    <figcaption>三張卡只列文章明寫的屬性；空缺的格子是文章沒說的，例如 read replica 的對帳間隔，我不補。</figcaption>
+  </figure>
+
+  <p>讀寫比的數字值得多看一眼。每筆寫入對應 100 次讀取，讀取約占請求數的 99.0%；對應 1,000 次，約占 99.9%。在這樣的分佈下，讀取若和寫入共用同一批 replica，寫入那一小條就得和近乎全部的讀取搶資源，文章說的「compete for the same resources」因此有了具體的量級。請求數不等於資源成本，但它說明了為什麼讀取脫鉤會被放進這次改動，而不是留作日後的附帶優化。</p>
+
+  <h2>三個零件接成一條路</h2>
+
+  <p>把一筆寫入從頭走一遍，三個零件的位置就清楚了。寫入進來，先看它碰哪個 reference：範圍縮到 reference 之後，它只和同一個 reference 上的寫入互相序列化，不再被其他 reference 的寫入擋住（「Git’s consistency requirements apply to each reference individually」）。接著它進 quorum，quorum 的成員裡有一個 virtual write replica，這個暫態節點把寫入串流到 object storage；寫入要在 object storage 裡持久化，才會被確認。最後一步發生在這個節點內部：同一時刻落在不同 reference 上的交易，被合併成一組對 object storage 的 I/O，忙碌的 repository 因此「pays for one round trip across many concurrent writes instead of one per write」。</p>
+
+  <p>讀取那條路和寫入共用同一個終點。virtual read replica 不進 quorum，從 Azure Blob Storage 把快取暖起來，就開始接讀取流量，並在背景拿 object storage 對帳。object storage 因此站在兩端：寫入端靠它持久化，讀取端以它為準。讀寫比落在每筆寫入對應 100 到 1,000 次讀取之間，意思是 quorum 只需要面對那一小部分請求，其餘的由可以隨需擴充的 read replica 吸收，兩邊各自長大，不再互相搶同一批資源。</p>
+
+  <p>三個動作各有各的對象，下面逐一對照原文。縮小鎖與 quorum 的範圍，依據是 Git 的一致性要求逐 reference 成立，reference 因此是可以切開的邊界。切開之後，每筆寫入仍然要承受跨區延遲，變的是不同 reference 的寫入可以同時在途（「Each write still experiences the cross-region latency but writes to different references can be in flight at the same time」），彼此不再排隊。合併 I/O 針對的是落在不同 reference 上的交易，忙碌的 repository 因此「pays for one round trip across many concurrent writes」。把讀取移出寫入 quorum，文章給的背景是大多數 repository 每筆寫入對應 100 到 1,000 次讀取。以下是我的推論：這些動作的收益都取決於流量的形狀，寫入幾乎都擠在同一個 reference 上時，合併沒有東西可合；讀寫比接近一比一時，讀取分離能省下的就小得多。</p>
+
+  <p>三者的順序有一條文章明寫的依賴：讀取脫鉤的前提，是 repository 資料已經持久地存放在 Azure Blob Storage，並隨每筆寫入更新。以下是我的推論：這等於說寫入端的 virtual replica 要先到位，read replica 才有可信的來源去暖快取與對帳；縮小範圍排在最前面，是因為合併處理的正是不同 reference 上彼此獨立的交易，沒有範圍切分，可合併的東西很少。讀寫比或 reference 分佈和 GitHub 不同的系統，三個條件不一定同時成立。</p>
+
+  <p>回到那 25ms。它是區域之間的往返，文章寫得明白：每筆寫入仍然要承受跨區延遲，換來的是不同 reference 的寫入能同時在途。以下是我的整理：三個動作改的是誰要排隊、誰要分擔，而不是往返本身。鎖縮到 reference 之後，一個 reference 的寫入在等往返時，其他 reference 的寫入不必陪著等；讀取移出之後，大量讀取不再擠進寫入要等的那群 replica。合併是另一件事，它省下的是對 object storage 的往返，和跨區的 25ms 不是同一趟。</p>
+
+  <p>這條路鋪在遷移完成的資料上。99.99999% 的 repository 已經同時存在兩個地方，大多數 repository 的五個 replica 裡有兩個在 Azure，Azure 服務約一半的 Git 流量；遷移期間流量跟著資料走，每搬一份副本，能由 Azure 服務的比例就多一分。沒搬完的是最忙的那批，它們停在 25ms 的往返前面，也正是最需要上面三個零件的 repository：寫入密、讀取更密、鎖範圍一大就互相擋。文章標題裡的 bridge，我的解讀是指這座橋，一端是已經就位的資料，另一端是尚未完工的新架構。</p>
+
+  <p>橋的另一端還沒蓋完，GitHub 自己也這樣說。quorum 仍是進一步提升的上限（「the quorum remains the bounding factor for increasing further」），下一個限制是寫入吞吐，還有幾個題目沒有答案，包括持久的 reference 狀態放在哪裡，以及 compaction 與垃圾回收如何擴充。文章預告系列的最後一篇會在 GitHub Universe 登場，帶讀者看終態的全貌，包括它對寫入吞吐的影響，以及剩下的那個共識群組。</p>
+
+  <p class="vg-deep-closer"><strong>The shape of it</strong>：鎖縮到 reference、持久性交給 object storage、讀取移出 quorum，三件事各拆掉寫入路徑上的一段等待，留下來的那一段是 quorum 自己。</p>
+</div>
