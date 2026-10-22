@@ -1,0 +1,814 @@
+{
+  "output_path": "src/posts/2026/10/23/deep-github-agent-scale-git.html",
+  "spine": [
+    "1. 遷移分兩段：資料先搬（99.99999% 的 repository 已有 Azure 副本，Azure 服務約一半 Git 流量），架構後換；最忙的那批被 25ms 往返擋住。",
+    "2. 起點的寫入路徑：五個 replica，quorum 只需多數卻等每個健康 replica，且每筆寫入持有整個 repository 的鎖，所以最慢的健康 replica 決定每筆寫入的延遲。",
+    "3. 第一步：把 quorum 的範圍從整個 repository 縮到單一 reference，因為 Git 的一致性要求本來就逐 reference；寫不同 reference 的內部測試吞吐高 3 到 4 倍。",
+    "4. 第二步：object storage 以 virtual write replica 加入 quorum，暫態、只串流寫入、不提供讀取，寫入持久化後才確認，並把不同 reference 的交易合併成一組 I/O。",
+    "5. 讀取脫鉤：virtual read replica 從 Azure Blob Storage 暖快取、不加入 quorum、背景對帳；大多數 repository 每筆寫入對應 100 到 1,000 次讀取，所以讀寫分開擴充有價值。",
+    "6. 取捨：確認條件變嚴、背景對帳只適合部分讀取負載、quorum 仍是寫入吞吐上限；每個 reference 內部的共識沒有消失。",
+    "7. 證據強度：單一來源（GitHub 自家部落格），內部測試條件不詳，無獨立重現；終態與剩餘共識群組留待 GitHub Universe 的最後一篇。"
+  ],
+  "sources": [
+    {
+      "url": "https://github.blog/engineering/architecture-optimization/the-bridge-to-agent-scale-git-infrastructure/",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": "2026-10-21",
+      "perspective": {
+        "mechanism": "遷移期間資料先到 Azure；quorum 範圍由 repository 縮到 reference，object storage 以 virtual write replica 進 quorum（暫態、串流寫入、持久化後確認、合併 I/O），virtual read replica 不進 quorum、從 object storage 暖快取並背景對帳。",
+        "tradeoff": "寫入確認條件多了 object storage 持久化；read replica 背景對帳只適合部分讀取負載；quorum 仍限制寫入吞吐，終態與剩餘共識群組未揭露。",
+        "reader_use": "維護複寫儲存的工程師可檢查鎖與 quorum 的單位是否大於一致性真正需要、持久層是備份還是 quorum 成員、讀取是否與寫入搶同一批資源。"
+      }
+    }
+  ],
+  "notes": [
+    {
+      "id": "n01",
+      "url": "https://github.blog/engineering/architecture-optimization/the-bridge-to-agent-scale-git-infrastructure/",
+      "quote": "We moved a copy of 99.99999% of GitHub’s repositories to Azure.",
+      "hedge": "asserted",
+      "interpretation": "遷移進度的主數字；文章發表日 2026-10-21，作者 Eleanor White、Victoria Dye。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n02",
+      "url": "https://github.blog/engineering/architecture-optimization/the-bridge-to-agent-scale-git-infrastructure/",
+      "quote": "they’re held back by just one thing: a 25ms round trip.",
+      "hedge": "asserted",
+      "interpretation": "沒搬完的是最忙的那批 repository，阻礙是 25ms 往返。因果推到寫入路徑上是我的推論，文章未如此寫。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n03",
+      "url": "https://github.blog/engineering/architecture-optimization/the-bridge-to-agent-scale-git-infrastructure/",
+      "quote": "The first copy of a repository landed in Azure’s Central US region in August 2025.",
+      "hedge": "asserted",
+      "interpretation": "第一份副本的時間與區域。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n04",
+      "url": "https://github.blog/engineering/architecture-optimization/the-bridge-to-agent-scale-git-infrastructure/",
+      "quote": "Today, most repositories have two of their five replicas in Azure, and Azure serves about half of Git traffic.",
+      "hedge": "asserted",
+      "interpretation": "現況：五個 replica 中兩個在 Azure，Azure 服務約一半流量。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n05",
+      "url": "https://github.blog/engineering/architecture-optimization/the-bridge-to-agent-scale-git-infrastructure/",
+      "quote": "we needed to sequence the work carefully: move the data first, then evolve the architecture once it arrived.",
+      "hedge": "asserted",
+      "interpretation": "先搬資料、後換架構的順序。文中對『同時改動風險過高、成長與容量壓力』的理由整理來自抓取摘要，非逐字，文中已標為我的整理。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n06",
+      "url": "https://github.blog/engineering/architecture-optimization/the-bridge-to-agent-scale-git-infrastructure/",
+      "quote": "During the migration, traffic follows the data.",
+      "hedge": "asserted",
+      "interpretation": "搬遷期間流量跟著資料；每多一個 replica 在 Azure，能由 Azure 服務的流量比例上升。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n07",
+      "url": "https://github.blog/engineering/architecture-optimization/the-bridge-to-agent-scale-git-infrastructure/",
+      "quote": "each write holds a repository-wide lock until it commits",
+      "hedge": "asserted",
+      "interpretation": "起點的鎖範圍是整個 repository，持有到 commit。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n08",
+      "url": "https://github.blog/engineering/architecture-optimization/the-bridge-to-agent-scale-git-infrastructure/",
+      "quote": "the slowest healthy replica sets the latency of every write",
+      "hedge": "asserted",
+      "interpretation": "文章對起點寫入延遲的結論。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n09",
+      "url": "https://github.blog/engineering/architecture-optimization/the-bridge-to-agent-scale-git-infrastructure/",
+      "quote": "only needs a majority to commit a write, but it waits for every healthy replica to respond",
+      "hedge": "asserted",
+      "interpretation": "Spokes 的 quorum 只需多數即可 commit，卻等每個健康 replica；五個的多數是三個為我的算術。完整句首為 Spokes’ quorum。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n10",
+      "url": "https://github.blog/engineering/architecture-optimization/the-bridge-to-agent-scale-git-infrastructure/",
+      "quote": "Most repositories have five replicas to balance durability, availability, and scale.",
+      "hedge": "asserted",
+      "interpretation": "大多數 repository 有五個 replica。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n11",
+      "url": "https://github.blog/engineering/architecture-optimization/the-bridge-to-agent-scale-git-infrastructure/",
+      "quote": "replicas that each hold a full copy of the repository",
+      "hedge": "asserted",
+      "interpretation": "每個 replica 持有完整副本。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n12",
+      "url": "https://github.blog/engineering/architecture-optimization/the-bridge-to-agent-scale-git-infrastructure/",
+      "quote": "So, we’re changing the scope of the quorum from the whole repository to individual references.",
+      "hedge": "asserted",
+      "interpretation": "第一個架構改動：quorum 範圍由 repository 縮到 reference。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n13",
+      "url": "https://github.blog/engineering/architecture-optimization/the-bridge-to-agent-scale-git-infrastructure/",
+      "quote": "Git’s consistency requirements apply to each reference individually.",
+      "hedge": "asserted",
+      "interpretation": "縮小範圍的依據。『Git 並未要求更大範圍的保護』是我由此做的解讀。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n14",
+      "url": "https://github.blog/engineering/architecture-optimization/the-bridge-to-agent-scale-git-infrastructure/",
+      "quote": "writes to different references consistently saw 3–4x higher throughput",
+      "hedge": "hedged",
+      "interpretation": "寫不同 reference 時吞吐高 3 到 4 倍。『內部測試、貼近實際流量、延遲也更低』的條件來自抓取摘要，非逐字；文中標明為 GitHub 自己的測試，無獨立重現。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n15",
+      "url": "https://github.blog/engineering/architecture-optimization/the-bridge-to-agent-scale-git-infrastructure/",
+      "quote": "The first step is making object storage a member of the quorum, but a special one that we call a virtual replica.",
+      "hedge": "asserted",
+      "interpretation": "virtual replica 的定義：object storage 以特殊身分成為 quorum 成員。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n16",
+      "url": "https://github.blog/engineering/architecture-optimization/the-bridge-to-agent-scale-git-infrastructure/",
+      "quote": "The compute that represents it is our first fully ephemeral node.",
+      "hedge": "asserted",
+      "interpretation": "代表它的運算資源是第一個完全暫態的節點。『持久性由 object storage 背書、節點可隨時替換』是我的推測。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n17",
+      "url": "https://github.blog/engineering/architecture-optimization/the-bridge-to-agent-scale-git-infrastructure/",
+      "quote": "It serves as a bridge to object storage, streaming incoming writes and serving no reads.",
+      "hedge": "asserted",
+      "interpretation": "virtual write replica 的角色：橋接、串流寫入、不提供讀取。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n18",
+      "url": "https://github.blog/engineering/architecture-optimization/the-bridge-to-agent-scale-git-infrastructure/",
+      "quote": "Because it’s a member of the quorum, a write isn’t acknowledged until it’s durable in object storage.",
+      "hedge": "asserted",
+      "interpretation": "寫入確認條件：object storage 持久化後才確認。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n19",
+      "url": "https://github.blog/engineering/architecture-optimization/the-bridge-to-agent-scale-git-infrastructure/",
+      "quote": "coalesces transactions on disjoint references into a single set of network I/Os to object storage",
+      "hedge": "asserted",
+      "interpretation": "合併不同 reference 上的交易。合併時間窗與單趟耗時文章未給。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n20",
+      "url": "https://github.blog/engineering/architecture-optimization/the-bridge-to-agent-scale-git-infrastructure/",
+      "quote": "so a busy repository pays for one round trip across many concurrent writes instead of one per write.",
+      "hedge": "asserted",
+      "interpretation": "合併的效果：多筆並行寫入共付一趟往返。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n21",
+      "url": "https://github.blog/engineering/architecture-optimization/the-bridge-to-agent-scale-git-infrastructure/",
+      "quote": "Today, reads and writes hit the same replicas, so they compete for the same resources and can’t be scaled independently.",
+      "hedge": "asserted",
+      "interpretation": "現況的讀寫耦合。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n22",
+      "url": "https://github.blog/engineering/architecture-optimization/the-bridge-to-agent-scale-git-infrastructure/",
+      "quote": "Most repositories are heavily read-skewed, with somewhere between 100 and 1,000 reads for every write.",
+      "hedge": "asserted",
+      "interpretation": "讀寫比 100 到 1,000；讀取占請求數 99.0% 到 99.9% 是我的算術，且以請求數計不等於資源成本。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n23",
+      "url": "https://github.blog/engineering/architecture-optimization/the-bridge-to-agent-scale-git-infrastructure/",
+      "quote": "warms its cache from Azure Blob Storage and starts taking read traffic without joining the quorum",
+      "hedge": "asserted",
+      "interpretation": "virtual read replica 的暖機與不進 quorum。完整句為 Each read replica warms its cache from Azure Blob Storage and starts taking read traffic without joining the quorum（抓取回傳為子句）。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n24",
+      "url": "https://github.blog/engineering/architecture-optimization/the-bridge-to-agent-scale-git-infrastructure/",
+      "quote": "using object storage as the source of truth and reconciling its local state against it in the background.",
+      "hedge": "asserted",
+      "interpretation": "read replica 以 object storage 為準並背景對帳。『看到的狀態可能落後 quorum』是我的推論。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n25",
+      "url": "https://github.blog/engineering/architecture-optimization/the-bridge-to-agent-scale-git-infrastructure/",
+      "quote": "which makes them a good fit for some read workloads but not all of them.",
+      "hedge": "hedged",
+      "interpretation": "背景對帳只適合部分讀取負載，文章未列舉哪些不適合。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n26",
+      "url": "https://github.blog/engineering/architecture-optimization/the-bridge-to-agent-scale-git-infrastructure/",
+      "quote": "we can begin to decouple read traffic from the write quorum, and independently scale the compute needed for each",
+      "hedge": "asserted",
+      "interpretation": "讀取與寫入 quorum 開始脫鉤、各自擴充運算。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n27",
+      "url": "https://github.blog/engineering/architecture-optimization/the-bridge-to-agent-scale-git-infrastructure/",
+      "quote": "the quorum remains the bounding factor for increasing further.",
+      "hedge": "asserted",
+      "interpretation": "quorum 仍是進一步提升的上限。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n28",
+      "url": "https://github.blog/engineering/architecture-optimization/the-bridge-to-agent-scale-git-infrastructure/",
+      "quote": "the next limit is write throughput.",
+      "hedge": "asserted",
+      "interpretation": "下一個限制是寫入吞吐。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n29",
+      "url": "https://github.blog/engineering/architecture-optimization/the-bridge-to-agent-scale-git-infrastructure/",
+      "quote": "like where durable reference state lives and how compaction and garbage collection scale.",
+      "hedge": "asserted",
+      "interpretation": "尚未解決的問題：持久 reference 狀態放哪、compaction 與 GC 如何擴充。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n30",
+      "url": "https://github.blog/engineering/architecture-optimization/the-bridge-to-agent-scale-git-infrastructure/",
+      "quote": "How can we push write throughput further?",
+      "hedge": "asserted",
+      "interpretation": "文章自己提出的開放問題。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n31",
+      "url": "https://github.blog/engineering/architecture-optimization/the-bridge-to-agent-scale-git-infrastructure/",
+      "quote": "At GitHub Universe and in the final post in this series",
+      "hedge": "asserted",
+      "interpretation": "預告系列最後一篇與 GitHub Universe，內容為終態、對寫入吞吐的影響與剩餘共識群組（後者來自抓取摘要）。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n32",
+      "url": "https://github.blog/engineering/architecture-optimization/the-bridge-to-agent-scale-git-infrastructure/",
+      "quote": "we laid out the two principles behind our next-generation storage architecture",
+      "hedge": "asserted",
+      "interpretation": "文章回頭提到先前一篇談過新一代儲存架構的兩項原則；本文只以文字提及，不引用該篇網址。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n33",
+      "url": "https://github.blog/engineering/architecture-optimization/the-bridge-to-agent-scale-git-infrastructure/",
+      "quote": "99.99999% of the Git repositories on GitHub began living in two places at once",
+      "hedge": "asserted",
+      "interpretation": "搬完後 repository 同時存在兩處；『這是後續改動前提、跨區延遲進入取捨』是我的推論。",
+      "timeliness": "volatile"
+    }
+  ],
+  "claims": [
+    {
+      "id": "c01",
+      "claim_text": "GitHub 10 月 21 日文章，作者 Eleanor White 與 Victoria Dye",
+      "location": "post body",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n01"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "see checker round 1",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c02",
+      "claim_text": "99.99999% 的 repository 複製一份到 Azure",
+      "location": "post body",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n01"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "see checker round 1",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c03",
+      "claim_text": "未搬完的是最忙的那批，被 25ms 往返擋住",
+      "location": "post body",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n02"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "see checker round 1",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c04",
+      "claim_text": "大多數 repository 有五個 replica",
+      "location": "post body",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n10"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "see checker round 1",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c05",
+      "claim_text": "每個 replica 持有完整副本",
+      "location": "post body",
+      "type": "quote",
+      "load": "low",
+      "note_ids": [
+        "n11"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "see checker round 1",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c06",
+      "claim_text": "第一份副本 2025 年 8 月落在 Azure Central US",
+      "location": "post body",
+      "type": "date-version",
+      "load": "medium",
+      "note_ids": [
+        "n03"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "see checker round 1",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c07",
+      "claim_text": "五個 replica 中兩個在 Azure；Azure 服務約一半 Git 流量",
+      "location": "post body",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n04"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "see checker round 1",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c08",
+      "claim_text": "move the data first, then evolve the architecture",
+      "location": "post body",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n05"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "see checker round 1",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c09",
+      "claim_text": "During the migration, traffic follows the data.",
+      "location": "post body",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n06"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "see checker round 1",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c10",
+      "claim_text": "began living in two places at once",
+      "location": "post body",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n33"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "see checker round 1",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c11",
+      "claim_text": "Spokes quorum 只需多數即可 commit，但等每個健康 replica 回應",
+      "location": "post body",
+      "type": "attribution",
+      "load": "high",
+      "note_ids": [
+        "n09"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "see checker round 1",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c12",
+      "claim_text": "每筆寫入持有整個 repository 的鎖直到 commit",
+      "location": "post body",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n07"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "see checker round 1",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c13",
+      "claim_text": "最慢的健康 replica 決定每筆寫入的延遲",
+      "location": "post body",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n08"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "see checker round 1",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c14",
+      "claim_text": "未搬完的是最忙的那批；合理的推測是最先撐不住（文中已標示）",
+      "location": "post body",
+      "type": "causal",
+      "load": "medium",
+      "note_ids": [
+        "n02"
+      ],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "already marked as inference in the post text",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c15",
+      "claim_text": "quorum 範圍由整個 repository 改為個別 reference",
+      "location": "post body",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n12"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "see checker round 1",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c16",
+      "claim_text": "Git 的一致性要求逐 reference 適用",
+      "location": "post body",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n13"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "see checker round 1",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c17",
+      "claim_text": "內部測試、貼近實際流量下，寫入不同 reference 吞吐高 3 到 4 倍且延遲更低",
+      "location": "post body",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n14"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "see checker round 1",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c18",
+      "claim_text": "quorum 仍是進一步提升的限制因素",
+      "location": "post body",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n27"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "see checker round 1",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c19",
+      "claim_text": "object storage 成為 quorum 成員的 virtual replica",
+      "location": "post body",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n15"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "see checker round 1",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c20",
+      "claim_text": "first fully ephemeral node；橋接 object storage、不服務讀取",
+      "location": "post body",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n16",
+        "n17"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "see checker round 1",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c21",
+      "claim_text": "寫入要在 object storage 持久化後才確認",
+      "location": "post body",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n18"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "see checker round 1",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c22",
+      "claim_text": "合併不同 reference 的交易，忙碌 repository 付出一次往返",
+      "location": "post body",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n19",
+        "n20"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "see checker round 1",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c23",
+      "claim_text": "讀寫打同一批 replica、無法獨立擴充",
+      "location": "post body",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n21"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "see checker round 1",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c24",
+      "claim_text": "每次寫入對應 100 到 1,000 次讀取",
+      "location": "post body",
+      "type": "number",
+      "load": "high",
+      "note_ids": [
+        "n22"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "see checker round 1",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c25",
+      "claim_text": "read replica 不加入 quorum、以 object storage 為準並背景對帳",
+      "location": "post body",
+      "type": "quote",
+      "load": "high",
+      "note_ids": [
+        "n23",
+        "n24"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "see checker round 1",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c26",
+      "claim_text": "讀取流量與寫入 quorum 解耦、各自擴充",
+      "location": "post body",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n26"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "see checker round 1",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c27",
+      "claim_text": "背景對帳適合部分讀取工作負載，非全部",
+      "location": "post body",
+      "type": "quote",
+      "load": "medium",
+      "note_ids": [
+        "n25"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "see checker round 1",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c28",
+      "claim_text": "下一個限制是寫入吞吐；持久 reference 狀態與 compaction/GC 等開放題目",
+      "location": "post body",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n28",
+        "n29"
+      ],
+      "independence": "single-source",
+      "verdict": "pending",
+      "hedge_delta": "none",
+      "evidence": "see checker round 1",
+      "note": "open-questions list (durable reference state, compaction/GC) not located in the summarising fetch; flagged for human eyeball",
+      "action": "hedge",
+      "resolution": "accepted-with-flag"
+    },
+    {
+      "id": "c29",
+      "claim_text": "系列最後一篇將於 GitHub Universe 登場",
+      "location": "post body",
+      "type": "attribution",
+      "load": "medium",
+      "note_ids": [
+        "n31"
+      ],
+      "independence": "single-source",
+      "verdict": "verified",
+      "hedge_delta": "none",
+      "evidence": "see checker round 1",
+      "note": "",
+      "action": "none",
+      "resolution": "none-needed"
+    },
+    {
+      "id": "c30",
+      "claim_text": "讀取占請求數約 99.0% 到 99.9%（作者算術，文中已標示）",
+      "location": "post body",
+      "type": "number",
+      "load": "low",
+      "note_ids": [
+        "n22"
+      ],
+      "independence": "single-source",
+      "verdict": "inferred",
+      "hedge_delta": "none",
+      "evidence": null,
+      "note": "already marked as inference in the post text",
+      "action": "none",
+      "resolution": "none-needed"
+    }
+  ],
+  "checked_at": "2026-10-23",
+  "checker_rounds": 1,
+  "coverage": {
+    "candidate_claims": 34,
+    "checked": 30,
+    "dropped_low_load": 4
+  }
+}
