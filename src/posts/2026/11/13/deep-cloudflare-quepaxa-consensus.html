@@ -1,0 +1,484 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">Cloudflare 為全球 control plane 的共識服務挑了 QuePaxa，一個沒有 Raft 與 Paxos 那麼身經百戰的演算法。理由很具體：leader 一慢，整個系統就跟著慢，而 QuePaxa 不靠 leader 也能往前走。</p>
+  <h1 class="vg-post-title">{{ title }}</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p><span class="vg-dropcap">C</span>loudflare 的 Meerkat 是一個實驗性的分散式共識服務，用來管理 Cloudflare 內部的全球 control plane，而且和同類系統不同，它從設計之初就瞄準全球規模。Meerkat 底下跑的共識演算法是 QuePaxa。這篇文章先拆開 QuePaxa 的結構：有哪些角色、一輪走哪四個階段、為什麼不靠 leader 也能前進。接著回頭看 Cloudflare 為什麼願意用它，以及他們自己承認的風險。文中凡是我自己的推論，都會明講是推測。</p>
+
+  <h2>單一 leader 的代價與三種卡住方式</h2>
+
+  <p>多數共識系統用的是 Raft、(Multi-)Paxos 或 Viewstamped Replication。Cloudflare 對這些演算法並不苛刻：它們被充分理解，有成熟的實作，通常也運作良好。問題出在它們共同的前提，也就是依賴單一 leader，而且要這個 leader 持續可用、延遲可預測。Cloudflare 的寫法是：「If the leader goes down, experiences higher latency than usual, or is disconnected, the entire consensus system slows down or becomes unavailable until the leader is replaced.」</p>
+
+  <p>這不是紙上談兵。2020 年，Cloudflare 一個核心網路交換器發生局部故障，一個靠共識運作的系統因此退化，dashboard 比平常慢了 80 倍，持續六小時。系統沒有掉資料，但在問題解決之前無法寫入，Cloudflare 對這一點的評語是 unacceptable。這次事故的形狀值得記住：不是整批機器當機，而是網路只壞了一部分。Cloudflare 對這類情況的觀察是，許多共識系統在網路狀況惡化時，會變得不成比例地不可用或緩慢。</p>
+
+  <p>Meerkat 是為全球規模設計的，所以這個風險不能當成偶發事件處理。合理的推測是，節點分得越開、鏈路的延遲與波動越大，單一 leader 出狀況的機會就越多。這是我的推論，原文沒有替這個趨勢給數字。</p>
+
+  <p>原文把傳統做法的弱點拆成三種，各有各的卡法。第一種屬於 Paxos 一族：當多個 proposer 同時提案，其中一個可以把自己更高的 ballot number 插進另一個 proposer 的兩個階段之間，兩個 proposer 就可能反覆封鎖對方。Cloudflare 把這個現象叫做 destructive interference，並且指出 proposer 越多、各自提出自己的 ballot，情況越糟。</p>
+
+  <p>第二種屬於 Raft：leader 不穩的時候選舉會失敗。原文舉的例子是兩個候選人都需要三票，卻各自只拿到兩票（自己的一票加另一個 replica 的一票），於是平手。更麻煩的是自我強化：選舉失敗得越多，想讓自己當選的 replica 就越多。即使 leader 已經不再有問題，選舉仍然持續干擾原本可以正常運作的系統。</p>
+
+  <p>第三種是 fault detection。偵測器靠觀察網路上的訊息來判斷故障，所以反應時間必須跟著網路延遲放大。Cloudflare 提到 Raft 常見的部署，election timeout 設在網路 round-trip time 的五到十倍。下表把三種卡法和 QuePaxa 的對應做法並排，QuePaxa 的細節留給後面幾節。</p>
+
+  <figure class="vg-w-table-quepaxa-failure-modes" data-mobile="keep">
+    <style>
+      .vg-w-table-quepaxa-failure-modes { overflow-x: auto; }
+      .vg-w-table-quepaxa-failure-modes table { width: 100%; min-width: 560px; border-collapse: collapse; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-table-quepaxa-failure-modes caption { text-align: left; caption-side: top; font-family: var(--scribed); font-style: italic; color: var(--muted); font-size: var(--fs-sm); padding: var(--s-1) 0; }
+      .vg-w-table-quepaxa-failure-modes thead th { font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; text-align: left; padding: var(--s-1) var(--s-2); border-bottom: 1.5px solid var(--ink); color: var(--muted); }
+      .vg-w-table-quepaxa-failure-modes tbody th { text-align: left; font-weight: 600; padding: var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; color: var(--accent-text); }
+      .vg-w-table-quepaxa-failure-modes tbody td { padding: var(--s-2); border-bottom: 1px solid var(--line); vertical-align: top; }
+    </style>
+    <table>
+      <caption>三種卡住方式與 QuePaxa 的對應做法（內容整理自 Cloudflare 原文）</caption>
+      <thead>
+        <tr><th scope="col">卡住的情境</th><th scope="col">傳統演算法的行為</th><th scope="col">QuePaxa 的做法</th></tr>
+      </thead>
+      <tbody>
+        <tr><th scope="row">leader 變慢或斷線</th><td>整個共識系統變慢或不可用，直到 leader 被換掉</td><td>leader 可有可無；client 把請求送給每個 replica，任何 proposer 都能提案</td></tr>
+        <tr><th scope="row">多個 proposer 競爭（Paxos）</th><td>互相封鎖，proposer 越多越糟，稱為 destructive interference</td><td>proposer 抽隨機優先權，遇到更高優先權的提案就改採用它，無法無限期互鎖</td></tr>
+        <tr><th scope="row">選舉失敗（Raft）</th><td>分票；選舉越失敗，參選的 replica 越多；leader 恢復後選舉仍在干擾</td><td>leader 只是優化，不是前提，沒有 leader 也能繼續</td></tr>
+        <tr><th scope="row">判斷 leader 是否故障</th><td>靠超時，反應時間隨網路延遲放大；Raft 常設為 RTT 的五到十倍</td><td>hedging 超時由 replica 本地決定，不是 fault detection，不受網路延遲限制</td></tr>
+      </tbody>
+    </table>
+  </figure>
+
+  <p>把四列並排看，會發現它們有同一個結構：傳統演算法把「誰有資格往前推進」綁在某個特定的角色或某次選舉的結果上，那個角色一出問題，進度就跟著停。Paxos 綁在誰的 ballot 最後勝出，Raft 綁在選舉有沒有選出 leader，兩者的 leader 偵測又綁在網路延遲上。QuePaxa 的做法是把這幾個綁定逐一鬆開，下面幾節依序看它怎麼鬆。</p>
+
+  <h2>proposer、recorder 與可有可無的 leader</h2>
+
+  <p>QuePaxa 和 Paxos 一樣有兩種角色：proposer 與 recorder。recorder 是 proposer 之間的中介，記錄自己看過的每一個提案，並且持續追蹤其中優先權最高的那一個。proposer 則負責把提案送去給 recorder，再根據 recorder 回報的內容決定自己接下來採用哪個提案。</p>
+
+  <p>其中一個 proposer 會被指定為 leader。leader 是唯一能在單一 round trip 內做出決定的 proposer，這是 QuePaxa 在正常情況下快速的來源。但 Cloudflare 強調，leader 完全是可選的：client 不必只對 leader 發請求，任何 proposer 都可以提案。依這個設計，少了 leader 只是少掉那條單趟決定的快路，決定會慢一些，但系統不必停下來等 leader 回來。</p>
+
+  <p>client 這一側的設計是 hedging：送提案給系統的 client 會把請求送到每一個 replica。Cloudflare 的說法是，這樣就不必只押注在某一個 replica 身上。換句話說，「這個請求交給誰」不再是一個需要事先猜對的問題。下圖畫出這三個元素的關係，數量只是示意。</p>
+
+  <figure class="vg-w-roles-quepaxa-topology" data-mobile="keep" data-svg-scroll="720">
+    <svg viewBox="0 0 720 380" role="img" aria-label="QuePaxa 角色示意：client 把請求 hedge 給每個 proposer，proposer 與 recorder 之間互相往返，其中一個 proposer 是可有可無的 leader">
+      <style>
+        .vg-w-roles-quepaxa-topology text { font-family: Spectral, serif; font-size: 13px; fill: var(--ink); }
+        .vg-w-roles-quepaxa-topology .sub { font-size: 12px; fill: var(--muted); }
+        .vg-w-roles-quepaxa-topology .head { font-family: Manrope, sans-serif; font-size: 12px; letter-spacing: 0.06em; fill: var(--muted); }
+        .vg-w-roles-quepaxa-topology .box { fill: var(--bg-soft); stroke: var(--muted-2); stroke-width: 1.5; }
+        .vg-w-roles-quepaxa-topology .leader { fill: var(--bg-soft); stroke: var(--accent); stroke-width: 2.5; }
+        .vg-w-roles-quepaxa-topology .rec { fill: var(--bg-soft); stroke: var(--sage-deep); stroke-width: 1.5; }
+        .vg-w-roles-quepaxa-topology .flow { stroke: var(--muted-2); stroke-width: 1; opacity: 0.7; fill: none; }
+        .vg-w-roles-quepaxa-topology .hedge { stroke: var(--accent); stroke-width: 1.5; fill: none; }
+      </style>
+      <defs>
+        <marker id="vg-w-roles-quepaxa-topology-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0 0 L10 5 L0 10 z" fill="var(--accent)"/>
+        </marker>
+      </defs>
+      <text class="head" x="16" y="24">CLIENT</text>
+      <text class="head" x="230" y="24">PROPOSERS</text>
+      <text class="head" x="520" y="24">RECORDERS</text>
+
+      <rect class="box" x="16" y="140" width="150" height="100" rx="4"/>
+      <text x="91" y="182" text-anchor="middle">client</text>
+      <text class="sub" x="91" y="204" text-anchor="middle">hedge：每個都送</text>
+
+      <path class="hedge" d="M166 190 L228 82" marker-end="url(#vg-w-roles-quepaxa-topology-arrow)"/>
+      <path class="hedge" d="M166 190 L228 190" marker-end="url(#vg-w-roles-quepaxa-topology-arrow)"/>
+      <path class="hedge" d="M166 190 L228 298" marker-end="url(#vg-w-roles-quepaxa-topology-arrow)"/>
+
+      <rect class="leader" x="230" y="44" width="200" height="76" rx="4"/>
+      <text x="330" y="76" text-anchor="middle">P1 · leader</text>
+      <text class="sub" x="330" y="98" text-anchor="middle">可有可無，優先權固定最高</text>
+
+      <rect class="box" x="230" y="152" width="200" height="76" rx="4"/>
+      <text x="330" y="184" text-anchor="middle">P2 · proposer</text>
+      <text class="sub" x="330" y="206" text-anchor="middle">優先權隨機抽取</text>
+
+      <rect class="box" x="230" y="260" width="200" height="76" rx="4"/>
+      <text x="330" y="292" text-anchor="middle">P3 · proposer</text>
+      <text class="sub" x="330" y="314" text-anchor="middle">優先權隨機抽取</text>
+
+      <path class="flow" d="M430 82 L520 82"/><path class="flow" d="M430 82 L520 190"/><path class="flow" d="M430 82 L520 298"/>
+      <path class="flow" d="M430 190 L520 82"/><path class="flow" d="M430 190 L520 190"/><path class="flow" d="M430 190 L520 298"/>
+      <path class="flow" d="M430 298 L520 82"/><path class="flow" d="M430 298 L520 190"/><path class="flow" d="M430 298 L520 298"/>
+
+      <rect class="rec" x="520" y="52" width="184" height="60" rx="4"/>
+      <text x="612" y="78" text-anchor="middle">R1</text>
+      <text class="sub" x="612" y="98" text-anchor="middle">記錄看過的提案</text>
+      <rect class="rec" x="520" y="160" width="184" height="60" rx="4"/>
+      <text x="612" y="186" text-anchor="middle">R2</text>
+      <text class="sub" x="612" y="206" text-anchor="middle">保留最高優先權者</text>
+      <rect class="rec" x="520" y="268" width="184" height="60" rx="4"/>
+      <text x="612" y="294" text-anchor="middle">R3</text>
+      <text class="sub" x="612" y="314" text-anchor="middle">任兩個多數必有交集</text>
+
+      <text class="sub" x="360" y="364" text-anchor="middle">示意圖：三個 proposer 與三個 recorder 只是為了說明，並非 Cloudflare 的部署規模</text>
+    </svg>
+  </figure>
+
+  <h2>隨機優先權與多數交集</h2>
+
+  <p>Paxos 的麻煩是 proposer 彼此競爭，各自想讓自己的提案被決定。QuePaxa 改成讓 proposer 合作：每個 proposer 隨機選一個優先權，把提案送給 recorder；當它從 recorder 收到優先權比自己高的提案時，就改採用那個提案。這個做法的直接後果是，proposer 無法無限期地把彼此鎖在門外。</p>
+
+  <p>leader 是這套機制裡唯一不隨機的角色。它的提案固定拿到最高可能的優先權，不經過抽籤。Cloudflare 對保證性的描述很直接：只要給足夠多輪，proposer 一定會對某個提案達成一致。換句話說，隨機性負責在沒有 leader 的時候打破僵局，leader 的固定最高優先權則負責在 leader 健康的時候讓一切很快結束。</p>
+
+  <p>安全性靠的是多數交集：任意兩個 recorder 多數至少共享一個 recorder。Cloudflare 用這個性質解釋 leader 的快路為什麼安全：leader 的提案一旦被一個多數接受，任何其他 proposer 去詢問另一個多數時，必然會碰到 leader 的提案並採用它，所以不可能決定出任何其他提案。下面的小工具讓你自己挑兩個多數，看交集是不是真的躲不掉。為了好操作，這裡用五個 recorder（多數為三個），數量是示意。</p>
+
+  <figure class="vg-w-majority-quepaxa-intersection" data-mobile="swap" data-mobile-summary="五個 recorder 裡任選兩組各三個，兩組至少共享一個 recorder，所以後來詢問的 proposer 一定會碰到先前被多數接受的提案。">
+    <style>
+      .vg-w-majority-quepaxa-intersection { display: grid; gap: var(--s-2); }
+      .vg-w-majority-quepaxa-intersection .row { display: grid; grid-template-columns: 9rem repeat(5, minmax(44px, 1fr)); gap: var(--s-1); align-items: center; }
+      .vg-w-majority-quepaxa-intersection .rowname { font-family: var(--sans); font-size: var(--fs-xs); letter-spacing: 0.04em; color: var(--muted); }
+      .vg-w-majority-quepaxa-intersection button { min-height: 44px; min-width: 44px; font-family: var(--mono); font-size: var(--fs-sm); background: var(--bg-soft); color: var(--ink); border: 1.5px solid var(--muted-2); cursor: pointer; }
+      .vg-w-majority-quepaxa-intersection button[aria-pressed="true"].a { border-color: var(--accent); background: var(--accent); color: var(--bg); }
+      .vg-w-majority-quepaxa-intersection button[aria-pressed="true"].b { border-color: var(--sage-deep); background: var(--sage-deep); color: var(--bg); }
+      .vg-w-majority-quepaxa-intersection .result { padding: var(--s-2); background: var(--bg-soft); border-left: 2px solid var(--accent); font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-majority-quepaxa-intersection .overlap { display: grid; grid-template-columns: 9rem repeat(5, minmax(44px, 1fr)); gap: var(--s-1); }
+      .vg-w-majority-quepaxa-intersection .cell { min-height: 28px; display: flex; align-items: center; justify-content: center; font-family: var(--mono); font-size: var(--fs-xs); color: var(--muted); border-bottom: 2px solid var(--line); }
+      .vg-w-majority-quepaxa-intersection .cell.hit { color: var(--accent-text); border-bottom-color: var(--accent); font-weight: 700; }
+      @media (max-width: 720px) { .vg-w-majority-quepaxa-intersection .row, .vg-w-majority-quepaxa-intersection .overlap { grid-template-columns: repeat(5, minmax(44px, 1fr)); } .vg-w-majority-quepaxa-intersection .rowname { grid-column: 1 / -1; } }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v3"/><path d="M18.5 13h-13"/><path d="m3 8 4-4 4 4"/><path d="m21 16-4 4-4-4"/></svg>
+      <span>點選 recorder，為多數 A 與多數 B 各挑三個 · 5 個 recorder</span>
+    </p>
+    <div class="row" data-vg-controls data-set="a"><span class="rowname">多數 A（先被接受）</span></div>
+    <div class="row" data-vg-controls data-set="b"><span class="rowname">多數 B（後來詢問）</span></div>
+    <div class="overlap" aria-hidden="true"><span class="rowname">交集</span></div>
+    <p class="result" data-role="result" aria-live="polite"></p>
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        var root = document.querySelector('.vg-w-majority-quepaxa-intersection');
+        if (!root) return;
+        var N = 5, K = 3;
+        var sel = { a: [0, 1, 2], b: [2, 3, 4] };
+        var rowA = root.querySelector('.row[data-set="a"]');
+        var rowB = root.querySelector('.row[data-set="b"]');
+        var overlap = root.querySelector('.overlap');
+        var result = root.querySelector('[data-role="result"]');
+        var btns = { a: [], b: [] };
+        var cells = [];
+        function mk(set, row) {
+          for (var i = 0; i < N; i++) {
+            var b = document.createElement('button');
+            b.type = 'button';
+            b.textContent = 'R' + (i + 1);
+            b.className = set;
+            b.setAttribute('aria-label', (set === 'a' ? '多數 A' : '多數 B') + ' 切換 R' + (i + 1));
+            (function (idx) {
+              b.addEventListener('click', function () {
+                var arr = sel[set];
+                var pos = arr.indexOf(idx);
+                if (pos >= 0) { if (arr.length > 1) arr.splice(pos, 1); }
+                else { arr.push(idx); while (arr.length > K) arr.shift(); }
+                render();
+              });
+            })(i);
+            btns[set].push(b);
+            row.appendChild(b);
+          }
+        }
+        mk('a', rowA);
+        mk('b', rowB);
+        for (var c = 0; c < N; c++) {
+          var cell = document.createElement('span');
+          cell.className = 'cell';
+          overlap.appendChild(cell);
+          cells.push(cell);
+        }
+        function render() {
+          var hits = [];
+          for (var i = 0; i < N; i++) {
+            btns.a[i].setAttribute('aria-pressed', sel.a.indexOf(i) >= 0 ? 'true' : 'false');
+            btns.b[i].setAttribute('aria-pressed', sel.b.indexOf(i) >= 0 ? 'true' : 'false');
+            var hit = sel.a.indexOf(i) >= 0 && sel.b.indexOf(i) >= 0;
+            cells[i].className = 'cell' + (hit ? ' hit' : '');
+            cells[i].textContent = hit ? 'R' + (i + 1) : '·';
+            if (hit) hits.push('R' + (i + 1));
+          }
+          if (sel.a.length < K || sel.b.length < K) {
+            result.textContent = '兩組都挑滿三個才算多數；目前 A 有 ' + sel.a.length + ' 個、B 有 ' + sel.b.length + ' 個。';
+          } else if (hits.length > 0) {
+            result.textContent = '交集：' + hits.join('、') + '。後來詢問多數 B 的 proposer，一定會從這 ' + hits.length + ' 個 recorder 讀到多數 A 已經記下的提案。';
+          } else {
+            result.textContent = '沒有交集，這在五選三的條件下不可能發生。';
+          }
+        }
+        render();
+      })();
+    </script>
+  </figure>
+
+  <p>多數交集這一半的保證有一個很樸素的來源：五個 recorder 裡挑兩組各三個，總共挑了六個名額，但只有五個位子，所以至少有一個位子被重複挑中。這是算術，不是 QuePaxa 專有的技巧；QuePaxa 把它和 recorder 保留最高優先權提案的規則接在一起，才讓「後來的人一定看得到先前的決定」成立。</p>
+
+  <h2>一輪四個階段</h2>
+
+  <p>一輪共有四個階段。Phase 0 是 Propose and Adopt：proposer 隨機選優先權，把提案送給 recorder，並採用看到的最高優先權提案。Phase 1 是 Spread：proposer 把自己採用的提案散播給多數 recorder。Phase 2 是 Check and Decide：proposer 向多數 recorder 詢問上一階段看到的最高優先權提案。Phase 3 是 Carry Forward：proposer 再次散播提案，並採用在多數 recorder 之間找到的最好提案。第四階段之後，proposer 進入下一輪。</p>
+
+  <p>leader 在這裡的特權很明確：它是唯一能在單一 round trip 內做出決定的 proposer。Cloudflare 的測試顯示，絕大多數決定都走這條快路。至於慢路徑，也就是 leader 缺席或太慢時，proposer 靠多跑幾輪、靠隨機優先權來收斂。</p>
+
+  <p>下面這個玩具模型把上面的規則壓成可以拖動的形式。三個 proposer、三個 recorder、多數是兩個。每個 proposer 以各自的速度走完四個階段，順序是隨機交錯的，滑桿拖到哪一步，畫面就停在那一步。你可以切換 leader 的狀態：沒有 leader、leader 正常運作（優先權固定為 100）、leader 當機（P1 不再動作）。如果一輪結束時三個 proposer 手上的提案還不一致，就按「下一輪」，帶著目前採用的提案、重抽優先權再跑一次。</p>
+
+  <p>先講清楚這個模型的限度：它是我為了呈現直覺而簡化的示意，recorder 每輪清空，也沒有實作 QuePaxa 完整的決定規則。它能讓你看到的只有兩件事：提案怎麼隨著優先權與多數查詢逐步趨同，以及 leader 當機時剩下的 proposer 仍然會往同一個提案靠攏。畫面上的所有數字都是瀏覽器當場隨機產生的，和 Cloudflare 的任何實測無關。</p>
+
+  <figure class="vg-w-quepaxa-round-sim" data-mobile="swap" data-mobile-summary="proposer 各抽隨機優先權，採用多數 recorder 回報的最高者；leader 優先權固定最高，缺席時其餘 proposer 仍會逐輪趨同。">
+    <style>
+      .vg-w-quepaxa-round-sim { display: grid; gap: var(--s-3); }
+      .vg-w-quepaxa-round-sim .controls { display: flex; flex-wrap: wrap; gap: var(--s-2); align-items: center; }
+      .vg-w-quepaxa-round-sim .controls label { display: inline-flex; align-items: center; gap: 0.4ch; min-height: 44px; font-family: var(--serif); font-size: var(--fs-sm); cursor: pointer; }
+      .vg-w-quepaxa-round-sim button { min-height: 44px; padding: var(--s-1) var(--s-2); font-family: var(--sans); font-size: var(--fs-sm); background: var(--bg-soft); color: var(--ink); border: 1.5px solid var(--muted-2); cursor: pointer; }
+      .vg-w-quepaxa-round-sim button:disabled { opacity: 0.45; cursor: not-allowed; }
+      .vg-w-quepaxa-round-sim .scrub { display: grid; gap: var(--s-1); }
+      .vg-w-quepaxa-round-sim input[type="range"] { width: 100%; height: 36px; accent-color: var(--accent); touch-action: none; }
+      .vg-w-quepaxa-round-sim .scrubhead { display: flex; justify-content: space-between; font-family: var(--sans); font-size: var(--fs-xs); letter-spacing: 0.05em; text-transform: uppercase; color: var(--muted); }
+      .vg-w-quepaxa-round-sim .board { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s-3); }
+      @media (max-width: 720px) { .vg-w-quepaxa-round-sim .board { grid-template-columns: 1fr; } }
+      .vg-w-quepaxa-round-sim .colhead { font-family: var(--sans); font-size: var(--fs-xs); letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); margin: 0 0 var(--s-1) 0; }
+      .vg-w-quepaxa-round-sim .line { display: grid; grid-template-columns: 5.5rem 1fr auto; gap: var(--s-2); align-items: center; padding: var(--s-1) var(--s-2); border-bottom: 1px solid var(--line); font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-quepaxa-round-sim .line.off { opacity: 0.45; }
+      .vg-w-quepaxa-round-sim .who em { display: block; font-family: var(--sans); font-style: normal; font-size: var(--fs-xs); color: var(--accent-text); }
+      .vg-w-quepaxa-round-sim .meta { font-family: var(--mono); font-size: var(--fs-xs); color: var(--muted); font-variant-numeric: tabular-nums; }
+      .vg-w-quepaxa-round-sim .chip { display: inline-flex; align-items: center; justify-content: center; min-width: 2.2rem; height: 2rem; font-family: var(--display); font-size: 1.1rem; border: 2px solid var(--ink); background: var(--bg-soft); color: var(--ink); }
+      .vg-w-quepaxa-round-sim .chip[data-v="A"] { border-style: solid; border-color: var(--accent); }
+      .vg-w-quepaxa-round-sim .chip[data-v="B"] { border-style: dashed; border-color: var(--sage-deep); }
+      .vg-w-quepaxa-round-sim .chip[data-v="C"] { border-style: dotted; border-color: var(--ink-deep); }
+      .vg-w-quepaxa-round-sim .chip[data-v="-"] { border-style: solid; border-color: var(--line); color: var(--muted); }
+      .vg-w-quepaxa-round-sim .log { margin: 0; padding: var(--s-2); background: var(--bg-soft); border-left: 2px solid var(--muted-2); font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink-soft); }
+      .vg-w-quepaxa-round-sim .verdict { margin: 0; padding: var(--s-2); border-left: 2px solid var(--accent); font-family: var(--serif); font-size: var(--fs-sm); }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m18 8 4 4-4 4"/><path d="m6 8-4 4 4 4"/><path d="M2 12h20"/></svg>
+      <span>拖動滑桿逐步推進 · 切換 leader 狀態 · 3 個 proposer 與 3 個 recorder 的玩具模型</span>
+    </p>
+    <div class="controls" data-vg-controls role="group" aria-label="leader 狀態與操作">
+      <label><input type="radio" name="vg-w-quepaxa-round-sim-mode" value="none" /> 沒有 leader</label>
+      <label><input type="radio" name="vg-w-quepaxa-round-sim-mode" value="leader" checked /> leader 正常運作</label>
+      <label><input type="radio" name="vg-w-quepaxa-round-sim-mode" value="down" /> leader 當機</label>
+      <button type="button" data-role="reroll">重新開始</button>
+      <button type="button" data-role="next">下一輪</button>
+    </div>
+    <div class="scrub" data-vg-controls>
+      <div class="scrubhead"><span data-role="roundlabel">第 1 輪</span><span data-role="steplabel">步驟 0</span></div>
+      <input type="range" min="0" max="12" step="1" value="0" data-role="slider" aria-label="本輪進行到第幾步" />
+    </div>
+    <div class="board">
+      <div><p class="colhead">proposers · 目前採用的提案</p><div data-role="props"></div></div>
+      <div><p class="colhead">recorders · 記下的最高優先權提案</p><div data-role="recs"></div></div>
+    </div>
+    <p class="log" data-role="log" aria-live="polite"></p>
+    <p class="verdict" data-role="verdict" aria-live="polite"></p>
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        var root = document.querySelector('.vg-w-quepaxa-round-sim');
+        if (!root) return;
+        var NAMES = ['P1', 'P2', 'P3'];
+        var VALS = ['A', 'B', 'C'];
+        var PHASES = ['Propose and Adopt', 'Spread', 'Check and Decide', 'Carry Forward'];
+        var el = {
+          slider: root.querySelector('[data-role="slider"]'),
+          props: root.querySelector('[data-role="props"]'),
+          recs: root.querySelector('[data-role="recs"]'),
+          log: root.querySelector('[data-role="log"]'),
+          verdict: root.querySelector('[data-role="verdict"]'),
+          round: root.querySelector('[data-role="roundlabel"]'),
+          step: root.querySelector('[data-role="steplabel"]'),
+          reroll: root.querySelector('[data-role="reroll"]'),
+          next: root.querySelector('[data-role="next"]')
+        };
+        var state = null;
+
+        function shuffle(a) {
+          for (var i = a.length - 1; i > 0; i--) {
+            var j = Math.floor(Math.random() * (i + 1));
+            var t = a[i]; a[i] = a[j]; a[j] = t;
+          }
+          return a;
+        }
+        function better(x, y) {
+          if (!x) return y;
+          if (!y) return x;
+          if (x.pri > y.pri) return x;
+          if (y.pri > x.pri) return y;
+          return x.id <= y.id ? x : y;
+        }
+        function pickMajority() {
+          return shuffle([0, 1, 2]).slice(0, 2).sort(function (a, b) { return a - b; });
+        }
+        function currentMode() {
+          var c = root.querySelector('input[name="vg-w-quepaxa-round-sim-mode"]:checked');
+          return c ? c.value : 'leader';
+        }
+        function recNames(m) {
+          return 'R' + m.map(function (x) { return x + 1; }).join('、R');
+        }
+
+        function build(carry, round) {
+          var mode = currentMode();
+          var pool = shuffle(Array.from({ length: 99 }, function (_, i) { return i + 1; }));
+          var props = [];
+          for (var i = 0; i < 3; i++) {
+            var pri = pool[i];
+            if (i === 0 && mode === 'leader') pri = 100;
+            var val = carry ? carry[i] : VALS[i];
+            props.push({ id: i, active: !(i === 0 && mode === 'down'), start: { pri: pri, val: val, id: i } });
+          }
+          var sched = [];
+          props.forEach(function (p) {
+            if (p.active) { for (var k = 0; k < 4; k++) sched.push(p.id); }
+          });
+          shuffle(sched);
+          var steps = sched.map(function (id) { return { id: id, maj: pickMajority() }; });
+          state = { mode: mode, round: round, props: props, steps: steps };
+          el.slider.max = String(steps.length);
+          el.slider.value = '0';
+          render();
+        }
+
+        function replay(t) {
+          var adopted = state.props.map(function (p) { return p.start; });
+          var done = [0, 0, 0];
+          var recs = [null, null, null];
+          var last = '還沒開始：每個 proposer 手上只有自己的提案。';
+          for (var s = 0; s < t; s++) {
+            var st = state.steps[s];
+            var i = st.id;
+            var k = done[i];
+            var m = st.maj;
+            var seen = adopted[i];
+            var verb;
+            if (k === 0 || k === 3) {
+              m.forEach(function (r) { recs[r] = better(recs[r], adopted[i]); });
+              m.forEach(function (r) { seen = better(seen, recs[r]); });
+              adopted[i] = seen;
+              verb = '寫入並讀取 ';
+            } else if (k === 1) {
+              m.forEach(function (r) { recs[r] = better(recs[r], adopted[i]); });
+              verb = '寫入 ';
+            } else {
+              m.forEach(function (r) { seen = better(seen, recs[r]); });
+              adopted[i] = seen;
+              verb = '讀取 ';
+            }
+            done[i] = k + 1;
+            last = '第 ' + (s + 1) + ' 步：' + NAMES[i] + ' 進入 Phase ' + k + '（' + PHASES[k] + '），' + verb + recNames(m) + '，目前採用 ' + adopted[i].val + '。';
+          }
+          return { adopted: adopted, done: done, recs: recs, last: last };
+        }
+
+        function pips(n) {
+          var s = '';
+          for (var i = 0; i < 4; i++) s += i < n ? '●' : '○';
+          return s;
+        }
+
+        function render() {
+          var T = state.steps.length;
+          var t = Number(el.slider.value);
+          var r = replay(t);
+          var html = '';
+          state.props.forEach(function (p, i) {
+            var lead = i === 0 && state.mode === 'leader';
+            var tag = lead ? '<em>leader</em>' : (i === 0 && state.mode === 'down' ? '<em>已當機</em>' : '');
+            var meta = p.active ? ('優先權 ' + p.start.pri + ' · ' + pips(r.done[i])) : '不再動作';
+            var v = p.active ? r.adopted[i].val : p.start.val;
+            html += '<div class="line' + (p.active ? '' : ' off') + '"><span class="who">' + NAMES[i] + tag + '</span><span class="meta">' + meta + '</span><span class="chip" data-v="' + v + '">' + v + '</span></div>';
+          });
+          el.props.innerHTML = html;
+          var rh = '';
+          r.recs.forEach(function (b, i) {
+            var v = b ? b.val : '-';
+            var meta = b ? ('優先權 ' + b.pri) : '尚未記下任何提案';
+            rh += '<div class="line"><span class="who">R' + (i + 1) + '</span><span class="meta">' + meta + '</span><span class="chip" data-v="' + v + '">' + v + '</span></div>';
+          });
+          el.recs.innerHTML = rh;
+          el.log.textContent = r.last;
+          el.round.textContent = '第 ' + state.round + ' 輪';
+          el.step.textContent = '步驟 ' + t + ' / ' + T;
+          var vals = {};
+          state.props.forEach(function (p, i) { if (p.active) vals[r.adopted[i].val] = true; });
+          var keys = Object.keys(vals);
+          var finished = t === T;
+          if (!finished) {
+            el.verdict.textContent = '本輪進行中，把滑桿拖到最後一步看結果。';
+          } else if (keys.length === 1) {
+            el.verdict.textContent = '第 ' + state.round + ' 輪結束：所有仍在運作的 proposer 都採用了 ' + keys[0] + '。';
+          } else {
+            el.verdict.textContent = '第 ' + state.round + ' 輪結束：提案還沒一致（' + keys.sort().join('、') + ' 並存）。按「下一輪」帶著目前採用的提案重抽優先權再跑一次。';
+          }
+          el.next.disabled = !finished;
+          state.final = r;
+        }
+
+        el.slider.addEventListener('input', render);
+        el.reroll.addEventListener('click', function () { build(null, 1); });
+        el.next.addEventListener('click', function () {
+          var T = state.steps.length;
+          if (Number(el.slider.value) !== T) return;
+          var carry = state.props.map(function (p, i) { return p.active ? state.final.adopted[i].val : p.start.val; });
+          build(carry, state.round + 1);
+        });
+        root.querySelectorAll('input[name="vg-w-quepaxa-round-sim-mode"]').forEach(function (inp) {
+          inp.addEventListener('change', function () { build(null, 1); });
+        });
+        build(null, 1);
+      })();
+    </script>
+  </figure>
+
+  <p>拖幾次之後可以留意兩個現象。一個是提案不是一步到位地趨同，而是先在各個 recorder 上留下高優先權的痕跡，再被後來讀取的 proposer 一個個撿走。另一個是 leader 當機時，在這個玩具模型裡剩下兩個 proposer 沒有人固定最高優先權，誰抽到較大的號碼，誰的提案就比較容易被撿走，下一輪換另一個人贏也無所謂，因為重點是大家最後採用同一個。</p>
+
+  <h2>hedging 超時不是 fault detection</h2>
+
+  <p>QuePaxa 另一個和傳統做法的分界在超時。client 為了避免依賴單一入口而 hedge 請求，這個機制帶有一個 Cloudflare 稱為 hedging timeout 的超時。Cloudflare 特別強調，它和 Raft 或 Multi-Paxos 使用的超時很不一樣。它不是 fault detection，所以不受網路延遲限制，而是由 replica 在本地決定，想設多小都可以。</p>
+
+  <p>這個差別解釋了為什麼 leader 失效時 QuePaxa 能恢復得很快。偵測器的反應時間得隨網路延遲放大，Raft 常見的 election timeout 是 round-trip time 的五到十倍，跨洲部署時 RTT 本身就大，等待時間跟著放大。Cloudflare 的說法是，QuePaxa 的 leader 掛了，可以想多快恢復就多快，不被網路延遲綁住。合理的推測是，差別的根源在於 hedging 不需要先斷定 leader 是否真的壞了，client 只是把請求同時送給每個 replica，所以猜錯的代價比較低。這是我的推論，原文沒有這樣展開。下圖把兩種超時放在同一條 RTT 軸上。</p>
+
+  <figure class="vg-w-timeout-quepaxa-rtt-scale" data-mobile="keep" data-svg-scroll="720">
+    <svg viewBox="0 0 720 260" role="img" aria-label="Raft 的 election timeout 常見為 RTT 的 5 到 10 倍，QuePaxa 的 hedging 超時由 replica 本地決定，不受 RTT 限制">
+      <style>
+        .vg-w-timeout-quepaxa-rtt-scale text { font-family: Spectral, serif; font-size: 13px; fill: var(--ink); }
+        .vg-w-timeout-quepaxa-rtt-scale .sub { font-size: 12px; fill: var(--muted); }
+        .vg-w-timeout-quepaxa-rtt-scale .tick { font-family: JetBrains Mono, monospace; font-size: 12px; fill: var(--muted); }
+        .vg-w-timeout-quepaxa-rtt-scale .raft { fill: var(--accent); fill-opacity: 0.35; stroke: var(--accent); stroke-width: 1.5; }
+        .vg-w-timeout-quepaxa-rtt-scale .hedge { fill: var(--sage); fill-opacity: 0.18; stroke: var(--sage-deep); stroke-width: 1.5; stroke-dasharray: 6 4; }
+        .vg-w-timeout-quepaxa-rtt-scale .axis { stroke: var(--muted-2); stroke-width: 1; }
+      </style>
+      <text x="60" y="44">Raft：election timeout 常見設定為 RTT 的五到十倍</text>
+      <rect class="raft" x="318" y="56" width="259" height="36"/>
+      <text class="sub" x="447" y="79" text-anchor="middle">5 至 10 倍 RTT</text>
+
+      <text x="60" y="124">QuePaxa：hedging 超時由 replica 本地決定</text>
+      <rect class="hedge" x="60" y="136" width="620" height="36"/>
+      <text class="sub" x="370" y="159" text-anchor="middle">不是 fault detection，可以小到 replica 想要的程度</text>
+
+      <line class="axis" x1="60" y1="198" x2="680" y2="198"/>
+      <line class="axis" x1="60" y1="194" x2="60" y2="202"/><text class="tick" x="60" y="220" text-anchor="middle">0</text>
+      <line class="axis" x1="163" y1="194" x2="163" y2="202"/><text class="tick" x="163" y="220" text-anchor="middle">2</text>
+      <line class="axis" x1="267" y1="194" x2="267" y2="202"/><text class="tick" x="267" y="220" text-anchor="middle">4</text>
+      <line class="axis" x1="370" y1="194" x2="370" y2="202"/><text class="tick" x="370" y="220" text-anchor="middle">6</text>
+      <line class="axis" x1="473" y1="194" x2="473" y2="202"/><text class="tick" x="473" y="220" text-anchor="middle">8</text>
+      <line class="axis" x1="577" y1="194" x2="577" y2="202"/><text class="tick" x="577" y="220" text-anchor="middle">10</text>
+      <line class="axis" x1="680" y1="194" x2="680" y2="202"/><text class="tick" x="680" y="220" text-anchor="middle">12</text>
+      <text class="sub" x="370" y="246" text-anchor="middle">以網路 round-trip time（RTT）為單位的等待時間</text>
+    </svg>
+    <figcaption>Raft 那一條的範圍取自 Cloudflare 對常見部署的描述。hedging 那一條刻意沒有數字，因為原文只說它由本地決定、可以任意小，沒有給任何具體值。</figcaption>
+  </figure>
+
+  <p>hedging 不是沒有成本。Cloudflare 對運作方式的描述是，非 leader 的 replica 會先等一小段超時，讓 leader 有機會自己提案並決定。他們也寫到，實作上和論文不同：他們讓 client 去等這段 hedge 超時，而不是讓 replica 等。代價在原文裡講得很白：「we incur extra bandwidth costs and may take more time to decide」，而且 proposer 越多，被廣播的提案就越多。Cloudflare 的結論是，這個取捨他們非常願意接受。合理的推測是，超時設得越小，非 leader 的 proposer 越早出手，廣播的提案也越多，所以超時值其實是在延遲與頻寬之間取捨；原文沒有給建議值。</p>
+
+  <h2>還沒被戰場驗證的部分</h2>
+
+  <p>Cloudflare 把 QuePaxa 當成選項之一，而不是免費午餐。他們自己的說法是，這個演算法沒有 Raft 或 Paxos 被實戰檢驗得那麼廣泛。成熟實作多、人人懂、工具鏈齊全，這些是 Raft 與 Paxos 的長處，選 QuePaxa 就是主動放棄這些長處，換取對 leader 失效與網路波動的耐受力。Cloudflare 對這個交換的判斷寫在「Why QuePaxa is the right fit」一節：Meerkat 的全球部署環境，把他們帶向這個承諾在波動環境下更穩定的演算法，而穩定性的來源，很大程度上就是不依賴 leader 才能前進。</p>
+
+  <p>實測結果是目前最具體的證據。Cloudflare 的測試叢集有伺服器分布在幾乎所有大陸上。他們的描述是，絕大多數決定，超過 95%，由 leader 在第一階段完成，所以吞吐量相當穩定。leader 失效的時候，系統變慢，但不會停下來；Cloudflare 說，他們從沒看過它完全停擺。這些是 Cloudflare 自己的測試描述，原文以文字交代結果，我沒有在這篇文章裡看到完整的測試資料表。</p>
+
+  <p>leader 失效的那一段，原文有比較具體的數字。Cloudflare 描述的圖表顯示，leader 出問題時決定速率降到原本的約 65%，故障的 leader 在失效一分鐘後被換掉，速率就回到 100%；吞吐量會短暫下降，最多掉到平常的三分之一。請注意這是 leader 故障、系統繼續服務的情況，不是全面中斷：Meerkat 在 leader 當機、斷線或只是變慢的時候，都還是持續處理請求。另有一個和論文對照的細節：QuePaxa 論文預測每一輪有 50% 的機率決定，Cloudflare 說實際機率高得多，原因是提案會收斂，而且失敗的一輪不會把已經做的工作丟掉。這些同樣是 Cloudflare 對自己測試的描述，我沒有看到原始資料。</p>
+
+  <p>另一個值得記的是 Cloudflare 排除了什麼。他們寫道，任何依賴嚴格 leader 或精確超時的演算法，在他們的環境裡終究會停擺；QuePaxa 則能在條件有利時用單一 round trip 達成共識，並在延遲突波、連線問題與伺服器故障時平緩地降級。他們的選擇邏輯因此不是「QuePaxa 最快」，而是其他方案的最壞情況太糟，這個歸納是我的。原文也承認一個限制：提案有可能散播得不夠好，而無法達成一致。Cloudflare 同時預告，除了形式化驗證，還會做大量的模擬與 fault-injection 測試。</p>
+
+  <p>風險的另一半在工程面。QuePaxa 原本是學術協定，Cloudflare 自己把這個過程描述為把學術協定變成 production 系統，並且寫道這需要謹慎的工程，以及比一般系統更強的正確性證據。因此他們正在對 QuePaxa 的實作與整個 Meerkat 做形式化驗證，並且把原始的 crash-stop 設計擴充成支援 crash recovery。這兩件事都還在進行中。合理的推測是，在這兩件事完成之前，Meerkat 作為實驗性服務的定位不會變，不過這是我的推論，原文沒有給時程。</p>
+
+  <p>如果你在評估自己的共識元件，這篇文章給出的是一組可以拿去問的問題，而不是結論。系統的進度是否綁在某個特定節點的延遲上？那個節點變慢（或像 2020 年那次一樣整體慢八十倍）時，寫入路徑會怎樣？失效偵測的超時是不是被網路往返時間決定的？選用比較新的協定時，你有沒有能力補上它欠缺的驗證？Cloudflare 的答案是，用 QuePaxa 換掉對 leader 的依賴，再自己花力氣做形式化驗證。你的答案可以不同，但這四個問題值得先答。</p>
+
+  <p>Cloudflare 預告後續文章會談 Meerkat 與 QuePaxa Rust 實作的驗證方式，以及把學術協定變成 production 系統的過程中學到的事。對想評估 QuePaxa 的工程師來說，這幾篇比這一篇更值得等：選型理由已經清楚，缺的是驗證與基準的證據。</p>
+
+  <p class="vg-deep-closer"><strong>What this enables</strong>：QuePaxa 讓 leader 從共識系統的前提降為單純的加速器，leader 正常運作時多數決定在第一階段完成，leader 失效時系統只是變慢而不停擺，Cloudflare 因此能把共識服務放到跨洲、網路會出局部故障的環境裡，代價是要自己負責驗證一個還沒被廣泛戰場檢驗的協定。</p>
+</div>
