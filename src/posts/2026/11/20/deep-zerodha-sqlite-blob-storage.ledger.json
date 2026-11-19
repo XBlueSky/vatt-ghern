@@ -1,0 +1,558 @@
+{
+  "output_path": "src/posts/2026/11/20/deep-zerodha-sqlite-blob-storage.html",
+  "spine": [
+    "1. SSDB 無人維護且只能單機，被迫把 blob 壓在 1 MB；新需求要同時服務 2 KB 到 5 MB，且明講可放寬 durability。",
+    "2. 現成方案各卡在不同的軸（吞吐、空間、用途不符、維運、TTL 粒度、自造輪子）；SQLite 沒有明顯的洞，短處（約 100 KiB 以上檔案較慢）用壓縮繞開。",
+    "3. 兩層切分：Redis Cluster 的 16384 個 slot 分到節點，節點內以 multi-probe consistent hashing 分到 SQLite 分片；每個分片一個 writer 加一個唯讀連線池。",
+    "4. 分片的收益不對稱：寫入約 3.3 倍，讀取幾乎不變，因為 SQLite 的單一寫入鎖只卡寫入（推測，與後面 TTL 清理的實際事故互相印證）。",
+    "5. 放寬 durability（不每次 fsync、async_write）換低寫入延遲，代價是崩潰時有遺失視窗；這是需求的一部分。",
+    "6. async 寫入欠下一致性債：pending map 加 tombstone，所有讀取指令都要先查；SQLite 自身行為（freelist 不縮檔、單一寫入鎖）也要由 Blobasaur 補。",
+    "7. 遷移以新工作負載、雙寫加回填、client 切換三步完成，雙寫一個月零不一致後關閉 SSDB；線上三節點 p99 約 2 ms。"
+  ],
+  "sources": [
+    {
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "fetch_status": "ok",
+      "archive_url": null,
+      "published": null,
+      "perspective": {
+        "mechanism": "SQLite 分片加單一 writer 加批次 commit 加 Redis Cluster slot，把一把寫入鎖複製成多把；壓縮把 blob 留在 SQLite 有利的大小區間；pending map 與 tombstone 讓 async 寫入對讀取可見。",
+        "tradeoff": "放寬 durability 與 async_write 換寫入延遲；靜態 slot 指派與離線 resharding 換簡單；SQLite 不縮檔與單一寫入鎖需要自行補強。",
+        "reader_use": "台灣工程師評估自建 blob 或偏好儲存時，可用其需求篩選順序與採用前四問（遺失視窗、壓縮後大小分布、TTL 粒度、可否接受靜態 slot 與離線 reshard）作檢查表。"
+      }
+    }
+  ],
+  "notes": [
+    {
+      "id": "n01",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "SSDB became unmaintained, which was an obvious operational risk.",
+      "hedge": "asserted",
+      "interpretation": "替換 SSDB 的第一個動機是無人維護。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n02",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "SSDB is not a distributed system and can only run on a single node.",
+      "hedge": "asserted",
+      "interpretation": "SSDB 只能單節點。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n03",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "forcing us to cap blob sizes at 1 MB because latency degrades on larger payloads.",
+      "hedge": "asserted",
+      "interpretation": "單機的後果是 1 MB 的 blob 上限，原因是較大 payload 延遲劣化。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n04",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "It needed to serve both 2 KB settings blobs and 5 MB chart layouts with single-digit millisecond latency.",
+      "hedge": "asserted",
+      "interpretation": "新系統需求涵蓋 2 KB 到 5 MB，延遲個位數毫秒。這是需求，不是線上實測的分 size 延遲。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n05",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "Relaxed durability is acceptable",
+      "hedge": "asserted",
+      "interpretation": "需求清單另五項為 Redis 協定相容、跨 payload 大小的低延遲、內建壓縮、帶 TTL 的簡單 CRUD、多節點分區；放寬 durability 是需求的一部分。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n06",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "Significantly lower throughput and higher resource usage.",
+      "hedge": "asserted",
+      "interpretation": "ScyllaDB 被排除的理由。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n07",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "it turned out to be severely suboptimal again for the use case in terms of performance and disk-space efficiency.",
+      "hedge": "asserted",
+      "interpretation": "PostgreSQL 被排除的理由。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n08",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "Has blob storage as one of the options, but is not primarily designed or optimized for it.",
+      "hedge": "asserted",
+      "interpretation": "YugabyteDB 被排除的理由。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n09",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "Had the right primitives, but again, not architected for high throughput multi-MB blob writes.",
+      "hedge": "asserted",
+      "interpretation": "RocksDB 被排除的理由。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n10",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "Severe operational complexity and resource requirements.",
+      "hedge": "asserted",
+      "interpretation": "Ceph 被排除的理由。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n11",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "SeaweedFS keeps appending before compaction, which can cause disk usage to grow uncontrollably.",
+      "hedge": "hedged",
+      "interpretation": "SeaweedFS 的空間問題（來源用 can cause，貼文以「可能」呈現）。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n12",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "It doesn’t support TTL per blob.",
+      "hedge": "asserted",
+      "interpretation": "SeaweedFS 不支援每個 blob 的 TTL。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n13",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "coarse lifecycle TTLs instead of exact key expiry.",
+      "hedge": "asserted",
+      "interpretation": "S3 與 MinIO 只有粗粒度 lifecycle TTL。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n14",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "Putting blobs directly on disk meant implementing atomic writes and write batching",
+      "hedge": "asserted",
+      "interpretation": "直接寫檔案得自己實作原子寫入與寫入批次。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n15",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "SQLite pretty much gave us everything that the raw filesystem lacked.",
+      "hedge": "asserted",
+      "interpretation": "選 SQLite 的總結理由。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n16",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "For small blobs, SQLite is up to 35% faster than raw filesystem I/O.",
+      "hedge": "hedged",
+      "interpretation": "來源用 up to，貼文寫成「最多快 35%」。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n17",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "While raw files start to beat SQLite above ~100 KiB, we compress blobs before writing them.",
+      "hedge": "asserted",
+      "interpretation": "約 100 KiB 以上原始檔案較快，所以先壓縮。壓縮讓資料留在 SQLite 有利區間是作者對兩句話關係的解讀。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n18",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "thankfully, 99% of our compressed values sit well below 100 KiB.",
+      "hedge": "asserted",
+      "interpretation": "壓縮後 99% 的 value 遠低於 100 KiB。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n19",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "the keyspace is divided into 16384 hash slots using",
+      "hedge": "asserted",
+      "interpretation": "Redis Cluster 式的 16384 個 hash slot，使用 CRC16（來源該句續接 CRC16）。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n20",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "Each Blobasaur node owns a configured range of slots, and nodes discover each other via gossip.",
+      "hedge": "asserted",
+      "interpretation": "節點擁有設定檔指定的 slot 範圍，節點以 gossip 互相發現。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n21",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "pointing to the owner node.",
+      "hedge": "asserted",
+      "interpretation": "送錯節點時回 MOVED 轉址指向擁有者（該句前半含 MOVED 字樣與反引號）。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n22",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "At present, slot assignment is static in config.",
+      "hedge": "asserted",
+      "interpretation": "slot 指派目前是靜態寫在設定檔的。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n23",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "the only code change was switching from a single-node Redis client to a Redis Cluster client",
+      "hedge": "asserted",
+      "interpretation": "切換時應用程式端唯一的程式碼改動。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n24",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "Each key maps to one shard via multi-probe consistent hashing.",
+      "hedge": "asserted",
+      "interpretation": "節點內以 multi-probe consistent hashing 把 key 對應到一個分片。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n25",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "Each shard has a dedicated writer task fed by a bounded queue.",
+      "hedge": "asserted",
+      "interpretation": "每個分片一個專屬 writer，由有上限的佇列餵資料。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n26",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "Instead of committing one key at a time, the writer drains a batch of pending writes from the queue",
+      "hedge": "asserted",
+      "interpretation": "writer 一次取出一批待寫資料放進同一個 transaction。批次攤薄 commit 成本、batch_size 與尾端延遲的取捨是作者推測。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n27",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "Reads go directly to a per-shard pool of read-only SQLite connections and can run concurrently with the writer.",
+      "hedge": "asserted",
+      "interpretation": "讀取走每分片的唯讀連線池，可與 writer 並行。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n28",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "Resharding is currently an offline operation via the built-in CLI.",
+      "hedge": "asserted",
+      "interpretation": "resharding 目前是離線操作。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n29",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "shard migrate 4 5 --verify",
+      "hedge": "asserted",
+      "interpretation": "遷移指令範例，需先停伺服器。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n30",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "The migration tool moves keys whose target shard changed.",
+      "hedge": "asserted",
+      "interpretation": "只搬目標分片改變的 key；加 --verify 會檢查位置並回報資料列數（來源另句）。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n31",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "7,740 ops/s, p99 10.7 ms",
+      "hedge": "asserted",
+      "interpretation": "1 個分片、純 HSET。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n32",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "25,324 ops/s, p99 8.3 ms",
+      "hedge": "asserted",
+      "interpretation": "16 個分片、純 HSET。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n33",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "14,227 ops/s, p99 10.5 ms",
+      "hedge": "asserted",
+      "interpretation": "1 個分片、一半 HSET 一半 HGET。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n34",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "29,538 ops/s, p99 8.5 ms",
+      "hedge": "asserted",
+      "interpretation": "16 個分片、一半 HSET 一半 HGET；約 2.1 倍為作者計算。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n35",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "67,128 ops/s, p99 2.1 ms",
+      "hedge": "asserted",
+      "interpretation": "1 個分片、純 HGET。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n36",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "70,884 ops/s, p99 2.3 ms",
+      "hedge": "asserted",
+      "interpretation": "16 個分片、純 HGET；比 1 分片多約 5.6% 為作者計算。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n37",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "With 16 shards, write throughput increases 3.3x and median write latency drops from 8.2 ms to 2.1 ms.",
+      "hedge": "asserted",
+      "interpretation": "來源自己的歸納。中位數降到約四分之一、p99 只降約兩成為作者計算。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n38",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "All runs used 100,000 keys, synchronous writes, and",
+      "hedge": "asserted",
+      "interpretation": "對照實驗設定：100,000 個 key、同步寫入、batch_size = 50（該句後續）。64 KiB payload 取自同節 setup 描述。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n39",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "64 KiB payloads",
+      "hedge": "asserted",
+      "interpretation": "對照實驗的 payload 大小。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n40",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "We run zstd in production.",
+      "hedge": "asserted",
+      "interpretation": "支援 zstd、lz4、gzip、brotli 四種，線上用 zstd。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n41",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "shrinking a 63.6 KiB payload to 5.5 KiB reduces its storage footprint from roughly 16 pages to roughly 2",
+      "hedge": "hedged",
+      "interpretation": "平均 63.6 KiB 壓成 5.5 KiB，約 16 個 page 到約 2 個；來源用 roughly，貼文寫「約」。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n42",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "about 11x",
+      "hedge": "hedged",
+      "interpretation": "來源表列的平均壓縮比約 11 倍。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n43",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "SQLite does not fsync on every transaction commit.",
+      "hedge": "asserted",
+      "interpretation": "放寬 durability 的具體機制；崩潰時可能遺失最近 commit 是作者推測。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n44",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "acknowledges writes as soon as they enter the",
+      "hedge": "asserted",
+      "interpretation": "async_write 在寫入進分片記憶體佇列時就回覆，早於 SQLite 批次 commit（該句續接 shard 的 memory queue, before the SQLite batch commits）。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n45",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "queued writes are also placed in an in-memory pending map that reads check before querying SQLite.",
+      "hedge": "asserted",
+      "interpretation": "pending map 的作用。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n46",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "could return the old value from SQLite",
+      "hedge": "asserted",
+      "interpretation": "DEL 後立刻 GET 的邊角情況，原因是佇列裡的 DEL 尚未 commit。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n47",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "storing explicit tombstones in the pending map",
+      "hedge": "asserted",
+      "interpretation": "修法是在 pending map 存明確的 tombstone。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n48",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "routing every read",
+      "hedge": "asserted",
+      "interpretation": "來源列出的讀取指令為 GET、HGET、EXISTS、TTL，全部先經 pending map（該句括號內列指令）。TTL 易被漏掉的說明是作者推論。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n49",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "Early on, we noticed disk usage only grew, even after millions of keys expired or were deleted.",
+      "hedge": "asserted",
+      "interpretation": "SQLite 檔不縮小的現象。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n50",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "By default, SQLite keeps freed pages on an internal freelist for future writes rather than returning space to the OS.",
+      "hedge": "asserted",
+      "interpretation": "原因是 freelist。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n51",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "to reclaim unused freelist pages within a set allocation (128 MB default).",
+      "hedge": "asserted",
+      "interpretation": "vacuum 子命令回收額度預設 128 MB；另啟用 auto_vacuum = INCREMENTAL（來源另句含反引號）。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n52",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "right after executing an incremental vacuum.",
+      "hedge": "asserted",
+      "interpretation": "每次增量 vacuum 之後立刻執行 wal_checkpoint(TRUNCATE)。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n53",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "In production, our p99 write latency normally sat below 5 ms, but we occasionally saw spikes to 30 to 50 ms.",
+      "hedge": "asserted",
+      "interpretation": "過期清理造成的寫入延遲尖峰。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n54",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "single write lock, stalling normal client batches.",
+      "hedge": "asserted",
+      "interpretation": "大型 DELETE 與分片主 writer 爭奪 SQLite 單一寫入鎖。來源章節標題為 Expiry cleanup has to share the writer。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n55",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "(1,000 rows by default).",
+      "hedge": "asserted",
+      "interpretation": "cleanup_chunk_size 預設 1,000 列。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n56",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "eliminated the latency spikes without affecting correctness.",
+      "hedge": "asserted",
+      "interpretation": "切塊清理後延遲尖峰消失。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n57",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "When we launched Kite Terminal mode, we pointed its workspace storage directly at Blobasaur.",
+      "hedge": "asserted",
+      "interpretation": "遷移第一步：新工作負載直接用 Blobasaur。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n58",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "we updated the services to dual-write to both SSDB and Blobasaur while running a background migration for historical keys.",
+      "hedge": "asserted",
+      "interpretation": "遷移第二步：既有工作負載（如圖表偏好）雙寫加背景回填。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n59",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "Reads went to Blobasaur first and fell back to SSDB on a cache miss or error.",
+      "hedge": "asserted",
+      "interpretation": "雙寫期讀取順序。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n60",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "After running dual-writes for a month with zero discrepancies, we turned off SSDB.",
+      "hedge": "asserted",
+      "interpretation": "雙寫一個月零不一致後關閉 SSDB；選這個長度的理由是作者推測。",
+      "timeliness": "annual"
+    },
+    {
+      "id": "n61",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "Our current Blobasaur deployment runs as a three-node (4 vCPU, 8 GB RAM) cluster.",
+      "hedge": "asserted",
+      "interpretation": "線上部署規模。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n62",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "p99 latency across all commands stays around 2 ms on every node",
+      "hedge": "asserted",
+      "interpretation": "線上 p99 約 2 ms。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n63",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "p50 sits between 250 and 550 µs.",
+      "hedge": "asserted",
+      "interpretation": "線上 p50 在 250 到 550 微秒。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n64",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "p99 around 1.4 ms",
+      "hedge": "asserted",
+      "interpretation": "HGET p99 約 1.4 ms；同句另有 HSET p99 約 2 ms（p99 sits around 2 ms）與 HDEL p99 多半低於 1 ms（mostly under 1 ms）。",
+      "timeliness": "volatile"
+    },
+    {
+      "id": "n65",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "Why SQLite (and Rust)",
+      "hedge": "asserted",
+      "interpretation": "章節標題；Blobasaur 以 Rust 寫成，以及協定為 Redis 協定（需求清單 Redis protocol compatibility）。",
+      "timeliness": "durable"
+    },
+    {
+      "id": "n66",
+      "url": "https://zerodha.tech/blog/high-performance-distributed-blob-storage/",
+      "quote": "is a partial index",
+      "hedge": "asserted",
+      "interpretation": "expires_at 欄位上的索引是 partial index。",
+      "timeliness": "durable"
+    }
+  ],
+  "claims": [],
+  "checked_at": "2026-11-20",
+  "checker_rounds": 0
+}
