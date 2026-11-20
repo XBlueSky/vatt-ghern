@@ -1,0 +1,465 @@
+<header class="vg-deep-hero">
+  <p class="vg-deep-opener">三個 4 vCPU、8 GB 的節點，線上 p99 大約 2 ms，p50 落在 250 到 550 µs，而它們要服務的 blob 從 2 KB 的設定檔一路到 5 MB 的圖表版面。Zerodha 的做法不是找到一個更快的儲存引擎，而是把資料切進很多個 SQLite 檔，讓每個檔只有一個 writer。</p>
+  <h1 class="vg-post-title">{{ title }}</h1>
+</header>
+
+<div class="vg-post-prose">
+  <p><span class="vg-dropcap">Z</span>erodha 為了替換 SSDB，自己寫了一個叫 Blobasaur 的 blob 伺服器：對外說 Redis 協定，底層每個分片就是一個 SQLite 檔。這篇照一個 key 進來之後經過的順序拆開它。先看一整排現成方案為什麼都被排除，再看資料怎麼被分到節點與分片、分片換到多少吞吐、壓縮和放寬 durability 各自換到什麼，最後看 async 寫入留下的一致性債，以及遷移與線上的數字。</p>
+
+  <h2>SSDB 的天花板與一排被淘汰的方案</h2>
+
+  <p>起點是維運風險。來源寫得很直接：SSDB 已經無人維護，是明顯的維運風險；它也不是分散式系統，只能跑在單一節點上。單機的後果落在 blob 大小上：較大的 payload 會讓延遲劣化，所以他們被迫把 blob 上限壓在 1 MB。新系統的要求卻是同時服務 2 KB 的設定 blob 和 5 MB 的圖表版面，而且延遲要維持在個位數毫秒。舊系統的 1 MB 上限和新需求的 5 MB 版面，從一開始就互相衝突。</p>
+
+  <p>來源列出的需求有六項：Redis 協定相容、跨各種 payload 大小的低延遲、內建壓縮、帶 TTL 的簡單 CRUD、多節點分區，以及可以接受放寬的 durability。最後一項值得先記住。它是需求清單的一部分，不是做完之後的讓步，後面幾乎每個取捨都從這裡長出來。</p>
+
+  <p>這六項需求和最後的設計幾乎一一對應，攤開來看可以看出 Blobasaur 的骨架。Redis 協定相容，所以 client 端用現成的 Redis 與 Redis Cluster client 就能連。跨大小的低延遲，靠分片與壓縮去撐。內建壓縮是寫入路徑上的一個步驟。帶 TTL 的 CRUD 落在資料列的 <code>expires_at</code> 欄位上，來源提到這個欄位的索引是 partial index。多節點分區則借用 Redis Cluster 的 slot 機制。合理的推測是，這個設計的取向是把每一項需求都交給既有而成熟的零件，而不是為 blob 另外發明新的演算法。這是我對整體設計風格的歸納，來源沒有這樣自我描述。</p>
+
+  <p>被排除的方案各自卡在不同的地方，下面的卡片逐項對應來源的說法。把它們放在一起看，淘汰的理由其實落在幾個不同的軸上：吞吐量（ScyllaDB）、效能與磁碟空間效率（PostgreSQL）、並非為 blob 設計（YugabyteDB、RocksDB）、維運複雜度（Ceph）、TTL 的粒度（SeaweedFS 與 S3、MinIO），以及要自己補原子寫入和寫入批次（直接寫檔案）。沒有哪一個方案是全面落後，每一個都是在某一項需求上過不了關。</p>
+
+  <figure class="vg-w-reject-cards" data-mobile="keep">
+    <style>
+      .vg-w-reject-cards { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--s-2); }
+      @media (max-width: 720px) { .vg-w-reject-cards { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+      .vg-w-reject-cards .card { padding: var(--s-2); border: 1px solid var(--line); border-left: 2px solid var(--accent); background: var(--bg-soft); }
+      .vg-w-reject-cards .name { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-reject-cards .why { margin: 0; font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink); line-height: 1.55; }
+      .vg-w-reject-cards .axis { display: block; margin-top: var(--s-1); font-family: var(--mono); font-size: var(--fs-xs); color: var(--muted); }
+      .vg-w-reject-cards .win { border-left-color: var(--sage-deep); }
+      .vg-w-reject-cards .win .name { color: var(--sage-deep); }
+    </style>
+    <div class="card"><p class="name">ScyllaDB</p><p class="why">吞吐量明顯較低，資源用量較高。<span class="axis">軸：吞吐量</span></p></div>
+    <div class="card"><p class="name">PostgreSQL</p><p class="why">對這個用途，效能與磁碟空間效率都嚴重不佳。<span class="axis">軸：效能、空間</span></p></div>
+    <div class="card"><p class="name">YugabyteDB</p><p class="why">有 blob 儲存選項，但不是主要的設計與最佳化目標。<span class="axis">軸：用途不符</span></p></div>
+    <div class="card"><p class="name">RocksDB</p><p class="why">原語是對的，但架構不是為高吞吐的多 MB blob 寫入設計。<span class="axis">軸：用途不符</span></p></div>
+    <div class="card"><p class="name">Ceph</p><p class="why">維運複雜度與資源需求都很重。<span class="axis">軸：維運</span></p></div>
+    <div class="card"><p class="name">SeaweedFS</p><p class="why">壓實之前持續 append，磁碟用量可能失控；也不支援每個 blob 的 TTL。<span class="axis">軸：空間、TTL</span></p></div>
+    <div class="card"><p class="name">S3 與 MinIO</p><p class="why">只有粗粒度的 lifecycle TTL，不是精確到 key 的過期。<span class="axis">軸：TTL 粒度</span></p></div>
+    <div class="card"><p class="name">直接寫檔案</p><p class="why">得自己實作原子寫入與寫入批次。<span class="axis">軸：自己造輪子</span></p></div>
+  </figure>
+
+  <p>留下來的是 SQLite。來源的說法是，SQLite 幾乎給了他們原始檔案系統缺的所有東西；對小 blob，它最多比直接做檔案 I/O 快 35%。但同一份來源也承認反方向的事實：檔案超過大約 100 KiB 之後，原始檔案開始贏過 SQLite，所以他們在寫入之前先壓縮 blob。壓縮之後，99% 的值遠低於 100 KiB。這兩句放在一起，邏輯就接上了：壓縮讓這批資料留在 SQLite 比較有利的區間裡。這是我對兩句話關係的解讀，來源沒有把它寫成一條因果鏈，但每個前提都在來源裡。</p>
+
+  <p>如果你正在替一批 blob 找儲存，這一節最能直接搬走的是判斷順序，而不是結論。Zerodha 先寫下六項需求，再用最難滿足的那一項去篩：單機與 1 MB 上限先排除了 SSDB，TTL 的粒度排除了物件儲存，維運複雜度排除了 Ceph。結論之所以是 SQLite，是因為它在這些軸上都沒有明顯的洞，而它的短處，也就是較大的檔案，可以用壓縮繞過去。這是我對選擇過程的歸納，來源沒有用這種方式描述自己的決策。</p>
+
+  <h2>一個 key 的路徑：節點、分片、writer</h2>
+
+  <p>先看跨機器的那一層。Blobasaur 照 Redis Cluster 的做法，用 CRC16 把 keyspace 切成 16384 個 hash slot。每個節點擁有設定檔裡指定的一段 slot 範圍，節點之間透過 gossip 互相發現。client 如果把 key 送到錯的節點，該節點會回一個 MOVED 轉址，指向真正的擁有者。遷移時應用程式端唯一需要改的程式碼，就是把單節點的 Redis client 換成 Redis Cluster client。限制也寫在來源裡：目前 slot 的指派是靜態寫在設定檔的。</p>
+
+  <p>進到節點之後，資料再被切一次。每個 key 透過 multi-probe consistent hashing 對應到一個分片，每個分片是磁碟上獨立的一個 SQLite 檔。每個分片有一個專屬的 writer task，由一條有上限的佇列餵資料。writer 不會一個 key 一個 key 地 commit，而是從佇列裡一次取出一批待寫的資料，放進同一個 transaction。讀取走另一條路：每個分片有一個唯讀 SQLite 連線池，讀請求直接進這個池，可以和 writer 並行。</p>
+
+  <figure class="vg-w-arch-blobasaur-path" data-mobile="keep" data-svg-scroll="720">
+    <svg viewBox="0 0 720 360" role="img" aria-label="Blobasaur 的請求路徑：client 依 slot 送到節點，節點用 multi-probe consistent hashing 選分片，每個分片有一個 writer 與一個唯讀連線池，共用一個 SQLite 檔">
+      <style>
+        .vg-w-arch-blobasaur-path text { font-family: Spectral, serif; font-size: 13px; fill: var(--ink); }
+        .vg-w-arch-blobasaur-path .sub { font-size: 12px; fill: var(--muted); }
+        .vg-w-arch-blobasaur-path .tag { font-family: JetBrains Mono, monospace; font-size: 12px; fill: var(--accent-text); }
+        .vg-w-arch-blobasaur-path .box { fill: var(--bg-soft); stroke: currentColor; stroke-width: 1.5; }
+        .vg-w-arch-blobasaur-path .node { fill: none; stroke: var(--muted-2); stroke-width: 1.5; stroke-dasharray: 5 4; }
+        .vg-w-arch-blobasaur-path .writer { fill: var(--accent); fill-opacity: 0.18; stroke: var(--accent); stroke-width: 1.5; }
+        .vg-w-arch-blobasaur-path .reader { fill: var(--sage); fill-opacity: 0.35; stroke: var(--sage-deep); stroke-width: 1.5; }
+        .vg-w-arch-blobasaur-path .file { fill: var(--ink-deep); fill-opacity: 0.18; stroke: var(--ink-deep); stroke-width: 1.5; }
+        .vg-w-arch-blobasaur-path .arrow { stroke: currentColor; stroke-width: 1.5; fill: none; }
+        .vg-w-arch-blobasaur-path .back { stroke: var(--accent); stroke-width: 1.5; fill: none; stroke-dasharray: 4 3; }
+      </style>
+      <defs>
+        <marker id="vg-w-arch-blobasaur-path-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0 0 L10 5 L0 10 z" fill="currentColor"/>
+        </marker>
+        <marker id="vg-w-arch-blobasaur-path-arrow-accent" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0 0 L10 5 L0 10 z" fill="var(--accent)"/>
+        </marker>
+      </defs>
+
+      <rect class="box" x="10" y="150" width="110" height="70" rx="3"/>
+      <text x="65" y="182" text-anchor="middle">Redis Cluster</text>
+      <text x="65" y="202" text-anchor="middle">client</text>
+
+      <rect class="node" x="200" y="24" width="510" height="318" rx="4"/>
+      <text class="tag" x="215" y="46">Blobasaur 節點</text>
+      <text class="sub" x="330" y="46">擁有設定檔指定的一段 slot</text>
+
+      <rect class="box" x="215" y="150" width="140" height="80" rx="3"/>
+      <text x="285" y="176" text-anchor="middle">multi-probe</text>
+      <text x="285" y="194" text-anchor="middle">consistent hashing</text>
+      <text class="sub" x="285" y="215" text-anchor="middle">key 對應到分片</text>
+
+      <rect class="box" x="400" y="58" width="296" height="140" rx="3"/>
+      <text class="tag" x="412" y="78">shard 1</text>
+      <rect class="writer" x="412" y="88" width="132" height="64" rx="3"/>
+      <text x="478" y="108" text-anchor="middle">writer task</text>
+      <text class="sub" x="478" y="126" text-anchor="middle">bounded queue</text>
+      <text class="sub" x="478" y="143" text-anchor="middle">批次 commit</text>
+      <rect class="reader" x="556" y="88" width="128" height="64" rx="3"/>
+      <text x="620" y="108" text-anchor="middle">唯讀連線池</text>
+      <text class="sub" x="620" y="126" text-anchor="middle">read-only</text>
+      <text class="sub" x="620" y="143" text-anchor="middle">與 writer 並行</text>
+      <rect class="file" x="412" y="162" width="272" height="28" rx="3"/>
+      <text x="548" y="181" text-anchor="middle">SQLite 檔</text>
+
+      <rect class="box" x="400" y="222" width="296" height="64" rx="3"/>
+      <text class="tag" x="412" y="244">shard 2 ... N</text>
+      <text class="sub" x="412" y="266">各有自己的 SQLite 檔與 writer</text>
+
+      <text class="sub" x="215" y="324">slot 指派目前寫在設定檔，resharding 需離線</text>
+
+      <path class="arrow" d="M120 175 L213 175" marker-end="url(#vg-w-arch-blobasaur-path-arrow)"/>
+      <text class="sub" x="128" y="167">依 slot 送</text>
+      <path class="back" d="M215 205 L122 205" marker-end="url(#vg-w-arch-blobasaur-path-arrow-accent)"/>
+      <text class="sub" x="128" y="224">MOVED</text>
+      <path class="arrow" d="M355 180 L398 128" marker-end="url(#vg-w-arch-blobasaur-path-arrow)"/>
+      <path class="arrow" d="M355 200 L398 252" marker-end="url(#vg-w-arch-blobasaur-path-arrow)"/>
+    </svg>
+    <figcaption>節點收到 key 之後的流程。writer 與唯讀連線池共用同一個分片檔，但走不同的連線。</figcaption>
+  </figure>
+
+  <p>client 端用的是 Redis Cluster client，也就是說 slot 到節點的對應由 client 持有，節點只有在對應不準時才用 MOVED 糾正。合理的推測是，正常情況下一個請求只走一跳，中間沒有額外的代理層；來源沒有量過轉址發生的頻率。靜態的 slot 指派在這裡可能還帶來一點好處：對應表寫在設定檔、不會自己變動，client 端的對應失準的機會應該不高。這同樣只是推測，來源只說明了指派是靜態的。</p>
+
+  <p>批次的設計值得多說一句。SQLite 每次 commit 都有固定成本，一個 transaction 裡放的寫入越多，這個成本被攤得越薄。來源的對照實驗把 <code>batch_size</code> 設成 50，writer 則是一次從佇列取出一批待寫的資料。合理的推測是，在同步寫入的設定下，client 等的是整批 commit 完成，所以批次越大，吞吐越有利，單筆延遲的尾巴也可能越長；來源沒有掃描 batch_size，這個取捨只能當作推測。</p>
+
+  <p>為什麼要切這麼細？來源在別處說得很清楚：SQLite 只有一把寫入鎖。後面談到過期清理的問題時，這把鎖會變成主角。合理的推測是，每個分片一個 writer、再把資料分到很多分片，目的就是把這一把鎖複製成很多把，讓寫入可以在不同的檔之間平行進行。讀取不需要等這把鎖，因為它們走唯讀連線。下一節的數字可以檢驗這個推測。</p>
+
+  <p>分片數可以改，但代價不小。來源說 resharding 目前是離線操作，用內建的 CLI 完成，例如 <code>blobasaur shard migrate 4 5 --verify</code>，執行前要先停掉伺服器。遷移工具只搬目標分片改變的 key，加上 <code>--verify</code> 時還會檢查 key 的位置並回報資料列數。靜態 slot 指派加上離線 resharding，意味著這套系統在擴縮上是偏手動的。對一個把 durability 放寬、負載型態相對固定的設定與偏好儲存，這個取捨說得通；若換成需要隨流量彈性伸縮的場景，這兩個限制就會變成問題。</p>
+
+  <h2>分片換到多少吞吐，讀寫為什麼不對稱</h2>
+
+  <p>來源做了一組對照：1 個分片對 16 個分片，三種工作負載。設定是 100,000 個 key、64 KiB 的 payload、<code>batch_size = 50</code>，而且全部使用同步寫入。純 <code>HSET</code> 從每秒 7,740 次提高到 25,324 次，p99 從 10.7 ms 降到 8.3 ms。來源自己的歸納是：16 個分片下寫入吞吐上升 3.3 倍，寫入延遲的中位數從 8.2 ms 降到 2.1 ms。</p>
+
+  <p>混合負載（一半 <code>HSET</code>、一半 <code>HGET</code>）從 14,227 次升到 29,538 次，約 2.1 倍，p99 從 10.5 ms 降到 8.5 ms。純 <code>HGET</code> 幾乎沒動：67,128 次對 70,884 次，只多了約 5.6%，p99 甚至從 2.1 ms 微升到 2.3 ms。三組數字畫成圖，寫入那兩組的差距和讀取那一組的平坦，一眼就看得出來。</p>
+
+  <figure class="vg-w-bars-shard-benchmark" data-mobile="keep" data-svg-scroll="720">
+    <svg viewBox="0 0 720 340" role="img" aria-label="1 個分片與 16 個分片在三種工作負載下的每秒操作數：純 HSET 7,740 對 25,324，混合 14,227 對 29,538，純 HGET 67,128 對 70,884">
+      <style>
+        .vg-w-bars-shard-benchmark text { font-family: Spectral, serif; font-size: 13px; fill: var(--ink); }
+        .vg-w-bars-shard-benchmark .sub { font-size: 12px; fill: var(--muted); }
+        .vg-w-bars-shard-benchmark .num { font-family: JetBrains Mono, monospace; font-size: 12px; fill: var(--ink); }
+        .vg-w-bars-shard-benchmark .grid { stroke: var(--line); stroke-width: 1; }
+        .vg-w-bars-shard-benchmark .one { fill: var(--muted); fill-opacity: 0.55; }
+        .vg-w-bars-shard-benchmark .sixteen { fill: var(--accent); }
+      </style>
+      <rect class="one" x="90" y="10" width="12" height="12"/>
+      <text class="sub" x="108" y="21">1 shard</text>
+      <rect class="sixteen" x="190" y="10" width="12" height="12"/>
+      <text class="sub" x="208" y="21">16 shards</text>
+      <text class="sub" x="690" y="21" text-anchor="end">每秒操作數（ops/s）</text>
+
+      <line class="grid" x1="70" y1="280" x2="690" y2="280"/>
+      <line class="grid" x1="70" y1="220" x2="690" y2="220"/>
+      <line class="grid" x1="70" y1="160" x2="690" y2="160"/>
+      <line class="grid" x1="70" y1="100" x2="690" y2="100"/>
+      <line class="grid" x1="70" y1="40" x2="690" y2="40"/>
+      <text class="sub" x="62" y="284" text-anchor="end">0</text>
+      <text class="sub" x="62" y="224" text-anchor="end">20k</text>
+      <text class="sub" x="62" y="164" text-anchor="end">40k</text>
+      <text class="sub" x="62" y="104" text-anchor="end">60k</text>
+      <text class="sub" x="62" y="44" text-anchor="end">80k</text>
+
+      <rect class="one" x="90" y="256.8" width="70" height="23.2"/>
+      <text class="num" x="125" y="250" text-anchor="middle">7,740</text>
+      <rect class="sixteen" x="170" y="204.1" width="70" height="75.9"/>
+      <text class="num" x="205" y="197" text-anchor="middle">25,324</text>
+      <text x="165" y="302" text-anchor="middle">純 HSET</text>
+      <text class="sub" x="165" y="322" text-anchor="middle">p99 10.7 到 8.3 ms</text>
+
+      <rect class="one" x="290" y="237.3" width="70" height="42.7"/>
+      <text class="num" x="325" y="231" text-anchor="middle">14,227</text>
+      <rect class="sixteen" x="370" y="191.4" width="70" height="88.6"/>
+      <text class="num" x="405" y="184" text-anchor="middle">29,538</text>
+      <text x="365" y="302" text-anchor="middle">一半 HSET 一半 HGET</text>
+      <text class="sub" x="365" y="322" text-anchor="middle">p99 10.5 到 8.5 ms</text>
+
+      <rect class="one" x="490" y="78.6" width="70" height="201.4"/>
+      <text class="num" x="525" y="72" text-anchor="middle">67,128</text>
+      <rect class="sixteen" x="570" y="67.3" width="70" height="212.7"/>
+      <text class="num" x="605" y="60" text-anchor="middle">70,884</text>
+      <text x="565" y="302" text-anchor="middle">純 HGET</text>
+      <text class="sub" x="565" y="322" text-anchor="middle">p99 2.1 到 2.3 ms</text>
+    </svg>
+    <figcaption>數字取自來源的分片對照表，條件為 100,000 個 key、64 KiB payload、<code>batch_size = 50</code>、同步寫入。</figcaption>
+  </figure>
+
+  <p>讀取為什麼幾乎不受分片數影響？一個 SQLite 檔在只有 1 個分片時，讀取已經能跑到每秒 67,128 次，因為讀取走唯讀連線池，不必排進 writer 的佇列。分片真正解開的是寫入這一側的序列化。這和上一節的推測一致：寫入受限於每個檔的單一寫入鎖，分片把鎖變多，寫入吞吐就跟著上去；讀取本來就沒有被這把鎖卡住，所以加分片幾乎沒有差別。</p>
+
+  <p>把倍數拉開看，還有兩件事。第一，寫入的中位數延遲降到原來的約四分之一（8.2 ms 到 2.1 ms），p99 卻只降了約兩成（10.7 ms 到 8.3 ms），吞吐與中位數的改善比尾端延遲的改善大得多。合理的推測是，尾端仍被批次 commit 的等待和 64 KiB 的資料量決定，分片能分散的是排隊，分散不了每一批 commit 自己的耗時。第二，混合負載的倍數（約 2.1 倍）夾在純寫入的 3.3 倍和純讀取的約 1.06 倍之間，方向上符合「寫入受益、讀取原地不動」的解釋，但來源沒有拆出混合負載裡讀寫各自的延遲，這只是和數字相容的讀法。</p>
+
+  <p>這組數字要有保留地讀。它是單一組設定下的結果，使用同步寫入，不代表任何一個線上負載。分片數從 1 跳到 16，中間的點來源沒有給，所以「分片越多越好」並沒有被這張表證明，這張表只證明了 1 與 16 兩個端點之間，寫入有 3.3 倍的差距。</p>
+
+  <h2>壓縮與放寬 durability</h2>
+
+  <p>Blobasaur 在寫入 SQLite 之前可以做壓縮，支援 zstd、lz4、gzip 與 brotli，線上跑的是 zstd。來源用一個平均值說明效果：平均 63.6 KiB 的 payload 壓縮後是 5.5 KiB，儲存佔用從大約 16 個 page 降到大約 2 個，表中列出的壓縮比約為 11 倍。page 是 SQLite 寫入與讀取的單位，payload 縮小，等於每個 blob 需要碰的 page 少了一大截。</p>
+
+  <figure class="vg-w-pages-compression" data-mobile="keep" data-svg-scroll="720">
+    <svg viewBox="0 0 720 240" role="img" aria-label="一個平均 63.6 KiB 的 payload 約佔 16 個 page，zstd 壓縮到 5.5 KiB 之後約佔 2 個 page">
+      <style>
+        .vg-w-pages-compression text { font-family: Spectral, serif; font-size: 14px; fill: var(--ink); }
+        .vg-w-pages-compression .sub { font-size: 12px; fill: var(--muted); }
+        .vg-w-pages-compression .tag { font-family: JetBrains Mono, monospace; font-size: 12px; fill: var(--accent-text); }
+        .vg-w-pages-compression .pg { fill: var(--muted); fill-opacity: 0.45; stroke: var(--muted-2); stroke-width: 1; }
+        .vg-w-pages-compression .pg-small { fill: var(--accent); fill-opacity: 0.8; stroke: var(--accent); stroke-width: 1; }
+        .vg-w-pages-compression .flow { stroke: currentColor; stroke-width: 1.5; fill: none; }
+      </style>
+      <defs>
+        <marker id="vg-w-pages-compression-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0 0 L10 5 L0 10 z" fill="currentColor"/>
+        </marker>
+      </defs>
+      <text x="30" y="38">壓縮前：平均 63.6 KiB</text>
+      <text class="sub" x="30" y="58">每格代表一個 SQLite page</text>
+      <rect class="pg" x="30" y="84" width="30" height="30"/>
+      <rect class="pg" x="66" y="84" width="30" height="30"/>
+      <rect class="pg" x="102" y="84" width="30" height="30"/>
+      <rect class="pg" x="138" y="84" width="30" height="30"/>
+      <rect class="pg" x="174" y="84" width="30" height="30"/>
+      <rect class="pg" x="210" y="84" width="30" height="30"/>
+      <rect class="pg" x="246" y="84" width="30" height="30"/>
+      <rect class="pg" x="282" y="84" width="30" height="30"/>
+      <rect class="pg" x="30" y="120" width="30" height="30"/>
+      <rect class="pg" x="66" y="120" width="30" height="30"/>
+      <rect class="pg" x="102" y="120" width="30" height="30"/>
+      <rect class="pg" x="138" y="120" width="30" height="30"/>
+      <rect class="pg" x="174" y="120" width="30" height="30"/>
+      <rect class="pg" x="210" y="120" width="30" height="30"/>
+      <rect class="pg" x="246" y="120" width="30" height="30"/>
+      <rect class="pg" x="282" y="120" width="30" height="30"/>
+      <text x="30" y="184">約 16 個 page</text>
+
+      <path class="flow" d="M340 117 L452 117" marker-end="url(#vg-w-pages-compression-arrow)"/>
+      <text class="tag" x="396" y="106" text-anchor="middle">zstd</text>
+
+      <text x="480" y="38">壓縮後：平均 5.5 KiB</text>
+      <rect class="pg-small" x="480" y="102" width="30" height="30"/>
+      <rect class="pg-small" x="516" y="102" width="30" height="30"/>
+      <text x="480" y="184">約 2 個 page</text>
+      <text class="sub" x="30" y="222">約 11 倍的壓縮比，99% 的壓縮後 value 遠低於 100 KiB</text>
+    </svg>
+  </figure>
+
+  <p>壓縮發生的位置也有講究。它在寫入 SQLite 之前，所以 SQLite 看到的是壓縮後的位元組，page 數、checkpoint 與 vacuum 面對的都是壓縮後的大小。這把前面那個 100 KiB 的分界變成可以操作的量：只要壓縮後的 value 夠小，檔案就留在 SQLite 比較有利的一側，而來源說 99% 的壓縮後 value 遠低於這個門檻。至於 5 MB 的圖表版面壓縮後會落在哪裡，來源沒有給單一案例，只給了平均值這類彙總數字，所以不能由此推出大 blob 的行為。</p>
+
+  <p>durability 的取捨在另一端。分片設成 <code>synchronous = NORMAL</code>，來源明說 SQLite 不會在每次 transaction commit 時 fsync。對照前面的需求清單，這正是「可以接受放寬 durability」的具體實作。合理的推測是，伺服器當機時，最近幾筆已經回覆 client 的 commit 可能還沒真的落到磁碟；來源在這一段沒有逐項列出能遺失什麼，這個後果是我從「不 fsync」推出來的。</p>
+
+  <p>更激進的是 <code>async_write</code> 模式。開啟之後，寫入一進到分片的記憶體佇列就回覆 client，早於 SQLite 批次 commit。client 看到的寫入延遲不再包含 commit 的時間，換來的視窗是：佇列裡已經回覆、尚未 commit 的資料，在程序崩潰時沒有任何磁碟上的副本。這個模式只在能接受遺失的資料上才說得通。合理的推測是，使用者的工作區偏好與圖表版面這類資料屬於這一類，不過來源在這一段沒有逐項說明哪些資料開了這個模式。</p>
+
+  <p>對想借用這個設計的人，這一節有一個具體的檢查點：資料遺失的視窗能不能接受。放寬 durability 的收益是寫入路徑上少了每次 commit 的 fsync，在 async_write 下甚至連 commit 都不用等；代價是崩潰時有一個大小說不準的視窗。來源的需求清單只寫了可以接受放寬的 durability。我的歸納是，這種設計適合遺失一筆可以由使用者重新設定的資料，不適合直接搬去放訂單或帳務這類不能少一筆的資料。</p>
+
+  <h2>async 寫入的債：pending map、tombstone 與刪除</h2>
+
+  <p>讓寫入先回覆，讀取就得看得見還沒 commit 的資料，不然 client 剛寫完就讀不到。Blobasaur 的解法是把進佇列的寫入同時放進一個記憶體裡的 pending map，讀取在查 SQLite 之前先查它。來源記下了一個邊角情況：一個 DEL 後面緊接著 GET，因為佇列裡的 DEL 還沒 commit，如果 pending map 裡找不到這個 key，讀取就會落到 SQLite，回傳舊值。修法是在 pending map 裡存明確的 tombstone，並且讓每一種讀取（GET、HGET、EXISTS、TTL）都先過它。</p>
+
+  <p>要是你也打算在資料庫前面放一條寫入佇列，來源列出的四個指令就是現成的檢查表：GET、HGET、EXISTS、TTL。只要有一個讀取指令繞過 pending map，就會在刪除或覆寫之後讀到過時的狀態。TTL 特別容易被漏掉，因為它讀的是過期資訊而不是值本身，但在佇列裡的 DEL 或重新 SET 尚未 commit 時，它同樣可能給出過時的答案。這是從來源的四個指令延伸出來的推論，來源只說明它們全都先經過 pending map。</p>
+
+  <p>下面的模擬器把這個狀態機攤開。選一種寫入模式，對一個 key 做 SET、DEL、GET，看佇列、pending map 和已 commit 的 SQLite 三個地方各自長什麼樣。把 tombstone 關掉，再依序按 SET、commit、DEL、GET，就會重現來源描述的那個 bug；按 crash 則看到佇列裡還沒 commit 的寫入一起消失。模擬器只實作了來源明講的行為，其餘細節（例如佇列滿了會怎樣）刻意沒有模擬。</p>
+
+  <figure class="vg-w-async-write-sim" data-mobile="swap" data-mobile-summary="async_write 下 DEL 後立刻 GET，若 pending map 沒存 tombstone，就會讀到 SQLite 裡還沒被刪除的舊值。">
+    <style>
+      .vg-w-async-write-sim { display: grid; gap: var(--s-3); }
+      .vg-w-async-write-sim .opts { display: flex; flex-wrap: wrap; gap: var(--s-3); align-items: center; font-family: var(--serif); font-size: var(--fs-sm); }
+      .vg-w-async-write-sim .opts label { display: inline-flex; gap: var(--s-1); align-items: center; min-height: 36px; cursor: pointer; }
+      .vg-w-async-write-sim .opts input[type="text"] { font-family: var(--mono); font-size: var(--fs-sm); padding: 4px 8px; width: 9em; border: 1px solid var(--line); background: var(--bg); color: var(--ink); min-height: 36px; }
+      .vg-w-async-write-sim .btns { display: flex; flex-wrap: wrap; gap: var(--s-2); }
+      .vg-w-async-write-sim button { min-height: 44px; min-width: 44px; padding: var(--s-1) var(--s-3); font-family: var(--sans); font-size: var(--fs-sm); background: var(--bg-soft); color: var(--ink); border: 1px solid var(--muted-2); cursor: pointer; }
+      .vg-w-async-write-sim button:hover { border-color: var(--accent); }
+      .vg-w-async-write-sim button.warn { color: var(--accent-text); border-color: var(--accent); }
+      .vg-w-async-write-sim .panes { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--s-2); }
+      @media (max-width: 720px) { .vg-w-async-write-sim .panes { grid-template-columns: 1fr; } }
+      .vg-w-async-write-sim .pane { padding: var(--s-2); border: 1px solid var(--line); background: var(--bg-soft); min-height: 8em; }
+      .vg-w-async-write-sim .pane h4 { margin: 0 0 var(--s-1) 0; font-family: var(--sans); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-text); }
+      .vg-w-async-write-sim .pane ul { list-style: none; margin: 0; padding: 0; font-family: var(--mono); font-size: var(--fs-sm); color: var(--ink); }
+      .vg-w-async-write-sim .pane li.empty { color: var(--muted); font-family: var(--serif); }
+      .vg-w-async-write-sim .pane li.tomb { color: var(--accent-text); }
+      .vg-w-async-write-sim .log { padding: var(--s-2); border-left: 2px solid var(--accent); font-family: var(--serif); font-size: var(--fs-sm); color: var(--ink-soft); }
+      .vg-w-async-write-sim .log p { margin: 0 0 4px 0; }
+      .vg-w-async-write-sim .log p.bad { color: var(--accent-text); }
+    </style>
+    <p class="vg-w-affordance">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 4.1 12 6"/><path d="m5.1 8-2.9-.8"/><path d="m6 12-1.9 2"/><path d="M7.2 2.2 8 5.1"/><path d="M9.037 9.69a.498.498 0 0 1 .653-.653l11 4.5a.5.5 0 0 1-.074.949l-4.349 1.041a1 1 0 0 0-.74.739l-1.04 4.35a.5.5 0 0 1-.95.074z"/></svg>
+      <span>按 SET、DEL、GET、commit、crash 觀察三個狀態 · 2 種寫入模式 · tombstone 可開關</span>
+    </p>
+
+    <div class="opts">
+      <span>
+        <label><input type="radio" name="vg-w-async-write-sim-mode" value="async" checked /> async_write（進佇列就回覆）</label>
+        <label><input type="radio" name="vg-w-async-write-sim-mode" value="sync" /> 同步（commit 後才回覆）</label>
+      </span>
+      <label><input type="checkbox" data-k="tomb" checked /> pending map 存 tombstone</label>
+      <label>key <input type="text" data-k="key" value="layout" aria-label="key" /></label>
+    </div>
+
+    <div class="btns">
+      <button type="button" data-act="set">SET</button>
+      <button type="button" data-act="del">DEL</button>
+      <button type="button" data-act="get">GET</button>
+      <button type="button" data-act="commit">commit 一批</button>
+      <button type="button" data-act="crash" class="warn">crash</button>
+      <button type="button" data-act="reset">重設</button>
+    </div>
+
+    <div class="panes">
+      <div class="pane"><h4>writer 佇列（待 commit）</h4><ul data-k="queue"></ul></div>
+      <div class="pane"><h4>pending map（讀取先查）</h4><ul data-k="pending"></ul></div>
+      <div class="pane"><h4>SQLite（已 commit）</h4><ul data-k="committed"></ul></div>
+    </div>
+
+    <div class="log" data-k="log" aria-live="polite"></div>
+
+    <script>
+      (function () {
+        if (window.matchMedia('(hover: none) and (pointer: coarse)').matches) return;
+        var root = document.querySelector('.vg-w-async-write-sim');
+        if (!root) return;
+        var TOMB = { tomb: true };
+        var q = function (k) { return root.querySelector('[data-k="' + k + '"]'); };
+        var radios = root.querySelectorAll('input[name="vg-w-async-write-sim-mode"]');
+        var committed, queue, pending, n, lines;
+
+        function init() {
+          committed = new Map([['layout', 'v0']]);
+          queue = [];
+          pending = new Map();
+          n = 0;
+          lines = [{ t: '初始狀態：SQLite 裡已有 layout = v0。', bad: false }];
+        }
+        function mode() {
+          var m = 'async';
+          radios.forEach(function (r) { if (r.checked) m = r.value; });
+          return m;
+        }
+        function key() { return (q('key').value || '').trim() || 'layout'; }
+        function say(t, bad) {
+          lines.unshift({ t: t, bad: !!bad });
+          if (lines.length > 6) lines.length = 6;
+        }
+        function fill(ul, items) {
+          while (ul.firstChild) ul.removeChild(ul.firstChild);
+          if (!items.length) {
+            var e = document.createElement('li');
+            e.className = 'empty';
+            e.textContent = '（空）';
+            ul.appendChild(e);
+            return;
+          }
+          items.forEach(function (it) {
+            var li = document.createElement('li');
+            li.textContent = it.text;
+            if (it.tomb) li.className = 'tomb';
+            ul.appendChild(li);
+          });
+        }
+        function render() {
+          fill(q('queue'), queue.map(function (o) {
+            return { text: o.op === 'SET' ? 'SET ' + o.k + ' = ' + o.v : 'DEL ' + o.k };
+          }));
+          var p = [];
+          pending.forEach(function (v, k) {
+            p.push(v === TOMB ? { text: k + ' = tombstone', tomb: true } : { text: k + ' = ' + v });
+          });
+          fill(q('pending'), p);
+          var c = [];
+          committed.forEach(function (v, k) { c.push({ text: k + ' = ' + v }); });
+          fill(q('committed'), c);
+          var log = q('log');
+          while (log.firstChild) log.removeChild(log.firstChild);
+          lines.forEach(function (l) {
+            var p2 = document.createElement('p');
+            if (l.bad) p2.className = 'bad';
+            p2.textContent = l.t;
+            log.appendChild(p2);
+          });
+        }
+        function truth(k) {
+          var copy = new Map(committed);
+          queue.forEach(function (o) {
+            if (o.op === 'SET') copy.set(o.k, o.v); else copy.delete(o.k);
+          });
+          return copy.has(k) ? copy.get(k) : null;
+        }
+        function act(a) {
+          var k = key();
+          if (a === 'set') {
+            n += 1;
+            var v = 'v' + n;
+            if (mode() === 'sync') {
+              committed.set(k, v);
+              say('SET ' + k + ' = ' + v + '：commit 完成後才回覆。');
+            } else {
+              queue.push({ op: 'SET', k: k, v: v });
+              pending.set(k, v);
+              say('SET ' + k + ' = ' + v + '：已回覆，但還在佇列裡，尚未 commit。');
+            }
+          } else if (a === 'del') {
+            if (mode() === 'sync') {
+              committed.delete(k);
+              say('DEL ' + k + '：commit 完成後才回覆。');
+            } else {
+              queue.push({ op: 'DEL', k: k });
+              if (q('tomb').checked) {
+                pending.set(k, TOMB);
+                say('DEL ' + k + '：已回覆，pending map 記下 tombstone。');
+              } else {
+                pending.delete(k);
+                say('DEL ' + k + '：已回覆，pending map 沒有留下任何標記。');
+              }
+            }
+          } else if (a === 'get') {
+            var res, src;
+            if (pending.has(k)) {
+              var pv = pending.get(k);
+              res = pv === TOMB ? null : pv;
+              src = 'pending map';
+            } else {
+              res = committed.has(k) ? committed.get(k) : null;
+              src = 'SQLite';
+            }
+            var shown = res === null ? '（不存在）' : res;
+            var ok = res === truth(k);
+            say('GET ' + k + ' 得到 ' + shown + '，來自 ' + src + (ok ? '。' : '。這個結果是舊的：佇列裡的寫入還沒 commit，讀取卻沒看到它。'), !ok);
+          } else if (a === 'commit') {
+            var cnt = queue.length;
+            queue.forEach(function (o) {
+              if (o.op === 'SET') committed.set(o.k, o.v); else committed.delete(o.k);
+            });
+            queue = [];
+            pending.clear();
+            say(cnt ? 'commit：' + cnt + ' 筆寫入落進 SQLite，pending map 清空。' : 'commit：佇列是空的，沒有東西可寫。');
+          } else if (a === 'crash') {
+            var lost = queue.length;
+            queue = [];
+            pending.clear();
+            say(lost ? 'crash：佇列裡 ' + lost + ' 筆已回覆但尚未 commit 的寫入遺失。' : 'crash：佇列是空的，沒有遺失任何已回覆的寫入。', lost > 0);
+          } else if (a === 'reset') {
+            init();
+          }
+          render();
+        }
+        root.querySelectorAll('button[data-act]').forEach(function (b) {
+          b.addEventListener('click', function () { act(b.getAttribute('data-act')); });
+        });
+        init();
+        render();
+      })();
+    </script>
+  </figure>
+
+  <p>這個 bug 的形狀值得留意：它不是邏輯寫錯，而是兩個各自正確的設計疊在一起。async 寫入讓回覆早於 commit，pending map 讓讀取看得見未 commit 的資料，但「刪除」在 map 裡本來就是一個沒有內容的狀態，沒有明確標記就和「從來沒寫過」無法區分。tombstone 的作用，就是讓「已刪除」成為 map 裡看得見的一個值。</p>
+
+  <p>另外兩個教訓都來自 SQLite 自己的行為。第一個是檔案不會縮小。來源說他們早期就發現，即使有上百萬個 key 過期或被刪除，磁碟用量還是只增不減，原因是 SQLite 預設把釋放的 page 放在內部的 freelist 留給未來的寫入，而不是還給作業系統。他們在每個分片啟用了 <code>PRAGMA auto_vacuum = INCREMENTAL</code>，另外加了 <code>blobasaur shard vacuum</code> 子命令，在設定的額度內回收 freelist 的 page，預設是 128 MB；每次增量 vacuum 之後會立刻執行 <code>PRAGMA wal_checkpoint(TRUNCATE)</code>。</p>
+
+  <p>第二個是過期清理和 writer 搶同一把鎖。線上的寫入 p99 平常在 5 ms 以下，卻偶爾衝到 30 到 50 ms。原因是一個很大的 <code>DELETE</code> 和分片的主 writer 爭奪 SQLite 的單一寫入鎖，讓一般 client 的批次停住。修法是把清理切成小塊，每一輪以 <code>cleanup_chunk_size</code> 為上限，預設 1,000 列，並讓清理走分片的 writer；來源說這樣分散實體刪除之後，延遲尖峰消失，正確性不受影響。這件事回頭印證了前面的推測：單一寫入鎖不是理論上的限制，它真的在正式環境以 30 到 50 ms 的尖峰出現過。</p>
+
+  <p>三個問題有一個共通點：它們都是 SQLite 的行為在這個用法下被放大。freelist、單一寫入鎖，加上自己加的記憶體佇列，三者都不是 PostgreSQL 或原始檔案系統會以同樣形式遇到的問題。合理的推測是，選 SQLite 換來了嵌入式引擎的簡單與速度，也同時繼承了它的運作細節，而這些細節得由 Blobasaur 自己去補。</p>
+
+  <h2>遷移路線與線上數字</h2>
+
+  <p>遷移分成三步。第一步是新的工作負載先走：Kite Terminal mode 上線時，它的 workspace 儲存直接指向 Blobasaur。第二步是既有的工作負載，例如圖表偏好：服務同時寫進 SSDB 與 Blobasaur，同時有背景任務搬歷史的 key；讀取先去 Blobasaur，遇到 cache miss 或錯誤才退回 SSDB。第三步是切換，應用程式端唯一的改動，就是從單節點的 Redis client 換成 Redis Cluster client。雙寫跑了一個月、沒有任何不一致之後，他們關掉了 SSDB。</p>
+
+  <p>這條路線的安全性來自兩個設計：讀取先打新系統、失敗再退回舊系統，所以任何一邊出問題都有後路；而因為 Blobasaur 說的是 Redis 協定，client 端的改動才小到只是換一個 client。協定相容這條需求，在遷移這一步才算真正兌現。</p>
+
+  <p>一個月的雙寫期也值得單獨看。雙寫的目的不是壓力測試，而是比對：兩個系統收到同樣的寫入，結果應該一致，「零不一致」才是可以關掉舊系統的證據。合理的推測是，一個月的長度是為了讓使用頻率不同的使用者都至少碰過一次這條路徑；來源只說跑了一個月、沒有不一致，沒有交代為什麼選這個長度。</p>
+
+  <p>線上的狀態，來源給的是這幾組數字：三個節點（每個 4 vCPU、8 GB RAM）組成的叢集，所有指令的 p99 在每個節點上都維持在約 2 ms，p50 在 250 到 550 µs 之間。拆開看指令，<code>HSET</code> 的 p99 約 2 ms，<code>HGET</code> 的 p99 約 1.4 ms，<code>HDEL</code> 的 p99 多半低於 1 ms。把這組數字和前面的分片對照表放在一起看會有落差，例如對照表裡純 <code>HSET</code> 的 p99 是 8.3 ms，但兩邊的條件不同（payload 大小、同步寫入、硬體都不一樣），不宜直接比較。</p>
+
+  <p>值得補上的是 1 MB 上限的對照。SSDB 時代因為延遲而被迫把 blob 壓在 1 MB；現在同一個叢集服務的範圍從 2 KB 到 5 MB，而線上 p99 在 2 ms 上下。這個比較有一個限制：來源沒有給出不同 blob 大小各自的線上延遲分布，所以「5 MB 的 blob 也是 2 ms」並沒有被證明，被證明的是整體的延遲分布和需求涵蓋的大小範圍。</p>
+
+  <p>把整篇濃縮成採用前的檢查表，大概是四個問題：資料遺失的視窗能不能接受？壓縮後的 value 大小是否多數落在 100 KiB 以下？TTL 需要精確到 key 嗎？能不能接受靜態的 slot 指派與離線的 resharding？前兩個問題決定 SQLite 適不適合這批資料，後兩個決定 Blobasaur 的運維模式適不適合你的團隊。這份清單是我的整理，不是來源的結論。</p>
+
+  <p class="vg-deep-closer"><strong>What this enables</strong>：三台 4 vCPU 的節點就能用 Redis 協定服務從 2 KB 到 5 MB 的 blob，代價是接受放寬的 durability、靜態的 slot 指派與離線的 resharding。</p>
+</div>
